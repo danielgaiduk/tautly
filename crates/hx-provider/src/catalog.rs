@@ -84,7 +84,10 @@ impl Catalog {
     /// Unknown models get conservative defaults and no price.
     pub fn get(&self, id: &ModelId) -> ModelInfo {
         self.models.get(id.as_str()).map_or_else(
-            || ModelInfo { caps: Capabilities::conservative(), price: None },
+            || ModelInfo {
+                caps: Capabilities::conservative(),
+                price: None,
+            },
             Entry::info,
         )
     }

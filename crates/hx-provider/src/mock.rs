@@ -3,8 +3,8 @@
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
-use futures::stream::{self, BoxStream};
 use futures::StreamExt;
+use futures::stream::{self, BoxStream};
 use tokio_util::sync::CancellationToken;
 
 use crate::{CanonicalRequest, Provider, ProviderError, ProviderEvent};
@@ -33,8 +33,13 @@ pub struct MockProvider {
 
 impl MockProvider {
     pub fn new(script: Vec<MockTurn>) -> Self {
-        let state = State { script: script.into(), requests: Vec::new() };
-        Self { state: Arc::new(Mutex::new(state)) }
+        let state = State {
+            script: script.into(),
+            requests: Vec::new(),
+        };
+        Self {
+            state: Arc::new(Mutex::new(state)),
+        }
     }
 
     /// Every request received so far, in order.
@@ -57,11 +62,17 @@ impl Provider for MockProvider {
             st.script.pop_front()
         };
         match turn {
-            None => stream::iter([Err(ProviderError::Other("mock script exhausted".into()))]).boxed(),
+            None => {
+                stream::iter([Err(ProviderError::Other("mock script exhausted".into()))]).boxed()
+            }
             Some(MockTurn::Events(evs)) => stream::iter(evs.into_iter().map(Ok)).boxed(),
             Some(MockTurn::Error(e)) => stream::iter([Err(e)]).boxed(),
             Some(MockTurn::DropAfter(evs)) => {
-                let drop = ProviderError::Transient { status: None, retry_after: None, msg: "mock connection dropped".into() };
+                let drop = ProviderError::Transient {
+                    status: None,
+                    retry_after: None,
+                    msg: "mock connection dropped".into(),
+                };
                 stream::iter(evs.into_iter().map(Ok).chain([Err(drop)])).boxed()
             }
             Some(MockTurn::Stall) => stream::once(async move {

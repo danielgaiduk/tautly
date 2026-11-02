@@ -20,7 +20,11 @@ impl<P> Retrying<P> {
         Self::with_policy(inner, 5, Duration::from_millis(500))
     }
     pub fn with_policy(inner: P, max_attempts: u32, base: Duration) -> Self {
-        Self { inner, max_attempts, base }
+        Self {
+            inner,
+            max_attempts,
+            base,
+        }
     }
 }
 
@@ -37,7 +41,11 @@ impl<P: Provider + Clone + 'static> Provider for Retrying<P> {
         self.inner.name()
     }
 
-    fn stream(&self, req: CanonicalRequest, cancel: CancellationToken) -> BoxStream<'static, Result<ProviderEvent, ProviderError>> {
+    fn stream(
+        &self,
+        req: CanonicalRequest,
+        cancel: CancellationToken,
+    ) -> BoxStream<'static, Result<ProviderEvent, ProviderError>> {
         let inner = self.inner.clone();
         let (max_attempts, base) = (self.max_attempts.max(1), self.base);
         Box::pin(async_stream::stream! {

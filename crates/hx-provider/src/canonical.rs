@@ -103,9 +103,20 @@ pub enum Block {
 #[serde(rename_all = "snake_case")]
 pub enum Content {
     Text(String),
-    ToolUse { id: String, name: String, input: Value },
-    ToolResult { id: String, output: String, is_error: bool },
-    Reasoning { text: String, signature: Option<String> },
+    ToolUse {
+        id: String,
+        name: String,
+        input: Value,
+    },
+    ToolResult {
+        id: String,
+        output: String,
+        is_error: bool,
+    },
+    Reasoning {
+        text: String,
+        signature: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -163,8 +174,14 @@ pub struct Quota {
 pub enum ProviderEvent {
     TextDelta(String),
     ReasoningDelta(String),
-    ToolCall { id: String, name: String, input_json: String },
+    ToolCall {
+        id: String,
+        name: String,
+        input_json: String,
+    },
     Usage(RawUsage),
     Quota(Quota),
-    Done { stop: StopReason },
+    Done {
+        stop: StopReason,
+    },
 }

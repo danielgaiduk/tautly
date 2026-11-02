@@ -3,7 +3,11 @@ use std::time::Duration;
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum ProviderError {
     #[error("transient provider error (status {status:?}): {msg}")]
-    Transient { status: Option<u16>, retry_after: Option<Duration>, msg: String },
+    Transient {
+        status: Option<u16>,
+        retry_after: Option<Duration>,
+        msg: String,
+    },
     #[error("authentication failed: {0}")]
     Auth(String),
     #[error("invalid request: {0}")]
