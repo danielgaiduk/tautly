@@ -1,0 +1,11 @@
+# All file and process access must go through hx_sandbox::Sandbox.
+disallowed-methods = [
+    "std::fs::read",
+    "std::fs::write",
+    "std::fs::read_to_string",
+    "std::fs::File::open",
+    "std::fs::File::create",
+    "tokio::fs::read",
+    "tokio::fs::write",
+]
+disallowed-types = ["std::process::Command", "tokio::process::Command"]

@@ -534,6 +534,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "hx-tools"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "blake3",
+ "globset",
+ "hx-provider",
+ "hx-sandbox",
+ "regex",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
 name = "hyper"
 version = "1.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

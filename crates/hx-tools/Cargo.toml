@@ -1,0 +1,24 @@
+[package]
+name = "hx-tools"
+description = "Tool trait and built-in tools for the hx agent harness"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+hx-sandbox = { path = "../hx-sandbox" }
+hx-provider = { path = "../hx-provider" }
+async-trait.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+blake3.workspace = true
+globset.workspace = true
+regex.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio.workspace = true
