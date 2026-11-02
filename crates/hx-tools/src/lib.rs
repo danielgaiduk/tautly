@@ -1,5 +1,6 @@
 //! The `Tool` trait, shared tool context, and the built-in read-side tools.
 
+mod cap;
 mod glob;
 mod grep;
 mod read;
@@ -18,6 +19,7 @@ use serde_json::Value;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
+pub use cap::cap_text;
 pub use glob::GlobTool;
 pub use grep::GrepTool;
 pub use read::ReadTool;

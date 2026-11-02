@@ -6,6 +6,7 @@ use hx_sandbox::{Effect, Sandbox};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+use crate::cap::{OUTPUT_CAP, cap_text};
 use crate::spec::{decode_text, parse_args, tool_spec};
 use crate::{AppliedEffect, Tool, ToolCx, ToolError, ToolResult};
 
@@ -98,7 +99,10 @@ impl Tool for ReadTool {
                 out.push(format!("{n}\t{line}"));
             }
         }
-        let mut output = out.join("\n");
+        let (mut output, truncated) = cap_text(&out.join("\n"), OUTPUT_CAP);
+        if truncated {
+            output.push_str("\n[output truncated; request a narrower line range]");
+        }
         if remaining > 0 {
             output.push_str(&format!(
                 "\n[{remaining} more lines; use start_line={} to continue]",

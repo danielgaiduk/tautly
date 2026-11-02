@@ -217,3 +217,115 @@ fn registry_order_and_specs() {
         assert_eq!(s.schema["type"], json!("object"));
     }
 }
+
+const CAP: usize = 31 * 1024;
+
+#[tokio::test]
+async fn read_single_huge_line_is_capped_with_marker() {
+    let e = env(EditFormat::StrReplace);
+    put(&e, "min.js", "x".repeat(100 * 1024).as_bytes()).await;
+    let r = run(&e, &ReadTool, json!({"path":"min.js"})).await;
+    assert!(!r.is_error);
+    assert!(r.output.len() <= CAP, "{}", r.output.len());
+    assert!(r.output.contains("bytes omitted"));
+    assert!(r.output.contains("request a narrower line range"));
+    let r = run(
+        &e,
+        &ReadTool,
+        json!({"path":"min.js","start_line":1,"end_line":1}),
+    )
+    .await;
+    assert!(r.output.len() <= CAP && r.output.contains("bytes omitted"));
+}
+
+#[tokio::test]
+async fn glob_output_is_capped() {
+    let e = env(EditFormat::StrReplace);
+    let long = "d".repeat(100);
+    for i in 0..600 {
+        put(&e, &format!("{long}/{i}_{long}.rs"), b"").await;
+    }
+    let r = run(&e, &GlobTool, json!({"pattern":"**/*.rs"})).await;
+    assert!(r.output.len() <= CAP, "{}", r.output.len());
+    assert!(r.output.contains("narrow the pattern"));
+}
+
+#[tokio::test]
+async fn grep_byte_cap_applies_below_match_cap() {
+    let e = env(EditFormat::StrReplace);
+    let body = format!("{}\n", "y".repeat(1000)).repeat(100);
+    put(&e, "a.txt", body.as_bytes()).await;
+    let r = run(&e, &GrepTool, json!({"pattern":"y"})).await;
+    assert!(r.output.len() <= CAP, "{}", r.output.len());
+    assert!(r.output.contains("truncated") || r.output.contains("bytes omitted"));
+}
+
+#[tokio::test]
+async fn symlink_escape_is_neither_globbed_nor_grepped() {
+    let e = env(EditFormat::StrReplace);
+    let outside_dir = TempDir::new().unwrap();
+    let outside = LocalSandbox::new(outside_dir.path().to_path_buf()).unwrap();
+    outside
+        .write_atomic(Path::new("secret.rs"), b"needle\n", None)
+        .await
+        .unwrap();
+    put(&e, "a/ok.rs", b"needle\n").await;
+    let root = e.sb.root().to_path_buf();
+    std::os::unix::fs::symlink(outside_dir.path(), root.join("a/escape")).unwrap();
+    std::os::unix::fs::symlink(outside_dir.path().join("secret.rs"), root.join("a/s.rs")).unwrap();
+    let r = run(&e, &GlobTool, json!({"pattern":"**/*.rs"})).await;
+    assert_eq!(r.output, "a/ok.rs");
+    let r = run(&e, &GrepTool, json!({"pattern":"needle"})).await;
+    assert_eq!(r.output, "a/ok.rs:1:needle");
+}
+
+#[tokio::test]
+async fn grep_terminates_on_symlink_loop() {
+    let e = env(EditFormat::StrReplace);
+    put(&e, "a/f.txt", b"needle\n").await;
+    let root = e.sb.root().to_path_buf();
+    std::os::unix::fs::symlink(&root, root.join("a/loop")).unwrap();
+    let r = run(&e, &GrepTool, json!({"pattern":"needle"})).await;
+    assert!(!r.is_error);
+    assert_eq!(r.output, "a/f.txt:1:needle");
+}
+
+#[tokio::test]
+async fn cancelled_grep_and_glob_return_error() {
+    let mut e = env(EditFormat::StrReplace);
+    put(&e, "a.txt", b"x\n").await;
+    let tok = tokio_util::sync::CancellationToken::new();
+    tok.cancel();
+    e.cx = ToolCx::new(EditFormat::StrReplace, ".spill".into()).with_cancel(tok);
+    let r = run(&e, &GrepTool, json!({"pattern":"x"})).await;
+    assert!(r.is_error && r.output.contains("cancelled"), "{}", r.output);
+    let r = run(&e, &GlobTool, json!({"pattern":"*.txt"})).await;
+    assert!(r.is_error && r.output.contains("cancelled"), "{}", r.output);
+}
+
+#[tokio::test]
+async fn grep_reports_skipped_files() {
+    let e = env(EditFormat::StrReplace);
+    put(&e, "ok.txt", b"needle\n").await;
+    put(&e, "bin.dat", b"needle\0").await;
+    put(&e, "huge.txt", &vec![b'a'; 10 * 1024 * 1024 + 1]).await;
+    let r = run(&e, &GrepTool, json!({"pattern":"needle"})).await;
+    assert!(r.output.starts_with("ok.txt:1:needle"), "{}", r.output);
+    assert!(
+        r.output
+            .contains("skipped 2 files: binary/unreadable/too large"),
+        "{}",
+        r.output
+    );
+}
+
+#[tokio::test]
+async fn glob_star_does_not_cross_directories() {
+    let e = env(EditFormat::StrReplace);
+    put(&e, "src/a.rs", b"").await;
+    put(&e, "src/a/b.rs", b"").await;
+    let r = run(&e, &GlobTool, json!({"pattern":"src/*.rs"})).await;
+    assert_eq!(r.output, "src/a.rs");
+    let r = run(&e, &GrepTool, json!({"pattern":"", "glob":"src/*.rs"})).await;
+    assert!(!r.output.contains("src/a/b.rs"));
+}
