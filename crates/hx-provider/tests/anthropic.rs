@@ -431,3 +431,13 @@ async fn system_images_are_rejected_without_sending_a_request() {
         ))]
     );
 }
+
+#[tokio::test]
+async fn unrelated_400_mentioning_context_is_invalid_request() {
+    let body = r#"{"type":"error","error":{"type":"invalid_request_error","message":"context_management: unknown field"}}"#;
+    let server = serve(ResponseTemplate::new(400).set_body_string(body)).await;
+    assert!(matches!(
+        run(&server).await[0],
+        Err(ProviderError::InvalidRequest(_))
+    ));
+}

@@ -218,7 +218,14 @@ fn map_http_error(status: u16, retry_after: Option<Duration>, body: &str) -> Pro
         _ if kind.as_deref() == Some("overloaded_error") => transient(),
         401 | 403 => ProviderError::Auth(msg),
         413 => ProviderError::ContextOverflow(msg),
-        400 if lower.contains("prompt is too long") || lower.contains("context") => {
+        400 if [
+            "prompt is too long",
+            "input is too long",
+            "exceeds the maximum context",
+        ]
+        .iter()
+        .any(|p| lower.contains(p)) =>
+        {
             ProviderError::ContextOverflow(msg)
         }
         400..=499 => ProviderError::InvalidRequest(msg),
