@@ -42,6 +42,7 @@ Post-v1, out of scope for all of the above: multi-agent orchestration, determini
 ### 1.6 Success criteria for this sub-project
 - Cold start to ready < 50 ms; idle RSS < 30 MB; RSS flat (±10%) across a 4-hour simulated session.
 - All four test layers green; performance gates in CI pass.
+- Cache hit ratio, blocked repeat attempts and edit repairs per stage are reported by `hx eval`.
 - Tokens per solved task on the eval starter set is measured, published, and protected by a CI regression gate (9.1).
 - Usable as a daily driver on a real repository with each of the four adapters, via `hx -p` and the interactive stub (2.3).
 
@@ -88,7 +89,7 @@ Every step is appended to the session log before its effects are surfaced, so an
 
 ### 3.2 Events (engine → client)
 Typed, serde-serializable, versioned:
-`TurnStarted`, `TextDelta`, `ReasoningDelta`, `ToolCallProposed`, `ToolApprovalRequested`, `ToolStarted`, `ToolOutputDelta`, `ToolFinished`, `Usage{role, tokens_in, tokens_out, cache_read, cache_write, cost_usd, quota?}` (`role` ∈ `main | side`), `ContextStatus{used, budget, breakdown}`, `Compacted{removed_turns, summary}`, `ContextCollected{elided_results, tokens_freed}`, `MemoryProposed{proposal_id, change}` (`change` = an entry to upsert and/or entry ids to delete), `SessionChanged{session_id}`, `TurnFinished{reason}`, `Error{kind, message, retryable, hint}`.
+`TurnStarted`, `TextDelta`, `ReasoningDelta`, `ToolCallProposed`, `ToolApprovalRequested`, `ToolStarted`, `ToolOutputDelta`, `ToolFinished{…, blocked}`, `Usage{role, tokens_in, tokens_out, cache_read, cache_write, cost_usd, quota?}` (`role` ∈ `main | side`), `ContextStatus{used, budget, breakdown}`, `Compacted{removed_turns, summary, reason}`, `ContextCollected{elided_results, tokens_freed, reason}`, `MemoryProposed{proposal_id, change}` (`change` = an entry to upsert and/or entry ids to delete), `SessionChanged{session_id}`, `TurnFinished{reason}`, `Error{kind, message, retryable, hint}`.
 
 `TurnFinished.reason` ∈ `completed | cancelled | budget | max_turns | timeout | error`.
 
@@ -204,7 +205,7 @@ Requests are assembled in fixed order:
 Sources: user (`/pin "…"` or `Pin` command), config, the `pin` tool, and AGENTS.md sections headed `Constraints` or `Rules` (auto-pinned). Pinned items are never summarized or dropped. Budget warning if pinned exceeds 10% of the window.
 
 ### 6.3 Working state
-Structured record: task, plan steps with status, files read/edited with content hashes, decisions, open questions. The files list is maintained by the engine from actual tool effects; plan, decisions and questions are updated by the model through the `state` tool.
+Structured record: task, plan steps with status, files read/edited with content hashes, decisions, open questions, failed attempts (7.8). The files list is maintained by the engine from actual tool effects; plan, decisions and questions are updated by the model through the `state` tool.
 
 ### 6.4 Compaction
 - Trigger: automatic at a configurable threshold (default 80% of context window; can be disabled), or `/compact`. Always announced via event before running.
@@ -235,7 +236,7 @@ Structured record: task, plan steps with status, files read/edited with content 
 - The read tracker stores the last content returned per path (blob reference). A re-read of the same range returns `unchanged since turn N` if identical; if fewer than 50% of lines changed it returns a line-numbered unified diff; otherwise the full content. `full: true` forces full content.
 - A tool result is *superseded* when: it is a `read` of a path later edited or re-read; it is a `bash` result of a command string later re-run; it is a failed `edit` on a path later edited successfully.
 - Superseded results are replaced by `[elided: superseded at turn N]`, keeping the tool-call id and pairing.
-- Collection runs only at turn start and only when elidable tokens ≥ max(2,000, 5% of the context window), so the cache prefix breaks at most once per batch. Emits `ContextCollected`; elisions are logged in the session and restored by `Uncompact`.
+- Collection runs only at turn start, scheduled by the cache-aware scheduler (7.7); without catalog prices it applies when elidable tokens ≥ max(2,000, 5% of the context window), so the cache prefix breaks at most once per batch. Emits `ContextCollected`; elisions are logged in the session and restored by `Uncompact`.
 
 ### 7.3 Output filters
 - Parsers for: `cargo test|build|check|clippy`, `pytest`, `jest`/`vitest`, `go test`, `tsc`, `eslint`. Detected from the parsed command (5.5 parser).
@@ -255,6 +256,34 @@ Structured record: task, plan steps with status, files read/edited with content 
 - Config `[routing] side_model = "<model id>"`. Default: the catalog model with `tier = "small"` from the main model's provider; if none, the main model.
 - Used for: compaction summaries, episodes, memory consolidation, and `web_fetch` with a `question` (returns the answer, ≤ 1,000 tokens, plus the source URL).
 - Side-model usage is reported with `Usage.role = side` and counted in budgets and the ledger.
+
+### 7.7 Cache-aware scheduling
+- The catalog gains `cache_ttl_s: Option<u32>` per model (default 300 for `explicit`/`automatic` cache styles, `None` for `none`).
+- `hx-context` tracks the time of the last provider request and the token length of the cached prefix (up to the last cache breakpoint).
+- Every history mutation (context GC 7.2, threshold compaction 6.4) goes through one scheduler that decides at turn start:
+  - **Cold cache** (time since last request ≥ TTL): apply all pending mutations; nothing cached is lost.
+  - **Warm cache:** apply only when `saved > cost`, where `saved = tokens_freed × input_price × 5` (5 = expected further requests in the turn horizon) and `cost = invalidated_prefix_tokens × (cache_write_price − cache_read_price)`. Without catalog prices, fall back to the 7.2 threshold rule.
+  - **Forced:** always apply when context use ≥ 90% of the window. Threshold compaction may therefore be deferred from 80% up to 90% while the cache is warm and the cost model says it is not yet worth it — never beyond 90%.
+- All mutations decided at one turn start are applied together as one "cache epoch", so the prefix breaks at most once.
+- `ContextCollected` and `Compacted` gain `reason: cold_cache | cost_benefit | forced | manual`.
+
+### 7.8 Attempt ledger and loop breaker
+- Deterministic, no model calls. The engine records each failed tool call: tool name, normalized arguments (bash: the command string with whitespace collapsed; edit/write: path + arguments hash), the turn, a failure signature (bash: exit code + blake3 of the filtered failure summary; edit: the match-error kind), and the workspace write-generation counter at that moment (incremented on every successful write effect).
+- **Guard:** before executing a call, if an identical call (same tool + normalized args) previously failed and the write-generation has not changed since, the call is not executed. The tool result is an error: `already tried at turn N with identical inputs and no file has changed since; previous result: <first 5 lines>`. If the model repeats the same call immediately after being blocked, it runs (escape hatch for flaky commands).
+- `ToolFinished` gains `blocked: bool`.
+- Working state (6.3) gains `failed_attempts`: the 10 most recent distinct failures, one line each, capped at 300 tokens; it survives compaction like the rest of working state.
+
+### 7.9 Tolerant edit applier
+- Runs only after the exact match (5.4 step 2) fails, for `str_replace` and for `patch` hunk context. `hashline` stale anchors are never repaired.
+- Stages, in order; each stage succeeds only with exactly one candidate (otherwise the next stage runs; ambiguity at any stage is an error):
+  1. **Normalize the model's text:** CRLF → LF, typographic quotes/dashes → ASCII, NBSP → space, trailing whitespace stripped per line, and accidental `read` artifacts removed (leading `<n>\t` line numbers, `<n>:<hash>|` hashline anchors). Retry exact match.
+  2. **Whitespace-insensitive match** (the existing 5.4 fallback).
+  3. **Indentation-relative match:** compare with common leading indentation removed; re-indent the replacement by the offset found.
+  4. **Anchor match:** first and last lines of the old text each match uniquely, and the interior has line-similarity ≥ 0.9.
+  5. **Structural fallback** (`str_replace` only): if the old text starts with a definition the code index can name (7.1), locate that symbol in the file; replace the symbol's range when the old text's similarity to the symbol source ≥ 0.8. The post-edit syntax check (5.4 step 4) must report no new errors, otherwise the edit is reverted and fails.
+- A repaired edit's result says which stage applied (`applied via indentation-relative match`).
+- When every stage fails, the error shows the single nearest window of real lines (≤ 20, line-numbered) so the model can retry without re-reading the file.
+- `hx eval` reports edit repairs per stage alongside the edit-failure rate.
 
 ### 7.6 Measurement
 - `hx eval` reports tokens per solved task (total input + output tokens across main and side roles, divided by solved tasks) and cache hit ratio (`cache_read / (input + cache_read)`).
