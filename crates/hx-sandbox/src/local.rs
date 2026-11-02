@@ -14,12 +14,19 @@ const MAX_BODY: usize = 10 * 1024 * 1024;
 #[derive(Debug, Clone)]
 pub struct LocalSandbox {
     root: PathBuf,
+    client: reqwest::Client,
 }
 
 impl LocalSandbox {
     pub fn new(root: PathBuf) -> Result<Self, SandboxError> {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .redirect(reqwest::redirect::Policy::limited(5))
+            .build()
+            .map_err(|e| SandboxError::Network(e.to_string()))?;
         Ok(Self {
             root: root.canonicalize()?,
+            client,
         })
     }
 }
@@ -122,7 +129,11 @@ impl Sandbox for LocalSandbox {
                 .parent()
                 .ok_or_else(|| SandboxError::Denied("path has no parent".into()))?;
             std::fs::create_dir_all(parent)?;
-            let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
+            // Created 0666 so the kernel applies the umask (new-file default), rather
+            // than NamedTempFile's owner-only 0600.
+            let mut tmp = tempfile::Builder::new()
+                .permissions(std::fs::Permissions::from_mode(0o666))
+                .tempfile_in(parent)?;
             tmp.write_all(&bytes)?;
             tmp.as_file().sync_all()?;
             // Preserve the existing file's mode unless one is given.
@@ -162,12 +173,19 @@ impl Sandbox for LocalSandbox {
     }
 
     fn walker(&self, base: &Path) -> Result<ignore::WalkBuilder, SandboxError> {
-        Ok(ignore::WalkBuilder::new(self.resolve(base)?))
+        let mut b = ignore::WalkBuilder::new(self.resolve(base)?);
+        let root = self.root.clone();
+        // Drop symlinked entries whose target lies outside the root, so confinement
+        // holds even with `follow_links(true)`.
+        b.filter_entry(move |e| {
+            !e.path_is_symlink() || e.path().canonicalize().is_ok_and(|c| c.starts_with(&root))
+        });
+        Ok(b)
     }
 
     async fn http_get(&self, url: &Url) -> Result<HttpResponse, SandboxError> {
         let net = |e: reqwest::Error| SandboxError::Network(e.to_string());
-        let mut resp = reqwest::get(url.clone()).await.map_err(net)?;
+        let mut resp = self.client.get(url.clone()).send().await.map_err(net)?;
         let status = resp.status().as_u16();
         let headers = resp
             .headers()

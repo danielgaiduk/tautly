@@ -125,3 +125,43 @@ async fn spawn_runs_in_cwd_with_env() {
         .unwrap();
     assert_eq!(out.trim(), "bar");
 }
+
+#[tokio::test]
+async fn write_atomic_new_file_gets_umask_default_mode() {
+    use std::os::unix::fs::MetadataExt;
+    let (t, sb) = sandbox();
+    sb.write_atomic(Path::new("plain.txt"), b"x", None)
+        .await
+        .unwrap();
+    // Reference: a file created by the kernel under the same umask.
+    let reference = t.path().join("ref.txt");
+    std::fs::File::create(&reference).unwrap();
+    let want = std::fs::metadata(&reference).unwrap().mode() & 0o777;
+    let got = sb.metadata(Path::new("plain.txt")).await.unwrap().mode & 0o777;
+    assert_eq!(got, want);
+    assert_ne!(got, 0o600, "should not be owner-only unless umask says so");
+}
+
+#[tokio::test]
+async fn walker_with_follow_links_does_not_leave_root() {
+    let outside = tempfile::tempdir().unwrap();
+    std::fs::write(outside.path().join("secret.txt"), "s").unwrap();
+    let (t, sb) = sandbox();
+    std::fs::write(t.path().join("inside.txt"), "i").unwrap();
+    std::os::unix::fs::symlink(outside.path(), t.path().join("out")).unwrap();
+    let root = t.path().canonicalize().unwrap();
+    let names: Vec<_> = sb
+        .walker(Path::new("."))
+        .unwrap()
+        .follow_links(true)
+        .build()
+        .filter_map(Result::ok)
+        .map(|e| e.path().to_path_buf())
+        .collect();
+    assert!(names.iter().any(|p| p.ends_with("inside.txt")));
+    assert!(
+        !names.iter().any(|p| p.ends_with("secret.txt")),
+        "{names:?}"
+    );
+    assert!(names.iter().all(|p| p.starts_with(&root)));
+}
