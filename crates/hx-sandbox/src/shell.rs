@@ -45,6 +45,16 @@ pub fn parse_commands(src: &str) -> Result<Vec<SimpleCommand>, Unparseable> {
     }
     let mut out = Vec::new();
     walk(root, src.as_bytes(), &mut out)?;
+    if out.is_empty() && !src.trim().is_empty() {
+        // Fail closed: only plain assignments and comments may yield nothing.
+        let mut cur = root.walk();
+        let benign = root
+            .named_children(&mut cur)
+            .all(|n| matches!(n.kind(), "variable_assignment" | "comment"));
+        if !benign {
+            return Err(Unparseable("no analyzable command found".into()));
+        }
+    }
     Ok(out)
 }
 
@@ -79,39 +89,73 @@ fn walk(node: Node, src: &[u8], out: &mut Vec<SimpleCommand>) -> Result<(), Unpa
         "command" => {
             let mut argv = Vec::new();
             let mut redirects = Vec::new();
+            let mut extra = Vec::new();
+            let mut rest = Vec::new();
             let mut cur = node.walk();
             for child in node.children(&mut cur) {
                 match child.kind() {
                     "command_name" => argv.push(unquote(child, src)),
-                    "file_redirect" => redirects.extend(redirect_of(child, src)),
-                    "variable_assignment" | "comment" => {}
-                    k if child.is_named() && !k.ends_with("_redirect") => {
-                        argv.push(unquote(child, src))
+                    "variable_assignment" => rest.push(child),
+                    "file_redirect" | "heredoc_redirect" | "herestring_redirect" => {
+                        collect_redirects(child, src, &mut redirects, &mut extra)?
+                    }
+                    "comment" => {}
+                    _ if child.is_named() => {
+                        argv.push(unquote(child, src));
+                        rest.push(child);
                     }
                     _ => {}
                 }
             }
-            if !argv.is_empty() {
+            if argv.is_empty() {
+                if redirects.iter().any(|r| r.write) {
+                    return Err(Unparseable("redirection without a command".into()));
+                }
+            } else {
                 reject_unanalyzable(&argv)?;
                 out.push(SimpleCommand { argv, redirects });
             }
+            for child in rest {
+                walk(child, src, out)?;
+            }
+            out.append(&mut extra);
+            Ok(())
+        }
+        "declaration_command" | "unset_command" => {
+            let mut argv = Vec::new();
+            let mut cur = node.walk();
+            for child in node.children(&mut cur) {
+                if !child.is_named() || child.kind() == "variable_assignment" {
+                    argv.push(text(child, src).to_string());
+                } else {
+                    argv.push(unquote(child, src));
+                }
+            }
+            out.push(SimpleCommand {
+                argv,
+                redirects: Vec::new(),
+            });
             walk_children(node, src, out)
         }
-        "redirected_statement" => {
+        "test_command" => {
+            out.push(SimpleCommand {
+                argv: vec!["[[".into()],
+                redirects: Vec::new(),
+            });
+            walk_children(node, src, out)
+        }
+        "redirected_statement" | "function_definition" => {
             let start = out.len();
             let mut redirects = Vec::new();
-            let mut body = None;
+            let mut extra = Vec::new();
             let mut cur = node.walk();
             for child in node.children(&mut cur) {
                 match child.kind() {
-                    "file_redirect" => redirects.extend(redirect_of(child, src)),
-                    "heredoc_redirect" | "herestring_redirect" => {}
-                    _ if child.is_named() && body.is_none() => body = Some(child),
-                    _ => {}
+                    "file_redirect" | "heredoc_redirect" | "herestring_redirect" => {
+                        collect_redirects(child, src, &mut redirects, &mut extra)?
+                    }
+                    _ => walk(child, src, out)?,
                 }
-            }
-            if let Some(b) = body {
-                walk(b, src, out)?;
             }
             if out.len() == start {
                 if redirects.iter().any(|r| r.write) {
@@ -122,13 +166,13 @@ fn walk(node: Node, src: &[u8], out: &mut Vec<SimpleCommand>) -> Result<(), Unpa
                     cmd.redirects.extend(redirects.iter().cloned());
                 }
             }
-            // Redirect operands and heredoc bodies may hide substitutions.
-            for child in node.children(&mut cur) {
-                if child.is_named() && Some(child) != body {
-                    walk(child, src, out)?;
-                }
-            }
+            out.append(&mut extra);
             Ok(())
+        }
+        // Redirects are only understood in the contexts above; anywhere else
+        // they could hide a write, so refuse.
+        "file_redirect" | "heredoc_redirect" | "herestring_redirect" => {
+            Err(Unparseable("redirection in an unsupported position".into()))
         }
         _ => walk_children(node, src, out),
     }
@@ -137,35 +181,82 @@ fn walk(node: Node, src: &[u8], out: &mut Vec<SimpleCommand>) -> Result<(), Unpa
 fn walk_children(node: Node, src: &[u8], out: &mut Vec<SimpleCommand>) -> Result<(), Unparseable> {
     let mut cur = node.walk();
     for child in node.children(&mut cur) {
-        // `command` children handled their own words above; descending into
-        // them still finds nested substitutions.
         walk(child, src, out)?;
     }
     Ok(())
 }
 
-/// `eval`, `source`, `.` and `{bash,sh,zsh} -c` execute strings we cannot see.
+/// Gather the file redirects under a redirect node into `redirects`, and any
+/// commands hidden in its operands (substitutions, heredoc pipelines) into
+/// `extra`.
+fn collect_redirects(
+    node: Node,
+    src: &[u8],
+    redirects: &mut Vec<Redirect>,
+    extra: &mut Vec<SimpleCommand>,
+) -> Result<(), Unparseable> {
+    let mut cur = node.walk();
+    match node.kind() {
+        "file_redirect" => {
+            redirects.extend(redirect_of(node, src)?);
+            walk_children(node, src, extra)
+        }
+        "heredoc_redirect" => {
+            for child in node.children(&mut cur) {
+                match child.kind() {
+                    "file_redirect" | "heredoc_redirect" | "herestring_redirect" => {
+                        collect_redirects(child, src, redirects, extra)?
+                    }
+                    _ => walk(child, src, extra)?,
+                }
+            }
+            Ok(())
+        }
+        _ => walk_children(node, src, extra),
+    }
+}
+
+const WRAPPERS: &[&str] = &[
+    "sudo", "doas", "env", "command", "builtin", "exec", "nohup", "time", "xargs", "nice",
+    "timeout", "setsid", "find",
+];
+
+fn base(s: &str) -> &str {
+    s.rsplit('/').next().unwrap_or(s)
+}
+
+/// Reject commands that execute strings we cannot see, directly or through a
+/// wrapper (wrapper argv is kept as written; we only look through it).
 fn reject_unanalyzable(argv: &[String]) -> Result<(), Unparseable> {
-    let name = argv[0].rsplit('/').next().unwrap_or(&argv[0]);
-    let bad = match name {
-        "eval" | "source" | "." => true,
-        "bash" | "sh" | "zsh" => argv[1..]
-            .iter()
-            .take_while(|a| a.starts_with('-') && !a.starts_with("--"))
-            .any(|a| a[1..].contains('c')),
-        _ => false,
+    if argv[0].contains('$') || argv[0].contains('`') {
+        return Err(Unparseable(format!("dynamic command name `{}`", argv[0])));
+    }
+    let bad = |a: &[String]| -> bool {
+        match base(&a[0]) {
+            "eval" | "source" | "." | "trap" | "coproc" => true,
+            "bash" | "sh" | "zsh" | "dash" | "ksh" => a[1..].iter().any(|x| {
+                x == "--command"
+                    || (!x.starts_with("--")
+                        && (x.starts_with('-') || x.starts_with('+'))
+                        && x.contains('c'))
+            }),
+            _ => false,
+        }
     };
-    if bad {
+    let wrapped = WRAPPERS.contains(&base(&argv[0]));
+    // Conservative: through a wrapper, any later word may be the inner command.
+    let found = bad(argv) || (wrapped && (1..argv.len()).any(|i| bad(&argv[i..])));
+    if found {
         Err(Unparseable(format!(
             "`{}` runs code that cannot be statically analyzed",
-            argv[0]
+            argv.join(" ")
         )))
     } else {
         Ok(())
     }
 }
 
-fn redirect_of(node: Node, src: &[u8]) -> Option<Redirect> {
+fn redirect_of(node: Node, src: &[u8]) -> Result<Option<Redirect>, Unparseable> {
     let mut op = "";
     let mut cur = node.walk();
     for child in node.children(&mut cur) {
@@ -174,15 +265,22 @@ fn redirect_of(node: Node, src: &[u8]) -> Option<Redirect> {
             break;
         }
     }
-    let dest = node.child_by_field_name("destination")?;
+    let Some(dest) = node.child_by_field_name("destination") else {
+        // `>&-` / `2>&-` close a descriptor; anything else is unknown.
+        return if matches!(op, ">&-" | "<&-") {
+            Ok(None)
+        } else {
+            Err(Unparseable(format!("redirect `{op}` without a target")))
+        };
+    };
     let target = unquote(dest, src);
     let dup = matches!(op, ">&" | "<&")
         && (target == "-" || (!target.is_empty() && target.bytes().all(|b| b.is_ascii_digit())));
     if dup {
-        return None;
+        return Ok(None);
     }
-    let write = matches!(op, ">" | ">>" | "&>" | "&>>" | ">|" | ">&" | "<>");
-    Some(Redirect { target, write })
+    let write = !matches!(op, "<");
+    Ok(Some(Redirect { target, write }))
 }
 
 fn text<'a>(node: Node, src: &'a [u8]) -> &'a str {

@@ -114,3 +114,113 @@ fn empty_and_assignment_only() {
     assert!(parse_commands("").unwrap().is_empty());
     assert!(parse_commands("FOO=1").unwrap().is_empty());
 }
+
+// ---- fix round: fail-closed behaviour ----
+
+#[test]
+fn shell_dash_c_with_intervening_options_is_unparseable() {
+    for s in [
+        "bash --norc -c 'rm x'",
+        "bash -o pipefail -c 'rm x'",
+        "bash -O extglob -c 'rm x'",
+        "bash --rcfile f -c 'rm x'",
+        "bash +O x -c 'rm x'",
+        "/bin/bash -ec 'rm x'",
+        "bash --command 'rm x'",
+    ] {
+        assert!(parse_commands(s).is_err(), "{s}");
+    }
+    assert!(parse_commands("bash script.sh").is_ok());
+}
+
+#[test]
+fn declaration_unset_and_test_commands_are_reported() {
+    let c = parse_commands("declare -x A=1").unwrap();
+    assert_eq!(c[0].argv, ["declare", "-x", "A=1"]);
+    assert_eq!(
+        parse_commands("local x=1").unwrap()[0].argv,
+        ["local", "x=1"]
+    );
+    assert_eq!(parse_commands("unset X").unwrap()[0].argv, ["unset", "X"]);
+    assert_eq!(parse_commands("[[ -f x ]]").unwrap()[0].argv, ["[["]);
+    let c = parse_commands("export X=$(id)").unwrap();
+    assert_eq!(c[0].argv, ["export", "X=$(id)"]);
+    assert_eq!(argv0s(&c), ["export", "id"]);
+    let c = parse_commands("[[ $(whoami) == x ]]").unwrap();
+    assert_eq!(argv0s(&c), ["[[", "whoami"]);
+}
+
+#[test]
+fn zero_commands_from_nonempty_input_is_unparseable() {
+    assert!(parse_commands("((x=1))").is_err());
+    assert!(parse_commands("A=1; B=2").unwrap().is_empty());
+    assert!(parse_commands("# just a comment").unwrap().is_empty());
+}
+
+#[test]
+fn function_definition_redirect_is_a_write() {
+    let c = parse_commands("f() { :; } > out.txt").unwrap();
+    assert!(
+        c.iter()
+            .all(|s| s.redirects.iter().any(|r| r.target == "out.txt" && r.write))
+    );
+}
+
+#[test]
+fn heredoc_with_output_redirect_is_a_write() {
+    let c = parse_commands("cat <<EOF > o.txt\nx\nEOF\n").unwrap();
+    assert_eq!(
+        c[0].redirects,
+        vec![Redirect {
+            target: "o.txt".into(),
+            write: true
+        }]
+    );
+    let c = parse_commands("cat <<EOF | tee y\nx\nEOF\n").unwrap();
+    assert_eq!(argv0s(&c), ["cat", "tee"]);
+}
+
+#[test]
+fn write_redirect_without_command_is_unparseable() {
+    assert!(parse_commands("> f").is_err());
+    assert!(parse_commands("A=1 > f").is_err());
+}
+
+#[test]
+fn redirect_without_target_is_unparseable_except_fd_close() {
+    assert!(parse_commands("ls >&-").unwrap()[0].redirects.is_empty());
+    assert!(parse_commands("ls 2>&-").unwrap()[0].redirects.is_empty());
+}
+
+#[test]
+fn dynamic_command_names_are_unparseable() {
+    assert!(parse_commands("$CMD -rf /").is_err());
+    assert!(parse_commands("\"$(printf rm)\" x").is_err());
+    assert!(parse_commands("`echo rm` x").is_err());
+}
+
+#[test]
+fn eval_and_shell_c_are_found_through_wrappers() {
+    for s in [
+        "sudo bash -c 'x'",
+        "sudo -u root sh -c x",
+        "command eval x",
+        "builtin eval x",
+        "exec bash -c x",
+        "env -i sh -c x",
+        "env FOO=1 bash -c x",
+        "nohup bash -c x",
+        "time bash -c x",
+        "xargs -n1 sh -c x",
+        "sudo env FOO=1 source f",
+        "find . -exec sh -c x {} ;",
+    ] {
+        assert!(parse_commands(s).is_err(), "{s}");
+    }
+}
+
+#[test]
+fn trap_and_coproc_are_unparseable() {
+    assert!(parse_commands("trap 'rm x' EXIT").is_err());
+    assert!(parse_commands("coproc cat").is_err());
+}
