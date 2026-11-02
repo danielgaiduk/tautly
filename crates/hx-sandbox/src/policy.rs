@@ -6,15 +6,16 @@ use globset::{Glob, GlobMatcher};
 use serde::{Deserialize, Serialize};
 
 use crate::effect::Effect;
-use crate::protected::approval_reason;
+use crate::protected::{argv_word_reason, normalize, path_reason, redirect_reason};
 use crate::shell::{SimpleCommand, parse_commands};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "kebab-case")]
 pub enum Mode {
     /// Ask before any write or command.
     Ask,
     /// Allow in-workspace edits; ask before commands.
+    #[serde(alias = "auto_edit")]
     AutoEdit,
     /// Allow everything except deny rules, protected paths and unparseable commands.
     Yolo,
@@ -42,6 +43,11 @@ pub enum PolicyError {
     #[error("malformed rule {rule:?}: {why}")]
     MalformedRule { rule: String, why: String },
 }
+
+/// Tools whose effect is always `ReadOnly` and carries no paths, so a glob could never match.
+const READ_ONLY_TOOLS: &[&str] = &[
+    "read", "grep", "glob", "outline", "symbol", "refs", "recall",
+];
 
 #[derive(Debug)]
 struct Rule {
@@ -78,6 +84,11 @@ impl Rule {
         {
             return Err(bad("tool name must be non-empty alphanumeric"));
         }
+        if glob.is_some() && READ_ONLY_TOOLS.contains(&tool) {
+            return Err(bad(&format!(
+                "path-scoped rules are not supported for read-only tool {tool}; use bare `{tool}`"
+            )));
+        }
         Ok(Rule {
             text: text.to_string(),
             tool: tool.to_string(),
@@ -93,8 +104,12 @@ impl Rule {
 /// What a tool call touches, normalized for rule matching.
 enum Subjects {
     Commands(Vec<SimpleCommand>),
-    Unparseable { reason: String, raw: String },
-    Paths(Vec<String>),
+    Unparseable {
+        reason: String,
+        raw: String,
+    },
+    /// Raw path and its root-relative lexical normalization, if inside the root.
+    Paths(Vec<(String, Option<PathBuf>)>),
     None,
 }
 
@@ -152,7 +167,11 @@ impl Policy {
             Effect::Write { paths } => Subjects::Paths(
                 paths
                     .iter()
-                    .map(|p| p.to_string_lossy().into_owned())
+                    .map(|p| {
+                        let raw = p.to_string_lossy().into_owned();
+                        let rel = normalize(&self.root, &raw);
+                        (raw, rel)
+                    })
                     .collect(),
             ),
             Effect::Exec { argv } => match raw_cmd {
@@ -185,7 +204,10 @@ impl Policy {
                 }
                 Subjects::Unparseable { raw, .. } => r.matches_str(tool, raw) || r.glob.is_none(),
                 Subjects::Paths(ps) => {
-                    r.glob.is_none() || ps.iter().any(|p| r.matches_str(tool, &self.rel_str(p)))
+                    r.glob.is_none()
+                        || ps
+                            .iter()
+                            .any(|(raw, rel)| r.matches_str(tool, &subject_str(raw, rel)))
                 }
             };
             if hit {
@@ -197,11 +219,8 @@ impl Policy {
 
     fn needs_approval(&self, subjects: &Subjects) -> Option<String> {
         match subjects {
-            Subjects::Paths(ps) => ps.iter().find_map(|p| approval_reason(&self.root, p)),
-            Subjects::Commands(cmds) => cmds
-                .iter()
-                .flat_map(|c| c.redirects.iter().filter(|r| r.write))
-                .find_map(|r| approval_reason(&self.root, &r.target)),
+            Subjects::Paths(ps) => ps.iter().find_map(|(raw, _)| path_reason(&self.root, raw)),
+            Subjects::Commands(cmds) => cmds.iter().find_map(|c| self.command_reason(c)),
             Subjects::Unparseable { reason, .. } => Some(format!("unparseable command: {reason}")),
             Subjects::None => None,
         }
@@ -213,7 +232,12 @@ impl Policy {
             Subjects::Commands(cmds) => {
                 !cmds.is_empty() && cmds.iter().all(|c| any(&c.argv.join(" ")))
             }
-            Subjects::Paths(ps) => !ps.is_empty() && ps.iter().all(|p| any(&self.rel_str(p))),
+            Subjects::Paths(ps) => {
+                !ps.is_empty()
+                    && ps
+                        .iter()
+                        .all(|(_, rel)| rel.as_ref().is_some_and(|r| any(&path_str(r))))
+            }
             Subjects::Unparseable { .. } | Subjects::None => false,
         }
     }
@@ -234,10 +258,55 @@ impl Policy {
         }
     }
 
-    /// Path as matched by rules: relative to root when it lies inside it.
-    fn rel_str(&self, p: &str) -> String {
-        Path::new(p)
-            .strip_prefix(&self.root)
-            .map_or_else(|_| p.to_string(), |r| r.to_string_lossy().into_owned())
+    /// Approval needed for protected paths touched by one command: write
+    /// redirects, any non-flag argv word, and git config/`-c` invocations.
+    fn command_reason(&self, c: &SimpleCommand) -> Option<String> {
+        c.redirects
+            .iter()
+            .filter(|r| r.write)
+            .find_map(|r| redirect_reason(&self.root, &r.target))
+            .or_else(|| {
+                c.argv
+                    .iter()
+                    .skip(1)
+                    .find_map(|w| argv_word_reason(&self.root, w))
+            })
+            .or_else(|| git_reason(&c.argv))
     }
+}
+
+fn path_str(rel: &Path) -> String {
+    rel.to_string_lossy().into_owned()
+}
+
+/// The string path rules match: normalized when possible, else the raw path.
+fn subject_str(raw: &str, rel: &Option<PathBuf>) -> String {
+    rel.as_deref().map_or_else(|| raw.to_string(), path_str)
+}
+
+/// `git config` that may set values, or any `git -c`, can plant hooks/aliases.
+fn git_reason(argv: &[String]) -> Option<String> {
+    let i = argv
+        .iter()
+        .position(|w| w == "git" || w.ends_with("/git"))?;
+    let mut args = argv[i + 1..].iter();
+    while let Some(a) = args.next() {
+        if a == "-C" {
+            args.next();
+        } else if a == "-c" || (a.starts_with("-c") && !a.starts_with("--")) {
+            return Some("git -c overrides configuration".into());
+        } else if !a.starts_with('-') {
+            if a != "config" {
+                return None;
+            }
+            const READ: &[&str] = &["--get", "--get-all", "--get-regexp", "--list", "-l"];
+            let rest: Vec<&String> = args.collect();
+            return if rest.iter().any(|r| READ.contains(&r.as_str())) {
+                None
+            } else {
+                Some("git config may modify configuration".into())
+            };
+        }
+    }
+    None
 }
