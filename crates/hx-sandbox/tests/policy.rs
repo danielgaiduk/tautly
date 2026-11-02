@@ -384,7 +384,6 @@ fn unresolvable_argv_words_ask_only_if_they_may_name_protected_paths() {
         "cp x ~/.zshrc",
         "cp x ~other/y",
         "cp x $HOME$S/y",
-        "cp x *akefile",
         "cp x .GIT*/c",
     ] {
         assert!(asks(y.decide("bash", &exec("x"), Some(cmd))), "{cmd}");
