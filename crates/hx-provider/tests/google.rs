@@ -174,7 +174,7 @@ fn wire_basics_and_content_mapping() {
         w["contents"],
         json!([
             {"role":"user","parts":[{"text":"hello"},{"inlineData":{"mimeType":"image/png","data":"AQID"}}]},
-            {"role":"model","parts":[{"text":"calling"},{"functionCall":{"name":"read_file","args":{"path":"a"}}}]},
+            {"role":"model","parts":[{"text":"calling","thoughtSignature":"s"},{"functionCall":{"name":"read_file","args":{"path":"a"}}}]},
             {"role":"user","parts":[
                 {"functionResponse":{"name":"read_file","response":{"content":"file body"}}},
                 {"text":"here"},
@@ -444,4 +444,127 @@ async fn system_images_are_rejected_without_sending_a_request() {
     let r = run_req(&server, req).await;
     assert!(matches!(r[0], Err(ProviderError::InvalidRequest(_))));
     assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+#[test]
+fn tool_schemas_are_sanitized_recursively() {
+    let mut req = base_req();
+    req.tools = vec![ToolSpec {
+        name: "t".into(),
+        description: "d".into(),
+        schema: json!({
+            "$schema": "http://json-schema.org/draft-07/schema#",
+            "type": "object",
+            "additionalProperties": false,
+            "$defs": {"x": {"type": "string"}},
+            "properties": {
+                "opts": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {"n": {"type": "integer", "default": 3, "examples": [1]}},
+                },
+                "list": {"type": "array", "items": {"type": "object", "additionalProperties": false, "$comment": "c"}},
+                // A property that happens to share a stripped keyword's name is kept.
+                "examples": {"type": "string"},
+            },
+        }),
+    }];
+    let w = to_wire(&req);
+    assert_eq!(
+        w["tools"][0]["functionDeclarations"][0]["parameters"],
+        json!({
+            "type": "object",
+            "properties": {
+                "opts": {
+                    "type": "object",
+                    "properties": {"n": {"type": "integer", "default": 3}},
+                },
+                "list": {"type": "array", "items": {"type": "object"}},
+                "examples": {"type": "string"},
+            },
+        })
+    );
+}
+
+#[test]
+fn tool_result_error_uses_error_key() {
+    let req = req_of(vec![
+        msg(
+            Role::Assistant,
+            vec![Content::ToolUse {
+                id: "c0".into(),
+                name: "read_file".into(),
+                input: json!({}),
+            }],
+        ),
+        msg(
+            Role::User,
+            vec![Content::ToolResult {
+                id: "c0".into(),
+                output: "boom".into(),
+                is_error: true,
+            }],
+        ),
+    ]);
+    let w = to_wire(&req);
+    assert_eq!(
+        w["contents"][1]["parts"][0],
+        json!({"functionResponse":{"name":"read_file","response":{"error":"boom"}}})
+    );
+}
+
+#[test]
+fn reasoning_signature_attaches_to_following_part() {
+    let req = req_of(vec![msg(
+        Role::Assistant,
+        vec![
+            Content::Reasoning {
+                text: "t".into(),
+                signature: Some("sigA".into()),
+            },
+            Content::ToolUse {
+                id: "c0".into(),
+                name: "read_file".into(),
+                input: json!({"path":"a"}),
+            },
+            Content::Reasoning {
+                text: "t".into(),
+                signature: Some("sigB".into()),
+            },
+            text("done"),
+            Content::Reasoning {
+                text: "unsigned".into(),
+                signature: None,
+            },
+            text("tail"),
+        ],
+    )]);
+    let w = to_wire(&req);
+    assert_eq!(
+        w["contents"][0]["parts"],
+        json!([
+            {"functionCall":{"name":"read_file","args":{"path":"a"}},"thoughtSignature":"sigA"},
+            {"text":"done","thoughtSignature":"sigB"},
+            {"text":"tail"},
+        ])
+    );
+}
+
+#[tokio::test]
+async fn thought_signature_emits_event_before_its_part() {
+    let server = serve(sse(fixture("thought_signature.sse"))).await;
+    let evs = ok(run(&server).await);
+    assert_eq!(
+        &evs[..4],
+        &[
+            ProviderEvent::ReasoningSignature("sigA".into()),
+            ProviderEvent::ToolCall {
+                id: "call_0".into(),
+                name: "read_file".into(),
+                input_json: "{\"path\":\"a.rs\"}".into()
+            },
+            ProviderEvent::ReasoningSignature("sigB".into()),
+            ProviderEvent::TextDelta("done".into()),
+        ]
+    );
 }

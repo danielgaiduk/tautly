@@ -64,6 +64,47 @@ fn effort_budget(e: &Effort) -> u32 {
     }
 }
 
+/// Keywords Gemini's function-declaration schema subset rejects.
+const UNSUPPORTED_SCHEMA_KEYS: [&str; 7] = [
+    "$schema",
+    "additionalProperties",
+    "$defs",
+    "definitions",
+    "$id",
+    "$comment",
+    "examples",
+];
+
+/// Recursively drop schema keywords Gemini rejects. Keys under `properties` are property
+/// names, not keywords, so they are kept.
+fn sanitize_schema(v: &Value) -> Value {
+    match v {
+        Value::Object(o) => Value::Object(
+            o.iter()
+                .filter(|(k, _)| !UNSUPPORTED_SCHEMA_KEYS.contains(&k.as_str()))
+                .map(|(k, v)| {
+                    let v = if k == "properties" {
+                        match v {
+                            Value::Object(props) => Value::Object(
+                                props
+                                    .iter()
+                                    .map(|(n, p)| (n.clone(), sanitize_schema(p)))
+                                    .collect(),
+                            ),
+                            other => other.clone(),
+                        }
+                    } else {
+                        sanitize_schema(v)
+                    };
+                    (k.clone(), v)
+                })
+                .collect(),
+        ),
+        Value::Array(a) => Value::Array(a.iter().map(sanitize_schema).collect()),
+        other => other.clone(),
+    }
+}
+
 /// Build the `streamGenerateContent` request body.
 pub fn to_wire(req: &CanonicalRequest) -> Value {
     let system: Vec<Value> = req
@@ -82,22 +123,40 @@ pub fn to_wire(req: &CanonicalRequest) -> Value {
     for m in &req.messages {
         let mut responses = Vec::new();
         let mut parts = Vec::new();
+        // Signature of the reasoning block just seen; it belongs to the next text/call part.
+        let mut signature: Option<&str> = None;
+        let sign = |mut part: Value, sig: &mut Option<&str>| {
+            if let Some(s) = sig.take() {
+                part["thoughtSignature"] = s.into();
+            }
+            part
+        };
         for c in &m.content {
             match c {
-                Content::Text(t) => parts.push(json!({"text": t})),
+                Content::Text(t) => parts.push(sign(json!({"text": t}), &mut signature)),
                 Content::Image { media_type, data } => parts.push(
                     json!({"inlineData": {"mimeType": media_type, "data": STANDARD.encode(data)}}),
                 ),
                 Content::ToolUse { id, name, input } => {
                     names.insert(id, name);
-                    parts.push(json!({"functionCall": {"name": name, "args": input}}));
+                    parts.push(sign(
+                        json!({"functionCall": {"name": name, "args": input}}),
+                        &mut signature,
+                    ));
                 }
-                Content::ToolResult { id, output, .. } => {
+                Content::ToolResult {
+                    id,
+                    output,
+                    is_error,
+                } => {
                     let name = names.get(id.as_str()).copied().unwrap_or(id.as_str());
-                    responses.push(json!({"functionResponse": {"name": name, "response": {"content": output}}}));
+                    let key = if *is_error { "error" } else { "content" };
+                    responses.push(
+                        json!({"functionResponse": {"name": name, "response": {key: output}}}),
+                    );
                 }
-                // Thought signatures are not modelled; thoughts are not sent back.
-                Content::Reasoning { .. } => {}
+                // Thought text is not sent back, only its signature.
+                Content::Reasoning { signature: sig, .. } => signature = sig.as_deref(),
             }
         }
         // Function responses must directly follow the calls they answer, so they go first.
@@ -130,7 +189,7 @@ pub fn to_wire(req: &CanonicalRequest) -> Value {
         let decls: Vec<Value> = req
             .tools
             .iter()
-            .map(|t| json!({"name": t.name, "description": t.description, "parameters": t.schema}))
+            .map(|t| json!({"name": t.name, "description": t.description, "parameters": sanitize_schema(&t.schema)}))
             .collect();
         body["tools"] = json!([{"functionDeclarations": decls}]);
     }
@@ -235,6 +294,13 @@ impl StreamState {
         }
         let cand = &v["candidates"][0];
         for part in cand["content"]["parts"].as_array().into_iter().flatten() {
+            let sig = part["thoughtSignature"].as_str().filter(|s| !s.is_empty());
+            let is_thought = part["thought"] == true;
+            // A signature precedes the call or answer text it belongs to; on a thought part it
+            // follows the thought text, which is the block it signs.
+            if let Some(sig) = sig.filter(|_| !is_thought) {
+                out.push(ProviderEvent::ReasoningSignature(sig.into()));
+            }
             if let Some(call) = part["functionCall"].as_object() {
                 self.has_calls = true;
                 let id = format!("call_{}", self.next_call.fetch_add(1, Ordering::Relaxed));
@@ -249,11 +315,14 @@ impl StreamState {
                     input_json: args.to_string(),
                 });
             } else if let Some(t) = part["text"].as_str() {
-                out.push(if part["thought"] == true {
+                out.push(if is_thought {
                     ProviderEvent::ReasoningDelta(t.into())
                 } else {
                     ProviderEvent::TextDelta(t.into())
                 });
+            }
+            if let Some(sig) = sig.filter(|_| is_thought) {
+                out.push(ProviderEvent::ReasoningSignature(sig.into()));
             }
         }
         if let Some(f) = cand["finishReason"].as_str() {

@@ -1,0 +1,4 @@
+data: {"candidates":[{"content":{"role":"model","parts":[{"functionCall":{"name":"read_file","args":{"path":"a.rs"}},"thoughtSignature":"sigA"}]},"index":0}]}
+
+data: {"candidates":[{"content":{"role":"model","parts":[{"text":"done","thoughtSignature":"sigB"}]},"finishReason":"STOP","index":0}],"usageMetadata":{"promptTokenCount":5,"candidatesTokenCount":3,"totalTokenCount":8}}
+
