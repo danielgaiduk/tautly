@@ -481,3 +481,27 @@ async fn system_images_are_rejected_without_sending_a_request() {
     assert!(matches!(r[0], Err(ProviderError::InvalidRequest(_))));
     assert!(server.received_requests().await.unwrap().is_empty());
 }
+
+#[tokio::test]
+async fn tool_calls_without_index_split_on_new_id() {
+    let server = serve(sse(fixture("tool_calls_no_index.sse"))).await;
+    let evs = ok(run(&server).await);
+    assert_eq!(
+        evs,
+        vec![
+            ProviderEvent::ToolCall {
+                id: "call_x".into(),
+                name: "read_file".into(),
+                input_json: "{\"path\":\"a.rs\"}".into()
+            },
+            ProviderEvent::ToolCall {
+                id: "call_y".into(),
+                name: "grep".into(),
+                input_json: "{\"pattern\":\"fn\"}".into()
+            },
+            ProviderEvent::Done {
+                stop: StopReason::ToolUse
+            },
+        ]
+    );
+}

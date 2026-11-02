@@ -475,3 +475,23 @@ fn image_content_serde_round_trips_as_base64() {
     assert_eq!(v, json!({"image":{"media_type":"image/png","data":"AQID"}}));
     assert_eq!(serde_json::from_value::<Content>(v).unwrap(), c);
 }
+
+#[test]
+fn assistant_image_content_is_skipped() {
+    let mut req = base_req();
+    req.messages = vec![Message {
+        role: Role::Assistant,
+        content: vec![
+            Content::Text("ok".into()),
+            Content::Image {
+                media_type: "image/png".into(),
+                data: vec![1],
+            },
+        ],
+    }];
+    let w = to_wire(&req);
+    assert_eq!(
+        w["messages"][0]["content"],
+        json!([{"type":"text","text":"ok"}])
+    );
+}

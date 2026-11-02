@@ -1,0 +1,12 @@
+data: {"id":"n1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"id":"call_x","type":"function","function":{"name":"read_file","arguments":"{\"path\":"}}]},"finish_reason":null}]}
+
+data: {"id":"n1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"tool_calls":[{"function":{"arguments":"\"a.rs\"}"}}]},"finish_reason":null}]}
+
+data: {"id":"n1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"tool_calls":[{"id":"call_y","type":"function","function":{"name":"grep","arguments":"{\"pattern\":"}}]},"finish_reason":null}]}
+
+data: {"id":"n1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"tool_calls":[{"function":{"arguments":"\"fn\"}"}}]},"finish_reason":null}]}
+
+data: {"id":"n1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}
+
+data: [DONE]
+

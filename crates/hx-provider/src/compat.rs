@@ -232,6 +232,8 @@ struct Call {
 #[derive(Default)]
 struct StreamState {
     calls: BTreeMap<u64, Call>,
+    /// Key of the call the latest delta belongs to (used when deltas carry no `index`).
+    current: Option<u64>,
     has_calls: bool,
     finish: Option<String>,
     usage: Option<RawUsage>,
@@ -287,16 +289,25 @@ impl StreamState {
         if let Some(t) = delta["content"].as_str().filter(|t| !t.is_empty()) {
             out.push(ProviderEvent::TextDelta(t.into()));
         }
-        for (i, tc) in delta["tool_calls"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .enumerate()
-        {
-            let call = self
-                .calls
-                .entry(tc["index"].as_u64().unwrap_or(i as u64))
-                .or_default();
+        for tc in delta["tool_calls"].as_array().into_iter().flatten() {
+            let id = tc["id"].as_str().filter(|s| !s.is_empty());
+            let key = match tc["index"].as_u64() {
+                Some(i) => i,
+                // Without an index, a delta with a new id starts a new call; anything else
+                // continues the current one.
+                None => match self.current {
+                    Some(k)
+                        if id.is_none_or(|id| {
+                            self.calls[&k].id.is_empty() || self.calls[&k].id == id
+                        }) =>
+                    {
+                        k
+                    }
+                    _ => self.calls.keys().next_back().map_or(0, |k| k + 1),
+                },
+            };
+            self.current = Some(key);
+            let call = self.calls.entry(key).or_default();
             if let Some(id) = tc["id"].as_str().filter(|s| !s.is_empty()) {
                 call.id = id.into();
             }

@@ -117,7 +117,13 @@ pub fn to_wire(req: &CanonicalRequest) -> Value {
         .messages
         .iter()
         .map(|m| {
-            let mut blocks: Vec<Value> = m.content.iter().filter_map(content_to_wire).collect();
+            let mut blocks: Vec<Value> = m
+                .content
+                .iter()
+                // The API accepts images in user messages only.
+                .filter(|c| !(m.role == Role::Assistant && matches!(c, Content::Image { .. })))
+                .filter_map(content_to_wire)
+                .collect();
             // tool_result blocks must precede any other content in a user message.
             blocks.sort_by_key(|b| b["type"] != "tool_result");
             json!({"role": if m.role == Role::Assistant { "assistant" } else { "user" }, "content": blocks})
