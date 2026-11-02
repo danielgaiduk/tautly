@@ -1,0 +1,8 @@
+data: {"id":"r1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"reasoning_content":"Hmm."},"finish_reason":null}]}
+
+data: {"id":"r1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"Ok"},"finish_reason":null}]}
+
+data: {"id":"r1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"length"}]}
+
+data: [DONE]
+

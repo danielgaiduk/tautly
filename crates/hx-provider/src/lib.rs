@@ -4,8 +4,10 @@ pub mod anthropic;
 pub mod canonical;
 pub mod capabilities;
 pub mod catalog;
+pub mod compat;
 pub mod cost;
 pub mod error;
+pub mod google;
 pub mod openai;
 pub(crate) mod util;
 
