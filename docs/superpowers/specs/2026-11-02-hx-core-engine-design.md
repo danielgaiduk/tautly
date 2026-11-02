@@ -26,7 +26,7 @@ An open-source, provider-neutral agentic coding harness that becomes the go-to t
 
 ### 1.4 Why this can win (from market research, Nov 2026)
 - Codex CLI is fast (Rust) but OpenAI-centric; OpenCode is provider-neutral but has documented memory runaways (10–15 GB+), orphaned processes and version-to-version breakage; pi is minimal and transparent but has no sandbox; Claude Code is closed and single-vendor.
-- Gaps this design targets: bounded memory and instant start, flicker-free TUI, sandbox covering *all* tools, transparent context with constraints that survive compaction, model-adaptive and measured edit tools, live cost/quota with hard budgets, open session format, standards interop (AGENTS.md, SKILL.md, MCP, ACP).
+- Gaps this design targets: lowest tokens per solved task (code index, diff re-reads, context GC, output filters, code-anchored memory, cheap side-model routing), bounded memory and instant start, flicker-free TUI, sandbox covering *all* tools, transparent context with constraints that survive compaction, model-adaptive and measured edit tools, live cost/quota with hard budgets, open session format, standards interop (AGENTS.md, SKILL.md, MCP, ACP).
 
 ### 1.5 Program decomposition
 | # | Sub-project | Covered here? |
@@ -42,6 +42,7 @@ Post-v1, out of scope for all of the above: multi-agent orchestration, determini
 ### 1.6 Success criteria for this sub-project
 - Cold start to ready < 50 ms; idle RSS < 30 MB; RSS flat (±10%) across a 4-hour simulated session.
 - All four test layers green; performance gates in CI pass.
+- Tokens per solved task on the eval starter set is measured, published, and protected by a CI regression gate (9.1).
 - Usable as a daily driver on a real repository with each of the four adapters, via `hx -p` and the interactive stub (2.3).
 
 ## 2. Architecture
@@ -53,12 +54,15 @@ hx-cli        binary: arg parsing, selects TUI or headless mode
  ├─ hx-rpc    JSON-RPC 2.0 over stdio (headless; later ACP bridge)
  └─ hx-core   the engine — no terminal I/O, no global state
      ├─ hx-provider   Provider trait + anthropic / openai / google / openai-compat
-     ├─ hx-tools      Tool trait + read, write, edit, bash, grep, glob, web_fetch
-     ├─ hx-context    context assembly, token budget, pinning, working state, compaction
+     ├─ hx-tools      Tool trait + read, write, edit, bash, grep, glob, outline, symbol, refs,
+     │                web_fetch, recall, remember, pin, state; output filters
+     ├─ hx-context    context assembly, token budget, pinning, working state, compaction, context GC
+     ├─ hx-memory     code-anchored project memory, episodic memory, recall search
+     ├─ hx-index      tree-sitter symbol/reference index (SQLite), incremental
      ├─ hx-session    append-only session log, resume, fork, undo
      └─ hx-sandbox    Sandbox trait; this sub-project ships a passthrough-with-policy stub
 ```
-Dependencies only point downward. Each crate is independently testable.
+Dependencies only point downward (`hx-tools → hx-memory → {hx-index, hx-session}`, `hx-index → hx-sandbox`, `hx-tools → hx-sandbox`, `hx-context → hx-provider`). Each crate is independently testable.
 
 ### 2.2 Rules
 - **Single entry point:** `hx-core` exposes an `Engine` handle. Clients send `Command`s and receive a stream of `Event`s. TUI and RPC are both plain consumers, guaranteeing identical behavior.
@@ -84,18 +88,18 @@ Every step is appended to the session log before its effects are surfaced, so an
 
 ### 3.2 Events (engine → client)
 Typed, serde-serializable, versioned:
-`TurnStarted`, `TextDelta`, `ReasoningDelta`, `ToolCallProposed`, `ToolApprovalRequested`, `ToolStarted`, `ToolOutputDelta`, `ToolFinished`, `Usage{tokens_in, tokens_out, cache_read, cache_write, cost_usd, quota?}`, `ContextStatus{used, budget, breakdown}`, `Compacted{removed_turns, summary}`, `TurnFinished{reason}`, `Error{kind, message, retryable, hint}`.
+`TurnStarted`, `TextDelta`, `ReasoningDelta`, `ToolCallProposed`, `ToolApprovalRequested`, `ToolStarted`, `ToolOutputDelta`, `ToolFinished`, `Usage{role, tokens_in, tokens_out, cache_read, cache_write, cost_usd, quota?}` (`role` ∈ `main | side`), `ContextStatus{used, budget, breakdown}`, `Compacted{removed_turns, summary}`, `ContextCollected{elided_results, tokens_freed}`, `MemoryProposed{proposal_id, change}` (`change` = an entry to upsert and/or entry ids to delete), `SessionChanged{session_id}`, `TurnFinished{reason}`, `Error{kind, message, retryable, hint}`.
 
 `TurnFinished.reason` ∈ `completed | cancelled | budget | max_turns | timeout | error`.
 
 ### 3.3 Commands (client → engine)
-`SendMessage`, `Approve`, `Deny`, `Cancel`, `SetBudget`, `Compact`, `Uncompact`, `Pin`, `Unpin`, `Fork`, `Shutdown`.
+`SendMessage`, `Approve`, `Deny`, `Cancel`, `SetBudget`, `Compact`, `Uncompact`, `Pin`, `Unpin`, `ApproveMemory{proposal_id}`, `RejectMemory{proposal_id}`, `ConsolidateMemory`, `Fork`, `Shutdown`.
 
 ### 3.4 Headless protocol (`hx-rpc`)
 - JSON-RPC 2.0, newline-delimited JSON over stdio. Commands are methods; events are notifications.
 - `initialize` handshake negotiates protocol version. Event and field additions are minor-version and backwards compatible; any removal or semantic change is a major-version bump.
 - One-shot mode: `hx -p "<prompt>" --output json|text` sends one message, streams events to stdout, exits with a code mapped from `TurnFinished.reason` (0 completed, 1 error, 2 budget/max_turns/timeout, 130 cancelled).
-- In headless mode `ask` resolves to `deny` unless `--approve <mode>` is given (`auto-edit` or `yolo`). Headless never blocks on input.
+- In headless mode `ask` resolves to `deny` unless `--approve <mode>` is given (`auto-edit` or `yolo`), and memory proposals are rejected unless `--approve-memory` is given. Headless never blocks on input.
 
 ### 3.5 Stream reliability
 - Provider errors are classified retryable (429, 5xx, network) or fatal.
@@ -151,12 +155,14 @@ trait Tool: Send + Sync {
 ### 5.2 Tool set (v1)
 | Tool | Behavior |
 |---|---|
-| `read` | Line ranges; emits hashline anchors when the active edit format is `hashline`; images for capable models |
+| `read` | Line ranges; emits hashline anchors when the active edit format is `hashline`; images for capable models; re-reads return `unchanged`/diff (7.2) unless `full: true` |
 | `edit` | Per-model edit format (5.3) |
 | `write` | Create/overwrite a file |
-| `bash` | Runs via sandbox in its own process group; default timeout 120 s; output capped at 30 KB (head + tail kept), full output spilled to a temp file referenced in the result |
+| `bash` | Runs via sandbox in its own process group; default timeout 120 s; output > 2 KB passed through output filters (7.3), else/fallback capped at 30 KB (head + tail kept); full output spilled to a temp file referenced in the result |
 | `grep`, `glob` | ripgrep crates (`grep-searcher`, `ignore`); `.gitignore`-aware |
-| `web_fetch` | HTML → markdown; subject to sandbox network policy |
+| `outline`, `symbol`, `refs` | Code-index queries (7.1) |
+| `web_fetch` | HTML → markdown; subject to sandbox network policy; optional `question` arg answered by the side model (7.5) |
+| `recall`, `remember` | Memory search and memory proposals (7.4) |
 | `pin`, `state` | Context-management tools (section 6) |
 
 ### 5.3 Edit formats
@@ -185,7 +191,7 @@ Rules are evaluated in `hx-core`; OS-level enforcement is sub-project 2.
 ### 6.1 Block model
 Requests are assembled in fixed order:
 ```
-[stable]   system prompt · tool schemas · AGENTS.md
+[stable]   system prompt · tool schemas · AGENTS.md · memory index (7.4)
 [pinned]   constraints and facts that survive compaction
 [state]    structured working state
 [history]  recent turns, verbatim
@@ -205,6 +211,7 @@ Structured record: task, plan steps with status, files read/edited with content 
 - Effect: oldest history turns replaced by a summary generated by the active model; pinned and state blocks preserved verbatim; files list lets the model re-read selectively.
 - Reversible: originals remain in the session log; `Uncompact` restores them if they fit the window.
 - Context overflow from the provider triggers one compaction and one retry.
+- Compaction summaries are generated by the side model (7.5).
 
 ### 6.5 Session store
 - Append-only JSONL per session: `~/.local/share/hx/sessions/<project-hash>/<session-id>.jsonl`. Large blobs (file contents, tool outputs) stored content-addressed in a sibling `blobs/` directory and referenced by hash.
@@ -213,7 +220,46 @@ Structured record: task, plan steps with status, files read/edited with content 
 - Operations: `hx --continue`, `hx --resume <id>`, `/fork` (new log referencing parent at an event offset), `hx sessions list|show|export`.
 - Format documented and versioned (`schema_version` in the header record).
 
-## 7. Error handling
+## 7. Token efficiency and memory
+
+### 7.1 Code index (`hx-index`)
+- tree-sitter extraction of symbols (functions, types, methods, constants: name, kind, parent, signature, line range, content hash) and name-based references, for the syntax-check language set (5.4).
+- SQLite at `~/.local/share/hx/index/<project-hash>.db`: `files(path, hash, mtime, size, lang)`, `symbols(file, name, kind, parent, start_line, end_line, signature, hash)`, `refs(file, line, name)`. WAL mode.
+- Incremental: on engine start a background task re-parses files whose size or mtime changed; it never blocks start-up. Each successful edit re-indexes that file synchronously before the tool result is returned.
+- Reads files only through `Sandbox`; honors `.gitignore`.
+- Until the initial build completes, `outline`/`symbol`/`refs` fall back to tree-sitter on demand (outline) or grep (symbol, refs) and say so in the result.
+- Tools: `outline(path)` → symbols with signatures and line ranges, no bodies; `symbol(name, kind?)` → source of the definition with location (several matches → list of locations, no bodies); `refs(name)` → locations with one line of context. `refs` is name-based, and its description says so.
+- Targets: initial index of a 10,000-file repository < 10 s; single-file reindex < 50 ms.
+
+### 7.2 Diff-on-re-read and context GC
+- The read tracker stores the last content returned per path (blob reference). A re-read of the same range returns `unchanged since turn N` if identical; if fewer than 50% of lines changed it returns a line-numbered unified diff; otherwise the full content. `full: true` forces full content.
+- A tool result is *superseded* when: it is a `read` of a path later edited or re-read; it is a `bash` result of a command string later re-run; it is a failed `edit` on a path later edited successfully.
+- Superseded results are replaced by `[elided: superseded at turn N]`, keeping the tool-call id and pairing.
+- Collection runs only at turn start and only when elidable tokens ≥ max(2,000, 5% of the context window), so the cache prefix breaks at most once per batch. Emits `ContextCollected`; elisions are logged in the session and restored by `Uncompact`.
+
+### 7.3 Output filters
+- Parsers for: `cargo test|build|check|clippy`, `pytest`, `jest`/`vitest`, `go test`, `tsc`, `eslint`. Detected from the parsed command (5.5 parser).
+- Applied when raw output exceeds 2 KB. Result: counts (passed/failed/errors/warnings) plus each failure or diagnostic (name, `file:line`, message, ≤ 20 lines each), plus the path of the spilled full output.
+- Parse failure falls back to the 30 KB head + tail cap. `raw: true` disables filtering.
+
+### 7.4 Memory (`hx-memory`)
+- **Project memory:** one markdown file per entry in `.hx/memory/<id>.md` (shareable via git). Frontmatter: `id`, `title`, `kind` (`convention | fact | gotcha | command`), `anchors: [{path, symbol?, hash}]`, `created`, `verified`. Body ≤ 300 tokens.
+- **Memory index:** one line per entry (`- [kind] title` plus ` [stale]` when applicable), capped at 500 tokens (oldest unverified entries dropped from the index first, never deleted), in the stable block after AGENTS.md.
+- **Staleness:** at session start and after each edit, every anchor hash is compared with the code index (symbol hash when `symbol` is set, file hash otherwise). Mismatch marks the entry stale; `recall` returns stale entries with a warning; an entry whose anchors are re-confirmed by the model through `remember` gets `verified` updated.
+- **Episodic memory:** `~/.local/share/hx/memory/<project-hash>/episodes/<session-id>.md` (private, never shared). Written by the side model at session end and at each compaction: task, outcome, what failed, key files. No approval needed.
+- **`recall(query)`:** BM25 over titles and bodies of project entries and episodes; returns the top 5, capped at 2,000 tokens.
+- **`remember(entry)`:** proposes a new or updated entry; the engine emits `MemoryProposed` and writes the file only after `ApproveMemory`. The system prompt instructs the model to call `remember` when the user corrects it.
+- **Consolidation:** `hx memory consolidate`, and offered automatically when the full index would exceed 500 tokens. The side model proposes merges and deletions, shown as a diff; applied only on approval.
+
+### 7.5 Side-model routing
+- Config `[routing] side_model = "<model id>"`. Default: the catalog model with `tier = "small"` from the main model's provider; if none, the main model.
+- Used for: compaction summaries, episodes, memory consolidation, and `web_fetch` with a `question` (returns the answer, ≤ 1,000 tokens, plus the source URL).
+- Side-model usage is reported with `Usage.role = side` and counted in budgets and the ledger.
+
+### 7.6 Measurement
+- `hx eval` reports tokens per solved task (total input + output tokens across main and side roles, divided by solved tasks) and cache hit ratio (`cache_read / (input + cache_read)`).
+
+## 8. Error handling
 
 | Class | Behavior |
 |---|---|
@@ -228,24 +274,26 @@ Structured record: task, plan steps with status, files read/edited with content 
 - Cancellation: first Ctrl-C cancels the turn and kills child process groups within 200 ms; second Ctrl-C exits.
 - Shutdown: all spawned process groups are terminated; verified by test.
 
-## 8. Testing
+## 9. Testing
 
 1. **Unit** — edit matching, atomic write, command parser, permission rules, context assembly, cost math. `proptest` for edit application and budget accounting.
 2. **Adapter** — recorded real provider streams replayed through each adapter. Nightly live smoke suite with real keys (not a merge gate).
 3. **Engine** — `MockProvider` with scripted responses: tool calls, errors, stream drops, oversized outputs. Covers loop, approvals, cancellation, budgets, compaction, crash-resume.
 4. **Protocol** — `hx -p` golden-file tests over the JSON event stream.
 
-### 8.1 CI performance gates (merge-blocking)
+### 9.1 CI performance gates (merge-blocking)
 - Cold start < 50 ms (`hyperfine`, release build, `hx --version` and `hx -p` against `MockProvider` to first event).
 - Idle RSS < 30 MB.
 - 4-hour simulated session (mock provider, accelerated clock): RSS within ±10% of the 10-minute mark.
 - 100 MB tool output: RSS bounded, output spilled to disk.
 - Release binary size tracked and reported (not gated).
+- Index build of a generated 10,000-file repository < 10 s; single-file reindex < 50 ms.
+- Token regression: tokens per solved task on the starter set (scripted mock replay, deterministic) must not exceed the committed baseline by more than 10%.
 
-### 8.2 Eval runner (interface for sub-project 5)
-- `hx eval --tasks <dir> --model <id> [--edit-format <fmt>]` runs tasks headlessly in temporary git worktrees and reports pass rate, cost, tokens, and edit-failure rate as JSON.
+### 9.2 Eval runner (interface for sub-project 5)
+- `hx eval --tasks <dir> --model <id> [--edit-format <fmt>]` runs tasks headlessly in temporary git worktrees and reports pass rate, cost, tokens, tokens per solved task, cache hit ratio, and edit-failure rate as JSON.
 - Ships with a starter set of ~50 small repository tasks (each: setup script, prompt, verification command).
 - Terminal-Bench adapter and the published benchmark program are sub-project 5.
 
-## 9. Out of scope (this sub-project)
-Real OS sandbox enforcement; full TUI; MCP, hooks, skills, ACP; multi-agent/subagents; LSP diagnostics; deterministic replay; Windows; team policy; plugin marketplace.
+## 10. Out of scope (this sub-project)
+Real OS sandbox enforcement; full TUI; semantic (type-aware) references; embedding-based memory search; learned skills; speculative prefetch; pre-run cost estimates; MCP, hooks, skills, ACP; multi-agent/subagents; LSP diagnostics; deterministic replay; Windows; team policy; plugin marketplace.

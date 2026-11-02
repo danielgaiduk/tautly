@@ -2,11 +2,11 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Build sub-project 1 of `hx`: a Rust, library-first agent engine with four provider adapters, a sandbox-gated tool set with model-adaptive edits, structured context with state-preserving compaction, an append-only session store, a JSON-RPC headless mode, a line-mode interactive stub, CI performance gates and an eval runner.
+**Goal:** Build sub-project 1 of `hx`: a Rust, library-first agent engine with four provider adapters, a sandbox-gated tool set with model-adaptive edits, a code index, output filters, structured context with diff re-reads, context GC and state-preserving compaction, code-anchored memory, cheap side-model routing, an append-only session store, a JSON-RPC headless mode, a line-mode interactive stub, CI performance gates and an eval runner.
 
 **Architecture:** Cargo workspace of single-purpose crates with downward-only dependencies. `hx-core::Engine` accepts `Command`s and emits a bounded stream of `Event`s; the REPL stub and the JSON-RPC server are both thin consumers. All file and process access from tools goes through `hx-sandbox::Sandbox`.
 
-**Tech Stack:** Rust (edition 2024, MSRV 1.85), tokio, tokio-util (`CancellationToken`), futures, serde/serde_json, toml, thiserror/anyhow, reqwest (rustls, `stream`), eventsource-stream, blake3, tempfile, ignore + grep-searcher + grep-regex, tree-sitter (+ rust, typescript, javascript, python, go, json, toml, yaml, bash grammars), htmd, rusqlite (`bundled`), keyring, clap, nix, tracing, opentelemetry + opentelemetry-otlp, proptest, insta.
+**Tech Stack:** Rust (edition 2024, MSRV 1.85), tokio, tokio-util (`CancellationToken`), futures, serde/serde_json, toml, thiserror/anyhow, reqwest (rustls, `stream`), eventsource-stream, blake3, tempfile, ignore + grep-searcher + grep-regex, globset, rayon, similar (diffs), serde_yaml (frontmatter), ulid, wiremock, assert_cmd, memory-stats, tree-sitter (+ rust, typescript, javascript, python, go, json, toml, yaml, bash grammars), htmd, rusqlite (`bundled`), keyring, clap, nix, tracing, opentelemetry + opentelemetry-otlp, proptest, insta.
 
 **Spec:** `docs/superpowers/specs/2026-11-02-hx-core-engine-design.md`
 
@@ -17,19 +17,20 @@
 - Auth: API keys from env vars or OS keychain only. No subscription OAuth, ever.
 - Telemetry: off by default; nothing leaves the machine unless enabled.
 - Cold start < 50 ms; idle RSS < 30 MB; RSS within ±10% over 4-hour simulated session.
-- Dependencies point downward only: `hx-cli → {hx-tui, hx-rpc} → hx-core → {hx-provider, hx-tools, hx-context, hx-session, hx-sandbox}`; `hx-tools → hx-sandbox`; `hx-context → hx-provider`.
+- Dependencies point downward only: `hx-cli → {hx-tui, hx-rpc} → hx-core → {hx-provider, hx-tools, hx-context, hx-memory, hx-index, hx-session, hx-sandbox}`; `hx-tools → {hx-sandbox, hx-provider, hx-index, hx-memory}`; `hx-memory → {hx-index, hx-session}`; `hx-index → hx-sandbox`; `hx-context → hx-provider`.
 - `hx-tools` must not call `std::fs::*`, `tokio::fs::*`, `std::process::Command`, `tokio::process::Command` directly (enforced by `clippy::disallowed_methods`/`disallowed_types`).
 - Errors: `thiserror` per crate; `anyhow` only in `hx-cli`. No `panic = "abort"`.
 - Paths: config `~/.config/hx/config.toml`, project `.hx/config.toml`, sessions `~/.local/share/hx/sessions/<project-hash>/<session-id>.jsonl` (+ `blobs/`), ledger `~/.local/share/hx/ledger.db`. Honor `XDG_CONFIG_HOME` / `XDG_DATA_HOME` and an `HX_HOME` override (used by tests).
 - Fixed values: bash timeout 120 s; tool output cap 30 KB (head + tail); max 5 retry attempts; compaction threshold 80%; budget warning 80%; system prompt < 2,000 tokens; pinned warning at 10% of window; cancel kills children within 200 ms.
+- Token-efficiency values: diff re-read when < 50% of lines changed; context GC threshold max(2,000 tokens, 5% of window), only at turn start; output filters apply above 2 KB, ≤ 20 detail lines per item; memory index ≤ 500 tokens; memory entry body ≤ 300 tokens; `recall` top 5, ≤ 2,000 tokens; `web_fetch` question answers ≤ 1,000 tokens; index build of 10,000 files < 10 s, single-file reindex < 50 ms; token regression gate 10%.
 - Exit codes for `hx -p`: 0 completed, 1 error, 2 budget/max_turns/timeout, 130 cancelled.
 
 ## Review Focus
 
 1. **Binary or non-UTF-8 files** passed to `read`/`edit`/`grep` — expect a clear tool error ("binary file", "not UTF-8"), never a panic or mangled write. Test in Task 9 and Task 11.
-2. **Malformed tool-call arguments from the model** (invalid JSON, missing fields, wrong types) — expect an error tool result returned to the model and the turn continuing. Test in Task 18.
-3. **Two `hx` processes on the same project** (concurrent sessions, shared ledger) — expect both to work: separate session files, SQLite in WAL mode with busy timeout. Test in Task 15 and Task 19.
-4. **Terminal closed / SIGTERM / SIGHUP mid-turn** — expect child process groups killed and the session left resumable. Test in Task 19.
+2. **Malformed tool-call arguments from the model** (invalid JSON, missing fields, wrong types) — expect an error tool result returned to the model and the turn continuing. Test in Task 24.
+3. **Two `hx` processes on the same project** (concurrent sessions, shared ledger) — expect both to work: separate session files, SQLite in WAL mode with busy timeout. Test in Task 18 and Task 25.
+4. **Terminal closed / SIGTERM / SIGHUP mid-turn** — expect child process groups killed and the session left resumable. Test in Task 25.
 5. **Symlink tricks and loops** inside the workspace (link pointing outside root, cyclic links during `glob`/`grep`) — expect confinement errors and no hang. Test in Task 1 and Task 9.
 
 ---
@@ -46,18 +47,23 @@ crates/
                    anthropic.rs, openai.rs, google.rs, compat.rs}
   hx-provider/catalog/models.toml
   hx-provider/tests/fixtures/{anthropic,openai,google,compat}/*.sse
-  hx-tools/src/{lib.rs, spec.rs, read.rs, write.rs, grep.rs, glob.rs, bash.rs, web_fetch.rs, pin_state.rs,
+  hx-index/src/{lib.rs, extract.rs, store.rs, update.rs}, hx-index/queries/<lang>.scm
+  hx-memory/src/{lib.rs, entry.rs, store.rs, stale.rs, search.rs, episodes.rs, consolidate.rs}
+  hx-tools/src/{lib.rs, spec.rs, read.rs, write.rs, grep.rs, glob.rs, bash.rs, web_fetch.rs, pin_state.rs, index_tools.rs, memory_tools.rs,
+                filters/{mod.rs, cargo.rs, pytest.rs, jest.rs, gotest.rs, tsc.rs, eslint.rs},
                 edit/{mod.rs, guard.rs, atomic.rs, str_replace.rs, patch.rs, hashline.rs, syntax.rs}}
   hx-tools/clippy.toml
   hx-session/src/{lib.rs, record.rs, writer.rs, reader.rs, blobs.rs, paths.rs}
-  hx-context/src/{lib.rs, blocks.rs, tokens.rs, pinned.rs, state.rs, agents_md.rs, assemble.rs, compact.rs, prompt.rs}
+  hx-context/src/{lib.rs, blocks.rs, tokens.rs, pinned.rs, state.rs, agents_md.rs, assemble.rs, compact.rs, gc.rs, prompt.rs}
   hx-context/prompts/system.md
   hx-core/src/{lib.rs, protocol.rs, config.rs, auth.rs, engine.rs, turn.rs, approvals.rs, budget.rs, ledger.rs,
-               resume.rs, telemetry.rs}
+               resume.rs, routing.rs, memory.rs, telemetry.rs}
   hx-rpc/src/{lib.rs, jsonrpc.rs, server.rs, oneshot.rs}
   hx-tui/src/{lib.rs, repl.rs, render.rs}
   hx-cli/src/{main.rs, cmd/{prompt.rs, sessions.rs, models.rs, undo.rs, eval.rs}}
 evals/starter/<task-id>/{task.toml, setup.sh, verify.sh}
+evals/replay/<task-id>.json      scripted mock sessions for the token regression gate
+evals/baseline.json              committed tokens-per-solved-task baseline
 benches/perf/{startup.sh, soak.rs, big_output.rs}
 ```
 
@@ -228,7 +234,7 @@ benches/perf/{startup.sh, soak.rs, big_output.rs}
 ```
 
 - [ ] **Step 2: Run** `cargo test -p hx-provider --test catalog` — Expected: FAIL.
-- [ ] **Step 3: Implement.** `models.toml` entries keyed `"<provider>/<model>"`; populate current Anthropic, OpenAI, Google models with published prices at implementation time. If the three model ids used in these tests are not the current flagship ids, replace them in the tests and in Task 27 with the ids you put in the catalog. `include_str!` the catalog.
+- [ ] **Step 3: Implement.** `models.toml` entries keyed `"<provider>/<model>"`; populate current Anthropic, OpenAI, Google models with published prices at implementation time. If the three model ids used in these tests are not the current flagship ids, replace them in the tests and in Task 35 with the ids you put in the catalog. `include_str!` the catalog.
 - [ ] **Step 4: Run** — Expected: PASS.
 - [ ] **Step 5: Commit** `git commit -m "feat(provider): canonical types, capabilities, catalog, cost"`
 
@@ -354,7 +360,7 @@ benches/perf/{startup.sh, soak.rs, big_output.rs}
 ```
 
 - [ ] **Step 2: Run** `cargo test -p hx-tools --test read_side` — Expected: FAIL.
-- [ ] **Step 3: Implement.** `clippy.toml` in `hx-tools` sets `disallowed-methods = ["std::fs::read", "std::fs::write", "std::fs::read_to_string", "std::fs::File::open", "std::fs::File::create", "tokio::fs::read", "tokio::fs::write"]` and `disallowed-types = ["std::process::Command", "tokio::process::Command"]`. Hash anchor = first 4 hex chars of blake3 of the line. Grep output: one line per match `path:line:text`, capped at 30 KB (head kept) — Task 10 later swaps in the shared `cap_output`. In this task `registry` returns only the tools that exist (read, write, grep, glob) in their final relative order; Tasks 10 and 13 insert the rest.
+- [ ] **Step 3: Implement.** `clippy.toml` in `hx-tools` sets `disallowed-methods = ["std::fs::read", "std::fs::write", "std::fs::read_to_string", "std::fs::File::open", "std::fs::File::create", "tokio::fs::read", "tokio::fs::write"]` and `disallowed-types = ["std::process::Command", "tokio::process::Command"]`. Hash anchor = first 4 hex chars of blake3 of the line. Grep output: one line per match `path:line:text`, capped at 30 KB (head kept) — Task 10 later swaps in the shared `cap_output`. In this task `registry` returns only the tools that exist (read, write, grep, glob) in their final relative order; Tasks 10, 13, 15 and 22 insert the rest.
 - [ ] **Step 4: Run** `cargo test -p hx-tools --test read_side && cargo clippy -p hx-tools -- -D warnings` — Expected: PASS, no clippy errors.
 - [ ] **Step 5: Commit** `git commit -m "feat(tools): Tool trait, read/write/grep/glob, fs lint"`
 
@@ -440,15 +446,108 @@ proptest! { #[test] fn apply_then_inverse_restores(text in "[a-z\\n]{1,200}", ..
 - Test: `crates/hx-tools/tests/{syntax.rs,web_fetch.rs,pin_state.rs}`
 
 **Interfaces:**
-- Produces: `fn syntax::new_errors(path: &Path, before: &str, after: &str) -> Option<Vec<(usize, String)>>` (None = unsupported language); `WebFetchTool`; `PinTool`, `StateTool` whose `run` returns `ToolResult` with `effects` empty and a JSON body; the engine (Task 18) intercepts their parsed args as `ContextOp::{Pin(String), StateUpdate(StatePatch)}` — define `enum ContextOp` here and `fn parse_context_op(tool: &str, args: &Value) -> Option<ContextOp>`.
+- Produces: `fn syntax::new_errors(path: &Path, before: &str, after: &str) -> Option<Vec<(usize, String)>>` (None = unsupported language); `WebFetchTool`; `PinTool`, `StateTool` whose `run` returns `ToolResult` with `effects` empty and a JSON body; the engine (Task 24) intercepts their parsed args as `ContextOp::{Pin(String), StateUpdate(StatePatch)}` — define `enum ContextOp` here and `fn parse_context_op(tool: &str, args: &Value) -> Option<ContextOp>`.
 
-- [ ] **Step 1: Write the failing tests:** `introduced_parse_error_reported` (Rust file, remove closing brace → `Some(vec![(line, msg)])`); `preexisting_error_not_reported`; `unsupported_extension_returns_none` (`.xyz`); supported set exactly rs, ts, tsx, js, py, go, json, toml, yaml/yml; `edit_result_includes_syntax_warning_and_keeps_edit`; `web_fetch_converts_html_to_markdown` (wiremock); `web_fetch_caps_output`; `pin_parses_context_op`; `state_rejects_unknown_fields`; `registry_order_is_stable` (`names(registry(&caps())) == ["read","edit","write","bash","grep","glob","web_fetch","pin","state"]`).
+- [ ] **Step 1: Write the failing tests:** `introduced_parse_error_reported` (Rust file, remove closing brace → `Some(vec![(line, msg)])`); `preexisting_error_not_reported`; `unsupported_extension_returns_none` (`.xyz`); supported set exactly rs, ts, tsx, js, py, go, json, toml, yaml/yml; `edit_result_includes_syntax_warning_and_keeps_edit`; `web_fetch_converts_html_to_markdown` (wiremock); `web_fetch_caps_output`; `pin_parses_context_op`; `state_rejects_unknown_fields`; `registry_order_is_stable` (`names(registry(&caps())) == ["read","edit","write","bash","grep","glob","web_fetch","pin","state"]`; Tasks 15 and 22 extend this assertion).
 - [ ] **Step 2: Run** `cargo test -p hx-tools` — Expected: FAIL on new tests.
 - [ ] **Step 3: Implement.** Count `ERROR`/`MISSING` nodes before and after; report nodes whose line is not in the "before" set. `StatePatch { plan: Option<Vec<PlanStep>>, decisions_add: Vec<String>, questions_add: Vec<String>, questions_resolve: Vec<usize> }`, `PlanStep { text: String, status: StepStatus }`, `enum StepStatus { Pending, InProgress, Done }`.
 - [ ] **Step 4: Run** `cargo test -p hx-tools` — Expected: PASS.
 - [ ] **Step 5: Commit** `git commit -m "feat(tools): syntax check, web_fetch, pin/state tools"`
 
-### Task 14: Session store
+### Task 14: Code index (`hx-index`)
+
+**Files:**
+- Create: `crates/hx-index/src/{lib.rs,extract.rs,store.rs,update.rs}`, `crates/hx-index/queries/{rust,typescript,javascript,python,go}.scm`
+- Test: `crates/hx-index/tests/index.rs`
+
+**Interfaces:**
+- Consumes: `Sandbox` (Task 1); language detection shared with `syntax.rs` (Task 13) — move the extension→language map to `hx-index::Lang` and have `syntax.rs` use it.
+- Produces:
+  - `enum Lang { Rust, TypeScript, Tsx, JavaScript, Python, Go, Json, Toml, Yaml }` with `fn Lang::from_path(p: &Path) -> Option<Lang>`
+  - `enum SymbolKind { Function, Method, Type, Constant, Module }`
+  - `struct SymbolRow { path: PathBuf, name: String, kind: SymbolKind, parent: Option<String>, start_line: u32, end_line: u32, signature: String, hash: String }`; `struct RefRow { path: PathBuf, line: u32, context: String }`
+  - `struct Index` with `fn open(db: &Path, sb: Arc<dyn Sandbox>) -> Result<Index, IndexError>`, `async fn refresh(&self) -> Result<RefreshStats, IndexError>`, `fn spawn_background_refresh(self: Arc<Self>) -> JoinHandle<()>`, `fn is_ready(&self) -> bool`, `async fn reindex_file(&self, rel: &Path) -> Result<(), IndexError>`, `fn outline(&self, rel: &Path) -> Result<Vec<SymbolRow>, IndexError>`, `fn find_symbol(&self, name: &str, kind: Option<SymbolKind>) -> Result<Vec<SymbolRow>, IndexError>`, `fn refs(&self, name: &str, limit: usize) -> Result<Vec<RefRow>, IndexError>`, `fn file_hash(&self, rel: &Path) -> Option<String>`, `fn symbol_hash(&self, rel: &Path, name: &str) -> Option<String>`, `fn stats(&self) -> IndexStats`
+  - `struct RefreshStats { parsed: u32, removed: u32, unchanged: u32 }`; `struct IndexStats { files: u64, symbols: u64, refs: u64 }`
+  - `fn extract::extract(lang: Lang, src: &str) -> Extracted` with `struct Extracted { symbols: Vec<SymbolRow /* path empty */>, refs: Vec<(u32, String)> }`
+
+- [ ] **Step 1: Write the failing tests**
+
+```rust
+#[test] fn extracts_rust_items_with_parents() {
+    let e = extract(Lang::Rust, "struct A;\nimpl A {\n    fn go(&self) -> u8 { 1 }\n}\nconst N: u8 = 3;\nfn main() {}\n");
+    assert_eq!(names_kinds(&e), [("A",Type),("go",Method),("N",Constant),("main",Function)]);
+    assert_eq!(e.symbols[1].parent.as_deref(), Some("A"));
+    assert_eq!(e.symbols[1].signature, "fn go(&self) -> u8");
+}
+#[test] fn extracts_python_ts_go_definitions() { /* one def/class/func per language → expected names and kinds */ }
+#[test] fn refs_exclude_definition_sites() {}
+#[test] fn symbol_hash_changes_only_when_that_symbol_changes() {}
+#[tokio::test] async fn refresh_reparses_only_changed_files() {
+    let (t, idx) = index_with(&[("a.rs","fn a(){}"),("b.rs","fn b(){}")]); idx.refresh().await.unwrap();
+    touch_write(t.path().join("a.rs"), "fn a2(){}");
+    assert_eq!(idx.refresh().await.unwrap(), RefreshStats{parsed:1, removed:0, unchanged:1});
+}
+#[tokio::test] async fn deleted_files_are_removed() {}
+#[tokio::test] async fn gitignored_files_skipped() {}
+#[tokio::test] async fn reindex_file_updates_outline() {}
+#[tokio::test] async fn two_handles_share_db_in_wal_mode() {}
+#[tokio::test] async fn is_ready_false_until_first_refresh_completes() {}
+```
+
+- [ ] **Step 2: Run** `cargo test -p hx-index` — Expected: FAIL.
+- [ ] **Step 3: Implement.** Queries capture `@definition.<kind>` / `@name` (start from each grammar's `tags.scm` where shipped). Signature = source from the definition start up to (excluding) the body node, whitespace-collapsed, ≤ 200 chars. Symbol hash = blake3 of the definition's source text. Initial build parses with `rayon` inside `spawn_blocking`; writes in one transaction per 500 files. Skip files > 1 MB and non-UTF-8 files.
+- [ ] **Step 4: Run** — Expected: PASS.
+- [ ] **Step 5: Commit** `git commit -m "feat(index): incremental tree-sitter symbol index"`
+
+### Task 15: `outline`, `symbol`, `refs` tools
+
+**Files:**
+- Create: `crates/hx-tools/src/index_tools.rs`; modify `lib.rs` (`ToolCx` gains `index: Option<Arc<Index>>` and `turn: u32`), `edit/mod.rs` (call `index.reindex_file` after each successful write), `registry`
+- Test: `crates/hx-tools/tests/index_tools.rs`
+
+**Interfaces:**
+- Consumes: `Index` (Task 14).
+- Produces: `OutlineTool`, `SymbolTool`, `RefsTool` (all `Effect::ReadOnly`). Registry order becomes `read, edit, write, bash, grep, glob, outline, symbol, refs, web_fetch, pin, state`.
+
+- [ ] **Step 1: Write the failing tests:** `outline_lists_signatures_and_ranges_without_bodies`; `symbol_returns_source_with_path_and_lines`; `symbol_with_multiple_matches_lists_locations_only`; `symbol_kind_filter_narrows`; `refs_lists_path_line_context_and_respects_limit` (default limit 50); `refs_description_says_name_based`; `fallback_while_index_not_ready` (outline still works via on-demand parse and the output starts with `(index building)`; symbol falls back to grep); `edit_then_symbol_sees_new_body`; `registry_order_is_stable` updated to the order above.
+- [ ] **Step 2: Run** `cargo test -p hx-tools --test index_tools` — Expected: FAIL.
+- [ ] **Step 3: Implement.** Output formats: outline `L<start>-<end> <kind> <signature>` per line, indented under parent; refs `path:line: context`.
+- [ ] **Step 4: Run** — Expected: PASS.
+- [ ] **Step 5: Commit** `git commit -m "feat(tools): outline, symbol, refs index tools"`
+
+### Task 16: Output filters
+
+**Files:**
+- Create: `crates/hx-tools/src/filters/{mod.rs,cargo.rs,pytest.rs,jest.rs,gotest.rs,tsc.rs,eslint.rs}`, fixtures `crates/hx-tools/tests/fixtures/filters/{cargo_test_fail,cargo_build_err,clippy_warn,pytest_fail,jest_fail,vitest_fail,gotest_fail,tsc_err,eslint_err}.txt` (captured from real tool runs); modify `bash.rs`
+- Test: `crates/hx-tools/tests/filters.rs`
+
+**Interfaces:**
+- Consumes: `SimpleCommand`, `parse_commands` (Task 2); `cap_output` (Task 10).
+- Produces: `enum FilterKind { Cargo, Pytest, Jest, GoTest, Tsc, Eslint }`; `fn filters::detect(cmds: &[SimpleCommand]) -> Option<FilterKind>` (last command of a pipeline/list that matches); `fn filters::apply(kind: FilterKind, output: &str) -> Option<Summary>`; `struct Summary { passed: Option<u32>, failed: u32, errors: u32, warnings: u32, items: Vec<Item> }`; `struct Item { name: String, location: Option<String>, message: String, detail: Vec<String> }`; `fn Summary::render(&self, spill: &Path) -> String`.
+
+- [ ] **Step 1: Write the failing tests:** `detects_common_invocations` (`cargo test -p x`, `cargo clippy`, `python -m pytest -q`, `pytest`, `npx jest`, `pnpm vitest run`, `go test ./...`, `npx tsc --noEmit`, `eslint .`, `npm run lint` → None); one `parses_<fixture>` test per fixture asserting counts and the first item's `name`/`location`; `detail_capped_at_20_lines`; `output_under_2kb_not_filtered`; `unparseable_output_falls_back_to_head_tail_cap`; `raw_true_disables_filtering`; `render_includes_spill_path_and_counts`.
+- [ ] **Step 2: Run** `cargo test -p hx-tools --test filters` — Expected: FAIL.
+- [ ] **Step 3: Implement.** Prefer machine-readable markers in the text output (cargo `error[E…]`/`--> file:line`, pytest `FAILED path::name`, go `--- FAIL:`, tsc `file(line,col): error TS…`, eslint stylish blocks, jest/vitest `●` blocks). Bash: if `detect` matches and raw output > 2 KB and `!args.raw`, use `Summary::render`; else `cap_output`.
+- [ ] **Step 4: Run** — Expected: PASS.
+- [ ] **Step 5: Commit** `git commit -m "feat(tools): output filters for common test and build tools"`
+
+### Task 17: Diff-on-re-read
+
+**Files:**
+- Modify: `crates/hx-tools/src/{lib.rs,read.rs}`
+- Test: `crates/hx-tools/tests/reread.rs`
+
+**Interfaces:**
+- Consumes: `ReadTracker` (Task 9), `ToolCx.turn` (Task 15).
+- Produces: `ReadTracker::record(&self, path: &Path, range: LineRange, meta: &FileMeta, hash: blake3::Hash, turn: u32, content: &str)` storing content on disk at `<spill_dir>/reads/<hash>` (tracker keeps only path → (range, hash, turn, mtime) in memory); `fn ReadTracker::previous(&self, path: &Path, range: LineRange) -> Option<PrevRead>`; `struct PrevRead { hash: blake3::Hash, turn: u32, content_path: PathBuf }`; `read` arg `full: bool` (default false).
+
+- [ ] **Step 1: Write the failing tests:** `identical_reread_returns_unchanged_since_turn` (output == `unchanged since turn 3`); `small_change_returns_line_numbered_unified_diff` (1 of 10 lines changed → output starts with `changed since turn 3:` and contains `@@`); `change_of_half_or_more_returns_full`; `full_true_forces_full_content`; `different_range_is_not_a_reread`; `tracker_keeps_contents_on_disk_not_in_memory` (file exists under `reads/`); `edit_updates_tracker_so_reread_after_own_edit_is_diffed_against_post_edit`.
+- [ ] **Step 2: Run** `cargo test -p hx-tools --test reread` — Expected: FAIL.
+- [ ] **Step 3: Implement** with the `similar` crate (line diff, 2 lines of context, new-file line numbers).
+- [ ] **Step 4: Run** — Expected: PASS.
+- [ ] **Step 5: Commit** `git commit -m "feat(tools): diff-on-re-read"`
+
+### Task 18: Session store
 
 **Files:**
 - Create: `crates/hx-session/src/{lib.rs,record.rs,writer.rs,reader.rs,blobs.rs,paths.rs}`
@@ -469,7 +568,7 @@ proptest! { #[test] fn apply_then_inverse_restores(text in "[a-z\\n]{1,200}", ..
 - [ ] **Step 4: Run** — Expected: PASS.
 - [ ] **Step 5: Commit** `git commit -m "feat(session): append-only JSONL store with blobs and fork"`
 
-### Task 15: Context blocks, token accounting, pinned items, working state
+### Task 19: Context blocks, token accounting, pinned items, working state
 
 **Files:**
 - Create: `crates/hx-context/src/{lib.rs,blocks.rs,tokens.rs,pinned.rs,state.rs,agents_md.rs,assemble.rs,prompt.rs}`, `crates/hx-context/prompts/system.md`
@@ -478,13 +577,13 @@ proptest! { #[test] fn apply_then_inverse_restores(text in "[a-z\\n]{1,200}", ..
 **Interfaces:**
 - Consumes: Task 4 canonical types; `ContextOp`, `StatePatch` (Task 13); `AppliedEffect` (Task 9).
 - Produces:
-  - `struct Context { pinned: Vec<Pinned>, state: WorkingState, history: Vec<Turn>, agents_md: Option<String>, tokens: TokenEstimator }`
+  - `struct Context { pinned: Vec<Pinned>, state: WorkingState, history: Vec<Turn>, agents_md: Option<String>, memory_index: Option<String>, tokens: TokenEstimator }` (`memory_index` is set by the engine in Task 28; rendered in the stable block after AGENTS.md)
   - `struct Pinned { text: String, source: PinSource }`; `enum PinSource { User, Config, Model, AgentsMd }`
   - `struct WorkingState { task: Option<String>, plan: Vec<PlanStep>, files: BTreeMap<PathBuf, FileNote>, decisions: Vec<String>, questions: Vec<String> }`; `struct FileNote { read_hash: Option<String>, edited: bool }`
   - `struct Turn { messages: Vec<Message> }`
   - `fn Context::apply_effects(&mut self, effects: &[AppliedEffect])`; `fn Context::apply_op(&mut self, op: ContextOp)`
   - `fn Context::assemble(&self, caps: &Capabilities, tools: &[ToolSpec], model: &ModelId) -> (CanonicalRequest, ContextStatus)`
-  - `struct ContextStatus { used: u32, budget: u32, breakdown: Breakdown, warnings: Vec<String> }`; `struct Breakdown { system: u32, tools: u32, agents_md: u32, pinned: u32, state: u32, history: u32 }`
+  - `struct ContextStatus { used: u32, budget: u32, breakdown: Breakdown, warnings: Vec<String> }`; `struct Breakdown { system: u32, tools: u32, agents_md: u32, memory: u32, pinned: u32, state: u32, history: u32 }`
   - `struct TokenEstimator` with `fn estimate(&self, s: &str) -> u32` (`ceil(bytes / 4 * ratio)`) and `fn calibrate(&mut self, estimated: u32, actual: u64)` (ratio = EMA of actual/estimated, clamped 0.5–2.0)
   - `fn agents_md::load(root: &Path) -> (Option<String>, Vec<Pinned>)` — concatenates AGENTS.md from root up to filesystem root (nearest last); sections whose heading text is `Constraints` or `Rules` (any level, case-insensitive) become `Pinned{source: AgentsMd}`
   - `fn prompt::system() -> &'static str` (`include_str!("../prompts/system.md")`)
@@ -492,7 +591,7 @@ proptest! { #[test] fn apply_then_inverse_restores(text in "[a-z\\n]{1,200}", ..
 - [ ] **Step 1: Write the failing tests**
 
 ```rust
-#[test] fn block_order_is_system_tools_agents_pinned_state_history() { /* inspect request.system blocks order and that pinned/state appear after stable prefix */ }
+#[test] fn block_order_is_system_tools_agents_memory_pinned_state_history() { /* inspect request.system blocks order and that pinned/state appear after stable prefix */ }
 #[test] fn stable_prefix_is_byte_identical_across_turns() {
     let mut c = ctx(); let (a, _) = c.assemble(&caps(), &tools(), &m()); c.history.push(turn("hi")); c.apply_op(ContextOp::Pin("x".into()));
     let (b, _) = c.assemble(&caps(), &tools(), &m());
@@ -512,7 +611,7 @@ proptest! { #[test] fn apply_then_inverse_restores(text in "[a-z\\n]{1,200}", ..
 - [ ] **Step 4: Run** — Expected: PASS.
 - [ ] **Step 5: Commit** `git commit -m "feat(context): block assembly, token accounting, pinned, working state"`
 
-### Task 16: Compaction
+### Task 20: Compaction
 
 **Files:**
 - Create: `crates/hx-context/src/compact.rs`
@@ -527,7 +626,66 @@ proptest! { #[test] fn apply_then_inverse_restores(text in "[a-z\\n]{1,200}", ..
 - [ ] **Step 4: Run** — Expected: PASS.
 - [ ] **Step 5: Commit** `git commit -m "feat(context): state-preserving reversible compaction"`
 
-### Task 17: Config, auth, protocol types
+### Task 21: Context garbage collection
+
+**Files:**
+- Create: `crates/hx-context/src/gc.rs`; modify `lib.rs`, `assemble.rs`
+- Test: `crates/hx-context/tests/gc.rs`
+
+**Interfaces:**
+- Consumes: `Context`, `Turn` (Task 19); `CompactionRecord`, `uncompact` (Task 20).
+- Produces: `fn Context::push_tool_result(&mut self, call_id: &str, tool: &str, args: &Value, output: String, is_error: bool, turn: u32)` (records `ResultMeta { call_id, tool, key: Option<String> /* path for read/edit, command for bash */, failed_edit: bool, turn, tokens, elided: bool }`); `fn Context::collect(&mut self, window: u32) -> Option<GcRecord>`; `struct GcRecord { elided: Vec<(String /* call_id */, String /* original output */)>, tokens_freed: u32 }`; `fn Context::restore_gc(&mut self, rec: &GcRecord)`.
+
+- [ ] **Step 1: Write the failing tests:** `read_superseded_by_later_edit_of_same_path`; `read_superseded_by_later_reread`; `bash_superseded_by_same_command_string`; `failed_edit_superseded_by_later_successful_edit`; `latest_result_never_elided`; `stub_text_and_call_id_preserved` (output == `[elided: superseded at turn N]`, call id unchanged, tool_use/tool_result pairing intact); `below_threshold_returns_none` (threshold = max(2000, 5% of window)); `above_threshold_elides_all_superseded`; `restore_gc_restores_original_outputs`.
+- [ ] **Step 2: Run** `cargo test -p hx-context --test gc` — Expected: FAIL.
+- [ ] **Step 3: Implement.** `collect` is a pure function of context state; the engine decides when to call it (turn start only — Task 24).
+- [ ] **Step 4: Run** — Expected: PASS.
+- [ ] **Step 5: Commit** `git commit -m "feat(context): cache-aware context garbage collection"`
+
+### Task 22: Memory store and `recall` / `remember` tools
+
+**Files:**
+- Create: `crates/hx-memory/src/{lib.rs,entry.rs,store.rs,stale.rs,search.rs,episodes.rs,consolidate.rs}`, `crates/hx-tools/src/memory_tools.rs`; modify `crates/hx-tools/src/{lib.rs,pin_state.rs}` (`ToolCx` gains `memory: Option<Arc<RwLock<MemoryStore>>>`; `ContextOp` gains `Remember(MemoryDraft)`)
+- Test: `crates/hx-memory/tests/memory.rs`, `crates/hx-tools/tests/memory_tools.rs`
+
+**Interfaces:**
+- Consumes: `Index::{file_hash, symbol_hash}` (Task 14); `paths::{data_home, project_hash}` (Task 18).
+- Produces:
+  - `enum MemoryKind { Convention, Fact, Gotcha, Command }`; `struct MemAnchor { path: PathBuf, symbol: Option<String>, hash: String }`
+  - `struct MemoryEntry { id: String, title: String, kind: MemoryKind, anchors: Vec<MemAnchor>, created: SystemTime, verified: Option<SystemTime>, body: String, stale: bool /* not serialized */ }` — file format: YAML frontmatter + markdown body
+  - `struct MemoryDraft { id: Option<String>, title: String, kind: MemoryKind, anchors: Vec<(PathBuf, Option<String>)>, body: String }`
+  - `struct MemoryChange { upsert: Option<MemoryEntry>, delete: Vec<String> }`
+  - `struct MemoryStore` with `fn open(project_root: &Path, index: Arc<Index>) -> Result<Self, MemoryError>`, `fn entries(&self) -> &[MemoryEntry]`, `fn refresh_staleness(&mut self) -> usize`, `fn index_block(&self, budget_tokens: u32, est: &dyn Fn(&str) -> u32) -> (String, bool /* over budget */)`, `fn draft_to_change(&self, d: MemoryDraft, est: &dyn Fn(&str) -> u32) -> Result<MemoryChange, MemoryError>` (fills anchor hashes; body > 300 tokens → `MemoryError::TooLong`), `fn apply(&mut self, c: &MemoryChange) -> Result<(), MemoryError>`, `fn search(&self, query: &str, k: usize, cap_tokens: u32, est: &dyn Fn(&str) -> u32) -> Vec<Hit>`, `fn write_episode(&self, session_id: &str, markdown: &str) -> Result<PathBuf, MemoryError>`, `fn consolidation_request(&self) -> String` (prompt listing all entries for the side model), `fn parse_consolidation(&self, reply: &str) -> Result<Vec<MemoryChange>, MemoryError>` (expects a JSON array of `{merge: [ids], into: {title, kind, body}}` / `{delete: id}`)
+  - `struct Hit { source: HitSource /* Project(id) | Episode(session_id) */, title: String, text: String, stale: bool, score: f32 }`
+  - `RecallTool` (`ReadOnly`), `RememberTool` (`ReadOnly`; returns `proposed; awaiting user approval` and writes nothing). Final registry order: `read, edit, write, bash, grep, glob, outline, symbol, refs, web_fetch, recall, remember, pin, state`.
+
+- [ ] **Step 1: Write the failing tests**
+
+```rust
+#[test] fn entry_roundtrips_through_frontmatter_file() {}
+#[tokio::test] async fn anchored_symbol_change_marks_stale() {
+    let (t, idx, mut m) = setup(&[("lib.rs","fn a(){1}\nfn b(){2}")]);
+    m.apply(&m.draft_to_change(draft_anchored("lib.rs", Some("a")), &est).unwrap()).unwrap();
+    write(t.path().join("lib.rs"), "fn a(){9}\nfn b(){2}"); idx.reindex_file(Path::new("lib.rs")).await.unwrap();
+    assert_eq!(m.refresh_staleness(), 1); assert!(m.entries()[0].stale);
+}
+#[tokio::test] async fn change_to_other_symbol_does_not_mark_stale() {}
+#[test] fn index_block_marks_stale_and_respects_500_token_budget_dropping_oldest_unverified_first() {}
+#[test] fn search_ranks_relevant_entry_first() { /* "pnpm" query → convention "use pnpm not npm" ranked 1 */ }
+#[test] fn search_includes_episodes_and_caps_at_2000_tokens() {}
+#[test] fn draft_body_over_300_tokens_rejected() {}
+#[test] fn parse_consolidation_produces_merge_and_delete_changes() {}
+#[tokio::test] async fn remember_tool_emits_context_op_and_writes_nothing() {}
+#[tokio::test] async fn recall_tool_flags_stale_hits() {}
+#[test] fn registry_order_is_stable() { /* final order above */ }
+```
+
+- [ ] **Step 2: Run** `cargo test -p hx-memory && cargo test -p hx-tools --test memory_tools` — Expected: FAIL.
+- [ ] **Step 3: Implement.** Entry id = slug of title + 4 hex chars. BM25 (k1 = 1.2, b = 0.75) over lowercase alphanumeric tokens of title + body, built in memory at open (corpus is small); episodes loaded lazily on first search. Anchors without a `symbol` use `file_hash`.
+- [ ] **Step 4: Run** — Expected: PASS.
+- [ ] **Step 5: Commit** `git commit -m "feat(memory): code-anchored memory store, recall and remember tools"`
+
+### Task 23: Config, auth, protocol types
 
 **Files:**
 - Create: `crates/hx-core/src/{lib.rs,protocol.rs,config.rs,auth.rs}`
@@ -535,11 +693,11 @@ proptest! { #[test] fn apply_then_inverse_restores(text in "[a-z\\n]{1,200}", ..
 
 **Interfaces:**
 - Produces:
-  - `struct Config { model: ModelId, providers: ProvidersConfig, permissions: PolicyConfig, compaction_threshold: Option<f32> /* 0.8 */, max_turns: u32 /* 100 */, turn_timeout_s: Option<u64>, budget: BudgetConfig, telemetry: TelemetryConfig /* enabled=false */, pins: Vec<String>, catalog_overrides: Option<Catalog> }`
+  - `struct Config { model: ModelId, providers: ProvidersConfig, permissions: PolicyConfig, compaction_threshold: Option<f32> /* 0.8 */, max_turns: u32 /* 100 */, turn_timeout_s: Option<u64>, budget: BudgetConfig, telemetry: TelemetryConfig /* enabled=false */, pins: Vec<String>, catalog_overrides: Option<Catalog>, routing: RoutingConfig { side_model: Option<ModelId> }, approve_memory: bool /* false */ }`
   - `fn Config::load(root: &Path, cli: CliOverrides) -> Result<Config, ConfigError>` — user then project then CLI; tables merge deeply, arrays replace
   - `struct ProvidersConfig { anthropic: Option<ProviderEntry>, openai: Option<ProviderEntry>, google: Option<ProviderEntry>, compat: Vec<CompatEntry> }`; `struct ProviderEntry { base_url: Option<Url>, api_key_env: Option<String> }`; `struct CompatEntry { name: String, base_url: Url, api_key_env: Option<String> }`
   - `fn auth::api_key(provider: &str, entry: &ProviderEntry) -> Result<Option<String>, AuthError>` — env var (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`, or configured name) then keychain service `hx`, account = provider
-  - `enum Event` and `enum Command` exactly as spec §3.2/§3.3, `#[serde(tag = "type", rename_all = "snake_case")]`; `enum FinishReason { Completed, Cancelled, Budget, MaxTurns, Timeout, Error }`; `enum ErrorKind { ProviderTransient, ProviderFatal, ContextOverflow, Tool, Policy, Internal }`
+  - `enum Event` and `enum Command` exactly as spec §3.2/§3.3 (including `Usage.role: UsageRole { Main, Side }`, `ContextCollected`, `MemoryProposed{proposal_id, change: MemoryChange}`, `SessionChanged`, `ApproveMemory`, `RejectMemory`, `ConsolidateMemory`; `MemoryChange { upsert: Option<MemoryEntry>, delete: Vec<String> }` re-exported from `hx-memory`), `#[serde(tag = "type", rename_all = "snake_case")]`; `enum FinishReason { Completed, Cancelled, Budget, MaxTurns, Timeout, Error }`; `enum ErrorKind { ProviderTransient, ProviderFatal, ContextOverflow, Tool, Policy, Internal }`
   - `const PROTOCOL_VERSION: (u32, u32) = (1, 0)`
 
 - [ ] **Step 1: Write the failing tests:** `project_overrides_user_and_cli_overrides_project`; `arrays_replace_not_concat`; `defaults_match_spec` (threshold 0.8, telemetry disabled, mode Ask); `env_key_wins_over_keychain` (keychain mocked via trait); `event_json_shape_is_stable` (insta snapshot of one of each `Event` variant); `command_roundtrip`.
@@ -548,7 +706,7 @@ proptest! { #[test] fn apply_then_inverse_restores(text in "[a-z\\n]{1,200}", ..
 - [ ] **Step 4: Run** — Expected: PASS.
 - [ ] **Step 5: Commit** `git commit -m "feat(core): config layering, auth, protocol types"`
 
-### Task 18: Engine turn loop and approvals
+### Task 24: Engine turn loop and approvals
 
 **Files:**
 - Create: `crates/hx-core/src/{engine.rs,turn.rs,approvals.rs}`
@@ -574,15 +732,17 @@ proptest! { #[test] fn apply_then_inverse_restores(text in "[a-z\\n]{1,200}", ..
 #[tokio::test] async fn mid_stream_drop_reissues_from_last_complete_message() { /* DropAfter([ToolCall partial]) then full → tool executed exactly once */ }
 #[tokio::test] async fn records_appended_before_events_visible() { /* on receipt of ToolFinished, session file already contains ToolResult */ }
 #[tokio::test] async fn pin_and_state_tools_update_context() {}
+#[tokio::test] async fn context_gc_runs_only_at_turn_start_and_emits_context_collected() { /* script re-reads a large file 6×; ContextCollected emitted at a TurnStarted boundary, never mid-turn */ }
+#[tokio::test] async fn edits_reindex_before_result_returned() { /* edit then symbol in same turn sees new body */ }
 #[tokio::test] async fn max_turns_stops() { /* max_turns=2, mock always calls a tool → TurnFinished{MaxTurns} */ }
 ```
 
 - [ ] **Step 2: Run** `cargo test -p hx-core --test engine_loop` — Expected: FAIL.
-- [ ] **Step 3: Implement.** Engine runs one actor task owning `Context`, `SessionWriter`, `Policy`, `ReadTracker`; commands arrive on an mpsc; each turn is a child task with a child `CancellationToken`. Tool calls resolve through `registry()`; `Approve`/`Deny` resolve pending approvals by tool-call id via a `HashMap<String, oneshot::Sender<bool>>`. Provider is wrapped in `Retrying`. Checkpoint the session at every tool boundary and turn end.
+- [ ] **Step 3: Implement.** Engine runs one actor task owning `Context`, `SessionWriter`, `Policy`, `ReadTracker`; commands arrive on an mpsc; each turn is a child task with a child `CancellationToken`. Engine owns `Arc<Index>` (opened at build, `spawn_background_refresh` started after the first event is emitted so start-up is not delayed) and passes it, the turn number and the spill dir in `ToolCx`; record every tool result with `Context::push_tool_result`; at each turn start (and only then) call `Context::collect` and log the `GcRecord`. Tool calls resolve through `registry()`; `Approve`/`Deny` resolve pending approvals by tool-call id via a `HashMap<String, oneshot::Sender<bool>>`. Provider is wrapped in `Retrying`. Checkpoint the session at every tool boundary and turn end.
 - [ ] **Step 4: Run** — Expected: PASS.
 - [ ] **Step 5: Commit** `git commit -m "feat(core): engine turn loop, approvals, tool dispatch"`
 
-### Task 19: Cancellation, budgets, ledger, signals
+### Task 25: Cancellation, budgets, ledger, signals
 
 **Files:**
 - Create: `crates/hx-core/src/{budget.rs,ledger.rs}`; modify `engine.rs`, `turn.rs`
@@ -597,38 +757,70 @@ proptest! { #[test] fn apply_then_inverse_restores(text in "[a-z\\n]{1,200}", ..
 - [ ] **Step 4: Run** — Expected: PASS.
 - [ ] **Step 5: Commit** `git commit -m "feat(core): cancellation, budgets, cost ledger, signal handling"`
 
-### Task 20: Resume, fork, undo, compaction wiring
+### Task 26: Resume, fork, undo, compaction wiring
 
 **Files:**
 - Create: `crates/hx-core/src/resume.rs`; modify `engine.rs`
 - Test: `crates/hx-core/tests/resume.rs`
 
 **Interfaces:**
-- Produces: `fn resume::rebuild(reader: &SessionReader<SessionRecord>) -> Result<Rebuilt, ResumeError>`; `struct Rebuilt { context: Context, incomplete_turn: bool, turn_count: u32 }`; engine handles `Command::Fork` (opens a new writer with `parent=(id, offset)` and emits a new additive event `Event::SessionChanged{session_id}` — add it to `protocol.rs` and its snapshot), `Command::Compact`, `Command::Uncompact`; `fn undo(reader, sandbox, turn: Option<u32>) -> Result<Vec<PathBuf>, UndoError>` restoring pre-images of the given (default last) turn in reverse order, deleting files whose pre-image is `None`.
+- Produces: `fn resume::rebuild(reader: &SessionReader<SessionRecord>) -> Result<Rebuilt, ResumeError>`; `struct Rebuilt { context: Context, incomplete_turn: bool, turn_count: u32 }`; engine handles `Command::Fork` (opens a new writer with `parent=(id, offset)` and emits `Event::SessionChanged{session_id}`), `Command::Compact`, `Command::Uncompact`; `fn undo(reader, sandbox, turn: Option<u32>) -> Result<Vec<PathBuf>, UndoError>` restoring pre-images of the given (default last) turn in reverse order, deleting files whose pre-image is `None`.
 
-- [ ] **Step 1: Write the failing tests:** `resume_rebuilds_context_identically` (assembled request after resume == before); `resume_after_crash_mid_turn_marks_incomplete_and_continues_on_next_message`; `fork_creates_child_with_parent_offset`; `auto_compaction_announced_before_running` (`Compacted` preceded by `ContextStatus` with warning "compacting"); `context_overflow_compacts_and_retries_once`; `uncompact_command_restores`; `undo_last_turn_restores_files`; `undo_deletes_files_created_in_turn`.
+- [ ] **Step 1: Write the failing tests:** `resume_rebuilds_context_identically` (assembled request after resume == before); `resume_after_crash_mid_turn_marks_incomplete_and_continues_on_next_message`; `fork_creates_child_with_parent_offset`; `auto_compaction_announced_before_running` (`Compacted` preceded by `ContextStatus` with warning "compacting"); `context_overflow_compacts_and_retries_once`; `uncompact_command_restores` (also restores GC elisions via `restore_gc`); `undo_last_turn_restores_files`; `undo_deletes_files_created_in_turn`.
 - [ ] **Step 2: Run** `cargo test -p hx-core --test resume` — Expected: FAIL.
 - [ ] **Step 3: Implement.**
 - [ ] **Step 4: Run** — Expected: PASS.
 - [ ] **Step 5: Commit** `git commit -m "feat(core): resume, fork, undo, compaction wiring"`
 
-### Task 21: JSON-RPC server and `hx -p` one-shot
+### Task 27: Side-model routing
 
 **Files:**
-- Create: `crates/hx-rpc/src/{lib.rs,jsonrpc.rs,server.rs,oneshot.rs}`, `crates/hx-cli/src/main.rs` (clap skeleton: `hx [-p PROMPT] [--output json|text] [--approve auto-edit|yolo] [--model ID] [--budget-usd N] [--continue] [--resume ID] [--rpc]`; `--budget-usd` sends `SetBudget{scope: session}` before the first message)
+- Create: `crates/hx-core/src/routing.rs`; modify `crates/hx-provider/src/{lib.rs,catalog.rs}` (add `trait SideModel` and `tier`), `crates/hx-provider/catalog/models.toml`, `crates/hx-tools/src/web_fetch.rs`, `crates/hx-core/src/{engine.rs,turn.rs}`
+- Test: `crates/hx-core/tests/routing.rs`
+
+**Interfaces:**
+- Consumes: `Config.routing` (Task 23), `compaction_request` (Task 20), `Ledger` and `Budget` (Task 25).
+- Produces: `enum Tier { Small, Large }` and `ModelInfo.tier: Option<Tier>`; `#[async_trait] trait SideModel: Send + Sync { async fn complete(&self, system: &str, user: &str, max_tokens: u32) -> Result<String, ProviderError>; }` (in `hx-provider`); `fn routing::side_model_id(cfg: &Config, catalog: &Catalog) -> ModelId`; `struct SideRunner { provider: Arc<dyn Provider>, model: ModelId, usage: mpsc::Sender<Usage> }` implementing `SideModel` and reporting `Usage{role: Side}`; `ToolCx` gains `side: Option<Arc<dyn SideModel>>`; `web_fetch` arg `question: Option<String>`.
+
+- [ ] **Step 1: Write the failing tests:** `default_side_model_is_small_tier_of_same_provider`; `falls_back_to_main_model_when_no_small_tier`; `config_side_model_overrides_default`; `compaction_summary_requested_from_side_model_not_main` (two `MockProvider`s; inspect `requests()`); `side_usage_has_role_side_and_counts_toward_budget_and_ledger`; `web_fetch_with_question_returns_answer_and_url_capped_at_1000_tokens`; `web_fetch_without_question_unchanged`.
+- [ ] **Step 2: Run** `cargo test -p hx-core --test routing` — Expected: FAIL.
+- [ ] **Step 3: Implement.** Mark Haiku-class, `-mini`, and Flash-class catalog entries `tier = "small"`. Side requests carry no tools and no reasoning.
+- [ ] **Step 4: Run** — Expected: PASS.
+- [ ] **Step 5: Commit** `git commit -m "feat(core): side-model routing for compaction, memory and web_fetch"`
+
+### Task 28: Memory in the engine
+
+**Files:**
+- Create: `crates/hx-core/src/memory.rs`; modify `engine.rs`, `turn.rs`, `resume.rs`
+- Test: `crates/hx-core/tests/memory.rs`
+
+**Interfaces:**
+- Consumes: `MemoryStore`, `MemoryChange`, `ContextOp::Remember` (Task 22); `SideModel` (Task 27); `Context.memory_index` (Task 19).
+- Produces: engine behavior only — `MemoryProposed{proposal_id, change}` emitted for each `Remember` op and each consolidation change; `ApproveMemory` applies, `RejectMemory` discards; `ConsolidateMemory` asks the side model via `consolidation_request` and emits one proposal per parsed change; episodes written via the side model at `Shutdown`/session end and after each compaction; `refresh_staleness` at build and after every turn that applied an `Edited` effect, then `Context.memory_index` reset from `index_block(500, …)`; when `index_block` reports over budget, `ContextStatus.warnings` gains `memory index over budget — run /memory consolidate`. Session records gain `MemoryProposal { id, change }` and `MemoryDecision { id, approved }` so pending proposals survive resume.
+
+- [ ] **Step 1: Write the failing tests:** `memory_index_rendered_after_agents_md_in_stable_block`; `remember_emits_proposal_and_writes_file_only_after_approve`; `reject_writes_nothing`; `editing_anchored_symbol_marks_entry_stale_in_next_request`; `episode_written_by_side_model_at_shutdown`; `episode_written_after_compaction`; `over_budget_index_adds_warning`; `consolidate_emits_proposals_and_applies_only_approved`; `pending_proposal_survives_resume`.
+- [ ] **Step 2: Run** `cargo test -p hx-core --test memory` — Expected: FAIL.
+- [ ] **Step 3: Implement.**
+- [ ] **Step 4: Run** — Expected: PASS.
+- [ ] **Step 5: Commit** `git commit -m "feat(core): memory proposals, staleness, episodes, consolidation"`
+
+### Task 29: JSON-RPC server and `hx -p` one-shot
+
+**Files:**
+- Create: `crates/hx-rpc/src/{lib.rs,jsonrpc.rs,server.rs,oneshot.rs}`, `crates/hx-cli/src/main.rs` (clap skeleton: `hx [-p PROMPT] [--output json|text] [--approve auto-edit|yolo] [--model ID] [--budget-usd N] [--approve-memory] [--continue] [--resume ID] [--rpc]`; `--budget-usd` sends `SetBudget{scope: session}` before the first message)
 - Test: `crates/hx-rpc/tests/{server.rs,oneshot.rs}`, golden files under `crates/hx-rpc/tests/snapshots/`
 
 **Interfaces:**
 - Consumes: `Engine`, `Event`, `Command`, `PROTOCOL_VERSION`.
-- Produces: `async fn serve(engine: Engine, events: mpsc::Receiver<Event>, stdin: impl AsyncBufRead, stdout: impl AsyncWrite) -> Result<()>`; methods `initialize` (returns `{protocol: "1.0", session_id}`; rejects major ≠ 1), `send_message`, `approve`, `deny`, `cancel`, `set_budget`, `compact`, `uncompact`, `pin`, `unpin`, `fork`, `shutdown`; notifications `event` with the serialized `Event`. `async fn run_oneshot(engine, events, prompt: String, output: OutputFormat, out: impl AsyncWrite) -> i32` (exit code).
+- Produces: `async fn serve(engine: Engine, events: mpsc::Receiver<Event>, stdin: impl AsyncBufRead, stdout: impl AsyncWrite) -> Result<()>`; methods `initialize` (returns `{protocol: "1.0", session_id}`; rejects major ≠ 1), `send_message`, `approve`, `deny`, `cancel`, `set_budget`, `compact`, `uncompact`, `pin`, `unpin`, `approve_memory`, `reject_memory`, `consolidate_memory`, `fork`, `shutdown`; notifications `event` with the serialized `Event`. `async fn run_oneshot(engine, events, prompt: String, output: OutputFormat, out: impl AsyncWrite) -> i32` (exit code).
 
-- [ ] **Step 1: Write the failing tests:** `initialize_negotiates_version`; `rejects_major_version_mismatch`; `methods_map_to_commands`; `events_become_notifications_ndjson` (each line valid JSON-RPC); `oneshot_json_golden` (insta snapshot of full event stream for a scripted mock run); `oneshot_text_prints_text_only`; `exit_codes` (completed 0, error 1, budget 2, max_turns 2, timeout 2, cancelled 130); `headless_ask_becomes_deny_without_approve_flag`; `headless_with_approve_auto_edit_allows_edits`; `malformed_json_line_returns_parse_error_and_continues`.
+- [ ] **Step 1: Write the failing tests:** `initialize_negotiates_version`; `rejects_major_version_mismatch`; `methods_map_to_commands`; `events_become_notifications_ndjson` (each line valid JSON-RPC); `oneshot_json_golden` (insta snapshot of full event stream for a scripted mock run); `oneshot_text_prints_text_only`; `exit_codes` (completed 0, error 1, budget 2, max_turns 2, timeout 2, cancelled 130); `headless_ask_becomes_deny_without_approve_flag`; `headless_with_approve_auto_edit_allows_edits`; `headless_memory_proposal_rejected_without_flag_and_written_with_approve_memory`; `malformed_json_line_returns_parse_error_and_continues`.
 - [ ] **Step 2: Run** `cargo test -p hx-rpc` — Expected: FAIL.
 - [ ] **Step 3: Implement.** Provider selection in `hx-cli` from `model` prefix (`anthropic/`, `openai/`, `google/`, `compat:<name>/`). Hidden test flag `--mock-script <file>` (cfg feature `mock`) wires `MockProvider` for golden and perf tests.
 - [ ] **Step 4: Run** — Expected: PASS.
 - [ ] **Step 5: Commit** `git commit -m "feat(rpc): JSON-RPC server and hx -p one-shot mode"`
 
-### Task 22: Interactive REPL stub
+### Task 30: Interactive REPL stub
 
 **Files:**
 - Create: `crates/hx-tui/src/{lib.rs,repl.rs,render.rs}`; modify `crates/hx-cli/src/main.rs` (no `-p` and stdin is a TTY → REPL)
@@ -637,28 +829,28 @@ proptest! { #[test] fn apply_then_inverse_restores(text in "[a-z\\n]{1,200}", ..
 **Interfaces:**
 - Produces: `async fn run_repl(engine: Engine, events: mpsc::Receiver<Event>, input: impl AsyncBufRead, out: impl AsyncWrite) -> Result<()>`; `fn render::event(e: &Event) -> Option<String>`.
 
-- [ ] **Step 1: Write the failing tests** (scripted stdin, captured stdout): `prints_streamed_text`; `approval_prompt_y_approves_n_denies`; `shows_context_and_cost_after_each_turn` (line matching `ctx \d+/\d+ tok · \$\d+\.\d{4}`); `slash_commands_map` (`/pin x` → `Pin`, `/compact`, `/fork`, `/undo`); `ctrl_c_once_cancels_twice_exits` (simulate via injected signal stream); `unknown_slash_command_prints_help`.
+- [ ] **Step 1: Write the failing tests** (scripted stdin, captured stdout): `prints_streamed_text`; `approval_prompt_y_approves_n_denies`; `shows_context_and_cost_after_each_turn` (line matching `ctx \d+/\d+ tok · \$\d+\.\d{4}`); `slash_commands_map` (`/pin x` → `Pin`, `/compact`, `/fork`, `/undo`, `/memory consolidate` → `ConsolidateMemory`); `memory_proposal_shows_entry_and_y_approves_n_rejects`; `context_collected_prints_tokens_freed`; `ctrl_c_once_cancels_twice_exits` (simulate via injected signal stream); `unknown_slash_command_prints_help`.
 - [ ] **Step 2: Run** `cargo test -p hx-tui` — Expected: FAIL.
 - [ ] **Step 3: Implement.** Plain line output, no alternate screen.
 - [ ] **Step 4: Run** — Expected: PASS.
 - [ ] **Step 5: Commit** `git commit -m "feat(tui): line-mode interactive REPL stub"`
 
-### Task 23: CLI utility commands
+### Task 31: CLI utility commands
 
 **Files:**
 - Create: `crates/hx-cli/src/cmd/{prompt.rs,sessions.rs,models.rs,undo.rs}`
 - Test: `crates/hx-cli/tests/cli.rs` (`assert_cmd`)
 
 **Interfaces:**
-- Produces: `hx prompt show [--full]` (system prompt; `--full` prints last request of latest session as JSON); `hx sessions list|show <id>|export <id> [--format jsonl|md]`; `hx models list|update [--from URL]` (default URL `https://models.dev/api.json`, writes `~/.config/hx/models.toml` overrides); `hx undo [--turn N]`.
+- Produces: `hx prompt show [--full]` (system prompt; `--full` prints last request of latest session as JSON); `hx sessions list|show <id>|export <id> [--format jsonl|md]`; `hx models list|update [--from URL]` (default URL `https://models.dev/api.json`, writes `~/.config/hx/models.toml` overrides); `hx undo [--turn N]`; `hx memory list|show <id>|consolidate` (consolidate runs a headless engine turn that issues `ConsolidateMemory` and prompts y/n per proposal); `hx index status|rebuild`.
 
-- [ ] **Step 1: Write the failing tests:** `prompt_show_prints_system_prompt`; `prompt_show_full_prints_last_request`; `sessions_list_shows_ids`; `sessions_export_md`; `models_update_from_local_fixture_server` (wiremock); `undo_restores_file` (run mock session that edits a file, then `hx undo`).
+- [ ] **Step 1: Write the failing tests:** `prompt_show_prints_system_prompt`; `prompt_show_full_prints_last_request`; `sessions_list_shows_ids`; `sessions_export_md`; `models_update_from_local_fixture_server` (wiremock); `undo_restores_file` (run mock session that edits a file, then `hx undo`); `memory_list_shows_stale_marker`; `index_status_reports_file_and_symbol_counts`.
 - [ ] **Step 2: Run** `cargo test -p hx-cli` — Expected: FAIL.
 - [ ] **Step 3: Implement.**
 - [ ] **Step 4: Run** — Expected: PASS.
 - [ ] **Step 5: Commit** `git commit -m "feat(cli): prompt, sessions, models, undo commands"`
 
-### Task 24: Opt-in OpenTelemetry export
+### Task 32: Opt-in OpenTelemetry export
 
 **Files:**
 - Create: `crates/hx-core/src/telemetry.rs`
@@ -673,7 +865,7 @@ proptest! { #[test] fn apply_then_inverse_restores(text in "[a-z\\n]{1,200}", ..
 - [ ] **Step 4: Run** — Expected: PASS.
 - [ ] **Step 5: Commit** `git commit -m "feat(core): opt-in OpenTelemetry GenAI spans"`
 
-### Task 25: Performance gates in CI
+### Task 33: Performance gates in CI
 
 **Files:**
 - Create: `benches/perf/startup.sh`, `benches/perf/soak.rs`, `benches/perf/big_output.rs` (as `[[test]]` targets in a `perf` crate or `hx-cli` with `#[ignore]` run explicitly), modify `.github/workflows/ci.yml` (job `perf`, release build, both OSes)
@@ -687,28 +879,29 @@ proptest! { #[test] fn apply_then_inverse_restores(text in "[a-z\\n]{1,200}", ..
   - Idle RSS: start `hx --rpc --mock-script …`, send `initialize`, sleep 2 s, read RSS (`ps -o rss=`); fail if > 30 MB.
   - `soak.rs`: drive `Engine` with a looping mock (text + read/grep/edit tool calls) under `tokio::time::pause`, simulating 4 h of turns with compaction; sample RSS (`memory-stats` crate) at the 10-minute mark and every simulated 10 min; fail if any sample is outside ±10% of the 10-minute sample.
   - `big_output.rs`: bash tool emitting 100 MB (`head -c 100000000 /dev/zero | tr '\0' a`); assert peak RSS growth < 20 MB and spill file size == 100,000,000.
+  - Index: generate a 10,000-file synthetic Rust/TS/Python repo (`benches/perf/gen_repo.rs`, fixed seed); assert `Index::refresh` from empty < 10 s and `reindex_file` on a 500-line file < 50 ms (median of 20).
   - Binary size: print `ls -l target/release/hx` to the job summary (not gated).
 - [ ] **Step 2: Run** `cargo build --release && bash benches/perf/startup.sh && cargo test --release -p perf -- --ignored` — Expected: currently may FAIL; record numbers.
 - [ ] **Step 3: Fix** any failing gate (typical levers: lazy provider/catalog init, `opt-level=3`, `lto="thin"`, `codegen-units=1`, `panic` unwinding kept, avoid tokio multi-thread runtime for `--version`).
 - [ ] **Step 4: Run** the same commands — Expected: all gates PASS.
 - [ ] **Step 5: Commit** `git commit -m "ci: performance gates for startup, RSS, soak, big output"`
 
-### Task 26: `hx eval` runner and starter task set
+### Task 34: `hx eval` runner and starter task set
 
 **Files:**
 - Create: `crates/hx-cli/src/cmd/eval.rs`, `evals/starter/<id>/{task.toml,setup.sh,verify.sh}` × 50, `evals/README.md` (task format)
 - Test: `crates/hx-cli/tests/eval.rs`
 
 **Interfaces:**
-- Produces: `hx eval --tasks <dir> --model <id> [--edit-format str_replace|patch|hashline] [--jobs N] [--out results.json]`; `task.toml` = `{ id, prompt, timeout_s = 600, budget_usd = 1.0, tags = [] }`; results JSON `{ model, edit_format, tasks: [{ id, passed, cost_usd, tokens_in, tokens_out, edit_failures, duration_s }], summary: { pass_rate, total_cost_usd, edit_failure_rate } }`. `edit_failures` = count of `edit` ToolResults with `is_error` in the session log.
+- Produces: `hx eval --tasks <dir> --model <id> [--edit-format str_replace|patch|hashline] [--jobs N] [--out results.json]`; `task.toml` = `{ id, prompt, timeout_s = 600, budget_usd = 1.0, tags = [] }`; results JSON `{ model, edit_format, tasks: [{ id, passed, cost_usd, tokens_in, tokens_out, cache_read, side_tokens, edit_failures, duration_s }], summary: { pass_rate, total_cost_usd, edit_failure_rate, tokens_per_solved_task, cache_hit_ratio } }` with `tokens_per_solved_task = Σ(tokens_in + tokens_out + side_tokens) / solved` and `cache_hit_ratio = Σcache_read / Σ(tokens_in + cache_read)`. `hx eval --replay evals/replay` runs scripted `MockProvider` sessions (deterministic) and compares `tokens_per_solved_task` with `evals/baseline.json`; exits non-zero if it exceeds baseline by > 10%; `--update-baseline` rewrites it. `edit_failures` = count of `edit` ToolResults with `is_error` in the session log.
 
-- [ ] **Step 1: Write the failing tests:** `runs_task_in_temp_git_worktree_and_cleans_up`; `verify_exit_0_is_pass`; `respects_task_budget` (mock exceeding budget → passed=false, reason budget); `edit_format_override_applied` (provider request tool schema matches format); `summary_math`.
+- [ ] **Step 1: Write the failing tests:** `runs_task_in_temp_git_worktree_and_cleans_up`; `verify_exit_0_is_pass`; `respects_task_budget` (mock exceeding budget → passed=false, reason budget); `edit_format_override_applied` (provider request tool schema matches format); `summary_math` (including tokens per solved task and cache hit ratio); `replay_regression_over_10_percent_fails`; `replay_within_10_percent_passes`.
 - [ ] **Step 2: Run** `cargo test -p hx-cli --test eval` — Expected: FAIL.
-- [ ] **Step 3: Implement** the runner (spawns `hx -p … --approve yolo --output json` per task in a fresh worktree; parses event stream). Author 50 starter tasks: 15 bug fixes, 10 small features, 10 refactors/renames, 5 multi-file edits, 5 test-writing, 5 config/build fixes; spread across Rust, Python, TypeScript, Go; each `setup.sh` creates a tiny repo, each `verify.sh` runs its tests. Validate every task: `verify.sh` fails on the unmodified setup.
+- [ ] **Step 3: Implement** the runner (spawns `hx -p … --approve yolo --output json` per task in a fresh worktree; parses event stream). Author 50 starter tasks: 15 bug fixes, 10 small features, 10 refactors/renames, 5 multi-file edits, 5 test-writing, 5 config/build fixes; spread across Rust, Python, TypeScript, Go; each `setup.sh` creates a tiny repo, each `verify.sh` runs its tests. Validate every task: `verify.sh` fails on the unmodified setup. Record a replay script for 10 of the tasks (mock responses that exercise read, re-read, outline/symbol, edit, bash test runs and recall) and commit the initial baseline. Add the replay gate to the CI `perf` job.
 - [ ] **Step 4: Run** `cargo test -p hx-cli --test eval && for d in evals/starter/*/; do (cd $(mktemp -d) && bash "$OLDPWD/$d/setup.sh" && ! bash "$OLDPWD/$d/verify.sh"); done` — Expected: PASS, and every task fails before solving.
 - [ ] **Step 5: Commit** `git commit -m "feat(eval): hx eval runner and 50-task starter set"`
 
-### Task 27: Live smoke suite and daily-driver acceptance
+### Task 35: Live smoke suite and daily-driver acceptance
 
 **Files:**
 - Create: `crates/hx-cli/tests/live_smoke.rs` (`#[ignore]`, requires keys), `.github/workflows/nightly.yml`
