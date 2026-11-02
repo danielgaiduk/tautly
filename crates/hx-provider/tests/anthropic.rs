@@ -441,3 +441,37 @@ async fn unrelated_400_mentioning_context_is_invalid_request() {
         Err(ProviderError::InvalidRequest(_))
     ));
 }
+
+#[test]
+fn user_image_content_becomes_base64_image_block() {
+    let mut req = base_req();
+    req.messages = vec![Message {
+        role: Role::User,
+        content: vec![
+            Content::Text("look".into()),
+            Content::Image {
+                media_type: "image/png".into(),
+                data: vec![1, 2, 3],
+            },
+        ],
+    }];
+    let w = to_wire(&req);
+    assert_eq!(
+        w["messages"][0]["content"],
+        json!([
+            {"type":"text","text":"look"},
+            {"type":"image","source":{"type":"base64","media_type":"image/png","data":"AQID"}},
+        ])
+    );
+}
+
+#[test]
+fn image_content_serde_round_trips_as_base64() {
+    let c = Content::Image {
+        media_type: "image/png".into(),
+        data: vec![1, 2, 3],
+    };
+    let v = serde_json::to_value(&c).unwrap();
+    assert_eq!(v, json!({"image":{"media_type":"image/png","data":"AQID"}}));
+    assert_eq!(serde_json::from_value::<Content>(v).unwrap(), c);
+}

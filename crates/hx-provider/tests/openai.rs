@@ -562,3 +562,25 @@ async fn expired_previous_response_falls_back_to_full_history() {
     assert!(b[2].get("previous_response_id").is_none());
     assert_eq!(b[2]["input"].as_array().unwrap().len(), 3);
 }
+
+#[test]
+fn user_image_content_becomes_input_image_data_url() {
+    let req = req_of(vec![msg(
+        Role::User,
+        vec![
+            text("look"),
+            Content::Image {
+                media_type: "image/png".into(),
+                data: vec![1, 2, 3],
+            },
+        ],
+    )]);
+    let w = to_wire(&req, None);
+    assert_eq!(
+        w["input"],
+        json!([{"role":"user","content":[
+            {"type":"input_text","text":"look"},
+            {"type":"input_image","image_url":"data:image/png;base64,AQID"},
+        ]}])
+    );
+}

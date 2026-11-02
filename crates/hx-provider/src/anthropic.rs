@@ -13,6 +13,7 @@ use tokio_util::sync::CancellationToken;
 use url::Url;
 
 use crate::sse::try_events;
+use crate::util::{header_u64, retry_after, transient};
 use crate::{
     Block, CachePoint, CanonicalRequest, Catalog, Content, Effort, Provider, ProviderError,
     ProviderEvent, Quota, RawUsage, Reasoning, Role, StopReason,
@@ -71,6 +72,9 @@ fn effort_budget(e: &Effort) -> u32 {
 fn content_to_wire(c: &Content) -> Option<Value> {
     Some(match c {
         Content::Text(t) => json!({"type": "text", "text": t}),
+        Content::Image { media_type, data } => {
+            json!({"type": "image", "source": {"type": "base64", "media_type": media_type, "data": STANDARD.encode(data)}})
+        }
         Content::ToolUse { id, name, input } => {
             json!({"type": "tool_use", "id": id, "name": name, "input": input})
         }
@@ -161,10 +165,6 @@ pub fn to_wire(req: &CanonicalRequest) -> Value {
         None => {}
     }
     body
-}
-
-pub(crate) fn header_u64(h: &HeaderMap, name: &str) -> Option<u64> {
-    h.get(name)?.to_str().ok()?.trim().parse().ok()
 }
 
 fn header_time(h: &HeaderMap, name: &str) -> Option<SystemTime> {
@@ -371,14 +371,6 @@ impl StreamState {
     }
 }
 
-pub(crate) fn transient(msg: impl Into<String>) -> ProviderError {
-    ProviderError::Transient {
-        status: None,
-        retry_after: None,
-        msg: msg.into(),
-    }
-}
-
 impl Provider for AnthropicProvider {
     fn name(&self) -> &str {
         "anthropic"
@@ -423,7 +415,7 @@ impl Provider for AnthropicProvider {
             };
             let status = resp.status();
             if !status.is_success() {
-                let retry_after = header_u64(resp.headers(), "retry-after").map(Duration::from_secs);
+                let retry_after = retry_after(resp.headers());
                 let body = resp.text().await.unwrap_or_default();
                 yield Err(map_http_error(status.as_u16(), retry_after, &body));
                 return;

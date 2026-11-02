@@ -103,6 +103,11 @@ pub enum Block {
 #[serde(rename_all = "snake_case")]
 pub enum Content {
     Text(String),
+    Image {
+        media_type: String,
+        #[serde(with = "b64")]
+        data: Vec<u8>,
+    },
     ToolUse {
         id: String,
         name: String,

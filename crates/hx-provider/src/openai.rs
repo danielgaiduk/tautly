@@ -8,20 +8,20 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
+use base64::{Engine, engine::general_purpose::STANDARD};
 use futures::StreamExt;
 use futures::stream::BoxStream;
-use reqwest::header::HeaderMap;
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 use url::Url;
 
-use crate::anthropic::{header_u64, transient};
 use crate::sse::try_events;
+use crate::util::{openai_quota_from_headers, retry_after, transient};
 use crate::{
     Block, CanonicalRequest, Catalog, Content, Effort, Message, Provider, ProviderError,
-    ProviderEvent, Quota, RawUsage, Reasoning, Role, StopReason,
+    ProviderEvent, RawUsage, Reasoning, Role, StopReason,
 };
 
 /// Last completed response: id, blake3 of the serialized input items it covers, item count.
@@ -103,7 +103,9 @@ fn input_items(messages: &[Message]) -> Vec<Value> {
                         flush(&mut text, &mut items);
                         items.push(tool_call_item(id, name, input));
                     }
-                    Content::ToolResult { .. } | Content::Reasoning { .. } => {}
+                    Content::ToolResult { .. }
+                    | Content::Reasoning { .. }
+                    | Content::Image { .. } => {}
                 }
             }
             flush(&mut text, &mut items);
@@ -121,6 +123,10 @@ fn input_items(messages: &[Message]) -> Vec<Value> {
                 .iter()
                 .filter_map(|c| match c {
                     Content::Text(t) => Some(json!({"type": "input_text", "text": t})),
+                    Content::Image { media_type, data } => Some(json!({
+                        "type": "input_image",
+                        "image_url": format!("data:{media_type};base64,{}", STANDARD.encode(data)),
+                    })),
                     _ => None,
                 })
                 .collect();
@@ -189,56 +195,6 @@ fn build_body(req: &CanonicalRequest, input: &[Value], prev: Option<&str>) -> Va
 /// is continuing a stored response and must pass a request holding only the new messages.
 pub fn to_wire(req: &CanonicalRequest, prev: Option<&str>) -> Value {
     build_body(req, &input_items(&req.messages), prev)
-}
-
-/// Parse a Go-style duration such as `1s`, `6m0s` or `20ms`.
-fn parse_go_duration(s: &str) -> Option<Duration> {
-    let mut rest = s.trim();
-    if rest.is_empty() {
-        return None;
-    }
-    let mut secs = 0f64;
-    let is_num = |c: char| c.is_ascii_digit() || c == '.';
-    while !rest.is_empty() {
-        let n_end = rest.find(|c| !is_num(c))?;
-        let n: f64 = rest[..n_end].parse().ok()?;
-        rest = &rest[n_end..];
-        let u_end = rest.find(is_num).unwrap_or(rest.len());
-        let scale = match &rest[..u_end] {
-            "h" => 3600.0,
-            "m" => 60.0,
-            "s" => 1.0,
-            "ms" => 1e-3,
-            "us" | "\u{b5}s" => 1e-6,
-            "ns" => 1e-9,
-            _ => return None,
-        };
-        secs += n * scale;
-        rest = &rest[u_end..];
-    }
-    Duration::try_from_secs_f64(secs).ok()
-}
-
-fn header_duration(h: &HeaderMap, name: &str) -> Option<Duration> {
-    parse_go_duration(h.get(name)?.to_str().ok()?)
-}
-
-fn quota_from_headers(h: &HeaderMap) -> Option<Quota> {
-    let now = SystemTime::now();
-    let quota = Quota {
-        remaining_requests: header_u64(h, "x-ratelimit-remaining-requests"),
-        remaining_tokens: header_u64(h, "x-ratelimit-remaining-tokens"),
-        // Quota is fully restored once the later of the resets has passed.
-        reset_at: [
-            header_duration(h, "x-ratelimit-reset-requests"),
-            header_duration(h, "x-ratelimit-reset-tokens"),
-        ]
-        .into_iter()
-        .flatten()
-        .max()
-        .and_then(|d| now.checked_add(d)),
-    };
-    (quota != Quota::default()).then_some(quota)
 }
 
 fn error_parts(body: &str) -> (Option<String>, String) {
@@ -538,7 +494,7 @@ impl Provider for OpenAiProvider {
                 if status.is_success() {
                     break resp;
                 }
-                let retry_after = header_u64(resp.headers(), "retry-after").map(Duration::from_secs);
+                let retry_after = retry_after(resp.headers());
                 let text = resp.text().await.unwrap_or_default();
                 if reuse.is_some() && text.contains("previous_response_not_found") {
                     // The stored response expired or was deleted: resend the full history.
@@ -549,7 +505,7 @@ impl Provider for OpenAiProvider {
                 yield Err(map_http_error(status.as_u16(), retry_after, &text));
                 return;
             };
-            if let Some(q) = quota_from_headers(resp.headers()) {
+            if let Some(q) = openai_quota_from_headers(resp.headers()) {
                 yield Ok(ProviderEvent::Quota(q));
             }
 

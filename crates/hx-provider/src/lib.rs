@@ -7,6 +7,7 @@ pub mod catalog;
 pub mod cost;
 pub mod error;
 pub mod openai;
+pub(crate) mod util;
 
 pub use canonical::*;
 pub use capabilities::*;
