@@ -11,3 +11,21 @@ pub use capabilities::*;
 pub use catalog::{Catalog, CatalogError, ModelInfo, Price};
 pub use cost::cost_usd;
 pub use error::ProviderError;
+pub mod mock;
+pub mod retry;
+
+pub use mock::{MockProvider, MockTurn};
+pub use retry::Retrying;
+
+use futures::stream::BoxStream;
+use tokio_util::sync::CancellationToken;
+
+/// A streaming model backend. Adapters implement this; the engine wraps them in [`Retrying`].
+pub trait Provider: Send + Sync {
+    fn name(&self) -> &str;
+    fn stream(
+        &self,
+        req: CanonicalRequest,
+        cancel: CancellationToken,
+    ) -> BoxStream<'static, Result<ProviderEvent, ProviderError>>;
+}
