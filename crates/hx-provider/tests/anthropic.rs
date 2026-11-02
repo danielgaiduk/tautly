@@ -132,10 +132,6 @@ fn reasoning_budget_maps_to_thinking() {
 #[test]
 fn wire_basics_and_message_mapping() {
     let mut req = base_req();
-    req.system.push(Block::Image {
-        media_type: "image/png".into(),
-        data: vec![1, 2, 3],
-    });
     req.messages = vec![
         Message {
             role: Role::Assistant,
@@ -172,10 +168,6 @@ fn wire_basics_and_message_mapping() {
     assert_eq!(w["stream"], true);
     assert_eq!(w["max_tokens"], 16_000);
     assert_eq!(w["system"][0], json!({"type":"text","text":"You are hx."}));
-    assert_eq!(
-        w["system"][1]["source"],
-        json!({"type":"base64","media_type":"image/png","data":"AQID"})
-    );
     assert_eq!(w["tools"][0]["input_schema"], json!({"type":"object"}));
     let a = &w["messages"][0];
     assert_eq!(a["role"], "assistant");
@@ -267,6 +259,7 @@ async fn parses_thinking_fixture() {
         vec![
             ProviderEvent::ReasoningDelta("Let me think".into()),
             ProviderEvent::ReasoningDelta(" about this.".into()),
+            ProviderEvent::ReasoningSignature("EqQBCgIYAhIM".into()),
             ProviderEvent::TextDelta("42".into()),
             ProviderEvent::Usage(RawUsage {
                 input: 10,
@@ -410,4 +403,31 @@ async fn connection_failure_is_transient() {
         r[0],
         Err(ProviderError::Transient { status: None, .. })
     ));
+}
+
+#[tokio::test]
+async fn system_images_are_rejected_without_sending_a_request() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(sse(fixture("text.sse")))
+        .expect(0)
+        .mount(&server)
+        .await;
+    let mut req = base_req();
+    req.system.push(Block::Image {
+        media_type: "image/png".into(),
+        data: vec![1],
+    });
+    let p = AnthropicProvider::new(
+        "k".into(),
+        server.uri().parse().unwrap(),
+        Arc::new(Catalog::builtin()),
+    );
+    let r: Vec<_> = p.stream(req, CancellationToken::new()).collect().await;
+    assert_eq!(
+        r,
+        vec![Err(ProviderError::InvalidRequest(
+            "images are not supported in the system prompt".into()
+        ))]
+    );
 }

@@ -322,7 +322,10 @@ impl StreamState {
                                 .push_str(d["partial_json"].as_str().unwrap_or_default());
                         }
                     }
-                    // signature_delta and unknown delta types carry nothing the canonical stream models.
+                    "signature_delta" => out.push(ProviderEvent::ReasoningSignature(
+                        d["signature"].as_str().unwrap_or_default().into(),
+                    )),
+                    // Unknown delta types carry nothing the canonical stream models.
                     _ => {}
                 }
             }
@@ -383,6 +386,13 @@ impl Provider for AnthropicProvider {
             req.max_output = req
                 .max_output
                 .min(self.catalog.get(&req.model).caps.max_output);
+        }
+        if req.system.iter().any(|b| matches!(b, Block::Image { .. })) {
+            return Box::pin(futures::stream::once(async {
+                Err(ProviderError::InvalidRequest(
+                    "images are not supported in the system prompt".into(),
+                ))
+            }));
         }
         let builder = self
             .client

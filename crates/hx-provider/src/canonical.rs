@@ -174,6 +174,8 @@ pub struct Quota {
 pub enum ProviderEvent {
     TextDelta(String),
     ReasoningDelta(String),
+    /// Signature of the thinking block just streamed; send it back with the reasoning text.
+    ReasoningSignature(String),
     ToolCall {
         id: String,
         name: String,
