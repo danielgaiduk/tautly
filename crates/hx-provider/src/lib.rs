@@ -1,5 +1,6 @@
 //! Canonical provider types, capabilities, model catalog and cost accounting.
 
+pub mod anthropic;
 pub mod canonical;
 pub mod capabilities;
 pub mod catalog;
@@ -13,6 +14,7 @@ pub use cost::cost_usd;
 pub use error::ProviderError;
 pub mod mock;
 pub mod retry;
+pub mod sse;
 
 pub use mock::{MockProvider, MockTurn};
 pub use retry::Retrying;
