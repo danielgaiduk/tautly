@@ -1,0 +1,115 @@
+# Built-in model catalog. Prices are USD per million tokens.
+# NOTE: windows and prices below are best-effort estimates and MUST be verified
+# against the providers' pricing pages before release.
+
+[models."anthropic/claude-sonnet-5-5"]
+context_window = 200000
+max_output = 64000
+parallel_tools = true
+reasoning = "budget"
+cache = "explicit"
+images = true
+edit_format = "str_replace"
+[models."anthropic/claude-sonnet-5-5".price]
+input = 3.0
+output = 15.0
+cache_read = 0.3
+cache_write = 3.75
+
+[models."anthropic/claude-opus-5-5"]
+context_window = 200000
+max_output = 64000
+parallel_tools = true
+reasoning = "budget"
+cache = "explicit"
+images = true
+edit_format = "str_replace"
+[models."anthropic/claude-opus-5-5".price]
+input = 5.0
+output = 25.0
+cache_read = 0.5
+cache_write = 6.25
+
+[models."anthropic/claude-haiku-5-5"]
+context_window = 200000
+max_output = 64000
+parallel_tools = true
+reasoning = "budget"
+cache = "explicit"
+images = true
+edit_format = "str_replace"
+[models."anthropic/claude-haiku-5-5".price]
+input = 1.0
+output = 5.0
+cache_read = 0.1
+cache_write = 1.25
+
+[models."anthropic/claude-fable-5-1"]
+context_window = 200000
+max_output = 64000
+parallel_tools = true
+reasoning = "budget"
+cache = "explicit"
+images = true
+edit_format = "str_replace"
+[models."anthropic/claude-fable-5-1".price]
+input = 15.0
+output = 75.0
+cache_read = 1.5
+cache_write = 18.75
+
+[models."openai/gpt-5"]
+context_window = 400000
+max_output = 128000
+parallel_tools = true
+reasoning = "effort"
+cache = "automatic"
+images = true
+edit_format = "patch"
+[models."openai/gpt-5".price]
+input = 1.25
+output = 10.0
+cache_read = 0.125
+cache_write = 0.0
+
+[models."openai/gpt-5-mini"]
+context_window = 400000
+max_output = 128000
+parallel_tools = true
+reasoning = "effort"
+cache = "automatic"
+images = true
+edit_format = "patch"
+[models."openai/gpt-5-mini".price]
+input = 0.25
+output = 2.0
+cache_read = 0.025
+cache_write = 0.0
+
+[models."google/gemini-3-pro"]
+context_window = 1000000
+max_output = 64000
+parallel_tools = true
+reasoning = "budget"
+cache = "automatic"
+images = true
+edit_format = "str_replace"
+[models."google/gemini-3-pro".price]
+input = 2.0
+output = 12.0
+cache_read = 0.2
+cache_write = 0.0
+
+[models."google/gemini-3-flash"]
+context_window = 1000000
+max_output = 64000
+parallel_tools = true
+reasoning = "budget"
+cache = "automatic"
+images = true
+edit_format = "str_replace"
+[models."google/gemini-3-flash".price]
+input = 0.5
+output = 3.0
+cache_read = 0.05
+cache_write = 0.0
