@@ -1,0 +1,6 @@
+event: response.created
+data: {"type":"response.created","sequence_number":0,"response":{"id":"resp_6","object":"response","status":"in_progress","output":[]}}
+
+event: error
+data: {"type":"error","sequence_number":1,"code":"invalid_prompt","message":"Prompt was flagged.","param":null}
+

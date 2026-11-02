@@ -8,3 +8,11 @@ available when they were written.
 
 They must be replaced by real recordings (with keys scrubbed) when API keys are
 available.
+
+The files under `openai/` are likewise hand-authored, from OpenAI's documented Responses
+streaming events (`response.created`, `response.output_item.added`/`.done`,
+`response.output_text.delta`, `response.reasoning_summary_text.delta`,
+`response.function_call_arguments.delta`/`.done`, `response.completed`,
+`response.incomplete`, `response.failed`, `error`). They are NOT recordings of real API
+responses, and must be replaced by real recordings (keys scrubbed) when API keys are
+available.

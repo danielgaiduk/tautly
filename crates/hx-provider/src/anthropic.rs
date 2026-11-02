@@ -163,7 +163,7 @@ pub fn to_wire(req: &CanonicalRequest) -> Value {
     body
 }
 
-fn header_u64(h: &HeaderMap, name: &str) -> Option<u64> {
+pub(crate) fn header_u64(h: &HeaderMap, name: &str) -> Option<u64> {
     h.get(name)?.to_str().ok()?.trim().parse().ok()
 }
 
@@ -371,7 +371,7 @@ impl StreamState {
     }
 }
 
-fn transient(msg: impl Into<String>) -> ProviderError {
+pub(crate) fn transient(msg: impl Into<String>) -> ProviderError {
     ProviderError::Transient {
         status: None,
         retry_after: None,
