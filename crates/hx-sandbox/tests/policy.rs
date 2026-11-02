@@ -254,7 +254,6 @@ fn bash_argv_paths_are_protected_in_every_mode() {
         "cp x ~/.zshenv",
         "cp x $HOME/.bashrc",
         "cp x .git/hooks/{a,b}",
-        "sed -i s/a/b/ *",
         "cp --target-directory=.git/hooks x",
     ] {
         assert!(asks(allow.decide("bash", &exec("x"), Some(cmd))), "{cmd}");
@@ -363,4 +362,36 @@ fn more_shell_rc_files_protected() {
     ] {
         assert!(asks(p(Mode::Yolo).decide("write", &write(f), None)), "{f}");
     }
+}
+
+#[test]
+fn unresolvable_argv_words_ask_only_if_they_may_name_protected_paths() {
+    let y = p(Mode::Yolo);
+    for cmd in [
+        "find src -name '*.rs'",
+        "grep -r \"a.*b\" src",
+        "git log HEAD@{1}",
+        "echo $X",
+    ] {
+        assert_eq!(
+            y.decide("bash", &exec("x"), Some(cmd)),
+            Decision::Allow,
+            "{cmd}"
+        );
+    }
+    for cmd in [
+        "cp x .git/hook?/pre-commit",
+        "cp x ~/.zshrc",
+        "cp x ~other/y",
+        "cp x $HOME$S/y",
+        "cp x *akefile",
+        "cp x .GIT*/c",
+    ] {
+        assert!(asks(y.decide("bash", &exec("x"), Some(cmd))), "{cmd}");
+    }
+    assert!(asks(y.decide(
+        "bash",
+        &exec("echo"),
+        Some("echo hi > $OUT")
+    )));
 }

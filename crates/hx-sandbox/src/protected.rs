@@ -94,8 +94,18 @@ pub(crate) fn argv_word_reason(root: &Path, word: &str) -> Option<String> {
             return is_protected(Path::new(tail)).then(|| format!("protected path: {word}"));
         }
     }
-    if word.starts_with('~') || word.contains(['$', '{', '*', '?', '[']) {
-        return Some(format!("unresolvable path pattern: {word}"));
+    if word.starts_with('~') || word.starts_with("$HOME") || word.starts_with("${HOME}") {
+        return Some(format!("home-relative path: {word}"));
+    }
+    if word.contains(['$', '{', '*', '?', '[']) {
+        // Cannot be resolved statically; only matters if it could name a protected path.
+        let lower = word.to_lowercase();
+        let token = PROTECTED_DIRS
+            .iter()
+            .chain(PROTECTED_FILES)
+            .chain(&[".github"])
+            .any(|t| lower.contains(t));
+        return token.then(|| format!("unresolvable path pattern: {word}"));
     }
     let rel = normalize(root, word)?;
     is_protected(&rel).then(|| format!("protected path: {}", rel.display()))
