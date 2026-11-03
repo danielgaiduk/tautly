@@ -2492,19 +2492,26 @@ dependencies = [
 name = "tautly-core"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "blake3",
+ "futures",
+ "ignore",
  "insta",
  "keyring",
  "libc",
  "serde",
  "serde_json",
  "tautly-context",
+ "tautly-index",
  "tautly-memory",
  "tautly-provider",
  "tautly-sandbox",
+ "tautly-session",
  "tautly-tools",
  "tempfile",
  "thiserror",
+ "tokio",
+ "tokio-util",
  "toml",
  "url",
 ]

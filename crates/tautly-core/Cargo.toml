@@ -1,6 +1,6 @@
 [package]
 name = "tautly-core"
-description = "Tautly engine: configuration, authentication and the client protocol (events and commands)"
+description = "Tautly engine: the turn loop, approvals, configuration, authentication and the client protocol"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -12,6 +12,12 @@ tautly-sandbox = { path = "../tautly-sandbox" }
 tautly-tools = { path = "../tautly-tools" }
 tautly-context = { path = "../tautly-context" }
 tautly-memory = { path = "../tautly-memory" }
+tautly-index = { path = "../tautly-index" }
+tautly-session = { path = "../tautly-session" }
+tokio.workspace = true
+tokio-util.workspace = true
+futures.workspace = true
+blake3.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 toml.workspace = true
@@ -28,4 +34,5 @@ keyring = { workspace = true, features = ["linux-native-async-persistent", "cryp
 [dev-dependencies]
 insta.workspace = true
 tempfile.workspace = true
-blake3.workspace = true
+async-trait.workspace = true
+ignore.workspace = true
