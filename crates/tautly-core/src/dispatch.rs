@@ -11,6 +11,7 @@
 //! shown.
 
 use std::panic::AssertUnwindSafe;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use futures::FutureExt;
@@ -25,7 +26,7 @@ use tokio::sync::mpsc;
 use crate::approvals::Verdict;
 use crate::protocol::{EffectView, Event};
 use crate::record::{SessionRecord, storable, utf8_effects};
-use crate::session::Session;
+use crate::session::{Log, LogFailure, Session};
 use crate::turn::{Call, TurnControl};
 
 /// Output lines buffered per running tool before they are dropped (bash never blocks).
@@ -109,8 +110,16 @@ impl Session {
             };
             let run = &planned[start..end];
             let outcomes = self.execute(run, turn, ctl).await;
+            let mut finished = Vec::with_capacity(run.len());
             for (p, o) in run.iter().zip(outcomes) {
-                results.push(self.finish(p.call, o, turn).await);
+                let (content, event) = self.finish(p.call, o, turn).await;
+                results.push(content);
+                finished.push(event);
+            }
+            // One durability point per run, before any of its results is shown.
+            self.checkpoint().await;
+            for ev in finished {
+                self.emit(ev).await;
             }
             start = end;
         }
@@ -292,8 +301,9 @@ impl Session {
         result
     }
 
-    /// Settle one call's outcome in model order and return its result for the history.
-    async fn finish(&mut self, call: &Call, outcome: Outcome, turn: u32) -> Content {
+    /// Settle one call's outcome in model order: its result for the history and its
+    /// `ToolFinished`, to be shown once the run is checkpointed.
+    async fn finish(&mut self, call: &Call, outcome: Outcome, turn: u32) -> (Content, Event) {
         let Outcome {
             mut result,
             blocked,
@@ -333,8 +343,7 @@ impl Session {
             result.is_error,
             turn,
         );
-        self.persist_result(call, &result, turn).await;
-        self.emit(Event::ToolFinished {
+        let event = Event::ToolFinished {
             call_id: call.id.clone(),
             tool: call.name.clone(),
             output: result.output.clone(),
@@ -342,72 +351,99 @@ impl Session {
             blocked,
             effects: result.effects.iter().map(EffectView::from).collect(),
             meta: (&result.meta).into(),
-        })
-        .await;
-        Content::ToolResult {
-            id: call.id.clone(),
-            output: result.output,
-            is_error: result.is_error,
-        }
-    }
-
-    /// Log a result with its effects (file contents as blobs, paths that are not valid
-    /// UTF-8 left out with a warning) and an `Edit` record per changed file, then fsync.
-    async fn persist_result(&mut self, call: &Call, result: &ToolResult, turn: u32) {
-        let Some(result_blob) = self.blob(result.output.as_bytes()).await else {
-            return;
         };
-        let log = self.log.clone();
-        let mut persisted = Vec::with_capacity(result.effects.len());
-        for e in &result.effects {
-            let mut put = |bytes: &[u8]| log.blob(bytes).map(|b| b.as_str().to_string());
-            match PersistedEffect::from_applied(e, &mut put) {
-                Ok(p) => persisted.push(p),
-                Err(f) => {
-                    if let Some(ev) = f.event() {
-                        self.emit(ev).await;
-                    }
-                    return;
-                }
+        let content = Content::ToolResult {
+            id: call.id.clone(),
+            output: result.output.clone(),
+            is_error: result.is_error,
+        };
+        let id = call.id.clone();
+        if let Some(skipped) = self
+            .with_log(move |log| persist_result(log, id, result, turn))
+            .await
+        {
+            self.untracked(skipped.untracked).await;
+            for p in skipped.bad_pre_images {
+                self.warn(format!(
+                    "{}: the change is not in the session log (its prior content could not \
+                     be referenced), so undo will not restore it",
+                    p.to_string_lossy()
+                ))
+                .await;
             }
         }
-        let (effects, skipped) = utf8_effects(persisted);
-        self.untracked(skipped).await;
-        let edits: Vec<SessionRecord> = effects
-            .iter()
-            .filter_map(|e| {
-                let (path, pre) = match e {
-                    PersistedEffect::Edited {
-                        path,
-                        pre_image_blob,
-                        ..
-                    } => (path, pre_image_blob.as_deref()),
-                    PersistedEffect::Deleted {
-                        path,
-                        pre_image_blob,
-                        ..
-                    } => (path, Some(pre_image_blob.as_str())),
-                    _ => return None,
-                };
-                debug_assert!(storable(path));
-                Some(SessionRecord::Edit {
-                    path: path.clone(),
-                    pre_image: pre.and_then(|b| BlobRef::parse(b).ok()),
-                    turn,
-                })
-            })
-            .collect();
-        self.log(SessionRecord::ToolResult {
-            id: call.id.clone(),
-            result_blob,
-            is_error: result.is_error,
-            effects,
-            meta: result.meta.clone(),
-        })
-        .await;
-        for rec in edits {
-            self.log(rec).await;
-        }
-        self.checkpoint().await;
+        (content, event)
     }
+}
+
+/// What [`persist_result`] left out of the log.
+struct Skipped {
+    /// Paths that are not valid UTF-8.
+    untracked: Vec<PathBuf>,
+    /// Changed files whose pre-image reference is unusable: no `Edit` record, rather than
+    /// one that says the file was created.
+    bad_pre_images: Vec<PathBuf>,
+}
+
+/// Log a result with its effects (file contents as blobs, paths that are not valid UTF-8
+/// left out) and an `Edit` record per changed file. Buffered: the caller checkpoints.
+/// Blocking file I/O.
+fn persist_result(
+    log: &Log,
+    id: String,
+    result: ToolResult,
+    turn: u32,
+) -> Result<Skipped, LogFailure> {
+    let result_blob = log.blob(result.output.as_bytes())?;
+    let mut persisted = Vec::with_capacity(result.effects.len());
+    for e in &result.effects {
+        let mut put = |bytes: &[u8]| log.blob(bytes).map(|b| b.as_str().to_string());
+        persisted.push(PersistedEffect::from_applied(e, &mut put)?);
+    }
+    let (effects, untracked) = utf8_effects(persisted);
+    let mut edits = Vec::new();
+    let mut bad_pre_images = Vec::new();
+    for e in &effects {
+        let (path, pre) = match e {
+            PersistedEffect::Edited {
+                path,
+                pre_image_blob,
+                ..
+            } => (path, pre_image_blob.as_deref()),
+            PersistedEffect::Deleted {
+                path,
+                pre_image_blob,
+                ..
+            } => (path, Some(pre_image_blob.as_str())),
+            _ => continue,
+        };
+        debug_assert!(storable(path));
+        let pre_image = match pre.map(BlobRef::parse) {
+            None => None,
+            Some(Ok(b)) => Some(b),
+            Some(Err(_)) => {
+                bad_pre_images.push(path.clone());
+                continue;
+            }
+        };
+        edits.push(SessionRecord::Edit {
+            path: path.clone(),
+            pre_image,
+            turn,
+        });
+    }
+    log.append(&SessionRecord::ToolResult {
+        id,
+        result_blob,
+        is_error: result.is_error,
+        effects,
+        meta: result.meta,
+    })?;
+    for rec in &edits {
+        log.append(rec)?;
+    }
+    Ok(Skipped {
+        untracked,
+        bad_pre_images,
+    })
 }

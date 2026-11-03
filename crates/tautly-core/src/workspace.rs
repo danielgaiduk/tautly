@@ -81,8 +81,13 @@ impl Workspace {
         let mut handle = None;
         if let Some(index) = &index {
             Arc::clone(index).spawn_background_refresh();
-            match Arc::clone(index).start_watcher() {
-                Ok(h) => handle = Some(h),
+            // A recursive watch can walk the whole tree (inotify): off the async workers.
+            let watched = Arc::clone(index);
+            match tokio::task::spawn_blocking(move || watched.start_watcher()).await {
+                Ok(Ok(h)) => handle = Some(h),
+                Ok(Err(e)) => warnings.push(format!(
+                    "file watcher not running ({e}); the code index is treated as stale"
+                )),
                 Err(e) => warnings.push(format!(
                     "file watcher not running ({e}); the code index is treated as stale"
                 )),

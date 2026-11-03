@@ -4,17 +4,19 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use tautly_context::pinned::{self, PinSource, Pinned};
 use tautly_context::{CompactionRecord, Context, agents_md};
-use tautly_provider::{ModelId, ModelInfo, Provider, ToolSpec};
+use tautly_provider::{CanonicalRequest, ModelId, ModelInfo, Provider, ToolSpec};
 use tautly_sandbox::{Policy, Sandbox, cleanup_spills};
 use tautly_session::{BlobRef, SessionWriter};
 use tautly_tools::{ReadTracker, Tool};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 
 use crate::attempts::AttemptLedger;
 use crate::protocol::{Command, ErrorKind, Event};
@@ -31,19 +33,72 @@ const SPILL_MAX_AGE: Duration = Duration::from_secs(7 * 24 * 3600);
 /// The spill store is cut back to this size at engine start.
 const SPILL_MAX_BYTES: u64 = 256 * 1024 * 1024;
 
-/// Where events go. A client that stopped listening is not an error.
+/// How long an event waits for room in the channel once the turn is cancelled (or for
+/// the actor's last words) before it is dropped.
+const SEND_GRACE: Duration = Duration::from_secs(1);
+
+/// Where events go. A client that stopped listening is not an error, and a client that
+/// stopped reading cannot wedge the engine: a sink [`bound`](EventSink::bound) to a turn
+/// waits on a full channel only until the turn is cancelled (then [`SEND_GRACE`]); an
+/// unbound sink (the actor's, and the session's between turns) never waits. Dropped
+/// events are counted and announced with a warning as soon as there is room.
 #[derive(Clone)]
 pub(crate) struct EventSink {
     tx: mpsc::Sender<Event>,
+    cancel: Option<CancellationToken>,
+    dropped: Arc<AtomicU64>,
 }
 
 impl EventSink {
     pub fn new(tx: mpsc::Sender<Event>) -> Self {
-        EventSink { tx }
+        EventSink {
+            tx,
+            cancel: None,
+            dropped: Arc::default(),
+        }
+    }
+
+    /// This sink, giving up on a full channel once `cancel` fires.
+    pub fn bound(&self, cancel: CancellationToken) -> Self {
+        EventSink {
+            cancel: Some(cancel),
+            ..self.clone()
+        }
     }
 
     pub async fn emit(&self, ev: Event) {
-        let _ = self.tx.send(ev).await;
+        self.announce_dropped();
+        match &self.cancel {
+            None => self.try_emit(ev),
+            Some(cancel) => {
+                let permit = tokio::select! {
+                    permit = self.tx.reserve() => Some(permit),
+                    () = cancel.cancelled() => None,
+                };
+                match permit {
+                    Some(Ok(permit)) => permit.send(ev),
+                    Some(Err(_)) => {}
+                    None => self.send_or_drop(ev).await,
+                }
+            }
+        }
+    }
+
+    /// Send within [`SEND_GRACE`], else drop and count.
+    pub async fn send_or_drop(&self, ev: Event) {
+        if let Err(mpsc::error::SendTimeoutError::Timeout(_)) =
+            self.tx.send_timeout(ev, SEND_GRACE).await
+        {
+            self.dropped.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Send now if there is room, else drop and count. Never waits.
+    pub fn try_emit(&self, ev: Event) {
+        self.announce_dropped();
+        if let Err(mpsc::error::TrySendError::Full(_)) = self.tx.try_send(ev) {
+            self.dropped.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     pub async fn warn(&self, message: impl Into<String>) {
@@ -52,11 +107,28 @@ impl EventSink {
         })
         .await;
     }
+
+    /// Say how many events were dropped, if any and if there is room now.
+    fn announce_dropped(&self) {
+        let n = self.dropped.swap(0, Ordering::Relaxed);
+        if n == 0 {
+            return;
+        }
+        let ev = Event::Warning {
+            message: format!(
+                "{n} event{} dropped because the client was not reading events",
+                if n == 1 { " was" } else { "s were" }
+            ),
+        };
+        if self.tx.try_send(ev).is_err() {
+            self.dropped.fetch_add(n, Ordering::Relaxed);
+        }
+    }
 }
 
 /// The session log, shared by the actor (which logs commands as they arrive) and the turn.
 /// A failure poisons the writer, so the session is no longer persisted; it is reported
-/// once ([`Log::failure`]) and the session carries on in memory.
+/// once ([`LogFailure::event`]) and the session carries on in memory.
 #[derive(Clone)]
 pub(crate) struct Log {
     inner: Arc<Mutex<LogInner>>,
@@ -176,6 +248,8 @@ pub(crate) struct Session {
     pub history_provider: String,
     /// Non-UTF-8 paths already reported as not tracked.
     pub untracked_paths: HashSet<PathBuf>,
+    /// Where [`Session::log_request`] keeps the latest request.
+    pub last_request_path: PathBuf,
     pub index_error_reported: bool,
 }
 
@@ -188,33 +262,63 @@ impl Session {
         self.events.warn(message).await;
     }
 
-    async fn report(&self, failure: LogFailure) {
+    pub async fn report(&self, failure: LogFailure) {
         if let Some(ev) = failure.event() {
             self.emit(ev).await;
         }
     }
 
-    /// Append a record; a failure is reported once and otherwise ignored.
-    pub async fn log(&self, rec: SessionRecord) {
-        if let Err(f) = self.log.append(&rec) {
-            self.report(f).await;
+    /// Run `f` on the log off the async workers (the log writes files and fsyncs). A
+    /// failure is reported once and otherwise ignored: the session goes on in memory.
+    pub async fn with_log<T: Send + 'static>(
+        &self,
+        f: impl FnOnce(&Log) -> Result<T, LogFailure> + Send + 'static,
+    ) -> Option<T> {
+        let log = self.log.clone();
+        match tokio::task::spawn_blocking(move || f(&log)).await {
+            Ok(Ok(t)) => Some(t),
+            Ok(Err(failure)) => {
+                self.report(failure).await;
+                None
+            }
+            Err(_) => None,
         }
+    }
+
+    /// Append a record (buffered; durable at the next checkpoint).
+    pub async fn log(&self, rec: SessionRecord) {
+        self.with_log(move |l| l.append(&rec)).await;
+    }
+
+    /// Append several records with one trip off the async workers.
+    pub async fn log_all(&self, recs: Vec<SessionRecord>) {
+        self.with_log(move |l| recs.iter().try_for_each(|r| l.append(r)))
+            .await;
     }
 
     pub async fn blob(&self, bytes: &[u8]) -> Option<BlobRef> {
-        match self.log.blob(bytes) {
-            Ok(b) => Some(b),
-            Err(f) => {
-                self.report(f).await;
-                None
-            }
-        }
+        let bytes = bytes.to_vec();
+        self.with_log(move |l| l.blob(&bytes)).await
     }
 
+    /// Flush and fsync: at tool-run and turn boundaries.
     pub async fn checkpoint(&self) {
-        if let Err(f) = self.log.checkpoint() {
-            self.report(f).await;
-        }
+        self.with_log(|l| l.checkpoint()).await;
+    }
+
+    /// Log a request by its hash only, and keep the request itself, unsynced, in the
+    /// session's last-request file (for `prompt show --full`): a blob per request would
+    /// make the log grow with the square of the session length.
+    pub async fn log_request(&self, req: &CanonicalRequest) {
+        let bytes = serde_json::to_vec(req).unwrap_or_default();
+        let hash = BlobRef::parse(blake3::hash(&bytes).to_hex().as_str())
+            .expect("a blake3 hex digest is a blob reference");
+        let path = self.last_request_path.clone();
+        self.with_log(move |l| {
+            write_private(&path, &bytes);
+            l.append(&SessionRecord::Request { hash })
+        })
+        .await;
     }
 
     /// Say once per path that a non-UTF-8 path is left out of the log.
@@ -377,4 +481,19 @@ impl Session {
     pub fn root(&self) -> &Path {
         self.sandbox.root()
     }
+}
+
+/// Replace `path` with `bytes`, readable by the user only (requests hold the whole
+/// conversation). Best effort, not synced: it is a debugging aid, not the record.
+fn write_private(path: &Path, bytes: &[u8]) {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let written = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)
+        .and_then(|mut f| f.write_all(bytes));
+    drop(written);
 }

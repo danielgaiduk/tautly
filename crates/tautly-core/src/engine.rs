@@ -33,7 +33,7 @@ use crate::config::{Config, LoadedConfig};
 use crate::protocol::{Command, ErrorKind, Event, FinishReason};
 use crate::provider_setup::provider_for;
 use crate::record::SessionRecord;
-use crate::session::{EventSink, Log, Session};
+use crate::session::{EventSink, Log, LogFailure, Session};
 use crate::turn::TurnControl;
 use crate::workspace::Workspace;
 
@@ -118,6 +118,10 @@ impl EngineBuilder {
     /// be called inside a Tokio runtime. Opening the code index and memory store, reading
     /// AGENTS.md and cleaning the spill store happen after the first event
     /// (`SessionChanged`), off this path.
+    ///
+    /// Without a `provider`, this looks up the API key, which may read the OS keychain and
+    /// block (on macOS it can wait for the user to allow access): call it from
+    /// `tokio::task::spawn_blocking` (keeping the runtime entered) or pass a provider.
     pub fn build(self) -> Result<(Engine, mpsc::Receiver<Event>), EngineError> {
         let runtime = tokio::runtime::Handle::try_current().map_err(|_| EngineError::NoRuntime)?;
         if self.resume.is_some() {
@@ -197,6 +201,7 @@ impl EngineBuilder {
             latest_compaction: None,
             pending_memory_index: None,
             untracked_paths: HashSet::new(),
+            last_request_path: last_request_path(&session_path),
             index_error_reported: false,
         };
         let actor = Actor {
@@ -258,6 +263,17 @@ impl Engine {
     pub fn session_path(&self) -> &Path {
         &self.session_path
     }
+
+    /// The file holding the latest provider request in full (`prompt show --full`),
+    /// next to the session log; overwritten at every step and not fsynced.
+    pub fn last_request_path(&self) -> PathBuf {
+        last_request_path(&self.session_path)
+    }
+}
+
+/// `<session-id>.last-request.json` next to `<session-id>.jsonl`.
+pub(crate) fn last_request_path(session_path: &Path) -> PathBuf {
+    session_path.with_extension("last-request.json")
 }
 
 /// The turn task in flight. It hands back the session and the inbox, whose leftovers
@@ -284,14 +300,12 @@ impl Actor {
         config_warnings: Vec<String>,
         config_pins: Vec<String>,
     ) {
-        self.events
-            .emit(Event::SessionChanged {
-                session_id: self.session_id.clone(),
-            })
-            .await;
+        self.events.try_emit(Event::SessionChanged {
+            session_id: self.session_id.clone(),
+        });
         session.workspace.start();
         for w in config_warnings {
-            self.events.warn(w).await;
+            self.events.try_emit(Event::Warning { message: w });
         }
         session.init(&config_pins).await;
 
@@ -308,10 +322,12 @@ impl Actor {
                                 running = Some(self.spawn_turn(s, text));
                                 break;
                             }
-                            None => self.lost().await,
+                            None => self.lost(),
                         }
                     } else if let Some(s) = state.as_mut() {
                         self.idle_command(s, cmd).await;
+                    } else {
+                        self.lost();
                     }
                 }
             }
@@ -321,27 +337,30 @@ impl Actor {
             tokio::select! {
                 cmd = commands.recv(), if !stopping => {
                     let cmd = cmd.unwrap_or(Command::Shutdown);
-                    if let Err(f) = self.log.append(&SessionRecord::Command(cmd.clone())) {
-                        if let Some(ev) = f.event() {
-                            self.events.emit(ev).await;
-                        }
-                    }
+                    self.with_log({
+                        let rec = SessionRecord::Command(cmd.clone());
+                        move |l| l.append(&rec)
+                    })
+                    .await;
+                    let lost = state.is_none() && running.is_none();
                     match cmd {
+                        Command::Shutdown => {
+                            stopping = true;
+                            self.approvals.deny_all("the session is shutting down");
+                            self.shutdown.cancel();
+                        }
+                        // After a crashed turn every command gets the same answer.
+                        _ if lost => self.lost(),
                         Command::Approve { request_id } => {
-                            self.resolve(&request_id, Verdict::Approved).await;
+                            self.resolve(&request_id, Verdict::Approved);
                         }
                         Command::Deny { request_id, reason } => {
-                            self.resolve(&request_id, Verdict::Denied { reason }).await;
+                            self.resolve(&request_id, Verdict::Denied { reason });
                         }
                         Command::Cancel => {
                             if let Some(r) = &running {
                                 r.cancel.cancel();
                             }
-                        }
-                        Command::Shutdown => {
-                            stopping = true;
-                            self.approvals.deny_all("the session is shutting down");
-                            self.shutdown.cancel();
                         }
                         cmd @ (Command::Pin { .. } | Command::Unpin { .. }) if running.is_some() => {
                             if let Some(r) = &running {
@@ -366,9 +385,15 @@ impl Actor {
                 }
             }
         }
-        if let Err(f) = self.log.checkpoint() {
-            if let Some(ev) = f.event() {
-                self.events.emit(ev).await;
+        self.with_log(|l| l.checkpoint()).await;
+    }
+
+    /// Run `f` on the log off the async workers; a first failure is shown.
+    async fn with_log(&self, f: impl FnOnce(&Log) -> Result<(), LogFailure> + Send + 'static) {
+        let log = self.log.clone();
+        if let Ok(Err(failure)) = tokio::task::spawn_blocking(move || f(&log)).await {
+            if let Some(ev) = failure.event() {
+                self.events.try_emit(ev);
             }
         }
     }
@@ -392,11 +417,11 @@ impl Actor {
         }
     }
 
-    async fn resolve(&self, request_id: &str, verdict: Verdict) {
+    fn resolve(&self, request_id: &str, verdict: Verdict) {
         if !self.approvals.resolve(request_id, verdict) {
-            self.events
-                .warn(format!("no approval request `{request_id}` is pending"))
-                .await;
+            self.events.try_emit(Event::Warning {
+                message: format!("no approval request `{request_id}` is pending"),
+            });
         }
     }
 
@@ -409,30 +434,48 @@ impl Actor {
                     .ok()
                     .and_then(|v| v["type"].as_str().map(str::to_string))
                     .unwrap_or_default();
-                self.events
-                    .emit(Event::Error {
-                        kind: ErrorKind::Internal,
-                        message: format!("the `{name}` command is not supported yet"),
-                        retryable: false,
-                        hint: None,
-                    })
-                    .await;
+                self.events.try_emit(Event::Error {
+                    kind: ErrorKind::Internal,
+                    message: format!("the `{name}` command is not supported yet"),
+                    retryable: false,
+                    hint: None,
+                });
             }
         }
     }
 
     /// A turn task panicked: an engine bug. The state it held is gone, but the log is
-    /// intact up to the crash, so the session can be resumed.
+    /// intact up to the crash (plus the panic's message), so the session can be resumed.
     async fn crashed(&self, e: tokio::task::JoinError) {
-        let _ = self.log.append(&SessionRecord::TurnEnd {
-            reason: FinishReason::Error,
-        });
-        let _ = self.log.checkpoint();
+        let what = if e.is_panic() {
+            let payload = e.into_panic();
+            let text = payload
+                .downcast_ref::<&str>()
+                .map(|s| s.to_string())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "a panic without a message".to_string());
+            format!("the turn panicked: {text}")
+        } else {
+            format!("the turn stopped: {e}")
+        };
+        let recs = [
+            SessionRecord::EngineError {
+                message: what.clone(),
+            },
+            SessionRecord::TurnEnd {
+                reason: FinishReason::Error,
+            },
+        ];
+        self.with_log(move |l| {
+            recs.iter().try_for_each(|r| l.append(r))?;
+            l.checkpoint()
+        })
+        .await;
         self.events
-            .emit(Event::Error {
+            .send_or_drop(Event::Error {
                 kind: ErrorKind::Internal,
                 message: format!(
-                    "engine bug in session {}: the turn stopped ({e}); the session log is intact",
+                    "engine bug in session {}: {what}; the session log is intact",
                     self.session_id
                 ),
                 retryable: false,
@@ -440,23 +483,21 @@ impl Actor {
             })
             .await;
         self.events
-            .emit(Event::TurnFinished {
+            .send_or_drop(Event::TurnFinished {
                 reason: FinishReason::Error,
             })
             .await;
     }
 
-    async fn lost(&self) {
-        self.events
-            .emit(Event::Error {
-                kind: ErrorKind::Internal,
-                message: format!(
-                    "session {} stopped after an internal error and takes no more messages",
-                    self.session_id
-                ),
-                retryable: false,
-                hint: Some("resume the session to continue".into()),
-            })
-            .await;
+    fn lost(&self) {
+        self.events.try_emit(Event::Error {
+            kind: ErrorKind::Internal,
+            message: format!(
+                "session {} stopped after an internal error and takes no more commands",
+                self.session_id
+            ),
+            retryable: false,
+            hint: Some("resume the session to continue".into()),
+        });
     }
 }

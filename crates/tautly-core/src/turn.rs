@@ -83,16 +83,19 @@ impl Response {
                     signature: None,
                 }),
             },
-            ProviderEvent::ReasoningSignature(sig) => {
-                if let Some(Content::Reasoning { signature, .. }) = self
-                    .content
-                    .iter_mut()
-                    .rev()
-                    .find(|c| matches!(c, Content::Reasoning { .. }))
-                {
-                    *signature = Some(sig.clone());
-                }
-            }
+            // A signature belongs to the reasoning just streamed, if it is still unsigned.
+            // Otherwise it stands alone (Gemini signs function calls and parts that carry
+            // no thought text), as an empty reasoning item the adapter sends back.
+            ProviderEvent::ReasoningSignature(sig) => match self.content.last_mut() {
+                Some(Content::Reasoning {
+                    signature: signature @ None,
+                    ..
+                }) => *signature = Some(sig.clone()),
+                _ => self.content.push(Content::Reasoning {
+                    text: String::new(),
+                    signature: Some(sig.clone()),
+                }),
+            },
             ProviderEvent::RedactedReasoning(data) => self
                 .content
                 .push(Content::RedactedReasoning { data: data.clone() }),
@@ -202,6 +205,13 @@ fn error_event(e: &ProviderError) -> Event {
 impl Session {
     /// Run one user message to its end.
     pub async fn run_turn(&mut self, text: String, ctl: &mut TurnControl) {
+        let unbound = self.events.clone();
+        self.events = unbound.bound(ctl.cancel.clone());
+        self.run_turn_inner(text, ctl).await;
+        self.events = unbound;
+    }
+
+    async fn run_turn_inner(&mut self, text: String, ctl: &mut TurnControl) {
         self.apply_startup().await;
         self.emit(Event::TurnStarted).await;
         self.context.history.push(Turn {
@@ -238,12 +248,7 @@ impl Session {
                 return FinishReason::Cancelled;
             }
             let turn = self.context.next_turn();
-            if let Some(hash) = self
-                .blob(&serde_json::to_vec(&req).unwrap_or_default())
-                .await
-            {
-                self.log(SessionRecord::Request { hash }).await;
-            }
+            self.log_request(&req).await;
             let sent_at = Instant::now();
             let resp = match self.stream(req, ctl).await {
                 Ok(r) => r,
@@ -253,6 +258,14 @@ impl Session {
                     return FinishReason::Error;
                 }
             };
+            self.log_all(
+                resp.logged
+                    .iter()
+                    .cloned()
+                    .map(SessionRecord::Provider)
+                    .collect(),
+            )
+            .await;
             self.context.note_request(sent_at, status.cached_prefix);
             if let Some(u) = resp.usage {
                 self.context.calibrate(&status, &u);
@@ -268,9 +281,6 @@ impl Session {
                 .await;
             }
             self.emit(Event::context_status(&status)).await;
-            for ev in &resp.logged {
-                self.log(SessionRecord::Provider(ev.clone())).await;
-            }
             steps += 1;
             let assistant = Message {
                 role: Role::Assistant,
@@ -285,14 +295,17 @@ impl Session {
                 self.checkpoint().await;
                 return FinishReason::Completed;
             }
-            for c in &resp.calls {
-                self.log(SessionRecord::ToolCall {
-                    id: c.id.clone(),
-                    name: c.name.clone(),
-                    args: c.input(),
-                })
-                .await;
-            }
+            self.log_all(
+                resp.calls
+                    .iter()
+                    .map(|c| SessionRecord::ToolCall {
+                        id: c.id.clone(),
+                        name: c.name.clone(),
+                        args: c.input(),
+                    })
+                    .collect(),
+            )
+            .await;
             self.checkpoint().await;
             for c in &resp.calls {
                 self.emit(Event::ToolCallProposed {
@@ -345,6 +358,8 @@ impl Session {
         loop {
             let mut s = self.provider.stream(req.clone(), ctl.cancel.child_token());
             let mut resp = Response::default();
+            // Mirrors `Retrying`: usage and quota alone are not content.
+            let mut content = false;
             let broke = loop {
                 let item = tokio::select! {
                     biased;
@@ -363,6 +378,7 @@ impl Session {
                             }
                             _ => {}
                         }
+                        content |= !matches!(ev, ProviderEvent::Usage(_) | ProviderEvent::Quota(_));
                         resp.push(ev);
                     }
                     Some(Err(e)) => break Some(e),
@@ -370,7 +386,9 @@ impl Session {
             };
             match broke {
                 None => return Ok(resp.finish()),
-                Some(e) if e.is_transient() && attempt < MAX_REISSUES => {
+                // Before any content, `Retrying` has already retried (spec 3.5): its error
+                // is final. Only a response that broke off after content is sent again.
+                Some(e) if content && e.is_transient() && attempt < MAX_REISSUES => {
                     attempt += 1;
                     self.warn(format!(
                         "the response broke off ({e}); discarding it and sending the request again"
@@ -593,6 +611,69 @@ mod tests {
         assert_eq!(r.logged.len(), 3);
         let r = r.finish();
         assert_eq!(r.content, vec![Content::Text("ab".into())]);
+    }
+
+    fn reasoning(r: &Response) -> Vec<(String, Option<String>)> {
+        r.content
+            .iter()
+            .filter_map(|c| match c {
+                Content::Reasoning { text, signature } => Some((text.clone(), signature.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_signature_without_thought_text_is_kept_as_its_own_item() {
+        // Gemini: a signed function call with no thought before it.
+        let mut r = Response::default();
+        r.push(ProviderEvent::ReasoningSignature("SIG-CALL".into()));
+        r.push(ProviderEvent::ToolCall {
+            id: "c1".into(),
+            name: "read".into(),
+            input_json: "{}".into(),
+        });
+        assert_eq!(reasoning(&r), [(String::new(), Some("SIG-CALL".into()))]);
+        assert!(matches!(r.content[1], Content::ToolUse { .. }));
+    }
+
+    #[test]
+    fn a_call_signature_does_not_overwrite_the_thought_signature() {
+        // Gemini: a signed thought, then a signed function call.
+        let mut r = Response::default();
+        for ev in [
+            ProviderEvent::ReasoningDelta("think".into()),
+            ProviderEvent::ReasoningSignature("SIG-THOUGHT".into()),
+            ProviderEvent::ReasoningSignature("SIG-CALL".into()),
+            ProviderEvent::ToolCall {
+                id: "c1".into(),
+                name: "read".into(),
+                input_json: "{}".into(),
+            },
+        ] {
+            r.push(ev);
+        }
+        assert_eq!(
+            reasoning(&r),
+            [
+                ("think".to_string(), Some("SIG-THOUGHT".to_string())),
+                (String::new(), Some("SIG-CALL".to_string())),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_anthropic_signature_signs_the_thinking_before_it() {
+        let mut r = Response::default();
+        for ev in [
+            ProviderEvent::ReasoningDelta("a".into()),
+            ProviderEvent::ReasoningDelta("b".into()),
+            ProviderEvent::ReasoningSignature("SIG".into()),
+            ProviderEvent::TextDelta("answer".into()),
+        ] {
+            r.push(ev);
+        }
+        assert_eq!(reasoning(&r), [("ab".to_string(), Some("SIG".to_string()))]);
     }
 
     #[test]

@@ -72,6 +72,9 @@ pub enum SessionRecord {
     MemoryIndexApplied { text: String },
     /// The session pins moved into the pinned block here.
     PinsFolded,
+    /// An engine bug (a panic in the turn task), with its message; a `TurnEnd{Error}`
+    /// follows.
+    EngineError { message: String },
     /// A user message's turn ended.
     TurnEnd { reason: FinishReason },
     /// A record type this version does not know (read only; never written).
@@ -91,6 +94,7 @@ const KNOWN_TYPES: &[&str] = &[
     "gc_applied",
     "memory_index_applied",
     "pins_folded",
+    "engine_error",
     "turn_end",
 ];
 
@@ -245,6 +249,9 @@ mod tests {
                 text: String::new(),
             },
             SessionRecord::PinsFolded,
+            SessionRecord::EngineError {
+                message: String::new(),
+            },
             SessionRecord::TurnEnd {
                 reason: FinishReason::Error,
             },

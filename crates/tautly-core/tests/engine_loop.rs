@@ -1254,3 +1254,406 @@ async fn two_sessions_share_one_workspace() {
     assert!(f[0].1.contains("two.rs"), "{f:?}");
     assert!(!f[0].1.contains("index building"), "{f:?}");
 }
+
+/// Total bytes under `dir`, recursively (0 if missing).
+fn dir_bytes(dir: &Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .map(|e| {
+            let m = e.metadata().unwrap();
+            if m.is_dir() {
+                dir_bytes(&e.path())
+            } else {
+                m.len()
+            }
+        })
+        .sum()
+}
+
+fn state_steps(from: usize, n: usize) -> Vec<MockTurn> {
+    let mut script: Vec<MockTurn> = (from..from + n)
+        .map(|i| {
+            tools_step(vec![call(
+                &format!("s{i}"),
+                "state",
+                json!({"decisions_add": [format!("decision number {i}")]}),
+            )])
+        })
+        .collect();
+    script.push(text_step("done"));
+    script
+}
+
+#[tokio::test]
+async fn request_records_keep_only_hashes_and_blob_bytes_grow_linearly() {
+    let fx = Fx::new();
+    let mut script = state_steps(0, 49);
+    script.extend(state_steps(49, 49));
+    let mock = MockProvider::new(script);
+    let mut run = start(fx.builder(config(Mode::Ask), &mock));
+    let blobs = fx
+        .home
+        .path()
+        .join("sessions")
+        .join(tautly_session::paths::project_hash(&fx.root()))
+        .join("blobs");
+    let before = dir_bytes(&blobs);
+    assert_eq!(
+        finish_reason(&run.turn_with("one").await),
+        FinishReason::Completed
+    );
+    let first = dir_bytes(&blobs) - before;
+    assert_eq!(
+        finish_reason(&run.turn_with("two").await),
+        FinishReason::Completed
+    );
+    let second = dir_bytes(&blobs) - before - first;
+    // Each half adds about as much as the first: no per-request copy of the whole
+    // (ever-growing) request.
+    assert!(
+        second <= first + first / 2 + 4096,
+        "first 50 steps added {first} bytes, the next 50 added {second}"
+    );
+    let reqs = mock.requests();
+    assert_eq!(reqs.len(), 100);
+    let recs = records(&run.engine);
+    let hashes: Vec<_> = recs
+        .iter()
+        .filter_map(|r| match r {
+            SessionRecord::Request { hash } => Some(hash.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(hashes.len(), 100);
+    let last_bytes = serde_json::to_vec(reqs.last().unwrap()).unwrap();
+    assert_eq!(
+        hashes.last().unwrap().as_str(),
+        blake3::hash(&last_bytes).to_hex().as_str()
+    );
+    // No request is stored as a blob.
+    let reader = SessionReader::<SessionRecord>::open(run.engine.session_path()).unwrap();
+    assert!(hashes.iter().all(|h| reader.read_blob(h).is_err()));
+    // The latest request, for `prompt show --full`.
+    let saved: CanonicalRequest =
+        serde_json::from_slice(&std::fs::read(run.engine.last_request_path()).unwrap()).unwrap();
+    assert_eq!(&saved, reqs.last().unwrap());
+}
+
+fn transient() -> ProviderError {
+    ProviderError::Transient {
+        status: Some(503),
+        retry_after: Some(Duration::from_millis(1)),
+        msg: "overloaded".into(),
+    }
+}
+
+#[tokio::test]
+async fn transient_errors_before_content_are_retried_only_by_the_retry_wrapper() {
+    let fx = Fx::new();
+    let mock = MockProvider::new((0..8).map(|_| MockTurn::Error(transient())).collect());
+    let mut run = start(fx.builder(config(Mode::Ask), &mock));
+    let events = run.turn_with("hi").await;
+    assert_eq!(finish_reason(&events), FinishReason::Error);
+    assert_eq!(mock.requests().len(), 5, "spec 3.5: at most 5 attempts");
+    assert!(events.iter().any(|e| matches!(
+        e,
+        Event::Error {
+            kind: ErrorKind::ProviderTransient,
+            retryable: true,
+            ..
+        }
+    )));
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, Event::Warning { message } if message.contains("broke off")))
+    );
+}
+
+#[tokio::test]
+async fn a_break_after_usage_only_is_not_resent_by_the_engine() {
+    let fx = Fx::new();
+    // Usage alone is not content: Retrying holds it back and retries; the engine must not
+    // add attempts of its own.
+    let mock = MockProvider::new((0..8).map(|_| MockTurn::DropAfter(vec![usage()])).collect());
+    let mut run = start(fx.builder(config(Mode::Ask), &mock));
+    let events = run.turn_with("hi").await;
+    assert_eq!(finish_reason(&events), FinishReason::Error);
+    assert_eq!(mock.requests().len(), 5);
+}
+
+#[tokio::test]
+async fn unpin_removes_a_pin_and_reports_unknown_text() {
+    let fx = Fx::new();
+    let mock = MockProvider::new(vec![text_step("ok")]);
+    let mut run = start(fx.builder(config(Mode::Ask), &mock));
+    for cmd in [
+        Command::Pin {
+            text: "keep this".into(),
+        },
+        Command::Pin {
+            text: "drop this".into(),
+        },
+        Command::Unpin {
+            text: "drop this".into(),
+        },
+        Command::Unpin {
+            text: "never pinned".into(),
+        },
+    ] {
+        run.engine.send(cmd).await.unwrap();
+    }
+    run.until(|e| matches!(e, Event::Warning { message } if message.contains("no pin")))
+        .await;
+    run.turn_with("go").await;
+    let all = serde_json::to_string(&mock.requests()[0].messages).unwrap();
+    assert!(all.contains("keep this"));
+    assert!(!all.contains("drop this"));
+}
+
+/// A `LocalSandbox` whose directory walks fail, so the code index cannot refresh.
+struct NoWalk(LocalSandbox);
+
+#[async_trait]
+impl Sandbox for NoWalk {
+    fn root(&self) -> &Path {
+        self.0.root()
+    }
+    fn resolve(&self, p: &Path) -> Result<PathBuf, SandboxError> {
+        self.0.resolve(p)
+    }
+    async fn read(&self, p: &Path) -> Result<Vec<u8>, SandboxError> {
+        self.0.read(p).await
+    }
+    async fn metadata(&self, p: &Path) -> Result<FileMeta, SandboxError> {
+        self.0.metadata(p).await
+    }
+    async fn write_atomic(
+        &self,
+        p: &Path,
+        bytes: &[u8],
+        mode: Option<u32>,
+    ) -> Result<(), SandboxError> {
+        self.0.write_atomic(p, bytes, mode).await
+    }
+    async fn remove_file(&self, p: &Path) -> Result<(), SandboxError> {
+        self.0.remove_file(p).await
+    }
+    async fn spill(&self, bytes: &[u8]) -> Result<PathBuf, SandboxError> {
+        self.0.spill(bytes).await
+    }
+    async fn spawn(&self, spec: SpawnSpec) -> Result<Child, SandboxError> {
+        self.0.spawn(spec).await
+    }
+    fn walker(&self, _base: &Path) -> Result<ignore::WalkBuilder, SandboxError> {
+        Err(SandboxError::Denied(
+            "walks are disabled in this test".into(),
+        ))
+    }
+    async fn http_get(&self, url: &Url) -> Result<HttpResponse, SandboxError> {
+        self.0.http_get(url).await
+    }
+}
+
+#[tokio::test]
+async fn a_failed_index_refresh_is_reported_once() {
+    let fx = Fx::new();
+    fx.write("a.txt", "a\n");
+    let sb: Arc<dyn Sandbox> = Arc::new(NoWalk(LocalSandbox::new(fx.root()).unwrap()));
+    let ws = Workspace::new(sb, fx.home.path());
+    ws.start();
+    let deadline = Instant::now() + WAIT;
+    while ws.index().and_then(|i| i.last_error()).is_none() {
+        assert!(Instant::now() < deadline, "the refresh never failed");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let mock = MockProvider::new(vec![
+        tools_step(vec![call("c1", "read", json!({"path": "a.txt"}))]),
+        text_step("ok"),
+        tools_step(vec![call("c2", "read", json!({"path": "a.txt"}))]),
+        text_step("ok"),
+    ]);
+    let mut run = start(EngineBuilder {
+        workspace: Some(ws),
+        ..fx.builder(config(Mode::Ask), &mock)
+    });
+    let mut events = run.turn_with("one").await;
+    events.extend(run.turn_with("two").await);
+    let n = events
+        .iter()
+        .filter(|e| matches!(e, Event::Warning { message } if message.contains("code index refresh failed")))
+        .count();
+    assert_eq!(n, 1, "{events:?}");
+}
+
+#[tokio::test]
+async fn old_spill_files_are_cleaned_at_start() {
+    let fx = Fx::new();
+    fx.write(".tautly/tmp/spill/old", "stale output");
+    fx.write(".tautly/tmp/spill/new", "fresh output");
+    let old = std::fs::File::options()
+        .write(true)
+        .open(fx.dir.path().join(".tautly/tmp/spill/old"))
+        .unwrap();
+    old.set_modified(std::time::SystemTime::now() - Duration::from_secs(30 * 24 * 3600))
+        .unwrap();
+    drop(old);
+    let mock = MockProvider::new(vec![text_step("ok")]);
+    let mut run = start(fx.builder(config(Mode::Ask), &mock));
+    run.turn_with("go").await;
+    let deadline = Instant::now() + WAIT;
+    while fx.dir.path().join(".tautly/tmp/spill/old").exists() {
+        assert!(Instant::now() < deadline, "old spill file kept");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(fx.dir.path().join(".tautly/tmp/spill/new").exists());
+}
+
+#[tokio::test]
+async fn a_client_that_stops_reading_cannot_wedge_cancel_or_the_actor() {
+    let fx = Fx::new();
+    // One step that emits far more events than the channel holds.
+    let pins: Vec<ProviderEvent> = (0..20)
+        .map(|i| {
+            call(
+                &format!("p{i}"),
+                "pin",
+                json!({"text": format!("rule {i}")}),
+            )
+        })
+        .collect();
+    let mut script = vec![MockTurn::Events(
+        (0..300)
+            .map(|i| ProviderEvent::TextDelta(format!("t{i} ")))
+            .collect(),
+    )];
+    script[0] = MockTurn::Events({
+        let mut evs: Vec<ProviderEvent> = (0..300)
+            .map(|i| ProviderEvent::TextDelta(format!("t{i} ")))
+            .collect();
+        evs.extend(pins);
+        evs
+    });
+    let mock = MockProvider::new(script);
+    let run = start(fx.builder(config(Mode::Ask), &mock));
+    // The client never reads `run.events`.
+    run.say("go").await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let sends = async {
+        for i in 0..200 {
+            run.engine
+                .send(Command::Deny {
+                    request_id: format!("stale-{i}"),
+                    reason: None,
+                })
+                .await
+                .unwrap();
+        }
+        run.engine.send(Command::Cancel).await.unwrap();
+    };
+    tokio::time::timeout(WAIT, sends)
+        .await
+        .expect("the actor stopped taking commands");
+    let deadline = Instant::now() + WAIT;
+    loop {
+        let ended = records(&run.engine)
+            .iter()
+            .any(|r| matches!(r, SessionRecord::TurnEnd { .. }));
+        if ended {
+            break;
+        }
+        assert!(Instant::now() < deadline, "the cancelled turn never ended");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// A provider that panics: an engine bug inside the turn task.
+struct Exploding;
+
+impl tautly_provider::Provider for Exploding {
+    fn name(&self) -> &str {
+        "exploding"
+    }
+    fn stream(
+        &self,
+        _req: CanonicalRequest,
+        _cancel: tokio_util::sync::CancellationToken,
+    ) -> futures::stream::BoxStream<'static, Result<ProviderEvent, ProviderError>> {
+        panic!("provider exploded on purpose");
+    }
+}
+
+#[tokio::test]
+async fn after_a_turn_panic_every_command_is_answered_and_the_panic_is_logged() {
+    let fx = Fx::new();
+    let mut run = start(EngineBuilder {
+        provider: Some(Arc::new(Exploding)),
+        data_home: Some(fx.home.path().to_path_buf()),
+        ..EngineBuilder::new(config(Mode::Ask), fx.dir.path())
+    });
+    let events = run.turn_with("boom").await;
+    assert_eq!(finish_reason(&events), FinishReason::Error);
+    assert!(events.iter().any(
+        |e| matches!(e, Event::Error { message, .. } if message.contains("provider exploded on purpose"))
+    ));
+    assert!(records(&run.engine).iter().any(
+        |r| matches!(r, SessionRecord::EngineError { message } if message.contains("provider exploded on purpose"))
+    ));
+    run.engine
+        .send(Command::Pin { text: "x".into() })
+        .await
+        .unwrap();
+    let ev = run.next().await;
+    assert!(
+        matches!(&ev, Event::Error { message, .. } if message.contains("takes no more")),
+        "{ev:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_pin_queued_behind_a_message_reaches_that_turn() {
+    let fx = Fx::new();
+    let mock = MockProvider::new(vec![
+        tools_step(vec![call(
+            "w1",
+            "write",
+            json!({"path": "o.txt", "content": "x"}),
+        )]),
+        text_step("first done"),
+        text_step("second done"),
+    ]);
+    let mut run = start(EngineBuilder {
+        interactive: true,
+        ..fx.builder(config(Mode::Ask), &mock)
+    });
+    run.say("first").await;
+    let events = run
+        .until(|e| matches!(e, Event::ToolApprovalRequested { .. }))
+        .await;
+    let Some(Event::ToolApprovalRequested { request_id, .. }) = events.last() else {
+        unreachable!()
+    };
+    // While the first turn waits: a second message, then a pin behind it.
+    run.say("second").await;
+    run.engine
+        .send(Command::Pin {
+            text: "queued pin".into(),
+        })
+        .await
+        .unwrap();
+    run.engine
+        .send(Command::Approve {
+            request_id: request_id.clone(),
+        })
+        .await
+        .unwrap();
+    run.turn().await;
+    run.turn().await;
+    let reqs = mock.requests();
+    assert_eq!(reqs.len(), 3);
+    let second = serde_json::to_string(&reqs[2].messages).unwrap();
+    assert!(second.contains("queued pin"), "{second}");
+}
