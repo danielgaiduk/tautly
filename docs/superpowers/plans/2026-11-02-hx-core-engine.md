@@ -727,6 +727,8 @@ proptest! { #[test] fn apply_then_inverse_restores(text in "[a-z\\n]{1,200}", ..
 
 ### Task 24: Engine turn loop and approvals
 
+**Client-protocol amendment (binding, user-approved 2026-11-03; spec 3.4):** `EngineBuilder` takes an optional shared `Arc<Workspace>` (index, watcher, memory store for one root) so several engines in one process share them; without it the builder opens its own. Approval requests carry a `request_id`, and `Command::Approve`/`Deny` name it.
+
 **Task 38 review note (binding):** build the repo map off the startup path (spawn_blocking) once per session; on a first-ever session with no ready index the map is empty for that session — acceptable in v1, but log it. Call `init_repo_map` exactly once at session start, ignore a `false` return, never retry per turn (a later success would change the stable prefix mid-session). Before the first `assemble`, await both the repo map and the first memory index for a bounded ~300 ms (otherwise request 2's stable prefix differs and the cache is lost); on timeout the slot stays empty for the session. Read-tracker turn numbers and `Context` turn numbers are the same absolute step counter (Task 20's `CompactionRecord` reports the last removed absolute turn; pass it to `ReadTracker::forget_shown_at` and call `ReadTracker::forget_path` for every `CompactionRecord.forgotten_paths` entry).
 
 **Task 21 review note (binding):** at every step start (before each provider request) compute `gc_decision` and `compaction_decision` together; if either fires, apply both in the same cache epoch (`collect(gc.or(compaction))`, then compaction if pending, then `Context::fold_session_pins()`, and the pending memory index per Task 28) so the prefix breaks once. On resume, rebuild `Context.results` by replaying `push_tool_result(call_id, tool, args, effects, is_error, turn)` from the logged `ToolResult` records (effects included), re-apply the logged `GcApplied`/`MemoryIndexApplied` records, and set `Context.root` to the canonical root.
@@ -854,6 +856,8 @@ proptest! { #[test] fn apply_then_inverse_restores(text in "[a-z\\n]{1,200}", ..
 - [ ] **Step 5: Commit** `git commit -m "feat(core): memory proposals, staleness, episodes, consolidation"`
 
 ### Task 29: JSON-RPC server and `hx -p` one-shot
+
+**Client-protocol amendment (binding, user-approved 2026-11-03; spec 3.4):** `initialize` accepts `client: {interactive, name, version}`; interactive clients get `ToolApprovalRequested{request_id}` / `MemoryProposed` answered by `approve`/`deny`/`approve_memory`/`reject_memory` with ids, and pending requests resolve to deny on disconnect or `shutdown`. Add `session/new {root, resume?, fork?}`, `session/list`, `session/close`; session-scoped methods take `session_id`; `event` notifications carry `session_id`. Sessions on one root share a `Workspace` hub (index, watcher, memory store; `Arc`, opened once, closed with the last session). Tests: `interactive_ask_waits_for_client_approval`, `pending_approval_denied_on_disconnect`, `two_sessions_share_one_index_and_route_events_by_session_id`, `single_session_form_still_works`.
 
 **Files:**
 - Create: `crates/hx-rpc/src/{lib.rs,jsonrpc.rs,server.rs,oneshot.rs}`, `crates/hx-cli/src/main.rs` (clap skeleton: `hx [-p PROMPT] [--output json|text] [--approve auto-edit|yolo] [--model ID] [--budget-usd N] [--approve-memory] [--continue] [--resume ID] [--rpc]`; `--budget-usd` sends `SetBudget{scope: session}` before the first message)

@@ -101,6 +101,8 @@ Typed, serde-serializable, versioned:
 - `initialize` handshake negotiates protocol version. Event and field additions are minor-version and backwards compatible; any removal or semantic change is a major-version bump.
 - One-shot mode: `hx -p "<prompt>" --output json|text` sends one message, streams events to stdout, exits with a code mapped from `TurnFinished.reason` (0 completed, 1 error, 2 budget/max_turns/timeout, 130 cancelled).
 - In headless mode `ask` resolves to `deny` unless `--approve <mode>` is given (`auto-edit` or `yolo`), and memory proposals are rejected unless `--approve-memory` is given. Headless never blocks on input.
+- **Interactive clients (apps, IDE extensions, the ACP bridge):** `initialize` params carry `client: {interactive: bool, name, version}`. With `interactive: true`, `ask` emits `ToolApprovalRequested{request_id, …}` and waits for `approve`/`deny` with that `request_id`; memory proposals wait for `approve_memory`/`reject_memory`. Pending requests are denied when the client disconnects or sends `shutdown`, so nothing hangs. Without `interactive`, the headless rules above apply unchanged.
+- **Several sessions per process:** `session/new {root, resume?, fork?}` returns a `session_id`; `session/list` and `session/close` manage them. Every session-scoped method takes `session_id`, and every `event` notification carries it. Sessions on the same root share one code index, file watcher and memory store (opened once, reference-counted); each session has its own context, read tracker, budget and session log. The single-session form (no `session/new`, `session_id` optional) remains valid for scripts and `hx -p`.
 
 ### 3.5 Stream reliability
 - Provider errors are classified retryable (429, 5xx, network) or fatal.
