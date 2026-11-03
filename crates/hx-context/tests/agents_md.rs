@@ -1,0 +1,284 @@
+use std::ffi::CString;
+use std::os::unix::ffi::OsStrExt;
+use std::path::Path;
+use std::sync::mpsc;
+use std::time::Duration;
+
+use hx_context::agents_md::{self, AgentsMd};
+use hx_context::{Context, PinSource};
+use hx_provider::{CacheStyle, Capabilities, EditFormat, ReasoningStyle};
+use hx_sandbox::LocalSandbox;
+
+fn load(root: &Path) -> AgentsMd {
+    agents_md::load(&LocalSandbox::new(root.to_path_buf()).unwrap())
+}
+
+/// `load` on a thread, or None when it has not returned within two seconds.
+fn load_within_2s(root: &Path) -> Option<AgentsMd> {
+    let sb = LocalSandbox::new(root.to_path_buf()).unwrap();
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(agents_md::load(&sb));
+    });
+    rx.recv_timeout(Duration::from_secs(2)).ok()
+}
+
+fn mkfifo(path: &Path) {
+    let c = CString::new(path.as_os_str().as_bytes()).unwrap();
+    // SAFETY: a valid NUL-terminated path.
+    assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+}
+
+fn caps() -> Capabilities {
+    Capabilities {
+        context_window: 100_000,
+        max_output: 8_000,
+        parallel_tools: true,
+        reasoning: ReasoningStyle::None,
+        cache: CacheStyle::Explicit,
+        images: false,
+        edit_format: EditFormat::StrReplace,
+    }
+}
+
+#[test]
+fn agents_md_rules_section_autopinned() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("AGENTS.md"),
+        "# Project\nhello\n\n## Rules\n- never touch migrations/\n",
+    )
+    .unwrap();
+    let found = load(dir.path());
+    assert!(found.text.unwrap().contains("hello"));
+    assert_eq!(found.pins.len(), 1);
+    assert_eq!(found.pins[0].source, PinSource::AgentsMd);
+    assert_eq!(found.pins[0].text, "- never touch migrations/");
+    assert!(found.warnings.is_empty());
+}
+
+#[test]
+fn agents_md_heading_matching_and_section_extent() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("AGENTS.md"),
+        "# Constraints\n- a\n\n### sub\n- b\n\n# Style\n- not pinned\n\n## RULES\n- c\n\n## Rules and more\n- not this\n\n```\n# Rules\n- in a fence\n```\n",
+    )
+    .unwrap();
+    let pins = load(dir.path()).pins;
+    let texts: Vec<&str> = pins.iter().map(|p| p.text.as_str()).collect();
+    assert_eq!(texts, ["- a\n\n### sub\n- b", "- c"]);
+}
+
+#[test]
+fn agents_md_concatenates_ancestors_nearest_last() {
+    let dir = tempfile::tempdir().unwrap();
+    let sub = dir.path().join("pkg");
+    std::fs::create_dir(&sub).unwrap();
+    std::fs::write(
+        dir.path().join("AGENTS.md"),
+        "outer text\n## Rules\n- outer rule\n",
+    )
+    .unwrap();
+    std::fs::write(
+        sub.join("AGENTS.md"),
+        "inner text\n## Rules\n- inner rule\n",
+    )
+    .unwrap();
+    let found = load(&sub);
+    let text = found.text.unwrap();
+    assert!(text.find("outer text").unwrap() < text.find("inner text").unwrap());
+    let texts: Vec<&str> = found.pins.iter().map(|p| p.text.as_str()).collect();
+    assert_eq!(texts, ["- outer rule", "- inner rule"]);
+}
+
+#[test]
+fn agents_md_absent_gives_none() {
+    let dir = tempfile::tempdir().unwrap();
+    // No AGENTS.md in the temp dir or (in practice) any of its ancestors.
+    let found = load(dir.path());
+    assert_eq!(found, AgentsMd::default());
+}
+
+#[test]
+fn agents_md_reads_each_file_once_and_dedupes_pins() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join("pkg")).unwrap();
+    std::fs::write(
+        dir.path().join("AGENTS.md"),
+        "outer text\n## Rules\n- same rule\n",
+    )
+    .unwrap();
+    // `pkg/..` and its ancestors name the same file twice unless paths are normalized.
+    let found = load(&dir.path().join("pkg").join(".."));
+    assert_eq!(found.text.unwrap().matches("outer text").count(), 1);
+    assert_eq!(found.pins.len(), 1);
+
+    // The same rule in two files is pinned once.
+    std::fs::write(
+        dir.path().join("pkg").join("AGENTS.md"),
+        "## Rules\n- same rule\n",
+    )
+    .unwrap();
+    assert_eq!(load(&dir.path().join("pkg")).pins.len(), 1);
+}
+
+#[test]
+fn agents_md_accepts_headings_indented_up_to_three_spaces() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("AGENTS.md"),
+        "   ## Rules\n- indented ok\n\n    ## Rules\n- four spaces is code\n",
+    )
+    .unwrap();
+    let pins = load(dir.path()).pins;
+    let texts: Vec<&str> = pins.iter().map(|p| p.text.as_str()).collect();
+    assert_eq!(
+        texts,
+        ["- indented ok\n\n    ## Rules\n- four spaces is code"]
+    );
+}
+
+// ---- confinement and caps (C1) ----
+
+#[test]
+fn symlink_out_of_the_root_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let outside = dir.path().join("outside");
+    let root = dir.path().join("root");
+    std::fs::create_dir(&outside).unwrap();
+    std::fs::create_dir(&root).unwrap();
+    std::fs::write(
+        outside.join("credentials"),
+        "## Rules\nfake_key = TEST-NOT-A-SECRET\n",
+    )
+    .unwrap();
+    std::os::unix::fs::symlink("../outside/credentials", root.join("AGENTS.md")).unwrap();
+
+    let found = load(&root);
+    assert_eq!(found.text, None, "{found:?}");
+    assert!(found.pins.is_empty());
+    assert!(
+        found.warnings.iter().any(|w| w.contains("outside")),
+        "{:?}",
+        found.warnings
+    );
+}
+
+#[test]
+fn symlink_inside_the_root_is_followed() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join("docs")).unwrap();
+    std::fs::write(
+        dir.path().join("docs").join("agents.md"),
+        "linked text\n## Rules\n- linked rule\n",
+    )
+    .unwrap();
+    std::os::unix::fs::symlink("docs/agents.md", dir.path().join("AGENTS.md")).unwrap();
+
+    let found = load(dir.path());
+    assert!(found.text.unwrap().contains("linked text"));
+    assert_eq!(found.pins[0].text, "- linked rule");
+    assert!(found.warnings.is_empty(), "{:?}", found.warnings);
+}
+
+#[test]
+fn fifo_is_skipped_promptly() {
+    let dir = tempfile::tempdir().unwrap();
+    mkfifo(&dir.path().join("AGENTS.md"));
+    let found = load_within_2s(dir.path()).expect("load returned within 2 s");
+    assert_eq!(found.text, None);
+    assert!(
+        found
+            .warnings
+            .iter()
+            .any(|w| w.contains("not a regular file")),
+        "{:?}",
+        found.warnings
+    );
+}
+
+#[test]
+fn fifo_in_an_ancestor_is_skipped_promptly() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("root");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::write(root.join("AGENTS.md"), "inner text\n").unwrap();
+    mkfifo(&dir.path().join("AGENTS.md"));
+    let found = load_within_2s(&root).expect("load returned within 2 s");
+    assert_eq!(found.text.as_deref(), Some("inner text"));
+}
+
+#[test]
+fn ancestor_may_link_anywhere_but_must_be_a_regular_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("root");
+    let elsewhere = dir.path().join("elsewhere");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::create_dir(&elsewhere).unwrap();
+    std::fs::write(elsewhere.join("mine.md"), "the user's own notes\n").unwrap();
+    // Above the root the files are the user's own: a link out of the root is fine there.
+    std::os::unix::fs::symlink(elsewhere.join("mine.md"), dir.path().join("AGENTS.md")).unwrap();
+    let found = load(&root);
+    assert_eq!(found.text.as_deref(), Some("the user's own notes"));
+}
+
+#[test]
+fn oversize_file_is_truncated_with_a_marker_and_a_warning() {
+    let dir = tempfile::tempdir().unwrap();
+    // 100 KB of text; the per-file cap is 32 KB.
+    let line = "use tabs, not spaces, in every file of this repository\n";
+    let body = line.repeat(100 * 1024 / line.len());
+    std::fs::write(dir.path().join("AGENTS.md"), &body).unwrap();
+
+    let found = load(dir.path());
+    let text = found.text.clone().unwrap();
+    assert!(
+        text.ends_with("[AGENTS.md truncated at 32 KB]"),
+        "{}",
+        &text[text.len() - 80..]
+    );
+    assert!(text.len() <= 32 * 1024 + 64, "{}", text.len());
+    assert!(text.starts_with(line.trim_end()));
+    assert_eq!(found.warnings.len(), 1, "{:?}", found.warnings);
+    assert!(found.warnings[0].contains("32 KB"), "{:?}", found.warnings);
+
+    // The warning reaches every status.
+    let mut c = Context::default();
+    c.set_agents_md(found);
+    let (_, st) = c.assemble(&caps(), &[], &"anthropic/claude-sonnet".into());
+    assert!(
+        st.warnings.iter().any(|w| w.contains("AGENTS.md")),
+        "{:?}",
+        st.warnings
+    );
+}
+
+#[test]
+fn total_is_capped_keeping_the_nearest_files_whole() {
+    let dir = tempfile::tempdir().unwrap();
+    let mid = dir.path().join("a");
+    let root = mid.join("b");
+    std::fs::create_dir_all(&root).unwrap();
+    // Three files of 30 KB each: 90 KB against a 64 KB total.
+    let file = |tag: &str| format!("{tag}\n{}", "x".repeat(30 * 1024 - tag.len() - 1));
+    std::fs::write(dir.path().join("AGENTS.md"), file("OUTER")).unwrap();
+    std::fs::write(mid.join("AGENTS.md"), file("MIDDLE")).unwrap();
+    std::fs::write(root.join("AGENTS.md"), file("NEAREST")).unwrap();
+
+    let found = load(&root);
+    let text = found.text.unwrap();
+    assert!(text.len() <= 64 * 1024 + 128, "{}", text.len());
+    // Nearest last, and the nearest two whole; the outermost is cut to what is left.
+    let outer = text.find("OUTER").unwrap();
+    let middle = text.find("MIDDLE").unwrap();
+    let nearest = text.find("NEAREST").unwrap();
+    assert!(outer < middle && middle < nearest);
+    assert!(text[outer..middle].contains("[AGENTS.md truncated at 4 KB]"));
+    assert!(text[nearest..].len() >= 30 * 1024 - 1);
+    assert!(
+        found.warnings.iter().any(|w| w.contains("64 KB")),
+        "{:?}",
+        found.warnings
+    );
+}

@@ -10,13 +10,14 @@ license.workspace = true
 hx-provider = { path = "../hx-provider" }
 hx-tools = { path = "../hx-tools" }
 hx-index = { path = "../hx-index" }
+hx-sandbox = { path = "../hx-sandbox" }
+libc.workspace = true
 toml.workspace = true
 globset.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
-hx-sandbox = { path = "../hx-sandbox" }
 tokio.workspace = true
 blake3.workspace = true
 tempfile.workspace = true

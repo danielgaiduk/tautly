@@ -53,6 +53,9 @@ pub struct Context {
     pub results: Vec<ResultMeta>,
     /// When the provider last saw the prefix, see [`Context::note_request`].
     pub clock: CacheClock,
+    /// Problems found while loading the session's inputs (an AGENTS.md that was truncated
+    /// or refused), repeated in the warnings of every [`ContextStatus`].
+    pub load_warnings: Vec<String>,
 }
 
 impl Default for Context {
@@ -69,11 +72,22 @@ impl Default for Context {
             root: None,
             results: Vec::new(),
             clock: CacheClock::default(),
+            load_warnings: Vec::new(),
         }
     }
 }
 
 impl Context {
+    /// Take what [`agents_md::load`] found: its text for the `<agents_md>` block, its pins
+    /// (added to the session-start pins) and its warnings (shown in every status).
+    pub fn set_agents_md(&mut self, found: agents_md::AgentsMd) {
+        self.agents_md = found.text;
+        for pin in found.pins {
+            pinned::add(&mut self.pinned, pin);
+        }
+        self.load_warnings.extend(found.warnings);
+    }
+
     /// Record what tools actually did to files. The files list is maintained from these
     /// effects only, never from what the model says.
     pub fn apply_effects(&mut self, effects: &[AppliedEffect]) {

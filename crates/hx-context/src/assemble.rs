@@ -124,7 +124,7 @@ impl Context {
         let used = breakdown.total();
         let budget = caps.context_window;
 
-        let mut warnings = Vec::new();
+        let mut warnings = self.load_warnings.clone();
         if u64::from(breakdown.pinned) * 100 > u64::from(budget) * PINNED_WARN_PERCENT {
             warnings.push(format!(
                 "pinned items use {} tokens, over {PINNED_WARN_PERCENT}% of the {budget}-token window",

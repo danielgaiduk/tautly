@@ -620,6 +620,7 @@ dependencies = [
  "hx-provider",
  "hx-sandbox",
  "hx-tools",
+ "libc",
  "serde_json",
  "tempfile",
  "thiserror",

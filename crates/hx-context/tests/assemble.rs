@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use hx_context::{Context, PinSource, Pinned, STABLE_LEN, TokenEstimator, Turn, agents_md, prompt};
+use hx_context::{Context, PinSource, Pinned, STABLE_LEN, TokenEstimator, Turn, prompt};
 use hx_provider::{
     Block, CachePoint, CacheStyle, Capabilities, Content, EditFormat, Message, ModelId,
     ReasoningStyle, Role, ToolSpec,
@@ -483,105 +483,6 @@ fn request_carries_model_and_max_output() {
     let (req, _) = c.assemble(&caps(), &[], &m());
     assert_eq!(req.model, m());
     assert_eq!(req.max_output, 8_000);
-}
-
-#[test]
-fn agents_md_rules_section_autopinned() {
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::write(
-        dir.path().join("AGENTS.md"),
-        "# Project\nhello\n\n## Rules\n- never touch migrations/\n",
-    )
-    .unwrap();
-    let (text, pins) = agents_md::load(dir.path());
-    assert!(text.unwrap().contains("hello"));
-    assert_eq!(pins.len(), 1);
-    assert_eq!(pins[0].source, PinSource::AgentsMd);
-    assert_eq!(pins[0].text, "- never touch migrations/");
-}
-
-#[test]
-fn agents_md_heading_matching_and_section_extent() {
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::write(
-        dir.path().join("AGENTS.md"),
-        "# Constraints\n- a\n\n### sub\n- b\n\n# Style\n- not pinned\n\n## RULES\n- c\n\n## Rules and more\n- not this\n\n```\n# Rules\n- in a fence\n```\n",
-    )
-    .unwrap();
-    let (_, pins) = agents_md::load(dir.path());
-    let texts: Vec<&str> = pins.iter().map(|p| p.text.as_str()).collect();
-    assert_eq!(texts, ["- a\n\n### sub\n- b", "- c"]);
-}
-
-#[test]
-fn agents_md_concatenates_ancestors_nearest_last() {
-    let dir = tempfile::tempdir().unwrap();
-    let sub = dir.path().join("pkg");
-    std::fs::create_dir(&sub).unwrap();
-    std::fs::write(
-        dir.path().join("AGENTS.md"),
-        "outer text\n## Rules\n- outer rule\n",
-    )
-    .unwrap();
-    std::fs::write(
-        sub.join("AGENTS.md"),
-        "inner text\n## Rules\n- inner rule\n",
-    )
-    .unwrap();
-    let (text, pins) = agents_md::load(&sub);
-    let text = text.unwrap();
-    assert!(text.find("outer text").unwrap() < text.find("inner text").unwrap());
-    let texts: Vec<&str> = pins.iter().map(|p| p.text.as_str()).collect();
-    assert_eq!(texts, ["- outer rule", "- inner rule"]);
-}
-
-#[test]
-fn agents_md_absent_gives_none() {
-    let dir = tempfile::tempdir().unwrap();
-    // No AGENTS.md in the temp dir or (in practice) any of its ancestors.
-    let (text, pins) = agents_md::load(dir.path());
-    assert_eq!(text, None);
-    assert!(pins.is_empty());
-}
-
-#[test]
-fn agents_md_reads_each_file_once_and_dedupes_pins() {
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::create_dir(dir.path().join("pkg")).unwrap();
-    std::fs::write(
-        dir.path().join("AGENTS.md"),
-        "outer text\n## Rules\n- same rule\n",
-    )
-    .unwrap();
-    // `pkg/..` and its ancestors name the same file twice unless paths are normalized.
-    let (text, pins) = agents_md::load(&dir.path().join("pkg").join(".."));
-    assert_eq!(text.unwrap().matches("outer text").count(), 1);
-    assert_eq!(pins.len(), 1);
-
-    // The same rule in two files is pinned once.
-    std::fs::write(
-        dir.path().join("pkg").join("AGENTS.md"),
-        "## Rules\n- same rule\n",
-    )
-    .unwrap();
-    let (_, pins) = agents_md::load(&dir.path().join("pkg"));
-    assert_eq!(pins.len(), 1);
-}
-
-#[test]
-fn agents_md_accepts_headings_indented_up_to_three_spaces() {
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::write(
-        dir.path().join("AGENTS.md"),
-        "   ## Rules\n- indented ok\n\n    ## Rules\n- four spaces is code\n",
-    )
-    .unwrap();
-    let (_, pins) = agents_md::load(dir.path());
-    let texts: Vec<&str> = pins.iter().map(|p| p.text.as_str()).collect();
-    assert_eq!(
-        texts,
-        ["- indented ok\n\n    ## Rules\n- four spaces is code"]
-    );
 }
 
 #[test]
