@@ -66,8 +66,13 @@ fn content_text(c: &Content) -> &str {
     }
 }
 
+fn tail_text(req: &hx_provider::CanonicalRequest) -> &str {
+    let last = req.messages.last().expect("a tail message");
+    content_text(last.content.last().unwrap())
+}
+
 #[test]
-fn block_order_is_system_tools_agents_memory_pinned_state_history() {
+fn block_order_is_system_tools_agents_memory_pinned_history_state() {
     let mut c = ctx();
     c.apply_op(ContextOp::Pin("never drop tables".into()));
     c.apply_op(ContextOp::StateUpdate(StatePatch {
@@ -88,10 +93,16 @@ fn block_order_is_system_tools_agents_memory_pinned_state_history() {
     let first = &req.messages[0];
     assert_eq!(first.role, Role::User);
     let texts: Vec<&str> = first.content.iter().map(content_text).collect();
-    assert_eq!(texts.len(), 3);
+    assert_eq!(texts.len(), 2);
     assert!(texts[0].starts_with("<pinned>") && texts[0].contains("never drop tables"));
-    assert!(texts[1].starts_with("<working_state>") && texts[1].contains("use sqlite"));
-    assert_eq!(texts[2], "do the thing");
+    assert_eq!(texts[1], "do the thing");
+    // The working state is the final message, after the history.
+    assert_eq!(req.messages.len(), 2);
+    let tail = &req.messages[1];
+    assert_eq!(tail.role, Role::User);
+    assert_eq!(tail.content.len(), 1);
+    let st = content_text(&tail.content[0]);
+    assert!(st.starts_with("<working_state>") && st.contains("use sqlite"));
     for blk in &req.system {
         let t = text_of(blk);
         assert!(!t.contains("never drop tables") && !t.contains("use sqlite"));
@@ -379,7 +390,7 @@ fn files_render_root_relative() {
         },
     ]);
     let (req, _) = c.assemble(&caps(), &[], &m());
-    let t = content_text(&req.messages[0].content[0]);
+    let t = tail_text(&req);
     assert!(t.contains("src/a.rs"), "{t}");
     assert!(!t.contains("/p/src"), "{t}");
     assert!(t.contains("old.rs") && t.contains("deleted"), "{t}");
@@ -423,7 +434,7 @@ fn failed_attempts_render_at_most_10_within_300_tokens() {
     let mut c = Context::default();
     c.state.failed_attempts = (0..15).map(|i| format!("attempt {i}")).collect();
     let (req, _) = c.assemble(&caps(), &[], &m());
-    let t = content_text(&req.messages[0].content[0]);
+    let t = tail_text(&req);
     assert!(t.contains("attempt 14") && t.contains("attempt 5"), "{t}");
     assert!(
         !t.contains("attempt 4\n") && !t.contains("attempt 0"),
@@ -435,7 +446,7 @@ fn failed_attempts_render_at_most_10_within_300_tokens() {
         .map(|i| format!("{i}:{}", "z".repeat(1000)))
         .collect();
     let (req, st) = c.assemble(&caps(), &[], &m());
-    let t = content_text(&req.messages[0].content[0]);
+    let t = tail_text(&req);
     assert!(t.contains("9:z"), "newest attempt is kept");
     assert!(!t.contains("0:z"), "oldest attempt is dropped to fit");
     assert!(
@@ -550,4 +561,147 @@ fn calibrate_clamps_and_ignores_zero_estimates() {
     let before = t.ratio();
     t.calibrate(0, 100);
     assert_eq!(t.ratio(), before);
+}
+
+fn edited_effect(path: &str, body: &[u8]) -> AppliedEffect {
+    AppliedEffect::Edited {
+        path: path.into(),
+        pre_image: None,
+        pre_mode: None,
+        post_hash: blake3::hash(body),
+    }
+}
+
+/// A context with pinned items and a history ending in a user tool-result message.
+fn ctx_with_history() -> Context {
+    let mut c = ctx();
+    c.apply_op(ContextOp::Pin("keep me".into()));
+    c.history.push(turn("start"));
+    c.history.push(Turn {
+        messages: vec![
+            Message {
+                role: Role::Assistant,
+                content: vec![Content::ToolUse {
+                    id: "1".into(),
+                    name: "read".into(),
+                    input: json!({"path": "a.rs"}),
+                }],
+            },
+            Message {
+                role: Role::User,
+                content: vec![Content::ToolResult {
+                    id: "1".into(),
+                    output: "fn main() {}".into(),
+                    is_error: false,
+                }],
+            },
+        ],
+    });
+    c
+}
+
+#[test]
+fn state_tail_follows_last_history_message() {
+    let mut c = ctx_with_history();
+    c.apply_effects(&[edited_effect("/p/a.rs", b"1")]);
+    let (req, _) = c.assemble(&caps(), &tools(), &m());
+    // 3 history messages, then the state tail as its own final user message; the history
+    // message before it is untouched.
+    assert_eq!(req.messages.len(), 4);
+    let last_history = &req.messages[2];
+    assert_eq!(last_history.content.len(), 1);
+    assert!(matches!(
+        last_history.content[0],
+        Content::ToolResult { .. }
+    ));
+    let tail = &req.messages[3];
+    assert_eq!(tail.role, Role::User);
+    assert_eq!(tail.content.len(), 1);
+    assert!(content_text(&tail.content[0]).starts_with("<working_state>"));
+    // Also after an assistant-final history.
+    c.history.push(Turn {
+        messages: vec![Message {
+            role: Role::Assistant,
+            content: vec![Content::Text("done".into())],
+        }],
+    });
+    let (req, _) = c.assemble(&caps(), &tools(), &m());
+    assert_eq!(req.messages.len(), 5);
+    assert_eq!(req.messages[3].role, Role::Assistant);
+    assert!(content_text(&req.messages[4].content[0]).starts_with("<working_state>"));
+    // The state is never stored in history.
+    assert!(c.history.iter().flat_map(|t| &t.messages).all(|m| {
+        m.content
+            .iter()
+            .all(|c| !matches!(c, Content::Text(t) if t.contains("<working_state>")))
+    }));
+}
+
+#[test]
+fn state_change_keeps_history_prefix_byte_identical() {
+    let mut c = ctx_with_history();
+    c.apply_effects(&[edited_effect("/p/a.rs", b"1")]);
+    let (a, _) = c.assemble(&caps(), &tools(), &m());
+    c.apply_effects(&[
+        read_effect("/p/b.rs", b"b", Shown::Full),
+        edited_effect("/p/a.rs", b"2"),
+    ]);
+    c.state.task = Some("a different task".into());
+    let (b, _) = c.assemble(&caps(), &tools(), &m());
+
+    let history_len = 3;
+    assert_eq!(a.messages.len(), history_len + 1);
+    assert_eq!(b.messages.len(), history_len + 1);
+    assert_ne!(a.messages[history_len], b.messages[history_len]);
+    let prefix = |r: &hx_provider::CanonicalRequest| {
+        (
+            serde_json::to_vec(&r.system).unwrap(),
+            serde_json::to_vec(&r.tools).unwrap(),
+            serde_json::to_vec(&r.messages[..history_len]).unwrap(),
+        )
+    };
+    assert_eq!(prefix(&a), prefix(&b));
+}
+
+#[test]
+fn cache_breakpoint_precedes_state_tail() {
+    let mut c = ctx_with_history();
+    c.apply_effects(&[edited_effect("/p/a.rs", b"1")]);
+    let (req, _) = c.assemble(&caps(), &tools(), &m());
+    assert_eq!(req.messages.len(), 4);
+    assert_eq!(
+        req.cache_breakpoints,
+        vec![
+            CachePoint::AfterTools,
+            CachePoint::AfterSystem,
+            CachePoint::AfterMessage(2)
+        ]
+    );
+    // No state: no tail, the breakpoint sits on the last message.
+    let c = ctx_with_history();
+    let (req, _) = c.assemble(&caps(), &tools(), &m());
+    assert_eq!(req.messages.len(), 3);
+    assert_eq!(
+        req.cache_breakpoints.last(),
+        Some(&CachePoint::AfterMessage(2))
+    );
+    // State but no history: nothing to cache after the system prefix.
+    let mut c = Context::default();
+    c.state.task = Some("t".into());
+    let (req, _) = c.assemble(&caps(), &[], &m());
+    assert_eq!(req.messages.len(), 1);
+    assert_eq!(req.cache_breakpoints, vec![CachePoint::AfterSystem]);
+}
+
+#[test]
+fn no_cache_breakpoints_when_cache_style_is_none() {
+    let c = ctx_with_history();
+    let mut none = caps();
+    none.cache = CacheStyle::None;
+    let (req, _) = c.assemble(&none, &tools(), &m());
+    assert!(req.cache_breakpoints.is_empty());
+    let mut auto = caps();
+    auto.cache = CacheStyle::Automatic;
+    let (req, _) = c.assemble(&auto, &tools(), &m());
+    assert!(!req.cache_breakpoints.is_empty());
 }

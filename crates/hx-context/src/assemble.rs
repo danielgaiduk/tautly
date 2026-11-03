@@ -1,16 +1,17 @@
 //! Request assembly in the fixed block order: system prompt, tools, AGENTS.md, memory index,
-//! then pinned, working state and history as messages.
+//! then pinned and history as messages, and the working state as a tail message.
 
 use hx_provider::{
-    Block, CachePoint, CanonicalRequest, Capabilities, Content, Message, ModelId, Role, ToolSpec,
+    Block, CachePoint, CacheStyle, CanonicalRequest, Capabilities, Content, Message, ModelId, Role,
+    ToolSpec,
 };
 
 use crate::blocks::{Breakdown, ContextStatus, message_tokens};
 use crate::{Context, pinned, prompt};
 
 /// Leading `system` blocks that form the cache-stable prefix: system prompt, AGENTS.md,
-/// memory index. Tools travel in `CanonicalRequest.tools`; pinned items and working state
-/// follow as the first user content, never in `system`.
+/// memory index. Tools travel in `CanonicalRequest.tools`; pinned items follow as the first
+/// user content and the working state as a tail message after the history, never in `system`.
 pub const STABLE_LEN: usize = 3;
 
 /// Pinned text above this share of the window triggers a warning.
@@ -57,35 +58,44 @@ impl Context {
             .collect();
         let history_tokens = messages.iter().map(|m| message_tokens(m, est)).sum();
 
-        // Pinned and state lead the conversation. They join the first message when it is a
-        // user message (providers want alternating roles), else stand in front of it.
-        let lead: Vec<Content> = [&pinned_text, &state_text]
-            .into_iter()
-            .flatten()
-            .map(|t| Content::Text(t.clone()))
-            .collect();
-        if !lead.is_empty() {
+        // Pinned leads the conversation: it joins the first message when that is a user
+        // message, else stands in front of it. It changes rarely, so it stays cacheable.
+        if let Some(pinned) = &pinned_text {
+            let lead = Content::Text(pinned.clone());
             match messages.first_mut() {
-                Some(first) if first.role == Role::User => {
-                    first.content.splice(0..0, lead);
-                }
+                Some(first) if first.role == Role::User => first.content.insert(0, lead),
                 _ => messages.insert(
                     0,
                     Message {
                         role: Role::User,
-                        content: lead,
+                        content: vec![lead],
                     },
                 ),
             }
         }
 
-        let mut cache_breakpoints = Vec::new();
-        if !tools.is_empty() {
-            cache_breakpoints.push(CachePoint::AfterTools);
+        // The working state changes on almost every tool call, so it is a tail block after the
+        // last message, built fresh for each request. It is always its own user message: the
+        // last cache breakpoint marks the final content block of its message, and appending
+        // to a user message (tool results) would put the volatile state inside the cached
+        // prefix. Providers take consecutive user turns (Anthropic merges them).
+        let cached_len = messages.len();
+        if let Some(state) = &state_text {
+            messages.push(Message {
+                role: Role::User,
+                content: vec![Content::Text(state.clone())],
+            });
         }
-        cache_breakpoints.push(CachePoint::AfterSystem);
-        if !messages.is_empty() {
-            cache_breakpoints.push(CachePoint::AfterMessage(messages.len() - 1));
+
+        let mut cache_breakpoints = Vec::new();
+        if caps.cache != CacheStyle::None {
+            if !tools.is_empty() {
+                cache_breakpoints.push(CachePoint::AfterTools);
+            }
+            cache_breakpoints.push(CachePoint::AfterSystem);
+            if cached_len > 0 {
+                cache_breakpoints.push(CachePoint::AfterMessage(cached_len - 1));
+            }
         }
 
         let breakdown = Breakdown {
