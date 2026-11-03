@@ -1052,6 +1052,29 @@ fn hashline_range_errors() {
 }
 
 #[test]
+fn hashline_blank_only_results_keep_their_newline() {
+    // Deleting the only non-blank line leaves one blank line, not an empty file.
+    let ops = [HashlineOp::Delete {
+        start: hl(1, "a"),
+        end: hl(1, "a"),
+    }];
+    assert_eq!(hashline::apply("a\n\n", &ops).unwrap(), "\n");
+    // Replacing the only (blank) line with a blank line is a no-op.
+    let ops = [HashlineOp::Replace {
+        start: hl(1, ""),
+        end: hl(1, ""),
+        lines: vec![String::new()],
+    }];
+    assert_eq!(hashline::apply("\n", &ops).unwrap(), "\n");
+    // Deleting every line still empties the file.
+    let ops = [HashlineOp::Delete {
+        start: hl(1, "a"),
+        end: hl(1, "a"),
+    }];
+    assert_eq!(hashline::apply("a\n", &ops).unwrap(), "");
+}
+
+#[test]
 fn hashline_lines_with_embedded_newlines_are_split() {
     let ops = [HashlineOp::Replace {
         start: hl(1, "a"),
@@ -1179,17 +1202,17 @@ async fn hashline_tool_applies_stale_read_guard() {
     assert!(r.output.contains("read the file first"), "{}", r.output);
 
     let a1 = anchor(&e, "a.txt", 1).await;
-    put(&e, "a.txt", b"one\n").await; // rewritten: mtime moves
+    // Changed content (not just mtime, which can be too coarse to move on a fast rewrite).
+    put(&e, "a.txt", b"ONE\n").await;
     let r = run_hashline(
         &e,
         "a.txt",
         json!([{"op": "delete", "start": a1, "end": a1}]),
     )
     .await;
-    // Same content hash but a newer mtime still counts as stale.
     assert!(r.is_error);
     assert!(r.output.contains("changed since last read"), "{}", r.output);
-    assert_eq!(slurp(&e, "a.txt").await, b"one\n");
+    assert_eq!(slurp(&e, "a.txt").await, b"ONE\n");
 }
 
 #[tokio::test]
@@ -1229,6 +1252,35 @@ async fn hashline_tool_rejects_bad_args_and_escapes() {
     assert_eq!(slurp(&e, "a.txt").await, b"one\n");
 }
 
+#[tokio::test]
+async fn hashline_tool_names_the_missing_field_of_an_op() {
+    let e = hashline_env();
+    put(&e, "a.txt", b"one\ntwo\n").await;
+    let a1 = anchor(&e, "a.txt", 1).await;
+    let cases = [
+        (json!({"op": "replace", "start": a1, "lines": ["x"]}), "end"),
+        (json!({"op": "replace", "start": a1, "end": a1}), "lines"),
+        (json!({"op": "insert_after", "lines": ["x"]}), "at"),
+        (json!({"op": "insert_after", "at": a1}), "lines"),
+        (json!({"op": "delete", "end": a1}), "start"),
+    ];
+    for (op, field) in cases {
+        let r = run_hashline(&e, "a.txt", json!([op])).await;
+        assert!(r.is_error, "{op}");
+        assert!(
+            r.output.contains(&format!("missing `{field}`")),
+            "{op}: {}",
+            r.output
+        );
+        assert!(r.output.contains("op 1"), "{op}: {}", r.output);
+    }
+    let r = run_hashline(&e, "a.txt", json!([{"op": "frobnicate"}])).await;
+    assert!(r.is_error);
+    assert!(r.output.contains("replace"), "{}", r.output);
+    assert!(r.output.contains("insert_after"), "{}", r.output);
+    assert_eq!(slurp(&e, "a.txt").await, b"one\ntwo\n");
+}
+
 #[test]
 fn hashline_effect_is_the_single_path() {
     let eff = EditTool
@@ -1258,6 +1310,23 @@ fn edit_tool_schema_switches_with_format() {
     assert!(hashline.schema["properties"].get("ops").is_some());
     assert!(hashline.schema["properties"].get("patch").is_none());
     assert!(hashline.description.contains("insert_after"));
+
+    // Hashline is the default for the models least likely to cope with `oneOf`/`const`.
+    for fmt in [
+        EditFormat::Patch,
+        EditFormat::Hashline,
+        EditFormat::StrReplace,
+    ] {
+        let schema = EditTool.spec(&caps(fmt)).schema.to_string();
+        assert!(!schema.contains("oneOf"), "{fmt:?}: {schema}");
+        assert!(!schema.contains("const"), "{fmt:?}: {schema}");
+    }
+    let op = &hashline.schema["properties"]["ops"]["items"];
+    assert_eq!(
+        op["properties"]["op"]["enum"],
+        json!(["replace", "insert_after", "delete"])
+    );
+    assert_eq!(op["required"], json!(["op"]));
 
     let str_replace = EditTool.spec(&caps(EditFormat::StrReplace));
     assert!(str_replace.schema["properties"].get("old_text").is_some());

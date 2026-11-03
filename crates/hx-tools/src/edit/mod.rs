@@ -60,41 +60,46 @@ struct HashlineArgs {
     ops: Vec<OpArgs>,
 }
 
+/// One hashline op as the model writes it. Kept flat (no tagged union) so the JSON
+/// schema stays simple for models that handle `oneOf` poorly; [`OpArgs::into_op`]
+/// checks which fields the chosen op needs.
 #[derive(Deserialize)]
-#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
-enum OpArgs {
-    Replace {
-        start: String,
-        end: String,
-        lines: Vec<String>,
-    },
-    InsertAfter {
-        at: String,
-        lines: Vec<String>,
-    },
-    Delete {
-        start: String,
-        end: String,
-    },
+#[serde(deny_unknown_fields)]
+struct OpArgs {
+    op: String,
+    start: Option<String>,
+    end: Option<String>,
+    at: Option<String>,
+    lines: Option<Vec<String>>,
 }
 
 impl OpArgs {
-    fn into_op(self) -> Result<HashlineOp, HashlineError> {
-        Ok(match self {
-            OpArgs::Replace { start, end, lines } => HashlineOp::Replace {
-                start: Anchor::parse(&start)?,
-                end: Anchor::parse(&end)?,
-                lines,
-            },
-            OpArgs::InsertAfter { at, lines } => HashlineOp::InsertAfter {
-                at: Anchor::parse(&at)?,
-                lines,
-            },
-            OpArgs::Delete { start, end } => HashlineOp::Delete {
-                start: Anchor::parse(&start)?,
-                end: Anchor::parse(&end)?,
-            },
-        })
+    /// `n` is the op's 1-based position, for messages.
+    fn into_op(self, n: usize) -> Result<HashlineOp, String> {
+        let name = self.op.clone();
+        let missing = |field: &str| format!("op {n} ({name}): missing `{field}`");
+        let anchor = |a: Option<String>, field: &str| -> Result<Anchor, String> {
+            let a = a.ok_or_else(|| missing(field))?;
+            Anchor::parse(&a).map_err(|e| format!("op {n} ({name}): {e}"))
+        };
+        match self.op.as_str() {
+            "replace" => Ok(HashlineOp::Replace {
+                start: anchor(self.start, "start")?,
+                end: anchor(self.end, "end")?,
+                lines: self.lines.ok_or_else(|| missing("lines"))?,
+            }),
+            "insert_after" => Ok(HashlineOp::InsertAfter {
+                at: anchor(self.at, "at")?,
+                lines: self.lines.ok_or_else(|| missing("lines"))?,
+            }),
+            "delete" => Ok(HashlineOp::Delete {
+                start: anchor(self.start, "start")?,
+                end: anchor(self.end, "end")?,
+            }),
+            other => Err(format!(
+                "op {n}: unknown op `{other}`; use `replace`, `insert_after` or `delete`"
+            )),
+        }
     }
 }
 
@@ -137,14 +142,13 @@ fn patch_spec() -> ToolSpec {
 }
 
 fn hashline_spec() -> ToolSpec {
-    let anchor = json!({"type": "string", "description": "Line anchor `<n>:<hash>` exactly as `read` printed it before the `|`."});
-    let lines = json!({"type": "array", "items": {"type": "string"}, "description": "New lines, without line numbers or anchors."});
     tool_spec(
         "edit",
-        "Edit a file by line anchors from `read` (`<n>:<hash>|<line>`). ops: `replace` start..end \
-         (inclusive) with lines, `insert_after` the anchored line, or `delete` start..end. All anchors \
-         refer to the file as you last read it, and ops must not overlap. If a line changed, its anchor \
-         is rejected; read again. Example: {\"path\":\"a.rs\",\"ops\":[{\"op\":\"replace\",\"start\":\"3:a1b2\",\"end\":\"3:a1b2\",\"lines\":[\"let x = 1;\"]}]}",
+        "Edit a file by line anchors from `read` (`<n>:<hash>|<line>`). Each op has an `op` of: \
+         `replace` (needs start, end, lines: replaces start..end inclusive), `insert_after` (needs at, \
+         lines) or `delete` (needs start, end). All anchors refer to the file as you last read it, and \
+         ops must not overlap. If a line changed, its anchor is rejected; read again. Example: \
+         {\"path\":\"a.rs\",\"ops\":[{\"op\":\"replace\",\"start\":\"3:a1b2\",\"end\":\"3:a1b2\",\"lines\":[\"let x = 1;\"]}]}",
         json!({
             "type": "object",
             "properties": {
@@ -153,35 +157,16 @@ fn hashline_spec() -> ToolSpec {
                     "type": "array",
                     "minItems": 1,
                     "items": {
-                        "oneOf": [
-                            {
-                                "type": "object",
-                                "properties": {
-                                    "op": {"const": "replace"},
-                                    "start": anchor, "end": anchor, "lines": lines
-                                },
-                                "required": ["op", "start", "end", "lines"],
-                                "additionalProperties": false
-                            },
-                            {
-                                "type": "object",
-                                "properties": {
-                                    "op": {"const": "insert_after"},
-                                    "at": anchor, "lines": lines
-                                },
-                                "required": ["op", "at", "lines"],
-                                "additionalProperties": false
-                            },
-                            {
-                                "type": "object",
-                                "properties": {
-                                    "op": {"const": "delete"},
-                                    "start": anchor, "end": anchor
-                                },
-                                "required": ["op", "start", "end"],
-                                "additionalProperties": false
-                            }
-                        ]
+                        "type": "object",
+                        "properties": {
+                            "op": {"type": "string", "enum": ["replace", "insert_after", "delete"]},
+                            "start": {"type": "string", "description": "replace/delete: first line anchor `<n>:<hash>` exactly as `read` printed it before the `|`."},
+                            "end": {"type": "string", "description": "replace/delete: last line anchor (inclusive); same as start for one line."},
+                            "at": {"type": "string", "description": "insert_after: anchor of the line to insert after."},
+                            "lines": {"type": "array", "items": {"type": "string"}, "description": "replace/insert_after: new lines, without line numbers or anchors."}
+                        },
+                        "required": ["op"],
+                        "additionalProperties": false
                     }
                 }
             },
@@ -341,7 +326,10 @@ async fn run_hashline(a: HashlineArgs, sb: &dyn Sandbox, cx: &ToolCx) -> ToolRes
         return ToolResult::error("ops must not be empty");
     }
     let count = a.ops.len();
-    let ops: Vec<HashlineOp> = match a.ops.into_iter().map(OpArgs::into_op).collect() {
+    let ops: Vec<HashlineOp> = match (a.ops.into_iter().enumerate())
+        .map(|(i, op)| op.into_op(i + 1))
+        .collect()
+    {
         Ok(ops) => ops,
         Err(e) => return ToolResult::error(format!("{}: {e}", a.path)),
     };

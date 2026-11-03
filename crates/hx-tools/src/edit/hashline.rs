@@ -191,7 +191,7 @@ pub fn apply(text: &str, ops: &[HashlineOp]) -> Result<String, HashlineError> {
         lines.splice(e.from..e.to, e.lines);
     }
     let mut out = lines.join("\n");
-    if !out.is_empty() {
+    if !lines.is_empty() {
         out.push('\n');
     }
     Ok(out)
