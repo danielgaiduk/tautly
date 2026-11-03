@@ -394,3 +394,62 @@ fn unresolvable_argv_words_ask_only_if_they_may_name_protected_paths() {
         Some("echo hi > $OUT")
     )));
 }
+
+// --- checkpoint fix: C2 environment assignments ---
+#[test]
+fn dangerous_env_assignments_ask_in_every_mode() {
+    let allow = with_rules(
+        Mode::Ask,
+        &["bash(ls*)", "bash(git status*)", "bash(LD_PRELOAD=* ls*)"],
+        &[],
+    );
+    for cmd in [
+        "LD_PRELOAD=./x.so ls",
+        "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.fsmonitor GIT_CONFIG_VALUE_0='touch /tmp/pwn' git status",
+        "GIT_EXTERNAL_DIFF=./evil git status",
+        "DYLD_INSERT_LIBRARIES=x ls",
+        "BASH_ENV=x bash s.sh",
+        "ENV=x sh s.sh",
+        "PATH=/tmp/evil ls",
+        "PYTHONPATH=. python3 x.py",
+        "NODE_OPTIONS=--require=./x node a.js",
+        "PERL5OPT=-Mx perl a.pl",
+        "RUBYOPT=-rx ruby a.rb",
+        "IFS=x ls",
+        "PS4='$(id)' bash -x s.sh",
+        "PROMPT_COMMAND=x ls",
+        "env LD_PRELOAD=x ls",
+        "env -i GIT_DIR=x git status",
+        "sudo LD_PRELOAD=x ls",
+        "export PATH=/tmp/evil",
+        "declare -x GIT_SSH_COMMAND=x",
+    ] {
+        assert!(asks(allow.decide("bash", &exec("x"), Some(cmd))), "{cmd}");
+        assert!(
+            asks(p(Mode::Yolo).decide("bash", &exec("x"), Some(cmd))),
+            "{cmd}"
+        );
+    }
+}
+#[test]
+fn leading_assignments_need_an_explicit_allow_rule() {
+    let p1 = with_rules(Mode::Ask, &["bash(ls*)"], &[]);
+    assert!(asks(p1.decide("bash", &exec("ls"), Some("FOO=1 ls"))));
+    assert_eq!(p1.decide("bash", &exec("ls"), Some("ls")), Decision::Allow);
+    let p2 = with_rules(Mode::Ask, &["bash(FOO=1 ls*)"], &[]);
+    assert_eq!(
+        p2.decide("bash", &exec("ls"), Some("FOO=1 ls -l")),
+        Decision::Allow
+    );
+    // Ordinary assignments are fine in yolo.
+    assert_eq!(
+        p(Mode::Yolo).decide("bash", &exec("ls"), Some("FOO=1 ls")),
+        Decision::Allow
+    );
+    // Deny rules still see the command behind the assignments.
+    let d = with_rules(Mode::Yolo, &[], &["bash(rm -rf*)"]);
+    assert!(matches!(
+        d.decide("bash", &exec("rm"), Some("FOO=1 rm -rf x")),
+        Decision::Deny { .. }
+    ));
+}

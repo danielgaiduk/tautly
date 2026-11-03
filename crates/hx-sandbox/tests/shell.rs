@@ -224,3 +224,29 @@ fn trap_and_coproc_are_unparseable() {
     assert!(parse_commands("trap 'rm x' EXIT").is_err());
     assert!(parse_commands("coproc cat").is_err());
 }
+
+// ---- checkpoint fix: C2 leading environment assignments ----
+
+#[test]
+fn leading_assignments_are_kept_verbatim() {
+    let c = parse_commands("FOO=1 BAR='x y' ls -l").unwrap();
+    assert_eq!(c[0].assignments, ["FOO=1", "BAR='x y'"]);
+    assert_eq!(c[0].argv, ["ls", "-l"]);
+    let c = parse_commands("ls; A=$(id) git status").unwrap();
+    assert!(c[0].assignments.is_empty());
+    assert_eq!(c[1].assignments, ["A=$(id)"]);
+    assert_eq!(argv0s(&c), ["ls", "git", "id"]);
+}
+
+#[test]
+fn bare_assignment_to_dangerous_variable_is_unparseable() {
+    for s in [
+        "PATH=/tmp/evil; ls",
+        "LD_PRELOAD=./x.so; export LD_PRELOAD; ls",
+        "GIT_DIR=x",
+        "IFS=/",
+    ] {
+        assert!(parse_commands(s).is_err(), "{s}");
+    }
+    assert!(parse_commands("FOO=1; ls").is_ok());
+}

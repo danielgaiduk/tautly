@@ -11,6 +11,8 @@ use tree_sitter::{Node, Parser};
 /// stay literal (`$X`). Wrappers such as `sudo` or `env` are not unwrapped.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SimpleCommand {
+    /// Leading `NAME=VALUE` words (environment for this command only), verbatim source text.
+    pub assignments: Vec<String>,
     pub argv: Vec<String>,
     pub redirects: Vec<Redirect>,
 }
@@ -87,6 +89,7 @@ fn snippet(s: &str) -> String {
 fn walk(node: Node, src: &[u8], out: &mut Vec<SimpleCommand>) -> Result<(), Unparseable> {
     match node.kind() {
         "command" => {
+            let mut assignments = Vec::new();
             let mut argv = Vec::new();
             let mut redirects = Vec::new();
             let mut extra = Vec::new();
@@ -95,7 +98,10 @@ fn walk(node: Node, src: &[u8], out: &mut Vec<SimpleCommand>) -> Result<(), Unpa
             for child in node.children(&mut cur) {
                 match child.kind() {
                     "command_name" => argv.push(unquote(child, src)),
-                    "variable_assignment" => rest.push(child),
+                    "variable_assignment" => {
+                        assignments.push(text(child, src).to_string());
+                        rest.push(child);
+                    }
                     "file_redirect" | "heredoc_redirect" | "herestring_redirect" => {
                         collect_redirects(child, src, &mut redirects, &mut extra)?
                     }
@@ -113,10 +119,20 @@ fn walk(node: Node, src: &[u8], out: &mut Vec<SimpleCommand>) -> Result<(), Unpa
                 }
             } else {
                 reject_unanalyzable(&argv)?;
-                out.push(SimpleCommand { argv, redirects });
+                out.push(SimpleCommand {
+                    assignments,
+                    argv,
+                    redirects,
+                });
             }
             for child in rest {
-                walk(child, src, out)?;
+                // A command's own assignments only reach its environment; the policy
+                // judges them, so only look inside for substitutions.
+                if child.kind() == "variable_assignment" {
+                    walk_children(child, src, out)?;
+                } else {
+                    walk(child, src, out)?;
+                }
             }
             out.append(&mut extra);
             Ok(())
@@ -132,13 +148,24 @@ fn walk(node: Node, src: &[u8], out: &mut Vec<SimpleCommand>) -> Result<(), Unpa
                 }
             }
             out.push(SimpleCommand {
+                assignments: Vec::new(),
                 argv,
                 redirects: Vec::new(),
             });
-            walk_children(node, src, out)
+            // Assignments here are argv words the policy judges; only look inside them.
+            let mut cur = node.walk();
+            for child in node.children(&mut cur) {
+                if child.kind() == "variable_assignment" {
+                    walk_children(child, src, out)?;
+                } else {
+                    walk(child, src, out)?;
+                }
+            }
+            Ok(())
         }
         "test_command" => {
             out.push(SimpleCommand {
+                assignments: Vec::new(),
                 argv: vec!["[[".into()],
                 redirects: Vec::new(),
             });
@@ -168,6 +195,17 @@ fn walk(node: Node, src: &[u8], out: &mut Vec<SimpleCommand>) -> Result<(), Unpa
             }
             out.append(&mut extra);
             Ok(())
+        }
+        // A bare assignment changes how every later command in the input runs.
+        "variable_assignment" => {
+            let t = text(node, src);
+            let name = t.split(['=', '[', '+']).next().unwrap_or(t);
+            if is_dangerous_env(name) {
+                return Err(Unparseable(format!(
+                    "assignment to `{name}` changes how later commands run"
+                )));
+            }
+            walk_children(node, src, out)
         }
         // Redirects are only understood in the contexts above; anywhere else
         // they could hide a write, so refuse.
@@ -214,6 +252,54 @@ fn collect_redirects(
         }
         _ => walk_children(node, src, extra),
     }
+}
+
+/// Environment variables that make an otherwise harmless program load or run
+/// other code (dynamic loader, shell startup, interpreters, git, tool runners).
+const DANGEROUS_ENV: &[&str] = &[
+    "BASH_ENV",
+    "ENV",
+    "PATH",
+    "IFS",
+    "PS4",
+    "PROMPT_COMMAND",
+    "NODE_OPTIONS",
+    "RUBYOPT",
+    "SHELLOPTS",
+    "BASHOPTS",
+    "HOME",
+    "ZDOTDIR",
+    "XDG_CONFIG_HOME",
+    "EDITOR",
+    "VISUAL",
+    "PAGER",
+    "MANPAGER",
+    "LESSOPEN",
+    "JAVA_TOOL_OPTIONS",
+    "_JAVA_OPTIONS",
+    "RUSTC_WRAPPER",
+    "RUSTC_WORKSPACE_WRAPPER",
+    "SSH_ASKPASS",
+    "SUDO_ASKPASS",
+];
+/// Prefixes of dangerous environment variable families.
+const DANGEROUS_ENV_PREFIXES: &[&str] = &[
+    "LD_",
+    "DYLD_",
+    "GIT_",
+    "PYTHON",
+    "PERL5",
+    "BASH_FUNC_",
+    "CARGO_",
+    "NPM_CONFIG_",
+];
+
+/// Whether assigning `name` in a command's environment can make it run other code.
+/// Compared case-insensitively (some tools, e.g. npm, also read lowercase names).
+pub(crate) fn is_dangerous_env(name: &str) -> bool {
+    let upper = name.to_ascii_uppercase();
+    DANGEROUS_ENV.contains(&upper.as_str())
+        || DANGEROUS_ENV_PREFIXES.iter().any(|p| upper.starts_with(p))
 }
 
 const WRAPPERS: &[&str] = &[

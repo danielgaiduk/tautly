@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::effect::Effect;
 use crate::protected::{argv_word_reason, normalize, path_reason, redirect_reason};
-use crate::shell::{SimpleCommand, parse_commands};
+use crate::shell::{SimpleCommand, is_dangerous_env, parse_commands};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -183,6 +183,7 @@ impl Policy {
                     },
                 },
                 None => Subjects::Commands(vec![SimpleCommand {
+                    assignments: Vec::new(),
                     argv: argv.clone(),
                     redirects: vec![],
                 }]),
@@ -200,7 +201,11 @@ impl Policy {
             let hit = match subjects {
                 Subjects::None => r.glob.is_none(),
                 Subjects::Commands(cmds) => {
-                    r.glob.is_none() || cmds.iter().any(|c| r.matches_str(tool, &c.argv.join(" ")))
+                    r.glob.is_none()
+                        || cmds.iter().any(|c| {
+                            r.matches_str(tool, &c.argv.join(" "))
+                                || r.matches_str(tool, &command_line(c))
+                        })
                 }
                 Subjects::Unparseable { raw, .. } => r.matches_str(tool, raw) || r.glob.is_none(),
                 Subjects::Paths(ps) => {
@@ -230,7 +235,8 @@ impl Policy {
         let any = |s: &str| self.allow.iter().any(|r| r.matches_str(tool, s));
         match subjects {
             Subjects::Commands(cmds) => {
-                !cmds.is_empty() && cmds.iter().all(|c| any(&c.argv.join(" ")))
+                // Leading assignments are part of what the rule must match.
+                !cmds.is_empty() && cmds.iter().all(|c| any(&command_line(c)))
             }
             Subjects::Paths(ps) => {
                 !ps.is_empty()
@@ -258,13 +264,17 @@ impl Policy {
         }
     }
 
-    /// Approval needed for protected paths touched by one command: write
-    /// redirects, any non-flag argv word, and git config/`-c` invocations.
+    /// Approval needed for one command: dangerous environment assignments,
+    /// protected paths touched by write redirects or any non-flag argv word, and
+    /// git config/`-c` invocations.
     fn command_reason(&self, c: &SimpleCommand) -> Option<String> {
-        c.redirects
-            .iter()
-            .filter(|r| r.write)
-            .find_map(|r| redirect_reason(&self.root, &r.target))
+        env_reason(c)
+            .or_else(|| {
+                c.redirects
+                    .iter()
+                    .filter(|r| r.write)
+                    .find_map(|r| redirect_reason(&self.root, &r.target))
+            })
             .or_else(|| {
                 c.argv
                     .iter()
@@ -273,6 +283,37 @@ impl Policy {
             })
             .or_else(|| git_reason(&c.argv))
     }
+}
+
+/// The command as rules see it: leading assignments, then argv.
+fn command_line(c: &SimpleCommand) -> String {
+    c.assignments
+        .iter()
+        .chain(&c.argv)
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// A dangerous `NAME=VALUE` in the command's own environment, or anywhere in its
+/// argv (`env NAME=VALUE cmd`, `sudo NAME=VALUE cmd`, `export NAME=VALUE`, `make
+/// NAME=VALUE` all pass it on).
+fn env_reason(c: &SimpleCommand) -> Option<String> {
+    c.assignments
+        .iter()
+        .map(String::as_str)
+        .chain(c.argv.iter().skip(1).map(String::as_str))
+        .find_map(|w| {
+            let (name, _) = w.split_once('=')?;
+            let name = name.strip_suffix('+').unwrap_or(name);
+            let ident = !name.is_empty()
+                && !name.starts_with(|ch: char| ch.is_ascii_digit())
+                && name
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || ch == '_');
+            (ident && is_dangerous_env(name))
+                .then(|| format!("sets environment variable {name}, which can run other code"))
+        })
 }
 
 fn path_str(rel: &Path) -> String {
