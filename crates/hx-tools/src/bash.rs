@@ -19,7 +19,7 @@ const DEFAULT_TIMEOUT_S: u64 = 120;
 const MAX_TIMEOUT_S: u64 = 600;
 /// Grace between SIGTERM and SIGKILL.
 const TERM_GRACE: Duration = Duration::from_millis(100);
-/// How long (idle) to keep reading pipes after the shell exits (background children may hold them).
+/// Absolute cap on how long to keep reading pipes after the shell exits (background children may hold them).
 const DRAIN_GRACE: Duration = Duration::from_millis(200);
 /// Upper bound on output kept in memory; the rest is drained and discarded.
 const MAX_CAPTURE: usize = 16 * 1024 * 1024;
@@ -155,15 +155,13 @@ impl Tool for BashTool {
         let spec = SpawnSpec {
             argv: vec!["/bin/sh".into(), "-c".into(), a.command],
             cwd: Path::new(".").to_path_buf(),
-            env: std::env::vars()
-                .filter(|(k, _)| !matches!(k.as_str(), "HX" | "PAGER" | "GIT_PAGER" | "TERM"))
-                .chain([
-                    ("HX".into(), "1".into()),
-                    ("PAGER".into(), "cat".into()),
-                    ("GIT_PAGER".into(), "cat".into()),
-                    ("TERM".into(), "dumb".into()),
-                ])
-                .collect(),
+            // Overrides only: the sandbox spawn inherits the rest of the environment.
+            env: vec![
+                ("HX".into(), "1".into()),
+                ("PAGER".into(), "cat".into()),
+                ("GIT_PAGER".into(), "cat".into()),
+                ("TERM".into(), "dumb".into()),
+            ],
             new_process_group: true,
         };
         let mut child = match sb.spawn(spec).await {
@@ -194,14 +192,11 @@ impl Tool for BashTool {
             }
             tokio::select! {
                 biased;
-                _ = cx.cancel().cancelled() => break Outcome::Cancelled,
-                _ = tokio::time::sleep_until(deadline) => break Outcome::TimedOut,
+                _ = cx.cancel().cancelled(), if exit.is_none() => break Outcome::Cancelled,
+                _ = tokio::time::sleep_until(deadline), if exit.is_none() => break Outcome::TimedOut,
                 line = lines.recv(), if pipes_open => match line {
                     Some(l) => {
                         cap.push(l);
-                        if drain_until.is_some() {
-                            drain_until = Some(Instant::now() + DRAIN_GRACE);
-                        }
                     }
                     None => pipes_open = false,
                 },

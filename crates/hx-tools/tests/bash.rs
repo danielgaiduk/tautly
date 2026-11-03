@@ -239,3 +239,29 @@ async fn bad_args_run_returns_error_result() {
     let r = run_args(json!({"timeout_s": 5})).await;
     assert!(r.is_error);
 }
+
+#[tokio::test]
+async fn chatty_background_child_does_not_hold_the_call_open() {
+    let marker = format!("hx-test-{}", unique_sleep());
+    let cmd = format!("(while true; do echo x; sleep 0.05; done) & # {marker}\necho done");
+    let t = Instant::now();
+    let r = run_bash(&cmd).await;
+    let _ = Command::new("pkill").args(["-f", &marker]).status();
+    assert!(t.elapsed() < Duration::from_secs(2), "{:?}", t.elapsed());
+    assert!(!r.is_error, "{}", r.output);
+    assert!(
+        r.output.trim_end().ends_with("exit code: 0"),
+        "{}",
+        r.output
+    );
+}
+
+#[tokio::test]
+async fn non_utf8_environment_does_not_panic() {
+    use std::os::unix::ffi::OsStrExt;
+    // SAFETY: test-only; set before any bash run in this test and the value is unused elsewhere.
+    unsafe { std::env::set_var("HX_TEST_BAD", std::ffi::OsStr::from_bytes(b"\xff\xfe")) };
+    let r = run_bash("echo ok").await;
+    unsafe { std::env::remove_var("HX_TEST_BAD") };
+    assert!(!r.is_error, "{}", r.output);
+}
