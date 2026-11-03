@@ -10,6 +10,7 @@ pub mod budget;
 pub mod config;
 mod dispatch;
 pub mod engine;
+pub mod evidence;
 pub mod ledger;
 pub mod protocol;
 mod provider_setup;
@@ -26,6 +27,9 @@ pub use config::{
     ProviderEntry, ProvidersConfig, RoutingConfig, TelemetryConfig, config_home,
 };
 pub use engine::{Engine, EngineBuilder, EngineError};
+pub use evidence::{
+    DEFAULT_TEST_COMMANDS, EvidenceConfig, EvidenceTracker, TestEvidence, TestMatcher,
+};
 pub use ledger::{Ledger, LedgerError, Totals};
 pub use protocol::{
     BudgetScope, Command, EffectView, ErrorKind, Event, FinishReason, PROTOCOL_VERSION,

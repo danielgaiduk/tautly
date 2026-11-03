@@ -6,7 +6,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{AppliedEffect, LineRange, Shown, ToolMeta};
+use crate::{AppliedEffect, LineRange, Shown, TestCounts, ToolMeta};
 
 /// `#[serde(with = "...")]` for a `blake3::Hash`: a 64-digit lowercase hex string.
 pub(crate) mod hash_hex {
@@ -90,6 +90,8 @@ struct MetaRepr {
     exit_code: Option<i32>,
     #[serde(default)]
     error_kind: Option<String>,
+    #[serde(default)]
+    counts: Option<TestCounts>,
 }
 
 impl<'de> Deserialize<'de> for ToolMeta {
@@ -104,6 +106,7 @@ impl<'de> Deserialize<'de> for ToolMeta {
                     .find(|known| *known == k)
                     .unwrap_or(UNKNOWN_KIND)
             }),
+            counts: r.counts,
         })
     }
 }

@@ -136,6 +136,7 @@ fn every_event() -> Vec<Event> {
         },
         Event::TurnFinished {
             reason: FinishReason::MaxTurns,
+            evidence: None,
         },
         Event::Error {
             kind: ErrorKind::ProviderTransient,
@@ -263,6 +264,25 @@ fn event_json_shape_is_stable() {
         assert!(serde_json::to_value(e).unwrap().get("session_id").is_none());
     }
     insta::assert_json_snapshot!("events", events);
+}
+
+#[test]
+fn turn_finished_with_evidence_has_a_stable_shape() {
+    let e = Event::TurnFinished {
+        reason: FinishReason::Completed,
+        evidence: Some(tautly_core::TestEvidence {
+            command: "cargo test -p tautly-core".into(),
+            exit_code: Some(101),
+            passed: Some(41),
+            failed: Some(2),
+            step: 3,
+            write_gen: 12,
+            stale: true,
+            edits_since: 2,
+            execs_since: 1,
+        }),
+    };
+    insta::assert_json_snapshot!("turn_finished_with_evidence", e);
 }
 
 #[test]
@@ -570,7 +590,8 @@ fn unknown_events_and_values_read_as_unknown_not_as_errors() {
     assert_eq!(
         e,
         Event::TurnFinished {
-            reason: FinishReason::Unknown
+            reason: FinishReason::Unknown,
+            evidence: None,
         }
     );
     let e: Event = serde_json::from_value(json!({

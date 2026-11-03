@@ -288,3 +288,20 @@ fn blob_errors_abort_the_conversion() {
     let err = p.to_applied(&mut |k| blobs.get(k)).unwrap_err();
     assert!(err.starts_with("no blob "), "{err}");
 }
+
+#[test]
+fn tool_meta_counts_roundtrip_and_are_omitted_when_absent() {
+    use tautly_tools::TestCounts;
+    let mut meta = ToolMeta::default();
+    meta.exit_code = Some(1);
+    meta.counts = Some(TestCounts {
+        passed: 7,
+        failed: 2,
+    });
+    let v = serde_json::to_value(&meta).unwrap();
+    assert_eq!(
+        v,
+        json!({"exit_code": 1, "error_kind": null, "counts": {"passed": 7, "failed": 2}})
+    );
+    assert_eq!(serde_json::from_value::<ToolMeta>(v).unwrap(), meta);
+}

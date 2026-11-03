@@ -20,6 +20,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::attempts::AttemptLedger;
 use crate::budget::Budgets;
+use crate::evidence::EvidenceTracker;
 use crate::ledger::CostLedger;
 use crate::protocol::{Command, ErrorKind, Event};
 use crate::record::SessionRecord;
@@ -318,6 +319,8 @@ pub(crate) struct Session {
     /// Paths of writes abandoned at their bound, with `(mtime, len)` last seen: a blocking
     /// write may still land after its future was dropped.
     pub lost_write_paths: HashMap<PathBuf, Option<(SystemTime, u64)>>,
+    /// The running turn's test evidence (spec 7.11.7); replaced at every turn start.
+    pub evidence: EvidenceTracker,
 }
 
 impl Session {

@@ -35,6 +35,7 @@ use crate::approvals::{Approvals, Verdict};
 use crate::attempts::AttemptLedger;
 use crate::budget::{Budget, Budgets};
 use crate::config::{Config, LoadedConfig};
+use crate::evidence::{EvidenceTracker, TestMatcher};
 use crate::ledger::{CostLedger, LEDGER_FILE};
 use crate::protocol::{BudgetScope, Command, ErrorKind, Event, FinishReason};
 use crate::provider_setup::provider_for;
@@ -62,6 +63,8 @@ pub enum EngineError {
     Sandbox(#[from] SandboxError),
     #[error("invalid permission rules: {0}")]
     Policy(#[from] PolicyError),
+    #[error("invalid [evidence] test pattern: {0}")]
+    Evidence(PolicyError),
     #[error("{0}")]
     Provider(String),
     #[error("the shared workspace is for {}, not {}", workspace.display(), session.display())]
@@ -165,6 +168,8 @@ impl EngineBuilder {
         let root = sandbox.root().to_path_buf();
         let config = self.config;
         let policy = Policy::new(config.permissions.clone(), root.clone())?;
+        let test_matcher =
+            Arc::new(TestMatcher::new(&config.evidence).map_err(EngineError::Evidence)?);
         let mut catalog = Catalog::builtin();
         if let Some(overrides) = config.catalog_overrides.clone() {
             catalog.merge(overrides);
@@ -225,6 +230,7 @@ impl EngineBuilder {
             cost_ledger_reported: false,
             groups: groups.clone(),
             lost_write_paths: Default::default(),
+            evidence: EvidenceTracker::new(test_matcher),
         };
         let actor = Actor {
             log: session.log.clone(),
@@ -537,6 +543,7 @@ impl Actor {
             },
             SessionRecord::TurnEnd {
                 reason: FinishReason::Error,
+                evidence: None,
             },
         ];
         self.with_log(move |l| {
@@ -558,6 +565,7 @@ impl Actor {
         self.events
             .send_or_drop(Event::TurnFinished {
                 reason: FinishReason::Error,
+                evidence: None,
             })
             .await;
     }

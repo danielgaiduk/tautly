@@ -290,6 +290,7 @@ impl Session {
             })
         });
         self.apply_startup().await;
+        self.evidence = self.evidence.fresh();
         self.emit(Event::TurnStarted).await;
         self.budgets
             .lock()
@@ -308,9 +309,15 @@ impl Session {
         if reason == FinishReason::Cancelled && timed_out.load(Ordering::Relaxed) {
             reason = FinishReason::Timeout;
         }
-        self.log(SessionRecord::TurnEnd { reason }).await;
+        let next = self.evidence.fresh();
+        let evidence = std::mem::replace(&mut self.evidence, next).finish();
+        self.log(SessionRecord::TurnEnd {
+            reason,
+            evidence: evidence.clone(),
+        })
+        .await;
         self.checkpoint().await;
-        self.emit(Event::TurnFinished { reason }).await;
+        self.emit(Event::TurnFinished { reason, evidence }).await;
     }
 
     async fn steps(&mut self, ctl: &mut TurnControl) -> FinishReason {

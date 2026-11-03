@@ -16,7 +16,7 @@ use crate::cap::{OUTPUT_CAP, cap_text};
 use crate::filters;
 use crate::procs::{GroupGuard, group_alive, killpg};
 use crate::spec::{parse_args, tool_spec};
-use crate::{AppliedEffect, Tool, ToolCx, ToolError, ToolResult};
+use crate::{AppliedEffect, TestCounts, Tool, ToolCx, ToolError, ToolResult};
 
 const DEFAULT_TIMEOUT_S: u64 = 120;
 const MAX_TIMEOUT_S: u64 = 600;
@@ -82,15 +82,47 @@ pub async fn cap_output(full: &str, cap: usize, sb: &dyn Sandbox) -> (String, Op
     (text, sb.spill(full.as_bytes()).await.ok())
 }
 
-/// The filtered summary of `full` when `command` ends in a recognized tool and its
-/// output is large enough and parseable. The complete output is spilled and named in
-/// the summary. `None` (use the plain cap) when any of that does not hold, when the
-/// run was cut short (`exit_code` is `None`: killed, timed out or cancelled, so the
-/// output is partial), or when the command failed but the summary shows no failure
-/// or error, or the output holds a crash the summary leaves out (the parser missed
-/// what went wrong).
+/// What a recognized tool's output says, parsed once for the filtered summary and the
+/// counts: `None` for an unrecognized command, unparseable output, or a run that was cut
+/// short (`exit_code` is `None`: killed, timed out or cancelled, so the output is partial).
+fn parse_summary(command: &str, full: &str, exit_code: Option<i32>) -> Option<filters::Summary> {
+    exit_code?;
+    filters::apply(filters::detect_command(command)?, full)
+}
+
+/// Whether a failed run (`code != 0`) shows nothing the summary accounts for: no failure or
+/// error in it, or a crash in the output that it leaves out (the parser missed what went
+/// wrong), so neither the summary nor its counts can be trusted.
+fn contradicts_exit(summary: &filters::Summary, full: &str, code: i32) -> bool {
+    code != 0
+        && (summary.failed + summary.errors == 0 || filters::has_unparsed_crash(full, summary))
+}
+
+/// Passed and failed counts of a test tool's summary (builds and linters report no passes);
+/// a crashed test binary or collection error counts as a failure. None when the summary
+/// contradicts the exit code ([`contradicts_exit`]): the footer must not say "4 passed,
+/// 0 failed" about a run that exited non-zero.
+fn test_counts(
+    summary: &filters::Summary,
+    full: &str,
+    exit_code: Option<i32>,
+) -> Option<TestCounts> {
+    if contradicts_exit(summary, full, exit_code?) {
+        return None;
+    }
+    Some(TestCounts {
+        passed: summary.passed?,
+        failed: summary.failed.saturating_add(summary.errors),
+    })
+}
+
+/// The filtered summary of `full` when `summary` (see [`parse_summary`]) exists and the
+/// output is large enough. The complete output is spilled and named in the summary.
+/// `None` (use the plain cap) when any of that does not hold, when the command failed but
+/// the summary shows no failure or error, or the output holds a crash the summary leaves
+/// out (the parser missed what went wrong).
 async fn filtered_output(
-    command: &str,
+    summary: Option<&filters::Summary>,
     full: &str,
     exit_code: Option<i32>,
     sb: &dyn Sandbox,
@@ -99,10 +131,8 @@ async fn filtered_output(
     if full.len() <= FILTER_THRESHOLD {
         return None;
     }
-    let summary = filters::apply(filters::detect_command(command)?, full)?;
-    if code != 0
-        && (summary.failed + summary.errors == 0 || filters::has_unparsed_crash(full, &summary))
-    {
+    let summary = summary?;
+    if contradicts_exit(summary, full, code) {
         return None;
     }
     let spill = sb.spill(full.as_bytes()).await.ok()?;
@@ -369,10 +399,11 @@ impl Tool for BashTool {
             Ok(s) => s,
             Err(e) => String::from_utf8_lossy(e.as_bytes()).into_owned(),
         };
+        let summary = parse_summary(&a.command, &full, exit_code);
         let filtered = if a.raw == Some(true) {
             None
         } else {
-            filtered_output(&a.command, &full, exit_code, sb).await
+            filtered_output(summary.as_ref(), &full, exit_code, sb).await
         };
         // A summary already names the spilled file; otherwise the cap spills when it cuts.
         let (mut text, spilled) = match filtered {
@@ -389,6 +420,9 @@ impl Tool for BashTool {
         let mut r = ToolResult::ok(text);
         r.is_error = is_error;
         r.meta.exit_code = exit_code;
+        r.meta.counts = summary
+            .as_ref()
+            .and_then(|s| test_counts(s, &full, exit_code));
         r.effects.push(AppliedEffect::Exec { may_write: true });
         r
     }
