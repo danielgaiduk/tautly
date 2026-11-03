@@ -271,7 +271,7 @@ fn patch_reuses_tolerant_indentation_stage() {
         PatchOp::Update("impl X {\n    fn f() {\n        new();\n    }\n}\n".into())
     );
     assert_eq!(staged[0].repairs.len(), 1);
-    assert_eq!(staged[0].repairs[0].0, 1);
+    assert_eq!(staged[0].repairs[0].hunk, 1);
 }
 
 #[test]

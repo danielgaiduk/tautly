@@ -2,7 +2,7 @@
 
 use std::path::Path;
 
-use super::tolerant::{Located, RepairStage, adapt_new_text, locate, locate_structural};
+use super::tolerant::{Located, RepairStage, adapt_new_text, line_span, locate, locate_structural};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MatchError {
@@ -14,6 +14,10 @@ pub enum MatchError {
     },
     /// More than one match; 1-based start lines.
     Ambiguous { lines: Vec<usize> },
+    /// A repaired match whose `new` text carries copied `read` artifacts (line numbers or
+    /// hashline anchors) on some lines but not all: stripping them would guess, keeping them
+    /// would write them into the file.
+    MixedArtifacts,
 }
 
 /// Replace the single place `old` matches in `text` with `new`.
@@ -21,9 +25,18 @@ pub fn apply(text: &str, old: &str, new: &str) -> Result<String, MatchError> {
     apply_staged(text, old, new).map(|(out, _)| out)
 }
 
+/// An edit located and spliced into the text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Spliced {
+    pub text: String,
+    pub stage: RepairStage,
+    /// 1-based first and last lines of the original text that were replaced.
+    pub lines: (usize, usize),
+}
+
 /// Like [`apply`], also reporting which stage located the match.
 pub fn apply_staged(text: &str, old: &str, new: &str) -> Result<(String, RepairStage), MatchError> {
-    splice(text, old, new, locate(text, old)?)
+    splice(text, old, new, locate(text, old)?).map(|s| (s.text, s.stage))
 }
 
 /// [`apply_staged`] for the file at `path`: when stages 1-4 find nothing, stage 5 (the
@@ -34,7 +47,7 @@ pub fn apply_staged_for(
     text: &str,
     old: &str,
     new: &str,
-) -> Result<(String, RepairStage), MatchError> {
+) -> Result<Spliced, MatchError> {
     let loc = match locate(text, old) {
         Ok(loc) => loc,
         Err(e @ MatchError::NotFound { .. }) => match locate_structural(path, text, old)? {
@@ -46,17 +59,16 @@ pub fn apply_staged_for(
     splice(text, old, new, loc)
 }
 
-fn splice(
-    text: &str,
-    old: &str,
-    new: &str,
-    loc: Located,
-) -> Result<(String, RepairStage), MatchError> {
+fn splice(text: &str, old: &str, new: &str, loc: Located) -> Result<Spliced, MatchError> {
     let matched = &text[loc.range.clone()];
-    let replacement = adapt_new_text(old, new, matched, loc.stage);
+    let replacement = adapt_new_text(old, new, matched, loc.stage)?;
     let mut out = String::with_capacity(text.len() + replacement.len());
     out.push_str(&text[..loc.range.start]);
     out.push_str(&replacement);
     out.push_str(&text[loc.range.end..]);
-    Ok((out, loc.stage))
+    Ok(Spliced {
+        text: out,
+        stage: loc.stage,
+        lines: line_span(text, &loc.range),
+    })
 }

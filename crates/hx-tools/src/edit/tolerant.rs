@@ -1,4 +1,4 @@
-//! Tolerant applier stages 1-4 (spec 7.9).
+//! Tolerant applier stages 1-5 (spec 7.9).
 //!
 //! [`locate`] finds the single place the model's `old` text refers to. Stages run in
 //! order and each needs exactly one candidate: none moves on to the next stage, more
@@ -138,7 +138,11 @@ fn locate_with(text: &str, old: &str, whole_lines: bool) -> Result<Located, Matc
             let firsts: Vec<usize> = (0..n).filter(|&i| file.line(i).trim() == first).collect();
             let lasts: Vec<usize> = (0..n).filter(|&i| file.line(i).trim() == last).collect();
             if let (&[i], &[j]) = (firsts.as_slice(), lasts.as_slice()) {
+                // The interiors must have the same number of lines: `new` was written for
+                // the model's block, so replacing a longer file block would delete the lines
+                // the model left out (and a shorter one would duplicate its extra lines).
                 if j > i
+                    && j - i == m - 1
                     && interior_similarity(&file, i + 1..j, &want, 1..m - 1) >= ANCHOR_SIMILARITY
                 {
                     return Ok(Located {
@@ -279,16 +283,27 @@ fn dedent(text: &str) -> String {
 /// when they were stripped from `old`, typographic quotes/dashes become ASCII when `old`
 /// had them but the matched file text has none, and for the line-based stages the block
 /// is re-indented to where it sits in the file ([`reindent_to_match`]).
-pub fn adapt_new_text(old: &str, new: &str, matched: &str, stage: RepairStage) -> String {
+///
+/// After any repair, a `new` text with copied artifacts on some lines but not all is
+/// refused ([`MatchError::MixedArtifacts`]): the stripped lines and the unmarked ones cannot
+/// be told apart from text that merely starts with digits. An exact match keeps `new` as
+/// written (the model's `old` text was the file's own text, so `new` is too).
+pub fn adapt_new_text(
+    old: &str,
+    new: &str,
+    matched: &str,
+    stage: RepairStage,
+) -> Result<String, MatchError> {
     let mut out = new.replace("\r\n", "\n");
     if stage == RepairStage::Exact {
-        return out;
+        return Ok(out);
     }
     let norm = normalize_old(old);
-    if norm.stripped_artifacts {
-        if let Some(stripped) = strip_artifacts(&out) {
-            out = stripped;
-        }
+    match strip_artifacts(&out) {
+        Some(stripped) if norm.stripped_artifacts => out = stripped,
+        Some(_) => {}
+        None if has_artifact_lines(&out) => return Err(MatchError::MixedArtifacts),
+        None => {}
     }
     if old.contains('\u{FEFF}') {
         out = out.replace('\u{FEFF}', "");
@@ -305,7 +320,23 @@ pub fn adapt_new_text(old: &str, new: &str, matched: &str, stage: RepairStage) -
     ) {
         out = reindent_to_match(&out, &norm.text, matched);
     }
-    out
+    Ok(out)
+}
+
+/// The 1-based first and last lines of `text` that the byte `range` covers (a newline that
+/// ends the range belongs to its last line).
+pub fn line_span(text: &str, range: &Range<usize>) -> (usize, usize) {
+    let first = text[..range.start].matches('\n').count() + 1;
+    let end = if range.end > range.start && text.as_bytes()[range.end - 1] == b'\n' {
+        range.end - 1
+    } else {
+        range.end
+    };
+    let last = first
+        + text[range.start..end.max(range.start)]
+            .matches('\n')
+            .count();
+    (first, last)
 }
 
 /// Columns a tab counts for when comparing indentation.
@@ -526,6 +557,17 @@ fn artifact(line: &str) -> Option<(usize, Artifact)> {
             .then_some((digits + 6, Artifact::Hash)),
         _ => None,
     }
+}
+
+/// Whether any line of `text` starts with an unambiguous copied artifact: a tabbed line
+/// number or a hashline anchor (a bare number is ordinary text).
+fn has_artifact_lines(text: &str) -> bool {
+    text.split('\n').any(|l| {
+        matches!(
+            artifact(l),
+            Some((_, Artifact::Number { has_tab: true } | Artifact::Hash))
+        )
+    })
 }
 
 /// Remove copied `<n>\t` line numbers or `<n>:<hash>|` anchors, but only when every line

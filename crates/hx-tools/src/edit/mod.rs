@@ -220,12 +220,44 @@ async fn record_written(
     full: &Path,
     from: Option<&[u8]>,
     bytes: &[u8],
+    repaired: bool,
 ) -> blake3::Hash {
     if let Ok(meta) = sb.metadata(full).await {
-        crate::record_written_file(sb, cx, full, &meta, bytes, crate::WrittenBy::Edit { from })
-            .await;
+        let by = crate::WrittenBy::Edit { from, repaired };
+        crate::record_written_file(sb, cx, full, &meta, bytes, by).await;
     }
     blake3::hash(bytes)
+}
+
+/// Whether a match found at `stage` must lie in content the model has seen as it is now
+/// (spec 7.9): every stage that can match text differing from the model's `old` text.
+fn needs_seen(stage: RepairStage) -> bool {
+    !matches!(stage, RepairStage::Exact | RepairStage::Normalized)
+}
+
+/// Whether the model has seen `lines` (1-based, inclusive) of `file` as they are now.
+fn seen_now(cx: &ToolCx, file: &Loaded, (first, last): (usize, usize)) -> bool {
+    let Ok(text) = crate::spec::decode_text(&file.original) else {
+        return false;
+    };
+    let lines: Vec<&str> = text.lines().collect();
+    cx.reads().has_seen(
+        &file.full,
+        blake3::hash(&file.original),
+        &lines,
+        first,
+        last,
+    )
+}
+
+/// The error for a repaired match over lines the model has not seen as they are now.
+fn unseen_repair(subject: &str, stage: RepairStage, (first, last): (usize, usize)) -> String {
+    format!(
+        "{subject}: matched lines {first}-{last} only via {}, and you have not seen those \
+         lines as they are now (they changed since you read them, or you never read them); \
+         read lines {first}-{last} again before editing",
+        stage.describe()
+    )
 }
 
 /// Most errors a syntax warning lists.
@@ -286,6 +318,7 @@ async fn write_edited(
     path: &str,
     file: Loaded,
     edited: &str,
+    repaired: bool,
 ) -> Result<(AppliedEffect, Option<String>), String> {
     // The requested path, not `file.full`: the sandbox refuses symlinks into protected paths.
     atomic::preserve_and_write(sb, Path::new(path), &file.original, edited)
@@ -297,6 +330,7 @@ async fn write_edited(
         &file.full,
         Some(&file.original),
         &atomic::restore(&file.original, edited),
+        repaired,
     )
     .await;
     let warning = join_notes([
@@ -374,7 +408,7 @@ async fn run_str_replace(a: StrReplaceArgs, sb: &dyn Sandbox, cx: &ToolCx) -> To
         Ok(f) => f,
         Err(e) => return ToolResult::error(e),
     };
-    let (edited, stage) = match str_replace::apply_staged_for(
+    let spliced = match str_replace::apply_staged_for(
         Path::new(&a.path),
         &file.text,
         &a.old_text,
@@ -383,6 +417,10 @@ async fn run_str_replace(a: StrReplaceArgs, sb: &dyn Sandbox, cx: &ToolCx) -> To
         Ok(r) => r,
         Err(e) => return ToolResult::error(match_error_message(&a.path, "old_text", &e)),
     };
+    let (edited, stage) = (spliced.text, spliced.stage);
+    if needs_seen(stage) && !seen_now(cx, &file, spliced.lines) {
+        return ToolResult::error(unseen_repair(&a.path, stage, spliced.lines));
+    }
     // A symbol-level guess must leave the file parsing at least as well as before. Nothing
     // has been written yet, so rejecting it leaves the pre-image in place.
     if stage == RepairStage::Structural {
@@ -395,7 +433,8 @@ async fn run_str_replace(a: StrReplaceArgs, sb: &dyn Sandbox, cx: &ToolCx) -> To
             ));
         }
     }
-    let (effect, warning) = match write_edited(sb, cx, &a.path, file, &edited).await {
+    let repaired = stage != RepairStage::Exact;
+    let (effect, warning) = match write_edited(sb, cx, &a.path, file, &edited, repaired).await {
         Ok(e) => e,
         Err(e) => return ToolResult::error(e),
     };
@@ -438,7 +477,7 @@ async fn run_hashline(a: HashlineArgs, sb: &dyn Sandbox, cx: &ToolCx) -> ToolRes
         }
         Err(e) => return ToolResult::error(format!("{}: {e}", a.path)),
     };
-    match write_edited(sb, cx, &a.path, file, &edited).await {
+    match write_edited(sb, cx, &a.path, file, &edited, false).await {
         Ok((effect, warning)) => {
             let mut output = format!("edited {} ({count} ops)", a.path);
             if let Some(w) = warning {
@@ -467,6 +506,8 @@ struct Step {
     bytes: Vec<u8>,
     /// Set when the new content has parse errors the old content did not.
     warning: Option<String>,
+    /// A tolerant stage located one of its hunks.
+    repaired: bool,
 }
 
 impl Step {
@@ -550,6 +591,14 @@ async fn run_patch(a: PatchArgs, sb: &dyn Sandbox, cx: &ToolCx) -> ToolResult {
     let mut notes: Vec<String> = Vec::new();
     for (ap, (full, file)) in applied.iter().zip(loaded) {
         let rel = ap.path.to_string_lossy().into_owned();
+        if let Some(f) = &file {
+            for r in ap.repairs.iter().filter(|r| needs_seen(r.stage)) {
+                if !seen_now(cx, f, r.lines) {
+                    let subject = format!("{rel}: hunk {}", r.hunk);
+                    return ToolResult::error(unseen_repair(&subject, r.stage, r.lines));
+                }
+            }
+        }
         let (original, mode) = match file {
             Some(f) => (Some(f.original), Some(f.meta.mode)),
             None => (None, None),
@@ -567,10 +616,11 @@ async fn run_patch(a: PatchArgs, sb: &dyn Sandbox, cx: &ToolCx) -> ToolResult {
             PatchOp::Add(text) => syntax_warning(&rel, "", text),
             PatchOp::Delete => None,
         };
-        for (hunk, stage) in &ap.repairs {
+        for r in &ap.repairs {
             notes.push(format!(
-                "{rel}: hunk {hunk} applied via {}",
-                stage.describe()
+                "{rel}: hunk {} applied via {}",
+                r.hunk,
+                r.stage.describe()
             ));
         }
         steps.push(Step {
@@ -581,6 +631,7 @@ async fn run_patch(a: PatchArgs, sb: &dyn Sandbox, cx: &ToolCx) -> ToolResult {
             mode,
             bytes,
             warning,
+            repaired: !ap.repairs.is_empty(),
         });
     }
 
@@ -616,8 +667,15 @@ async fn run_patch(a: PatchArgs, sb: &dyn Sandbox, cx: &ToolCx) -> ToolResult {
         let (verb, post_hash) = match step.op {
             PatchOp::Delete => ("deleted", blake3::hash(b"")),
             PatchOp::Update(_) | PatchOp::Add(_) => {
-                let h =
-                    record_written(sb, cx, &step.full, step.original.as_deref(), &step.bytes).await;
+                let h = record_written(
+                    sb,
+                    cx,
+                    &step.full,
+                    step.original.as_deref(),
+                    &step.bytes,
+                    step.repaired,
+                )
+                .await;
                 let verb = if matches!(step.op, PatchOp::Add(_)) {
                     "added"
                 } else {
@@ -672,5 +730,9 @@ pub(crate) fn match_error_message(subject: &str, what: &str, e: &MatchError) -> 
             }
             msg
         }
+        MatchError::MixedArtifacts => format!(
+            "{subject}: the replacement has copied `read` line numbers or anchors on some \
+             lines but not all; remove them (write only the file's text) and retry"
+        ),
     }
 }

@@ -643,11 +643,12 @@ fn strips_bom_from_the_models_text() {
 
 #[test]
 fn anchor_match_requires_unique_first_last_and_0_9_interior() {
-    // 11 interior lines; the file's copy has one extra line (line ratio 2*11/23 = 0.96).
+    // 11 interior lines; the file's copy has one changed line (line ratio 2*10/22 = 0.91).
+    // (An extra or missing interior line never anchors: see tests/edit_repairs.rs.)
     let interior: Vec<String> = (0..11).map(|i| format!("    step_{i}();")).collect();
     let file_interior = {
         let mut v = interior.clone();
-        v.insert(5, "    extra();".to_string());
+        v[5] = "    changed();".to_string();
         v
     };
     let build = |mid: &[String]| {

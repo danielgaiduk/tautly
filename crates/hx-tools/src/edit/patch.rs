@@ -12,7 +12,7 @@ use std::sync::LazyLock;
 use regex::Regex;
 
 use super::str_replace::MatchError;
-use super::tolerant::{RepairStage, adapt_new_text, locate_lines};
+use super::tolerant::{RepairStage, adapt_new_text, line_span, locate_lines};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PatchOp {
@@ -90,12 +90,22 @@ impl fmt::Display for PatchError {
 
 impl std::error::Error for PatchError {}
 
-/// One file's result, with the hunks (1-based) that needed a tolerant stage.
+/// One file's result, with the hunks that needed a tolerant stage.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Applied {
     pub path: PathBuf,
     pub op: PatchOp,
-    pub repairs: Vec<(usize, RepairStage)>,
+    pub repairs: Vec<Repair>,
+}
+
+/// A hunk located by a tolerant stage.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Repair {
+    /// 1-based hunk number.
+    pub hunk: usize,
+    pub stage: RepairStage,
+    /// 1-based first and last lines of the original file the hunk replaced.
+    pub lines: (usize, usize),
 }
 
 /// The files a patch touches, in order, without applying anything.
@@ -556,7 +566,7 @@ fn apply_hunks(
     path: &Path,
     text: &str,
     hunks: &[Hunk],
-) -> Result<(String, Vec<(usize, RepairStage)>), PatchError> {
+) -> Result<(String, Vec<Repair>), PatchError> {
     // Every line newline-terminated; the writer restores the file's own final-newline state.
     let mut work = text.to_string();
     if !work.is_empty() && !work.ends_with('\n') {
@@ -585,9 +595,14 @@ fn apply_hunks(
         }
         let old = join_lines(&hunk.side(Tag::Remove));
         let loc = locate_hunk(&work, &old, hunk.header.as_deref()).map_err(|e| fail(n, e))?;
-        let replacement = adapt_new_text(&old, &new, &work[loc.range.clone()], loc.stage);
+        let replacement = adapt_new_text(&old, &new, &work[loc.range.clone()], loc.stage)
+            .map_err(|e| fail(n, e))?;
         if loc.stage != RepairStage::Exact {
-            repairs.push((n, loc.stage));
+            repairs.push(Repair {
+                hunk: n,
+                stage: loc.stage,
+                lines: line_span(&work, &loc.range),
+            });
         }
         splices.push(Splice {
             hunk: n,

@@ -202,6 +202,37 @@ impl ReadTracker {
         seen.get(path).copied()
     }
 
+    /// Whether the model has seen lines `first..=last` (1-based) of `path` as they are now:
+    /// its whole-file baseline describes the file with `hash`, or a baseline whose range
+    /// covers those lines showed exactly what they hold now. `lines` are the file's current
+    /// lines, as `read` splits them. Tolerant repairs may only match such content (spec 7.9).
+    pub fn has_seen(
+        &self,
+        path: &Path,
+        hash: blake3::Hash,
+        lines: &[&str],
+        first: usize,
+        last: usize,
+    ) -> bool {
+        let ranges = self.ranges.lock().unwrap_or_else(|e| e.into_inner());
+        if ranges
+            .get(&(path.to_path_buf(), LineRange::ALL))
+            .is_some_and(|prev| prev.hash == hash)
+        {
+            return true;
+        }
+        let total = lines.len();
+        ranges.iter().any(|((p, r), prev)| {
+            let start = r.start.unwrap_or(1);
+            let end = r.end.unwrap_or(total).min(total);
+            p == path
+                && start >= 1
+                && start <= first
+                && last <= end
+                && prev.content_hash == blake3::hash(lines[start - 1..end].join("\n").as_bytes())
+        })
+    }
+
     /// The last read of exactly this `range` of `path` shown in `format`, if its content
     /// was kept.
     pub fn previous(&self, path: &Path, range: LineRange, format: EditFormat) -> Option<PrevRead> {
@@ -220,12 +251,15 @@ pub(crate) const MAX_READ_LINES: usize = 2000;
 /// After `write` the model supplied the entire content. After an edit it has seen the whole
 /// file only if its whole-file baseline describes the file the edit started from (`from`,
 /// the pre-edit bytes): an edit after a partial read, or after a change it never saw, must
-/// not make a whole-file read answer `unchanged`.
+/// not make a whole-file read answer `unchanged`. Nor may a repaired edit: the file then
+/// differs from what the model believes it wrote (re-indented, normalized, ...).
 pub(crate) enum WrittenBy<'a> {
     Write,
     /// An edit of a file that had these bytes (none: the edit created the file).
     Edit {
         from: Option<&'a [u8]>,
+        /// A tolerant stage located some of it (spec 7.9).
+        repaired: bool,
     },
 }
 
@@ -247,7 +281,8 @@ pub(crate) async fn record_written_file(
     }
     let seen_whole = match by {
         WrittenBy::Write => true,
-        WrittenBy::Edit { from } => from.is_some_and(|from| {
+        WrittenBy::Edit { repaired: true, .. } => false,
+        WrittenBy::Edit { from, .. } => from.is_some_and(|from| {
             cx.reads()
                 .previous(full, LineRange::ALL, cx.edit_format())
                 .is_some_and(|prev| prev.hash == blake3::hash(from))
