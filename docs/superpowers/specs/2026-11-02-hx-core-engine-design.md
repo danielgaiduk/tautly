@@ -203,17 +203,17 @@ Requests are assembled in fixed order:
 [state]    structured working state — a tail block after the last message, rendered fresh for each request and never stored in history
 ```
 - Adapters whose wire API requires alternating roles merge consecutive same-role messages (e.g. tool results followed by the state tail).
-- AGENTS.md is read through the sandbox resolver (regular files only; in-root symlinks are accepted), capped at 32 KB per file and 64 KB in total, with a visible truncation marker and a status warning.
+- AGENTS.md is read through the sandbox resolver (regular files only; in-root symlinks are accepted), capped at 32 KB per file and 64 KB in total, with a visible truncation marker and a status warning. A file above the sandbox root is accepted only when its link target stays inside the directory holding it.
 - Cache stability: the working state changes on almost every tool call (the files list follows effects), so it sits after history; the cached prefix (stable · pinned · history up to the last cache breakpoint) survives state changes. Pinned items change rarely and stay before history.
 - `ContextStatus{used, budget, breakdown}` is emitted every turn.
 - `hx prompt show` prints the system prompt; `hx prompt show --full` prints the exact last request.
 - System prompt target: < 2,000 tokens.
 
 ### 6.2 Pinned items
-Sources: user (`/pin "…"` or `Pin` command), config, the `pin` tool, and AGENTS.md sections headed `Constraints` or `Rules` (auto-pinned). Pinned items are never summarized or dropped. Budget warning if pinned exceeds 10% of the window. Pin text is capped at 2 KB. Pins render with their source, and only user, config and AGENTS.md pins are authoritative. A pin added by the model mid-session renders in the state tail until the next cache epoch (7.7), then folds into the pinned block, so it does not break the cached prefix.
+Sources: user (`/pin "…"` or `Pin` command), config, the `pin` tool, and AGENTS.md sections headed `Constraints` or `Rules` (auto-pinned). Pinned items are never summarized or dropped. Budget warning if pinned exceeds 10% of the window. Pin text is capped at 2 KB, and at most 20 session pins are held; AGENTS.md pins are capped at 2 KB each and 4 KB in total. Pins render with their source, and only user, config and AGENTS.md pins are authoritative. Every pin added mid-session (by the model or the user's `/pin`) renders in the state tail until the next cache epoch (7.7, including a cold cache), then folds into the pinned block, so it does not break the cached prefix.
 
 ### 6.3 Working state
-Structured record: task, plan steps with status, files read/edited with content hashes, decisions, open questions, failed attempts (7.8). The files list is maintained by the engine from actual tool effects; plan, decisions and questions are updated by the model through the `state` tool. The rendered files list is capped (~40 entries / 600 tokens): edited, deleted and maybe-stale files first (with hashes), then the most recent reads, then "+N more files read earlier (re-read to see them)".
+Structured record: task, plan steps with status, files read/edited with content hashes, decisions, open questions, failed attempts (7.8). The files list is maintained by the engine from actual tool effects; plan, decisions and questions are updated by the model through the `state` tool. The rendered files list is capped (~40 entries / 600 tokens): edited, deleted and maybe-stale files first (hashes only for edited files), then the most recent reads, then "+N more files read earlier (re-read to see them)".
 
 ### 6.4 Compaction
 - Trigger: automatic at a configurable threshold (default 80% of context window; can be disabled), or `/compact`. Always announced via event before running.
