@@ -22,6 +22,7 @@ use std::time::{Duration, Instant};
 
 use hx_provider::{Content, Price};
 use hx_tools::{AppliedEffect, LineRange, Shown};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::schedule::{self, MutationReason};
@@ -35,7 +36,7 @@ fn stub(turn: u32) -> String {
 }
 
 /// What [`Context::collect`] removed, enough to undo it with [`Context::restore_gc`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GcRecord {
     /// Tool-call id and original output of each elided result, oldest first.
     pub elided: Vec<(String, String)>,

@@ -11,9 +11,11 @@
 use std::time::{Duration, Instant};
 
 use hx_provider::Price;
+use serde::{Deserialize, Serialize};
 
 /// Why a history mutation was applied; reported in `ContextCollected` and `Compacted`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum MutationReason {
     /// The provider's cache has expired, so nothing cached is lost.
     ColdCache,

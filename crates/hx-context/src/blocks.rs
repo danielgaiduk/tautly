@@ -2,18 +2,20 @@
 //! token weight of messages.
 
 use hx_provider::{Content, Message, ModelId};
+use serde::{Deserialize, Serialize};
 
 use crate::tokens::TokenEstimator;
 
 /// Flat estimate for one image; providers bill images by size, which the context does not see.
 const IMAGE_TOKENS: u32 = 1_000;
 
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Turn {
     pub messages: Vec<Message>,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Breakdown {
     pub system: u32,
     pub tools: u32,
@@ -38,7 +40,8 @@ impl Breakdown {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ContextStatus {
     pub used: u32,
     pub budget: u32,

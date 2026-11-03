@@ -14,6 +14,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use hx_provider::{Block, CanonicalRequest, Capabilities, Content, Message, ModelId, Price, Role};
+use serde::{Deserialize, Serialize};
 
 use crate::blocks::{ContextStatus, ReasoningWire, Turn, message_tokens};
 use crate::schedule::{self, MutationReason};
@@ -47,7 +48,7 @@ const COMPACT_PROMPT: &str = include_str!("../prompts/compact.md");
 ///   recorded *later* that still depend on a removed read: a post-edit baseline (the model
 ///   knows the file from the removed read plus the edit) and a diff answer (only a diff
 ///   against the removed read). Like collection's `GcRecord::forgotten_paths`.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CompactionRecord {
     pub removed_turns: Vec<Turn>,
     /// The summary as generated, without the `<summary>` wrapper.
