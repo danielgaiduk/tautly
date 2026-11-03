@@ -247,11 +247,17 @@ impl Index {
 
     /// Re-index one file now (the post-edit hook). A file that no longer exists or is
     /// no longer admitted (ignored, hidden, outside the root) is dropped from the
-    /// index; a directory is ignored. When the path leads through a symlink, the
-    /// canonical in-root path of the same file is re-indexed too: it is the only row
-    /// that can hold postings for it, and nobody told it about the change. Whenever the
-    /// file cannot be re-read (metadata, walk or read fails) its old postings stop
-    /// vouching for it and the error is returned.
+    /// index; a directory is ignored. When the path is another name for a file (a
+    /// symlink, admitted or not, or a differently-cased spelling), the canonical in-root
+    /// path of that file is re-indexed too: it is the only row that can hold postings
+    /// for it, and nobody told it about the change. Whenever the file cannot be re-read
+    /// (metadata, walk or read fails) its old postings stop vouching for it and the
+    /// error is returned.
+    ///
+    /// Known limitation: a hard link created after the file was indexed, then edited in
+    /// place (same inode) with no watcher running, keeps stale postings until the next
+    /// [`Index::refresh`] sees the new link count. hx's own edits are atomic renames,
+    /// which break hard links, so they never hit this.
     pub async fn reindex_file(&self, rel: &Path) -> Result<(), IndexError> {
         let key = self.inner.key(rel);
         if let Some(canonical) = self.reindex_one(key).await? {
@@ -261,18 +267,27 @@ impl Index {
     }
 
     /// [`Index::reindex_file`] for one path; returns the canonical path to follow when
-    /// this one is reached through a symlink.
+    /// this one is another name for it.
     async fn reindex_one(&self, key: String) -> Result<Option<String>, IndexError> {
         let inner = &self.inner;
         if key.is_empty() {
             return Ok(None);
         }
+        // Whatever happens to this name, the file it leads to may have changed. This
+        // does not depend on this name being admitted (hidden or ignored links, other
+        // spellings) or even existing (a delete through a link).
+        let canonical = canonical_key(inner, &key).filter(|c| *c != key);
+        if let Some(c) = &canonical {
+            distrust(inner, vec![c.clone()]).await;
+        }
         let meta = match inner.sb.metadata(Path::new(&key)).await {
             Ok(m) => m,
             Err(SandboxError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
-                return forget(inner, key).await.map(|()| None);
+                return forget(inner, key).await.map(|()| canonical);
             }
-            Err(SandboxError::OutsideRoot(_)) => return forget(inner, key).await.map(|()| None),
+            Err(SandboxError::OutsideRoot(_)) => {
+                return forget(inner, key).await.map(|()| canonical);
+            }
             Err(e) => {
                 distrust(inner, vec![key]).await;
                 return Err(e.into());
@@ -281,22 +296,13 @@ impl Index {
         let aliased = match admission(inner, &key).await {
             Ok(Admission::File { aliased }) => aliased,
             Ok(Admission::Dir) => return Ok(None),
-            Ok(Admission::No) => return forget(inner, key).await.map(|()| None),
+            Ok(Admission::No) => return forget(inner, key).await.map(|()| canonical),
             Err(e) => {
                 distrust(inner, vec![key]).await;
                 return Err(e);
             }
         };
         let cand = candidate(key.clone(), &meta, aliased);
-        // Reached through a link: the canonical row's postings may be stale from now on.
-        let canonical = if cand.aliased {
-            canonical_key(inner, &key).filter(|c| *c != key)
-        } else {
-            None
-        };
-        if let Some(c) = &canonical {
-            distrust(inner, vec![c.clone()]).await;
-        }
         if is_oversize(cand.size) {
             let file = oversize_file(cand);
             inner.run(move |i| i.apply(&[file], &[], &[])).await?;

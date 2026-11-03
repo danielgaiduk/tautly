@@ -752,3 +752,97 @@ async fn watcher_reconciles_after_git_info_exclude_changes() {
     );
     assert!(idx.tree().get(Path::new("keep.rs")).is_some());
 }
+
+// ------------------------------------------------------ review round 3 (RED first)
+
+/// Writes through `alias` (a name the walker never admits) and reports the change under
+/// that name: the canonical row, which is the only one that can hold postings, must end
+/// up a candidate for the new content.
+async fn edit_through_unadmitted_name(
+    files: &[(&str, &str)],
+    alias: &str,
+    link: Option<(&str, &str)>,
+) {
+    let fx = Fixture::new(files);
+    if let Some((target, name)) = link {
+        std::os::unix::fs::symlink(target, fx.path(name)).unwrap();
+    }
+    let idx = fx.open();
+    idx.refresh().await.unwrap();
+    idx.build_trigrams().await.unwrap();
+    assert!(!has_candidate(&idx, "alias_edit_token", "real/x.rs"));
+    std::fs::write(fx.path(alias), "fn changed() { alias_edit_token(); }\n").unwrap();
+    idx.reindex_file(Path::new(alias)).await.unwrap();
+    assert!(
+        has_candidate(&idx, "alias_edit_token", "real/x.rs"),
+        "edit through {alias} hid real/x.rs"
+    );
+    // The canonical row was re-read, not just distrusted.
+    assert!(!has_candidate(&idx, "zzz_absent_zzz", "real/x.rs"));
+    assert_eq!(row(&fx.db(), "real/x.rs").0, 1);
+}
+
+#[tokio::test]
+async fn an_edit_through_a_hidden_alias_updates_the_canonical_row() {
+    edit_through_unadmitted_name(
+        &[("real/x.rs", "fn old() {}\n")],
+        ".hl/x.rs",
+        Some(("real", ".hl")),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn an_edit_through_a_gitignored_alias_updates_the_canonical_row() {
+    edit_through_unadmitted_name(
+        &[
+            ("real/x.rs", "fn old() {}\n"),
+            (".gitignore", "lnk_ignored\n"),
+        ],
+        "lnk_ignored/x.rs",
+        Some(("real", "lnk_ignored")),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn an_edit_through_a_case_variant_path_updates_the_canonical_row() {
+    let probe = tempfile::tempdir().unwrap();
+    std::fs::write(probe.path().join("a"), "").unwrap();
+    if !probe.path().join("A").exists() {
+        eprintln!("skipped: case-sensitive filesystem");
+        return;
+    }
+    edit_through_unadmitted_name(&[("real/x.rs", "fn old() {}\n")], "REAL/x.rs", None).await;
+}
+
+#[tokio::test]
+async fn failures_on_an_unadmitted_alias_still_distrust_the_canonical_row() {
+    let (fx, sb, idx) = probe_fixture(&[("real/x.rs", "fn old() {}\n")]);
+    std::os::unix::fs::symlink("real", fx.path(".hl")).unwrap();
+    idx.refresh().await.unwrap();
+    idx.build_trigrams().await.unwrap();
+    std::fs::write(
+        fx.path("real/x.rs"),
+        "fn changed() { meta_alias_token(); }\n",
+    )
+    .unwrap();
+    sb.fail_metadata_of(".hl/x.rs", true);
+    assert!(idx.reindex_file(Path::new(".hl/x.rs")).await.is_err());
+    assert!(has_candidate(&idx, "meta_alias_token", "real/x.rs"));
+}
+
+#[tokio::test]
+async fn deleting_through_an_alias_drops_the_canonical_row() {
+    let fx = Fixture::new(&[
+        ("real/x.rs", "fn old() {}\n"),
+        ("keep.rs", "fn keep() {}\n"),
+    ]);
+    std::os::unix::fs::symlink("real", fx.path("alias")).unwrap();
+    let idx = fx.open();
+    idx.refresh().await.unwrap();
+    std::fs::remove_file(fx.path("alias/x.rs")).unwrap();
+    idx.reindex_file(Path::new("alias/x.rs")).await.unwrap();
+    assert!(idx.tree().get(Path::new("real/x.rs")).is_none());
+    assert!(idx.tree().get(Path::new("alias/x.rs")).is_none());
+}
