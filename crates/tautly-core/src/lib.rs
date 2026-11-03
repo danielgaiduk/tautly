@@ -17,6 +17,7 @@ pub mod mcp;
 pub mod protocol;
 mod provider_setup;
 pub mod record;
+pub mod routing;
 mod session;
 pub mod signals;
 pub mod turn;

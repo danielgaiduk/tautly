@@ -23,8 +23,8 @@ use tautly_context::compact::DEFAULT_KEEP_RECENT;
 use tautly_context::schedule::{self, MutationReason};
 use tautly_context::{CompactError, ContextStatus, GcRecord, TokenEstimator, Turn};
 use tautly_provider::{
-    CanonicalRequest, Content, Message, ProviderError, ProviderEvent, Quota, RawUsage, Role,
-    StopReason, cost_usd,
+    CanonicalRequest, Content, Message, ModelId, Price, ProviderError, ProviderEvent, Quota,
+    RawUsage, Role, StopReason, cost_usd,
 };
 use tautly_session::RelPath;
 use tokio::sync::mpsc;
@@ -34,6 +34,7 @@ use crate::approvals::Approvals;
 use crate::ledger::Row;
 use crate::protocol::{BudgetScope, Command, ErrorKind, Event, FinishReason, UsageRole};
 use crate::record::SessionRecord;
+use crate::routing::{Side, model_failed};
 use crate::session::Session;
 
 /// A response that breaks off after content is sent again at most this many times.
@@ -190,7 +191,11 @@ fn parse_args(input_json: &str) -> Result<serde_json::Value, String> {
 /// The usage to count for an attempt that ended early (broke off, was cancelled): what the
 /// provider reported, with the output raised to what was streamed, or else an estimate of
 /// the request's input and the streamed output. True when any of it is estimated.
-fn partial_usage(reported: Option<RawUsage>, est_input: u64, est_output: u64) -> (RawUsage, bool) {
+pub(crate) fn partial_usage(
+    reported: Option<RawUsage>,
+    est_input: u64,
+    est_output: u64,
+) -> (RawUsage, bool) {
     match reported {
         Some(u) => (
             RawUsage {
@@ -615,30 +620,45 @@ impl Session {
         .await;
     }
 
-    /// Threshold compaction (spec 6.4): announced first, summarized by the model, and if
-    /// that fails (or the summary is not smaller) the oldest turns are dropped without a
-    /// summary; never retried in a loop. True when the history changed.
+    /// Threshold compaction (spec 6.4): announced first, summarized by the side model
+    /// (7.5), and if that fails (or the summary is not smaller) the oldest turns are dropped
+    /// without a summary; never retried in a loop. True when the history changed.
     async fn compact(&mut self, reason: MutationReason, ctl: &TurnControl) -> bool {
-        let (req, removed) =
-            self.context
-                .compaction_request(&self.model, &self.info.caps, DEFAULT_KEEP_RECENT);
-        if removed == 0 {
-            return false;
-        }
-        let (_, mut status) = self.assemble();
-        status.warnings.push(format!(
-            "compacting: summarizing the {removed} oldest turns"
-        ));
-        self.emit(Event::context_status(&status)).await;
-        let summary = match self.summarize(req, ctl).await {
-            Ok(s) => Some(s),
-            Err(StreamEnd::Cancelled | StreamEnd::Budget) => return false,
-            Err(StreamEnd::Failed(e)) => {
-                self.warn(format!(
-                    "the compaction summary failed ({e}); dropping the oldest turns without one"
-                ))
-                .await;
-                None
+        // A side model that is no use (bad key, not on the account) is given up for the
+        // session and the summary is asked of the main model once.
+        let mut fell_back = self.side.model == self.model;
+        let mut announced = false;
+        let (summary, removed) = loop {
+            // The request is sized for the side model's window.
+            let (req, removed) = self.context.compaction_request(
+                &self.side.model,
+                &self.side.info.caps,
+                DEFAULT_KEEP_RECENT,
+            );
+            if removed == 0 {
+                return false;
+            }
+            if !std::mem::replace(&mut announced, true) {
+                let (_, mut status) = self.assemble();
+                status.warnings.push(format!(
+                    "compacting: summarizing the {removed} oldest turns"
+                ));
+                self.emit(Event::context_status(&status)).await;
+            }
+            match self.summarize(req, ctl).await {
+                Ok(s) => break (Some(s), removed),
+                Err(StreamEnd::Cancelled | StreamEnd::Budget) => return false,
+                Err(StreamEnd::Failed(e)) if !fell_back && model_failed(&e) => {
+                    fell_back = true;
+                    self.side_to_main(&e.to_string()).await;
+                }
+                Err(StreamEnd::Failed(e)) => {
+                    self.warn(format!(
+                        "the compaction summary failed ({e}); dropping the oldest turns without one"
+                    ))
+                    .await;
+                    break (None, removed);
+                }
             }
         };
         let rec = match summary.map(|s| self.context.apply_compaction(removed, s)) {
@@ -679,7 +699,7 @@ impl Session {
         true
     }
 
-    /// Run a summary request and collect its text. (Task 27 sends it to the side model.)
+    /// Run a summary request on the side model and collect its text.
     async fn summarize(
         &mut self,
         req: CanonicalRequest,
@@ -690,7 +710,7 @@ impl Session {
                 .tokens
                 .estimate(&serde_json::to_string(&req).unwrap_or_default()),
         );
-        let mut s = self.provider.stream(req, ctl.cancel.child_token());
+        let mut s = self.side.provider.stream(req, ctl.cancel.child_token());
         let mut text = String::new();
         let mut usage = None;
         let ended = loop {
@@ -704,20 +724,26 @@ impl Session {
                 Some(Ok(ProviderEvent::TextDelta(t))) => text.push_str(&t),
                 Some(Ok(ProviderEvent::Usage(u))) => usage = Some(u),
                 Some(Ok(ProviderEvent::DiscardedUsage(u))) => {
-                    self.spend(UsageRole::Side, u, None, false).await;
+                    self.spend_side(u, false).await;
                 }
                 Some(Ok(_)) => {}
                 Some(Err(e)) => break Ended::Failed(e),
             }
         };
         if let (Ended::Done, Some(u)) = (&ended, usage) {
-            self.spend(UsageRole::Side, u, None, false).await;
+            self.spend_side(u, false).await;
             return Ok(text.trim().to_string());
         }
-        // Failed or cancelled: what it reported, or an estimate, still counts.
-        let est_output = u64::from(self.context.tokens.estimate(&text));
-        let (u, estimated) = partial_usage(usage, est_input, est_output);
-        self.spend(UsageRole::Side, u, None, estimated).await;
+        // Failed or cancelled: what it reported, or an estimate, still counts. A request the
+        // provider refused outright (bad key, not available) was never billed.
+        let refused = matches!(&ended, Ended::Failed(e) if model_failed(e))
+            && usage.is_none()
+            && text.is_empty();
+        if !refused {
+            let est_output = u64::from(self.context.tokens.estimate(&text));
+            let (u, estimated) = partial_usage(usage, est_input, est_output);
+            self.spend_side(u, estimated).await;
+        }
         match ended {
             Ended::Done => Ok(text.trim().to_string()),
             Ended::Cancelled => Err(StreamEnd::Cancelled),
@@ -732,14 +758,72 @@ impl Session {
         self.spend(role, u, resp.quota.clone(), estimated).await;
     }
 
-    /// Account for one provider response: queue its ledger row, emit `Usage`, then count it
-    /// against the budgets (whose 80% and exhausted warnings follow the `Usage`).
+    /// Account for one response of the main model (see [`Session::charge`]).
     async fn spend(&mut self, role: UsageRole, u: RawUsage, quota: Option<Quota>, estimated: bool) {
-        let cost = cost_usd(&u, self.info.price.as_ref());
+        let (model, price) = (self.model.clone(), self.info.price);
+        self.charge(role, &model, price.as_ref(), u, quota, estimated)
+            .await;
+    }
+
+    /// Account for one response of the side model: its own id and its own price, never the
+    /// main model's (spec 7.5). An unpriced side model costs `None`.
+    async fn spend_side(&mut self, u: RawUsage, estimated: bool) {
+        let (model, price) = (self.side.model.clone(), self.side.info.price);
+        self.charge(UsageRole::Side, &model, price.as_ref(), u, None, estimated)
+            .await;
+    }
+
+    /// Account for the side-model requests tools made (`web_fetch` answers) since the last
+    /// call. Run at tool boundaries, before the call's result is shown, so the budgets know
+    /// what a call spent before the next one is admitted.
+    pub(crate) async fn drain_side_usage(&mut self) {
+        self.drain_usage().await;
+        if self.side.model != self.model
+            && let Some(why) = self.side.take_failure()
+        {
+            self.side_to_main(&why).await;
+        }
+    }
+
+    async fn drain_usage(&mut self) {
+        while let Ok(s) = self.side.usage.try_recv() {
+            self.spend_side(s.usage, s.estimated).await;
+        }
+    }
+
+    /// The side model failed for good: the main model does side work from now on, for the
+    /// rest of the session. Said once, since afterwards the side model is the main model.
+    async fn side_to_main(&mut self, why: &str) {
+        self.drain_usage().await;
+        self.warn(format!(
+            "the side model {} failed ({why}); the main model {} does side work for the rest \
+             of the session",
+            self.side.model, self.model
+        ))
+        .await;
+        self.side = Side::new(
+            Arc::clone(&self.provider),
+            self.model.clone(),
+            self.info.clone(),
+        );
+    }
+
+    /// Account for one provider response of `model`: queue its ledger row, emit `Usage`, then
+    /// count it against the budgets (whose 80% and exhausted warnings follow the `Usage`).
+    async fn charge(
+        &mut self,
+        role: UsageRole,
+        model: &ModelId,
+        price: Option<&Price>,
+        u: RawUsage,
+        quota: Option<Quota>,
+        estimated: bool,
+    ) {
+        let cost = cost_usd(&u, price);
         // Queued for the background writer: never waits (not even on the cancel path).
         let row = Row {
             session: self.session_id.clone(),
-            model: self.model.clone(),
+            model: model.clone(),
             usage: u,
             cost,
             estimated,
@@ -758,10 +842,13 @@ impl Session {
             estimated,
         })
         .await;
-        self.budgets
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .spend(&u, cost);
+        {
+            let mut budgets = self.budgets.lock().unwrap_or_else(PoisonError::into_inner);
+            budgets.spend(&u, cost);
+            if cost.is_none() {
+                budgets.note_unpriced(model.as_str());
+            }
+        }
         self.budget_exhausted().await;
     }
 

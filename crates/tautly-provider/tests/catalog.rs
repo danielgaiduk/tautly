@@ -21,6 +21,53 @@ fn builtin_catalog_has_each_provider_family() {
 }
 
 #[test]
+fn small_tier_marks_haiku_mini_and_flash_class_models_only() {
+    let c = Catalog::builtin();
+    let small: Vec<String> = c
+        .ids()
+        .filter(|id| c.get(id).tier == Some(Tier::Small))
+        .map(|id| id.to_string())
+        .collect();
+    assert_eq!(
+        small,
+        [
+            "anthropic/claude-haiku-5-5",
+            "google/gemini-3-flash",
+            "openai/gpt-5-mini"
+        ]
+    );
+    // Unknown models have no tier.
+    assert_eq!(c.get(&"acme/x".into()).tier, None);
+}
+
+#[test]
+fn tier_comes_from_toml_and_defaults_to_none() {
+    let c = Catalog::from_toml(
+        r#"[models."a/x"]
+tier = "large"
+context_window = 1000
+max_output = 100
+parallel_tools = false
+reasoning = "none"
+cache = "none"
+images = false
+edit_format = "str_replace"
+[models."a/y"]
+context_window = 1000
+max_output = 100
+parallel_tools = false
+reasoning = "none"
+cache = "none"
+images = false
+edit_format = "str_replace"
+"#,
+    )
+    .unwrap();
+    assert_eq!(c.get(&"a/x".into()).tier, Some(Tier::Large));
+    assert_eq!(c.get(&"a/y".into()).tier, None);
+}
+
+#[test]
 fn builtin_has_all_required_models() {
     let c = Catalog::builtin();
     for id in [

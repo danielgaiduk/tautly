@@ -22,6 +22,17 @@ pub struct Price {
     pub cache_write: f64,
 }
 
+/// Size class of a model: side work (summaries, `web_fetch` answers) goes to the
+/// provider's `Small` model when the user names none (spec 7.5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Tier {
+    Small,
+    /// Only `Small` has a meaning today (side routing looks for it); `Large` marks a model
+    /// as not small, for the catalog's vocabulary.
+    Large,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct ModelInfo {
     pub caps: Capabilities,
@@ -29,6 +40,8 @@ pub struct ModelInfo {
     /// How long the provider keeps a prompt-cache entry alive after a request, in seconds;
     /// `None` when the model has no prompt cache.
     pub cache_ttl_s: Option<u32>,
+    /// Size class; `None` when the catalog does not say (and for unknown models).
+    pub tier: Option<Tier>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -48,6 +61,8 @@ struct Entry {
     /// Overrides the default for the cache style (see [`DEFAULT_CACHE_TTL_S`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     cache_ttl_s: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tier: Option<Tier>,
 }
 
 impl Entry {
@@ -67,6 +82,7 @@ impl Entry {
                 CacheStyle::None => None,
                 CacheStyle::Explicit | CacheStyle::Automatic => Some(DEFAULT_CACHE_TTL_S),
             }),
+            tier: self.tier,
         }
     }
 }
@@ -95,6 +111,11 @@ impl Catalog {
         self.models.contains_key(id.as_str())
     }
 
+    /// Every model id in the catalog, in id order.
+    pub fn ids(&self) -> impl Iterator<Item = ModelId> + '_ {
+        self.models.keys().map(|k| ModelId::from(k.as_str()))
+    }
+
     /// Unknown models get conservative defaults and no price.
     pub fn get(&self, id: &ModelId) -> ModelInfo {
         self.models.get(id.as_str()).map_or_else(
@@ -102,6 +123,7 @@ impl Catalog {
                 caps: Capabilities::conservative(),
                 price: None,
                 cache_ttl_s: None,
+                tier: None,
             },
             Entry::info,
         )

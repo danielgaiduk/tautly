@@ -236,6 +236,8 @@ impl Session {
             }
         });
         let ran: Vec<Option<ToolResult>> = join_all(bounded).await;
+        // What a call asked the side model counts before its result is final.
+        self.drain_side_usage().await;
         let mut lost_writes = Vec::new();
         for ((p, _), r) in admitted.iter().zip(&ran) {
             if let (None, Some((_, Effect::Write { paths }))) = (r, &p.runnable) {
@@ -461,7 +463,8 @@ impl Session {
             .with_reads(Arc::clone(&self.reads))
             .with_cancel(ctl.cancel.child_token())
             .with_turn(turn)
-            .with_process_groups(self.groups.clone());
+            .with_process_groups(self.groups.clone())
+            .with_side(Arc::clone(&self.side.runner));
         if let Some(index) = self.workspace.index() {
             cx = cx.with_index(index);
         }

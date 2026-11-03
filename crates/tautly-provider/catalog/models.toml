@@ -31,6 +31,7 @@ cache_read = 0.5
 cache_write = 6.25
 
 [models."anthropic/claude-haiku-5-5"]
+tier = "small"
 context_window = 200000
 max_output = 64000
 parallel_tools = true
@@ -73,6 +74,7 @@ cache_read = 0.125
 cache_write = 0.0
 
 [models."openai/gpt-5-mini"]
+tier = "small"
 context_window = 400000
 max_output = 128000
 parallel_tools = true
@@ -101,6 +103,7 @@ cache_read = 0.2
 cache_write = 0.0
 
 [models."google/gemini-3-flash"]
+tier = "small"
 context_window = 1000000
 max_output = 64000
 parallel_tools = true
