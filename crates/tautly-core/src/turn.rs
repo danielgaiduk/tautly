@@ -23,8 +23,8 @@ use tautly_context::compact::DEFAULT_KEEP_RECENT;
 use tautly_context::schedule::{self, MutationReason};
 use tautly_context::{CompactError, ContextStatus, GcRecord, TokenEstimator, Turn};
 use tautly_provider::{
-    CanonicalRequest, Content, Message, ProviderError, ProviderEvent, Quota, RawUsage, Role,
-    StopReason, cost_usd,
+    CanonicalRequest, Content, Message, ModelId, Price, ProviderError, ProviderEvent, Quota,
+    RawUsage, Role, StopReason, cost_usd,
 };
 use tautly_session::RelPath;
 use tokio::sync::mpsc;
@@ -190,7 +190,11 @@ fn parse_args(input_json: &str) -> Result<serde_json::Value, String> {
 /// The usage to count for an attempt that ended early (broke off, was cancelled): what the
 /// provider reported, with the output raised to what was streamed, or else an estimate of
 /// the request's input and the streamed output. True when any of it is estimated.
-fn partial_usage(reported: Option<RawUsage>, est_input: u64, est_output: u64) -> (RawUsage, bool) {
+pub(crate) fn partial_usage(
+    reported: Option<RawUsage>,
+    est_input: u64,
+    est_output: u64,
+) -> (RawUsage, bool) {
     match reported {
         Some(u) => (
             RawUsage {
@@ -613,13 +617,16 @@ impl Session {
         .await;
     }
 
-    /// Threshold compaction (spec 6.4): announced first, summarized by the model, and if
-    /// that fails (or the summary is not smaller) the oldest turns are dropped without a
-    /// summary; never retried in a loop. True when the history changed.
+    /// Threshold compaction (spec 6.4): announced first, summarized by the side model
+    /// (7.5), and if that fails (or the summary is not smaller) the oldest turns are dropped
+    /// without a summary; never retried in a loop. True when the history changed.
     async fn compact(&mut self, reason: MutationReason, ctl: &TurnControl) -> bool {
-        let (req, removed) =
-            self.context
-                .compaction_request(&self.model, &self.info.caps, DEFAULT_KEEP_RECENT);
+        // The request is sized for the side model's window.
+        let (req, removed) = self.context.compaction_request(
+            &self.side.model,
+            &self.side.info.caps,
+            DEFAULT_KEEP_RECENT,
+        );
         if removed == 0 {
             return false;
         }
@@ -677,7 +684,7 @@ impl Session {
         true
     }
 
-    /// Run a summary request and collect its text. (Task 27 sends it to the side model.)
+    /// Run a summary request on the side model and collect its text.
     async fn summarize(
         &mut self,
         req: CanonicalRequest,
@@ -688,7 +695,7 @@ impl Session {
                 .tokens
                 .estimate(&serde_json::to_string(&req).unwrap_or_default()),
         );
-        let mut s = self.provider.stream(req, ctl.cancel.child_token());
+        let mut s = self.side.provider.stream(req, ctl.cancel.child_token());
         let mut text = String::new();
         let mut usage = None;
         let ended = loop {
@@ -702,20 +709,20 @@ impl Session {
                 Some(Ok(ProviderEvent::TextDelta(t))) => text.push_str(&t),
                 Some(Ok(ProviderEvent::Usage(u))) => usage = Some(u),
                 Some(Ok(ProviderEvent::DiscardedUsage(u))) => {
-                    self.spend(UsageRole::Side, u, None, false).await;
+                    self.spend_side(u, false).await;
                 }
                 Some(Ok(_)) => {}
                 Some(Err(e)) => break Ended::Failed(e),
             }
         };
         if let (Ended::Done, Some(u)) = (&ended, usage) {
-            self.spend(UsageRole::Side, u, None, false).await;
+            self.spend_side(u, false).await;
             return Ok(text.trim().to_string());
         }
         // Failed or cancelled: what it reported, or an estimate, still counts.
         let est_output = u64::from(self.context.tokens.estimate(&text));
         let (u, estimated) = partial_usage(usage, est_input, est_output);
-        self.spend(UsageRole::Side, u, None, estimated).await;
+        self.spend_side(u, estimated).await;
         match ended {
             Ended::Done => Ok(text.trim().to_string()),
             Ended::Cancelled => Err(StreamEnd::Cancelled),
@@ -730,14 +737,46 @@ impl Session {
         self.spend(role, u, resp.quota.clone(), estimated).await;
     }
 
-    /// Account for one provider response: queue its ledger row, emit `Usage`, then count it
-    /// against the budgets (whose 80% and exhausted warnings follow the `Usage`).
+    /// Account for one response of the main model (see [`Session::charge`]).
     async fn spend(&mut self, role: UsageRole, u: RawUsage, quota: Option<Quota>, estimated: bool) {
-        let cost = cost_usd(&u, self.info.price.as_ref());
+        let (model, price) = (self.model.clone(), self.info.price);
+        self.charge(role, &model, price.as_ref(), u, quota, estimated)
+            .await;
+    }
+
+    /// Account for one response of the side model: its own id and its own price, never the
+    /// main model's (spec 7.5). An unpriced side model costs `None`.
+    async fn spend_side(&mut self, u: RawUsage, estimated: bool) {
+        let (model, price) = (self.side.model.clone(), self.side.info.price);
+        self.charge(UsageRole::Side, &model, price.as_ref(), u, None, estimated)
+            .await;
+    }
+
+    /// Account for the side-model requests tools made (`web_fetch` answers) since the last
+    /// call. Run at tool boundaries, before the call's result is shown, so the budgets know
+    /// what a call spent before the next one is admitted.
+    pub(crate) async fn drain_side_usage(&mut self) {
+        while let Ok(s) = self.side.usage.try_recv() {
+            self.spend_side(s.usage, s.estimated).await;
+        }
+    }
+
+    /// Account for one provider response of `model`: queue its ledger row, emit `Usage`, then
+    /// count it against the budgets (whose 80% and exhausted warnings follow the `Usage`).
+    async fn charge(
+        &mut self,
+        role: UsageRole,
+        model: &ModelId,
+        price: Option<&Price>,
+        u: RawUsage,
+        quota: Option<Quota>,
+        estimated: bool,
+    ) {
+        let cost = cost_usd(&u, price);
         // Queued for the background writer: never waits (not even on the cancel path).
         let row = Row {
             session: self.session_id.clone(),
-            model: self.model.clone(),
+            model: model.clone(),
             usage: u,
             cost,
             estimated,
@@ -756,10 +795,13 @@ impl Session {
             estimated,
         })
         .await;
-        self.budgets
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .spend(&u, cost);
+        {
+            let mut budgets = self.budgets.lock().unwrap_or_else(PoisonError::into_inner);
+            budgets.spend(&u, cost);
+            if cost.is_none() {
+                budgets.note_unpriced(model.as_str());
+            }
+        }
         self.budget_exhausted().await;
     }
 

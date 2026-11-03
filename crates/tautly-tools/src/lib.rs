@@ -29,7 +29,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tautly_index::Index;
 use tautly_memory::MemoryStore;
-use tautly_provider::{Capabilities, EditFormat, ToolSpec};
+use tautly_provider::{Capabilities, EditFormat, SideModel, ToolSpec};
 use tautly_sandbox::{Effect, FileMeta, Sandbox};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -465,6 +465,7 @@ pub struct ToolCx {
     groups: ProcessGroups,
     approved_bases: Option<Vec<(PathBuf, Option<blake3::Hash>)>>,
     preview_diff: bool,
+    side: Option<Arc<dyn SideModel>>,
 }
 
 impl std::fmt::Debug for ToolCx {
@@ -493,6 +494,7 @@ impl ToolCx {
             groups: ProcessGroups::default(),
             approved_bases: None,
             preview_diff: true,
+            side: None,
         }
     }
 
@@ -549,6 +551,13 @@ impl ToolCx {
         self
     }
 
+    /// The cheap side model (spec 7.5) for tools that answer questions about what they
+    /// fetched (`web_fetch`). Its usage is counted by whoever built it.
+    pub fn with_side(mut self, side: Arc<dyn SideModel>) -> Self {
+        self.side = Some(side);
+        self
+    }
+
     pub fn edit_format(&self) -> EditFormat {
         self.edit_format
     }
@@ -591,6 +600,10 @@ impl ToolCx {
 
     pub fn preview_diff(&self) -> bool {
         self.preview_diff
+    }
+
+    pub fn side(&self) -> Option<&Arc<dyn SideModel>> {
+        self.side.as_ref()
     }
 }
 

@@ -24,6 +24,7 @@ use crate::evidence::EvidenceTracker;
 use crate::ledger::CostLedger;
 use crate::protocol::{Command, ErrorKind, Event};
 use crate::record::{BlockHashes, SessionRecord};
+use crate::routing::Side;
 use crate::workspace::Workspace;
 
 /// How long the first request waits for the repo map and the memory index (Task 38 note):
@@ -292,6 +293,8 @@ pub(crate) struct Session {
     pub provider: Arc<dyn Provider>,
     pub model: ModelId,
     pub info: ModelInfo,
+    /// Where side work goes (spec 7.5); the main model when the catalog has no small one.
+    pub side: Side,
     pub tools: Vec<Arc<dyn Tool>>,
     pub specs: Vec<ToolSpec>,
     pub max_turns: u32,

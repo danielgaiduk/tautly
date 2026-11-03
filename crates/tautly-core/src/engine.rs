@@ -12,10 +12,10 @@
 //!
 //! Seams for later tasks: resume and fork (Task 26) build the
 //! `Session` from a log instead of [`Session::init`]'s fresh state (`EngineBuilder::resume`
-//! is refused until then); side-model routing (Task 27) replaces the provider used by
-//! `Session::summarize`; memory proposals (Task 28) plug in at the `ContextOp::Remember`
+//! is refused until then); memory proposals (Task 28) plug in at the `ContextOp::Remember`
 //! arm of `dispatch.rs` and fill `Session::pending_memory_index`, which the cache epoch
-//! already applies.
+//! already applies, and ask the side model through `Session::side` (`routing.rs`), which
+//! already serves compaction summaries and `web_fetch` answers.
 
 use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -40,6 +40,7 @@ use crate::ledger::{CostLedger, LEDGER_FILE};
 use crate::protocol::{BudgetScope, Command, ErrorKind, Event, FinishReason};
 use crate::provider_setup::provider_for;
 use crate::record::SessionRecord;
+use crate::routing::Side;
 use crate::session::{EventSink, Log, LogFailure, Session};
 use crate::turn::TurnControl;
 use crate::workspace::Workspace;
@@ -85,6 +86,10 @@ pub struct EngineBuilder {
     /// Default: the adapter for `config.model`, with its key from the environment or the
     /// keychain. Always wrapped in `Retrying`.
     pub provider: Option<Arc<dyn Provider>>,
+    /// Serves the side model (spec 7.5) when it is not the main model's provider. Default:
+    /// the main provider when the side model has the same provider, else an adapter built
+    /// from the configuration. Always wrapped in `Retrying`.
+    pub side_provider: Option<Arc<dyn Provider>>,
     /// Default: a `LocalSandbox` on the root (or the workspace's sandbox).
     pub sandbox: Option<Arc<dyn Sandbox>>,
     /// A session id to resume (Task 26).
@@ -109,6 +114,7 @@ impl EngineBuilder {
             config,
             root: root.into(),
             provider: None,
+            side_provider: None,
             sandbox: None,
             resume: None,
             workspace: None,
@@ -182,6 +188,9 @@ impl EngineBuilder {
                 .map_err(EngineError::Provider)?,
         };
         let provider: Arc<dyn Provider> = Arc::new(Retrying::new(provider));
+        let (side, side_note) = Side::resolve(&config, &catalog, &provider, self.side_provider);
+        let mut config_warnings = self.config_warnings;
+        config_warnings.extend(side_note);
         let init = HeaderInit {
             model: Some(config.model.as_str().to_string()),
             config_hash: Some(config.hash()),
@@ -218,6 +227,7 @@ impl EngineBuilder {
             history_provider: config.model.provider().to_string(),
             model: config.model.clone(),
             info,
+            side,
             tools,
             specs,
             max_turns: config.max_turns,
@@ -248,12 +258,7 @@ impl EngineBuilder {
             budgets,
             groups: groups.clone(),
         };
-        runtime.spawn(actor.run(
-            session,
-            command_rx,
-            self.config_warnings,
-            config.pins.clone(),
-        ));
+        runtime.spawn(actor.run(session, command_rx, config_warnings, config.pins.clone()));
         Ok((
             Engine {
                 commands: command_tx,

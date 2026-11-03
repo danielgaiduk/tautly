@@ -118,6 +118,9 @@ pub(crate) struct Budgets {
     priced: bool,
     model: String,
     unpriced_reported: bool,
+    /// Other models (the side model) that billed without a catalog price, and whether the
+    /// user has been told.
+    unpriced_others: Vec<(String, bool)>,
 }
 
 impl Budgets {
@@ -128,6 +131,7 @@ impl Budgets {
             priced,
             model: model.to_string(),
             unpriced_reported: false,
+            unpriced_others: Vec::new(),
         }
     }
 
@@ -153,6 +157,15 @@ impl Budgets {
         }
     }
 
+    /// A response of `model` came without a cost (no catalog price). For the session's own
+    /// model that is the `priced` flag; for another (the side model) a USD limit then
+    /// misses its spend, which [`news`](Self::news) says once.
+    pub fn note_unpriced(&mut self, model: &str) {
+        if model != self.model && !self.unpriced_others.iter().any(|(m, _)| m == model) {
+            self.unpriced_others.push((model.to_string(), false));
+        }
+    }
+
     /// Whether a limit is reached: the loop stops at the next tool boundary.
     pub fn exceeded(&self) -> Option<BudgetScope> {
         [BudgetScope::Session, BudgetScope::Turn]
@@ -172,6 +185,16 @@ impl Budgets {
                  only the token budgets apply",
                 self.model
             ));
+        }
+        if usd_limit {
+            for (model, told) in self.unpriced_others.iter_mut().filter(|(_, told)| !told) {
+                *told = true;
+                out.push(format!(
+                    "the side model {model} has no known price, so what it spends cannot \
+                     count against the USD budget; its tokens still count against the token \
+                     budgets"
+                ));
+            }
         }
         for scope in [BudgetScope::Turn, BudgetScope::Session] {
             let state = self.state(scope);
@@ -240,6 +263,36 @@ impl Budgets {
 mod tests {
     use super::*;
     use proptest::prelude::*;
+
+    #[test]
+    fn an_unpriced_side_model_is_reported_once_and_only_with_a_usd_limit() {
+        let usd = BudgetConfig {
+            session: BudgetLimits {
+                max_usd: Some(5.0),
+                max_tokens: None,
+            },
+            ..BudgetConfig::default()
+        };
+        let mut b = Budgets::new(&BudgetConfig::default(), true, "main");
+        b.note_unpriced("side");
+        assert!(b.news().is_empty(), "no USD limit, nothing to say");
+        b.set(
+            BudgetScope::Session,
+            Budget {
+                max_usd: Some(5.0),
+                max_tokens: None,
+            },
+        );
+        let news = b.news();
+        assert_eq!(news.len(), 1, "{news:?}");
+        assert!(news[0].contains("side") && news[0].contains("no known price"));
+        b.note_unpriced("side");
+        assert!(b.news().is_empty(), "once");
+        // The session's own model is the `priced` flag's business, not this.
+        let mut b = Budgets::new(&usd, true, "main");
+        b.note_unpriced("main");
+        assert!(b.news().is_empty());
+    }
 
     #[test]
     fn warn_from_80_percent_exceeded_from_100() {
