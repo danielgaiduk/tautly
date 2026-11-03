@@ -346,6 +346,7 @@ impl Actor {
         config_warnings: Vec<String>,
         config_pins: Vec<String>,
     ) {
+        crate::subreaper::session_started();
         self.events.try_emit(Event::SessionChanged {
             session_id: self.session_id.clone(),
         });
@@ -421,6 +422,7 @@ impl Actor {
                 }
                 joined = async { (&mut running.as_mut().expect("guarded").handle).await }, if running.is_some() => {
                     running = None;
+                    crate::subreaper::reap();
                     match joined {
                         Ok((mut s, mut inbox)) => {
                             inbox.close();
@@ -437,6 +439,7 @@ impl Actor {
         // The turn has ended (its own command was killed with it); what is left are groups
         // with background children, such as dev servers.
         self.groups.terminate_all(GROUP_GRACE).await;
+        crate::subreaper::session_ended(GROUP_GRACE).await;
         self.with_log(|l| l.checkpoint()).await;
     }
 

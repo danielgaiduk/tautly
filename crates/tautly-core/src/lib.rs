@@ -16,6 +16,7 @@ mod provider_setup;
 pub mod record;
 mod session;
 pub mod signals;
+mod subreaper;
 pub mod turn;
 pub mod workspace;
 

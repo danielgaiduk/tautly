@@ -906,3 +906,50 @@ fn network_rules_match_ipv6_literal_hosts() {
         Decision::Deny { .. }
     ));
 }
+
+#[test]
+fn commands_that_escape_session_cleanup_ask_even_in_yolo() {
+    let y = p(Mode::Yolo);
+    for cmd in [
+        "setsid sleep 100",
+        "nohup setsid ./server &",
+        "/usr/bin/setsid -f srv",
+        "set -o monitor",
+        "set -em",
+        "bash -m run.sh",
+        "daemonize /bin/srv",
+        "start-stop-daemon --start --exec /bin/srv",
+    ] {
+        match y.decide("bash", &exec("x"), Some(cmd)) {
+            Decision::Ask { reason } => {
+                assert!(
+                    reason.contains("escapes session cleanup"),
+                    "{cmd}: {reason}"
+                )
+            }
+            other => panic!("{cmd}: {other:?}"),
+        }
+    }
+    // `set` before more commands, or inline shell code, already makes the input
+    // unanalyzable: it asks.
+    for cmd in [
+        "set -m; sleep 100 &",
+        "(set -m; sleep 100 &)",
+        "bash -m -c 'sleep 9 &'",
+    ] {
+        assert!(asks(y.decide("bash", &exec("x"), Some(cmd))), "{cmd}");
+    }
+    for cmd in [
+        "set -e",
+        "sleep 1 &",
+        "nohup ./srv &",
+        "echo -m",
+        "sh run.sh -m",
+    ] {
+        assert_eq!(
+            y.decide("bash", &exec("x"), Some(cmd)),
+            Decision::Allow,
+            "{cmd}"
+        );
+    }
+}

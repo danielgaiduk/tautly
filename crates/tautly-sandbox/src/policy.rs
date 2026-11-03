@@ -341,7 +341,41 @@ impl Policy {
                 })
             })
             .or_else(|| git_reason(&c.argv))
+            .or_else(|| escape_reason(&c.argv))
     }
+}
+
+/// A command that leaves its process group, so the session's cleanup (killing the groups
+/// its commands started) cannot reach what it leaves running: `setsid`, daemonizers, and
+/// job control (`set -m`, `set -o monitor`, a shell started with `-m`), which puts every
+/// background job in a group of its own.
+fn escape_reason(argv: &[String]) -> Option<String> {
+    const LEAVERS: &[&str] = &["setsid", "daemonize", "start-stop-daemon"];
+    const SHELLS: &[&str] = &["sh", "bash", "zsh", "dash", "ksh"];
+    let base = |w: &str| w.rsplit('/').next().unwrap_or(w).to_string();
+    let reason = |what: &str| Some(format!("{what} escapes session cleanup"));
+    if let Some(w) = argv.iter().find(|w| LEAVERS.contains(&base(w).as_str())) {
+        return reason(&format!("`{}`", base(w)));
+    }
+    let first = argv.first().map(|w| base(w))?;
+    let job_control = first == "set" || SHELLS.contains(&first.as_str());
+    if !job_control {
+        return None;
+    }
+    let mut words = argv.iter().skip(1);
+    while let Some(w) = words.next() {
+        if w == "-o" && words.next().is_some_and(|o| o == "monitor") {
+            return reason("job control (`-o monitor`)");
+        }
+        // Options end at the first operand (`sh script.sh -m` passes `-m` on).
+        if !w.starts_with('-') || w == "-" || w == "--" {
+            break;
+        }
+        if !w.starts_with("--") && w[1..].contains('m') {
+            return reason("job control (`-m`)");
+        }
+    }
+    None
 }
 
 /// The command as rules see it: leading assignments, then argv.

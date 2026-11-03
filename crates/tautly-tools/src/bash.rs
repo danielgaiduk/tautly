@@ -251,6 +251,9 @@ impl Tool for BashTool {
             // Inherited values that would change how the shell runs the command
             // (`cd` targets, startup files, options, tracing hooks) behind the policy.
             env_remove: SHELL_STATE_ENV.iter().map(|v| v.to_string()).collect(),
+            // Its own group, so cancel and shutdown can end everything it started. What
+            // leaves the group (setsid, job control, daemonizers) is not reached; see
+            // `procs` for the list and the mitigations.
             new_process_group: true,
         };
         let mut child = match sb.spawn(spec).await {
