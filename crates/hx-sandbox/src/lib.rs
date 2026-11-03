@@ -6,6 +6,7 @@ mod policy;
 mod protected;
 mod runners;
 mod shell;
+mod shell_state;
 
 pub use effect::{Effect, FileMeta, HttpResponse, Sandbox, SandboxError, SpawnSpec};
 pub use local::LocalSandbox;

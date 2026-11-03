@@ -737,3 +737,41 @@ fn paths_after_cd_resolve_against_the_new_directory() {
         );
     }
 }
+
+// --- checkpoint fix round 4 ---
+#[test]
+fn round_four_cd_bypasses_ask() {
+    let pol = with_rules(
+        Mode::Ask,
+        &[
+            "bash(cd*)",
+            "bash(echo*)",
+            "bash(cat*)",
+            "bash(export*)",
+            "bash(builtin*)",
+            "bash(command*)",
+            "bash(shopt*)",
+            "bash(true*)",
+            "bash(pushd*)",
+        ],
+        &[],
+    );
+    for cmd in [
+        "CDPATH=.git cd hooks && echo pwn > pre-commit",
+        "CDPATH=.git; cd hooks && echo pwn > pre-commit",
+        "export CDPATH=:.git; cd hooks && echo pwn > pre-commit",
+        "builtin cd sub && cat ../.git/config",
+        "command -- cd sub && cat ../.git/config",
+        "time cd sub && cat ../.git/config",
+        "\\builtin cd sub && cat ../.git/config",
+        "builtin pushd sub && cat ../.git/config",
+        "shopt -s lastpipe; true | cd .g*/hooks; echo pwn > pre-commit",
+        "cd a && cd b; cat ../.git/config",
+    ] {
+        assert!(asks(pol.decide("bash", &exec("cd"), Some(cmd))), "{cmd}");
+        assert!(
+            asks(p(Mode::Yolo).decide("bash", &exec("cd"), Some(cmd))),
+            "{cmd}"
+        );
+    }
+}

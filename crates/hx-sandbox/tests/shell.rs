@@ -732,3 +732,126 @@ fn arithmetic_operands_of_builtins_are_unparseable() {
         assert!(parse_commands(s).is_ok(), "{s}");
     }
 }
+
+// ---- checkpoint fix round 4 ----
+
+fn cwd_set(c: &SimpleCommand) -> std::collections::BTreeSet<String> {
+    cwds(c).into_iter().collect()
+}
+
+#[test]
+fn cdpath_assignments_are_unparseable() {
+    for s in [
+        "CDPATH=.git; cd hooks && echo pwn > pre-commit",
+        "export CDPATH=:.git; ls",
+        "printf -v CDPATH '.%s' git; ls",
+        "read CDPATH <<< .git; ls",
+        "for CDPATH in .git; do :; done; ls",
+        "declare -x CDPATH=.git; ls",
+    ] {
+        assert!(parse_commands(s).is_err(), "{s}");
+    }
+}
+
+#[test]
+fn cd_through_builtin_command_time_and_backslash_is_tracked() {
+    for s in [
+        "builtin cd sub && cat x",
+        "command cd sub && cat x",
+        "command -- cd sub && cat x",
+        "command -p cd sub && cat x",
+        "time cd sub && cat x",
+        "time -p cd sub && cat x",
+        "\\cd sub && cat x",
+        "\\builtin cd sub && cat x",
+        "builtin pushd sub && cat x",
+    ] {
+        let c = parse_commands(s).unwrap_or_else(|e| panic!("{s}: {e}"));
+        let cat = c.iter().find(|c| c.argv[0] == "cat").unwrap();
+        assert_eq!(cwds(cat), ["sub"], "{s}");
+    }
+    for s in [
+        "builtin cd .g*/hooks; echo pwn > pre-commit",
+        "command cd $D; ls",
+        "time cd .g*/hooks; echo x",
+        "\\builtin cd ~; ls",
+        "builtin popd; ls",
+        "command dirs -c; ls",
+    ] {
+        assert!(parse_commands(s).is_err(), "{s}");
+    }
+}
+
+#[test]
+fn shell_option_changes_followed_by_commands_are_unparseable() {
+    for s in [
+        "shopt -s lastpipe; true | cd .g*/hooks; echo pwn > pre-commit",
+        "shopt -s lastpipe; ls",
+        "shopt -u extglob; ls",
+        "shopt -s -o posix; ls",
+        "set -o posix; ls",
+        "set +e; ls",
+        "set -f; ls",
+        "set -eo vi; ls",
+        "ls; set -e; ls",
+        "set -e; ls; set -u; ls",
+        "builtin set -o posix; ls",
+        "(set -e; ls; set -B; ls)",
+    ] {
+        assert!(parse_commands(s).is_err(), "{s}");
+    }
+    for s in [
+        "set -e; ls",
+        "set -euo pipefail; cargo test",
+        "set -o errexit -o nounset; ls",
+        "set -x; set -o pipefail; ls",
+        "set -euxo pipefail\ncargo build",
+        "shopt -q extglob; ls",
+        "set -- a b; ls",
+        "shopt -s lastpipe",
+        "ls; set -o posix",
+    ] {
+        assert!(parse_commands(s).is_ok(), "{s}");
+    }
+}
+
+#[test]
+fn and_chains_keep_intermediate_directories() {
+    let c = parse_commands("cd a && cd b; ls").unwrap();
+    let expect: std::collections::BTreeSet<String> =
+        ["", "a", "a/b"].iter().map(|s| s.to_string()).collect();
+    assert_eq!(cwd_set(&c[2]), expect);
+    // The right side of && still runs only after the left side succeeded.
+    let c = parse_commands("cd a && cd b && ls").unwrap();
+    assert_eq!(cwds(&c[2]), ["a/b"]);
+    let c = parse_commands("cd a || ls").unwrap();
+    assert_eq!(
+        cwd_set(&c[1]),
+        ["", "a"].iter().map(|s| s.to_string()).collect()
+    );
+}
+
+#[test]
+fn printf_length_modifiers_and_time_conversions_are_numeric() {
+    for s in [
+        "printf '%ld' \"$x\"",
+        "printf '%lld' \"$x\"",
+        "printf '%hd' \"$x\"",
+        "printf '%hhu' $x",
+        "printf '%jd' \"$x\"",
+        "printf '%zx' \"$x\"",
+        "printf '%qd' $x",
+        "printf '%td' $x",
+        "printf '%Lx' $x",
+        "printf '%(%Y)T' \"$x\"",
+    ] {
+        assert!(parse_commands(s).is_err(), "{s}");
+    }
+    for s in [
+        "printf '%lf' \"$x\"",
+        "printf '%s' \"$x\"",
+        "printf '%(%Y)T' 0",
+    ] {
+        assert!(parse_commands(s).is_ok(), "{s}");
+    }
+}

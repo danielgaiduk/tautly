@@ -31,6 +31,17 @@ const MAX_CHUNK: usize = 64 * 1024;
 /// bytes); a full channel blocks the readers, and so the command, instead of growing.
 const CHANNEL_CHUNKS: usize = 32;
 
+/// Removed from the child's inherited environment.
+const SHELL_STATE_ENV: &[&str] = &[
+    "CDPATH",
+    "BASH_ENV",
+    "ENV",
+    "SHELLOPTS",
+    "BASHOPTS",
+    "PROMPT_COMMAND",
+    "PS4",
+];
+
 pub struct BashTool;
 
 #[derive(Deserialize)]
@@ -198,6 +209,9 @@ impl Tool for BashTool {
                 ("GIT_PAGER".into(), "cat".into()),
                 ("TERM".into(), "dumb".into()),
             ],
+            // Inherited values that would change how the shell runs the command
+            // (`cd` targets, startup files, options, tracing hooks) behind the policy.
+            env_remove: SHELL_STATE_ENV.iter().map(|v| v.to_string()).collect(),
             new_process_group: true,
         };
         let mut child = match sb.spawn(spec).await {

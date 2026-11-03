@@ -111,6 +111,7 @@ async fn spawn_runs_in_cwd_with_env() {
             argv: vec!["sh".into(), "-c".into(), "echo $FOO".into()],
             cwd: ".".into(),
             env: vec![("FOO".into(), "bar".into())],
+            env_remove: vec![],
             new_process_group: true,
         })
         .await

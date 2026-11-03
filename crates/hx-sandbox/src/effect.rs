@@ -25,6 +25,8 @@ pub struct SpawnSpec {
     pub argv: Vec<String>,
     pub cwd: PathBuf,
     pub env: Vec<(String, String)>,
+    /// Variables removed from the inherited environment.
+    pub env_remove: Vec<String>,
     pub new_process_group: bool,
 }
 

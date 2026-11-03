@@ -215,6 +215,9 @@ impl Sandbox for LocalSandbox {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
+        for k in &spec.env_remove {
+            cmd.env_remove(k);
+        }
         if spec.new_process_group {
             cmd.process_group(0);
         }

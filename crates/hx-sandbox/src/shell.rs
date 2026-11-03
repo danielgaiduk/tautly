@@ -10,6 +10,7 @@ use std::path::PathBuf;
 use tree_sitter::{Node, Parser};
 
 use crate::runners::{base, reject_unanalyzable, runs_module};
+use crate::shell_state::{Cwd, unwrap_prefixes};
 
 /// A single command invocation with its words unquoted. Variable expansions
 /// stay literal (`$X`). Wrappers such as `sudo` or `env` are not unwrapped.
@@ -113,7 +114,6 @@ const STRUCTURAL: &[&str] = &[
     "case_statement",
     "case_item",
     "do_group",
-    "negated_command",
     "concatenation",
     "string",
     "translated_string",
@@ -228,6 +228,12 @@ fn walk(
             r
         }
         "list" => walk_list(node, src, out, cx, depth),
+        // `! cmd` succeeds exactly when `cmd` fails.
+        "negated_command" => {
+            walk_children(node, src, out, cx, depth)?;
+            cx.assume_failure();
+            Ok(())
+        }
         "c_style_for_statement" => {
             let mut cur = node.walk();
             for child in node.named_children(&mut cur) {
@@ -329,12 +335,12 @@ fn walk_command(
         }
     } else {
         reject_unanalyzable(&argv)?;
-        reject_dynamic_names(&argv)?;
-        reject_dynamic_numbers(&argv)?;
+        reject_dynamic_names(unwrap_prefixes(&argv))?;
+        reject_dynamic_numbers(unwrap_prefixes(&argv))?;
         if fed && runs_module(&argv) {
             return Err(fed_module(&argv));
         }
-        let dir_change = is_dir_change(&argv).then(|| argv.clone());
+        let effective = unwrap_prefixes(&argv).to_vec();
         cx.push(
             out,
             SimpleCommand {
@@ -344,9 +350,7 @@ fn walk_command(
                 redirects,
             },
         )?;
-        if let Some(argv) = dir_change {
-            cx.change_dir(&argv);
-        }
+        cx.after_command(&effective);
     }
     for child in rest {
         // A command's own assignments only reach its environment; the policy
@@ -481,147 +485,18 @@ fn walk_list(
     let (Some(left), Some(right), true) = (named.first(), named.last(), named.len() == 2) else {
         return walk_children(node, src, out, cx, depth);
     };
-    let before = cx.cwds.clone();
     walk(*left, src, out, cx, depth)?;
     if op == Some("||") {
         let after_left = cx.cwds.clone();
-        cx.merge(before);
+        cx.assume_failure();
         walk(*right, src, out, cx, depth)?;
         cx.merge(after_left);
     } else {
+        // Directories where the left side may have failed are kept in the state
+        // and become possible again after the statement.
         walk(*right, src, out, cx, depth)?;
     }
     Ok(())
-}
-
-/// Most working directories tracked at once before giving up.
-const MAX_CWDS: usize = 8;
-
-/// Working-directory state while walking: every directory the next command may
-/// run in (lexical, relative to the workspace root or absolute).
-struct Cwd {
-    cwds: Vec<PathBuf>,
-    /// Set once the directory changed in a way we cannot follow; any later
-    /// command is then unparseable.
-    lost: Option<String>,
-    /// Inside a loop or function body.
-    loops: usize,
-}
-
-impl Default for Cwd {
-    fn default() -> Self {
-        Cwd {
-            cwds: vec![PathBuf::new()],
-            lost: None,
-            loops: 0,
-        }
-    }
-}
-
-impl Cwd {
-    fn push(
-        &self,
-        out: &mut Vec<SimpleCommand>,
-        mut cmd: SimpleCommand,
-    ) -> Result<(), Unparseable> {
-        if let Some(why) = &self.lost {
-            return Err(Unparseable(format!(
-                "{why}, so `{}` runs in an unknown directory",
-                cmd.argv.join(" ")
-            )));
-        }
-        cmd.cwds = self.cwds.clone();
-        out.push(cmd);
-        Ok(())
-    }
-
-    fn save(&self) -> (Vec<PathBuf>, Option<String>) {
-        (self.cwds.clone(), self.lost.clone())
-    }
-
-    fn restore(&mut self, (cwds, lost): (Vec<PathBuf>, Option<String>)) {
-        self.cwds = cwds;
-        self.lost = lost;
-    }
-
-    /// Union with directories that remain possible (`before` first).
-    fn merge(&mut self, before: Vec<PathBuf>) {
-        let mut all = before;
-        for c in self.cwds.drain(..) {
-            if !all.contains(&c) {
-                all.push(c);
-            }
-        }
-        self.cwds = all;
-        if self.cwds.len() > MAX_CWDS && self.lost.is_none() {
-            self.lost = Some("too many possible working directories".into());
-        }
-    }
-
-    fn in_loop<T>(&mut self, f: impl FnOnce(&mut Self) -> T) -> T {
-        self.loops += 1;
-        let r = f(self);
-        self.loops -= 1;
-        r
-    }
-
-    /// Apply a `cd`/`pushd`/`popd`/`dirs` that has just been recorded.
-    fn change_dir(&mut self, argv: &[String]) {
-        let target = match base(&argv[0]) {
-            "cd" | "pushd" if self.loops == 0 => literal_dir(&argv[1..]),
-            _ => None,
-        };
-        match target {
-            Some(t) => {
-                let mut next: Vec<PathBuf> = Vec::new();
-                for c in &self.cwds {
-                    let n = c.join(&t); // an absolute target replaces `c`
-                    if !next.contains(&n) {
-                        next.push(n);
-                    }
-                }
-                self.cwds = next;
-            }
-            None => {
-                self.lost.get_or_insert_with(|| {
-                    format!(
-                        "`{}` changes directory in a way we cannot follow",
-                        argv.join(" ")
-                    )
-                });
-            }
-        }
-    }
-}
-
-fn is_dir_change(argv: &[String]) -> bool {
-    matches!(base(&argv[0]), "cd" | "pushd" | "popd" | "dirs")
-}
-
-/// The target of `cd`/`pushd` when it is one literal path: no glob, expansion,
-/// `~`, `-` (previous directory), stack index or missing argument (home).
-fn literal_dir(args: &[String]) -> Option<PathBuf> {
-    let mut operands = Vec::new();
-    let mut options_done = false;
-    for a in args {
-        if !options_done && a == "--" {
-            options_done = true;
-        } else if !options_done && a.len() > 1 && a.starts_with('-') {
-            if !matches!(a.as_str(), "-P" | "-L") {
-                return None;
-            }
-        } else {
-            operands.push(a.as_str());
-        }
-    }
-    let [t] = operands[..] else {
-        return None;
-    };
-    let unsafe_target = t.is_empty()
-        || t == "-"
-        || t.starts_with(['~', '+'])
-        || t.contains(['*', '?', '[', '{', '$', '`']);
-    (!unsafe_target).then(|| PathBuf::from(t))
 }
 
 fn walk_children(
@@ -631,16 +506,35 @@ fn walk_children(
     cx: &mut Cwd,
     depth: usize,
 ) -> Result<(), Unparseable> {
+    // Between statements every directory a `cd` may have left behind (it can
+    // fail) becomes possible again.
+    let statements = STATEMENT_LISTS.contains(&node.kind());
     let mut cur = node.walk();
     for child in node.children(&mut cur) {
-        // A `cd` in a statement may fail, so afterwards the old directories are
-        // still possible too.
         let before = cx.cwds.clone();
         walk(child, src, out, cx, depth)?;
-        cx.merge(before);
+        if statements {
+            cx.end_statement(before);
+        }
     }
     Ok(())
 }
+
+/// Node kinds whose children are separate statements.
+const STATEMENT_LISTS: &[&str] = &[
+    "program",
+    "compound_statement",
+    "do_group",
+    "subshell",
+    "if_statement",
+    "elif_clause",
+    "else_clause",
+    "case_statement",
+    "case_item",
+    "while_statement",
+    "for_statement",
+    "c_style_for_statement",
+];
 
 /// Gather the file redirects under a redirect node into `redirects`, and any
 /// commands hidden in its operands (substitutions, heredoc pipelines) into
@@ -986,8 +880,9 @@ fn reject_dynamic_numbers(argv: &[String]) -> Result<(), Unparseable> {
     }
 }
 
-/// Whether a printf format has a numeric conversion (`%d %i %o %u %x %X`) or a
-/// `*` width/precision, whose argument bash evaluates arithmetically.
+/// Whether a printf format has a numeric conversion (`%d %i %o %u %x %X`, with
+/// any length modifier), a `*` width/precision or a `%(...)T` time, whose
+/// argument bash evaluates arithmetically.
 fn numeric_format(f: &str) -> bool {
     let b = f.as_bytes();
     let mut i = 0;
@@ -1001,6 +896,10 @@ fn numeric_format(f: &str) -> bool {
             i += 1;
             continue;
         }
+        if b.get(i) == Some(&b'(') {
+            // `%(fmt)T` takes its argument as an integer time.
+            return true;
+        }
         let mut star = false;
         while let Some(&c) = b.get(i) {
             if b"-+ #0'.123456789*".contains(&c) {
@@ -1009,6 +908,10 @@ fn numeric_format(f: &str) -> bool {
             } else {
                 break;
             }
+        }
+        // Length modifiers (`%ld`, `%hhu`, `%zx`, ...).
+        while b.get(i).is_some_and(|c| b"hjlLqtz".contains(c)) {
+            i += 1;
         }
         if star || matches!(b.get(i), Some(b'd' | b'i' | b'o' | b'u' | b'x' | b'X')) {
             return true;
@@ -1058,6 +961,7 @@ fn options<'a>(
 /// other code (dynamic loader, shell startup, interpreters, git, tool runners).
 const DANGEROUS_ENV: &[&str] = &[
     "BASH_ENV",
+    "CDPATH",
     "ENV",
     "PATH",
     "IFS",
