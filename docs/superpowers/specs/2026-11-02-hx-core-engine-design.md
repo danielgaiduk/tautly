@@ -70,7 +70,7 @@ Dependencies only point downward (`tautly-tools → tautly-memory → {tautly-in
 - **Async:** Tokio. Each turn runs in its own task scope with a `CancellationToken`; cancellation propagates to provider streams and child processes.
 - **Sandbox chokepoint:** tools receive `&dyn Sandbox` and have no direct access to `std::fs` or `std::process`. Enforced by crate visibility and a CI lint (`clippy::disallowed_methods` for `std::fs::*`, `std::process::Command` in `tautly-tools`).
 - **Bounded by construction:** fixed-capacity channels between engine and clients; tool output capped with disk spill; session history streamed to disk; only the active context plus an index held in memory.
-- **Config:** layered TOML — user (`~/.config/tautly/config.toml`) → project (`.tautly/config.toml`) → CLI flags. `AGENTS.md` in the repository root and ancestors is loaded as context.
+- **Config:** layered TOML — user (`~/.config/tautly/config.toml`) → project (`.tautly/config.toml`) → CLI flags. The project layer is repository content and therefore untrusted: it may not set `providers` (base URLs, key variables), `telemetry`, `approve_memory`, `catalog_overrides` or `routing`, and in `permissions` it can only tighten (add `ask`/`deny` rules or lower the mode), never loosen. Ignored keys produce a `Warning` event naming the key. `AGENTS.md` in the repository root and ancestors is loaded as context.
 
 ### 2.3 Stubs shipped in this sub-project
 - **`tautly-tui` stub:** a line-mode interactive REPL (no full-screen UI). Prints streamed text and tool activity, prompts y/n for approvals, shows `ContextStatus` and session cost after each turn, supports `/pin`, `/compact`, `/fork`, `/undo`. Replaced by the ratatui client in sub-project 3.
