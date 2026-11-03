@@ -5,8 +5,10 @@ mod cap;
 pub mod edit;
 mod glob;
 mod grep;
+mod pin_state;
 mod read;
 mod spec;
+mod web_fetch;
 mod write;
 
 use std::collections::HashMap;
@@ -26,7 +28,11 @@ pub use cap::cap_text;
 pub use edit::EditTool;
 pub use glob::GlobTool;
 pub use grep::GrepTool;
+pub use pin_state::{
+    ContextOp, PinTool, PlanStep, StatePatch, StateTool, StepStatus, parse_context_op,
+};
 pub use read::ReadTool;
+pub use web_fetch::WebFetchTool;
 pub use write::WriteTool;
 
 /// Invalid tool arguments.
@@ -166,5 +172,8 @@ pub fn registry(_caps: &Capabilities) -> Vec<Arc<dyn Tool>> {
         Arc::new(BashTool),
         Arc::new(GrepTool),
         Arc::new(GlobTool),
+        Arc::new(WebFetchTool),
+        Arc::new(PinTool),
+        Arc::new(StateTool),
     ]
 }

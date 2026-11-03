@@ -6,6 +6,7 @@ pub mod guard;
 pub mod hashline;
 pub mod patch;
 pub mod str_replace;
+pub mod syntax;
 pub mod tolerant;
 
 use std::collections::HashMap;
@@ -221,25 +222,53 @@ async fn record_written(sb: &dyn Sandbox, cx: &ToolCx, full: &Path, bytes: &[u8]
     hash
 }
 
-/// Write `edited` (LF text) over a loaded file, keeping its encoding, and report the effect.
+/// Most errors a syntax warning lists.
+const MAX_WARNED_ERRORS: usize = 5;
+
+/// The warning to append to an edit's output when `after` has parse errors `before` did
+/// not. The edit is already on disk; this only tells the model.
+fn syntax_warning(path: &str, before: &str, after: &str) -> Option<String> {
+    let errors = syntax::new_errors(Path::new(path), before, after)?;
+    if errors.is_empty() {
+        return None;
+    }
+    let mut listed: Vec<String> = errors
+        .iter()
+        .take(MAX_WARNED_ERRORS)
+        .map(|(line, msg)| format!("line {line} ({msg})"))
+        .collect();
+    if errors.len() > MAX_WARNED_ERRORS {
+        listed.push(format!("{} more", errors.len() - MAX_WARNED_ERRORS));
+    }
+    Some(format!(
+        "syntax warning: new parse errors in {path} at lines {}. The edit was applied; \
+         check it and fix the syntax with another edit if it is unintended.",
+        listed.join(", ")
+    ))
+}
+
+/// Write `edited` (LF text) over a loaded file, keeping its encoding, and report the effect
+/// plus a syntax warning if the edit introduced parse errors.
 async fn write_edited(
     sb: &dyn Sandbox,
     cx: &ToolCx,
     path: &str,
     file: Loaded,
     edited: &str,
-) -> Result<AppliedEffect, String> {
+) -> Result<(AppliedEffect, Option<String>), String> {
     // The requested path, not `file.full`: the sandbox refuses symlinks into protected paths.
     atomic::preserve_and_write(sb, Path::new(path), &file.original, edited)
         .await
         .map_err(|e| format!("{path}: {e}"))?;
     let post_hash =
         record_written(sb, cx, &file.full, &atomic::restore(&file.original, edited)).await;
-    Ok(AppliedEffect::Edited {
+    let warning = syntax_warning(path, &file.text, edited);
+    let effect = AppliedEffect::Edited {
         path: file.full,
         pre_image: Some(file.original),
         post_hash,
-    })
+    };
+    Ok((effect, warning))
 }
 
 #[async_trait]
@@ -309,13 +338,17 @@ async fn run_str_replace(a: StrReplaceArgs, sb: &dyn Sandbox, cx: &ToolCx) -> To
         Ok(r) => r,
         Err(e) => return ToolResult::error(match_error_message(&a.path, "old_text", &e)),
     };
-    let effect = match write_edited(sb, cx, &a.path, file, &edited).await {
+    let (effect, warning) = match write_edited(sb, cx, &a.path, file, &edited).await {
         Ok(e) => e,
         Err(e) => return ToolResult::error(e),
     };
     let mut output = format!("edited {}", a.path);
     if stage != RepairStage::Exact {
         output.push_str(&format!("; applied via {}", stage.describe()));
+    }
+    if let Some(w) = warning {
+        output.push('\n');
+        output.push_str(&w);
     }
     let mut r = ToolResult::ok(output);
     r.effects.push(effect);
@@ -349,8 +382,13 @@ async fn run_hashline(a: HashlineArgs, sb: &dyn Sandbox, cx: &ToolCx) -> ToolRes
         Err(e) => return ToolResult::error(format!("{}: {e}", a.path)),
     };
     match write_edited(sb, cx, &a.path, file, &edited).await {
-        Ok(effect) => {
-            let mut r = ToolResult::ok(format!("edited {} ({count} ops)", a.path));
+        Ok((effect, warning)) => {
+            let mut output = format!("edited {} ({count} ops)", a.path);
+            if let Some(w) = warning {
+                output.push('\n');
+                output.push_str(&w);
+            }
+            let mut r = ToolResult::ok(output);
             r.effects.push(effect);
             r
         }
@@ -370,6 +408,8 @@ struct Step {
     mode: Option<u32>,
     /// What to write for an update or add.
     bytes: Vec<u8>,
+    /// Set when the new content has parse errors the old content did not.
+    warning: Option<String>,
 }
 
 impl Step {
@@ -462,6 +502,14 @@ async fn run_patch(a: PatchArgs, sb: &dyn Sandbox, cx: &ToolCx) -> ToolResult {
             (PatchOp::Add(text), _) => text.clone().into_bytes(),
             _ => Vec::new(),
         };
+        let warning = match &ap.op {
+            PatchOp::Update(text) => {
+                let before = texts.get(&ap.path).map_or("", String::as_str);
+                syntax_warning(&rel, before, text)
+            }
+            PatchOp::Add(text) => syntax_warning(&rel, "", text),
+            PatchOp::Delete => None,
+        };
         for (hunk, stage) in &ap.repairs {
             notes.push(format!(
                 "{rel}: hunk {hunk} applied via {}",
@@ -475,6 +523,7 @@ async fn run_patch(a: PatchArgs, sb: &dyn Sandbox, cx: &ToolCx) -> ToolResult {
             original,
             mode,
             bytes,
+            warning,
         });
     }
 
@@ -504,6 +553,7 @@ async fn run_patch(a: PatchArgs, sb: &dyn Sandbox, cx: &ToolCx) -> ToolResult {
     }
 
     let mut lines = Vec::with_capacity(steps.len() + notes.len());
+    let mut warnings = Vec::new();
     let mut effects = Vec::with_capacity(steps.len());
     for step in steps {
         let (verb, post_hash) = match step.op {
@@ -519,6 +569,7 @@ async fn run_patch(a: PatchArgs, sb: &dyn Sandbox, cx: &ToolCx) -> ToolResult {
             }
         };
         lines.push(format!("{verb} {}", step.rel));
+        warnings.extend(step.warning);
         effects.push(AppliedEffect::Edited {
             path: step.full,
             pre_image: step.original,
@@ -526,6 +577,7 @@ async fn run_patch(a: PatchArgs, sb: &dyn Sandbox, cx: &ToolCx) -> ToolResult {
         });
     }
     lines.extend(notes);
+    lines.extend(warnings);
     let mut r = ToolResult::ok(lines.join("\n"));
     r.effects = effects;
     r

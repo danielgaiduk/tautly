@@ -205,11 +205,24 @@ async fn glob_returns_sorted_relative_paths_and_terminates_on_symlink_cycle() {
 }
 
 #[test]
-fn registry_order_and_specs() {
+fn registry_order_is_stable() {
     let caps = Capabilities::conservative();
     let tools = registry(&caps);
     let names: Vec<_> = tools.iter().map(|t| t.name()).collect();
-    assert_eq!(names, ["read", "edit", "write", "bash", "grep", "glob"]);
+    assert_eq!(
+        names,
+        [
+            "read",
+            "edit",
+            "write",
+            "bash",
+            "grep",
+            "glob",
+            "web_fetch",
+            "pin",
+            "state"
+        ]
+    );
     for t in &tools {
         let s = t.spec(&caps);
         assert_eq!(s.name, t.name());
