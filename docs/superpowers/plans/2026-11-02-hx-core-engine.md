@@ -723,6 +723,8 @@ proptest! { #[test] fn apply_then_inverse_restores(text in "[a-z\\n]{1,200}", ..
 
 ### Task 24: Engine turn loop and approvals
 
+**Task 38 review note (binding):** build the repo map off the startup path (spawn_blocking) once per session; on a first-ever session with no ready index the map is empty for that session — acceptable in v1, but log it.
+
 **Task 19 re-review note (binding):** after each turn call `Context::calibrate(status.used, input_tokens)` (not `TokenEstimator::calibrate`); when a response is cut off right after a reasoning item, drop that trailing reasoning item from history; on a mid-session model switch to another provider, strip `Reasoning`/`RedactedReasoning` content produced by a different provider before the next request (redacted payloads are provider-specific).
 
 **Task 19 review note (binding):** every step ends in the plain-text state tail, so providers see each step as a fresh user turn; confirm with the mock provider that reasoning continuity holds (Anthropic thinking signatures, OpenAI encrypted reasoning items) across tool steps. The engine passes a canonicalized root (same canonicalization as the sandbox) into `Context.root` and merges `agents_md::load` pins into `Context.pinned` exactly once.
