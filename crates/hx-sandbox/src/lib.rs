@@ -8,6 +8,7 @@ mod runners;
 mod shell;
 mod shell_state;
 mod spill;
+mod walk;
 
 pub use effect::{Effect, FileMeta, HttpResponse, Sandbox, SandboxError, SpawnSpec};
 pub use local::LocalSandbox;

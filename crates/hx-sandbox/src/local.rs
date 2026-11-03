@@ -1,5 +1,5 @@
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -9,8 +9,9 @@ use tokio::process::{Child, Command};
 use url::Url;
 
 use crate::effect::{FileMeta, HttpResponse, Sandbox, SandboxError, SpawnSpec};
-use crate::protected::{self, is_protected};
+use crate::protected::{self, Resolved, is_protected};
 use crate::spill::SPILL_DIR;
+use crate::walk;
 
 const MAX_BODY: usize = 10 * 1024 * 1024;
 
@@ -89,62 +90,17 @@ impl Sandbox for LocalSandbox {
     }
 
     fn resolve(&self, p: &Path) -> Result<PathBuf, SandboxError> {
-        let outside = || SandboxError::OutsideRoot(p.to_path_buf());
-        // A relative `p` starts at the root, which is canonical already and is never
-        // canonicalized again; an absolute `p` replaces it.
-        let mut cur = if p.is_absolute() {
-            p.to_path_buf()
-        } else {
-            self.root.join(p)
-        };
-        // Each round canonicalizes the longest prefix that exists, in one call (the
-        // kernel resolves `..` after a symlink against the real directory), then
-        // normalizes the missing tail lexically. A `..` in that tail can pop back onto
-        // components that do exist, which may be symlinks (`missing/../link_out/x`), so
-        // when the tail held a `..` the result is resolved again against the filesystem
-        // and the loop repeats until the tail has none: the final path is checked
-        // against the root exactly as one written without `..` would be. (Rejecting
-        // every `..` after a missing component would be simpler, but would also refuse
-        // the legitimate `src/new_dir/../new_file.rs`.) Each round that repeats has
-        // removed at least one `..`, so this ends within `p`'s component count.
-        let limit = cur.components().count() + 1;
-        for _ in 0..limit {
-            let parts: Vec<Component> = cur.components().collect();
-            let mut keep = parts.len();
-            let existing = loop {
-                if keep == 0 {
-                    break PathBuf::new();
-                }
-                let prefix: PathBuf = parts[..keep].iter().collect();
-                match prefix.canonicalize() {
-                    Ok(canon) => break canon,
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => keep -= 1,
-                    Err(e) => return Err(e.into()),
-                }
-            };
-            let tail = &parts[keep..];
-            let mut result = existing;
-            for c in tail {
-                match c {
-                    Component::ParentDir => {
-                        if !result.pop() {
-                            return Err(outside());
-                        }
-                    }
-                    Component::CurDir => {}
-                    other => result.push(other.as_os_str()),
-                }
-            }
-            if !tail.contains(&Component::ParentDir) {
-                return if result.starts_with(&self.root) {
-                    Ok(result)
-                } else {
-                    Err(outside())
-                };
-            }
-            cur = result;
+        // The same walk the permission policy uses to see where a path leads, so the
+        // file a write reaches is the file the policy approved. The root is canonical
+        // already; a path without `..` over missing names costs one `canonicalize`.
+        match walk::walk(&self.root, p)? {
+            Resolved::Inside(rel) if rel.as_os_str().is_empty() => Ok(self.root.clone()),
+            Resolved::Inside(rel) => Ok(self.root.join(rel)),
+            Resolved::Outside(_) => Err(SandboxError::OutsideRoot(p.to_path_buf())),
+            Resolved::Loop => Err(SandboxError::Io(std::io::Error::from_raw_os_error(
+                walk::ELOOP,
+            ))),
         }
-        Err(outside())
     }
 
     async fn read(&self, p: &Path) -> Result<Vec<u8>, SandboxError> {

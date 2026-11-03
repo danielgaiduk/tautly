@@ -440,3 +440,148 @@ async fn dotdot_inside_an_all_missing_tail_still_resolves_inside_root() {
         .unwrap();
     assert_eq!(std::fs::read(root.join("a/c.rs")).unwrap(), b"ok");
 }
+
+// --- one resolver for policy and sandbox (review round 1) ---
+fn policy_for(root: &Path, allow: &[&str]) -> hx_sandbox::Policy {
+    hx_sandbox::Policy::new(
+        hx_sandbox::PolicyConfig {
+            mode: hx_sandbox::Mode::Ask,
+            allow: allow.iter().map(|s| s.to_string()).collect(),
+            deny: vec![],
+        },
+        root.to_path_buf(),
+    )
+    .unwrap()
+}
+
+fn write_effect(p: &Path) -> hx_sandbox::Effect {
+    hx_sandbox::Effect::Write {
+        paths: vec![p.to_path_buf()],
+    }
+}
+
+/// `src/a -> ../other`, `other/lnk -> ../src/deep`: `src/a/lnk/..` is `src`.
+fn two_link_repo() -> (tempfile::TempDir, LocalSandbox) {
+    let (t, sb) = protected_repo();
+    for d in ["src/deep", "other"] {
+        std::fs::create_dir_all(t.path().join(d)).unwrap();
+    }
+    std::os::unix::fs::symlink("../other", t.path().join("src/a")).unwrap();
+    std::os::unix::fs::symlink("../src/deep", t.path().join("other/lnk")).unwrap();
+    (t, sb)
+}
+
+#[tokio::test]
+async fn policy_and_sandbox_agree_on_dotdot_over_links_after_a_missing_component() {
+    let (t, sb) = two_link_repo();
+    let root = sb.root().to_path_buf();
+    let policy = policy_for(&root, &["write(src/**)"]);
+    let req = Path::new("src/missing/../a/lnk/../b");
+    // The kernel (and the policy's link walk) reads this as src/b, inside the allow rule.
+    assert_eq!(
+        policy.decide("write", &write_effect(req), None),
+        hx_sandbox::Decision::Allow
+    );
+    assert_eq!(sb.resolve(req).unwrap(), root.join("src/b"));
+    sb.write_atomic(req, b"x", None).await.unwrap();
+    assert!(t.path().join("src/b").exists());
+    assert!(!t.path().join("other/b").exists());
+}
+
+#[tokio::test]
+async fn policy_and_sandbox_agree_when_dotdot_after_a_missing_component_leaves_a_protected_link() {
+    let (t, sb) = two_link_repo();
+    let root = sb.root().to_path_buf();
+    // docs/hooks -> ../.git/hooks, so docs/hooks/.. is .git: this names .git/config.
+    let req = Path::new("missing/../docs/hooks/../config");
+    assert!(matches!(
+        policy_for(&root, &["write"]).decide("write", &write_effect(req), None),
+        hx_sandbox::Decision::Ask { .. }
+    ));
+    assert_eq!(sb.resolve(req).unwrap(), root.join(".git/config"));
+    let r = sb.write_atomic(req, b"evil", None).await;
+    assert!(matches!(r, Err(SandboxError::Denied(_))), "{r:?}");
+    assert!(!t.path().join("docs/config").exists());
+    assert_eq!(
+        std::fs::read_to_string(t.path().join(".git/config")).unwrap(),
+        "[core]\n"
+    );
+}
+
+#[tokio::test]
+async fn dangling_symlinks_are_followed_by_resolve() {
+    let (t, _outside, sb) = dotdot_repo();
+    let outside = t.path().parent().unwrap().join("hx-no-such-target");
+    std::os::unix::fs::symlink(&outside, t.path().join("dangle_out")).unwrap();
+    std::os::unix::fs::symlink("made/later.txt", t.path().join("dangle_in")).unwrap();
+    let root = sb.root().to_path_buf();
+    for p in ["dangle_out", "missing/../dangle_out", "dangle_out/sub/x"] {
+        let r = sb.resolve(Path::new(p));
+        assert!(matches!(r, Err(SandboxError::OutsideRoot(_))), "{p}: {r:?}");
+    }
+    assert!(!outside.exists());
+    for p in ["dangle_in", "missing/../dangle_in"] {
+        assert_eq!(
+            sb.resolve(Path::new(p)).unwrap(),
+            root.join("made/later.txt")
+        );
+    }
+    sb.write_atomic(Path::new("missing/../dangle_in"), b"x", None)
+        .await
+        .unwrap();
+    assert_eq!(
+        std::fs::read(t.path().join("made/later.txt")).unwrap(),
+        b"x"
+    );
+}
+
+#[tokio::test]
+async fn symlink_loop_after_dotdot_is_an_error_not_a_hang() {
+    let (t, sb) = sandbox();
+    std::os::unix::fs::symlink("loop2", t.path().join("loop1")).unwrap();
+    std::os::unix::fs::symlink("loop1", t.path().join("loop2")).unwrap();
+    for p in ["loop1/x", "missing/../loop1/x", "missing/../loop1"] {
+        assert!(sb.resolve(Path::new(p)).is_err(), "{p}");
+    }
+}
+
+#[tokio::test]
+async fn trailing_dotdot_after_missing_and_after_an_outside_link() {
+    let (t, _outside, sb) = dotdot_repo();
+    let root = sb.root().to_path_buf();
+    assert_eq!(sb.resolve(Path::new("missing/..")).unwrap(), root);
+    assert_eq!(sb.resolve(Path::new("a/b/../..")).unwrap(), root);
+    assert_eq!(
+        sb.resolve(Path::new("docs/x/..")).unwrap(),
+        root.join("docs")
+    );
+    // `link_out/..` is the outside directory's parent, not the root.
+    for p in ["missing/../link_out/..", "missing/../link_out/../x"] {
+        let r = sb.resolve(Path::new(p));
+        assert!(matches!(r, Err(SandboxError::OutsideRoot(_))), "{p}: {r:?}");
+    }
+    drop(t);
+}
+
+#[tokio::test]
+async fn resolve_outside_the_root_never_reveals_what_exists() {
+    let (t, sb) = sandbox();
+    let deep = "../".repeat(30);
+    for p in [
+        format!("missing/{deep}etc/passwd/x"),
+        format!("missing/{deep}etc/passwd"),
+        format!("missing/{deep}etc/no-such-dir/x"),
+        format!("{deep}etc/passwd/x"),
+    ] {
+        let r = sb.resolve(Path::new(&p));
+        assert!(matches!(r, Err(SandboxError::OutsideRoot(_))), "{p}: {r:?}");
+    }
+    let r = sb.resolve(Path::new("/etc/passwd/x"));
+    assert!(matches!(r, Err(SandboxError::OutsideRoot(_))), "{r:?}");
+    // Inside the root a file used as a directory is still reported as such.
+    std::fs::write(t.path().join("f.txt"), "x").unwrap();
+    assert!(matches!(
+        sb.resolve(Path::new("f.txt/x")),
+        Err(SandboxError::Io(_))
+    ));
+}

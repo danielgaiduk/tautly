@@ -1,7 +1,5 @@
 //! Paths that always require approval, regardless of mode (spec 5.5).
 
-use std::collections::VecDeque;
-use std::ffi::OsString;
 use std::path::{Component, Path, PathBuf};
 
 /// Directories whose entire subtree is protected, at any depth.
@@ -109,54 +107,15 @@ pub(crate) enum Resolved {
     Loop,
 }
 
-const MAX_LINKS: usize = 40;
-
 /// Follow symlinks along `target` (relative to `root`, or absolute) the way the
 /// kernel would, including dangling links (a shell redirect creates their
-/// target) and `..` after a link. Missing components are taken lexically.
-/// `None` when `root` does not exist, so there is nothing on disk to follow.
+/// target) and `..` after a link; see [`crate::walk::walk`], which
+/// `LocalSandbox::resolve` shares. `None` when `root` does not exist, so there is
+/// nothing on disk to follow, or when the walk hits an error such as a file used as
+/// a directory (the lexical checks still apply to such a path).
 pub(crate) fn resolve_links(root: &Path, target: &Path) -> Option<Resolved> {
     let root = root.canonicalize().ok()?;
-    let mut cur = if target.is_absolute() {
-        PathBuf::from("/")
-    } else {
-        root.clone()
-    };
-    let mut queue: VecDeque<OsString> = target
-        .components()
-        .map(|c| c.as_os_str().to_owned())
-        .collect();
-    let mut links = 0;
-    while let Some(part) = queue.pop_front() {
-        match Path::new(&part).components().next() {
-            Some(Component::RootDir) => cur = PathBuf::from("/"),
-            Some(Component::ParentDir) => {
-                cur.pop();
-            }
-            Some(Component::Normal(name)) => {
-                let next = cur.join(name);
-                let link =
-                    std::fs::symlink_metadata(&next).is_ok_and(|m| m.file_type().is_symlink());
-                match link.then(|| std::fs::read_link(&next).ok()).flatten() {
-                    Some(dest) => {
-                        links += 1;
-                        if links > MAX_LINKS {
-                            return Some(Resolved::Loop);
-                        }
-                        for c in dest.components().rev() {
-                            queue.push_front(c.as_os_str().to_owned());
-                        }
-                    }
-                    None => cur = next,
-                }
-            }
-            _ => {}
-        }
-    }
-    Some(match cur.strip_prefix(&root) {
-        Ok(rel) => Resolved::Inside(rel.to_path_buf()),
-        Err(_) => Resolved::Outside(cur),
-    })
+    crate::walk::walk(&root, target).ok()
 }
 
 /// Reason a write-redirect target (a literal shell word) needs approval.
