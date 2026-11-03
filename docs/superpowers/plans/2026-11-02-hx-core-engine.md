@@ -574,6 +574,8 @@ proptest! { #[test] fn apply_then_inverse_restores(text in "[a-z\\n]{1,200}", ..
 
 ### Task 19: Context blocks, token accounting, pinned items, working state
 
+**Checkpoint 2 amendments (binding):** Use the new effect shapes from the checkpoint-2 fix wave: `AppliedEffect::{Read{path,range,file_hash,shown}, Edited{path,pre_image,pre_mode,post_hash}, Deleted{path,pre_image,pre_mode}, Exec{may_write}}`; the files list is keyed by the resolved effect path (displayed root-relative); `Deleted` removes the file note's `edited` state and marks it deleted.
+
 **Files:**
 - Create: `crates/hx-context/src/{lib.rs,blocks.rs,tokens.rs,pinned.rs,state.rs,agents_md.rs,assemble.rs,prompt.rs}`, `crates/hx-context/prompts/system.md`
 - Test: `crates/hx-context/tests/assemble.rs`
@@ -617,6 +619,8 @@ proptest! { #[test] fn apply_then_inverse_restores(text in "[a-z\\n]{1,200}", ..
 
 ### Task 20: Compaction
 
+**Checkpoint 2 amendments (binding):** Compaction must call `ReadTracker::forget_shown_at(cut_turn)` (or `clear()`) so no `unchanged since turn N` answer refers to a compacted turn.
+
 **Files:**
 - Create: `crates/hx-context/src/compact.rs`
 - Test: `crates/hx-context/tests/compact.rs`
@@ -631,6 +635,8 @@ proptest! { #[test] fn apply_then_inverse_restores(text in "[a-z\\n]{1,200}", ..
 - [ ] **Step 5: Commit** `git commit -m "feat(context): state-preserving reversible compaction"`
 
 ### Task 21: Context garbage collection
+
+**Checkpoint 2 amendments (binding):** Supersede detection uses effects, not args (one batched read covers up to 10 paths). A read whose `shown` is `Unchanged`/`Diff` never supersedes its base. Whenever any read result of path P is elided, call `ReadTracker::forget_path(P)`.
 
 **Files:**
 - Create: `crates/hx-context/src/gc.rs`; modify `lib.rs`, `assemble.rs`
@@ -648,6 +654,8 @@ proptest! { #[test] fn apply_then_inverse_restores(text in "[a-z\\n]{1,200}", ..
 - [ ] **Step 5: Commit** `git commit -m "feat(context): cache-aware context garbage collection"`
 
 ### Task 22: Memory store and `recall` / `remember` tools
+
+**Checkpoint 2 amendments (binding):** `symbol_hash` lookups must pass parent/kind when known (use the checkpoint-2 `symbol_hash_in(rel, name, parent, kind)`); reject or flag anchors whose `file_hash` is None (unindexed) or empty (oversize).
 
 **Files:**
 - Create: `crates/hx-memory/src/{lib.rs,entry.rs,store.rs,stale.rs,search.rs,episodes.rs,consolidate.rs}`, `crates/hx-tools/src/memory_tools.rs`; modify `crates/hx-tools/src/{lib.rs,pin_state.rs}` (`ToolCx` gains `memory: Option<Arc<RwLock<MemoryStore>>>`; `ContextOp` gains `Remember(MemoryDraft)`)
@@ -713,6 +721,8 @@ proptest! { #[test] fn apply_then_inverse_restores(text in "[a-z\\n]{1,200}", ..
 
 ### Task 24: Engine turn loop and approvals
 
+**Checkpoint 2 amendments (binding):** Ordering: partition calls into maximal runs; consecutive ReadOnly calls run concurrently; every Write/Exec/Network call is a barrier executed alone in model order; ContextOps (pin/state/remember) apply in model order after each run. Index: open it on a blocking task AFTER the first event (ToolCx gets `index: None` until ready), start the watcher (`Index::start_watcher`) and keep the `WatchHandle` in the actor; if the watcher fails or stops (`watching()` false) tools treat the index as stale. Emit `last_error()` once as a status warning. On Cancel, forget every read baseline committed by results that are not appended (use effects' `shown`). Write-generation bumps on `Edited | Deleted | Exec`. Resume replays ToolCall records through `parse_context_op` (ContextOp has no serde). Run spill cleanup at engine start.
+
 **Files:**
 - Create: `crates/hx-core/src/{engine.rs,turn.rs,approvals.rs}`
 - Test: `crates/hx-core/tests/engine_loop.rs`
@@ -753,6 +763,8 @@ proptest! { #[test] fn apply_then_inverse_restores(text in "[a-z\\n]{1,200}", ..
 
 ### Task 25: Cancellation, budgets, ledger, signals
 
+**Checkpoint 2 amendments (binding):** The process-group registry also reaps per-call bash reader tasks/fds on return; spill cleanup (age/size cap) runs at engine start if Task 24 didn't add it.
+
 **Files:**
 - Create: `crates/hx-core/src/{budget.rs,ledger.rs}`; modify `engine.rs`, `turn.rs`
 - Test: `crates/hx-core/tests/{cancel_budget.rs,ledger.rs}`
@@ -767,6 +779,8 @@ proptest! { #[test] fn apply_then_inverse_restores(text in "[a-z\\n]{1,200}", ..
 - [ ] **Step 5: Commit** `git commit -m "feat(core): cancellation, budgets, cost ledger, signal handling"`
 
 ### Task 26: Resume, fork, undo, compaction wiring
+
+**Checkpoint 2 amendments (binding):** Fork gives the child a fresh ReadTracker; undo uses `Edited.pre_image/pre_mode` and `Deleted` (restore file + mode).
 
 **Files:**
 - Create: `crates/hx-core/src/resume.rs`; modify `engine.rs`
@@ -798,6 +812,8 @@ proptest! { #[test] fn apply_then_inverse_restores(text in "[a-z\\n]{1,200}", ..
 - [ ] **Step 5: Commit** `git commit -m "feat(core): side-model routing for compaction, memory and web_fetch"`
 
 ### Task 28: Memory in the engine
+
+**Checkpoint 2 amendments (binding):** Refresh memory staleness after bash only once the index is fresh (`!is_stale()`); use `wait_ready(timeout)`.
 
 **Files:**
 - Create: `crates/hx-core/src/memory.rs`; modify `engine.rs`, `turn.rs`, `resume.rs`
@@ -875,6 +891,8 @@ proptest! { #[test] fn apply_then_inverse_restores(text in "[a-z\\n]{1,200}", ..
 - [ ] **Step 5: Commit** `git commit -m "feat(core): opt-in OpenTelemetry GenAI spans"`
 
 ### Task 33: Performance gates in CI
+
+**Checkpoint 2 amendments (binding):** Add an RSS gate for a 100k-file tree (index open + tree) and a gate that a no-op post-bash freshness check with a live watcher is cookie-based (< 50 ms), not a full refresh.
 
 **Files:**
 - Create: `benches/perf/startup.sh`, `benches/perf/soak.rs`, `benches/perf/big_output.rs` (as `[[test]]` targets in a `perf` crate or `hx-cli` with `#[ignore]` run explicitly), modify `.github/workflows/ci.yml` (job `perf`, release build, both OSes)
@@ -961,6 +979,8 @@ proptest! { #[test] fn apply_then_inverse_restores(text in "[a-z\\n]{1,200}", ..
 - [ ] **Step 5: Commit** `git commit -m "feat(tools): find tool, batched reads, index-backed grep and glob"`
 
 ### Task 38: Repo map (execute after Task 19)
+
+**Checkpoint 2 amendments (binding):** Build the map from the DB-loaded tree if the index is not ready within ~200 ms (`wait_ready`), never regenerate mid-session; use `TreeView::dirs(depth)` and per-slot `lang`; compute `top_referenced` with a capped query in the background.
 
 **Files:**
 - Create: `crates/hx-context/src/repo_map.rs`; modify `assemble.rs`, `lib.rs`
