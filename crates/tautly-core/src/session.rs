@@ -12,7 +12,7 @@ use tautly_context::pinned::{self, PinSource, Pinned};
 use tautly_context::{CompactionRecord, Context, Turn, agents_md};
 use tautly_provider::{Block, CanonicalRequest, ModelId, ModelInfo, Provider, ToolSpec};
 use tautly_sandbox::{Policy, Sandbox, cleanup_spills};
-use tautly_session::{BlobRef, SessionWriter};
+use tautly_session::{BlobRef, HeaderInit, SessionWriter};
 use tautly_tools::{ProcessGroups, ReadTracker, Tool};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
@@ -23,7 +23,7 @@ use crate::budget::Budgets;
 use crate::evidence::EvidenceTracker;
 use crate::ledger::CostLedger;
 use crate::protocol::{Command, ErrorKind, Event};
-use crate::record::{BlockHashes, SessionRecord};
+use crate::record::{BlockHashes, LoggedPin, SessionRecord};
 use crate::workspace::Workspace;
 
 /// How long the first request waits for the repo map and the memory index (Task 38 note):
@@ -224,6 +224,14 @@ impl Log {
         self.lock().writer.path().to_path_buf()
     }
 
+    /// Write to `writer` from now on (a fork's log), for every holder of this log; the
+    /// old writer is flushed and closed.
+    pub fn replace(&self, writer: SessionWriter<SessionRecord>) {
+        let mut g = self.lock();
+        g.writer = writer;
+        g.reported = false;
+    }
+
     /// Flush and fsync (tool and turn boundaries).
     pub fn checkpoint(&self) -> Result<(), LogFailure> {
         let mut g = self.lock();
@@ -330,6 +338,10 @@ pub(crate) struct Session {
     pub lost_write_paths: HashMap<PathBuf, Option<(SystemTime, u64)>>,
     /// The running turn's test evidence (spec 7.11.7); replaced at every turn start.
     pub evidence: EvidenceTracker,
+    /// Where session logs live (a fork creates its log here).
+    pub data_home: PathBuf,
+    /// The header fields every log of this session shares (model, config hash).
+    pub header_init: HeaderInit,
 }
 
 impl Session {
@@ -469,10 +481,7 @@ impl Session {
     /// ledger, config pins, AGENTS.md (once), and the background build of the repo map and
     /// memory index.
     pub async fn init(&mut self, config_pins: &[String]) {
-        let root = self.sandbox.root().to_path_buf();
-        tokio::task::spawn_blocking(move || cleanup_spills(&root, SPILL_MAX_AGE, SPILL_MAX_BYTES));
-        // Off the start path: another process may hold the file for seconds.
-        self.cost_ledger.start(self.events.clone());
+        self.start_housekeeping();
         for pin in config_pins {
             pinned::add(
                 &mut self.context.pinned,
@@ -487,7 +496,20 @@ impl Session {
             self.warn(w.clone()).await;
         }
         self.context.set_agents_md(found);
+        if !self.context.pinned.is_empty() {
+            let pins = self.context.pinned.iter().map(LoggedPin::from).collect();
+            self.log(SessionRecord::StartPins { pins }).await;
+        }
         self.startup = Some(self.spawn_startup());
+    }
+
+    /// Spill cleanup in the background and the cost ledger's writer (every session start,
+    /// a resumed one included).
+    pub fn start_housekeeping(&self) {
+        let root = self.sandbox.root().to_path_buf();
+        tokio::task::spawn_blocking(move || cleanup_spills(&root, SPILL_MAX_AGE, SPILL_MAX_BYTES));
+        // Off the start path: another process may hold the file for seconds.
+        self.cost_ledger.start(self.events.clone());
     }
 
     fn spawn_startup(&self) -> Startup {

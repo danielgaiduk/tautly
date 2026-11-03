@@ -873,6 +873,30 @@ fn summary_not_smaller_than_what_it_replaces_is_rejected() {
     assert!(c.apply_compaction(6, String::new()).is_ok());
 }
 
+#[test]
+fn a_logged_compaction_is_redone_without_the_size_check() {
+    // The live session applied it (its estimates differed); resume must redo it as logged.
+    let mut live = ctx_with(10);
+    let long = "word ".repeat(200);
+    let mut replay = live.clone();
+    let rec = replay.reapply_compaction(6, long.clone()).unwrap();
+    assert_eq!(rec.removed_turns, live.history[..6]);
+    assert_eq!((rec.first_removed_turn, rec.last_removed_turn), (1, 6));
+    assert_eq!(replay.history.len(), 5);
+    assert_eq!(replay.first_turn, 6);
+    // Same result as the checked path when that one accepts the summary.
+    let mut checked = ctx_with(10);
+    checked.apply_compaction(6, String::new()).unwrap();
+    live.reapply_compaction(6, String::new()).unwrap();
+    assert_eq!(live.history, checked.history);
+    // Nothing to redo: only a summary.
+    let mut tiny = ctx_with(0);
+    assert_eq!(
+        tiny.reapply_compaction(1, "s".into()),
+        Err(CompactError::Nothing)
+    );
+}
+
 // ---- forgetting baselines by path (I1) ----
 
 fn read_fx(path: &str) -> tautly_tools::AppliedEffect {

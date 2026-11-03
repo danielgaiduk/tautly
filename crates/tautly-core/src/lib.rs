@@ -16,6 +16,7 @@ pub mod ledger;
 pub mod protocol;
 mod provider_setup;
 pub mod record;
+pub mod resume;
 mod session;
 pub mod signals;
 pub mod turn;

@@ -70,6 +70,11 @@ impl<R: DeserializeOwned> SessionReader<R> {
         &self.header
     }
 
+    /// The log file.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
     /// Whether the log ended in a partial line that was skipped.
     pub fn truncated_tail(&self) -> bool {
         self.tail_start.is_some()

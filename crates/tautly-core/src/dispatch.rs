@@ -120,7 +120,7 @@ impl Outcome {
 
 /// What identifies a failure for the ledger: `exit N #<hash of the output>` for commands,
 /// the error kind otherwise. The part from ` #` on is not shown to the model.
-fn signature(tool: &str, r: &ToolResult) -> String {
+pub(crate) fn signature(tool: &str, r: &ToolResult) -> String {
     match (tool, r.meta.exit_code) {
         ("bash", Some(code)) => format!(
             "exit {code} #{}",
@@ -588,8 +588,9 @@ impl Session {
         };
         let id = call.id.clone();
         let root = self.root().to_path_buf();
+        let how = Ran { ran, blocked };
         if let Some(skipped) = self
-            .with_log(move |log| persist_result(log, &root, id, result, turn))
+            .with_log(move |log| persist_result(log, &root, id, result, how, turn))
             .await
         {
             self.untracked(skipped.untracked).await;
@@ -696,6 +697,12 @@ fn edit_record(e: &PersistedEffect, step: u32) -> Option<Option<SessionRecord>> 
     }))
 }
 
+/// Whether a call ran or the loop breaker refused it, as its `ToolResult` record says.
+struct Ran {
+    ran: bool,
+    blocked: bool,
+}
+
 /// Log a result with its effects (paths relative to `root`, file contents as blobs, paths a
 /// record cannot hold left out) and an `Edit` record per changed file, with the content
 /// it had before and after. Buffered: the caller checkpoints. Blocking file I/O.
@@ -704,6 +711,7 @@ fn persist_result(
     root: &Path,
     id: String,
     result: ToolResult,
+    how: Ran,
     turn: u32,
 ) -> Result<Skipped, LogFailure> {
     let result_blob = log.blob(result.output.as_bytes())?;
@@ -742,6 +750,8 @@ fn persist_result(
         is_error: result.is_error,
         effects,
         meta: result.meta,
+        ran: how.ran,
+        blocked: how.blocked,
     })?;
     for rec in &edits {
         log.append(rec)?;

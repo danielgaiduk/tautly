@@ -355,7 +355,16 @@ pub enum Command {
         proposal_id: String,
     },
     ConsolidateMemory,
-    Fork,
+    /// Branch the conversation (spec 7.12.3): a new session whose log is this one's
+    /// records up to the end of step `at` (default: the tip), copied verbatim, with
+    /// `origin: fork` and `label`. Files are not touched. Answered with
+    /// [`Event::SessionChanged`] naming the branch, on which the engine continues.
+    Fork {
+        #[serde(default)]
+        at: Option<u32>,
+        #[serde(default)]
+        label: Option<String>,
+    },
     /// Answered with [`Event::SessionDiff`]: the whole session (None) or user turn `turn`
     /// (1-based).
     Diff {

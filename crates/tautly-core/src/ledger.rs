@@ -231,27 +231,37 @@ impl Ledger {
 
     /// Totals of the rows recorded at or after `since`.
     pub fn totals(&self, since: SystemTime) -> Result<Totals> {
+        self.sum("at_ms >= ?1", params![unix_ms(since)])
+    }
+
+    /// Totals of every row of session `session` (discarded and estimated attempts
+    /// included): what a resumed session has spent so far.
+    pub fn session_totals(&self, session: &str) -> Result<Totals> {
+        self.sum("session = ?1", params![session])
+    }
+
+    /// Totals of the rows matching `filter` (an SQL condition on `usage`, with `args`).
+    fn sum(&self, filter: &str, args: impl rusqlite::Params) -> Result<Totals> {
         let n = |v: i64| u64::try_from(v).unwrap_or(0);
-        let totals = self.conn().query_row(
+        let sql = format!(
             "SELECT COUNT(*), COALESCE(SUM(input), 0), COALESCE(SUM(output), 0), \
              COALESCE(SUM(cache_read), 0), COALESCE(SUM(cache_write), 0), \
              COALESCE(SUM(cost_usd), 0.0), COUNT(*) - COUNT(cost_usd), \
              COALESCE(SUM(estimated), 0) \
-             FROM usage WHERE at_ms >= ?1",
-            params![unix_ms(since)],
-            |r| {
-                Ok(Totals {
-                    requests: n(r.get(0)?),
-                    input: n(r.get(1)?),
-                    output: n(r.get(2)?),
-                    cache_read: n(r.get(3)?),
-                    cache_write: n(r.get(4)?),
-                    usd: r.get(5)?,
-                    unpriced: n(r.get(6)?),
-                    estimated: n(r.get(7)?),
-                })
-            },
-        )?;
+             FROM usage WHERE {filter}"
+        );
+        let totals = self.conn().query_row(&sql, args, |r| {
+            Ok(Totals {
+                requests: n(r.get(0)?),
+                input: n(r.get(1)?),
+                output: n(r.get(2)?),
+                cache_read: n(r.get(3)?),
+                cache_write: n(r.get(4)?),
+                usd: r.get(5)?,
+                unpriced: n(r.get(6)?),
+                estimated: n(r.get(7)?),
+            })
+        })?;
         Ok(totals)
     }
 

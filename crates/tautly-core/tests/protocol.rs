@@ -241,7 +241,14 @@ fn every_command() -> Vec<Command> {
             proposal_id: "prop_1".into(),
         },
         Command::ConsolidateMemory,
-        Command::Fork,
+        Command::Fork {
+            at: None,
+            label: None,
+        },
+        Command::Fork {
+            at: Some(5),
+            label: Some("try-b".into()),
+        },
         Command::Diff { turn: None },
         Command::Diff { turn: Some(3) },
         Command::Shutdown,
@@ -260,7 +267,7 @@ fn every_command() -> Vec<Command> {
             | Command::ApproveMemory { .. }
             | Command::RejectMemory { .. }
             | Command::ConsolidateMemory
-            | Command::Fork
+            | Command::Fork { .. }
             | Command::Diff { .. }
             | Command::Shutdown => {}
         }

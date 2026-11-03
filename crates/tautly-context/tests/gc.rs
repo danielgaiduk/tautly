@@ -441,6 +441,26 @@ fn restore_gc_restores_original_outputs() {
 }
 
 #[test]
+fn a_kept_result_is_never_collected_but_still_covers() {
+    let mut c = Context::default();
+    read_call(&mut c, "r1", "/w/a.rs", "old");
+    read_call(&mut c, "r2", "/w/a.rs", "mid");
+    read_call(&mut c, "r3", "/w/a.rs", "new");
+    let rec = c.collect(NOW).unwrap();
+    assert_eq!(elided_ids(&rec), ["r1", "r2"]);
+    c.restore_gc(&rec);
+    // The user's Uncompact keeps r2: the next collection takes r1 only.
+    c.results
+        .iter_mut()
+        .find(|m| m.call_id == "r2")
+        .unwrap()
+        .kept = true;
+    let again = c.collect(NOW).unwrap();
+    assert_eq!(elided_ids(&again), ["r1"]);
+    assert_eq!(output_of(&c, "r2"), "mid");
+}
+
+#[test]
 fn restore_skips_results_that_are_gone_or_changed() {
     let mut c = Context::default();
     read_call(&mut c, "r1", "/w/a.rs", "old");

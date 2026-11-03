@@ -10,9 +10,11 @@
 //! its next tool boundary (`budget.rs`). At shutdown, after the turn has ended, every
 //! process group the session's commands left behind is terminated.
 //!
-//! Seams for later tasks: resume and fork (Task 26) build the
-//! `Session` from a log instead of [`Session::init`]'s fresh state (`EngineBuilder::resume`
-//! is refused until then); side-model routing (Task 27) replaces the provider used by
+//! A resumed session (`EngineBuilder::resume`) starts from its log, rebuilt by
+//! [`resume`](crate::resume); `Fork` moves the engine to a branch of its log, and
+//! `Compact`/`Uncompact` run between turns (all queued behind a running turn).
+//!
+//! Seams for later tasks: side-model routing (Task 27) replaces the provider used by
 //! `Session::summarize`; memory proposals (Task 28) plug in at the `ContextOp::Remember`
 //! arm of `dispatch.rs` and fill `Session::pending_memory_index`, which the cache epoch
 //! already applies.
@@ -40,6 +42,7 @@ use crate::ledger::{CostLedger, LEDGER_FILE};
 use crate::protocol::{BudgetScope, Command, ErrorKind, Event, FinishReason};
 use crate::provider_setup::provider_for;
 use crate::record::SessionRecord;
+use crate::resume::{self, Resumed};
 use crate::session::{EventSink, Log, LogFailure, Session};
 use crate::turn::TurnControl;
 use crate::workspace::Workspace;
@@ -72,8 +75,8 @@ pub enum EngineError {
         workspace: PathBuf,
         session: PathBuf,
     },
-    #[error("resuming a session is not available yet")]
-    ResumeUnsupported,
+    #[error("cannot resume the session: {0}")]
+    Resume(#[from] resume::OpenError),
 }
 
 /// Everything a session needs; see [`EngineBuilder::build`].
@@ -87,7 +90,9 @@ pub struct EngineBuilder {
     pub provider: Option<Arc<dyn Provider>>,
     /// Default: a `LocalSandbox` on the root (or the workspace's sandbox).
     pub sandbox: Option<Arc<dyn Sandbox>>,
-    /// A session id to resume (Task 26).
+    /// A session to resume: the id of one that ran in this work tree (the sandbox root).
+    /// Its log is reopened and its context rebuilt from it (a turn it ended in gets its
+    /// missing `TurnEnd`); AGENTS.md and the repo map are the logged ones.
     pub resume: Option<String>,
     /// Index, watcher and memory store shared with other sessions on the same root
     /// (spec 3.4). Default: the builder opens its own.
@@ -136,9 +141,6 @@ impl EngineBuilder {
     /// `tokio::task::spawn_blocking` (keeping the runtime entered) or pass a provider.
     pub fn build(self) -> Result<(Engine, mpsc::Receiver<Event>), EngineError> {
         let runtime = tokio::runtime::Handle::try_current().map_err(|_| EngineError::NoRuntime)?;
-        if self.resume.is_some() {
-            return Err(EngineError::ResumeUnsupported);
-        }
         let data_home = match self.data_home {
             Some(d) => d,
             None => tautly_session::paths::data_home()?,
@@ -187,14 +189,27 @@ impl EngineBuilder {
             config_hash: Some(config.hash()),
             ..HeaderInit::default()
         };
-        let writer = SessionWriter::<SessionRecord>::create_in(&data_home, &root, init)?;
+        let tools = registry(&info.caps);
+        let specs: Vec<_> = tools.iter().map(|t| t.spec(&info.caps)).collect();
+        let (writer, rebuilt) = match &self.resume {
+            None => (
+                SessionWriter::<SessionRecord>::create_in(&data_home, &root, init.clone())?,
+                None,
+            ),
+            Some(id) => {
+                let calibration = resume::Calibration {
+                    caps: info.caps.clone(),
+                    specs: specs.clone(),
+                };
+                let (w, r) = resume::open(&data_home, &root, id, &calibration)?;
+                (w, Some(r))
+            }
+        };
         let session_id = writer.session_id().to_string();
         let session_path = writer.path().to_path_buf();
 
         let (event_tx, event_rx) = mpsc::channel(EVENT_CAPACITY);
         let (command_tx, command_rx) = mpsc::channel(COMMAND_CAPACITY);
-        let tools = registry(&info.caps);
-        let specs = tools.iter().map(|t| t.spec(&info.caps)).collect();
         let context = Context {
             root: Some(root.clone()),
             ..Context::default()
@@ -205,7 +220,7 @@ impl EngineBuilder {
             config.model.as_str(),
         )));
         let groups = ProcessGroups::default();
-        let session = Session {
+        let mut session = Session {
             context,
             reads: Arc::new(ReadTracker::default()),
             policy: Arc::new(policy),
@@ -238,27 +253,36 @@ impl EngineBuilder {
             groups: groups.clone(),
             lost_write_paths: Default::default(),
             evidence: EvidenceTracker::new(test_matcher),
+            data_home,
+            header_init: init,
         };
+        let resumed = rebuilt.map(|r| session.adopt(r));
+        let current = Arc::new(Mutex::new((session_id.clone(), session_path.clone())));
         let actor = Actor {
             log: session.log.clone(),
             events: session.events.clone(),
             approvals: Approvals::new(self.interactive),
             shutdown: CancellationToken::new(),
             session_id: session_id.clone(),
+            current: Arc::clone(&current),
             budgets,
             groups: groups.clone(),
         };
         runtime.spawn(actor.run(
             session,
             command_rx,
-            self.config_warnings,
-            config.pins.clone(),
+            Start {
+                config_warnings: self.config_warnings,
+                config_pins: config.pins.clone(),
+                resumed,
+            },
         ));
         Ok((
             Engine {
                 commands: command_tx,
                 session_id,
                 session_path,
+                current,
                 groups,
             },
             event_rx,
@@ -282,6 +306,8 @@ pub struct Engine {
     commands: mpsc::Sender<Command>,
     session_id: String,
     session_path: PathBuf,
+    /// The session the engine is on now (a fork moves it to the branch).
+    current: Arc<Mutex<(String, PathBuf)>>,
     groups: ProcessGroups,
 }
 
@@ -294,8 +320,19 @@ impl Engine {
             .map_err(|_| EngineError::Closed)
     }
 
+    /// The session the engine was built on (created or resumed); see
+    /// [`current_session`](Self::current_session) after a fork.
     pub fn session_id(&self) -> &str {
         &self.session_id
+    }
+
+    /// The id and log of the session the engine is on now: after a `Fork`, the branch
+    /// (also announced by `SessionChanged`).
+    pub fn current_session(&self) -> (String, PathBuf) {
+        self.current
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     /// The command channel, held weakly (the signal listener).
@@ -308,15 +345,15 @@ impl Engine {
         &self.groups
     }
 
-    /// The session log file.
+    /// The log of the session the engine was built on.
     pub fn session_path(&self) -> &Path {
         &self.session_path
     }
 
     /// The file holding the latest provider request in full (`prompt show --full`),
-    /// next to the session log; overwritten at every step and not fsynced.
+    /// next to the current session's log; overwritten at every step and not fsynced.
     pub fn last_request_path(&self) -> PathBuf {
-        last_request_path(&self.session_path)
+        last_request_path(&self.current_session().1)
     }
 }
 
@@ -339,8 +376,18 @@ struct Actor {
     approvals: Approvals,
     shutdown: CancellationToken,
     session_id: String,
+    /// Shared with the [`Engine`] handle.
+    current: Arc<Mutex<(String, PathBuf)>>,
     budgets: Arc<Mutex<Budgets>>,
     groups: ProcessGroups,
+}
+
+/// What the actor does at session start.
+struct Start {
+    config_warnings: Vec<String>,
+    config_pins: Vec<String>,
+    /// The session was resumed: what is left to restore.
+    resumed: Option<Resumed>,
 }
 
 /// The actor's task dropped without a shutdown (the runtime went away): no process group
@@ -353,20 +400,22 @@ impl Drop for Actor {
 
 impl Actor {
     async fn run(
-        self,
+        mut self,
         mut session: Session,
         mut commands: mpsc::Receiver<Command>,
-        config_warnings: Vec<String>,
-        config_pins: Vec<String>,
+        start: Start,
     ) {
         self.events.try_emit(Event::SessionChanged {
             session_id: self.session_id.clone(),
         });
         session.workspace.start();
-        for w in config_warnings {
+        for w in start.config_warnings {
             self.events.try_emit(Event::Warning { message: w });
         }
-        session.init(&config_pins).await;
+        match start.resumed {
+            Some(resumed) => session.resume_start(resumed, &start.config_pins).await,
+            None => session.init(&start.config_pins).await,
+        }
 
         let mut state = Some(session);
         let mut running: Option<Running> = None;
@@ -512,10 +561,41 @@ impl Actor {
     }
 
     /// A command that runs between turns.
-    async fn idle_command(&self, session: &mut Session, cmd: Command) {
+    async fn idle_command(&mut self, session: &mut Session, cmd: Command) {
         match cmd {
             Command::Pin { .. } | Command::Unpin { .. } => session.context_command(cmd).await,
             Command::Diff { turn } => session.diff(turn).await,
+            Command::Fork { at, label } => match session.fork(at, label).await {
+                Ok((id, path)) => {
+                    self.session_id.clone_from(&id);
+                    *self.current.lock().unwrap_or_else(PoisonError::into_inner) =
+                        (id.clone(), path);
+                    self.events
+                        .send_or_drop(Event::SessionChanged { session_id: id })
+                        .await;
+                }
+                Err(why) => {
+                    self.events
+                        .send_or_drop(Event::Error {
+                            kind: ErrorKind::Internal,
+                            message: format!("fork: {why}"),
+                            retryable: false,
+                            hint: None,
+                        })
+                        .await;
+                }
+            },
+            Command::Compact => {
+                // The summary request can be stopped only by a shutdown, which is not
+                // read while this runs; the provider's own timeouts bound it.
+                let ctl = TurnControl {
+                    cancel: self.shutdown.child_token(),
+                    inbox: mpsc::unbounded_channel().1,
+                    approvals: self.approvals.clone(),
+                };
+                session.compact_command(&ctl).await;
+            }
+            Command::Uncompact => session.uncompact_command().await,
             other => {
                 let name = serde_json::to_value(&other)
                     .ok()

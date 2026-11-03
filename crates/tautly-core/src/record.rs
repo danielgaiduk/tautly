@@ -11,6 +11,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tautly_context::MutationReason;
+use tautly_context::pinned::{PinSource, Pinned};
 use tautly_provider::{ModelId, ProviderEvent};
 use tautly_session::{BlobRef, RelPath, SessionReader};
 use tautly_tools::{PersistedEffect, ToolMeta};
@@ -72,6 +73,13 @@ pub enum SessionRecord {
         is_error: bool,
         effects: Vec<PersistedEffect>,
         meta: ToolMeta,
+        /// The call ran (it was not refused, denied, blocked or cancelled first): the
+        /// attempt ledger counts it, and resume replays it there.
+        #[serde(default)]
+        ran: bool,
+        /// The loop breaker refused to repeat the call.
+        #[serde(default)]
+        blocked: bool,
     },
     /// A file a tool changed, with its content before the change (none: it was created)
     /// and after it (H7; none: deleted, or the content could not be captured), at provider
@@ -91,6 +99,13 @@ pub enum SessionRecord {
         files: Vec<UndoneFile>,
         backup_ref: Option<String>,
     },
+    /// An `Uncompact` that changed the context: the latest compaction was undone
+    /// (`compaction`), and the elisions of these results (call ids) were restored, their
+    /// outputs read back from their `ToolResult` blobs.
+    Uncompacted {
+        compaction: bool,
+        restored: Vec<String>,
+    },
     /// A compaction: each removed turn is a blob (a serialized context `Turn`).
     Compaction {
         removed: Vec<BlobRef>,
@@ -108,6 +123,10 @@ pub enum SessionRecord {
     MemoryIndexApplied { text: String },
     /// The session pins moved into the pinned block here.
     PinsFolded,
+    /// The pins the session started with (configuration, AGENTS.md / CLAUDE.md sections),
+    /// logged once at session start: a resumed session's pinned block is the logged one,
+    /// never re-read from disk.
+    StartPins { pins: Vec<LoggedPin> },
     /// A question to the user (H8), logged before its event is shown.
     ApprovalRequested {
         request_id: String,
@@ -138,6 +157,10 @@ pub enum SessionRecord {
     /// An engine bug (a panic in the turn task), with its message; a `TurnEnd{Error}`
     /// follows.
     EngineError { message: String },
+    /// User turn `turn` (1-based) started with the message `text`. A message sent while
+    /// another turn runs is logged as a command when it arrives, and its turn starts only
+    /// after that turn's `TurnEnd`; rebuild pushes the user turn here.
+    TurnStart { turn: u32, text: String },
     /// A user message's turn ended.
     TurnEnd {
         reason: FinishReason,
@@ -176,6 +199,55 @@ pub struct UndoneFile {
     pub to_mode: Option<u32>,
 }
 
+/// One pin of a [`SessionRecord::StartPins`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LoggedPin {
+    pub text: String,
+    pub source: PinOrigin,
+}
+
+/// Who pinned a [`LoggedPin`] (the context's `PinSource`, in log form).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PinOrigin {
+    User,
+    Config,
+    Model,
+    AgentsMd,
+    ClaudeMd,
+    /// A source this version does not know (read back as a configuration pin).
+    #[serde(other)]
+    Unknown,
+}
+
+impl From<&Pinned> for LoggedPin {
+    fn from(p: &Pinned) -> Self {
+        LoggedPin {
+            text: p.text.clone(),
+            source: match p.source {
+                PinSource::User => PinOrigin::User,
+                PinSource::Config => PinOrigin::Config,
+                PinSource::Model => PinOrigin::Model,
+                PinSource::AgentsMd => PinOrigin::AgentsMd,
+                PinSource::ClaudeMd => PinOrigin::ClaudeMd,
+            },
+        }
+    }
+}
+
+impl From<&LoggedPin> for Pinned {
+    fn from(p: &LoggedPin) -> Self {
+        let source = match p.source {
+            PinOrigin::User => PinSource::User,
+            PinOrigin::Model => PinSource::Model,
+            PinOrigin::AgentsMd => PinSource::AgentsMd,
+            PinOrigin::ClaudeMd => PinSource::ClaudeMd,
+            PinOrigin::Config | PinOrigin::Unknown => PinSource::Config,
+        };
+        Pinned::new(p.text.clone(), source)
+    }
+}
+
 /// What an [`SessionRecord::ApprovalRequested`] asks about.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -198,15 +270,18 @@ const KNOWN_TYPES: &[&str] = &[
     "tool_result",
     "edit",
     "undone",
+    "uncompacted",
     "compaction",
     "gc_applied",
     "memory_index_applied",
     "pins_folded",
+    "start_pins",
     "approval_requested",
     "checkpoint",
     "checkpoint_skipped",
     "labeled",
     "engine_error",
+    "turn_start",
     "turn_end",
 ];
 
@@ -280,6 +355,8 @@ mod tests {
             is_error: false,
             effects: vec![kept, PersistedEffect::Exec { may_write: true }],
             meta: ToolMeta::default(),
+            ran: true,
+            blocked: false,
         };
         let v = serde_json::to_value(&rec).unwrap();
         assert_eq!(v["data"]["effects"][0]["path"], "ok.txt");
@@ -412,6 +489,8 @@ mod tests {
                 is_error: false,
                 effects: vec![],
                 meta: ToolMeta::default(),
+                ran: true,
+                blocked: false,
             },
             SessionRecord::Edit {
                 path: rel("a"),
@@ -430,6 +509,10 @@ mod tests {
                 }],
                 backup_ref: Some("refs/tautly/checkpoints/s/undo-1".into()),
             },
+            SessionRecord::Uncompacted {
+                compaction: true,
+                restored: vec!["c1".into()],
+            },
             SessionRecord::Compaction {
                 removed: vec![blob],
                 summary: String::new(),
@@ -444,6 +527,12 @@ mod tests {
                 text: String::new(),
             },
             SessionRecord::PinsFolded,
+            SessionRecord::StartPins {
+                pins: vec![LoggedPin {
+                    text: "use tabs".into(),
+                    source: PinOrigin::AgentsMd,
+                }],
+            },
             SessionRecord::ApprovalRequested {
                 request_id: "approval-1".into(),
                 kind: ApprovalKind::McpServer,
@@ -469,6 +558,10 @@ mod tests {
             },
             SessionRecord::EngineError {
                 message: String::new(),
+            },
+            SessionRecord::TurnStart {
+                turn: 1,
+                text: "hi".into(),
             },
             SessionRecord::TurnEnd {
                 reason: FinishReason::Error,

@@ -81,6 +81,10 @@ pub struct ResultMeta {
     pub turn: u32,
     /// Whether [`Context::collect`] has replaced the output with a stub.
     pub elided: bool,
+    /// Never collect this result (still covering earlier ones). The engine sets it on the
+    /// results the user's `Uncompact` restored, so the next collection does not take
+    /// them away again.
+    pub kept: bool,
     /// The read targets, from the result's `Read` effects.
     pub reads: Vec<ReadTarget>,
     /// Paths the result wrote, from its `Edited` effects.
@@ -150,6 +154,7 @@ impl Context {
             tool: tool.to_string(),
             turn,
             elided: false,
+            kept: false,
             reads,
             writes,
             failed_edit,
@@ -227,7 +232,8 @@ impl Context {
 
     /// Undo [`collect`](Self::collect): put the original outputs back, byte for byte. A
     /// result that is no longer in the history (compacted away; restore it with
-    /// `uncompact` first) or no longer a stub is left alone.
+    /// `uncompact` first) or no longer a stub is left alone. A restored result can be
+    /// collected again, unless the caller marks it [`ResultMeta::kept`].
     pub fn restore_gc(&mut self, rec: &GcRecord) {
         let found: Vec<(Pos, &String, &String)> = {
             let at = result_positions(&self.history);
@@ -317,7 +323,7 @@ impl Context {
                 idx: i,
                 turn: meta.turn,
             };
-            if !meta.elided {
+            if !meta.elided && !meta.kept {
                 let by = if let Some(cmd) = &meta.command {
                     later_cmd.get(cmd.as_str()).map(|l| l.turn)
                 } else if !meta.reads.is_empty() {
