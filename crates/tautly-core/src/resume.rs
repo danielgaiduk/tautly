@@ -64,6 +64,7 @@ use tautly_context::pinned::{self, PinSource};
 use tautly_context::{
     CompactionRecord, Context, ContextStatus, GcElision, GcRecord, MutationReason, Turn,
 };
+use tautly_memory::MemoryChange;
 use tautly_provider::{
     Capabilities, Catalog, Content, Message, ModelId, RawUsage, Role, ToolSpec, cost_usd,
 };
@@ -122,6 +123,10 @@ pub struct Rebuilt {
     pub(crate) seen: HashMap<PathBuf, blake3::Hash>,
     /// A `StartPins` record was replayed: the session's start pins are the logged ones.
     pub(crate) start_pins: bool,
+    /// Memory proposals no decision followed, oldest first.
+    pub(crate) memory_proposals: Vec<(String, MemoryChange)>,
+    /// Memory proposals logged (their ids are numbered).
+    pub(crate) memory_seq: u32,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -224,6 +229,8 @@ pub(crate) fn rebuild_with(
             reasoning_retry: false,
             seen: HashMap::new(),
             start_pins: false,
+            memory_proposals: Vec::new(),
+            memory_seq: 0,
         },
         root,
         step: None,
@@ -349,6 +356,13 @@ impl Replay<'_> {
                 self.close_step();
                 self.apply_pending();
                 self.running = false;
+            }
+            SessionRecord::MemoryProposal { id, change } => {
+                self.out.memory_seq += 1;
+                self.out.memory_proposals.push((id, change));
+            }
+            SessionRecord::MemoryDecision { id, .. } => {
+                self.out.memory_proposals.retain(|(p, _)| *p != id);
             }
             SessionRecord::Forked => {
                 self.close_step();
@@ -893,6 +907,7 @@ impl Session {
             self.restore_model(model).await;
         }
         self.resume_start(resumed, config_pins).await;
+        self.show_pending_proposals().await;
         Ok(())
     }
 
@@ -931,6 +946,12 @@ impl Session {
             self.prefix_log.logged(p);
         }
         self.reasoning_retry = r.reasoning_retry;
+        self.memory.pending = r.memory_proposals;
+        self.memory.seq = r.memory_seq;
+        self.memory.task = None;
+        if let Some(text) = crate::memory::first_task(&self.context.history) {
+            self.memory.note_task(&text);
+        }
         self.reads = Arc::new(ReadTracker::default());
         self.evidence = self.evidence.fresh();
         {
@@ -963,6 +984,10 @@ impl Session {
             Some(prefix) => {
                 self.start_housekeeping();
                 self.warn_if_prefix_changed(prefix).await;
+                // The logged index stands until the store is checked again (once the code
+                // index is ready), which an epoch then applies.
+                self.memory.live = true;
+                self.memory.refresh_due = true;
             }
         }
         self.restore_spend(resumed.usage).await;

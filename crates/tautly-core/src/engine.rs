@@ -24,11 +24,10 @@
 //! run between turns (all queued behind a running turn). `Compact` sends a summary
 //! request, so it runs as a task like a turn: `Cancel` and `Shutdown` stop it.
 //!
-//! Seams for later tasks: memory proposals (Task 28) plug in at the `ContextOp::Remember`
-//! arm of `dispatch.rs` and fill `Session::pending_memory_index`, which the cache epoch
-//! already applies, and ask the side model through `Session::side` (`routing.rs`), which
-//! already serves compaction summaries and `web_fetch` answers (and is recomputed by every
-//! `SetModel`).
+//! Project memory (`memory.rs`): `ApproveMemory`/`RejectMemory` reach a running turn at its
+//! next step start (like `Pin`) and apply at once when idle; `ConsolidateMemory` asks the
+//! side model, so it runs as a task like `Compact`. At shutdown, after the turn has ended,
+//! the side model writes the session's episode (bounded) before anything else stops.
 
 use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -52,6 +51,7 @@ use crate::config::{Config, LoadedConfig};
 use crate::evidence::{EvidenceTracker, TestMatcher};
 use crate::ledger::{CostLedger, LEDGER_FILE};
 use crate::mcp::{McpSession, McpSetup, NoPreExec, PreExecHook};
+use crate::memory::{MemoryMode, MemoryState};
 use crate::model_switch::ModelSetup;
 use crate::protocol::{BudgetScope, Command, ErrorKind, Event, FinishReason};
 use crate::provider_setup::{ProviderFactory, provider_for, provider_label};
@@ -276,6 +276,7 @@ impl EngineBuilder {
             startup: None,
             latest_compaction: None,
             pending_memory_index: None,
+            memory: MemoryState::new(MemoryMode::new(config.approve_memory, self.interactive)),
             untracked_paths: HashSet::new(),
             user_turn: 0,
             prefix_log: Default::default(),
@@ -400,11 +401,12 @@ pub(crate) fn last_request_path(session_path: &Path) -> PathBuf {
     session_path.with_extension("last-request.json")
 }
 
-/// What runs as a task, with its own cancellation: a user message's turn, or a manual
-/// compaction (a summary request).
+/// What runs as a task, with its own cancellation: a user message's turn, a manual
+/// compaction (a summary request) or a memory consolidation (a side-model request).
 enum Job {
     Turn(String),
     Compact,
+    Consolidate,
 }
 
 /// The task in flight (a turn or a compaction). It hands back the session and the inbox,
@@ -513,6 +515,7 @@ impl Actor {
                     let job = match cmd {
                         Command::SendMessage { text } => Job::Turn(text),
                         Command::Compact => Job::Compact,
+                        Command::ConsolidateMemory => Job::Consolidate,
                         Command::SetModel { model } => {
                             match state.as_mut() {
                                 Some(s) => {
@@ -576,6 +579,10 @@ impl Actor {
                 }
             }
         }
+        // The session's episode, by the side model (spec 7.4), before anything stops.
+        if let Some(s) = state.as_mut() {
+            s.end_episode().await;
+        }
         // MCP servers end with their process groups. (A session lost to a crashed turn
         // dropped its servers, which kills their groups.)
         if let Some(mcp) = state.as_ref().and_then(|s| s.mcp.as_ref()) {
@@ -628,7 +635,12 @@ impl Actor {
             } => {
                 self.set_budget(scope, max_usd, max_tokens);
             }
-            cmd @ (Command::Pin { .. } | Command::Unpin { .. }) if running.is_some() => {
+            cmd @ (Command::Pin { .. }
+            | Command::Unpin { .. }
+            | Command::ApproveMemory { .. }
+            | Command::RejectMemory { .. })
+                if running.is_some() =>
+            {
                 if let Some(r) = running {
                     let _ = r.inbox.send(cmd);
                 }
@@ -680,6 +692,7 @@ impl Actor {
             match job {
                 Job::Turn(text) => session.run_turn(text, &mut ctl).await,
                 Job::Compact => session.compact_command(&ctl).await,
+                Job::Consolidate => session.consolidate_command(&ctl).await,
             }
             (session, ctl.inbox)
         });
@@ -701,7 +714,10 @@ impl Actor {
     /// A command that runs between turns.
     async fn idle_command(&mut self, session: &mut Session, cmd: Command) {
         match cmd {
-            Command::Pin { .. } | Command::Unpin { .. } => session.context_command(cmd).await,
+            Command::Pin { .. }
+            | Command::Unpin { .. }
+            | Command::ApproveMemory { .. }
+            | Command::RejectMemory { .. } => session.context_command(cmd).await,
             Command::Diff { turn } => session.diff(turn).await,
             Command::Fork { at, label } => match session.fork(at, label).await {
                 Ok((id, path)) => {

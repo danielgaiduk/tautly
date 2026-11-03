@@ -379,6 +379,39 @@ impl Context {
         }
     }
 
+    /// The history as a transcript, rendered as compaction renders it (tool inputs and
+    /// results clipped, text neutralized): the first turn (the task, or an earlier
+    /// compaction's summary) and the newest turns that fit `max_tokens`, with a marker
+    /// where turns were left out. For side-model notes (episodes).
+    pub fn transcript(&self, max_tokens: u32) -> String {
+        let est = &self.tokens;
+        let chunks: Vec<String> = self.history.iter().map(render_turn).collect();
+        let costs: Vec<u32> = chunks.iter().map(|c| est.estimate(c)).collect();
+        let total = costs.iter().fold(0u32, |a, c| a.saturating_add(*c));
+        if total <= max_tokens {
+            return chunks.concat();
+        }
+        let marker = |n: usize| format!("[... {n} turns left out ...]\n\n");
+        // The marker's size for the longest count it can show.
+        let mut left = max_tokens.saturating_sub(est.estimate(&marker(chunks.len())));
+        let first = match costs.first() {
+            Some(&c) if c <= left => {
+                left -= c;
+                1
+            }
+            _ => 0,
+        };
+        let mut from = chunks.len();
+        while from > first && costs[from - 1] <= left {
+            left -= costs[from - 1];
+            from -= 1;
+        }
+        let mut out = chunks[..first].concat();
+        out.push_str(&marker(from - first));
+        out.push_str(&chunks[from..].concat());
+        out
+    }
+
     /// The tracker turn number of the next turn: what the engine passes to
     /// `ToolCx::with_turn`, and the first number a compaction would not cover yet.
     pub fn next_turn(&self) -> u32 {

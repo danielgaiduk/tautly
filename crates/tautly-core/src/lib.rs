@@ -14,6 +14,7 @@ pub mod engine;
 pub mod evidence;
 pub mod ledger;
 pub mod mcp;
+mod memory;
 mod model_switch;
 pub mod protocol;
 mod provider_setup;

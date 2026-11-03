@@ -36,6 +36,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::approvals::Approvals;
 use crate::ledger::Row;
+use crate::memory::OVER_BUDGET_WARNING;
 use crate::model_switch::rejects_reasoning;
 use crate::protocol::{BudgetScope, Command, ErrorKind, Event, FinishReason, UsageRole};
 use crate::provider_setup::provider_label;
@@ -287,6 +288,7 @@ impl Session {
         });
         self.apply_startup().await;
         self.evidence = self.evidence.fresh();
+        self.memory.note_task(&text);
         self.user_turn += 1;
         self.log(SessionRecord::TurnStart {
             turn: self.user_turn,
@@ -307,6 +309,7 @@ impl Session {
             }],
         });
         let mut reason = self.steps(ctl).await;
+        self.memory.episode_due = true;
         if let Some(t) = timer {
             t.abort();
         }
@@ -344,6 +347,7 @@ impl Session {
             }
             self.check_lost_writes().await;
             self.check_index().await;
+            self.memory_step_start().await;
             // Reasoning is provider-specific (a switch strips it already; this holds the
             // invariant for any other way the model changes).
             self.context
@@ -471,8 +475,13 @@ impl Session {
     }
 
     pub(crate) fn assemble(&self) -> (CanonicalRequest, ContextStatus) {
-        self.context
-            .assemble(&self.info.caps, &self.specs, &self.model)
+        let (req, mut status) = self
+            .context
+            .assemble(&self.info.caps, &self.specs, &self.model);
+        if self.memory.live && self.memory.over_budget {
+            status.warnings.push(OVER_BUDGET_WARNING.to_string());
+        }
+        (req, status)
     }
 
     /// Stream one response. Text and reasoning are shown as they arrive; tool calls are
@@ -721,7 +730,9 @@ impl Session {
             reason,
         })
         .await;
+        let summary = rec.summary.clone();
         self.latest_compaction = Some(rec);
+        self.episode_from_summary(&summary).await;
         true
     }
 

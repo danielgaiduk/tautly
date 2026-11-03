@@ -415,8 +415,9 @@ async fn resume_rebuilds_context_identically() {
     });
     run_turn_a(&mut live).await;
     live.turn_with("turn B").await;
-    live.stop().await;
+    // (Stopping adds the session's episode request.)
     let expected = live_mock.requests().last().unwrap().clone();
+    live.stop().await;
     let prefix = serde_json::to_string(&expected.system).unwrap();
     assert!(prefix.contains("ORIGINAL-AGENTS"), "{prefix}");
     assert!(prefix.contains("Use pnpm"), "the memory index: {prefix}");
@@ -651,8 +652,8 @@ async fn resume_replays_the_attempt_ledger_escape_hatch() {
     let mut run = start(fx.builder(config(Mode::Ask), &mock));
     run.turn_with("try").await;
     let id = run.engine.session_id().to_string();
-    run.stop().await;
     let results = tool_results(mock.requests().last().unwrap());
+    run.stop().await;
     assert!(results[1].1.contains("already tried"), "{results:?}");
 
     let mock = MockProvider::new(vec![tools_step(vec![missing("m3")]), text_step("end")]);
@@ -1048,6 +1049,8 @@ async fn rebuild_until_step_matches_live_prefix_at_that_step() {
     run.turn_with("first").await;
     run.turn_with("second").await;
     let path = run.engine.session_path().to_path_buf();
+    // Before the session-end episode request.
+    let live = mock.requests();
     run.stop().await;
     let steps: Vec<u32> = records_at(&path)
         .iter()
@@ -1056,7 +1059,6 @@ async fn rebuild_until_step_matches_live_prefix_at_that_step() {
             _ => None,
         })
         .collect();
-    let live = mock.requests();
     assert_eq!(steps.len(), live.len());
     // Each request was built from the context at the end of the step before it.
     for (step, req) in steps.iter().zip(&live) {

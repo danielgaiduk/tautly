@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tautly_context::MutationReason;
 use tautly_context::pinned::{PinSource, Pinned};
+use tautly_memory::MemoryChange;
 use tautly_provider::{ModelId, ProviderEvent};
 use tautly_session::{BlobRef, RelPath, SessionReader};
 use tautly_tools::{PersistedEffect, ToolMeta};
@@ -121,6 +122,15 @@ pub enum SessionRecord {
     },
     /// The memory index text the stable prefix carries from here on.
     MemoryIndexApplied { text: String },
+    /// A memory change shown to the user (`MemoryProposed`), logged before its event; it
+    /// stays pending (and is shown again on resume) until a `MemoryDecision` names it.
+    MemoryProposal {
+        id: String,
+        #[serde(with = "crate::protocol::memory_change_wire")]
+        change: MemoryChange,
+    },
+    /// The proposal `id` was approved (its change was written to the store) or rejected.
+    MemoryDecision { id: String, approved: bool },
     /// The session pins moved into the pinned block here.
     PinsFolded,
     /// The pins the session started with (configuration, AGENTS.md / CLAUDE.md sections),
@@ -287,6 +297,8 @@ const KNOWN_TYPES: &[&str] = &[
     "compaction",
     "gc_applied",
     "memory_index_applied",
+    "memory_proposal",
+    "memory_decision",
     "pins_folded",
     "start_pins",
     "approval_requested",
@@ -558,6 +570,17 @@ mod tests {
             },
             SessionRecord::MemoryIndexApplied {
                 text: String::new(),
+            },
+            SessionRecord::MemoryProposal {
+                id: "mem-1".into(),
+                change: MemoryChange {
+                    upsert: None,
+                    delete: vec!["old".into()],
+                },
+            },
+            SessionRecord::MemoryDecision {
+                id: "mem-1".into(),
+                approved: true,
             },
             SessionRecord::PinsFolded,
             SessionRecord::StartPins {

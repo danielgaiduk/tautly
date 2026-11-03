@@ -467,7 +467,7 @@ mod quota_wire {
 
 /// `#[serde(with = "...")]` for [`MemoryChange`], whose entry timestamps (`created`,
 /// `verified`) go on the wire as unix seconds; the entry's `stale` flag is not sent.
-mod memory_change_wire {
+pub(crate) mod memory_change_wire {
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
     use tautly_memory::{MemAnchor, MemoryChange, MemoryEntry, MemoryKind};
 

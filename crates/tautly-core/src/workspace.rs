@@ -102,10 +102,11 @@ impl Workspace {
                 match opened {
                     Ok(Ok(store)) => {
                         let skipped = store.skipped_count();
-                        if skipped > 0 {
+                        if let (true, Some((path, why))) = (skipped > 0, store.skipped().first()) {
                             warnings.push(format!(
-                                "{skipped} memory entr{} could not be loaded",
-                                if skipped == 1 { "y" } else { "ies" }
+                                "{skipped} memory entr{} could not be loaded (first: {}: {why})",
+                                if skipped == 1 { "y" } else { "ies" },
+                                path.display()
                             ));
                         }
                         Some(Arc::new(RwLock::new(store)))
