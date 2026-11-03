@@ -10,7 +10,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use tautly_session::{
     ConfineError, GitState, HeaderInit, Origin, RelPath, SessionReader, SessionWriter, git_head,
-    list_in, paths,
+    list_here_in, list_in, paths,
 };
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -439,4 +439,188 @@ fn git_head_read_from_files_for_branch_detached_packed_refs_and_worktree() {
     let plain = t.join("plain");
     fs::create_dir(&plain).unwrap();
     assert_eq!(git_head(&plain), None);
+}
+
+#[test]
+fn packed_refs_scan_skips_non_utf8_lines_and_refuses_oversize_files() {
+    let top = tempfile::tempdir().unwrap();
+    let repo = top.path().join("repo");
+    write(&repo.join(".git/HEAD"), "ref: refs/heads/packed\n");
+    let mut packed = b"# pack-refs with: peeled sorted \n".to_vec();
+    packed.extend_from_slice(SHA_A.as_bytes());
+    packed.extend_from_slice(b" refs/tags/caf\xe9\n");
+    packed.extend_from_slice(b"\xff\xfe not utf-8 at all\n");
+    packed.extend_from_slice(format!("{SHA_C} refs/heads/packed\n").as_bytes());
+    fs::write(repo.join(".git/packed-refs"), &packed).unwrap();
+    assert_eq!(git_head(&repo).as_deref(), Some(SHA_C));
+
+    // Too big to scan within the start-up budget: no head (it is optional), rather than a
+    // slow start. The branch line is at the very end.
+    let mut big = vec![b'#'; 9 * 1024 * 1024];
+    big.push(b'\n');
+    big.extend_from_slice(format!("{SHA_C} refs/heads/packed\n").as_bytes());
+    fs::write(repo.join(".git/packed-refs"), &big).unwrap();
+    assert_eq!(git_head(&repo), None);
+    // A loose ref is still read.
+    write(&repo.join(".git/refs/heads/packed"), &format!("{SHA_B}\n"));
+    assert_eq!(git_head(&repo).as_deref(), Some(SHA_B));
+}
+
+#[test]
+fn summaries_carry_root_label_origin_parent_and_continue_here_keeps_this_tree() {
+    let data = tempfile::tempdir().unwrap();
+    let top = tempfile::tempdir().unwrap();
+    let main = top.path().join("main");
+    let wt = top.path().join("wt");
+    fs::create_dir(&main).unwrap();
+    git(&main, &["init", "-q"]);
+    write(&main.join("a.txt"), "a\n");
+    git(&main, &["add", "-A"]);
+    git(&main, &["commit", "-q", "-m", "one"]);
+    git(
+        &main,
+        &["worktree", "add", "-q", "-b", "side", wt.to_str().unwrap()],
+    );
+
+    let a = SessionWriter::<Msg>::create_in(data.path(), &main, HeaderInit::default()).unwrap();
+    let b = SessionWriter::<Msg>::create_in(
+        data.path(),
+        &wt,
+        HeaderInit {
+            parent: Some((a.session_id().to_string(), 0)),
+            label: Some("side-try".into()),
+            origin: Origin::WhatIf,
+            ..HeaderInit::default()
+        },
+    )
+    .unwrap();
+
+    // The project's listing spans both worktrees, and says where each session ran.
+    let all = list_in(data.path(), &wt).unwrap();
+    assert_eq!(all.len(), 2);
+    let sb = all.iter().find(|s| s.id == b.session_id()).unwrap();
+    assert_eq!(sb.root, wt.canonicalize().unwrap());
+    assert_eq!(sb.label.as_deref(), Some("side-try"));
+    assert_eq!(sb.origin, Origin::WhatIf);
+    assert_eq!(sb.parent, Some((a.session_id().to_string(), 0)));
+    let sa = all.iter().find(|s| s.id == a.session_id()).unwrap();
+    assert_eq!(sa.root, main.canonicalize().unwrap());
+    assert_eq!((sa.label.clone(), sa.origin), (None, Origin::User));
+
+    // "Continue here" only offers this tree's sessions.
+    let here: Vec<_> = list_here_in(data.path(), &wt)
+        .unwrap()
+        .into_iter()
+        .map(|s| s.id)
+        .collect();
+    assert_eq!(here, [b.session_id().to_string()]);
+    let here: Vec<_> = list_here_in(data.path(), &main)
+        .unwrap()
+        .into_iter()
+        .map(|s| s.id)
+        .collect();
+    assert_eq!(here, [a.session_id().to_string()]);
+}
+
+#[test]
+fn t_never_goes_backwards_even_after_reopen() {
+    let (data, project) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let mut w = SessionWriter::<Msg>::create_in(data.path(), project.path(), HeaderInit::default())
+        .unwrap();
+    w.append(&msg("now")).unwrap();
+    w.checkpoint().unwrap();
+    let path = w.path().to_path_buf();
+    drop(w);
+    // A record written while the clock was far ahead (then stepped back).
+    let future = now_ms() + 3_600_000;
+    OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap()
+        .write_all(
+            format!("{{\"type\":\"record\",\"offset\":1,\"t\":{future},\"data\":{{\"text\":\"ahead\"}}}}\n")
+                .as_bytes(),
+        )
+        .unwrap();
+    let mut w = SessionWriter::<Msg>::reopen(&path).unwrap();
+    w.append(&msg("after")).unwrap();
+    w.append(&msg("again")).unwrap();
+    w.checkpoint().unwrap();
+    let ts: Vec<u64> = SessionReader::<Msg>::open(&path)
+        .unwrap()
+        .entries()
+        .map(|e| e.unwrap().t_ms)
+        .collect();
+    assert_eq!(ts.len(), 4);
+    assert!(ts.windows(2).all(|w| w[0] <= w[1]), "{ts:?}");
+    assert_eq!(ts[2], future);
+}
+
+#[test]
+fn fork_copy_keeps_records_verbatim_with_their_original_t() {
+    let data = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let mut parent =
+        SessionWriter::<Msg>::create_in(data.path(), project.path(), HeaderInit::default())
+            .unwrap();
+    parent.append(&msg("one")).unwrap();
+    parent.append(&msg("two")).unwrap();
+    parent.checkpoint().unwrap();
+    let parent_path = parent.path().to_path_buf();
+    drop(parent);
+    // A record from a newer version, with a field this one does not know.
+    let later = now_ms() + 60_000;
+    OpenOptions::new()
+        .append(true)
+        .open(&parent_path)
+        .unwrap()
+        .write_all(
+            format!(
+                "{{\"type\":\"record\",\"offset\":2,\"t\":{later},\
+                 \"data\":{{\"text\":\"three\",\"added_later\":[1,2]}}}}\n"
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+    let parent_entries: Vec<_> = SessionReader::<Msg>::open(&parent_path)
+        .unwrap()
+        .entries()
+        .map(Result::unwrap)
+        .collect();
+
+    let mut child =
+        SessionWriter::<Msg>::create_in(data.path(), project.path(), HeaderInit::default())
+            .unwrap();
+    assert_eq!(child.copy_from(&parent_path, 3).unwrap(), 3);
+    child.append(&msg("child")).unwrap();
+    child.checkpoint().unwrap();
+    let child_entries: Vec<_> = SessionReader::<Msg>::open(child.path())
+        .unwrap()
+        .entries()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(child_entries.len(), 4);
+    for (c, p) in child_entries.iter().zip(&parent_entries) {
+        assert_eq!((c.offset, c.t_ms, &c.rec), (p.offset, p.t_ms, &p.rec));
+    }
+    // After the copy the clock continues from the copied records.
+    assert!(child_entries[3].t_ms >= later);
+    let raw = fs::read_to_string(child.path()).unwrap();
+    assert!(
+        raw.lines()
+            .nth(3)
+            .unwrap()
+            .contains(r#""added_later":[1,2]"#),
+        "{raw}"
+    );
+
+    // Fewer than asked when the parent is shorter; a prefix when asked for less.
+    let mut short =
+        SessionWriter::<Msg>::create_in(data.path(), project.path(), HeaderInit::default())
+            .unwrap();
+    assert_eq!(short.copy_from(&parent_path, 2).unwrap(), 2);
+    let mut long =
+        SessionWriter::<Msg>::create_in(data.path(), project.path(), HeaderInit::default())
+            .unwrap();
+    assert_eq!(long.copy_from(&parent_path, 10).unwrap(), 3);
 }

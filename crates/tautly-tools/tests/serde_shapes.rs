@@ -288,6 +288,20 @@ fn persisted_paths_are_relative_to_the_root_and_resolve_under_another() {
 }
 
 #[test]
+fn an_effect_type_from_a_newer_version_reads_as_unknown_and_counts_as_a_write() {
+    let blobs = FakeBlobs::default();
+    let p: PersistedEffect =
+        serde_json::from_value(json!({"type": "renamed", "from": "a", "to": "b"})).unwrap();
+    assert_eq!(p, PersistedEffect::Unknown);
+    assert_eq!(p.path(), None);
+    assert_eq!(
+        p.to_applied(Path::new(ROOT), &mut |k| blobs.get(k))
+            .unwrap(),
+        AppliedEffect::Exec { may_write: true }
+    );
+}
+
+#[test]
 fn a_persisted_path_that_leaves_the_root_is_refused() {
     let blobs = FakeBlobs::default();
     for (bad, want) in [

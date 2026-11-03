@@ -5,7 +5,7 @@
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
-use tautly_session::{ConfineError, RelPath};
+use tautly_session::{BlobRef, ConfineError, RelPath};
 
 use crate::{AppliedEffect, LineRange, Shown, ToolMeta};
 
@@ -133,7 +133,7 @@ pub enum PersistedEffect {
         /// which reads it back after the edit; [`from_applied`](Self::from_applied) leaves
         /// it empty.
         #[serde(default)]
-        post_image_blob: Option<String>,
+        post_image_blob: Option<BlobRef>,
     },
     Deleted {
         path: RelPath,
@@ -143,6 +143,11 @@ pub enum PersistedEffect {
     Exec {
         may_write: bool,
     },
+    /// An effect type this version does not know (read back from a newer log; never
+    /// written). [`to_applied`](Self::to_applied) treats it as a command that may have
+    /// written, which forgets what was known about the files.
+    #[serde(other)]
+    Unknown,
 }
 
 impl PersistedEffect {
@@ -210,13 +215,13 @@ impl PersistedEffect {
         }))
     }
 
-    /// The root-relative path the effect names (none for `Exec`).
+    /// The root-relative path the effect names (none for `Exec` and `Unknown`).
     pub fn path(&self) -> Option<&RelPath> {
         match self {
             Self::Read { path, .. } | Self::Edited { path, .. } | Self::Deleted { path, .. } => {
                 Some(path)
             }
-            Self::Exec { .. } => None,
+            Self::Exec { .. } | Self::Unknown => None,
         }
     }
 
@@ -264,6 +269,7 @@ impl PersistedEffect {
             Self::Exec { may_write } => AppliedEffect::Exec {
                 may_write: *may_write,
             },
+            Self::Unknown => AppliedEffect::Exec { may_write: true },
         })
     }
 }

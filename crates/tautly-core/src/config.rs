@@ -15,7 +15,7 @@ use std::io::Read;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
-use serde::{Deserialize, Deserializer};
+use serde::{Deserialize, Deserializer, Serialize};
 use tautly_provider::{Catalog, ModelId};
 use tautly_sandbox::{Mode, Policy, PolicyConfig};
 use tautly_tools::MAX_PIN_BYTES;
@@ -51,7 +51,7 @@ pub enum ConfigError {
 }
 
 /// The effective configuration.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     #[serde(default = "default_model")]
@@ -154,7 +154,7 @@ impl Default for Config {
     }
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProvidersConfig {
     pub anthropic: Option<ProviderEntry>,
@@ -165,7 +165,7 @@ pub struct ProvidersConfig {
     pub compat: Vec<CompatEntry>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProviderEntry {
     pub base_url: Option<Url>,
@@ -174,7 +174,7 @@ pub struct ProviderEntry {
     pub api_key_env: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CompatEntry {
     /// Selects the endpoint in a model id: `compat:<name>/model`.
@@ -194,7 +194,7 @@ impl CompatEntry {
 }
 
 /// A spending limit; `None` = unlimited.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BudgetLimits {
     pub max_usd: Option<f64>,
@@ -202,7 +202,7 @@ pub struct BudgetLimits {
 }
 
 /// `[budget.turn]` and `[budget.session]`.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BudgetConfig {
     #[serde(default)]
@@ -211,7 +211,7 @@ pub struct BudgetConfig {
     pub session: BudgetLimits,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TelemetryConfig {
     /// Off unless set: nothing leaves the machine by default.
@@ -221,7 +221,7 @@ pub struct TelemetryConfig {
     pub endpoint: Option<Url>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RoutingConfig {
     /// Model for compaction summaries, memory work and `web_fetch` questions; the
@@ -281,13 +281,15 @@ pub struct LoadedConfig {
 
 impl Config {
     /// blake3 hex of the effective configuration, for the session header (spec 6.5 H3):
-    /// equal for equal configurations. It hashes the `Debug` form, which is deterministic
-    /// because every map in `Config` is ordered (`BTreeMap`, `Vec`); it holds no secrets
-    /// (keys come from the environment or the keychain, never from configuration).
+    /// equal for equal configurations, whatever order the files listed keys in. It hashes
+    /// the canonical JSON form: serialized through `serde_json::Value`, whose objects keep
+    /// their keys sorted. It holds no secrets (keys come from the environment or the
+    /// keychain, never from configuration).
     pub fn hash(&self) -> String {
-        blake3::hash(format!("{self:?}").as_bytes())
-            .to_hex()
-            .to_string()
+        let canonical = serde_json::to_value(self)
+            .and_then(|v| serde_json::to_vec(&v))
+            .unwrap_or_default();
+        blake3::hash(&canonical).to_hex().to_string()
     }
 
     /// Defaults, then `<config home>/config.toml`, then `<root>/.tautly/config.toml`, then

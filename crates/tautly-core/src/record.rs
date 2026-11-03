@@ -73,13 +73,14 @@ pub enum SessionRecord {
         meta: ToolMeta,
     },
     /// A file a tool changed, with its content before the change (none: it was created)
-    /// and after it (H7; none: deleted, or the content could not be captured). `turn` is
-    /// the step.
+    /// and after it (H7; none: deleted, or the content could not be captured), at provider
+    /// step `step` (not a user turn: map steps to user turns with the `Request` records).
     Edit {
         path: RelPath,
         pre_image: Option<BlobRef>,
         post_image_blob: Option<BlobRef>,
-        turn: u32,
+        #[serde(alias = "turn")]
+        step: u32,
     },
     /// An undo of user turn `turn` (H7, written by Task 26): each file's content just
     /// before the undo (`from_blob`; none: it did not exist) and what it was set to (`to`;
@@ -159,7 +160,13 @@ pub struct BlockHashes {
 pub struct UndoneFile {
     pub path: RelPath,
     pub from_blob: Option<BlobRef>,
+    /// The file's mode before the undo (none: it did not exist).
+    #[serde(default)]
+    pub from_mode: Option<u32>,
     pub to: Option<BlobRef>,
+    /// The mode it was set to (none: deleted).
+    #[serde(default)]
+    pub to_mode: Option<u32>,
 }
 
 /// What an [`SessionRecord::ApprovalRequested`] asks about.
@@ -169,6 +176,9 @@ pub enum ApprovalKind {
     Tool,
     McpServer,
     Memory,
+    /// A kind this version does not know (read only).
+    #[serde(other)]
+    Unknown,
 }
 
 /// The `type` of every record this version writes.
@@ -273,6 +283,66 @@ mod tests {
     }
 
     #[test]
+    fn kinds_reasons_and_effects_from_a_newer_version_read_as_unknown() {
+        let approval: SessionRecord = serde_json::from_str(
+            r#"{"type":"approval_requested","data":{"request_id":"r","kind":"from_the_future",
+                "call_id":null,"reason":"x"}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            approval,
+            SessionRecord::ApprovalRequested {
+                kind: ApprovalKind::Unknown,
+                ..
+            }
+        ));
+        let gc: SessionRecord = serde_json::from_str(
+            r#"{"type":"gc_applied","data":{"elided":[],"reason":"from_the_future",
+                "tokens_freed":0,"forgotten_paths":[]}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            gc,
+            SessionRecord::GcApplied {
+                reason: MutationReason::Unknown,
+                ..
+            }
+        ));
+        let result: SessionRecord = serde_json::from_str(&format!(
+            r#"{{"type":"tool_result","data":{{"id":"c","result_blob":"{}","is_error":false,
+                "effects":[{{"type":"from_the_future","x":1}},{{"type":"exec","may_write":false}}],
+                "meta":{{"exit_code":null,"error_kind":null}}}}}}"#,
+            "a".repeat(64)
+        ))
+        .unwrap();
+        let SessionRecord::ToolResult { effects, .. } = result else {
+            panic!("{result:?}")
+        };
+        assert_eq!(
+            effects,
+            [
+                PersistedEffect::Unknown,
+                PersistedEffect::Exec { may_write: false }
+            ]
+        );
+    }
+
+    #[test]
+    fn an_edit_written_with_turn_reads_as_its_step() {
+        let rec: SessionRecord = serde_json::from_str(
+            r#"{"type":"edit","data":{"path":"a.txt","pre_image":null,"post_image_blob":null,
+                "turn":4}}"#,
+        )
+        .unwrap();
+        assert!(
+            matches!(rec, SessionRecord::Edit { step: 4, .. }),
+            "{rec:?}"
+        );
+        let v = serde_json::to_value(&rec).unwrap();
+        assert_eq!(v["data"]["step"], 4);
+    }
+
+    #[test]
     fn records_round_trip_and_unknown_types_are_tolerated() {
         let recs = vec![
             SessionRecord::Command(Command::SendMessage { text: "hi".into() }),
@@ -339,14 +409,16 @@ mod tests {
                 path: rel("a"),
                 pre_image: None,
                 post_image_blob: Some(blob.clone()),
-                turn: 1,
+                step: 1,
             },
             SessionRecord::Undone {
                 turn: 1,
                 files: vec![UndoneFile {
                     path: rel("a"),
                     from_blob: Some(blob.clone()),
+                    from_mode: Some(0o755),
                     to: None,
+                    to_mode: None,
                 }],
                 backup_ref: Some("refs/tautly/checkpoints/s/undo-1".into()),
             },

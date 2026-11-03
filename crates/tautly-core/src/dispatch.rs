@@ -506,28 +506,47 @@ fn effect_path(effect: &AppliedEffect) -> Option<&Path> {
 }
 
 /// What an edit wrote, read back from disk: only when it still hashes to `post_hash`, so
-/// the blob is exactly the tool's output and never a later change by someone else.
+/// the blob is exactly the tool's output and never a later change by someone else. Only a
+/// regular file is read, never through a symlink, never blocking (a FIFO swapped in), and
+/// never more than its size at open plus one byte.
 fn post_image(path: &Path, post_hash: &blake3::Hash) -> Option<Vec<u8>> {
-    let bytes = std::fs::read(path).ok()?;
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .ok()?;
+    let meta = file.metadata().ok()?;
+    if !meta.is_file() {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(usize::try_from(meta.len()).ok()?);
+    file.take(meta.len().saturating_add(1))
+        .read_to_end(&mut bytes)
+        .ok()?;
     (blake3::hash(&bytes) == *post_hash).then_some(bytes)
 }
 
-/// The `Edit` record of a changed file: None for reads and commands, `Some(None)` when its
-/// pre-image reference is unusable.
-fn edit_record(e: &PersistedEffect, turn: u32) -> Option<Option<SessionRecord>> {
+/// The `Edit` record of a changed file at step `step`: None for reads, commands and
+/// effects this version does not know, `Some(None)` when its pre-image reference is
+/// unusable.
+fn edit_record(e: &PersistedEffect, step: u32) -> Option<Option<SessionRecord>> {
     let (path, pre, post) = match e {
         PersistedEffect::Edited {
             path,
             pre_image_blob,
             post_image_blob,
             ..
-        } => (path, pre_image_blob.as_deref(), post_image_blob.as_deref()),
+        } => (path, pre_image_blob.as_deref(), post_image_blob.clone()),
         PersistedEffect::Deleted {
             path,
             pre_image_blob,
             ..
         } => (path, Some(pre_image_blob.as_str()), None),
-        PersistedEffect::Read { .. } | PersistedEffect::Exec { .. } => return None,
+        PersistedEffect::Read { .. } | PersistedEffect::Exec { .. } | PersistedEffect::Unknown => {
+            return None;
+        }
     };
     let Ok(pre_image) = pre.map(BlobRef::parse).transpose() else {
         return Some(None);
@@ -535,8 +554,8 @@ fn edit_record(e: &PersistedEffect, turn: u32) -> Option<Option<SessionRecord>> 
     Some(Some(SessionRecord::Edit {
         path: path.clone(),
         pre_image,
-        post_image_blob: post.and_then(|b| BlobRef::parse(b).ok()),
-        turn,
+        post_image_blob: post,
+        step,
     }))
 }
 
@@ -571,7 +590,7 @@ fn persist_result(
         ) = (&mut persisted, e)
             && let Some(bytes) = post_image(path, post_hash)
         {
-            *post_image_blob = Some(log.blob(&bytes)?.as_str().to_string());
+            *post_image_blob = Some(log.blob(&bytes)?);
         }
         match edit_record(&persisted, turn) {
             Some(Some(rec)) => edits.push(rec),
@@ -594,4 +613,45 @@ fn persist_result(
         untracked,
         bad_pre_images,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    use std::sync::mpsc;
+
+    use super::*;
+
+    /// `post_image` on another thread, given at most 2 s.
+    fn read_back(path: &Path, hash: blake3::Hash) -> Result<Option<Vec<u8>>, &'static str> {
+        let (tx, rx) = mpsc::channel();
+        let path = path.to_path_buf();
+        std::thread::spawn(move || {
+            let _ = tx.send(post_image(&path, &hash));
+        });
+        rx.recv_timeout(Duration::from_secs(2))
+            .map_err(|_| "the read-back blocked")
+    }
+
+    #[test]
+    fn post_images_are_read_only_from_regular_files_that_match() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.txt");
+        std::fs::write(&file, b"written").unwrap();
+        let hash = blake3::hash(b"written");
+        assert_eq!(read_back(&file, hash), Ok(Some(b"written".to_vec())));
+        // Changed since: not the tool's output.
+        assert_eq!(read_back(&file, blake3::hash(b"other")), Ok(None));
+        // A symlink swapped in, even to the right content, is not followed.
+        let link = dir.path().join("link.txt");
+        std::os::unix::fs::symlink(&file, &link).unwrap();
+        assert_eq!(read_back(&link, hash), Ok(None));
+        // A FIFO swapped in must neither block nor be read.
+        let fifo = dir.path().join("fifo");
+        let c = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: plain syscall with a valid NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        assert_eq!(read_back(&fifo, hash), Ok(None));
+    }
 }

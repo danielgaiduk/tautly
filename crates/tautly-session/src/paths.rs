@@ -49,8 +49,18 @@ pub fn project_hash(root: &Path) -> String {
 /// common directory when `root` is in a git work tree, so every worktree of a repository
 /// has the same id; else [`project_hash`] of the root. Keys session logs, blobs and
 /// memory episodes. Read from the git files; never runs git.
+///
+/// The git directory is the nearest ancestor's `.git`, as git finds it (without
+/// `GIT_CEILING_DIRECTORIES`): a directory that is not itself a repository but lies inside
+/// one (for example under a home directory kept in git) shares that repository's id.
+/// Listings span such directories; [`list_here`](crate::list_here) keeps one root's.
 pub fn project_id(root: &Path) -> String {
-    match crate::git::dirs(root) {
+    project_id_with(root, crate::git::dirs(root).as_ref())
+}
+
+/// [`project_id`] with the git directories already resolved.
+pub(crate) fn project_id_with(root: &Path, dirs: Option<&crate::git::GitDirs>) -> String {
+    match dirs {
         Some(dirs) => path_hash(&dirs.common_dir),
         None => project_hash(root),
     }
@@ -67,7 +77,12 @@ pub(crate) fn canonical_root(root: &Path) -> PathBuf {
 
 /// `<data_home>/sessions/<project_id>`.
 pub(crate) fn project_dir(data_home: &Path, root: &Path) -> PathBuf {
-    data_home.join("sessions").join(project_id(root))
+    sessions_dir(data_home, &project_id(root))
+}
+
+/// `<data_home>/sessions/<project>`.
+pub(crate) fn sessions_dir(data_home: &Path, project: &str) -> PathBuf {
+    data_home.join("sessions").join(project)
 }
 
 /// `create_dir_all` with mode 0700 for every directory it creates: logs and

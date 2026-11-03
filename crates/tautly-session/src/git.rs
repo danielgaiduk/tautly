@@ -6,13 +6,14 @@
 //! so a hostile repository cannot make this read outside its git directories or read much.
 
 use std::fs::File;
-use std::io::{BufRead, BufReader, Read};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 /// Largest `.git` file, `HEAD`, `commondir` or loose ref read.
 const SMALL_FILE_MAX: u64 = 4096;
-/// `packed-refs` is scanned up to this many bytes.
-const PACKED_REFS_MAX: u64 = 64 * 1024 * 1024;
+/// Largest `packed-refs` scanned. A scan costs about 1 ms per MB; this keeps a packed-only
+/// branch well inside the 50 ms cold-start budget. Bigger files give no head.
+const PACKED_REFS_MAX: u64 = 8 * 1024 * 1024;
 /// Symbolic refs followed before giving up (git's own limit is 5).
 const MAX_SYMREF_DEPTH: usize = 5;
 
@@ -56,8 +57,16 @@ pub(crate) fn dirs(root: &Path) -> Option<GitDirs> {
 /// The commit `HEAD` names in the work tree holding `root`: a detached hash, or the hash
 /// of the branch it points at (loose ref or `packed-refs`). None outside git, on an unborn
 /// branch, or when the files cannot be read. Never runs git.
+///
+/// A reftable repository (`HEAD` is `ref: refs/heads/.invalid`, the refs live in
+/// `reftable/`) gives None: the head is optional in the header, and the session-start
+/// checkpoint, which runs git, records the authoritative one.
 pub fn git_head(root: &Path) -> Option<String> {
-    let dirs = dirs(root)?;
+    head(&dirs(root)?)
+}
+
+/// [`git_head`] with the git directories already resolved.
+pub(crate) fn head(dirs: &GitDirs) -> Option<String> {
     let mut value = read_small(&dirs.git_dir.join("HEAD"))?;
     for _ in 0..MAX_SYMREF_DEPTH {
         let text = value.trim();
@@ -68,7 +77,7 @@ pub fn git_head(root: &Path) -> Option<String> {
         if !is_safe_ref_name(name) {
             return None;
         }
-        value = match loose_ref(&dirs, name) {
+        value = match loose_ref(dirs, name) {
             Some(v) => v,
             None => return packed_ref(&dirs.common_dir, name),
         };
@@ -83,20 +92,25 @@ fn loose_ref(dirs: &GitDirs, name: &str) -> Option<String> {
         .find_map(|dir| read_small(&dir.join(name)))
 }
 
-/// `name` in `<common>/packed-refs` (`<hash> <name>` lines; `#` and `^` lines skipped).
+/// `name` in `<common>/packed-refs` (`<hash> <name>` lines; `#` and `^` lines, and lines
+/// that are not UTF-8, skipped). A file over [`PACKED_REFS_MAX`] is not read at all: the
+/// head is optional, and scanning it would break the start-up budget.
 fn packed_ref(common_dir: &Path, name: &str) -> Option<String> {
     let file = File::open(common_dir.join("packed-refs")).ok()?;
-    let reader = BufReader::new(file.take(PACKED_REFS_MAX));
-    for line in reader.lines() {
-        let line = line.ok()?;
-        if let Some((id, refname)) = line.split_once(' ')
-            && refname.trim_end() == name
-            && is_object_id(id)
-        {
-            return Some(id.to_string());
-        }
+    let meta = file.metadata().ok()?;
+    if !meta.is_file() || meta.len() > PACKED_REFS_MAX {
+        return None;
     }
-    None
+    let mut bytes = Vec::with_capacity(usize::try_from(meta.len()).unwrap_or(0));
+    file.take(PACKED_REFS_MAX).read_to_end(&mut bytes).ok()?;
+    let want = name.as_bytes();
+    bytes.split(|&b| b == b'\n').find_map(|line| {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        let space = line.iter().position(|&b| b == b' ')?;
+        let (id, refname) = (&line[..space], &line[space + 1..]);
+        let id = std::str::from_utf8(id).ok()?;
+        (refname == want && is_object_id(id)).then(|| id.to_string())
+    })
 }
 
 /// A ref name that is safe to join to a git directory: `refs/...`, with no empty, `.` or

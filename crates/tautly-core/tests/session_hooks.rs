@@ -401,10 +401,7 @@ async fn edit_records_carry_post_image_equal_to_disk() {
         }
         _ => None,
     });
-    assert_eq!(
-        post_in_effect.as_deref(),
-        edits[2].2.as_ref().map(BlobRef::as_str)
-    );
+    assert_eq!(post_in_effect.as_ref(), edits[2].2.as_ref());
 }
 
 fn fx_read(fx: &Fx, rel: &str) -> String {
@@ -522,6 +519,76 @@ async fn config_hash_stable_for_identical_config() {
     assert_eq!(a.model.as_deref(), Some(MODEL));
     assert_eq!(a.project, paths::project_id(&fx.root()));
     assert!(!a.tautly_version.is_empty());
+}
+
+#[test]
+fn config_hash_is_a_canonical_serialization_independent_of_key_order() {
+    let one: Config = toml::from_str(
+        r#"
+model = "mock/test"
+max_turns = 40
+pins = ["first", "second"]
+[permissions]
+mode = "auto-edit"
+allow = ["bash(cargo test*)"]
+[budget.session]
+max_usd = 2.5
+[catalog_overrides.models."b/two"]
+context_window = 1000
+max_output = 10
+parallel_tools = false
+reasoning = "none"
+cache = "none"
+images = false
+edit_format = "str_replace"
+[catalog_overrides.models."a/one"]
+context_window = 2000
+max_output = 20
+parallel_tools = true
+reasoning = "none"
+cache = "none"
+images = false
+edit_format = "str_replace"
+"#,
+    )
+    .unwrap();
+    let two: Config = toml::from_str(
+        r#"
+pins = ["first", "second"]
+max_turns = 40
+model = "mock/test"
+[catalog_overrides.models."a/one"]
+edit_format = "str_replace"
+images = false
+cache = "none"
+reasoning = "none"
+parallel_tools = true
+max_output = 20
+context_window = 2000
+[catalog_overrides.models."b/two"]
+edit_format = "str_replace"
+images = false
+cache = "none"
+reasoning = "none"
+parallel_tools = false
+max_output = 10
+context_window = 1000
+[budget.session]
+max_usd = 2.5
+[permissions]
+allow = ["bash(cargo test*)"]
+mode = "auto-edit"
+"#,
+    )
+    .unwrap();
+    assert_eq!(one.hash(), two.hash());
+    // It is the hash of the canonical JSON (object keys sorted), not of a Debug form.
+    let canonical = serde_json::to_vec(&serde_json::to_value(&one).unwrap()).unwrap();
+    assert_eq!(one.hash(), hex(&canonical));
+    // Pin order matters (pins are rendered in order).
+    let mut swapped = one.clone();
+    swapped.pins.reverse();
+    assert_ne!(swapped.hash(), one.hash());
 }
 
 #[test]
