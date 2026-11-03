@@ -499,9 +499,83 @@ async fn session_diff_turn_scope_uses_user_turns() {
     assert!(unified.contains("-A\n+AA\n"), "{unified}");
 
     match run.diff(Some(3)).await {
-        Event::Error { message, .. } => assert!(message.contains("no turn 3"), "{message}"),
+        Event::Error { message, hint, .. } => {
+            assert!(message.contains("no turn 3"), "{message}");
+            assert_eq!(hint.as_deref(), Some("this session has 2 user turns"));
+        }
         other => panic!("{other:?}"),
     }
+}
+
+/// The answer to `Diff` waits for room in a full event channel instead of being dropped.
+#[tokio::test]
+async fn session_diff_reply_waits_for_a_full_event_channel() {
+    let fx = Fx::new();
+    let mock = MockProvider::new(vec![
+        tools_step(vec![write("w1", "a.txt", "a\n")]),
+        text_step("done"),
+    ]);
+    let mut run = fx.start(config(Mode::Yolo, "str_replace"), &mock, false);
+    run.say("write").await;
+    run.turn().await;
+    // Fill the channel (capacity 256) with warnings nobody reads.
+    for i in 0..300 {
+        run.send(Command::Approve {
+            request_id: format!("nope-{i}"),
+        })
+        .await;
+    }
+    run.send(Command::Diff { turn: None }).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let answer = tokio::time::timeout(
+        Duration::from_secs(10),
+        run.until(|e| matches!(e, Event::SessionDiff { .. } | Event::Error { .. })),
+    )
+    .await
+    .expect("the diff reply was dropped");
+    let (_, files, _, _) = session_diff(answer.last().cloned().unwrap());
+    assert_eq!(files, vec![file("a.txt", DiffStatus::Added, 1, 0)]);
+}
+
+/// Headless `ask`: a failing call is answered with its error, a passing one is denied;
+/// neither waits for an approval.
+#[tokio::test]
+async fn headless_ask_answers_failing_previews_and_denies_the_rest() {
+    let fx = Fx::new();
+    fx.write("a.txt", "alpha\n");
+    let mock = MockProvider::new(vec![
+        tools_step(vec![read("r1", "a.txt")]),
+        tools_step(vec![replace("e1", "a.txt", "no such text", "x")]),
+        tools_step(vec![replace("e2", "a.txt", "alpha", "beta")]),
+        text_step("done"),
+    ]);
+    let mut run = fx.start(config(Mode::Ask, "str_replace"), &mock, false);
+    run.say("edit").await;
+    let events = run.turn().await;
+    assert_eq!(reason(&events), FinishReason::Completed);
+    assert_eq!(approvals(&events), 0);
+    let f = finished(&events);
+    let failing = f.iter().find(|f| f.0 == "e1").unwrap();
+    assert_eq!(failing.2.as_deref(), Some("not_found"), "{f:?}");
+    let denied = events
+        .iter()
+        .find_map(|e| match e {
+            Event::ToolFinished {
+                call_id,
+                output,
+                is_error,
+                diff,
+                ..
+            } if call_id == "e2" => Some((output.clone(), *is_error, diff.clone())),
+            _ => None,
+        })
+        .unwrap();
+    assert!(
+        denied.1 && denied.0.contains("nobody can approve"),
+        "{denied:?}"
+    );
+    assert!(denied.2.is_none());
+    assert_eq!(fx.slurp("a.txt"), "alpha\n");
 }
 
 #[tokio::test]

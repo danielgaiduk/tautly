@@ -444,11 +444,9 @@ fn identical_content_has_no_diff_and_a_missing_newline_is_marked() {
 }
 
 #[tokio::test]
-async fn a_large_file_is_diffed_off_the_async_workers_with_the_same_result() {
+async fn a_large_file_previews_the_diff_it_applies() {
     let e = env(EditFormat::StrReplace);
-    // Over 1 MB, so the diff runs on the blocking pool.
     let big = lines_of(100_000, "row");
-    assert!(big.len() > 1024 * 1024);
     e.put("big.txt", big.as_bytes()).await;
     e.read("big.txt").await;
     let args = json!({"path": "big.txt", "old_text": "row line 50000\n", "new_text": "changed\n"});
@@ -464,4 +462,196 @@ async fn a_large_file_is_diffed_off_the_async_workers_with_the_same_result() {
     let r = e.run_approved(&EditTool, args, &p).await;
     assert!(!r.is_error, "{}", r.output);
     assert_eq!(r.applied_diff, Some(p.diff));
+}
+
+/// An approval covers the files the preview read. A symlink that now points elsewhere
+/// names another file, so the approved diff would not be the applied one.
+#[tokio::test]
+async fn an_approved_call_through_a_retargeted_symlink_is_refused() {
+    let e = env(EditFormat::StrReplace);
+    e.put("t1.txt", b"one\n").await;
+    e.put("t2.txt", b"one\n").await;
+    let link = e.dir.path().join("link.txt");
+    std::os::unix::fs::symlink("t1.txt", &link).unwrap();
+    // Fixture setup: the sandbox follows links, and the test must replace the link itself.
+    #[allow(clippy::disallowed_methods)]
+    let retarget = |to: &str| {
+        std::fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(to, &link).unwrap();
+    };
+
+    let w = json!({"path": "link.txt", "content": "mine\n"});
+    let p = e.preview(&WriteTool, &w).await.unwrap();
+    retarget("t2.txt");
+    let r = e.run_approved(&WriteTool, w, &p).await;
+    assert_eq!(
+        r.meta.error_kind,
+        Some("changed_after_approval"),
+        "{}",
+        r.output
+    );
+    assert_eq!(e.slurp("t1.txt").await, b"one\n");
+    assert_eq!(e.slurp("t2.txt").await, b"one\n");
+
+    // An edit, with both targets read so the stale guard alone would let it through.
+    retarget("t1.txt");
+    e.read("t1.txt").await;
+    e.read("t2.txt").await;
+    let args = json!({"path": "link.txt", "old_text": "one", "new_text": "ONE"});
+    let p = e.preview(&EditTool, &args).await.unwrap();
+    retarget("t2.txt");
+    let r = e.run_approved(&EditTool, args, &p).await;
+    assert_eq!(
+        r.meta.error_kind,
+        Some("changed_after_approval"),
+        "{}",
+        r.output
+    );
+    assert_eq!(e.slurp("t2.txt").await, b"one\n");
+}
+
+#[tokio::test]
+async fn an_approved_patch_with_one_changed_file_writes_nothing() {
+    let e = env(EditFormat::Patch);
+    e.put("a.txt", b"a\n").await;
+    e.put("b.txt", b"b\n").await;
+    e.read("a.txt").await;
+    e.read("b.txt").await;
+    let patch = "*** Begin Patch\n*** Update File: a.txt\n@@\n-a\n+A\n\
+                 *** Update File: b.txt\n@@\n-b\n+B\n*** Add File: c.txt\n+c\n*** End Patch";
+    let args = json!({ "patch": patch });
+    let p = e.preview(&EditTool, &args).await.unwrap();
+    e.put("b.txt", b"b\nexternal\n").await;
+    let r = e.run_approved(&EditTool, args, &p).await;
+    assert_eq!(
+        r.meta.error_kind,
+        Some("changed_after_approval"),
+        "{}",
+        r.output
+    );
+    assert!(r.output.contains("b.txt"), "{}", r.output);
+    assert_eq!(e.slurp("a.txt").await, b"a\n");
+    assert_eq!(e.slurp("b.txt").await, b"b\nexternal\n");
+    assert!(!e.dir.path().join("c.txt").exists());
+}
+
+#[tokio::test]
+async fn an_approved_write_over_a_changed_file_is_refused() {
+    let e = env(EditFormat::StrReplace);
+    e.put("a.txt", b"old\n").await;
+    let w = json!({"path": "a.txt", "content": "mine\n"});
+    let p = e.preview(&WriteTool, &w).await.unwrap();
+    assert!(
+        p.diff.unified.contains("-old\n+mine\n"),
+        "{}",
+        p.diff.unified
+    );
+    e.put("a.txt", b"theirs\n").await;
+    let r = e.run_approved(&WriteTool, w, &p).await;
+    assert_eq!(r.meta.error_kind, Some("changed_after_approval"));
+    assert!(
+        r.output.starts_with("stale: file changed after approval"),
+        "{}",
+        r.output
+    );
+    assert_eq!(e.slurp("a.txt").await, b"theirs\n");
+}
+
+#[test]
+fn creating_or_deleting_an_empty_file_shows_the_headers() {
+    let d = unified_diff(
+        &[
+            (PathBuf::from("new.txt"), None, Some(b"".as_slice())),
+            (PathBuf::from("gone.txt"), Some(b"".as_slice()), None),
+        ],
+        PREVIEW_MAX_LINES,
+        PREVIEW_MAX_BYTES,
+    );
+    assert_eq!(
+        d.unified,
+        "--- /dev/null\n+++ b/new.txt\n--- a/gone.txt\n+++ /dev/null\n"
+    );
+    assert_eq!(d.lines, 4);
+}
+
+/// A diff that takes too long (Myers is quadratic on a full rewrite) stops at the time
+/// budget and shows a summary with the line counts instead.
+#[test]
+fn a_slow_diff_falls_back_to_a_summary() {
+    let old = lines_of(60_000, "old");
+    let new = lines_of(60_000, "new");
+    let started = std::time::Instant::now();
+    let d = unified_diff(
+        &[
+            (
+                PathBuf::from("big.txt"),
+                Some(old.as_bytes()),
+                Some(new.as_bytes()),
+            ),
+            (
+                PathBuf::from("small.txt"),
+                Some(b"a\n".as_slice()),
+                Some(b"b\n".as_slice()),
+            ),
+        ],
+        PREVIEW_MAX_LINES,
+        PREVIEW_MAX_BYTES,
+    );
+    let elapsed = started.elapsed();
+    assert!(elapsed < std::time::Duration::from_secs(5), "{elapsed:?}");
+    assert!(!d.truncated, "{d:?}");
+    assert!(
+        d.unified.starts_with(
+            "File big.txt: diff too large or slow to show, summary only: +60000 -60000 lines\n"
+        ),
+        "{}",
+        &d.unified[..d.unified.len().min(300)]
+    );
+}
+
+/// The diff of a large change runs on the blocking pool: a current-thread runtime keeps
+/// running its other tasks meanwhile.
+#[test]
+fn a_large_diff_does_not_block_the_async_workers() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::time::{Duration, Instant};
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let e = env(EditFormat::StrReplace);
+        // About 120 KB of content, fully rewritten: slow to diff.
+        let old = lines_of(5_000, "old");
+        let new = lines_of(5_000, "new");
+        e.put("a.txt", old.as_bytes()).await;
+        let ticks = Arc::new(AtomicU32::new(0));
+        let counter = Arc::clone(&ticks);
+        let ticker = tokio::spawn(async move {
+            let mut every = tokio::time::interval(Duration::from_millis(5));
+            loop {
+                every.tick().await;
+                counter.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+        tokio::task::yield_now().await;
+        let started = Instant::now();
+        let before = ticks.load(Ordering::Relaxed);
+        let p = e
+            .preview(&WriteTool, &json!({"path": "a.txt", "content": new}))
+            .await
+            .unwrap();
+        let elapsed = started.elapsed();
+        let during = ticks.load(Ordering::Relaxed) - before;
+        ticker.abort();
+        assert!(p.diff.lines > 0);
+        // An inline diff would let no tick through while it runs.
+        let expected = (elapsed.as_millis() / 5) as u32;
+        assert!(
+            elapsed < Duration::from_millis(50) || during * 4 >= expected,
+            "{during} ticks in {elapsed:?}"
+        );
+    });
 }

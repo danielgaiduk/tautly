@@ -451,6 +451,7 @@ pub struct ToolCx {
     turn: u32,
     groups: ProcessGroups,
     approved_bases: Option<Vec<(PathBuf, Option<blake3::Hash>)>>,
+    preview_diff: bool,
 }
 
 impl std::fmt::Debug for ToolCx {
@@ -478,6 +479,7 @@ impl ToolCx {
             turn: 0,
             groups: ProcessGroups::default(),
             approved_bases: None,
+            preview_diff: true,
         }
     }
 
@@ -527,6 +529,13 @@ impl ToolCx {
         self
     }
 
+    /// [`Tool::preview`] skips computing the diff (left empty) and only says whether the
+    /// call would succeed, with its bases: nobody will see the diff (headless `ask`).
+    pub fn without_preview_diff(mut self) -> Self {
+        self.preview_diff = false;
+        self
+    }
+
     pub fn edit_format(&self) -> EditFormat {
         self.edit_format
     }
@@ -565,6 +574,10 @@ impl ToolCx {
 
     pub fn approved_bases(&self) -> Option<&[(PathBuf, Option<blake3::Hash>)]> {
         self.approved_bases.as_deref()
+    }
+
+    pub fn preview_diff(&self) -> bool {
+        self.preview_diff
     }
 }
 

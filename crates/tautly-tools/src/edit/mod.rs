@@ -22,7 +22,10 @@ use self::hashline::{Anchor, HashlineError, HashlineOp};
 use self::patch::{Kind, PatchError, PatchOp};
 use self::str_replace::MatchError;
 use self::tolerant::RepairStage;
-use crate::preview::{FileChange, Preview, check_approved, display_diff, shown_path};
+use crate::preview::{
+    Base, DiffPreview, FileChange, Preview, check_approved, display_diff, explain_failure,
+    shown_path,
+};
 use crate::spec::{parse_args, tool_spec};
 use crate::{AppliedEffect, Tool, ToolCx, ToolError, ToolResult};
 
@@ -402,7 +405,7 @@ impl Prepared {
     }
 
     /// The hash of each file as the pipeline read it (None: it does not exist).
-    fn bases(&self) -> Vec<(PathBuf, Option<blake3::Hash>)> {
+    fn bases(&self) -> Vec<Base> {
         match self {
             Prepared::One { file, .. } => {
                 vec![(file.full.clone(), Some(blake3::hash(&file.original)))]
@@ -510,11 +513,12 @@ impl Tool for EditTool {
     }
 
     async fn run(&self, args: Value, sb: &dyn Sandbox, cx: &ToolCx) -> ToolResult {
-        if let Err(r) = check_approved(sb, cx).await {
-            return r;
-        }
-        match prepare(&args, sb, cx).await {
-            Ok(p) => commit(p, sb, cx).await,
+        let p = match prepare(&args, sb, cx).await {
+            Ok(p) => p,
+            Err(r) => return explain_failure(sb, cx, r).await,
+        };
+        match check_approved(sb, cx, &p.bases()) {
+            Ok(()) => commit(p, sb, cx).await,
             Err(r) => r,
         }
     }
@@ -529,7 +533,11 @@ impl Tool for EditTool {
             Ok(p) => p,
             Err(r) => return Some(Err(r)),
         };
-        let diff = display_diff(&p.sides(sb)).await;
+        let diff = if cx.preview_diff() {
+            display_diff(&p.sides(sb)).await
+        } else {
+            DiffPreview::default()
+        };
         Some(Ok(Preview {
             diff,
             bases: p.bases(),

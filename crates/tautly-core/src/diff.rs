@@ -4,11 +4,10 @@
 
 use std::collections::HashSet;
 use std::path::PathBuf;
-use std::sync::Arc;
 
 use tautly_sandbox::{Sandbox, SandboxError};
 use tautly_session::{BlobRef, SessionReader};
-use tautly_tools::preview::{cap, file_diff};
+use tautly_tools::preview::diff_owned;
 
 use crate::protocol::{Command, DiffFile, DiffStatus, ErrorKind, Event};
 use crate::record::SessionRecord;
@@ -28,31 +27,48 @@ pub enum DiffError {
     Disk { path: String, source: SandboxError },
     #[error("there is no turn {turn}; this session has {turns}")]
     NoSuchTurn { turn: u32, turns: u32 },
+    #[error("the diff failed: {0}")]
+    Crashed(String),
 }
 
-/// The [`Event::SessionDiff`] for the whole session (`turn` None) or user turn `turn`
-/// (1-based: the turn of the n-th `SendMessage`): for every file the session's tools
-/// edited, created or deleted in that scope, the earliest pre-image in scope against the
-/// current disk content. Files that end as they started (including one created and then
-/// deleted) are left out; the rest come sorted by path. Capped at `max_lines` lines (and
-/// [`SESSION_DIFF_MAX_BYTES`]).
+/// A changed file and its earliest pre-image in scope (None: the scope created it).
+pub type PreImage = (PathBuf, Option<Vec<u8>>);
+
+/// What [`session_diff`] starts from, for the whole session (`turn` None) or user turn
+/// `turn` (1-based: the turn of the n-th `SendMessage`): every file the session's tools
+/// edited, created or deleted in that scope, with its earliest pre-image in scope (from
+/// the blob store), in log order.
 ///
-/// Reads the log and the blob store with blocking I/O: call it off the async workers.
-pub async fn session_diff(
+/// Blocking I/O (the log and the blob store): call it off the async workers.
+pub fn pre_images(
     reader: &SessionReader<SessionRecord>,
-    sb: &dyn Sandbox,
     turn: Option<u32>,
-    max_lines: u32,
-) -> Result<Event, DiffError> {
+) -> Result<Vec<PreImage>, DiffError> {
     let (first, turns) = earliest_pre_images(reader, turn)?;
     if let Some(t) = turn {
         if t == 0 || t > turns {
             return Err(DiffError::NoSuchTurn { turn: t, turns });
         }
     }
-    let mut sides = Vec::with_capacity(first.len());
-    for (path, pre) in first {
-        let before = pre.map(|b| reader.read_blob(&b)).transpose()?;
+    first
+        .into_iter()
+        .map(|(path, pre)| Ok((path, pre.map(|b| reader.read_blob(&b)).transpose()?)))
+        .collect()
+}
+
+/// The [`Event::SessionDiff`] of `scope` (from [`pre_images`]): each file's pre-image
+/// against its current disk content. Files that end as they started (including one
+/// created and then deleted) are left out; the rest come sorted by path. Capped at
+/// `max_lines` lines and [`SESSION_DIFF_MAX_BYTES`]; a large diff is computed on the
+/// blocking pool.
+pub async fn session_diff(
+    scope: Vec<PreImage>,
+    sb: &dyn Sandbox,
+    turn: Option<u32>,
+    max_lines: u32,
+) -> Result<Event, DiffError> {
+    let mut sides = Vec::with_capacity(scope.len());
+    for (path, before) in scope {
         let shown = path
             .strip_prefix(sb.root())
             .map_or_else(|_| path.clone(), PathBuf::from);
@@ -66,40 +82,44 @@ pub async fn session_diff(
                 });
             }
         };
-        sides.push((shown, before, after));
+        if before != after {
+            sides.push((shown, before, after));
+        }
     }
     sides.sort_by(|a, b| a.0.cmp(&b.0));
-
-    let mut files = Vec::new();
-    let mut full = String::new();
-    for (shown, before, after) in &sides {
-        let status = match (before, after) {
-            (None, None) => continue,
-            (Some(b), Some(a)) if b == a => continue,
-            (None, Some(_)) => DiffStatus::Added,
-            (Some(_), None) => DiffStatus::Deleted,
-            (Some(_), Some(_)) => DiffStatus::Modified,
-        };
-        let d = file_diff(shown, before.as_deref(), after.as_deref());
-        files.push(DiffFile {
-            path: shown.to_string_lossy().into_owned(),
+    let statuses: Vec<(String, DiffStatus)> = sides
+        .iter()
+        .map(|(shown, before, after)| {
+            let status = match (before, after) {
+                (None, _) => DiffStatus::Added,
+                (_, None) => DiffStatus::Deleted,
+                _ => DiffStatus::Modified,
+            };
+            (shown.to_string_lossy().into_owned(), status)
+        })
+        .collect();
+    let (diff, counts) = diff_owned(sides, max_lines, SESSION_DIFF_MAX_BYTES).await;
+    let files = statuses
+        .into_iter()
+        .zip(counts)
+        .map(|((path, status), c)| DiffFile {
+            path,
             status,
-            added: d.added,
-            removed: d.removed,
-        });
-        full.push_str(&d.text);
-    }
-    let capped = cap(full, max_lines, SESSION_DIFF_MAX_BYTES);
+            added: c.added,
+            removed: c.removed,
+        })
+        .collect();
     Ok(Event::SessionDiff {
         turn,
         files,
-        unified: capped.unified,
-        truncated: capped.truncated,
+        unified: diff.unified,
+        truncated: diff.truncated,
     })
 }
 
-/// A file a tool changed: its path and its content before the change (None: created).
-type PreImage = (PathBuf, Option<BlobRef>);
+/// A file a tool changed: its path and a reference to its content before the change
+/// (None: created).
+type PreImageRef = (PathBuf, Option<BlobRef>);
 
 /// The first `Edit` record per path in scope, in log order, and the number of user turns.
 ///
@@ -109,10 +129,10 @@ type PreImage = (PathBuf, Option<BlobRef>);
 fn earliest_pre_images(
     reader: &SessionReader<SessionRecord>,
     turn: Option<u32>,
-) -> Result<(Vec<PreImage>, u32), DiffError> {
+) -> Result<(Vec<PreImageRef>, u32), DiffError> {
     let mut messages = 0u32;
     let mut ended = 0u32;
-    let mut edits: Vec<PreImage> = Vec::new();
+    let mut edits: Vec<PreImageRef> = Vec::new();
     for rec in reader.records() {
         match rec?.1 {
             SessionRecord::Command(Command::SendMessage { .. }) => messages += 1,
@@ -129,34 +149,40 @@ fn earliest_pre_images(
 }
 
 impl Session {
-    /// Answer `Command::Diff` (between turns) with a `SessionDiff`, or an `Error`.
+    /// Answer `Command::Diff` (between turns) with a `SessionDiff`, or an `Error`. The
+    /// reply waits (bounded) for room in the event channel: the client asked for it.
     pub(crate) async fn diff(&self, turn: Option<u32>) {
+        let ev = match self.session_diff(turn).await {
+            Ok(ev) => ev,
+            Err(e) => {
+                let hint = match &e {
+                    DiffError::NoSuchTurn { turns, .. } => Some(format!(
+                        "this session has {turns} user turn{}",
+                        if *turns == 1 { "" } else { "s" }
+                    )),
+                    _ => None,
+                };
+                Event::Error {
+                    kind: ErrorKind::Internal,
+                    message: format!("diff: {e}"),
+                    retryable: false,
+                    hint,
+                }
+            }
+        };
+        self.events.send_or_drop(ev).await;
+    }
+
+    async fn session_diff(&self, turn: Option<u32>) -> Result<Event, DiffError> {
         // The reader must see every record written so far.
         self.checkpoint().await;
         let path = self.log.path();
-        let sb = Arc::clone(&self.sandbox);
-        let runtime = tokio::runtime::Handle::current();
-        let answer = tokio::task::spawn_blocking(move || {
+        let scope = tokio::task::spawn_blocking(move || {
             let reader = SessionReader::<SessionRecord>::open(&path)?;
-            runtime.block_on(session_diff(
-                &reader,
-                sb.as_ref(),
-                turn,
-                SESSION_DIFF_MAX_LINES,
-            ))
+            pre_images(&reader, turn)
         })
-        .await;
-        let message = match answer {
-            Ok(Ok(ev)) => return self.emit(ev).await,
-            Ok(Err(e)) => e.to_string(),
-            Err(e) => format!("the diff failed: {e}"),
-        };
-        self.emit(Event::Error {
-            kind: ErrorKind::Internal,
-            message: format!("diff: {message}"),
-            retryable: false,
-            hint: None,
-        })
-        .await;
+        .await
+        .map_err(|e| DiffError::Crashed(e.to_string()))??;
+        session_diff(scope, self.sandbox.as_ref(), turn, SESSION_DIFF_MAX_LINES).await
     }
 }

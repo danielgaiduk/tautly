@@ -6,11 +6,11 @@
 //! each of its calls passes, in model order, the loop breaker, the permission policy and,
 //! for `ask`, the user, who is shown the call's preview diff (spec 7.11.4): a call whose
 //! preview fails is answered with that failure without asking, and an approved call runs
-//! only if its files still hash as the preview saw them. After a run, its results are processed in model order: context
-//! operations (`pin`, `state`) are applied before the result is final (a refused pin
-//! becomes an error result), the attempt ledger and the working state are updated, the
-//! result is logged with its effects and checkpointed, and only then is `ToolFinished`
-//! shown.
+//! only if the files it reads are the ones the preview read, with the same content. After
+//! a run, its results are processed in model order: context operations (`pin`, `state`)
+//! are applied before the result is final (a refused pin becomes an error result), the
+//! attempt ledger and the working state are updated, the result is logged with its
+//! effects and checkpointed, and only then is `ToolFinished` shown.
 //!
 //! Every run boundary is a tool boundary for the budgets: once one is used up, the calls
 //! not started are answered "not run" (a call already running finishes). After a cancel,
@@ -388,7 +388,11 @@ impl Session {
         turn: u32,
         ctl: &TurnControl,
     ) -> Result<Option<Result<Preview, ToolResult>>, Outcome> {
-        let cx = self.tool_cx(turn, ctl);
+        let mut cx = self.tool_cx(turn, ctl);
+        // Headless, nobody sees the diff: the preview only says whether the call fails.
+        if !ctl.approvals.interactive() {
+            cx = cx.without_preview_diff();
+        }
         let preview =
             AssertUnwindSafe(tool.preview(args, self.sandbox.as_ref(), &cx)).catch_unwind();
         tokio::select! {

@@ -6,7 +6,9 @@ use serde_json::{Value, json};
 use tautly_provider::{Capabilities, ToolSpec};
 use tautly_sandbox::{Effect, Sandbox, SandboxError};
 
-use crate::preview::{Preview, check_approved, display_diff, shown_path};
+use crate::preview::{
+    DiffPreview, Preview, check_approved, display_diff, explain_failure, shown_path,
+};
 use crate::spec::{parse_args, tool_spec};
 use crate::{AppliedEffect, Tool, ToolCx, ToolError, ToolResult};
 
@@ -49,17 +51,18 @@ impl Tool for WriteTool {
     }
 
     async fn run(&self, args: Value, sb: &dyn Sandbox, cx: &ToolCx) -> ToolResult {
-        if let Err(r) = check_approved(sb, cx).await {
-            return r;
-        }
         let a: Args = match parse_args(&args) {
             Ok(a) => a,
             Err(e) => return ToolResult::error(e.to_string()),
         };
         let (full, pre_image, pre_mode) = match load(&a, sb).await {
             Ok(loaded) => loaded,
-            Err(r) => return r,
+            Err(r) => return explain_failure(sb, cx, r).await,
         };
+        let base = (full.clone(), pre_image.as_deref().map(blake3::hash));
+        if let Err(r) = check_approved(sb, cx, &[base]) {
+            return r;
+        }
         // The commit point: a cancel seen before it changes nothing; after it, the write
         // is reported in full (the engine waits for it rather than abandon it).
         if cx.cancel().is_cancelled() {
@@ -111,7 +114,7 @@ impl Tool for WriteTool {
         &self,
         args: &Value,
         sb: &dyn Sandbox,
-        _cx: &ToolCx,
+        cx: &ToolCx,
     ) -> Option<Result<Preview, ToolResult>> {
         let a: Args = match parse_args(args) {
             Ok(a) => a,
@@ -121,8 +124,12 @@ impl Tool for WriteTool {
             Ok(loaded) => loaded,
             Err(r) => return Some(Err(r)),
         };
-        let shown = shown_path(sb, &full, &a.path);
-        let diff = display_diff(&[(shown, pre_image.as_deref(), Some(a.content.as_bytes()))]).await;
+        let diff = if cx.preview_diff() {
+            let shown = shown_path(sb, &full, &a.path);
+            display_diff(&[(shown, pre_image.as_deref(), Some(a.content.as_bytes()))]).await
+        } else {
+            DiffPreview::default()
+        };
         let base = pre_image.as_deref().map(blake3::hash);
         Some(Ok(Preview {
             diff,
