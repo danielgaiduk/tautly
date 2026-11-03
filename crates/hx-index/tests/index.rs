@@ -654,3 +654,36 @@ fn unsupported_old_schema_is_refused_explicitly() {
         "{err:?}"
     );
 }
+
+#[tokio::test]
+async fn refs_in_filters_by_path_prefix_in_sql() {
+    let (_t, idx) = index_with(&[
+        (
+            "a/one.rs",
+            "fn x() { target(); target(); }\nfn y() { target(); }\n",
+        ),
+        ("a/two.rs", "fn z() { target(); }\n"),
+        ("ab.rs", "fn w() { target(); }\n"),
+        ("b/deep/three.rs", "fn v() { target(); }\n"),
+    ]);
+    idx.refresh().await.unwrap();
+    let paths = |p: Option<&str>, limit: usize| -> Vec<String> {
+        idx.refs_in("target", p.map(Path::new), limit)
+            .unwrap()
+            .iter()
+            .map(|r| r.path.to_str().unwrap().to_string())
+            .collect()
+    };
+    assert_eq!(paths(None, 10).len(), 5);
+    // Directory prefixes match whole components: `a` does not match `ab.rs`.
+    assert_eq!(paths(Some("a"), 10), ["a/one.rs", "a/one.rs", "a/two.rs"]);
+    assert_eq!(
+        paths(Some("./a/"), 10),
+        ["a/one.rs", "a/one.rs", "a/two.rs"]
+    );
+    assert_eq!(paths(Some("a"), 2), ["a/one.rs", "a/one.rs"]);
+    assert_eq!(paths(Some("b/deep"), 10), ["b/deep/three.rs"]);
+    assert_eq!(paths(Some("ab.rs"), 10), ["ab.rs"]);
+    assert_eq!(paths(Some("."), 10).len(), 5);
+    assert!(paths(Some("nope"), 10).is_empty());
+}

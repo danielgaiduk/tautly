@@ -209,13 +209,32 @@ impl Index {
     /// Name-based references (identifier occurrences that are not definitions), at most
     /// `limit`, ordered by file and line.
     pub fn refs(&self, name: &str, limit: usize) -> Result<Vec<RefRow>, IndexError> {
+        self.refs_in(name, None, limit)
+    }
+
+    /// [`Index::refs`] restricted to files at or under `path_prefix` (a file or directory;
+    /// `./`, absolute-under-root and trailing `/` spellings are normalized).
+    pub fn refs_in(
+        &self,
+        name: &str,
+        path_prefix: Option<&Path>,
+        limit: usize,
+    ) -> Result<Vec<RefRow>, IndexError> {
+        // The root itself (empty key) filters nothing.
+        let prefix = path_prefix
+            .map(|p| self.inner.key(p))
+            .filter(|k| !k.is_empty());
         let conn = self.inner.conn();
+        // Whole path components: `a` matches `a` and `a/x.rs`, not `ab.rs`. No LIKE, so
+        // `%` and `_` in directory names need no escaping.
         let mut stmt = conn.prepare_cached(
             "SELECT r.file, r.line, l.text FROM refs r \
              JOIN ref_lines l ON l.file = r.file AND l.line = r.line \
-             WHERE r.name = ?1 ORDER BY r.file, r.line LIMIT ?2",
+             WHERE r.name = ?1 \
+               AND (?2 IS NULL OR r.file = ?2 OR substr(r.file, 1, length(?2) + 1) = ?2 || '/') \
+             ORDER BY r.file, r.line LIMIT ?3",
         )?;
-        let rows = stmt.query_map(params![name, limit as i64], |r| {
+        let rows = stmt.query_map(params![name, prefix, limit as i64], |r| {
             Ok(RefRow {
                 path: PathBuf::from(r.get::<_, String>(0)?),
                 line: r.get(1)?,

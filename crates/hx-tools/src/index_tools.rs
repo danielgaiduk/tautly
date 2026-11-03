@@ -16,8 +16,6 @@ use crate::{GrepTool, Tool, ToolCx, ToolError, ToolResult};
 /// Default number of `refs` results.
 const DEFAULT_REFS_LIMIT: usize = 50;
 const MAX_REFS_LIMIT: usize = 500;
-/// With a path filter the index cannot apply it, so this many rows are fetched and filtered.
-const PATH_FILTER_FETCH: usize = 10_000;
 const REFS_HEADER_NOTE: &str = "name-based, may include unrelated identifiers with the same name";
 
 /// The line that says why results do not come from a ready index, if they do not.
@@ -253,7 +251,10 @@ impl Tool for SymbolTool {
                     Ok(b) => b,
                     Err(e) => return ToolResult::error(format!("{path}: {e}")),
                 };
-                let text = String::from_utf8_lossy(&bytes);
+                let text = match decode_text(&bytes) {
+                    Ok(t) => t,
+                    Err(e) => return ToolResult::error(format!("{path}: {e}")),
+                };
                 let lines: Vec<&str> = text.lines().collect();
                 let (start, end) = (row.start_line as usize, row.end_line as usize);
                 if start == 0 || end < start || end > lines.len() {
@@ -292,9 +293,8 @@ impl Tool for RefsTool {
     fn spec(&self, _caps: &Capabilities) -> ToolSpec {
         tool_spec(
             "refs",
-            "Find uses of an identifier: path:line: context. Results are name-based, so they may \
-             include unrelated identifiers with the same name (name-based, may include unrelated \
-             identifiers with the same name).",
+            "Find uses of an identifier: path:line: context (name-based, may include unrelated \
+             identifiers with the same name). Definitions are not listed.",
             json!({
                 "type": "object",
                 "properties": {
@@ -335,20 +335,11 @@ impl Tool for RefsTool {
             .unwrap_or(DEFAULT_REFS_LIMIT)
             .clamp(1, MAX_REFS_LIMIT);
         // The index reports no totals: asking for one more row than wanted detects truncation.
-        let fetch = if a.path.is_some() {
-            PATH_FILTER_FETCH
-        } else {
-            limit + 1
-        };
-        let mut rows = match index.refs(&a.name, fetch) {
+        let prefix = a.path.as_deref().map(Path::new);
+        let mut rows = match index.refs_in(&a.name, prefix, limit + 1) {
             Ok(r) => r,
             Err(e) => return ToolResult::error(format!("index error: {e}")),
         };
-        if let Some(path) = &a.path {
-            let wanted = Path::new(path);
-            let wanted = wanted.strip_prefix(sb.root()).unwrap_or(wanted);
-            rows.retain(|r| r.path.starts_with(wanted));
-        }
         if rows.is_empty() {
             return ToolResult::ok(format!("no references to `{}` found", a.name));
         }

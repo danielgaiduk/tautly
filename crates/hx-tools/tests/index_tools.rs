@@ -297,3 +297,41 @@ async fn edit_without_index_is_unaffected() {
     assert!(!r.is_error && !r.output.contains("index"), "{}", r.output);
     assert_eq!(sb.read(Path::new("a.rs")).await.unwrap(), b"fn b() {}\n");
 }
+
+#[tokio::test]
+async fn refs_path_filter_is_not_defeated_by_many_earlier_hits() {
+    // More hits in an earlier file than any fetch-then-filter window could hold.
+    let mut early = String::new();
+    for i in 0..10_200 {
+        early.push_str(&format!("fn f{i}() {{ target(); }}\n"));
+    }
+    let e = env(
+        &[
+            ("a_early.rs", &early),
+            ("z/late.rs", "fn late() { target(); }\n"),
+        ],
+        true,
+    )
+    .await;
+    let r = run(&e, &RefsTool, json!({"name": "target", "path": "./z"})).await;
+    assert!(!r.is_error, "{}", r.output);
+    assert!(
+        r.output.contains("z/late.rs:1: fn late() { target(); }"),
+        "{}",
+        r.output
+    );
+    assert!(!r.output.contains("a_early"), "{}", r.output);
+    assert!(!r.output.contains("truncated"), "{}", r.output);
+}
+
+#[tokio::test]
+async fn symbol_rejects_non_utf8_source() {
+    let e = env(&[("a.rs", "fn lone() {}\n")], true).await;
+    // Indexed as text, then replaced by bytes that are not UTF-8.
+    e.sb.write_atomic(Path::new("a.rs"), b"fn lone() {}\n\xff\xfe\n", None)
+        .await
+        .unwrap();
+    let r = run(&e, &SymbolTool, json!({"name": "lone"})).await;
+    assert!(r.is_error, "{}", r.output);
+    assert!(r.output.contains("not UTF-8"), "{}", r.output);
+}

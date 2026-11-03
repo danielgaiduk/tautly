@@ -81,6 +81,65 @@ async fn structural_fallback_reverts_on_new_parse_error() {
     assert_eq!(slurp(&e, "a.rs").await, STRUCTURAL_SRC.as_bytes());
 }
 
+const PY_SRC: &str = "def helper():\n    return 0\n\ndef compute_everything(first_value, second_value):\n    total_amount = first_value + second_value\n    scaled_amount = total_amount * 2\n    adjusted_amount = scaled_amount - 1\n    logged_amount = adjusted_amount + 0\n    final_amount = logged_amount\n    return final_amount\n\ndef neighbour():\n    return 1\n";
+
+#[tokio::test]
+async fn structural_fallback_rejects_truncated_old_text() {
+    let e = env();
+    put(&e, "a.py", PY_SRC.as_bytes()).await;
+    read(&e, "a.py").await;
+    // The first 5 of 6 body lines (the last statement is missing) with a typo. It parses as
+    // a complete shorter function, so replacing the whole symbol would silently drop the tail.
+    let old = "def compute_everything(first_value, second_value):\n    total_amount = first_value + second_value\n    scaled_amount = total_amount * 2\n    adjusted_amount = scaled_amount - 1\n    logged_amount = adjusted_amount + 0\n    final_amount = logged_amnt";
+    let r = edit(
+        &e,
+        "a.py",
+        old,
+        "def compute_everything(a, b):\n    return a + b",
+    )
+    .await;
+    assert!(r.is_error, "{}", r.output);
+    assert!(r.output.contains("not found"), "{}", r.output);
+    assert_eq!(slurp(&e, "a.py").await, PY_SRC.as_bytes());
+}
+
+#[tokio::test]
+async fn structural_fallback_rejects_old_text_that_includes_a_neighbour() {
+    let e = env();
+    put(&e, "a.py", PY_SRC.as_bytes()).await;
+    read(&e, "a.py").await;
+    // The target (with a typo) plus the next function: replacing only the first symbol
+    // would duplicate the neighbour.
+    let old = "def compute_everything(first_value, second_value):\n    total_amount = first_value + second_value\n    scaled_amount = total_amount * 2\n    adjusted_amount = scaled_amount - 1\n    logged_amount = adjusted_amount + 0\n    final_amount = logged_amnt\n    return final_amount\n\ndef neighbour():\n    return 1";
+    let new = "def compute_everything(a, b):\n    return a + b\n\ndef neighbour():\n    return 2";
+    let r = edit(&e, "a.py", old, new).await;
+    assert!(r.is_error, "{}", r.output);
+    assert!(r.output.contains("not found"), "{}", r.output);
+    assert_eq!(slurp(&e, "a.py").await, PY_SRC.as_bytes());
+}
+
+#[tokio::test]
+async fn structural_fallback_repairs_exact_extent_python() {
+    let e = env();
+    put(&e, "a.py", PY_SRC.as_bytes()).await;
+    read(&e, "a.py").await;
+    let old = "def compute_everything(first_value, second_value):\n    total_amount = first_value + second_value\n    scaled_amount = total_amount * 2\n    adjusted_amount = scaled_amount - 1\n    logged_amount = adjusted_amount + 0\n    final_amount = logged_amnt\n    return final_amount";
+    let r = edit(
+        &e,
+        "a.py",
+        old,
+        "def compute_everything(a, b):\n    return a + b",
+    )
+    .await;
+    assert!(!r.is_error, "{}", r.output);
+    assert!(r.output.contains("structural"), "{}", r.output);
+    let got = String::from_utf8(slurp(&e, "a.py").await).unwrap();
+    assert_eq!(
+        got,
+        "def helper():\n    return 0\n\ndef compute_everything(a, b):\n    return a + b\n\ndef neighbour():\n    return 1\n"
+    );
+}
+
 // ---------------------------------------------------------------- tool-level
 
 struct Env {

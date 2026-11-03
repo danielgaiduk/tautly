@@ -160,8 +160,9 @@ fn locate_with(text: &str, old: &str, whole_lines: bool) -> Result<Located, Matc
 
 /// Stage 5: the symbol the first definition line of `old` names, located in `text` by
 /// parsing it (never a stale index). The symbol's lines are the range to replace when their
-/// source resembles `old` (ratio >= [`STRUCTURAL_SIMILARITY`]) and exactly one same-named
-/// symbol does. `Ok(None)` when `old` does not start with a definition or nothing resembles it.
+/// source resembles `old` (ratio >= [`STRUCTURAL_SIMILARITY`], and so do their last lines)
+/// and exactly one same-named symbol does, provided `old` is exactly one symbol. `Ok(None)` when `old` is not exactly one definition
+/// or nothing resembles it.
 pub fn locate_structural(
     path: &Path,
     text: &str,
@@ -171,7 +172,11 @@ pub fn locate_structural(
         return Ok(None);
     };
     let norm = normalize_old(old).text;
-    let Some(first) = norm.split('\n').position(|l| !l.trim().is_empty()) else {
+    let model_lines: Vec<&str> = norm.split('\n').collect();
+    let (Some(first), Some(last)) = (
+        model_lines.iter().position(|l| !l.trim().is_empty()),
+        model_lines.iter().rposition(|l| !l.trim().is_empty()),
+    ) else {
         return Ok(None);
     };
     // Parse the model's block on its own, without the indentation it was nested in.
@@ -184,6 +189,14 @@ pub fn locate_structural(
     else {
         return Ok(None);
     };
+    // The block must be exactly one symbol: replacing the symbol's lines with new text
+    // written for a longer or shorter block would drop or duplicate code. A trailing
+    // neighbour is a further symbol starting after the first one ends.
+    if def.end_line as usize != last + 1
+        || wanted.symbols.iter().any(|s| s.start_line > def.end_line)
+    {
+        return Ok(None);
+    }
     let want_text = squash(&norm);
 
     let file = Lines::new(text);
@@ -195,7 +208,11 @@ pub fn locate_structural(
         .filter(|&(start, end)| end < file.len() && start <= end)
         .filter(|&(start, end)| {
             let source: Vec<&str> = (start..=end).map(|i| file.line(i)).collect();
-            similarity(&squash(&source.join("\n")), &want_text) >= STRUCTURAL_SIMILARITY
+            // A truncated block can still parse as a shorter symbol (Python), so its last
+            // line must also resemble the symbol's real last line.
+            let last_line = source.last().copied().unwrap_or("").trim();
+            similarity(last_line, model_lines[last].trim()) >= STRUCTURAL_SIMILARITY
+                && similarity(&squash(&source.join("\n")), &want_text) >= STRUCTURAL_SIMILARITY
         })
         .collect();
     match hits.as_slice() {
