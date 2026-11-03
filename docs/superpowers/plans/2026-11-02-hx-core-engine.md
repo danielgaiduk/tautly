@@ -723,7 +723,7 @@ proptest! { #[test] fn apply_then_inverse_restores(text in "[a-z\\n]{1,200}", ..
 
 ### Task 24: Engine turn loop and approvals
 
-**Task 38 review note (binding):** build the repo map off the startup path (spawn_blocking) once per session; on a first-ever session with no ready index the map is empty for that session — acceptable in v1, but log it.
+**Task 38 review note (binding):** build the repo map off the startup path (spawn_blocking) once per session; on a first-ever session with no ready index the map is empty for that session — acceptable in v1, but log it. Call `init_repo_map` exactly once at session start, ignore a `false` return, never retry per turn (a later success would change the stable prefix mid-session). Read-tracker turn numbers and `Context` turn numbers are the same absolute session turn counter (Task 20's `CompactionRecord` reports the last removed absolute turn; pass it to `ReadTracker::forget_shown_at`).
 
 **Task 19 re-review note (binding):** after each turn call `Context::calibrate(status.used, input_tokens)` (not `TokenEstimator::calibrate`); when a response is cut off right after a reasoning item, drop that trailing reasoning item from history; on a mid-session model switch to another provider, strip `Reasoning`/`RedactedReasoning` content produced by a different provider before the next request (redacted payloads are provider-specific).
 
