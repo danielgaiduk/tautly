@@ -2,6 +2,7 @@
 
 mod bash;
 mod cap;
+pub mod edit;
 mod glob;
 mod grep;
 mod read;
@@ -22,6 +23,7 @@ use tokio_util::sync::CancellationToken;
 
 pub use bash::{BashTool, cap_output};
 pub use cap::cap_text;
+pub use edit::EditTool;
 pub use glob::GlobTool;
 pub use grep::GrepTool;
 pub use read::ReadTool;
@@ -160,6 +162,7 @@ pub fn registry(_caps: &Capabilities) -> Vec<Arc<dyn Tool>> {
     vec![
         Arc::new(ReadTool),
         Arc::new(WriteTool),
+        Arc::new(EditTool),
         Arc::new(GrepTool),
         Arc::new(GlobTool),
         Arc::new(BashTool),

@@ -19,7 +19,9 @@ blake3.workspace = true
 globset.workspace = true
 regex.workspace = true
 libc.workspace = true
+similar.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
 tokio.workspace = true
+proptest.workspace = true

@@ -209,7 +209,7 @@ fn registry_order_and_specs() {
     let caps = Capabilities::conservative();
     let tools = registry(&caps);
     let names: Vec<_> = tools.iter().map(|t| t.name()).collect();
-    assert_eq!(names, ["read", "write", "grep", "glob", "bash"]);
+    assert_eq!(names, ["read", "write", "edit", "grep", "glob", "bash"]);
     for t in &tools {
         let s = t.spec(&caps);
         assert_eq!(s.name, t.name());
