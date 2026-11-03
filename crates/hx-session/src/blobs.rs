@@ -1,11 +1,12 @@
 use std::fs;
 use std::io::Write;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 
-use crate::{Error, Result};
+use crate::{Error, Result, paths};
 
 /// Content address of a blob: the blake3 hex digest (64 chars) of its bytes.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -60,14 +61,18 @@ impl BlobStore {
             return Ok(r);
         }
         let parent = path.parent().expect("blob path has a parent");
-        fs::create_dir_all(parent)?;
+        paths::create_private_dir_all(parent)?;
         let tmp = parent.join(format!(
             ".tmp-{}-{}",
             std::process::id(),
             TMP_COUNTER.fetch_add(1, Ordering::Relaxed)
         ));
         let result = (|| -> std::io::Result<()> {
-            let mut f = fs::File::create(&tmp)?;
+            let mut f = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&tmp)?;
             f.write_all(bytes)?;
             // Records reference this blob; it must be durable first.
             f.sync_data()?;
@@ -82,7 +87,8 @@ impl BlobStore {
 
     pub(crate) fn get(&self, r: &BlobRef) -> Result<Vec<u8>> {
         match fs::read(self.path_of(r)?) {
-            Ok(b) => Ok(b),
+            Ok(b) if blake3::hash(&b).to_hex().as_str() == r.as_str() => Ok(b),
+            Ok(_) => Err(Error::BlobCorrupt(r.as_str().to_string())),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 Err(Error::BlobNotFound(r.as_str().to_string()))
             }

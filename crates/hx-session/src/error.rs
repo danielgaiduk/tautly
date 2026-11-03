@@ -15,6 +15,18 @@ pub enum Error {
         line: u64,
         reason: String,
     },
+    #[error("{} is already open for writing by another writer", .0.display())]
+    AlreadyOpen(PathBuf),
+    #[error("session writer is poisoned by an earlier i/o error; reopen the session")]
+    Poisoned,
+    #[error("{}: schema_version {found} is newer than the supported {supported}", path.display())]
+    UnsupportedSchema {
+        path: PathBuf,
+        found: u32,
+        supported: u32,
+    },
+    #[error("blob {0} does not match its content hash")]
+    BlobCorrupt(String),
     #[error("invalid blob reference {0:?}")]
     InvalidBlobRef(String),
     #[error("blob {0} not found")]

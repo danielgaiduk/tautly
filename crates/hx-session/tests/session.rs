@@ -514,3 +514,171 @@ fn reopen_rejects_missing_header() {
         Err(Error::BadHeader { .. })
     ));
 }
+
+// ---- writer exclusion ----
+
+#[test]
+fn second_reopen_is_already_open_and_succeeds_after_the_first_drops() {
+    let env = Env::new();
+    let mut w = env.writer();
+    w.append(&msg("a")).unwrap();
+    w.checkpoint().unwrap();
+    let path = w.path().to_path_buf();
+    // The creating writer holds the lock.
+    assert!(matches!(
+        SessionWriter::<Rec>::reopen(&path),
+        Err(Error::AlreadyOpen(_))
+    ));
+    drop(w);
+
+    let first = SessionWriter::<Rec>::reopen(&path).unwrap();
+    assert!(matches!(
+        SessionWriter::<Rec>::reopen(&path),
+        Err(Error::AlreadyOpen(_))
+    ));
+    drop(first);
+    let mut again = SessionWriter::<Rec>::reopen(&path).unwrap();
+    assert_eq!(again.append(&msg("b")).unwrap(), 1);
+}
+
+#[test]
+fn contended_reopen_does_not_touch_the_file() {
+    let env = Env::new();
+    let mut w = env.writer();
+    w.append(&msg("a")).unwrap();
+    w.checkpoint().unwrap();
+    let path = w.path().to_path_buf();
+    let mut f = OpenOptions::new().append(true).open(&path).unwrap();
+    f.write_all(br#"{"type":"record","offset":1,"da"#).unwrap();
+    drop(f);
+    let before = fs::read(&path).unwrap();
+    assert!(matches!(
+        SessionWriter::<Rec>::reopen(&path),
+        Err(Error::AlreadyOpen(_))
+    ));
+    assert_eq!(
+        fs::read(&path).unwrap(),
+        before,
+        "no truncation without the lock"
+    );
+}
+
+// ---- tail is structural only ----
+
+fn append_raw(path: &Path, bytes: &[u8]) {
+    let mut f = OpenOptions::new().append(true).open(path).unwrap();
+    f.write_all(bytes).unwrap();
+}
+
+#[test]
+fn last_line_valid_json_but_not_r_is_corrupt_not_a_torn_tail() {
+    let env = Env::new();
+    let mut w = env.writer();
+    w.append(&msg("a")).unwrap();
+    w.checkpoint().unwrap();
+    let path = w.path().to_path_buf();
+    drop(w);
+    append_raw(
+        &path,
+        b"{\"type\":\"record\",\"offset\":1,\"data\":{\"kind\":\"future_kind\"}}\n",
+    );
+    let before = fs::read(&path).unwrap();
+
+    let r = SessionReader::<Rec>::open(&path).unwrap();
+    assert!(!r.truncated_tail());
+    let items: Vec<_> = r.records().collect();
+    assert_eq!(items.len(), 2);
+    assert!(items[0].is_ok());
+    assert!(matches!(items[1], Err(Error::Corrupt { line: 3, .. })));
+
+    // reopen agrees and leaves history alone.
+    assert!(matches!(
+        SessionWriter::<Rec>::reopen(&path),
+        Err(Error::Corrupt { .. })
+    ));
+    assert_eq!(fs::read(&path).unwrap(), before);
+}
+
+#[test]
+fn structurally_invalid_last_line_is_still_a_torn_tail() {
+    let env = Env::new();
+    let mut w = env.writer();
+    w.append(&msg("a")).unwrap();
+    w.checkpoint().unwrap();
+    let path = w.path().to_path_buf();
+    drop(w);
+    // Valid JSON, but a record line without its data.
+    append_raw(&path, b"{\"type\":\"record\",\"offset\":1}\n");
+    let (got, truncated) = read_all(&path);
+    assert!(truncated);
+    assert_eq!(got, vec![(0, msg("a"))]);
+}
+
+// ---- permissions, blob verification, schema ----
+
+#[cfg(unix)]
+#[test]
+fn directories_are_0700_and_files_0600() {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+    let env = Env::new();
+    let w = env.writer();
+    let blob = w.blob(b"secret output").unwrap();
+    let (head, rest) = blob.as_str().split_at(2);
+
+    assert_eq!(mode(&env.project_dir()), 0o700);
+    assert_eq!(mode(&env.data.path().join("sessions")), 0o700);
+    assert_eq!(mode(w.path()), 0o600);
+    assert_eq!(mode(&env.project_dir().join("blobs")), 0o700);
+    assert_eq!(mode(&env.project_dir().join("blobs").join(head)), 0o700);
+    assert_eq!(
+        mode(&env.project_dir().join("blobs").join(head).join(rest)),
+        0o600
+    );
+}
+
+#[test]
+fn read_blob_verifies_content_against_its_hash() {
+    let env = Env::new();
+    let w = env.writer();
+    let blob = w.blob(b"original").unwrap();
+    let path = w.path().to_path_buf();
+    drop(w);
+    let (head, rest) = blob.as_str().split_at(2);
+    fs::write(
+        env.project_dir().join("blobs").join(head).join(rest),
+        b"tampered",
+    )
+    .unwrap();
+
+    let r = SessionReader::<Rec>::open(&path).unwrap();
+    assert!(matches!(r.read_blob(&blob), Err(Error::BlobCorrupt(_))));
+}
+
+#[test]
+fn open_rejects_a_newer_schema_version() {
+    let env = Env::new();
+    let w = env.writer();
+    let path = w.path().to_path_buf();
+    drop(w);
+    let text = fs::read_to_string(&path).unwrap();
+    assert!(text.contains("\"schema_version\":1"));
+    fs::write(
+        &path,
+        text.replace("\"schema_version\":1", "\"schema_version\":2"),
+    )
+    .unwrap();
+
+    match SessionReader::<Rec>::open(&path) {
+        Err(Error::UnsupportedSchema {
+            found: 2,
+            supported: 1,
+            ..
+        }) => {}
+        other => panic!("expected UnsupportedSchema, got {:?}", other.err()),
+    }
+    assert!(matches!(
+        SessionWriter::<Rec>::reopen(&path),
+        Err(Error::UnsupportedSchema { .. })
+    ));
+}

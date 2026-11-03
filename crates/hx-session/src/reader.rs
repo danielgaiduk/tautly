@@ -4,19 +4,20 @@ use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-use serde::de::{DeserializeOwned, IgnoredAny};
+use serde::de::DeserializeOwned;
 
 use crate::blobs::{BlobRef, BlobStore};
 use crate::paths;
-use crate::record::{Header, Line};
+use crate::record::{Header, Parsed, SCHEMA_VERSION, parse_line};
 use crate::{Error, Result};
 
 /// Reads one session log.
 ///
-/// A final line that lacks its trailing newline or fails to parse is the
-/// remnant of a crash mid-write: it is skipped and reported by
+/// A final line that lacks its trailing newline or is not structurally valid
+/// (not a JSON object of a known shape) is the remnant of a crash mid-write: it is skipped and reported by
 /// [`truncated_tail`](Self::truncated_tail). A malformed line anywhere else is
-/// corruption and yields an error from [`records`](Self::records).
+/// corruption, as is any line whose payload does not deserialize as `R`; both
+/// yield an error from [`records`](Self::records).
 pub struct SessionReader<R: DeserializeOwned> {
     path: PathBuf,
     header: Header,
@@ -40,13 +41,20 @@ impl<R: DeserializeOwned> SessionReader<R> {
         if first.last() != Some(&b'\n') {
             return Err(bad("header line is missing or incomplete"));
         }
-        let header = match serde_json::from_slice::<Line<IgnoredAny>>(&first) {
-            Ok(Line::Header(h)) => h,
+        let header = match parse_line(&first) {
+            Ok(Parsed::Header(h)) => h,
             Ok(_) => return Err(bad("first line is not a header")),
             Err(e) => return Err(bad(&e.to_string())),
         };
+        if header.schema_version > SCHEMA_VERSION {
+            return Err(Error::UnsupportedSchema {
+                path: path.to_path_buf(),
+                found: header.schema_version,
+                supported: SCHEMA_VERSION,
+            });
+        }
         let body_start = first.len() as u64;
-        let tail_start = find_truncated_tail::<R>(file.into_inner(), body_start)?;
+        let tail_start = find_truncated_tail(file.into_inner(), body_start)?;
         let project_dir = path.parent().unwrap_or(Path::new("."));
         Ok(Self {
             path: path.to_path_buf(),
@@ -92,10 +100,7 @@ impl<R: DeserializeOwned> SessionReader<R> {
 
 /// Locate the final line when it is a crash remnant: no trailing newline, or
 /// not parseable as a line.
-fn find_truncated_tail<R: DeserializeOwned>(
-    mut file: File,
-    body_start: u64,
-) -> Result<Option<u64>> {
+fn find_truncated_tail(mut file: File, body_start: u64) -> Result<Option<u64>> {
     let len = file.metadata()?.len();
     if len <= body_start {
         return Ok(None);
@@ -113,7 +118,9 @@ fn find_truncated_tail<R: DeserializeOwned>(
     let mut buf = vec![0u8; (len - 1 - start) as usize];
     file.seek(SeekFrom::Start(start))?;
     file.read_exact(&mut buf)?;
-    Ok(match serde_json::from_slice::<Line<R>>(&buf) {
+    // Structural only: a complete line whose payload is not an `R` is
+    // corruption, reported by `records()`, never silently dropped.
+    Ok(match parse_line(&buf) {
         Ok(_) => None,
         Err(_) => Some(start),
     })
@@ -201,18 +208,24 @@ impl<R: DeserializeOwned> Iterator for Records<R> {
             if buf.last() != Some(&b'\n') {
                 return self.corrupt("line has no trailing newline".into());
             }
-            match serde_json::from_slice::<Line<R>>(&buf) {
-                Ok(Line::Record { offset, data }) => {
+            match parse_line(&buf) {
+                Ok(Parsed::Record { offset, data }) => {
                     if offset != self.next_offset {
                         let reason =
                             format!("expected offset {}, found {offset}", self.next_offset);
                         return self.corrupt(reason);
                     }
+                    let data = match serde_json::from_str::<R>(data.get()) {
+                        Ok(d) => d,
+                        Err(e) => {
+                            return self.corrupt(format!("record does not match its type: {e}"));
+                        }
+                    };
                     self.next_offset += 1;
                     return Some(Ok((offset, data)));
                 }
-                Ok(Line::Unknown) => continue,
-                Ok(Line::Header(_)) => return self.corrupt("unexpected second header".into()),
+                Ok(Parsed::Unknown) => continue,
+                Ok(Parsed::Header(_)) => return self.corrupt("unexpected second header".into()),
                 Err(e) => return self.corrupt(e.to_string()),
             }
         }
@@ -248,7 +261,7 @@ pub fn list_in(data_home: &Path, root: &Path) -> Result<Vec<SessionSummary>> {
         if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
             continue;
         }
-        let Ok(reader) = SessionReader::<IgnoredAny>::open(&path) else {
+        let Ok(reader) = SessionReader::<serde::de::IgnoredAny>::open(&path) else {
             continue;
         };
         let Ok(last_modified) = entry.metadata().and_then(|m| m.modified()) else {

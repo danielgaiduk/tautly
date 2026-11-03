@@ -36,3 +36,13 @@ pub(crate) fn canonical_root(root: &Path) -> PathBuf {
 pub(crate) fn project_dir(data_home: &Path, root: &Path) -> PathBuf {
     data_home.join("sessions").join(project_hash(root))
 }
+
+/// `create_dir_all` with mode 0700 for every directory it creates: logs and
+/// blobs hold tool output that may contain secrets.
+pub(crate) fn create_private_dir_all(dir: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)
+}
