@@ -78,8 +78,10 @@ pub fn parse_commands(src: &str) -> Result<Vec<SimpleCommand>, Unparseable> {
 /// word `.git`; the grammar keeps the pieces apart and every later check would
 /// judge the wrong words. Such a pair is refused wherever bash would join it: the
 /// only literal places are single-quoted strings and bodies of heredocs whose
-/// delimiter is quoted. A continuation followed by whitespace (or the end of the
-/// input) cannot change any word and stays fine.
+/// delimiter is quoted. A continuation cannot change any word, and stays fine, when
+/// it is followed by whitespace (or the end of the input), when it follows
+/// unescaped space or tab, or when it follows a shell operator token (`|`, `&&`,
+/// `||`, `;`, `(`) and the next byte could not fuse with that operator.
 fn reject_split_continuations(root: Node, src: &str) -> Result<(), Unparseable> {
     let bytes = src.as_bytes();
     let mut hits = bytes
@@ -87,6 +89,7 @@ fn reject_split_continuations(root: Node, src: &str) -> Result<(), Unparseable> 
         .enumerate()
         .filter(|(_, w)| w[0] == b'\\' && w[1] == b'\n' && !w[2].is_ascii_whitespace())
         .map(|(i, _)| i)
+        .filter(|&i| !separates_words(root, bytes, i))
         .peekable();
     if hits.peek().is_none() {
         return Ok(());
@@ -118,6 +121,31 @@ fn reject_split_continuations(root: Node, src: &str) -> Result<(), Unparseable> 
         return Err(Unparseable("line continuation splits a word".into()));
     }
     Ok(())
+}
+
+/// Whether the backslash-newline at `i` (followed by a non-whitespace byte) sits
+/// where bash and the grammar agree on the tokens: at the start of the input, after
+/// an unescaped space or tab, or right after an operator token that the next byte
+/// cannot extend (`|` + `|` would be `||` to bash, `(` + `(` would be `((`).
+fn separates_words(root: Node, src: &[u8], i: usize) -> bool {
+    let Some(&prev) = i.checked_sub(1).and_then(|p| src.get(p)) else {
+        return true;
+    };
+    if matches!(prev, b' ' | b'\t') {
+        let escapes = src[..i - 1]
+            .iter()
+            .rev()
+            .take_while(|&&b| b == b'\\')
+            .count();
+        return escapes % 2 == 0;
+    }
+    if matches!(prev, b'|' | b'&' | b';' | b'(') && !b"|&;()<>".contains(&src[i + 2]) {
+        // An operator token of its own, not an escaped or quoted lookalike.
+        return root.descendant_for_byte_range(i - 1, i).is_some_and(|n| {
+            !n.is_named() && n.end_byte() == i && matches!(n.kind(), "|" | "&&" | "||" | ";" | "(")
+        });
+    }
+    false
 }
 
 /// Locate the first error or missing node without recursion (the tree may be

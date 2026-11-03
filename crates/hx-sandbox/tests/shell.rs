@@ -899,12 +899,13 @@ fn line_continuation_inside_a_word_is_unparseable() {
         "c\\\nd .git && echo pwn > hooks/pre-commit",
         "ec\\\nho x",
         "cat .g\\\nit/config",
-        "echo a \\\nb",
         "echo \"a\\\nb\"",
     ] {
         assert!(parse_commands(s).is_err(), "{s:?}");
     }
-    assert!(parse_commands("cargo test \\\n  --all").is_ok());
+    for s in ["cargo test \\\n  --all", "echo a \\\nb"] {
+        assert!(parse_commands(s).is_ok(), "{s:?}");
+    }
 }
 
 #[test]
@@ -992,10 +993,50 @@ fn continuation_inside_quoted_heredoc_body_still_parses() {
 #[test]
 fn continuation_in_double_quotes_or_unquoted_heredoc_is_unparseable() {
     assert_split("echo \"a\\\nb\"");
-    assert_split("cat <<EOF\nfoo \\\nx\nEOF\n");
+    assert_split("cat <<EOF\nfoo\\\nx\nEOF\n");
 }
 
 #[test]
 fn apostrophe_in_comment_does_not_hide_a_later_continuation() {
     assert_split("echo hi # it's\necho pwn > .g\\\nit/hooks/pre-commit");
+}
+
+#[test]
+fn continuation_after_whitespace_or_operator_does_not_split_a_word() {
+    let c = parse_commands("cargo test \\\n--workspace").unwrap();
+    assert_eq!(c[0].argv, ["cargo", "test", "--workspace"]);
+    let c = parse_commands("echo a\t\\\nb").unwrap();
+    assert_eq!(c[0].argv, ["echo", "a", "b"]);
+    let c = parse_commands("cargo build &&\\\ncargo test").unwrap();
+    assert_eq!(argv0s(&c), ["cargo", "cargo"]);
+    let c = parse_commands("cargo build ||\\\ncargo test").unwrap();
+    assert_eq!(argv0s(&c), ["cargo", "cargo"]);
+    let c = parse_commands("ls |\\\nhead").unwrap();
+    assert_eq!(argv0s(&c), ["ls", "head"]);
+    let c = parse_commands("ls;\\\nhead").unwrap();
+    assert_eq!(argv0s(&c), ["ls", "head"]);
+    let c = parse_commands("(\\\nls)").unwrap();
+    assert_eq!(argv0s(&c), ["ls"]);
+}
+
+#[test]
+fn continuation_after_an_escaped_or_quoted_lookalike_still_splits() {
+    // The preceding byte is a space or `;`, but not whitespace/an operator to the shell.
+    assert_split("echo a\\ \\\nb");
+    assert_split("echo a\\;\\\nb");
+    assert_split("echo \"a;\\\nb\"");
+    assert_split("echo pwn > .g\\ \\\nit/hooks/pre-commit");
+}
+
+#[test]
+fn continuation_that_would_merge_two_operators_is_unparseable() {
+    for s in [
+        "ls |\\\n| head",
+        "ls &&\\\n& head",
+        "ls;\\\n; head",
+        "echo $(\\\n(1))",
+        "echo a >\\\n> .git/x",
+    ] {
+        assert!(parse_commands(s).is_err(), "{s:?}");
+    }
 }
