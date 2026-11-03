@@ -214,6 +214,7 @@ impl Context {
             max_output,
             reasoning: None,
             cache_breakpoints: Vec::new(),
+            volatile_tail: false,
         };
         (request, removed)
     }

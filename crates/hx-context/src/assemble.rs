@@ -91,7 +91,8 @@ impl Context {
             .flatten()
             .map(|t| Content::Text(t.clone()))
             .collect();
-        if !tail.is_empty() {
+        let volatile_tail = !tail.is_empty();
+        if volatile_tail {
             messages.push(Message {
                 role: Role::User,
                 content: tail,
@@ -165,6 +166,7 @@ impl Context {
             max_output: caps.max_output,
             reasoning: None,
             cache_breakpoints,
+            volatile_tail,
         };
         let status = ContextStatus {
             used,

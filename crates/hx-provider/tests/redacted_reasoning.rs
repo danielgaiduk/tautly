@@ -25,6 +25,7 @@ fn req(model: &str) -> CanonicalRequest {
         max_output: 100,
         reasoning: None,
         cache_breakpoints: vec![],
+        volatile_tail: false,
     }
 }
 

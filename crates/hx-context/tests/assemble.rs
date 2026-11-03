@@ -967,3 +967,43 @@ fn working_state_paths_are_escaped() {
     // Ordinary paths are shown as before.
     assert!(st.contains("- src/ok.rs ("), "{st}");
 }
+
+#[test]
+fn volatile_tail_marks_the_state_tail_message() {
+    let mut c = Context::default();
+    c.history.push(turn("hi"));
+    c.apply_op(ContextOp::StateUpdate(StatePatch {
+        decisions_add: vec!["use tabs".into()],
+        ..Default::default()
+    }))
+    .unwrap();
+    let (req, _) = c.assemble(&caps(), &[], &m());
+    assert!(req.volatile_tail);
+    // The marker means: the last message is the tail, after the last cache breakpoint.
+    assert!(tail_text(&req).contains("use tabs"));
+    let last_breakpoint = req.cache_breakpoints.iter().filter_map(|p| match p {
+        hx_provider::CachePoint::AfterMessage(i) => Some(*i),
+        _ => None,
+    });
+    assert!(last_breakpoint.max().unwrap() < req.messages.len() - 1);
+}
+
+#[test]
+fn volatile_tail_is_set_for_session_pins_alone() {
+    let mut c = Context::default();
+    c.history.push(turn("hi"));
+    c.apply_op(ContextOp::Pin("always run clippy".into()))
+        .unwrap();
+    let (req, _) = c.assemble(&caps(), &[], &m());
+    assert!(req.volatile_tail);
+    assert!(tail_text(&req).contains("always run clippy"));
+}
+
+#[test]
+fn volatile_tail_is_clear_without_a_tail_message() {
+    let mut c = Context::default();
+    c.history.push(turn("hi"));
+    let (req, _) = c.assemble(&caps(), &[], &m());
+    assert_eq!(req.messages.len(), 1);
+    assert!(!req.volatile_tail);
+}

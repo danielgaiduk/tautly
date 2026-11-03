@@ -41,6 +41,7 @@ fn req_of(messages: Vec<Message>) -> CanonicalRequest {
         max_output: 8_000,
         reasoning: None,
         cache_breakpoints: vec![],
+        volatile_tail: false,
     }
 }
 

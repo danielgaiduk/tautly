@@ -46,6 +46,7 @@ fn base_req() -> CanonicalRequest {
         max_output: 16_000,
         reasoning: None,
         cache_breakpoints: vec![],
+        volatile_tail: false,
     }
 }
 

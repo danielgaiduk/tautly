@@ -151,6 +151,12 @@ pub struct CanonicalRequest {
     pub max_output: u32,
     pub reasoning: Option<Reasoning>,
     pub cache_breakpoints: Vec<CachePoint>,
+    /// The last message of `messages` is the volatile tail (the working state, which
+    /// changes on almost every request) and sits after the last cache breakpoint. Adapters
+    /// may use this to place the tail differently, for example inside the last tool result;
+    /// today none does, and a request without a tail leaves it `false`.
+    #[serde(default)]
+    pub volatile_tail: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
