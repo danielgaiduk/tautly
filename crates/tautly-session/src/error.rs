@@ -31,6 +31,8 @@ pub enum Error {
     InvalidBlobRef(String),
     #[error("blob {0} not found")]
     BlobNotFound(String),
+    #[error("no usable data directory: {0}")]
+    DataHome(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

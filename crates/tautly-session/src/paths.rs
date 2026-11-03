@@ -1,23 +1,41 @@
 //! Filesystem locations shared by every crate that persists data.
 
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+
+use crate::error::{Error, Result};
 
 /// The Tautly data directory: `TAUTLY_HOME` used as-is, else `$XDG_DATA_HOME/tautly`,
 /// else `~/.local/share/tautly`. Empty variables are ignored.
-pub fn data_home() -> PathBuf {
-    if let Some(home) = non_empty_env("TAUTLY_HOME") {
-        return home;
-    }
-    non_empty_env("XDG_DATA_HOME")
-        .or_else(|| non_empty_env("HOME").map(|h| h.join(".local").join("share")))
-        .unwrap_or_else(|| PathBuf::from(".local/share"))
-        .join("tautly")
+///
+/// An error when the result would not be an absolute path (no `HOME`, or a relative
+/// variable): a relative directory would resolve against the working directory, which is
+/// usually the repository, and put sessions, blobs and memory episodes (tool output that
+/// may hold secrets) inside it.
+pub fn data_home() -> Result<PathBuf> {
+    data_home_from(|name| std::env::var_os(name))
 }
 
-fn non_empty_env(name: &str) -> Option<PathBuf> {
-    std::env::var_os(name)
-        .filter(|v| !v.is_empty())
-        .map(PathBuf::from)
+/// [`data_home`] with the environment lookup injected.
+pub fn data_home_from(get: impl Fn(&str) -> Option<OsString>) -> Result<PathBuf> {
+    let non_empty = |name: &str| get(name).filter(|v| !v.is_empty()).map(PathBuf::from);
+    let absolute = |name: &str, dir: PathBuf| {
+        if dir.is_absolute() {
+            Ok(dir)
+        } else {
+            Err(Error::DataHome(format!("{name} is not an absolute path")))
+        }
+    };
+    if let Some(home) = non_empty("TAUTLY_HOME") {
+        return absolute("TAUTLY_HOME", home);
+    }
+    if let Some(xdg) = non_empty("XDG_DATA_HOME") {
+        return absolute("XDG_DATA_HOME", xdg).map(|d| d.join("tautly"));
+    }
+    match non_empty("HOME") {
+        Some(home) => absolute("HOME", home).map(|d| d.join(".local").join("share").join("tautly")),
+        None => Err(Error::DataHome("HOME is not set".to_string())),
+    }
 }
 
 /// Stable 16-hex-digit identifier of a project: blake3 of its canonical path

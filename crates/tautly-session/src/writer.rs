@@ -71,7 +71,7 @@ impl<R: Serialize> SessionWriter<R> {
     /// Create a new session for the project at `root` under [`paths::data_home`].
     /// `parent` marks a fork: (parent session id, parent record offset).
     pub fn create(root: &Path, parent: Option<(String, u64)>) -> Result<Self> {
-        Self::create_in(&paths::data_home(), root, parent)
+        Self::create_in(&paths::data_home()?, root, parent)
     }
 
     /// Like [`create`](Self::create) with an explicit data home.

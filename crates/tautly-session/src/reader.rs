@@ -243,7 +243,7 @@ pub struct SessionSummary {
 
 /// Sessions of the project at `root` under [`paths::data_home`], newest first.
 pub fn list(root: &Path) -> Result<Vec<SessionSummary>> {
-    list_in(&paths::data_home(), root)
+    list_in(&paths::data_home()?, root)
 }
 
 /// Like [`list`] with an explicit data home. Unreadable or partial files are

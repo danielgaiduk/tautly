@@ -161,7 +161,11 @@ fn sort_key(e: &MemoryEntry) -> (SystemTime, &str) {
 impl MemoryStore {
     /// Open the store of `project_root`, with episodes under the Tautly data home.
     pub fn open(project_root: &Path, index: Arc<Index>) -> Result<Self, MemoryError> {
-        Self::open_in(project_root, &tautly_session::paths::data_home(), index)
+        let data_home = tautly_session::paths::data_home().map_err(|e| match e {
+            tautly_session::Error::DataHome(why) => MemoryError::DataHome(why),
+            other => MemoryError::DataHome(other.to_string()),
+        })?;
+        Self::open_in(project_root, &data_home, index)
     }
 
     /// [`open`](Self::open) with an explicit data home (tests). Entry files that cannot be

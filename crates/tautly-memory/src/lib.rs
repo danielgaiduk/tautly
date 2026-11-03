@@ -30,6 +30,8 @@ pub enum MemoryError {
     },
     #[error("{} is a symlink or not a directory; Tautly will not read or write memory through it", .0.display())]
     UnsafeDir(PathBuf),
+    #[error("no usable data directory: {0}")]
+    DataHome(String),
     #[error("code index error: {0}")]
     Index(String),
     #[error("invalid id `{0}`: use lowercase letters, digits, `-` and `_` only")]

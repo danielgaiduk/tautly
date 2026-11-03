@@ -388,11 +388,14 @@ fn data_home_precedence_and_default_create_uses_it() {
     set("HOME", Some(home.path()));
     set("XDG_DATA_HOME", None);
     set("TAUTLY_HOME", None);
-    assert_eq!(paths::data_home(), home.path().join(".local/share/tautly"));
+    assert_eq!(
+        paths::data_home().unwrap(),
+        home.path().join(".local/share/tautly")
+    );
     set("XDG_DATA_HOME", Some(xdg.path()));
-    assert_eq!(paths::data_home(), xdg.path().join("tautly"));
+    assert_eq!(paths::data_home().unwrap(), xdg.path().join("tautly"));
     set("TAUTLY_HOME", Some(tautly.path()));
-    assert_eq!(paths::data_home(), tautly.path());
+    assert_eq!(paths::data_home().unwrap(), tautly.path());
 
     // The default constructors follow TAUTLY_HOME.
     let project = tempfile::tempdir().unwrap();
@@ -403,6 +406,55 @@ fn data_home_precedence_and_default_create_uses_it() {
 
     for (k, v) in saved {
         set(k, v.as_deref().map(Path::new));
+    }
+}
+
+#[test]
+fn data_home_must_be_absolute_never_cwd_relative() {
+    use std::ffi::OsString;
+    use std::path::PathBuf;
+    let env = |pairs: &'static [(&'static str, &'static str)]| {
+        let map: std::collections::HashMap<&str, OsString> =
+            pairs.iter().map(|(k, v)| (*k, OsString::from(v))).collect();
+        move |name: &str| map.get(name).cloned()
+    };
+    assert_eq!(
+        paths::data_home_from(env(&[("TAUTLY_HOME", "/t"), ("HOME", "/h")])).unwrap(),
+        PathBuf::from("/t")
+    );
+    assert_eq!(
+        paths::data_home_from(env(&[("XDG_DATA_HOME", "/x"), ("HOME", "/h")])).unwrap(),
+        PathBuf::from("/x/tautly")
+    );
+    assert_eq!(
+        paths::data_home_from(env(&[("HOME", "/h")])).unwrap(),
+        PathBuf::from("/h/.local/share/tautly")
+    );
+    assert_eq!(
+        paths::data_home_from(env(&[
+            ("TAUTLY_HOME", ""),
+            ("XDG_DATA_HOME", ""),
+            ("HOME", "/h")
+        ]))
+        .unwrap(),
+        PathBuf::from("/h/.local/share/tautly")
+    );
+    for pairs in [
+        &[][..],
+        &[("HOME", "")][..],
+        &[("HOME", "relative")][..],
+        &[("HOME", ".")][..],
+        &[("XDG_DATA_HOME", "rel"), ("HOME", "/h")][..],
+        &[("TAUTLY_HOME", "rel"), ("HOME", "/h")][..],
+        &[("TAUTLY_HOME", "../x")][..],
+    ] {
+        let pairs: &'static [(&'static str, &'static str)] =
+            Box::leak(pairs.to_vec().into_boxed_slice());
+        let err = paths::data_home_from(env(pairs)).unwrap_err();
+        assert!(
+            matches!(err, tautly_session::Error::DataHome(_)),
+            "{pairs:?}: {err}"
+        );
     }
 }
 
