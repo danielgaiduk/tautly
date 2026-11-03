@@ -806,3 +806,31 @@ pub(crate) fn match_error_message(subject: &str, what: &str, e: &MatchError) -> 
         ),
     }
 }
+
+#[cfg(test)]
+mod kind_tests {
+    use super::kind;
+    use crate::persist::ERROR_KINDS;
+
+    /// `ToolMeta` reads error kinds back by looking them up in `ERROR_KINDS`, so a kind
+    /// missing there would come back as `unknown`.
+    #[test]
+    fn every_edit_error_kind_is_deserializable() {
+        for k in [
+            kind::BAD_ARGS,
+            kind::IO,
+            kind::UNDECODABLE,
+            kind::NOT_READ,
+            kind::STALE,
+            kind::NOT_FOUND,
+            kind::AMBIGUOUS,
+            kind::MIXED_ARTIFACTS,
+            kind::SYNTAX,
+            kind::STALE_ANCHOR,
+            kind::INVALID_OPS,
+            kind::INVALID_PATCH,
+        ] {
+            assert!(ERROR_KINDS.contains(&k), "{k} missing from ERROR_KINDS");
+        }
+    }
+}

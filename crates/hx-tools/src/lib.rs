@@ -9,6 +9,7 @@ mod glob;
 mod grep;
 mod index_tools;
 mod memory_tools;
+mod persist;
 mod pin_state;
 mod read;
 mod reread;
@@ -26,6 +27,7 @@ use hx_index::Index;
 use hx_memory::MemoryStore;
 use hx_provider::{Capabilities, EditFormat, ToolSpec};
 use hx_sandbox::{Effect, FileMeta, Sandbox};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -38,6 +40,7 @@ pub use glob::GlobTool;
 pub use grep::GrepTool;
 pub use index_tools::{OutlineTool, RefsTool, SymbolTool};
 pub use memory_tools::{RecallTool, RememberTool};
+pub use persist::PersistedEffect;
 pub use pin_state::{
     ContextOp, MAX_PIN_BYTES, PinTool, PlanStep, StatePatch, StateTool, StepStatus,
     parse_context_op,
@@ -55,13 +58,15 @@ pub enum ToolError {
 
 /// A side effect a tool actually applied, reported to the engine. Paths are absolute and
 /// canonical (as the sandbox resolved them).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub enum AppliedEffect {
     /// One read target: `range` as requested (a symbol target: the symbol's lines),
     /// `file_hash` of the whole file, and how it was shown.
     Read {
         path: PathBuf,
         range: LineRange,
+        #[serde(with = "persist::hash_hex")]
         file_hash: blake3::Hash,
         shown: Shown,
     },
@@ -69,13 +74,16 @@ pub enum AppliedEffect {
     /// write; both are None when the write created it.
     Edited {
         path: PathBuf,
+        #[serde(with = "persist::b64_opt")]
         pre_image: Option<Vec<u8>>,
         pre_mode: Option<u32>,
+        #[serde(with = "persist::hash_hex")]
         post_hash: blake3::Hash,
     },
     /// A file was deleted; `pre_mode` holds its permission bits.
     Deleted {
         path: PathBuf,
+        #[serde(with = "persist::b64")]
         pre_image: Vec<u8>,
         pre_mode: u32,
     },
@@ -84,7 +92,8 @@ pub enum AppliedEffect {
 }
 
 /// How a read target was shown, which tells the engine what the output depends on.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub enum Shown {
     /// The requested lines in full; this output is now the target's re-read baseline.
     Full,
@@ -98,12 +107,13 @@ pub enum Shown {
 }
 
 /// Structured facts about a result, so the engine never parses `output`.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 #[non_exhaustive]
 pub struct ToolMeta {
     /// A command's exit code (signals as 128 + n); None when it was killed or never ran.
     pub exit_code: Option<i32>,
     /// A stable name for why the call failed (e.g. `not_found`, `ambiguous`, `stale`).
+    /// Read back from a log, a name this version does not know becomes `unknown`.
     pub error_kind: Option<&'static str>,
 }
 
@@ -142,7 +152,7 @@ impl ToolResult {
 
 /// The lines of a file a read asked for: 1-based, inclusive, `None` = open end.
 /// Two reads are "the same read" when their ranges are equal.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct LineRange {
     pub start: Option<usize>,
     pub end: Option<usize>,
