@@ -69,6 +69,8 @@ pub struct SignalRouter {
 struct RouterState {
     engines: Vec<Registered>,
     policy: SignalPolicy,
+    /// `Shutdown` was sent, or an engine could not take a command: the next signal
+    /// escalates.
     shutdown_sent: bool,
 }
 
@@ -89,42 +91,44 @@ impl SignalRouter {
     /// Route signals to `engine` too (held weakly: never keeps it alive). A new session
     /// means the process goes on, so an earlier `Shutdown` no longer escalates.
     pub fn add(&self, engine: &Engine) {
+        self.add_channel(engine.weak_commands(), engine.process_groups().clone());
+    }
+
+    fn add_channel(&self, commands: mpsc::WeakSender<Command>, groups: ProcessGroups) {
         let mut st = self.lock();
-        st.engines.push(Registered {
-            commands: engine.weak_commands(),
-            groups: engine.process_groups().clone(),
-        });
+        st.engines.push(Registered { commands, groups });
         st.shutdown_sent = false;
     }
 
-    /// Act on one signal.
+    /// Act on one signal. Never waits: a command is handed over with `try_send`, and an
+    /// engine whose command channel is full counts as stuck, so the next signal escalates.
     pub async fn deliver(&self, sig: Signal) {
-        let (cmd, targets) = {
-            let mut st = self.lock();
-            let alive: Vec<_> = st
-                .engines
-                .iter()
-                .filter_map(|e| e.commands.upgrade())
-                .collect();
-            if st.shutdown_sent || alive.is_empty() {
-                for e in &st.engines {
-                    e.groups.kill_all_now();
-                }
-                st.engines.clear();
-                drop(st);
-                (self.escalate)(sig);
-                return;
+        let mut st = self.lock();
+        let alive: Vec<_> = st
+            .engines
+            .iter()
+            .filter_map(|e| e.commands.upgrade())
+            .collect();
+        if st.shutdown_sent || alive.is_empty() {
+            for e in &st.engines {
+                e.groups.kill_all_now();
             }
-            st.engines.retain(|e| e.commands.upgrade().is_some());
-            let cmd = st.policy.command(sig, Instant::now());
-            if cmd == Command::Shutdown {
-                st.shutdown_sent = true;
+            st.engines.clear();
+            drop(st);
+            (self.escalate)(sig);
+            return;
+        }
+        st.engines.retain(|e| e.commands.upgrade().is_some());
+        let cmd = st.policy.command(sig, Instant::now());
+        let mut stuck = false;
+        for tx in alive {
+            // A closed channel (stopped meanwhile) is skipped; a full one is stuck.
+            if let Err(mpsc::error::TrySendError::Full(_)) = tx.try_send(cmd.clone()) {
+                stuck = true;
             }
-            (cmd, alive)
-        };
-        for tx in targets {
-            // An engine that stopped meanwhile is simply skipped.
-            let _ = tx.send(cmd.clone()).await;
+        }
+        if cmd == Command::Shutdown || stuck {
+            st.shutdown_sent = true;
         }
     }
 
@@ -133,41 +137,55 @@ impl SignalRouter {
     }
 }
 
-/// The process-wide router behind [`install_signal_handlers`].
-static INSTALLED: Mutex<Option<Arc<SignalRouter>>> = Mutex::new(None);
+/// The process-wide router behind [`install_signal_handlers`], and its listener task.
+static INSTALLED: Mutex<Option<(Arc<SignalRouter>, JoinHandle<()>)>> = Mutex::new(None);
 
-/// Install the process-wide SIGINT, SIGTERM and SIGHUP listener (once; it lives as long as
-/// the process) and route signals to `engine` as well. Must be called inside a Tokio
-/// runtime. While installed these signals no longer end the process by themselves; the
-/// escalation (see [`SignalRouter`]) does. A client must not end the process with
+/// Install the process-wide SIGINT, SIGTERM and SIGHUP listener and route signals to
+/// `engine` as well. Must be called inside a Tokio runtime.
+///
+/// The listener runs on the runtime of the call that started it. If that runtime ends while
+/// the process goes on, signals stay captured but undelivered until the next call, which
+/// starts the listener again on its own runtime. For the CLI and the RPC server (one
+/// runtime for the life of the process) it simply lives as long as the process.
+///
+/// While installed these signals no longer end the process by themselves; the escalation
+/// (see [`SignalRouter`]) does. A client must not end the process with
 /// `std::process::exit` before an engine's event stream has closed: that skips the
 /// session's shutdown, including the end of its process groups.
 pub fn install_signal_handlers(engine: &Engine) -> std::io::Result<()> {
     let mut installed = INSTALLED.lock().unwrap_or_else(PoisonError::into_inner);
-    let router = match &*installed {
-        Some(r) => Arc::clone(r),
-        None => {
-            let int = signal(SignalKind::interrupt())?;
-            let term = signal(SignalKind::terminate())?;
-            let hup = signal(SignalKind::hangup())?;
-            let signals =
-                futures::stream::unfold((int, term, hup), |(mut int, mut term, mut hup)| async {
-                    let sig = tokio::select! {
-                        Some(()) = int.recv() => Signal::Interrupt,
-                        Some(()) = term.recv() => Signal::Terminate,
-                        Some(()) = hup.recv() => Signal::Hangup,
-                        else => return None,
-                    };
-                    Some((sig, (int, term, hup)))
-                });
-            let router = SignalRouter::new(die_by);
-            drop(handle_signals(&router, signals));
-            *installed = Some(Arc::clone(&router));
+    let router = match installed.take() {
+        Some((router, listener)) if !listener.is_finished() => {
+            *installed = Some((Arc::clone(&router), listener));
+            router
+        }
+        // Never started, or its runtime is gone: start it here.
+        earlier => {
+            let router = earlier.map_or_else(|| SignalRouter::new(die_by), |(r, _)| r);
+            let listener = listen(&router)?;
+            *installed = Some((Arc::clone(&router), listener));
             router
         }
     };
     router.add(engine);
     Ok(())
+}
+
+/// The real signals, fed to `router`.
+fn listen(router: &Arc<SignalRouter>) -> std::io::Result<JoinHandle<()>> {
+    let int = signal(SignalKind::interrupt())?;
+    let term = signal(SignalKind::terminate())?;
+    let hup = signal(SignalKind::hangup())?;
+    let signals = futures::stream::unfold((int, term, hup), |(mut int, mut term, mut hup)| async {
+        let sig = tokio::select! {
+            Some(()) = int.recv() => Signal::Interrupt,
+            Some(()) = term.recv() => Signal::Terminate,
+            Some(()) = hup.recv() => Signal::Hangup,
+            else => return None,
+        };
+        Some((sig, (int, term, hup)))
+    });
+    Ok(handle_signals(router, signals))
 }
 
 /// Feed `signals` to `router` until the stream ends.
@@ -224,6 +242,32 @@ mod tests {
             p.command(Signal::Interrupt, t + Duration::from_millis(3000)),
             Command::Shutdown
         );
+    }
+
+    #[tokio::test]
+    async fn a_full_command_channel_never_stalls_the_router() {
+        let escalated = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&escalated);
+        let router = SignalRouter::new(move |sig| seen.lock().unwrap().push(sig));
+        // An engine that takes no commands: its channel is full.
+        let (tx, _rx) = mpsc::channel(1);
+        tx.try_send(Command::Cancel).unwrap();
+        router.add_channel(tx.downgrade(), ProcessGroups::default());
+        let quick = |sig| {
+            let router = Arc::clone(&router);
+            async move {
+                tokio::time::timeout(Duration::from_millis(200), router.deliver(sig))
+                    .await
+                    .is_ok()
+            }
+        };
+        assert!(
+            quick(Signal::Interrupt).await,
+            "the router waited on a full channel"
+        );
+        // The command could not be handed over: the next signal ends the process.
+        assert!(quick(Signal::Interrupt).await);
+        assert_eq!(*escalated.lock().unwrap(), [Signal::Interrupt]);
     }
 
     #[test]

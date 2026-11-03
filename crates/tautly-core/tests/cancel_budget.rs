@@ -1156,9 +1156,19 @@ fn signal_child() {
     };
     let sig = match mode.as_str() {
         "int" => libc::SIGINT,
-        "term" => libc::SIGTERM,
+        "term" | "rt" => libc::SIGTERM,
         _ => libc::SIGHUP,
     };
+    if mode == "rt" {
+        // The first session installs the listener on a runtime that then ends.
+        let first = tokio::runtime::Runtime::new().unwrap();
+        first.block_on(async {
+            let fx = Fx::new();
+            let run = start(fx.builder(config(false), &MockProvider::new(vec![])));
+            install_signal_handlers(&run.engine).unwrap();
+        });
+        drop(first);
+    }
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {
         let fx = Fx::new();
@@ -1190,6 +1200,8 @@ fn real_signals_end_the_process_after_shutdown() {
         ("int", libc::SIGINT),
         ("term", libc::SIGTERM),
         ("hup", libc::SIGHUP),
+        // A listener whose runtime ended is started again on the next install.
+        ("rt", libc::SIGTERM),
     ] {
         let out = std::process::Command::new(&exe)
             .args(["--ignored", "--exact", "signal_child", "--nocapture"])
