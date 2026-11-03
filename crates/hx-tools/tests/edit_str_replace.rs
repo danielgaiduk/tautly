@@ -199,6 +199,16 @@ async fn not_found_shows_nearest_window_with_line_numbers() {
 }
 
 #[tokio::test]
+async fn edit_of_bom_file_accepts_line_one_copied_from_read() {
+    let e = env();
+    put(&e, "a.txt", "\u{FEFF}a\r\nb".as_bytes()).await;
+    read(&e, "a.txt").await;
+    let r = edit(&e, "a.txt", "\u{FEFF}a", "\u{FEFF}x").await;
+    assert!(!r.is_error, "{}", r.output);
+    assert_eq!(slurp(&e, "a.txt").await, "\u{FEFF}x\r\nb".as_bytes());
+}
+
+#[tokio::test]
 async fn ambiguous_edit_lists_lines() {
     let e = env();
     put(&e, "a.rs", b"x\ny\nx\n").await;
@@ -409,11 +419,56 @@ fn whitespace_stage_when_indentation_is_not_a_uniform_offset() {
 }
 
 #[test]
-fn whitespace_repair_keeps_the_files_first_line_indentation() {
+fn whitespace_repair_maps_relative_indentation_onto_the_files_first_line() {
+    // The model's block starts at column 2, the file's at 4: every replacement line keeps
+    // its offset from the first line, applied to the file's indentation.
     let text = "fn f() {\n    foo(\n      b);\n}\n";
-    let (out, stage) = apply_staged(text, "  foo(\n b);", "  bar(\n b);").unwrap();
+    let (out, stage) = apply_staged(text, "  foo(\n b);", "  bar(\n    b);").unwrap();
     assert_eq!(stage, RepairStage::Whitespace);
-    assert_eq!(out, "fn f() {\n    bar(\n b);\n}\n");
+    assert_eq!(out, "fn f() {\n    bar(\n      b);\n}\n");
+}
+
+#[test]
+fn whitespace_repair_converts_indent_style_to_the_files() {
+    // Tab-indented file, model wrote the same block with 4-space indentation.
+    let text = "fn f() {\n\tif x {\n\t\ty();\n\t}\n}\n";
+    let old = "    if x {\n        y();\n    }";
+    let new = "    if x {\n        z();\n    }";
+    let (out, stage) = apply_staged(text, old, new).unwrap();
+    assert_eq!(stage, RepairStage::Whitespace);
+    assert_eq!(out, "fn f() {\n\tif x {\n\t\tz();\n\t}\n}\n");
+
+    // And the other way: space-indented file, model used tabs.
+    let text = "fn f() {\n    if x {\n        y();\n    }\n}\n";
+    let old = "\tif x {\n\t\ty();\n\t}";
+    let new = "\tif x {\n\t\tz();\n\t}";
+    let (out, _) = apply_staged(text, old, new).unwrap();
+    assert_eq!(out, "fn f() {\n    if x {\n        z();\n    }\n}\n");
+}
+
+#[test]
+fn anchor_repair_reindents_replacement_to_the_files_indentation() {
+    let steps: Vec<String> = (0..11).map(|i| format!("step_{i}();")).collect();
+    let file_body: String = steps.iter().map(|l| format!("        {l}\n")).collect();
+    let text = format!("    fn a() {{\n{file_body}    }}\n");
+    // Model block at column 0 with one typo in the interior.
+    let mut typo = steps.clone();
+    typo[4] = "stepp_4();".to_string();
+    let old_body: String = typo.iter().map(|l| format!("    {l}\n")).collect();
+    let old = format!("fn a() {{\n{old_body}}}");
+    let (out, stage) = apply_staged(&text, &old, "fn a() {\n    new();\n}").unwrap();
+    assert_eq!(stage, RepairStage::Anchor);
+    assert_eq!(out, "    fn a() {\n        new();\n    }\n");
+}
+
+#[test]
+fn strips_bom_from_the_models_text() {
+    let loc = locate("a\nb\n", "\u{FEFF}a").unwrap();
+    assert_eq!(loc.stage, RepairStage::Normalized);
+    assert_eq!(loc.range, 0..1);
+    // The BOM the model copied into new_text is not written into the file body.
+    let (out, _) = apply_staged("a\nb\n", "\u{FEFF}a", "\u{FEFF}x").unwrap();
+    assert_eq!(out, "x\nb\n");
 }
 
 #[test]
@@ -514,13 +569,13 @@ fn not_found_includes_nearest_window_max_20_lines() {
     };
     assert_eq!(nearest, Some((3, "3\tc\n4\td".to_string())));
 
-    // Nothing resembling the old text: no window is offered.
+    // Nothing resembling the old text: no candidates, but the nearest window is still shown.
     let err = locate("aaaa\nbbbb\n", "zzzzzzzz\nqqqqqqqq").unwrap_err();
     assert_eq!(
         err,
         MatchError::NotFound {
             candidates: vec![],
-            nearest: None
+            nearest: Some((1, "1\taaaa\n2\tbbbb".to_string()))
         }
     );
 }

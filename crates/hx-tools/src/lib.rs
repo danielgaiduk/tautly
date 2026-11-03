@@ -161,10 +161,10 @@ pub trait Tool: Send + Sync {
 pub fn registry(_caps: &Capabilities) -> Vec<Arc<dyn Tool>> {
     vec![
         Arc::new(ReadTool),
-        Arc::new(WriteTool),
         Arc::new(EditTool),
+        Arc::new(WriteTool),
+        Arc::new(BashTool),
         Arc::new(GrepTool),
         Arc::new(GlobTool),
-        Arc::new(BashTool),
     ]
 }

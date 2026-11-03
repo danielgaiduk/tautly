@@ -23,8 +23,6 @@ const MAX_WINDOW_LINES: usize = 20;
 const ANCHOR_SIMILARITY: f32 = 0.9;
 /// Window similarity needed to be offered as a candidate location.
 const CANDIDATE_SCORE: f32 = 0.6;
-/// Window similarity needed to be shown as the nearest window.
-const NEAREST_SCORE: f32 = 0.3;
 const MAX_CANDIDATES: usize = 5;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,8 +54,9 @@ pub struct Located {
     /// Byte range in the searched text to replace.
     pub range: Range<usize>,
     pub stage: RepairStage,
-    /// Indentation columns to add (or, when negative, remove) on every non-blank line of
-    /// the replacement so it fits where the match was found.
+    /// Set when the model's block is indented by one uniform number of columns more
+    /// (negative: fewer) than the file's matched lines. [`adapt_new_text`] already applies
+    /// this to the replacement, so it is informational.
     pub reindent: Option<isize>,
 }
 
@@ -95,16 +94,8 @@ pub fn locate(text: &str, old: &str) -> Result<Located, MatchError> {
             [] => {}
             &[s] => {
                 let offset = uniform_offset(&file, s, &want);
-                let first = file.start(s);
-                // Re-indented replacements carry their own indentation; otherwise the
-                // first line's indentation stays in place.
-                let start = if offset.is_some() {
-                    first
-                } else {
-                    first + leading_ws_len(file.line(s))
-                };
                 return Ok(Located {
-                    range: start..file.end_of(s + m - 1, had_newline),
+                    range: file.start(s)..file.end_of(s + m - 1, had_newline),
                     stage: if offset.is_some() {
                         RepairStage::Indentation
                     } else {
@@ -132,8 +123,7 @@ pub fn locate(text: &str, old: &str) -> Result<Located, MatchError> {
                     && interior_similarity(&file, i + 1..j, &want, 1..m - 1) >= ANCHOR_SIMILARITY
                 {
                     return Ok(Located {
-                        range: file.start(i) + leading_ws_len(file.line(i))
-                            ..file.end_of(j, had_newline),
+                        range: file.start(i)..file.end_of(j, had_newline),
                         stage: RepairStage::Anchor,
                         reindent: None,
                     });
@@ -151,45 +141,129 @@ pub fn locate(text: &str, old: &str) -> Result<Located, MatchError> {
 
 /// The replacement text to splice in for a match found at `stage`. The model's text is
 /// brought in line with how its `old` text was repaired: CRLF always becomes LF (the
-/// file is matched and edited as LF), copied line-number artifacts are stripped when
-/// they were stripped from `old`, and typographic quotes/dashes become ASCII when `old`
-/// had them but the matched file text has none.
+/// file is matched and edited as LF), copied line-number artifacts and BOMs are stripped
+/// when they were stripped from `old`, typographic quotes/dashes become ASCII when `old`
+/// had them but the matched file text has none, and for the line-based stages the block
+/// is re-indented to where it sits in the file ([`reindent_to_match`]).
 pub fn adapt_new_text(old: &str, new: &str, matched: &str, stage: RepairStage) -> String {
     let mut out = new.replace("\r\n", "\n");
     if stage == RepairStage::Exact {
         return out;
     }
-    if normalize_old(old).stripped_artifacts {
+    let norm = normalize_old(old);
+    if norm.stripped_artifacts {
         if let Some(stripped) = strip_artifacts(&out) {
             out = stripped;
         }
     }
+    if old.contains('\u{FEFF}') {
+        out = out.replace('\u{FEFF}', "");
+    }
     if old.chars().any(is_typographic) && !matched.chars().any(is_typographic) {
         out = fold_typography(&out);
+    }
+    if matches!(
+        stage,
+        RepairStage::Whitespace | RepairStage::Indentation | RepairStage::Anchor
+    ) {
+        out = reindent_to_match(&out, &norm.text, matched);
     }
     out
 }
 
-/// Shift the indentation of every non-blank line of `text` by `offset` columns. Added
-/// indentation uses the character (tab or space) the `matched` file text indents with.
-pub fn reindent(text: &str, offset: isize, matched: &str) -> String {
-    let pad = matched
-        .lines()
-        .find(|l| !l.trim().is_empty())
-        .and_then(|l| l.chars().next())
-        .filter(|c| *c == '\t')
-        .unwrap_or(' ');
-    let amount = offset.unsigned_abs();
-    text.split('\n')
+/// Columns a tab counts for when comparing indentation.
+const TAB_COLS: usize = 4;
+
+fn leading_ws(line: &str) -> &str {
+    &line[..leading_ws_len(line)]
+}
+
+fn indent_cols(ws: &str) -> usize {
+    ws.chars()
+        .map(|c| if c == '\t' { TAB_COLS } else { 1 })
+        .sum()
+}
+
+fn first_content_line(text: &str) -> Option<&str> {
+    text.split('\n').find(|l| !l.trim().is_empty())
+}
+
+/// Whether the first indented non-blank line among `texts` is tab-indented.
+fn indents_with_tabs(texts: &[&str]) -> Option<bool> {
+    texts
+        .iter()
+        .flat_map(|t| t.split('\n'))
+        .filter(|l| !l.trim().is_empty())
+        .map(leading_ws)
+        .find(|ws| !ws.is_empty())
+        .map(|ws| ws.starts_with('\t'))
+}
+
+/// The smallest step between distinct indentation widths used in `texts`.
+fn indent_unit(texts: &[&str]) -> Option<usize> {
+    let mut widths: Vec<usize> = texts
+        .iter()
+        .flat_map(|t| t.split('\n'))
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| indent_cols(leading_ws(l)))
+        .collect();
+    widths.sort_unstable();
+    widths.dedup();
+    widths.windows(2).map(|w| w[1] - w[0]).min()
+}
+
+/// Re-indent `new` (the model's replacement, indented as the model believed `old_norm`
+/// to be) to where `matched` sits in the file. Each line keeps its indentation relative
+/// to the first line of the model's `old` block, applied to the indentation of the
+/// file's first matched line, and is written in the file's style: tabs or spaces,
+/// converting whole indentation levels when the model used the other one.
+pub fn reindent_to_match(new: &str, old_norm: &str, matched: &str) -> String {
+    let (Some(old_first), Some(file_first)) =
+        (first_content_line(old_norm), first_content_line(matched))
+    else {
+        return new.to_string();
+    };
+    let old_base = indent_cols(leading_ws(old_first)) as isize;
+    let file_base = indent_cols(leading_ws(file_first));
+    let model_tabs = indents_with_tabs(&[old_norm, new]);
+    let file_tabs = indents_with_tabs(&[matched]);
+    // With no indentation anywhere in the file block, follow the model's style.
+    let to_tabs = file_tabs.or(model_tabs).unwrap_or(false);
+    let convert = model_tabs.is_some_and(|m| m != to_tabs);
+    let model_unit = match model_tabs {
+        Some(true) => TAB_COLS,
+        _ => indent_unit(&[old_norm, new]).unwrap_or(TAB_COLS),
+    };
+    let file_unit = if to_tabs {
+        TAB_COLS
+    } else {
+        indent_unit(&[matched]).unwrap_or(model_unit)
+    };
+
+    new.split('\n')
         .map(|line| {
             if line.trim().is_empty() {
-                line.to_string()
-            } else if offset > 0 {
-                format!("{}{line}", pad.to_string().repeat(amount))
-            } else {
-                let strip = leading_ws_len(line).min(amount);
-                line[strip..].to_string()
+                return line.to_string();
             }
+            let rel = indent_cols(leading_ws(line)) as isize - old_base;
+            let cols = if convert {
+                // Whole levels: model levels become the file's level width.
+                let levels = (rel as f64 / model_unit as f64).round() as isize;
+                file_base as isize + levels * file_unit as isize
+            } else {
+                file_base as isize + rel
+            };
+            let cols = cols.max(0) as usize;
+            let indent = if to_tabs {
+                format!(
+                    "{}{}",
+                    "\t".repeat(cols / TAB_COLS),
+                    " ".repeat(cols % TAB_COLS)
+                )
+            } else {
+                " ".repeat(cols)
+            };
+            format!("{indent}{}", &line[leading_ws_len(line)..])
         })
         .collect::<Vec<_>>()
         .join("\n")
@@ -238,10 +312,10 @@ struct Normalized {
     stripped_artifacts: bool,
 }
 
-/// Stage 1: CRLF to LF, typographic characters to ASCII, trailing whitespace stripped
+/// Stage 1: CRLF to LF, BOMs dropped (the file is matched without its BOM), typographic characters to ASCII, trailing whitespace stripped
 /// per line, `read` artifacts removed.
 fn normalize_old(old: &str) -> Normalized {
-    let text = fold_typography(&old.replace("\r\n", "\n"));
+    let text = fold_typography(&old.replace("\r\n", "\n").replace('\u{FEFF}', ""));
     let text = text
         .split('\n')
         .map(str::trim_end)
@@ -383,16 +457,16 @@ fn leading_ws_len(line: &str) -> usize {
     line.len() - line.trim_start_matches([' ', '\t']).len()
 }
 
-/// The indentation offset, in columns, between the model's block and the file window at
-/// `start`, if every non-blank line differs by the same non-zero amount.
+/// The indentation offset, in columns, of the file window at `start` relative to the
+/// model's block, if every non-blank line differs by the same non-zero amount.
 fn uniform_offset(file: &Lines<'_>, start: usize, want: &Lines<'_>) -> Option<isize> {
     let mut offset = None;
     for i in 0..want.len() {
-        let (old, new) = (want.line(i), file.line(start + i));
-        if old.trim().is_empty() {
+        let (model, actual) = (want.line(i), file.line(start + i));
+        if model.trim().is_empty() {
             continue;
         }
-        let d = leading_ws_len(new) as isize - leading_ws_len(old) as isize;
+        let d = indent_cols(leading_ws(actual)) as isize - indent_cols(leading_ws(model)) as isize;
         if *offset.get_or_insert(d) != d {
             return None;
         }
@@ -457,16 +531,14 @@ fn nearest_windows(file: &Lines<'_>, want: &Lines<'_>) -> (Vec<usize>, Option<(u
     }
     candidates.sort_unstable();
 
-    let nearest = scores
-        .first()
-        .filter(|(_, score)| *score >= NEAREST_SCORE)
-        .map(|&(s, _)| {
-            let shown = (s..s + w)
-                .map(|i| format!("{}\t{}", i + 1, file.line(i)))
-                .collect::<Vec<_>>()
-                .join("\n");
-            (s + 1, shown)
-        });
+    // Always offered (spec 7.9), however weak the resemblance.
+    let nearest = scores.first().map(|&(s, _)| {
+        let shown = (s..s + w)
+            .map(|i| format!("{}\t{}", i + 1, file.line(i)))
+            .collect::<Vec<_>>()
+            .join("\n");
+        (s + 1, shown)
+    });
     (candidates.into_iter().map(|s| s + 1).collect(), nearest)
 }
 

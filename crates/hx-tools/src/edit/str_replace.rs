@@ -1,6 +1,6 @@
 //! `str_replace`: locate `old` (tolerantly) and splice in `new`.
 
-use super::tolerant::{RepairStage, adapt_new_text, locate, reindent};
+use super::tolerant::{RepairStage, adapt_new_text, locate};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MatchError {
@@ -23,13 +23,7 @@ pub fn apply(text: &str, old: &str, new: &str) -> Result<String, MatchError> {
 pub fn apply_staged(text: &str, old: &str, new: &str) -> Result<(String, RepairStage), MatchError> {
     let loc = locate(text, old)?;
     let matched = &text[loc.range.clone()];
-    let mut replacement = adapt_new_text(old, new, matched, loc.stage);
-    if let Some(offset) = loc.reindent {
-        replacement = reindent(&replacement, offset, matched);
-    } else if matches!(loc.stage, RepairStage::Whitespace | RepairStage::Anchor) {
-        // These ranges start after the first line's indentation, which stays in place.
-        replacement = replacement.trim_start_matches([' ', '\t']).to_string();
-    }
+    let replacement = adapt_new_text(old, new, matched, loc.stage);
     let mut out = String::with_capacity(text.len() + replacement.len());
     out.push_str(&text[..loc.range.start]);
     out.push_str(&replacement);
