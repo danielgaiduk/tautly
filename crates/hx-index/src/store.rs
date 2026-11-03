@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock};
 use std::time::Duration;
 
 use hx_sandbox::Sandbox;
@@ -11,10 +11,21 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use tokio::task::JoinHandle;
 
 use crate::lang::Lang;
+use crate::tree::{SharedTree, TreeData};
 
-/// Version written by this build; bump and add a `migrate` arm when the schema changes.
-const SCHEMA_VERSION: i64 = 1;
+/// Version written by this build; bump and append a [`MIGRATIONS`] step when the schema
+/// changes.
+const SCHEMA_VERSION: i64 = 2;
+/// The oldest version a migration path exists from.
+const OLDEST_MIGRATABLE: i64 = 1;
+/// Version of everything derived from file content (symbols, references, trigrams).
+/// Bump it when an extractor changes: a refresh that finds a different value in the
+/// database reparses every file instead of trusting content hashes.
+const EXTRACTOR_VERSION: &str = "2";
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+/// SQLite's default page cache, and the one used while refreshing, in KiB.
+const DEFAULT_CACHE_KIB: i64 = 2000;
+const BULK_CACHE_KIB: i64 = 64 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SymbolKind {
@@ -92,9 +103,11 @@ pub enum IndexError {
     #[error("index database has schema version {found}, this build understands {SCHEMA_VERSION}")]
     SchemaTooNew { found: i64 },
     #[error(
-        "index database has schema version {found}, older than the oldest supported ({SCHEMA_VERSION}); delete it to rebuild"
+        "index database has schema version {found}, older than the oldest migratable version ({OLDEST_MIGRATABLE}); delete it to rebuild"
     )]
     SchemaTooOld { found: i64 },
+    #[error("file watcher error: {0}")]
+    Watch(#[from] notify::Error),
     #[error("background task failed: {0}")]
     Task(String),
 }
@@ -110,13 +123,19 @@ pub(crate) struct KnownFile {
 /// the references sit on.
 pub(crate) struct ParsedFile {
     pub path: String,
+    /// Empty for a file over the size cap, which is never read.
     pub hash: String,
     pub mtime: i64,
     pub size: i64,
-    pub lang: Lang,
+    /// None for extensions without a grammar.
+    pub lang: Option<Lang>,
+    /// UTF-8 text within the size cap: has trigrams (possibly none, if tiny).
+    pub text: bool,
     pub symbols: Vec<SymbolRow>,
     pub refs: Vec<(u32, String)>,
     pub lines: Vec<(u32, String)>,
+    /// Distinct trigrams of the content (see [`crate::trigram::trigrams`]).
+    pub trigrams: Vec<u32>,
 }
 
 pub(crate) struct Inner {
@@ -124,6 +143,7 @@ pub(crate) struct Inner {
     pub sb: Arc<dyn Sandbox>,
     ready: AtomicBool,
     last_error: Mutex<Option<String>>,
+    tree: SharedTree,
 }
 
 /// Incremental symbol and reference index of the sandbox root, persisted in SQLite.
@@ -147,12 +167,14 @@ impl Index {
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.pragma_update_and_check(None, "journal_mode", "WAL", |_| Ok(()))?;
         migrate(&mut conn)?;
+        let tree = load_tree(&conn)?;
         Ok(Index {
             inner: Arc::new(Inner {
                 conn: Mutex::new(conn),
                 sb,
                 ready: AtomicBool::new(false),
                 last_error: Mutex::new(None),
+                tree: RwLock::new(tree),
             }),
         })
     }
@@ -308,6 +330,61 @@ impl Inner {
         self.conn.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
+    /// Run `f` with the connection locked.
+    pub fn with_conn<R>(&self, f: impl FnOnce(&Connection) -> R) -> R {
+        f(&self.conn())
+    }
+
+    pub fn tree(&self) -> &SharedTree {
+        &self.tree
+    }
+
+    /// Files whose content the trigram index cannot vouch for.
+    pub fn opaque_files(&self) -> Vec<String> {
+        let tree = self.tree.read().unwrap_or_else(PoisonError::into_inner);
+        tree.opaque().cloned().collect()
+    }
+
+    /// Whether the stored extractor version differs from this build's, so that no
+    /// content hash can be trusted to mean "already extracted".
+    pub fn extractor_changed(&self) -> Result<bool, IndexError> {
+        let stored: Option<String> = self
+            .conn()
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'extractor_version'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(stored.as_deref() != Some(EXTRACTOR_VERSION))
+    }
+
+    pub fn record_extractor_version(&self) -> Result<(), IndexError> {
+        self.conn().execute(
+            "INSERT INTO meta (key, value) VALUES ('extractor_version', ?1) \
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            [EXTRACTOR_VERSION],
+        )?;
+        Ok(())
+    }
+
+    /// Give SQLite a large page cache for the duration of a bulk refresh (the postings
+    /// b-tree is far bigger than the default 2 MB cache, and cache misses dominate the
+    /// build), then hand the memory back so an idle index stays small.
+    pub fn set_bulk_cache(&self, on: bool) -> Result<(), IndexError> {
+        let conn = self.conn();
+        let kib: i64 = if on {
+            -BULK_CACHE_KIB
+        } else {
+            -DEFAULT_CACHE_KIB
+        };
+        conn.pragma_update(None, "cache_size", kib)?;
+        if !on {
+            conn.execute_batch("PRAGMA shrink_memory")?;
+        }
+        Ok(())
+    }
+
     pub fn mark_ready(&self) {
         self.ready.store(true, Ordering::Release);
     }
@@ -390,7 +467,7 @@ impl Inner {
             .optional()?)
     }
 
-    /// Apply one batch of changes in a single transaction.
+    /// Apply one batch of changes in a single transaction, then mirror it in the tree.
     pub fn apply(
         &self,
         parsed: &[ParsedFile],
@@ -400,8 +477,13 @@ impl Inner {
         let mut conn = self.conn();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         {
+            // Postings carry no foreign key (they point at a rowid), so they go first.
+            let mut delete_tris = tx.prepare_cached(
+                "DELETE FROM trigrams WHERE file_id = (SELECT rowid FROM files WHERE path = ?1)",
+            )?;
             let mut delete = tx.prepare_cached("DELETE FROM files WHERE path = ?1")?;
             for path in removed {
+                delete_tris.execute([path])?;
                 delete.execute([path])?;
             }
             let mut touch =
@@ -410,7 +492,8 @@ impl Inner {
                 touch.execute(params![path, mtime, size])?;
             }
             let mut insert_file = tx.prepare_cached(
-                "INSERT INTO files (path, hash, mtime, size, lang) VALUES (?1, ?2, ?3, ?4, ?5)",
+                "INSERT INTO files (path, hash, mtime, size, lang, text) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             )?;
             let mut insert_symbol = tx.prepare_cached(
                 "INSERT INTO symbols \
@@ -421,9 +504,21 @@ impl Inner {
                 tx.prepare_cached("INSERT INTO refs (file, line, name) VALUES (?1, ?2, ?3)")?;
             let mut insert_line =
                 tx.prepare_cached("INSERT INTO ref_lines (file, line, text) VALUES (?1, ?2, ?3)")?;
+            let mut insert_tri =
+                tx.prepare_cached("INSERT INTO trigrams (tri, file_id) VALUES (?1, ?2)")?;
+            let mut postings: Vec<u64> = Vec::new();
             for f in parsed {
+                delete_tris.execute([&f.path])?;
                 delete.execute([&f.path])?;
-                insert_file.execute(params![f.path, f.hash, f.mtime, f.size, f.lang.as_str()])?;
+                insert_file.execute(params![
+                    f.path,
+                    f.hash,
+                    f.mtime,
+                    f.size,
+                    f.lang.map_or("other", Lang::as_str),
+                    f.text
+                ])?;
+                let file_id = tx.last_insert_rowid();
                 for s in &f.symbols {
                     insert_symbol.execute(params![
                         f.path,
@@ -442,11 +537,56 @@ impl Inner {
                 for (line, text) in &f.lines {
                     insert_line.execute(params![f.path, line, text])?;
                 }
+                postings.extend(f.trigrams.iter().map(|t| pack_posting(*t, file_id)));
+            }
+            // In key order, so the postings b-tree is appended to rather than hit at
+            // random.
+            postings.sort_unstable();
+            for p in postings {
+                insert_tri.execute(params![p >> POSTING_ID_BITS, p & POSTING_ID_MASK])?;
             }
         }
         tx.commit()?;
+        let mut tree = self.tree.write().unwrap_or_else(PoisonError::into_inner);
+        for path in removed {
+            tree.remove(path);
+        }
+        for (path, mtime, size) in touched {
+            tree.touch(path, *size, *mtime);
+        }
+        for f in parsed {
+            tree.insert(f.path.clone(), f.size, f.mtime, &f.hash, f.text);
+        }
         Ok(())
     }
+}
+
+const POSTING_ID_BITS: u32 = 40;
+const POSTING_ID_MASK: u64 = (1 << POSTING_ID_BITS) - 1;
+
+/// A posting as one sortable integer: trigram in the high bits, file id below.
+fn pack_posting(tri: u32, file_id: i64) -> u64 {
+    (u64::from(tri) << POSTING_ID_BITS) | (file_id as u64 & POSTING_ID_MASK)
+}
+
+/// The tree as the database remembers it.
+fn load_tree(conn: &Connection) -> Result<TreeData, IndexError> {
+    let mut tree = TreeData::default();
+    let mut stmt = conn.prepare("SELECT path, size, mtime, hash, text FROM files")?;
+    let rows = stmt.query_map([], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, i64>(1)?,
+            r.get::<_, i64>(2)?,
+            r.get::<_, String>(3)?,
+            r.get::<_, bool>(4)?,
+        ))
+    })?;
+    for row in rows {
+        let (path, size, mtime, hash, text) = row?;
+        tree.insert(path, size, mtime, &hash, text);
+    }
+    Ok(tree)
 }
 
 fn migrate(conn: &mut Connection) -> Result<(), IndexError> {
@@ -457,11 +597,10 @@ fn migrate(conn: &mut Connection) -> Result<(), IndexError> {
         .optional()?;
     match found {
         None => {
+            // A new database is created at v1 and migrated like any other.
             tx.execute_batch(SCHEMA_V1)?;
-            tx.execute(
-                "INSERT INTO schema_version (version) VALUES (?1)",
-                [SCHEMA_VERSION],
-            )?;
+            tx.execute("INSERT INTO schema_version (version) VALUES (1)", [])?;
+            upgrade(&tx, 1)?;
         }
         Some(found) if found > SCHEMA_VERSION => return Err(IndexError::SchemaTooNew { found }),
         Some(found) => upgrade(&tx, found)?,
@@ -471,9 +610,25 @@ fn migrate(conn: &mut Connection) -> Result<(), IndexError> {
 }
 
 /// Migration scripts as `(from_version, sql)`; each upgrades `from_version` to
-/// `from_version + 1`. Empty while v1 is the only schema; a schema change appends a
-/// step here and bumps [`SCHEMA_VERSION`].
-const MIGRATIONS: &[(i64, &str)] = &[];
+/// `from_version + 1`. A schema change appends a step here and bumps
+/// [`SCHEMA_VERSION`].
+const MIGRATIONS: &[(i64, &str)] = &[(1, MIGRATE_V1_TO_V2)];
+
+/// Trigram postings (`file_id` is the `files` rowid; the second index serves deleting
+/// one file's postings), the `meta` key/value table, a `text` flag on files (set when
+/// the trigram index covers the file), and a covering index for reference lookups.
+const MIGRATE_V1_TO_V2: &str = "
+CREATE TABLE trigrams (
+    tri     INTEGER NOT NULL,
+    file_id INTEGER NOT NULL,
+    PRIMARY KEY (tri, file_id)
+) WITHOUT ROWID;
+CREATE INDEX trigrams_file ON trigrams(file_id);
+CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT) WITHOUT ROWID;
+ALTER TABLE files ADD COLUMN text INTEGER NOT NULL DEFAULT 0;
+DROP INDEX refs_name;
+CREATE INDEX refs_name_file_line ON refs(name, file, line);
+";
 
 /// Step an existing database from `from` up to [`SCHEMA_VERSION`].
 fn upgrade(tx: &rusqlite::Transaction, from: i64) -> Result<(), IndexError> {

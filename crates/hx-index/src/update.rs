@@ -6,14 +6,15 @@ use std::sync::Arc;
 use std::time::UNIX_EPOCH;
 
 use futures::{StreamExt, stream};
-use hx_sandbox::{FileMeta, SandboxError};
+use hx_sandbox::{FileMeta, Sandbox, SandboxError};
 use rayon::prelude::*;
 
 use crate::extract::extract;
 use crate::lang::Lang;
 use crate::store::{Index, IndexError, Inner, ParsedFile, RefreshStats};
+use crate::trigram::trigrams;
 
-/// Files larger than this are not indexed.
+/// Files larger than this are tracked by size and mtime only (never read).
 const MAX_FILE_BYTES: u64 = 1024 * 1024;
 /// Files per transaction (and per read/parse batch) during a refresh.
 const BATCH_FILES: usize = 500;
@@ -26,7 +27,7 @@ const MAX_CONTEXT_CHARS: usize = 200;
 
 struct Candidate {
     key: String,
-    lang: Lang,
+    lang: Option<Lang>,
     mtime: i64,
     size: i64,
 }
@@ -36,17 +37,22 @@ enum Outcome {
     /// Content unchanged since it was indexed; only refresh mtime and size.
     Touch(String, i64, i64),
     Parsed(Box<ParsedFile>),
-    /// Not UTF-8 (or grew past the size cap): not indexed.
-    Skip(String),
 }
 
 impl Index {
-    /// Bring the index up to date with the sandbox root: parse files whose size or mtime
-    /// changed (skipping those whose content hash did not), drop files that are gone,
-    /// ignored, over 1 MB or not UTF-8. `unchanged` counts files left as they were.
-    /// A failure is also recorded in [`Index::last_error`] and leaves `is_ready` as it was.
+    /// Bring the index up to date with the sandbox root: every admitted file is a row
+    /// (and a tree entry); files whose size or mtime changed are re-read (and, if the
+    /// content hash changed, re-parsed and re-trigrammed); rows of files that are gone
+    /// or no longer admitted are dropped. Files over 1 MB are recorded without being
+    /// read; files that are not UTF-8 are recorded by hash only. `unchanged` counts
+    /// files left as they were. After a change of extractor version every file is
+    /// reparsed. A failure is also recorded in [`Index::last_error`] and leaves
+    /// `is_ready` as it was.
     pub async fn refresh(&self) -> Result<RefreshStats, IndexError> {
+        self.inner.run(|i| i.set_bulk_cache(true)).await?;
         let result = self.refresh_inner().await;
+        // Best effort: failing to shrink the cache must not hide the refresh's result.
+        let _ = self.inner.run(|i| i.set_bulk_cache(false)).await;
         self.inner.record_refresh(&result);
         result
     }
@@ -55,6 +61,7 @@ impl Index {
         let inner = &self.inner;
         let current = scan(inner).await?;
         let known = Arc::new(inner.run(|i| i.known_files()).await?);
+        let force = inner.run(|i| i.extractor_changed()).await?;
 
         let present: HashSet<&str> = current.iter().map(|c| c.key.as_str()).collect();
         let gone: Vec<String> = known
@@ -73,23 +80,35 @@ impl Index {
         }
 
         let (stale, fresh): (Vec<Candidate>, Vec<Candidate>) = current.into_iter().partition(|c| {
-            known
-                .get(&c.key)
-                .is_none_or(|k| (k.mtime, k.size) != (c.mtime, c.size))
+            force
+                || known
+                    .get(&c.key)
+                    .is_none_or(|k| (k.mtime, k.size) != (c.mtime, c.size))
         });
         stats.unchanged = fresh.len() as u32;
 
-        let sizes: Vec<u64> = stale.iter().map(|c| c.size as u64).collect();
+        // Files over the cap are never read, so they cost no batch budget.
+        let sizes: Vec<u64> = stale
+            .iter()
+            .map(|c| {
+                if is_oversize(c.size) {
+                    0
+                } else {
+                    c.size as u64
+                }
+            })
+            .collect();
         let mut stale = stale.into_iter();
         let mut pos = 0;
         while pos < sizes.len() {
             let n = batch_end(&sizes[pos..], BATCH_FILES, MAX_BATCH_BYTES);
             pos += n;
-            let batch: Vec<Candidate> = stale.by_ref().take(n).collect();
+            let (big, batch): (Vec<Candidate>, Vec<Candidate>) =
+                stale.by_ref().take(n).partition(|c| is_oversize(c.size));
             let read = read_all(inner, batch).await;
             let hashes: Vec<Option<String>> = read
                 .iter()
-                .map(|(c, _)| known.get(&c.key).map(|k| k.hash.clone()))
+                .map(|(c, _)| known.get(&c.key).filter(|_| !force).map(|k| k.hash.clone()))
                 .collect();
             let outcomes = tokio::task::spawn_blocking(move || {
                 read.into_par_iter()
@@ -100,98 +119,241 @@ impl Index {
             .await
             .map_err(|e| IndexError::Task(e.to_string()))?;
 
-            let (parsed, touched, dropped) = split(outcomes);
+            let (mut parsed, touched) = split(outcomes);
+            parsed.extend(big.into_iter().map(oversize_file));
             stats.parsed += parsed.len() as u32;
             stats.unchanged += touched.len() as u32;
-            stats.removed += dropped.iter().filter(|k| known.contains_key(*k)).count() as u32;
-            inner
-                .run(move |i| i.apply(&parsed, &touched, &dropped))
-                .await?;
+            inner.run(move |i| i.apply(&parsed, &touched, &[])).await?;
+        }
+        if force {
+            inner.run(|i| i.record_extractor_version()).await?;
         }
         inner.mark_ready();
         Ok(stats)
     }
 
-    /// Re-index one file now (the post-edit hook). A file that no longer exists or no
-    /// longer qualifies is dropped from the index; an unsupported extension is ignored.
+    /// Re-index one file now (the post-edit hook). A file that no longer exists or is
+    /// no longer admitted (ignored, hidden, outside the root) is dropped from the
+    /// index; a directory is ignored.
     pub async fn reindex_file(&self, rel: &Path) -> Result<(), IndexError> {
         let inner = &self.inner;
-        let Some(lang) = Lang::from_path(rel) else {
-            return Ok(());
-        };
         let key = inner.key(rel);
+        if key.is_empty() {
+            return Ok(());
+        }
         let meta = match inner.sb.metadata(Path::new(&key)).await {
             Ok(m) => m,
             Err(SandboxError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
-                return inner.run(move |i| i.apply(&[], &[], &[key])).await;
+                return forget(inner, key).await;
             }
+            Err(SandboxError::OutsideRoot(_)) => return forget(inner, key).await,
             Err(e) => return Err(e.into()),
         };
-        if meta.len > MAX_FILE_BYTES || !admitted(inner, &key).await? {
-            return inner.run(move |i| i.apply(&[], &[], &[key])).await;
+        match admission(inner, &key).await? {
+            Admission::File => {}
+            Admission::Dir => return Ok(()),
+            Admission::No => return forget(inner, key).await,
+        }
+        let cand = candidate(key.clone(), &meta);
+        if is_oversize(cand.size) {
+            let file = oversize_file(cand);
+            return inner.run(move |i| i.apply(&[file], &[], &[])).await;
         }
         let bytes = inner.sb.read(Path::new(&key)).await?;
-        let old = {
-            let key = key.clone();
-            inner
-                .run(move |i| i.known_file(&key))
-                .await?
-                .map(|k| k.hash)
-        };
-        let cand = candidate(key, lang, &meta);
+        let old = inner
+            .run(move |i| i.known_file(&key))
+            .await?
+            .map(|k| k.hash);
         let outcome = tokio::task::spawn_blocking(move || process(cand, &bytes, old.as_deref()))
             .await
             .map_err(|e| IndexError::Task(e.to_string()))?;
-        let (parsed, touched, dropped) = split(vec![outcome]);
-        inner
-            .run(move |i| i.apply(&parsed, &touched, &dropped))
-            .await
+        let (parsed, touched) = split(vec![outcome]);
+        inner.run(move |i| i.apply(&parsed, &touched, &[])).await
+    }
+
+    /// Bring whatever is at `rel` in line with the disk: a file is re-indexed, a
+    /// directory is walked (new files indexed, vanished ones dropped), and a path that
+    /// is gone or not admitted loses its row and everything under it. This is what the
+    /// watcher runs for each changed path.
+    pub(crate) async fn reindex_path(&self, rel: &Path) -> Result<(), IndexError> {
+        let inner = &self.inner;
+        let key = inner.key(rel);
+        if key.is_empty() {
+            return Ok(());
+        }
+        match admission(inner, &key).await? {
+            Admission::File => self.reindex_file(Path::new(&key)).await,
+            Admission::Dir => {
+                let found = files_under(inner, &key).await?;
+                let live: HashSet<&str> = found.iter().map(String::as_str).collect();
+                let gone: Vec<String> = tree_keys_under(inner, &key)
+                    .into_iter()
+                    .filter(|k| !live.contains(k.as_str()))
+                    .collect();
+                if !gone.is_empty() {
+                    inner.run(move |i| i.apply(&[], &[], &gone)).await?;
+                }
+                for file in &found {
+                    self.reindex_file(Path::new(file)).await?;
+                }
+                Ok(())
+            }
+            Admission::No => {
+                let mut gone = tree_keys_under(inner, &key);
+                let known = {
+                    let key = key.clone();
+                    inner.run(move |i| i.known_file(&key)).await?.is_some()
+                };
+                if known {
+                    gone.push(key);
+                }
+                if gone.is_empty() {
+                    return Ok(());
+                }
+                inner.run(move |i| i.apply(&[], &[], &gone)).await
+            }
+        }
     }
 }
 
-fn candidate(key: String, lang: Lang, meta: &FileMeta) -> Candidate {
+/// Drop the rows of `key` if it has any; a path that was never indexed costs a lookup,
+/// not a write.
+async fn forget(inner: &Arc<Inner>, key: String) -> Result<(), IndexError> {
+    inner
+        .run(move |i| {
+            if i.known_file(&key)?.is_none() {
+                return Ok(());
+            }
+            i.apply(&[], &[], &[key])
+        })
+        .await
+}
+
+fn tree_keys_under(inner: &Inner, dir: &str) -> Vec<String> {
+    inner
+        .tree()
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .keys_under(dir)
+}
+
+fn is_oversize(size: i64) -> bool {
+    size as u64 > MAX_FILE_BYTES
+}
+
+/// The row for a file over the size cap: size and mtime only, no hash, never read.
+fn oversize_file(c: Candidate) -> ParsedFile {
+    ParsedFile {
+        path: c.key,
+        hash: String::new(),
+        mtime: c.mtime,
+        size: c.size,
+        lang: c.lang,
+        text: false,
+        symbols: Vec::new(),
+        refs: Vec::new(),
+        lines: Vec::new(),
+        trigrams: Vec::new(),
+    }
+}
+
+fn candidate(key: String, meta: &FileMeta) -> Candidate {
     let mtime = meta
         .mtime
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_nanos() as i64);
     Candidate {
+        lang: Lang::from_path(Path::new(&key)),
         key,
-        lang,
         mtime,
         size: meta.len as i64,
     }
 }
 
-/// A walker over the root, configured the same way for every use so a refresh and a
-/// single-file reindex agree on which files exist.
-fn root_walker(inner: &Inner) -> Result<ignore::WalkBuilder, IndexError> {
-    let mut builder = inner.sb.walker(Path::new("."))?;
+/// A walker over `dir` (root-relative, empty for the root), configured the same way for
+/// every use so a refresh, a single-file reindex and the watcher agree on which files
+/// exist. It is the sandbox's own walker, so the sandbox's entry filter stays in force.
+fn walker_at(sb: &dyn Sandbox, dir: &str) -> Result<ignore::WalkBuilder, IndexError> {
+    let mut builder = sb.walker(Path::new(if dir.is_empty() { "." } else { dir }))?;
     builder.require_git(false);
     Ok(builder)
 }
 
-/// Whether the walker used by `refresh` would visit the file `key`. Runs the real
-/// walker (ignore files, hidden rules, global excludes) pruned to the directories on
-/// the way to the file, so the answer cannot drift from the refresh's.
-async fn admitted(inner: &Inner, key: &str) -> Result<bool, IndexError> {
-    let mut builder = root_walker(inner)?;
-    let target = inner.sb.root().join(key);
-    let probe = target.clone();
-    builder.filter_entry(move |e| probe.starts_with(e.path()));
+enum Admission {
+    /// A regular file the walker visits.
+    File,
+    /// A directory the walker descends into.
+    Dir,
+    /// Missing, ignored, hidden, filtered by the sandbox, or not a regular file.
+    No,
+}
+
+/// Whether the walker used by `refresh` would visit `key`, and as what. Walks down to it
+/// one directory at a time, each level with a walker from the sandbox (so its filter is
+/// never replaced) and ignore rules that still see the parents' ignore files, which
+/// makes a hidden or ignored directory on the way hide everything below it, exactly as
+/// the full walk does.
+async fn admission(inner: &Inner, key: &str) -> Result<Admission, IndexError> {
+    let sb = Arc::clone(&inner.sb);
+    let key = key.to_string();
+    tokio::task::spawn_blocking(move || {
+        let parts: Vec<&str> = key.split('/').collect();
+        let mut dir = String::new();
+        for (i, part) in parts.iter().enumerate() {
+            let mut builder = walker_at(sb.as_ref(), &dir)?;
+            builder.max_depth(Some(1));
+            let entry = builder
+                .build()
+                .flatten()
+                .find(|e| e.depth() == 1 && e.file_name() == *part);
+            let kind = entry.as_ref().and_then(|e| e.file_type());
+            let last = i + 1 == parts.len();
+            match kind {
+                Some(t) if t.is_dir() && !last => {
+                    if !dir.is_empty() {
+                        dir.push('/');
+                    }
+                    dir.push_str(part);
+                }
+                Some(t) if t.is_dir() => return Ok(Admission::Dir),
+                Some(t) if t.is_file() && last => return Ok(Admission::File),
+                _ => return Ok(Admission::No),
+            }
+        }
+        Ok(Admission::No)
+    })
+    .await
+    .map_err(|e| IndexError::Task(e.to_string()))?
+}
+
+/// Root-relative keys of the admitted files under the (admitted) directory `dir`.
+async fn files_under(inner: &Inner, dir: &str) -> Result<Vec<String>, IndexError> {
+    let builder = walker_at(inner.sb.as_ref(), dir)?;
+    let root = inner.sb.root().to_path_buf();
     tokio::task::spawn_blocking(move || {
         builder
             .build()
             .flatten()
-            .any(|e| e.path() == target && e.file_type().is_some_and(|t| t.is_file()))
+            .filter(|e| e.file_type().is_some_and(|t| t.is_file()))
+            .filter_map(|e| {
+                let rel = e.path().strip_prefix(&root).ok()?;
+                Some(
+                    rel.components()
+                        .map(|c| c.as_os_str().to_string_lossy())
+                        .collect::<Vec<_>>()
+                        .join("/"),
+                )
+            })
+            .collect()
     })
     .await
     .map_err(|e| IndexError::Task(e.to_string()))
 }
 
 /// Walk the root (honoring ignore files, even outside a git checkout) and stat every
-/// file of a known language that is within the size cap.
+/// file.
 async fn scan(inner: &Inner) -> Result<Vec<Candidate>, IndexError> {
-    let builder = root_walker(inner)?;
+    let builder = walker_at(inner.sb.as_ref(), "")?;
     let root = inner.sb.root().to_path_buf();
     let paths = tokio::task::spawn_blocking(move || {
         let mut out = Vec::new();
@@ -202,9 +364,7 @@ async fn scan(inner: &Inner) -> Result<Vec<Candidate>, IndexError> {
             let Ok(rel) = entry.path().strip_prefix(&root) else {
                 continue;
             };
-            if let Some(lang) = Lang::from_path(rel) {
-                out.push((rel.to_path_buf(), lang));
-            }
+            out.push(rel.to_path_buf());
         }
         out
     })
@@ -213,12 +373,9 @@ async fn scan(inner: &Inner) -> Result<Vec<Candidate>, IndexError> {
 
     let sb = &inner.sb;
     let stats: Vec<Option<Candidate>> = stream::iter(paths)
-        .map(|(rel, lang)| async move {
+        .map(|rel| async move {
             let meta = sb.metadata(&rel).await.ok()?;
-            if meta.len > MAX_FILE_BYTES {
-                return None;
-            }
-            Some(candidate(inner.key(&rel), lang, &meta))
+            Some(candidate(inner.key(&rel), &meta))
         })
         .buffer_unordered(IO_CONCURRENCY)
         .collect()
@@ -240,36 +397,39 @@ async fn read_all(inner: &Inner, batch: Vec<Candidate>) -> Vec<(Candidate, Vec<u
         .await
 }
 
-type Split = (Vec<ParsedFile>, Vec<(String, i64, i64)>, Vec<String>);
+type Split = (Vec<ParsedFile>, Vec<(String, i64, i64)>);
 
 fn split(outcomes: Vec<Outcome>) -> Split {
-    let mut out: Split = (Vec::new(), Vec::new(), Vec::new());
+    let mut out: Split = (Vec::new(), Vec::new());
     for o in outcomes {
         match o {
             Outcome::Parsed(p) => out.0.push(*p),
             Outcome::Touch(k, m, s) => out.1.push((k, m, s)),
-            Outcome::Skip(k) => out.2.push(k),
         }
     }
     out
 }
 
-/// Hash, decode and (when the content changed) parse one file.
+/// Hash, decode and (when the content changed) parse and trigram one file. Content that
+/// is over the cap (it grew since the stat) or not UTF-8 is recorded by hash only.
 fn process(c: Candidate, bytes: &[u8], old_hash: Option<&str>) -> Outcome {
-    if bytes.len() as u64 > MAX_FILE_BYTES {
-        return Outcome::Skip(c.key);
-    }
     let hash = blake3::hash(bytes).to_hex().to_string();
     if old_hash == Some(hash.as_str()) {
         return Outcome::Touch(c.key, c.mtime, c.size);
     }
-    let Ok(src) = std::str::from_utf8(bytes) else {
-        return Outcome::Skip(c.key);
-    };
-    let extracted = if c.lang.has_symbols() {
-        extract(c.lang, src)
+    let src = if bytes.len() as u64 > MAX_FILE_BYTES {
+        None
     } else {
-        Default::default()
+        std::str::from_utf8(bytes).ok()
+    };
+    let Some(src) = src else {
+        let mut file = oversize_file(c);
+        file.hash = hash;
+        return Outcome::Parsed(Box::new(file));
+    };
+    let extracted = match c.lang {
+        Some(lang) if lang.has_symbols() => extract(lang, src),
+        _ => Default::default(),
     };
     let lines: Vec<&str> = src.lines().collect();
     let mut context: HashMap<u32, String> = HashMap::new();
@@ -292,9 +452,11 @@ fn process(c: Candidate, bytes: &[u8], old_hash: Option<&str>) -> Outcome {
         mtime: c.mtime,
         size: c.size,
         lang: c.lang,
+        text: true,
         symbols,
         refs: extracted.refs,
         lines,
+        trigrams: trigrams(bytes),
     }))
 }
 

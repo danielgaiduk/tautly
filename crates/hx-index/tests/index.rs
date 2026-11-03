@@ -292,12 +292,14 @@ async fn gitignored_files_skipped() {
 }
 
 #[tokio::test]
-async fn oversize_and_non_utf8_files_are_skipped() {
+async fn oversize_and_non_utf8_files_are_tracked_without_symbols() {
     let big = format!("fn big(){{}}\n// {}\n", "x".repeat(1024 * 1024));
     let (t, idx) = index_with(&[("big.rs", &big), ("ok.rs", "fn ok(){}")]);
     std::fs::write(t.path().join("bin.rs"), b"fn bin(){}\n// \xff\xfe\n").unwrap();
     idx.refresh().await.unwrap();
-    assert_eq!(idx.stats().files, 1);
+    // All three are rows (the tree knows them); only the readable one is parsed.
+    assert_eq!(idx.stats().files, 3);
+    assert_eq!(idx.stats().symbols, 1);
     assert!(idx.find_symbol("big", None).unwrap().is_empty());
     assert!(idx.find_symbol("bin", None).unwrap().is_empty());
     assert_eq!(idx.find_symbol("ok", None).unwrap().len(), 1);
@@ -325,13 +327,15 @@ async fn reindex_file_updates_outline() {
     write_all(t.path(), &[("new.py", "def made(): pass\n")]);
     idx.reindex_file(Path::new("new.py")).await.unwrap();
     assert_eq!(idx.find_symbol("made", None).unwrap().len(), 1);
-    // A deleted file is dropped; an unsupported one is ignored.
+    // A deleted file is dropped; one without a grammar is tracked but has no symbols.
     std::fs::remove_file(t.path().join("a.rs")).unwrap();
     idx.reindex_file(Path::new("a.rs")).await.unwrap();
     assert!(idx.outline(Path::new("a.rs")).unwrap().is_empty());
     write_all(t.path(), &[("notes.txt", "fn nope(){}")]);
     idx.reindex_file(Path::new("notes.txt")).await.unwrap();
-    assert_eq!(idx.stats().files, 1);
+    assert_eq!(idx.stats().files, 2);
+    assert!(idx.find_symbol("nope", None).unwrap().is_empty());
+    assert!(idx.file_hash(Path::new("notes.txt")).is_some());
 }
 
 #[tokio::test]
@@ -444,7 +448,10 @@ async fn config_files_are_tracked_by_hash_only() {
 async fn two_handles_share_db_in_wal_mode() {
     let t = tempfile::tempdir().unwrap();
     write_all(t.path(), &[("a.rs", "fn shared(){}")]);
-    let db = t.path().join("nested/dir/index.db");
+    // The database lives outside the workspace, as in production; inside, its own files
+    // would be workspace files.
+    let db_dir = tempfile::tempdir().unwrap();
+    let db = db_dir.path().join("nested/dir/index.db");
     let one = open_at(t.path(), &db);
     let two = open_at(t.path(), &db);
     one.refresh().await.unwrap();
@@ -466,7 +473,7 @@ async fn two_handles_share_db_in_wal_mode() {
     let version: i64 = conn
         .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 1);
+    assert_eq!(version, 2);
 }
 
 #[tokio::test]
@@ -652,6 +659,11 @@ fn unsupported_old_schema_is_refused_explicitly() {
     assert!(
         matches!(err, hx_index::IndexError::SchemaTooOld { found: 0 }),
         "{err:?}"
+    );
+    // The message names the oldest version a migration exists for, not the current one.
+    assert!(
+        err.to_string().contains("oldest migratable version (1)"),
+        "{err}"
     );
 }
 

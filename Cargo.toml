@@ -47,3 +47,5 @@ htmd = "0.5"
 rusqlite = { version = "0.37", features = ["bundled"] }
 rayon = "1"
 streaming-iterator = "0.1"
+notify = "8"
+regex-syntax = "0.8"
