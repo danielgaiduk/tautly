@@ -3,7 +3,9 @@
 
 use std::path::PathBuf;
 
-use hx_context::{Breakdown, CompactionRecord, ContextStatus, GcRecord, MutationReason, Turn};
+use hx_context::{
+    Breakdown, CompactionRecord, ContextStatus, GcElision, GcRecord, MutationReason, Turn,
+};
 use hx_provider::{Content, Message, Role};
 use serde_json::json;
 
@@ -99,7 +101,11 @@ fn turn(text: &str) -> Turn {
 #[test]
 fn gc_record_roundtrips_and_has_a_stable_shape() {
     let rec = GcRecord {
-        elided: vec![("c1".into(), "old output".into())],
+        elided: vec![GcElision {
+            call_id: "c1".into(),
+            original: "old output".into(),
+            by_turn: 3,
+        }],
         tokens_freed: 77,
         reason: MutationReason::CostBenefit,
         forgotten_paths: vec![PathBuf::from("/p/a.rs")],
@@ -108,7 +114,7 @@ fn gc_record_roundtrips_and_has_a_stable_shape() {
     assert_eq!(
         v,
         json!({
-            "elided": [["c1", "old output"]],
+            "elided": [{"call_id": "c1", "original": "old output", "by_turn": 3}],
             "tokens_freed": 77,
             "reason": "cost_benefit",
             "forgotten_paths": ["/p/a.rs"],

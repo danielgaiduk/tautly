@@ -372,3 +372,69 @@ fn total_is_capped_keeping_the_nearest_files_whole() {
         found.warnings
     );
 }
+
+// ---- ancestor ownership and modes (D6) ----
+
+fn chmod(path: &Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+}
+
+/// A temp dir holding `AGENTS.md` (mode `file_mode`) and the sandbox root `root/`, the
+/// holding directory set to `dir_mode`.
+fn ancestor_case(file_mode: u32, dir_mode: u32) -> (tempfile::TempDir, AgentsMd) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("root");
+    std::fs::create_dir(&root).unwrap();
+    let file = dir.path().join("AGENTS.md");
+    std::fs::write(&file, "ancestor notes\n").unwrap();
+    chmod(&file, file_mode);
+    chmod(dir.path(), dir_mode);
+    let found = load(&root);
+    chmod(dir.path(), 0o755);
+    (dir, found)
+}
+
+#[test]
+fn own_ancestor_file_in_a_private_directory_is_accepted() {
+    let (_d, found) = ancestor_case(0o644, 0o755);
+    assert_eq!(found.text.as_deref(), Some("ancestor notes"));
+    assert!(found.warnings.is_empty(), "{:?}", found.warnings);
+}
+
+#[test]
+fn ancestor_file_writable_by_others_is_refused() {
+    for mode in [0o666, 0o664, 0o646] {
+        let (_d, found) = ancestor_case(mode, 0o755);
+        assert_eq!(found.text, None, "mode {mode:o}");
+        assert!(
+            found.warnings.iter().any(|w| w.contains("writable")),
+            "mode {mode:o}: {:?}",
+            found.warnings
+        );
+    }
+}
+
+#[test]
+fn ancestor_in_a_world_writable_directory_needs_the_sticky_bit() {
+    let (_d, found) = ancestor_case(0o644, 0o777);
+    assert_eq!(found.text, None);
+    assert!(
+        found.warnings.iter().any(|w| w.contains("world-writable")),
+        "{:?}",
+        found.warnings
+    );
+    // Sticky (like /tmp) and the file is the current user's: accepted.
+    let (_d, found) = ancestor_case(0o644, 0o1777);
+    assert_eq!(found.text.as_deref(), Some("ancestor notes"));
+}
+
+#[test]
+fn the_roots_own_file_is_not_subject_to_the_ancestor_rule() {
+    // A group-writable file inside the project is the repository's, read as before.
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("AGENTS.md");
+    std::fs::write(&file, "repo notes\n").unwrap();
+    chmod(&file, 0o664);
+    assert_eq!(load(dir.path()).text.as_deref(), Some("repo notes"));
+}

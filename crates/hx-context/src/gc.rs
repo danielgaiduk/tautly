@@ -38,8 +38,8 @@ fn stub(turn: u32) -> String {
 /// What [`Context::collect`] removed, enough to undo it with [`Context::restore_gc`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GcRecord {
-    /// Tool-call id and original output of each elided result, oldest first.
-    pub elided: Vec<(String, String)>,
+    /// Each elided result, oldest first.
+    pub elided: Vec<GcElision>,
     pub tokens_freed: u32,
     /// Why the scheduler allowed the collection.
     pub reason: MutationReason,
@@ -47,6 +47,20 @@ pub struct GcRecord {
     /// each to `ReadTracker::forget_path`: a re-read must not answer `unchanged since turn
     /// N` or a diff against a result the model can no longer see.
     pub forgotten_paths: Vec<PathBuf>,
+}
+
+/// One result [`Context::collect`] elided.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GcElision {
+    /// The tool-call id of the result.
+    pub call_id: String,
+    /// Its output before collection.
+    pub original: String,
+    /// The turn of the result that superseded it: the `N` of its stub
+    /// `[elided: superseded at turn N]`. With the call id, all a session log needs to
+    /// redo the collection on resume ([`Context::reapply_gc`]); the original comes back
+    /// from the logged tool result.
+    pub by_turn: u32,
 }
 
 /// One target of a read result.
@@ -197,7 +211,11 @@ impl Context {
                     forgotten_paths.push(target.path.clone());
                 }
             }
-            elided.push((meta.call_id.clone(), original));
+            elided.push(GcElision {
+                call_id: meta.call_id.clone(),
+                original,
+                by_turn: p.by_turn,
+            });
         }
         Some(GcRecord {
             elided,
@@ -215,7 +233,10 @@ impl Context {
             let at = result_positions(&self.history);
             rec.elided
                 .iter()
-                .filter_map(|(id, original)| at.get(id.as_str()).map(|p| (*p, id, original)))
+                .filter_map(|e| {
+                    at.get(e.call_id.as_str())
+                        .map(|p| (*p, &e.call_id, &e.original))
+                })
                 .collect()
         };
         for ((t, m, c), id, original) in found {
@@ -231,6 +252,35 @@ impl Context {
                 meta.elided = false;
             }
         }
+    }
+
+    /// Redo a logged collection on resume: replace the output of each `(call_id, by_turn)`
+    /// result with its stub and mark its record elided, so the history is byte-identical to
+    /// the one the collection produced and the collector does not plan it again. The
+    /// engine calls this at the log position of the collection, after rebuilding the
+    /// history and [`Context::results`] up to there, with the pairs from the record's
+    /// [`GcElision`]s. Ids not in the history are skipped; the return value counts them
+    /// (the engine may warn). Idempotent.
+    pub fn reapply_gc(&mut self, elided: &[(String, u32)]) -> usize {
+        let at: HashMap<String, Pos> = result_positions(&self.history)
+            .into_iter()
+            .map(|(id, p)| (id.to_string(), p))
+            .collect();
+        let mut unknown = 0;
+        for (id, by_turn) in elided {
+            let Some(&(t, m, c)) = at.get(id) else {
+                unknown += 1;
+                continue;
+            };
+            if let Content::ToolResult { output, .. } = &mut self.history[t].messages[m].content[c]
+            {
+                *output = stub(*by_turn);
+            }
+            for meta in self.results.iter_mut().filter(|r| &r.call_id == id) {
+                meta.elided = true;
+            }
+        }
+        unknown
     }
 
     /// Estimated tokens eliding `p` frees.

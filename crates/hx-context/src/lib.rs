@@ -23,7 +23,7 @@ use hx_tools::{AppliedEffect, ContextOp};
 pub use assemble::STABLE_LEN;
 pub use blocks::{Breakdown, ContextStatus, ReasoningWire, Turn};
 pub use compact::{CompactError, CompactionRecord, UncompactError};
-pub use gc::{GcRecord, ReadTarget, ResultMeta};
+pub use gc::{GcElision, GcRecord, ReadTarget, ResultMeta};
 pub use pinned::{PinError, PinSource, Pinned};
 pub use schedule::{CacheClock, MutationReason};
 pub use state::{FileNote, WorkingState};

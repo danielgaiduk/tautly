@@ -134,7 +134,7 @@ fn output_of<'a>(c: &'a Context, id: &str) -> &'a str {
 }
 
 fn elided_ids(rec: &GcRecord) -> Vec<&str> {
-    rec.elided.iter().map(|(id, _)| id.as_str()).collect()
+    rec.elided.iter().map(|e| e.call_id.as_str()).collect()
 }
 
 fn stub(n: u32) -> String {
@@ -409,7 +409,8 @@ fn above_threshold_elides_all_superseded() {
     assert_eq!(elided_ids(&rec), ["old0", "old1", "old2", "old_b"]);
     assert_eq!(rec.reason, MutationReason::CostBenefit);
     assert_eq!(rec.tokens_freed, freed);
-    for ((_, original), want) in rec.elided.iter().zip(&originals) {
+    for (e, want) in rec.elided.iter().zip(&originals) {
+        let original = &e.original;
         assert_eq!(original, want);
     }
     for id in ["live_x", "e_a", "re_b", "re_c", "new_b"] {
@@ -817,4 +818,71 @@ fn collect_with_a_forced_or_manual_reason_reports_it() {
         c.gc_decision(now, Some(TTL), Some(&price), 95_000, 100_000),
         Some(MutationReason::Forced)
     );
+}
+
+// ---- resume: per-entry stub turns and reapply_gc (D1) ----
+
+/// A context with superseded reads, built the same way every time.
+fn replayable() -> Context {
+    let mut c = Context::default();
+    read_call(&mut c, "r1", "/p/a.rs", &big("a v1"));
+    read_call(&mut c, "r2", "/p/b.rs", &big("b v1"));
+    edit_call(&mut c, "e1", "/p/a.rs");
+    read_call(&mut c, "r3", "/p/b.rs", &big("b v2"));
+    bash_call(&mut c, "b1", "cargo test", "ok");
+    c
+}
+
+#[test]
+fn record_carries_the_superseding_turn_of_each_entry() {
+    let mut c = replayable();
+    let rec = c.collect(NOW).unwrap();
+    let got: Vec<(&str, u32)> = rec
+        .elided
+        .iter()
+        .map(|e| (e.call_id.as_str(), e.by_turn))
+        .collect();
+    // r1 is superseded by the edit at turn 3, r2 by the re-read at turn 4.
+    assert_eq!(got, [("r1", 3), ("r2", 4)]);
+    for e in &rec.elided {
+        assert_eq!(output_of(&c, &e.call_id), stub(e.by_turn));
+    }
+}
+
+#[test]
+fn reapply_on_a_fresh_context_reproduces_the_history_byte_for_byte() {
+    let mut collected = replayable();
+    let rec = collected.collect(NOW).unwrap();
+    let persisted: Vec<(String, u32)> = rec
+        .elided
+        .iter()
+        .map(|e| (e.call_id.clone(), e.by_turn))
+        .collect();
+
+    // Resume: the same history and results, rebuilt from the log, then the record.
+    let mut resumed = replayable();
+    assert_eq!(resumed.reapply_gc(&persisted), 0);
+    assert!(
+        serde_json::to_vec(&resumed.history).unwrap()
+            == serde_json::to_vec(&collected.history).unwrap()
+    );
+    // The collector knows those results are elided: nothing is pending again.
+    assert_eq!(resumed.pending_gc(), 0);
+    assert_eq!(resumed.collect(NOW), None);
+    // Idempotent.
+    assert_eq!(resumed.reapply_gc(&persisted), 0);
+    assert_eq!(resumed.history, collected.history);
+}
+
+#[test]
+fn reapply_ignores_and_counts_unknown_ids() {
+    let mut c = replayable();
+    let before = c.history.clone();
+    let unknown = vec![("nope".to_string(), 9), ("gone".to_string(), 2)];
+    assert_eq!(c.reapply_gc(&unknown), 2);
+    assert_eq!(c.history, before);
+    // Known ids are applied even when listed among unknown ones.
+    let mixed = vec![("nope".to_string(), 9), ("r1".to_string(), 3)];
+    assert_eq!(c.reapply_gc(&mixed), 1);
+    assert_eq!(output_of(&c, "r1"), stub(3));
 }

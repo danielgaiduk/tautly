@@ -1,7 +1,7 @@
 //! AGENTS.md discovery and auto-pinning of `Constraints` / `Rules` sections.
 
 use std::io::Read;
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 use hx_sandbox::{Sandbox, SandboxError, is_protected};
@@ -40,6 +40,10 @@ pub const MAX_PINNED_BYTES: usize = 4 * 1024;
 /// - An `AGENTS.md` above the root may be a link only to a file under the directory that
 ///   holds it (stow-style `~/AGENTS.md -> ~/dotfiles/AGENTS.md`): when hx starts in a
 ///   subdirectory of a clone, the clone's top-level file is just as repository-controlled.
+/// - An `AGENTS.md` above the root must also look like the user's own: the file owned by
+///   the current user (or root) and not writable by group or others, in a directory that
+///   is not world-writable unless it is sticky (like `/tmp`) and the file is the current
+///   user's. Otherwise anyone who can write there could plant instructions.
 /// - A link whose target is a protected path (`.git/config`, `.hx/...`; relative to the
 ///   directory holding the file) is refused with a warning.
 /// - Every file is opened `O_NOFOLLOW` (after resolving) and without blocking (a FIFO
@@ -57,7 +61,7 @@ pub fn load(sb: &dyn Sandbox) -> AgentsMd {
     match sb.resolve(Path::new(FILE_NAME)) {
         Ok(path) => {
             if !refuse_protected(root, &path, &mut warnings)
-                && let Some(text) = read_capped(&path, &mut warnings)
+                && let Some(text) = read_capped(&path, None, &mut warnings)
             {
                 found.push((path, text));
             }
@@ -92,7 +96,7 @@ pub fn load(sb: &dyn Sandbox) -> AgentsMd {
         if refuse_protected(dir, &target, &mut warnings) {
             continue;
         }
-        if let Some(text) = read_capped(&target, &mut warnings) {
+        if let Some(text) = read_capped(&target, Some(dir), &mut warnings) {
             found.push((path, text));
         }
     }
@@ -190,6 +194,29 @@ fn refuse_protected(base: &Path, target: &Path, warnings: &mut Vec<String>) -> b
     true
 }
 
+/// Why an AGENTS.md above the root (`meta` of the open file, held in `dir`) is not
+/// trusted as the user's own, or None when it is.
+fn ancestor_untrusted(meta: &std::fs::Metadata, dir: &Path) -> Option<String> {
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    let me = unsafe { libc::geteuid() };
+    if meta.uid() != me && meta.uid() != 0 {
+        return Some(format!("is owned by another user (uid {})", meta.uid()));
+    }
+    if meta.mode() & 0o022 != 0 {
+        return Some("is writable by group or others".into());
+    }
+    let dir_mode = match std::fs::metadata(dir) {
+        Ok(m) => m.mode(),
+        Err(e) => return Some(format!("is in a directory that cannot be checked ({e})")),
+    };
+    if dir_mode & 0o002 != 0 && (dir_mode & 0o1000 == 0 || meta.uid() != me) {
+        return Some(
+            "is in a world-writable directory that is not sticky or the file is not yours".into(),
+        );
+    }
+    None
+}
+
 /// `body` cut at a character boundary to at most `max` bytes, with a marker.
 fn cut_pin(body: &str, max: usize) -> String {
     let mut end = max.min(body.len());
@@ -205,8 +232,9 @@ fn cut_pin(body: &str, max: usize) -> String {
 /// The text of the AGENTS.md at `path` (already resolved), cut to [`MAX_FILE_BYTES`];
 /// None when it is missing, empty or unusable (with a warning unless it is simply
 /// missing). Opened `O_NOFOLLOW`, so a link swapped in after resolving is refused. Never
-/// blocks on a FIFO, never reads a device.
-fn read_capped(path: &Path, warnings: &mut Vec<String>) -> Option<String> {
+/// blocks on a FIFO, never reads a device. `ancestor`: the directory holding a file above
+/// the root, whose ownership and modes [`ancestor_untrusted`] checks on the open file.
+fn read_capped(path: &Path, ancestor: Option<&Path>, warnings: &mut Vec<String>) -> Option<String> {
     let file = match std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW)
@@ -219,12 +247,20 @@ fn read_capped(path: &Path, warnings: &mut Vec<String>) -> Option<String> {
             return None;
         }
     };
-    let regular = file.metadata().is_ok_and(|m| m.is_file());
-    if !regular {
-        warnings.push(format!(
-            "{} is not a regular file; it was not loaded",
-            path.display()
-        ));
+    let meta = match file.metadata() {
+        Ok(m) if m.is_file() => m,
+        _ => {
+            warnings.push(format!(
+                "{} is not a regular file; it was not loaded",
+                path.display()
+            ));
+            return None;
+        }
+    };
+    if let Some(dir) = ancestor
+        && let Some(why) = ancestor_untrusted(&meta, dir)
+    {
+        warnings.push(format!("{} {why}; it was not loaded", path.display()));
         return None;
     }
     let mut bytes = Vec::new();
