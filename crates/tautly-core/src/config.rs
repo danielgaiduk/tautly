@@ -347,9 +347,18 @@ impl Config {
         for (path, trust) in layers.into_iter().flatten() {
             let layer = match (read_layer(&path, trust == Trust::User), trust) {
                 (Ok(layer), _) => layer,
+                // Whatever the repository did to its config file (symlink, FIFO, huge,
+                // `.tautly` being a file, no read permission), it must not stop startup.
                 (Err(ConfigError::Unsafe { path, why }), Trust::Project) => {
                     warnings.push(format!(
                         "{}: project config not read: {why}",
+                        path.display()
+                    ));
+                    None
+                }
+                (Err(ConfigError::Io { path, source }), Trust::Project) => {
+                    warnings.push(format!(
+                        "{}: project config not read: {source}",
                         path.display()
                     ));
                     None
@@ -534,6 +543,9 @@ const PROJECT_KEYS: &[&str] = &[
 /// ones from AGENTS.md: each at [`MAX_PIN_BYTES`], all together at this.
 const MAX_PROJECT_PINS_BYTES: usize = tautly_context::agents_md::MAX_PINNED_BYTES;
 
+/// Most warnings one project file produces before the rest are summarized.
+const MAX_PROJECT_WARNINGS: usize = 20;
+
 /// The lowest compaction threshold a project may ask for (a floor so a repository cannot
 /// make compaction thrash).
 const MIN_PROJECT_THRESHOLD: f64 = 0.5;
@@ -557,6 +569,7 @@ fn restrict_project_layer(
     path: &Path,
     warnings: &mut Vec<String>,
 ) {
+    let first = warnings.len();
     let mut ignore = |key: &str, why: &str| {
         warnings.push(format!("{}: ignored `{key}`: {why}", path.display()));
     };
@@ -633,39 +646,61 @@ fn restrict_project_layer(
     }
 
     if let Some(Value::Array(pins)) = layer.get_mut("pins") {
-        let mut kept = Vec::new();
+        // The user's pins stay (first), the project's are added after them.
+        let mut all: Vec<Value> = so_far
+            .get("pins")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
         let mut total = 0;
+        let (mut empty, mut too_big, mut over_cap) = (0, 0, 0);
         let mut full = false;
-        for (i, pin) in std::mem::take(pins).into_iter().enumerate() {
+        for pin in std::mem::take(pins) {
             let Value::String(text) = &pin else {
-                kept.push(pin); // a type error, for the check to report
+                all.push(pin); // a type error, for the check to report
                 continue;
             };
-            let key = format!("pins[{i}]");
+            if all.contains(&pin) {
+                continue; // an exact duplicate adds nothing
+            }
             if text.trim().is_empty() {
-                ignore(&key, "empty pin");
+                empty += 1;
             } else if text.len() > MAX_PIN_BYTES {
-                ignore(
-                    &key,
-                    &format!(
-                        "a pin holds at most {MAX_PIN_BYTES} bytes, this one {}",
-                        text.len()
-                    ),
-                );
+                too_big += 1;
             } else if full || total + text.len() > MAX_PROJECT_PINS_BYTES {
                 full = true;
-                ignore(
-                    &key,
-                    &format!(
-                        "a project's pins hold at most {MAX_PROJECT_PINS_BYTES} bytes together"
-                    ),
-                );
+                over_cap += 1;
             } else {
                 total += text.len();
-                kept.push(pin);
+                all.push(pin);
             }
         }
-        *pins = kept;
+        *pins = all;
+        let plural = |n: usize| if n == 1 { "pin" } else { "pins" };
+        if empty > 0 {
+            ignore(
+                "pins",
+                &format!("dropped {empty} empty project {}", plural(empty)),
+            );
+        }
+        if too_big > 0 {
+            ignore(
+                "pins",
+                &format!(
+                    "dropped {too_big} project {} over the {MAX_PIN_BYTES} byte limit",
+                    plural(too_big)
+                ),
+            );
+        }
+        if over_cap > 0 {
+            ignore(
+                "pins",
+                &format!(
+                    "dropped {over_cap} project {} over the {MAX_PROJECT_PINS_BYTES} byte cap",
+                    plural(over_cap)
+                ),
+            );
+        }
     }
 
     if let Some(Value::Table(perms)) = layer.get_mut("permissions") {
@@ -676,6 +711,17 @@ fn restrict_project_layer(
             &mut ignore,
         );
         restrict_permissions(perms, so_far, &mut ignore);
+    }
+
+    // A hostile file can name tens of thousands of unknown keys: say so a bounded number
+    // of times.
+    if warnings.len() - first > MAX_PROJECT_WARNINGS {
+        let more = warnings.len() - first - MAX_PROJECT_WARNINGS;
+        warnings.truncate(first + MAX_PROJECT_WARNINGS);
+        warnings.push(format!(
+            "{}: and {more} more ignored settings",
+            path.display()
+        ));
     }
 }
 

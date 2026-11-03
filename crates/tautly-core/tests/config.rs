@@ -147,7 +147,8 @@ base_url = "https://api.groq.com/openai/v1"
     );
     f.project("pins = [\"project pin\"]\n");
     let cfg = f.load(CliOverrides::default()).unwrap();
-    assert_eq!(cfg.pins, ["project pin"]);
+    // Project pins add to the user's (a repo cannot drop them); see the pins tests.
+    assert_eq!(cfg.pins, ["user pin 1", "user pin 2", "project pin"]);
     let names: Vec<_> = cfg.providers.compat.iter().map(|c| &*c.name).collect();
     assert_eq!(names, ["ollama", "groq"], "untouched arrays stay");
 }
@@ -963,7 +964,7 @@ fn user_layer_may_set_any_limit() {
 // ---- project layer: pins, threshold, model, unknown keys ----
 
 #[test]
-fn project_pins_are_capped_each_and_in_total() {
+fn project_pins_are_capped_each_and_in_total_with_bounded_warnings() {
     let f = Fixture::new();
     let big = "b".repeat(2 * 1024 + 1);
     let ok = "o".repeat(1500);
@@ -971,36 +972,146 @@ fn project_pins_are_capped_each_and_in_total() {
         "pins = [\"first\", \"{big}\", \"{ok}\", \"{ok}\", \"{ok}\", \"late\", \"   \"]\n"
     ));
     let loaded = f.load_full(CliOverrides::default()).unwrap();
-    // "first" + 1500 + 1500 fit under 4 KB; the third 1500 does not, and nothing after it
-    // is kept (nearest first, in file order).
+    // The repeated 1500-byte pins are exact duplicates and add nothing; the 2 KB+ one and the
+    // blank one are dropped, "late" still fits.
     assert_eq!(
         loaded.config.pins,
-        ["first".to_string(), ok.clone(), ok.clone()]
+        ["first".to_string(), ok.clone(), "late".to_string()]
     );
-    let w = loaded.warnings.join("\n");
-    assert!(w.contains("pins[1]") && w.contains("2048"), "{w}");
+    let pin_warnings: Vec<_> = loaded
+        .warnings
+        .iter()
+        .filter(|w| w.contains("`pins`"))
+        .collect();
+    let w = pin_warnings
+        .iter()
+        .map(|w| w.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
     assert!(
-        w.contains("pins[4]") && w.contains("pins[5]") && w.contains("4096"),
+        w.contains("dropped 1 project pin over the 2048 byte limit"),
         "{w}"
     );
-    assert!(w.contains("pins[6]"), "blank pin: {w}");
+    assert!(w.contains("dropped 1 empty project pin"), "{w}");
+    assert!(pin_warnings.len() <= 3, "{w}");
     let total: usize = loaded.config.pins.iter().map(String::len).sum();
     assert!(total <= 4 * 1024);
 
-    // 120 pins of 2000 bytes (the reviewer's probe): at most two survive.
+    // 120 distinct pins of 2000 bytes (the reviewer's probe): two survive, one warning.
     let f = Fixture::new();
-    let pin = "p".repeat(2000);
-    let all = std::iter::repeat_n(format!("\"{pin}\""), 120)
+    let all = (0..120)
+        .map(|i| format!("\"{i:03}{}\"", "p".repeat(1997)))
         .collect::<Vec<_>>()
         .join(",");
     f.project(&format!("pins = [{all}]\n"));
     let loaded = f.load_full(CliOverrides::default()).unwrap();
     assert_eq!(loaded.config.pins.len(), 2);
+    assert_eq!(loaded.warnings.len(), 1, "{:?}", loaded.warnings);
+    assert!(
+        loaded.warnings[0].contains("dropped 118 project pins over the 4096 byte cap"),
+        "{}",
+        loaded.warnings[0]
+    );
 
     // The user's own pins are not capped by this rule.
     let f = Fixture::new();
     f.user(&format!("pins = [{all}]\n"));
     assert_eq!(f.load(CliOverrides::default()).unwrap().pins.len(), 120);
+}
+
+#[test]
+fn project_pins_add_to_the_users_instead_of_replacing_them() {
+    let f = Fixture::new();
+    f.user("pins = [\"A\", \"B\"]\n");
+    f.project("pins = [\"B\", \"C\", \"C\", \"D\"]\n");
+    let loaded = f.load_full(CliOverrides::default()).unwrap();
+    assert_eq!(
+        loaded.config.pins,
+        ["A", "B", "C", "D"],
+        "user first, exact duplicates once"
+    );
+    assert!(loaded.warnings.is_empty(), "{:?}", loaded.warnings);
+
+    // The cap applies to the project's pins only; a big user list is kept whole.
+    let f = Fixture::new();
+    let user: Vec<String> = (0..10)
+        .map(|i| format!("\"u{i}{}\"", "x".repeat(1000)))
+        .collect();
+    f.user(&format!("pins = [{}]\n", user.join(",")));
+    let p: Vec<String> = (0..5)
+        .map(|i| format!("\"p{i}{}\"", "y".repeat(1500)))
+        .collect();
+    f.project(&format!("pins = [{}]\n", p.join(",")));
+    let loaded = f.load_full(CliOverrides::default()).unwrap();
+    assert_eq!(loaded.config.pins.len(), 10 + 2);
+    assert!(loaded.config.pins[..10].iter().all(|p| p.starts_with('u')));
+    assert_eq!(loaded.warnings.len(), 1);
+}
+
+#[test]
+fn project_read_errors_never_stop_startup() {
+    // `.tautly` is a regular file: ENOTDIR.
+    let f = Fixture::new();
+    fs::create_dir_all(f.root()).unwrap();
+    fs::write(f.root().join(".tautly"), "x").unwrap();
+    let loaded = f.load_full(CliOverrides::default()).unwrap();
+    assert_eq!(loaded.config.max_turns, 100);
+    assert!(
+        loaded
+            .warnings
+            .iter()
+            .any(|w| w.contains("project config not read")),
+        "{:?}",
+        loaded.warnings
+    );
+
+    // An unreadable config.toml: EACCES (not testable as root).
+    if unsafe { libc::geteuid() } != 0 {
+        use std::os::unix::fs::PermissionsExt;
+        let f = Fixture::new();
+        f.project("max_turns = 5\n");
+        let file = f.root().join(".tautly").join("config.toml");
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o000)).unwrap();
+        let loaded = f.load_full(CliOverrides::default()).unwrap();
+        assert_eq!(loaded.config.max_turns, 100);
+        assert!(
+            loaded
+                .warnings
+                .iter()
+                .any(|w| w.contains("project config not read")),
+            "{:?}",
+            loaded.warnings
+        );
+    }
+
+    // The user file stays strict.
+    let f = Fixture::new();
+    fs::create_dir_all(f.user_file().parent().unwrap()).unwrap();
+    fs::create_dir(f.user_file()).unwrap();
+    assert!(f.load(CliOverrides::default()).is_err());
+}
+
+#[test]
+fn warnings_about_a_hostile_project_file_are_bounded() {
+    let f = Fixture::new();
+    let junk: String = (0..15_000).map(|i| format!("k{i} = 1\n")).collect();
+    assert!(junk.len() < 256 * 1024);
+    f.project(&junk);
+    let loaded = f.load_full(CliOverrides::default()).unwrap();
+    assert!(
+        loaded.warnings.len() <= 25,
+        "{} warnings",
+        loaded.warnings.len()
+    );
+    assert!(
+        loaded
+            .warnings
+            .last()
+            .unwrap()
+            .contains("more ignored settings"),
+        "{:?}",
+        loaded.warnings.last()
+    );
 }
 
 #[test]
