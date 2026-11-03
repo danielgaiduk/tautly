@@ -875,3 +875,45 @@ fn more_crash_markers_are_recognized() {
     let out = format!("{PYTEST_QUIET_FAIL}!! not a banner\nWow!!!\n");
     assert!(!has_unparsed_crash(&out, &summary));
 }
+
+// ---- parsed counts in ToolMeta (evidence footer, spec 7.11.7) -----------------
+
+#[tokio::test]
+async fn bash_reports_parsed_test_counts_in_meta() {
+    use tautly_tools::TestCounts;
+    // A large output is summarized; the counts are the summary's (failed + errors).
+    let (_dir, r) = run(CARGO_TEST_FAIL, &fake("", "cargo", "test"), None).await;
+    assert_eq!(
+        r.meta.counts,
+        Some(TestCounts {
+            passed: 10,
+            failed: 2
+        })
+    );
+    // Output under the 2 KB filter threshold is not summarized, but its counts are parsed.
+    let small = "running 1 test\ntest a::t ... FAILED\n\nfailures:\n\n---- a::t stdout ----\nthread 'a::t' panicked at src/lib.rs:3:5:\nboom\n\ntest result: FAILED. 4 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n";
+    let (_dir, r) = run(small, &fake("", "cargo", "test"), None).await;
+    assert!(!r.output.contains("summary:"), "{}", r.output);
+    assert_eq!(
+        r.meta.counts,
+        Some(TestCounts {
+            passed: 4,
+            failed: 1
+        })
+    );
+    // `raw` only skips rewriting the output.
+    let (_dir, r) = run(CARGO_TEST_FAIL, &fake("", "cargo", "test"), Some(true)).await;
+    assert_eq!(r.meta.counts.map(|c| c.passed), Some(10));
+}
+
+#[tokio::test]
+async fn bash_reports_no_counts_without_a_test_parse() {
+    // A build reports no passes; junk output has no counts; a plain command is no tool.
+    let (_dir, r) = run(CARGO_BUILD_ERR, &fake("", "cargo", "build"), None).await;
+    assert_eq!(r.meta.counts, None);
+    let junk = "noise noise noise noise\n".repeat(3000);
+    let (_dir, r) = run(&junk, &fake("", "pytest", "-q"), None).await;
+    assert_eq!(r.meta.counts, None);
+    let (_dir, r) = run("x\n", "cat out.txt", None).await;
+    assert_eq!(r.meta.counts, None);
+}

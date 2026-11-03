@@ -3,7 +3,7 @@
 //! then command-line overrides. Tables merge key by key, arrays and scalars replace.
 //!
 //! The project file is repository content, so it is untrusted: it cannot set `providers`,
-//! `telemetry`, `approve_memory`, `catalog_overrides` or `routing`, and in `permissions` it
+//! `telemetry`, `approve_memory`, `catalog_overrides`, `routing` or `evidence`, and in `permissions` it
 //! can only lower the mode and add `deny` rules; `budget`, `max_turns` and `turn_timeout_s`
 //! can only go down. Dropped settings come back as
 //! [`LoadedConfig::warnings`]. Command-line flags are the user's own and override all.
@@ -21,6 +21,8 @@ use tautly_sandbox::{Mode, Policy, PolicyConfig};
 use tautly_tools::MAX_PIN_BYTES;
 use toml::{Table, Value};
 use url::Url;
+
+use crate::evidence::{EvidenceConfig, TestMatcher};
 
 /// Largest config file read; a bigger one is refused rather than parsed.
 const MAX_CONFIG_BYTES: u64 = 256 * 1024;
@@ -89,6 +91,9 @@ pub struct Config {
     /// Write memory proposals without asking (default false).
     #[serde(default)]
     pub approve_memory: bool,
+    /// `[evidence]`: which commands count as test runs (user layer only).
+    #[serde(default)]
+    pub evidence: EvidenceConfig,
 }
 
 fn default_model() -> ModelId {
@@ -150,6 +155,7 @@ impl Default for Config {
             catalog_overrides: None,
             routing: RoutingConfig::default(),
             approve_memory: false,
+            evidence: EvidenceConfig::default(),
         }
     }
 }
@@ -451,6 +457,7 @@ impl Config {
             }
         }
         Policy::new(self.permissions.clone(), PathBuf::new()).map_err(|e| e.to_string())?;
+        TestMatcher::new(&self.evidence).map_err(|e| format!("evidence: {e}"))?;
         if let Some(url) = &self.telemetry.endpoint {
             check_http("telemetry.endpoint", url)?;
         }
@@ -526,6 +533,8 @@ const USER_ONLY_KEYS: &[&str] = &[
     "approve_memory",
     "catalog_overrides",
     "routing",
+    // A repository could otherwise label any command a passing test (spec 7.11.7).
+    "evidence",
 ];
 
 /// Everything else a project file may set (some of it only to tighten).

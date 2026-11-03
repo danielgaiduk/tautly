@@ -237,6 +237,7 @@ impl Session {
             })
         });
         self.apply_startup().await;
+        self.evidence = self.evidence.fresh();
         self.emit(Event::TurnStarted).await;
         self.budgets
             .lock()
@@ -257,7 +258,9 @@ impl Session {
         }
         self.log(SessionRecord::TurnEnd { reason }).await;
         self.checkpoint().await;
-        self.emit(Event::TurnFinished { reason }).await;
+        let next = self.evidence.fresh();
+        let evidence = std::mem::replace(&mut self.evidence, next).finish();
+        self.emit(Event::TurnFinished { reason, evidence }).await;
     }
 
     async fn steps(&mut self, ctl: &mut TurnControl) -> FinishReason {

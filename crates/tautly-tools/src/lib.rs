@@ -117,6 +117,18 @@ pub struct ToolMeta {
     /// A stable name for why the call failed (e.g. `not_found`, `ambiguous`, `stale`).
     /// Read back from a log, a name this version does not know becomes `unknown`.
     pub error_kind: Option<&'static str>,
+    /// Passed and failed counts a test-output filter parsed from a command's output (set
+    /// by `bash` for recognized test tools, whatever the output's size).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub counts: Option<TestCounts>,
+}
+
+/// What a test tool's output said: tests passed, and tests failed or errored (a crashed
+/// test binary or a collection error counts as a failure).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TestCounts {
+    pub passed: u32,
+    pub failed: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

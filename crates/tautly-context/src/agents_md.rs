@@ -8,8 +8,6 @@ use tautly_sandbox::{Sandbox, SandboxError, is_protected};
 
 use crate::pinned::{self, PinSource, Pinned};
 
-const FILE_NAME: &str = "AGENTS.md";
-
 /// What [`load`] found: the text for the `<agents_md>` block, the pins of its `Rules` /
 /// `Constraints` sections, and warnings for the session's `ContextStatus`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -17,6 +15,44 @@ pub struct AgentsMd {
     pub text: Option<String>,
     pub pins: Vec<Pinned>,
     pub warnings: Vec<String>,
+    /// The files whose text is in `text`, outermost first (the order of the text), each
+    /// with the instruction file that directory level contributed.
+    pub sources: Vec<(PathBuf, InstructionFile)>,
+}
+
+/// Which instruction file a directory level contributed: its `AGENTS.md`, else its
+/// `CLAUDE.md` (spec 7.11.6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstructionFile {
+    AgentsMd,
+    ClaudeMd,
+}
+
+impl InstructionFile {
+    /// The file's name in its directory, as the block header and the warnings name it.
+    pub fn file_name(self) -> &'static str {
+        match self {
+            InstructionFile::AgentsMd => "AGENTS.md",
+            InstructionFile::ClaudeMd => "CLAUDE.md",
+        }
+    }
+
+    /// The file `dir` contributes: its `AGENTS.md` if that exists (whatever state it is
+    /// in: one that is refused or empty still takes the level, so a hostile `AGENTS.md`
+    /// never hands the level to `CLAUDE.md`), else its `CLAUDE.md` if that exists.
+    fn at(dir: &Path) -> Option<InstructionFile> {
+        [InstructionFile::AgentsMd, InstructionFile::ClaudeMd]
+            .into_iter()
+            .find(|k| std::fs::symlink_metadata(dir.join(k.file_name())).is_ok())
+    }
+}
+
+/// One file read, before the caps.
+struct Found {
+    /// The file's name in its directory (a link is not followed in the name).
+    path: PathBuf,
+    kind: InstructionFile,
+    text: String,
 }
 
 /// Bytes kept of one AGENTS.md file.
@@ -29,7 +65,11 @@ pub const MAX_PINNED_BYTES: usize = 4 * 1024;
 
 /// AGENTS.md files from the sandbox root up to the filesystem root, concatenated outermost
 /// first (the nearest file is last), and a pin for each `Constraints` / `Rules` section.
-/// Missing or empty files are skipped.
+/// Missing or empty files are skipped. A directory without `AGENTS.md` contributes its
+/// `CLAUDE.md` instead (spec 7.11.6), under the same rules as below (read "AGENTS.md" as
+/// the file that level uses); where both exist only `AGENTS.md` is read. A `CLAUDE.md`'s
+/// text starts with `[instructions from CLAUDE.md]`, so the block names the file used.
+/// `@path` import lines are text; nothing is followed.
 ///
 /// This runs at session start, before any tool call or approval, and its text goes into
 /// the system prompt, so the repository's file is read like any confined path:
@@ -57,26 +97,37 @@ pub fn load(sb: &dyn Sandbox) -> AgentsMd {
     let root = sb.root();
     let mut warnings = Vec::new();
     // Nearest first.
-    let mut found: Vec<(PathBuf, String)> = Vec::new();
-    match sb.resolve(Path::new(FILE_NAME)) {
-        Ok(path) => {
-            if !refuse_protected(root, &path, &mut warnings)
-                && let Some(text) = read_capped(&path, None, &mut warnings)
-            {
-                found.push((path, text));
+    let mut found: Vec<Found> = Vec::new();
+    if let Some(kind) = InstructionFile::at(root) {
+        let name = kind.file_name();
+        match sb.resolve(Path::new(name)) {
+            Ok(path) => {
+                if !refuse_protected(root, name, &path, &mut warnings)
+                    && let Some(text) = read_capped(&path, kind, None, &mut warnings)
+                {
+                    found.push(Found {
+                        path: root.join(name),
+                        kind,
+                        text,
+                    });
+                }
             }
+            Err(SandboxError::OutsideRoot(_)) => warnings.push(format!(
+                "{} links outside the project root; it was not loaded",
+                root.join(name).display()
+            )),
+            Err(e) => warnings.push(format!(
+                "{} could not be resolved ({e}); it was not loaded",
+                root.join(name).display()
+            )),
         }
-        Err(SandboxError::OutsideRoot(_)) => warnings.push(format!(
-            "{} links outside the project root; it was not loaded",
-            root.join(FILE_NAME).display()
-        )),
-        Err(e) => warnings.push(format!(
-            "{} could not be resolved ({e}); it was not loaded",
-            root.join(FILE_NAME).display()
-        )),
     }
     for dir in root.ancestors().skip(1) {
-        let path = dir.join(FILE_NAME);
+        let Some(kind) = InstructionFile::at(dir) else {
+            continue;
+        };
+        let name = kind.file_name();
+        let path = dir.join(name);
         let target = match std::fs::canonicalize(&path) {
             Ok(t) => t,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
@@ -93,33 +144,36 @@ pub fn load(sb: &dyn Sandbox) -> AgentsMd {
             ));
             continue;
         }
-        if refuse_protected(dir, &target, &mut warnings) {
+        if refuse_protected(dir, name, &target, &mut warnings) {
             continue;
         }
-        if let Some(text) = read_capped(&target, Some(dir), &mut warnings) {
-            found.push((path, text));
+        if let Some(text) = read_capped(&target, kind, Some(dir), &mut warnings) {
+            found.push(Found { path, kind, text });
         }
     }
 
     // The total cap, spent on the nearest files first.
     let mut left = MAX_TOTAL_BYTES;
-    let mut kept: Vec<(PathBuf, String)> = Vec::new();
-    for (path, text) in found {
-        if text.len() <= left {
-            left -= text.len();
-            kept.push((path, text));
+    let mut kept: Vec<Found> = Vec::new();
+    for f in found {
+        if f.text.len() <= left {
+            left -= f.text.len();
+            kept.push(f);
         } else if left > 0 {
-            kept.push((path.clone(), truncate(&text, left)));
-            left = 0;
             warnings.push(format!(
-                "{} was truncated: all AGENTS.md files together are capped at {} KB",
-                path.display(),
+                "{} was truncated: all AGENTS.md/CLAUDE.md files together are capped at {} KB",
+                f.path.display(),
                 MAX_TOTAL_BYTES / 1024
             ));
+            kept.push(Found {
+                text: truncate(&f.text, left, f.kind),
+                ..f
+            });
+            left = 0;
         } else {
             warnings.push(format!(
-                "{} was not loaded: all AGENTS.md files together are capped at {} KB",
-                path.display(),
+                "{} was not loaded: all AGENTS.md/CLAUDE.md files together are capped at {} KB",
+                f.path.display(),
                 MAX_TOTAL_BYTES / 1024
             ));
         }
@@ -128,7 +182,7 @@ pub fn load(sb: &dyn Sandbox) -> AgentsMd {
     // Pins, spent on the nearest files first like the text; outermost first again after.
     let mut left = MAX_PINNED_BYTES;
     let mut pins: Vec<Pinned> = Vec::new();
-    for (path, text) in &kept {
+    for Found { path, text, .. } in &kept {
         let mut file_pins = Vec::new();
         for body in pinned_sections(text) {
             if pins
@@ -166,20 +220,31 @@ pub fn load(sb: &dyn Sandbox) -> AgentsMd {
     kept.reverse();
     let text = (!kept.is_empty()).then(|| {
         kept.iter()
-            .map(|(_, t)| t.trim())
+            .map(|f| match f.kind {
+                InstructionFile::AgentsMd => f.text.trim().to_string(),
+                // The block names the file this level used (7.11.6).
+                InstructionFile::ClaudeMd => {
+                    format!("{CLAUDE_MD_HEADER}\n{}", f.text.trim())
+                }
+            })
             .collect::<Vec<_>>()
             .join("\n\n")
     });
+    let sources = kept.into_iter().map(|f| (f.path, f.kind)).collect();
     AgentsMd {
         text,
         pins,
         warnings,
+        sources,
     }
 }
 
+/// First line of a `CLAUDE.md`'s text in the `<agents_md>` block.
+const CLAUDE_MD_HEADER: &str = "[instructions from CLAUDE.md]";
+
 /// Whether `target` (resolved, under `base`) is a protected path relative to `base`; if so
-/// a warning says it was refused.
-fn refuse_protected(base: &Path, target: &Path, warnings: &mut Vec<String>) -> bool {
+/// a warning says it was refused. `name` is the file's name in `base`.
+fn refuse_protected(base: &Path, name: &str, target: &Path, warnings: &mut Vec<String>) -> bool {
     let Ok(rel) = target.strip_prefix(base) else {
         return false;
     };
@@ -188,7 +253,7 @@ fn refuse_protected(base: &Path, target: &Path, warnings: &mut Vec<String>) -> b
     }
     warnings.push(format!(
         "{} resolves to the protected path {}; it was not loaded",
-        base.join(FILE_NAME).display(),
+        base.join(name).display(),
         rel.display()
     ));
     true
@@ -234,7 +299,12 @@ fn cut_pin(body: &str, max: usize) -> String {
 /// missing). Opened `O_NOFOLLOW`, so a link swapped in after resolving is refused. Never
 /// blocks on a FIFO, never reads a device. `ancestor`: the directory holding a file above
 /// the root, whose ownership and modes [`ancestor_untrusted`] checks on the open file.
-fn read_capped(path: &Path, ancestor: Option<&Path>, warnings: &mut Vec<String>) -> Option<String> {
+fn read_capped(
+    path: &Path,
+    kind: InstructionFile,
+    ancestor: Option<&Path>,
+    warnings: &mut Vec<String>,
+) -> Option<String> {
     let file = match std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW)
@@ -298,22 +368,22 @@ fn read_capped(path: &Path, ancestor: Option<&Path>, warnings: &mut Vec<String>)
             path.display(),
             MAX_FILE_BYTES / 1024
         ));
-        return Some(format!("{text}\n\n{}", marker(MAX_FILE_BYTES)));
+        return Some(format!("{text}\n\n{}", marker(MAX_FILE_BYTES, kind)));
     }
     Some(text)
 }
 
 /// `text` cut at a character boundary to at most `max` bytes, ending in the marker.
-fn truncate(text: &str, max: usize) -> String {
+fn truncate(text: &str, max: usize, kind: InstructionFile) -> String {
     let mut end = max.min(text.len());
     while !text.is_char_boundary(end) {
         end -= 1;
     }
-    format!("{}\n\n{}", text[..end].trim_end(), marker(max))
+    format!("{}\n\n{}", text[..end].trim_end(), marker(max, kind))
 }
 
-fn marker(bytes: usize) -> String {
-    format!("[AGENTS.md truncated at {} KB]", bytes / 1024)
+fn marker(bytes: usize, kind: InstructionFile) -> String {
+    format!("[{} truncated at {} KB]", kind.file_name(), bytes / 1024)
 }
 
 /// Bodies of the sections headed `Constraints` or `Rules` (any level, any case). A section

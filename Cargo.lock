@@ -2495,6 +2495,7 @@ dependencies = [
  "async-trait",
  "blake3",
  "futures",
+ "globset",
  "ignore",
  "insta",
  "keyring",

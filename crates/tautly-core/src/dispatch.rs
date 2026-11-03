@@ -272,6 +272,7 @@ impl Session {
         }
         self.ledger
             .note_effects(&[AppliedEffect::Exec { may_write: true }]);
+        self.evidence.on_lost_write();
         let list: Vec<String> = paths.iter().map(|p| p.display().to_string()).collect();
         self.warn(format!(
             "a write was abandoned after the cancel; {} may have changed, and undo cannot \
@@ -420,6 +421,13 @@ impl Session {
         }
         if ran {
             self.ledger.note_effects(&result.effects);
+            let raw_cmd = args.get("command").and_then(Value::as_str);
+            self.evidence.on_tool(
+                turn,
+                raw_cmd.filter(|_| call.name == "bash"),
+                &result,
+                self.ledger.generation(),
+            );
             let sig = signature(&call.name, &result);
             self.ledger.record(
                 &call.name,

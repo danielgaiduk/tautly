@@ -195,7 +195,7 @@ impl Run {
 
 fn finish_reason(events: &[Event]) -> FinishReason {
     match events.last() {
-        Some(Event::TurnFinished { reason }) => *reason,
+        Some(Event::TurnFinished { reason, .. }) => *reason,
         other => panic!("turn did not finish: {other:?}"),
     }
 }
@@ -571,7 +571,8 @@ async fn shutdown_kills_all_process_groups_and_session_is_resumable() {
         events.iter().any(|e| matches!(
             e,
             Event::TurnFinished {
-                reason: FinishReason::Cancelled
+                reason: FinishReason::Cancelled,
+                ..
             }
         )),
         "{events:?}"
@@ -586,7 +587,8 @@ async fn shutdown_kills_all_process_groups_and_session_is_resumable() {
         matches!(
             last,
             SessionRecord::TurnEnd {
-                reason: FinishReason::Cancelled
+                reason: FinishReason::Cancelled,
+                ..
             }
         ),
         "{last:?}"

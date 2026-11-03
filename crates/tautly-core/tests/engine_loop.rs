@@ -194,7 +194,7 @@ fn kind(ev: &Event) -> String {
 
 fn finish_reason(events: &[Event]) -> FinishReason {
     match events.last() {
-        Some(Event::TurnFinished { reason }) => *reason,
+        Some(Event::TurnFinished { reason, .. }) => *reason,
         other => panic!("turn did not finish: {other:?}"),
     }
 }
@@ -685,7 +685,7 @@ async fn records_appended_before_events_visible() {
                 assert!(call_at.is_some() && result_at.is_some(), "{recs:?}");
                 assert!(call_at < result_at);
             }
-            Event::TurnFinished { reason } => {
+            Event::TurnFinished { reason, .. } => {
                 let recs = records(&run.engine);
                 assert_eq!(recs.last(), Some(&SessionRecord::TurnEnd { reason }));
                 assert!(matches!(

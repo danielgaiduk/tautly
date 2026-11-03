@@ -4,7 +4,7 @@ use std::path::Path;
 use std::sync::mpsc;
 use std::time::Duration;
 
-use tautly_context::agents_md::{self, AgentsMd};
+use tautly_context::agents_md::{self, AgentsMd, InstructionFile};
 use tautly_context::{Context, PinSource};
 use tautly_provider::{CacheStyle, Capabilities, EditFormat, ReasoningStyle};
 use tautly_sandbox::LocalSandbox;
@@ -437,4 +437,276 @@ fn the_roots_own_file_is_not_subject_to_the_ancestor_rule() {
     std::fs::write(&file, "repo notes\n").unwrap();
     chmod(&file, 0o664);
     assert_eq!(load(dir.path()).text.as_deref(), Some("repo notes"));
+}
+
+// ---- CLAUDE.md fallback (spec 7.11.6) ----
+
+fn canon(p: &Path) -> std::path::PathBuf {
+    p.canonicalize().unwrap()
+}
+
+#[test]
+fn claude_md_used_when_no_agents_md() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("CLAUDE.md"), "claude notes\n").unwrap();
+    let found = load(dir.path());
+    assert!(found.text.as_deref().unwrap().contains("claude notes"));
+    assert_eq!(
+        found.sources,
+        [(
+            canon(dir.path()).join("CLAUDE.md"),
+            InstructionFile::ClaudeMd
+        )]
+    );
+    assert!(found.warnings.is_empty(), "{:?}", found.warnings);
+}
+
+#[test]
+fn agents_md_wins_when_both_exist() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("root");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::write(dir.path().join("CLAUDE.md"), "outer claude\n").unwrap();
+    std::fs::write(root.join("AGENTS.md"), "agents notes\n## Rules\n- a rule\n").unwrap();
+    std::fs::write(root.join("CLAUDE.md"), "claude notes\n## Rules\n- c rule\n").unwrap();
+    let found = load(&root);
+    let text = found.text.clone().unwrap();
+    // The root level reads only AGENTS.md; the outer level has no AGENTS.md and falls back.
+    assert!(
+        text.contains("agents notes") && text.contains("outer claude"),
+        "{text}"
+    );
+    assert!(!text.contains("claude notes"), "{text}");
+    assert_eq!(
+        found.sources,
+        [
+            (
+                canon(dir.path()).join("CLAUDE.md"),
+                InstructionFile::ClaudeMd
+            ),
+            (canon(&root).join("AGENTS.md"), InstructionFile::AgentsMd),
+        ]
+    );
+    let pins: Vec<&str> = found.pins.iter().map(|p| p.text.as_str()).collect();
+    assert_eq!(pins, ["- a rule"]);
+}
+
+#[test]
+fn an_unusable_agents_md_still_wins_over_claude_md() {
+    // "Where both files exist, only AGENTS.md is read": a refused AGENTS.md is not a
+    // reason to trust the other file instead.
+    let dir = tempfile::tempdir().unwrap();
+    let outside = dir.path().join("outside");
+    let root = dir.path().join("root");
+    std::fs::create_dir(&outside).unwrap();
+    std::fs::create_dir(&root).unwrap();
+    std::fs::write(outside.join("x"), "elsewhere\n").unwrap();
+    std::os::unix::fs::symlink("../outside/x", root.join("AGENTS.md")).unwrap();
+    std::fs::write(root.join("CLAUDE.md"), "claude notes\n").unwrap();
+    let found = load(&root);
+    assert_eq!(found.text, None, "{found:?}");
+    assert!(found.sources.is_empty());
+    assert!(found.warnings.iter().any(|w| w.contains("outside")));
+}
+
+#[test]
+fn claude_md_obeys_caps_confinement_and_ownership() {
+    // Confinement: a link out of the root is refused.
+    let dir = tempfile::tempdir().unwrap();
+    let outside = dir.path().join("outside");
+    let root = dir.path().join("root");
+    std::fs::create_dir(&outside).unwrap();
+    std::fs::create_dir(&root).unwrap();
+    std::fs::write(
+        outside.join("credentials"),
+        "fake_key = TEST-NOT-A-SECRET\n",
+    )
+    .unwrap();
+    std::os::unix::fs::symlink("../outside/credentials", root.join("CLAUDE.md")).unwrap();
+    let found = load(&root);
+    assert_eq!(found.text, None, "{found:?}");
+    assert!(found.sources.is_empty());
+    assert!(
+        found.warnings.iter().any(|w| w.contains("outside")),
+        "{:?}",
+        found.warnings
+    );
+
+    // ... a link to a protected path too.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join(".git")).unwrap();
+    std::fs::write(dir.path().join(".git").join("config"), "[core]\n").unwrap();
+    std::os::unix::fs::symlink(".git/config", dir.path().join("CLAUDE.md")).unwrap();
+    let found = load(dir.path());
+    assert_eq!(found.text, None, "{found:?}");
+    assert!(found.warnings.iter().any(|w| w.contains("protected")));
+
+    // ... an in-root link works.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join("docs")).unwrap();
+    std::fs::write(dir.path().join("docs").join("c.md"), "linked claude\n").unwrap();
+    std::os::unix::fs::symlink("docs/c.md", dir.path().join("CLAUDE.md")).unwrap();
+    assert!(load(dir.path()).text.unwrap().contains("linked claude"));
+
+    // Ownership and modes above the root: group-writable file, world-writable directory.
+    for (file_mode, dir_mode) in [(0o664, 0o755), (0o644, 0o777)] {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        let file = dir.path().join("CLAUDE.md");
+        std::fs::write(&file, "ancestor claude\n").unwrap();
+        chmod(&file, file_mode);
+        chmod(dir.path(), dir_mode);
+        let found = load(&root);
+        chmod(dir.path(), 0o755);
+        assert_eq!(found.text, None, "modes {file_mode:o}/{dir_mode:o}");
+        assert!(
+            found.warnings.iter().any(|w| w.contains("writable")),
+            "{:?}",
+            found.warnings
+        );
+    }
+    // A clean ancestor CLAUDE.md is accepted, and a link out of its directory is not.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("root");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::write(dir.path().join("CLAUDE.md"), "ancestor claude\n").unwrap();
+    assert!(load(&root).text.unwrap().contains("ancestor claude"));
+    let dir = tempfile::tempdir().unwrap();
+    let clone = dir.path().join("clone");
+    let root = clone.join("pkg");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(dir.path().join("secret"), "TEST-NOT-A-SECRET\n").unwrap();
+    std::os::unix::fs::symlink("../secret", clone.join("CLAUDE.md")).unwrap();
+    let found = load(&root);
+    assert_eq!(found.text, None, "{found:?}");
+    assert!(
+        found
+            .warnings
+            .iter()
+            .any(|w| w.contains("outside the directory"))
+    );
+
+    // Caps: 40 KB is cut at 32 KB with the marker (naming the file) and a warning.
+    let dir = tempfile::tempdir().unwrap();
+    let line = "use tabs, not spaces, in every file of this repository\n";
+    std::fs::write(
+        dir.path().join("CLAUDE.md"),
+        line.repeat(40 * 1024 / line.len()),
+    )
+    .unwrap();
+    let found = load(dir.path());
+    let text = found.text.unwrap();
+    assert!(
+        text.ends_with("[CLAUDE.md truncated at 32 KB]"),
+        "{}",
+        &text[text.len() - 60..]
+    );
+    assert!(text.len() <= 32 * 1024 + 128, "{}", text.len());
+    assert!(
+        found.warnings.iter().any(|w| w.contains("32 KB")),
+        "{:?}",
+        found.warnings
+    );
+
+    // The 64 KB total is shared with AGENTS.md files: 30 KB of each, three levels.
+    let dir = tempfile::tempdir().unwrap();
+    let mid = dir.path().join("a");
+    let root = mid.join("b");
+    std::fs::create_dir_all(&root).unwrap();
+    let file = |tag: &str| format!("{tag}\n{}", "x".repeat(30 * 1024 - tag.len() - 1));
+    std::fs::write(dir.path().join("CLAUDE.md"), file("OUTER")).unwrap();
+    std::fs::write(mid.join("AGENTS.md"), file("MIDDLE")).unwrap();
+    std::fs::write(root.join("CLAUDE.md"), file("NEAREST")).unwrap();
+    let found = load(&root);
+    let text = found.text.unwrap();
+    assert!(text.len() <= 64 * 1024 + 256, "{}", text.len());
+    assert!(
+        text[text.find("OUTER").unwrap()..text.find("MIDDLE").unwrap()]
+            .contains("[CLAUDE.md truncated at 4 KB]")
+    );
+    assert!(
+        found.warnings.iter().any(|w| w.contains("64 KB")),
+        "{:?}",
+        found.warnings
+    );
+
+    // A FIFO named CLAUDE.md does not hang start-up.
+    let dir = tempfile::tempdir().unwrap();
+    mkfifo(&dir.path().join("CLAUDE.md"));
+    let found = load_within_2s(dir.path()).expect("load returned within 2 s");
+    assert_eq!(found.text, None);
+    assert!(
+        found
+            .warnings
+            .iter()
+            .any(|w| w.contains("not a regular file"))
+    );
+}
+
+#[test]
+fn claude_md_rules_section_auto_pinned() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("CLAUDE.md"),
+        "# Project\nhello\n\n## Rules\n- never touch migrations/\n\n## Constraints\n- no network\n",
+    )
+    .unwrap();
+    let found = load(dir.path());
+    let pins: Vec<&str> = found.pins.iter().map(|p| p.text.as_str()).collect();
+    assert_eq!(pins, ["- never touch migrations/", "- no network"]);
+    assert!(found.pins.iter().all(|p| p.source == PinSource::AgentsMd));
+    assert!(found.warnings.is_empty(), "{:?}", found.warnings);
+}
+
+#[test]
+fn claude_md_at_imports_kept_as_text() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("secret.md"), "IMPORTED-CONTENT\n").unwrap();
+    std::fs::write(
+        dir.path().join("CLAUDE.md"),
+        "see below\n@secret.md\n@~/.ssh/config\n",
+    )
+    .unwrap();
+    let found = load(dir.path());
+    let text = found.text.unwrap();
+    assert!(
+        text.contains("@secret.md") && text.contains("@~/.ssh/config"),
+        "{text}"
+    );
+    assert!(!text.contains("IMPORTED-CONTENT"), "{text}");
+    assert!(found.warnings.is_empty(), "{:?}", found.warnings);
+}
+
+#[test]
+fn block_header_names_file_used() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("CLAUDE.md"), "claude notes\n").unwrap();
+    let found = load(dir.path());
+    let text = found.text.clone().unwrap();
+    assert!(
+        text.starts_with("[instructions from CLAUDE.md]\n"),
+        "{text}"
+    );
+    // The header is part of the `<agents_md>` block the model sees.
+    let mut c = Context::default();
+    c.set_agents_md(found);
+    let (req, _) = c.assemble(&caps(), &[], &"anthropic/claude-sonnet".into());
+    let block = format!("{:?}", req.system[1]);
+    assert!(block.contains("instructions from CLAUDE.md"), "{block}");
+
+    // With an AGENTS.md at the same level, only it is read and no header names CLAUDE.md.
+    std::fs::write(dir.path().join("AGENTS.md"), "agents notes\n").unwrap();
+    assert_eq!(load(dir.path()).text.unwrap(), "agents notes");
+
+    // Mixed levels: only the CLAUDE.md level is labelled.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("pkg");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::write(dir.path().join("AGENTS.md"), "outer agents\n").unwrap();
+    std::fs::write(root.join("CLAUDE.md"), "inner claude\n").unwrap();
+    assert_eq!(
+        load(&root).text.unwrap(),
+        "outer agents\n\n[instructions from CLAUDE.md]\ninner claude"
+    );
 }

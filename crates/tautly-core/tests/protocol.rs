@@ -135,6 +135,7 @@ fn every_event() -> Vec<Event> {
         },
         Event::TurnFinished {
             reason: FinishReason::MaxTurns,
+            evidence: None,
         },
         Event::Error {
             kind: ErrorKind::ProviderTransient,
@@ -569,7 +570,8 @@ fn unknown_events_and_values_read_as_unknown_not_as_errors() {
     assert_eq!(
         e,
         Event::TurnFinished {
-            reason: FinishReason::Unknown
+            reason: FinishReason::Unknown,
+            evidence: None,
         }
     );
     let e: Event = serde_json::from_value(json!({

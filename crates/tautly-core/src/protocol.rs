@@ -28,6 +28,8 @@ use tautly_memory::MemoryChange;
 use tautly_provider::Quota;
 use tautly_tools::{AppliedEffect, LineRange, Shown, ToolMeta};
 
+use crate::evidence::TestEvidence;
+
 /// `(major, minor)` of this protocol.
 pub const PROTOCOL_VERSION: (u32, u32) = (1, 0);
 
@@ -235,6 +237,10 @@ pub enum Event {
     },
     TurnFinished {
         reason: FinishReason,
+        /// The turn's last test run and whether it is still fresh (spec 7.11.7); absent
+        /// when the turn ran none, and in events from before this field existed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        evidence: Option<TestEvidence>,
     },
     Error {
         kind: ErrorKind,
