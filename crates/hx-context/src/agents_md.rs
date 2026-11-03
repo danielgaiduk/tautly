@@ -2,7 +2,7 @@
 
 use std::path::Path;
 
-use crate::pinned::{PinSource, Pinned};
+use crate::pinned::{self, PinSource, Pinned};
 
 const FILE_NAME: &str = "AGENTS.md";
 
@@ -10,17 +10,18 @@ const FILE_NAME: &str = "AGENTS.md";
 /// nearest file is last), and a pin for each `Constraints` / `Rules` section. Unreadable or
 /// empty files are skipped.
 pub fn load(root: &Path) -> (Option<String>, Vec<Pinned>) {
+    // Normalize first so `.` / `a/..` do not yield the same directory under several names.
+    let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
     let mut found: Vec<String> = root
         .ancestors()
         .filter_map(|dir| std::fs::read_to_string(dir.join(FILE_NAME)).ok())
         .filter(|text| !text.trim().is_empty())
         .collect();
     found.reverse();
-    let pins = found
-        .iter()
-        .flat_map(|text| pinned_sections(text))
-        .map(|body| Pinned::new(body, PinSource::AgentsMd))
-        .collect();
+    let mut pins = Vec::new();
+    for body in found.iter().flat_map(|text| pinned_sections(text)) {
+        pinned::add(&mut pins, Pinned::new(body, PinSource::AgentsMd));
+    }
     let text = (!found.is_empty()).then(|| {
         found
             .iter()
@@ -78,8 +79,13 @@ fn pinned_sections(text: &str) -> Vec<String> {
     out
 }
 
-/// `(level, title)` of an ATX heading line.
+/// `(level, title)` of an ATX heading line (up to three leading spaces are allowed).
 fn heading(line: &str) -> Option<(usize, &str)> {
+    let indent = line.bytes().take_while(|&b| b == b' ').count();
+    if indent > 3 {
+        return None;
+    }
+    let line = &line[indent..];
     let level = line.bytes().take_while(|&b| b == b'#').count();
     if !(1..=6).contains(&level) {
         return None;

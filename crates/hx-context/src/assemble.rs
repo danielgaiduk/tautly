@@ -94,6 +94,17 @@ impl Context {
             }
             cache_breakpoints.push(CachePoint::AfterSystem);
             if cached_len > 0 {
+                // The previous request ended just before the latest assistant reply. Marking
+                // that message too keeps the earlier cache entry within the provider's
+                // lookback window when one step adds many blocks (4 breakpoints in all).
+                if caps.cache == CacheStyle::Explicit
+                    && let Some(a) = messages[..cached_len]
+                        .iter()
+                        .rposition(|m| m.role == Role::Assistant)
+                    && a >= 1
+                {
+                    cache_breakpoints.push(CachePoint::AfterMessage(a - 1));
+                }
                 cache_breakpoints.push(CachePoint::AfterMessage(cached_len - 1));
             }
         }

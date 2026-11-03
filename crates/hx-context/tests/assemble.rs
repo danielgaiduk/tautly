@@ -89,7 +89,7 @@ fn block_order_is_system_tools_agents_memory_pinned_history_state() {
     // Tools travel in the tools field, sorted by name for a fixed order.
     let names: Vec<&str> = req.tools.iter().map(|t| t.name.as_str()).collect();
     assert_eq!(names, ["bash", "edit", "read"]);
-    // Pinned and state are user content after the prefix, before the history, in that order.
+    // Pinned leads the conversation, joined to the first user message; the state follows the history.
     let first = &req.messages[0];
     assert_eq!(first.role, Role::User);
     let texts: Vec<&str> = first.content.iter().map(content_text).collect();
@@ -160,6 +160,7 @@ fn cache_breakpoints_after_stable_prefix_and_last_message() {
         vec![
             CachePoint::AfterTools,
             CachePoint::AfterSystem,
+            CachePoint::AfterMessage(0),
             CachePoint::AfterMessage(2)
         ]
     );
@@ -174,7 +175,7 @@ fn cache_breakpoints_skip_absent_parts() {
 }
 
 #[test]
-fn pinned_and_state_prepend_to_first_user_message_or_stand_alone() {
+fn pinned_prepends_to_first_user_message_or_stands_alone() {
     let mut c = Context::default();
     c.pinned.push(Pinned {
         text: "p".into(),
@@ -191,6 +192,13 @@ fn pinned_and_state_prepend_to_first_user_message_or_stand_alone() {
     assert_eq!(req.messages.len(), 2);
     assert_eq!(req.messages[0].role, Role::User);
     assert_eq!(req.messages[1].role, Role::Assistant);
+    // User-first history: pinned joins the first message instead.
+    let mut c2 = Context::default();
+    c2.pinned.push(Pinned::new("p", PinSource::User));
+    c2.history.push(turn("hi"));
+    let (req2, _) = c2.assemble(&caps(), &[], &m());
+    assert_eq!(req2.messages.len(), 1);
+    assert_eq!(req2.messages[0].content.len(), 2);
     // The history itself is never mutated.
     assert_eq!(c.history[0].messages[0].content.len(), 1);
 }
@@ -528,9 +536,50 @@ fn agents_md_concatenates_ancestors_nearest_last() {
 #[test]
 fn agents_md_absent_gives_none() {
     let dir = tempfile::tempdir().unwrap();
-    // Ancestors of a temp dir normally hold no AGENTS.md; only assert pins are empty.
-    let (_, pins) = agents_md::load(dir.path());
+    // No AGENTS.md in the temp dir or (in practice) any of its ancestors.
+    let (text, pins) = agents_md::load(dir.path());
+    assert_eq!(text, None);
     assert!(pins.is_empty());
+}
+
+#[test]
+fn agents_md_reads_each_file_once_and_dedupes_pins() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join("pkg")).unwrap();
+    std::fs::write(
+        dir.path().join("AGENTS.md"),
+        "outer text\n## Rules\n- same rule\n",
+    )
+    .unwrap();
+    // `pkg/..` and its ancestors name the same file twice unless paths are normalized.
+    let (text, pins) = agents_md::load(&dir.path().join("pkg").join(".."));
+    assert_eq!(text.unwrap().matches("outer text").count(), 1);
+    assert_eq!(pins.len(), 1);
+
+    // The same rule in two files is pinned once.
+    std::fs::write(
+        dir.path().join("pkg").join("AGENTS.md"),
+        "## Rules\n- same rule\n",
+    )
+    .unwrap();
+    let (_, pins) = agents_md::load(&dir.path().join("pkg"));
+    assert_eq!(pins.len(), 1);
+}
+
+#[test]
+fn agents_md_accepts_headings_indented_up_to_three_spaces() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("AGENTS.md"),
+        "   ## Rules\n- indented ok\n\n    ## Rules\n- four spaces is code\n",
+    )
+    .unwrap();
+    let (_, pins) = agents_md::load(dir.path());
+    let texts: Vec<&str> = pins.iter().map(|p| p.text.as_str()).collect();
+    assert_eq!(
+        texts,
+        ["- indented ok\n\n    ## Rules\n- four spaces is code"]
+    );
 }
 
 #[test]
@@ -674,6 +723,7 @@ fn cache_breakpoint_precedes_state_tail() {
         vec![
             CachePoint::AfterTools,
             CachePoint::AfterSystem,
+            CachePoint::AfterMessage(0),
             CachePoint::AfterMessage(2)
         ]
     );
@@ -704,4 +754,122 @@ fn no_cache_breakpoints_when_cache_style_is_none() {
     auto.cache = CacheStyle::Automatic;
     let (req, _) = c.assemble(&auto, &tools(), &m());
     assert!(!req.cache_breakpoints.is_empty());
+}
+
+#[test]
+fn second_breakpoint_marks_previous_steps_last_message() {
+    let step = |id: &str| Turn {
+        messages: vec![
+            Message {
+                role: Role::Assistant,
+                content: vec![Content::ToolUse {
+                    id: id.into(),
+                    name: "read".into(),
+                    input: json!({}),
+                }],
+            },
+            Message {
+                role: Role::User,
+                content: vec![Content::ToolResult {
+                    id: id.into(),
+                    output: "ok".into(),
+                    is_error: false,
+                }],
+            },
+        ],
+    };
+    let mut c = Context::default();
+    c.history.push(turn("start"));
+    c.history.push(step("1"));
+    c.history.push(step("2"));
+    c.state.task = Some("t".into());
+    // Messages: U A U A U (+ state tail). The previous request ended at index 2.
+    let (req, _) = c.assemble(&caps(), &tools(), &m());
+    assert_eq!(req.messages.len(), 6);
+    assert_eq!(
+        req.cache_breakpoints,
+        vec![
+            CachePoint::AfterTools,
+            CachePoint::AfterSystem,
+            CachePoint::AfterMessage(2),
+            CachePoint::AfterMessage(4)
+        ]
+    );
+    assert!(req.cache_breakpoints.len() <= 4);
+
+    // Only the explicit cache style gets the extra breakpoint.
+    let mut auto = caps();
+    auto.cache = CacheStyle::Automatic;
+    let (req, _) = c.assemble(&auto, &tools(), &m());
+    assert_eq!(
+        req.cache_breakpoints
+            .iter()
+            .filter(|p| matches!(p, CachePoint::AfterMessage(_)))
+            .count(),
+        1
+    );
+
+    // No earlier assistant message: no second message breakpoint.
+    let mut first = Context::default();
+    first.history.push(turn("only"));
+    let (req, _) = first.assemble(&caps(), &tools(), &m());
+    assert_eq!(
+        req.cache_breakpoints,
+        vec![
+            CachePoint::AfterTools,
+            CachePoint::AfterSystem,
+            CachePoint::AfterMessage(0)
+        ]
+    );
+}
+
+#[test]
+fn calibrate_ignores_flat_image_tokens() {
+    let image_turn = Turn {
+        messages: vec![Message {
+            role: Role::User,
+            content: vec![
+                Content::Text("x".repeat(400)),
+                Content::Image {
+                    media_type: "image/png".into(),
+                    data: vec![0; 10],
+                },
+            ],
+        }],
+    };
+    let mut c = Context::default();
+    c.history.push(image_turn);
+    let (_, st) = c.assemble(&caps(), &[], &m());
+    // Provider counted exactly the text estimate plus the same flat image cost.
+    c.calibrate(st.used, u64::from(st.used));
+    assert!(
+        (c.tokens.ratio() - 1.0).abs() < 1e-9,
+        "{}",
+        c.tokens.ratio()
+    );
+    // Text really is 50% more than estimated: image cost must not dilute the sample.
+    let text_est = st.used - 1_000;
+    c.calibrate(st.used, u64::from(text_est) * 3 / 2 + 1_000);
+    assert!(c.tokens.ratio() > 1.1, "{}", c.tokens.ratio());
+}
+
+#[test]
+fn exec_that_may_write_marks_every_file_maybe_stale_until_reread() {
+    let mut c = Context::default();
+    c.apply_effects(&[
+        read_effect("/p/a.rs", b"a", Shown::Full),
+        read_effect("/p/b.rs", b"b", Shown::Full),
+    ]);
+    c.apply_effects(&[AppliedEffect::Exec { may_write: false }]);
+    assert!(c.state.files.values().all(|n| !n.maybe_stale));
+    c.apply_effects(&[AppliedEffect::Exec { may_write: true }]);
+    assert!(c.state.files.values().all(|n| n.maybe_stale));
+    c.apply_effects(&[read_effect("/p/a.rs", b"a2", Shown::Full)]);
+    c.apply_effects(&[edited_effect("/p/b.rs", b"b2")]);
+    assert!(c.state.files.values().all(|n| !n.maybe_stale));
+
+    c.apply_effects(&[AppliedEffect::Exec { may_write: true }]);
+    let (req, _) = c.assemble(&caps(), &[], &m());
+    let t = tail_text(&req);
+    assert_eq!(t.matches("maybe stale").count(), 2, "{t}");
 }

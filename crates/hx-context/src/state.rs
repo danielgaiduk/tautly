@@ -13,6 +13,8 @@ pub struct FileNote {
     pub read_hash: Option<String>,
     pub edited: bool,
     pub deleted: bool,
+    /// A command that may write ran since this file was last read or edited.
+    pub maybe_stale: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -34,8 +36,8 @@ const FAILED_ATTEMPTS_TOKENS: u32 = 300;
 const HASH_SHOWN: usize = 12;
 
 impl WorkingState {
-    /// Record tool side effects on files. `Exec` is ignored: a command may have touched any
-    /// file, but nothing is known about which.
+    /// Record tool side effects on files. A command that may write marks all known files
+    /// `maybe_stale`: nothing is known about which it touched.
     pub fn apply_effects(&mut self, effects: &[AppliedEffect]) {
         for effect in effects {
             match effect {
@@ -45,6 +47,7 @@ impl WorkingState {
                     let note = self.files.entry(path.clone()).or_default();
                     note.read_hash = Some(file_hash.to_hex().to_string());
                     note.deleted = false;
+                    note.maybe_stale = false;
                 }
                 AppliedEffect::Edited {
                     path, post_hash, ..
@@ -53,14 +56,23 @@ impl WorkingState {
                     note.read_hash = Some(post_hash.to_hex().to_string());
                     note.edited = true;
                     note.deleted = false;
+                    note.maybe_stale = false;
                 }
                 AppliedEffect::Deleted { path, .. } => {
                     let note = self.files.entry(path.clone()).or_default();
                     note.read_hash = None;
                     note.edited = false;
                     note.deleted = true;
+                    note.maybe_stale = false;
                 }
-                AppliedEffect::Exec { .. } => {}
+                // A command that may write could have changed any file: flag every hash
+                // as possibly out of date until that file is read or edited again.
+                AppliedEffect::Exec { may_write: true } => {
+                    for note in self.files.values_mut() {
+                        note.maybe_stale = !note.deleted;
+                    }
+                }
+                AppliedEffect::Exec { may_write: false } => {}
             }
         }
     }
@@ -137,6 +149,9 @@ impl WorkingState {
                 }
                 if note.edited {
                     tags.push("edited".into());
+                }
+                if note.maybe_stale {
+                    tags.push("maybe stale".into());
                 }
                 out.push_str(&format!("- {shown} ({})\n", tags.join(", ")));
             }

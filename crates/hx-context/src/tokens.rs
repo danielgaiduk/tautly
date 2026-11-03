@@ -26,6 +26,15 @@ impl TokenEstimator {
         (s.len() as f64 / 4.0 * self.ratio).ceil() as u32
     }
 
+    /// [`calibrate`](Self::calibrate) for totals that include `flat` tokens of fixed
+    /// estimates (images) which the ratio does not scale: the sample is the text part only.
+    pub fn calibrate_excluding(&mut self, estimated: u32, actual: u64, flat: u32) {
+        self.calibrate(
+            estimated.saturating_sub(flat),
+            actual.saturating_sub(u64::from(flat)),
+        );
+    }
+
     /// Fold one observation into the ratio: `estimated` is a count this estimator produced
     /// (so it already includes the current ratio) and `actual` the provider's count for the
     /// same text. The ratio moves toward `actual / unscaled estimate`, an exponential moving

@@ -40,6 +40,21 @@ impl Context {
         self.state.apply_effects(effects);
     }
 
+    fn flat_tokens(&self) -> u32 {
+        self.history
+            .iter()
+            .map(|t| blocks::flat_tokens(&t.messages))
+            .sum()
+    }
+
+    /// Calibrate token estimation: `estimated` is the `used` of a request assembled from the
+    /// current history and `actual` the provider's input count for it. Images are a flat
+    /// estimate the ratio never scaled, so their share is left out of the sample.
+    pub fn calibrate(&mut self, estimated: u32, actual: u64) {
+        let flat = self.flat_tokens();
+        self.tokens.calibrate_excluding(estimated, actual, flat);
+    }
+
     /// Apply a `pin` or `state` tool call.
     pub fn apply_op(&mut self, op: ContextOp) {
         match op {

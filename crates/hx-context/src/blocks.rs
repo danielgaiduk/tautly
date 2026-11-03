@@ -44,6 +44,16 @@ pub struct ContextStatus {
     pub warnings: Vec<String>,
 }
 
+/// Tokens of fixed-size estimates (images) in `messages`, which the ratio does not scale.
+pub(crate) fn flat_tokens(messages: &[Message]) -> u32 {
+    let images = messages
+        .iter()
+        .flat_map(|m| &m.content)
+        .filter(|c| matches!(c, Content::Image { .. }))
+        .count();
+    IMAGE_TOKENS.saturating_mul(images as u32)
+}
+
 pub(crate) fn content_tokens(c: &Content, est: &TokenEstimator) -> u32 {
     match c {
         Content::Text(t) => est.estimate(t),
