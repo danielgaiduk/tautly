@@ -611,159 +611,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "15cdd26707701c53297e2fa6afb323d55fbc1d0810c3aec078ae3ef0424c3c15"
 
 [[package]]
-name = "hx-context"
-version = "0.1.0"
-dependencies = [
- "blake3",
- "globset",
- "hx-index",
- "hx-provider",
- "hx-sandbox",
- "hx-tools",
- "libc",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror",
- "tokio",
- "toml",
-]
-
-[[package]]
-name = "hx-index"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "blake3",
- "futures",
- "globset",
- "hx-sandbox",
- "ignore",
- "notify",
- "proptest",
- "rayon",
- "regex",
- "regex-syntax",
- "rusqlite",
- "streaming-iterator",
- "tempfile",
- "thiserror",
- "tokio",
- "tree-sitter",
- "tree-sitter-go",
- "tree-sitter-javascript",
- "tree-sitter-json",
- "tree-sitter-python",
- "tree-sitter-rust",
- "tree-sitter-toml-ng",
- "tree-sitter-typescript",
- "tree-sitter-yaml",
-]
-
-[[package]]
-name = "hx-memory"
-version = "0.1.0"
-dependencies = [
- "humantime",
- "hx-index",
- "hx-sandbox",
- "hx-session",
- "libc",
- "rand 0.9.5",
- "rusqlite",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror",
- "tokio",
-]
-
-[[package]]
-name = "hx-provider"
-version = "0.1.0"
-dependencies = [
- "async-stream",
- "base64 0.22.1",
- "blake3",
- "bytes",
- "futures",
- "humantime",
- "rand 0.9.5",
- "reqwest",
- "serde",
- "serde_json",
- "thiserror",
- "tokio",
- "tokio-util",
- "toml",
- "url",
- "wiremock",
-]
-
-[[package]]
-name = "hx-sandbox"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "blake3",
- "globset",
- "ignore",
- "libc",
- "reqwest",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror",
- "tokio",
- "tree-sitter",
- "tree-sitter-bash",
- "url",
- "wiremock",
-]
-
-[[package]]
-name = "hx-session"
-version = "0.1.0"
-dependencies = [
- "blake3",
- "libc",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror",
- "ulid",
-]
-
-[[package]]
-name = "hx-tools"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "base64 0.22.1",
- "blake3",
- "globset",
- "htmd",
- "hx-index",
- "hx-memory",
- "hx-provider",
- "hx-sandbox",
- "ignore",
- "libc",
- "proptest",
- "regex",
- "rusqlite",
- "serde",
- "serde_json",
- "similar",
- "tempfile",
- "thiserror",
- "tokio",
- "tokio-util",
- "tree-sitter",
- "wiremock",
-]
-
-[[package]]
 name = "hyper"
 version = "1.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1915,6 +1762,159 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.9",
+]
+
+[[package]]
+name = "tautly-context"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "globset",
+ "libc",
+ "serde",
+ "serde_json",
+ "tautly-index",
+ "tautly-provider",
+ "tautly-sandbox",
+ "tautly-tools",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "toml",
+]
+
+[[package]]
+name = "tautly-index"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "blake3",
+ "futures",
+ "globset",
+ "ignore",
+ "notify",
+ "proptest",
+ "rayon",
+ "regex",
+ "regex-syntax",
+ "rusqlite",
+ "streaming-iterator",
+ "tautly-sandbox",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tree-sitter",
+ "tree-sitter-go",
+ "tree-sitter-javascript",
+ "tree-sitter-json",
+ "tree-sitter-python",
+ "tree-sitter-rust",
+ "tree-sitter-toml-ng",
+ "tree-sitter-typescript",
+ "tree-sitter-yaml",
+]
+
+[[package]]
+name = "tautly-memory"
+version = "0.1.0"
+dependencies = [
+ "humantime",
+ "libc",
+ "rand 0.9.5",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tautly-index",
+ "tautly-sandbox",
+ "tautly-session",
+ "tempfile",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
+name = "tautly-provider"
+version = "0.1.0"
+dependencies = [
+ "async-stream",
+ "base64 0.22.1",
+ "blake3",
+ "bytes",
+ "futures",
+ "humantime",
+ "rand 0.9.5",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+ "toml",
+ "url",
+ "wiremock",
+]
+
+[[package]]
+name = "tautly-sandbox"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "blake3",
+ "globset",
+ "ignore",
+ "libc",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tree-sitter",
+ "tree-sitter-bash",
+ "url",
+ "wiremock",
+]
+
+[[package]]
+name = "tautly-session"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "libc",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "ulid",
+]
+
+[[package]]
+name = "tautly-tools"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "base64 0.22.1",
+ "blake3",
+ "globset",
+ "htmd",
+ "ignore",
+ "libc",
+ "proptest",
+ "regex",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "similar",
+ "tautly-index",
+ "tautly-memory",
+ "tautly-provider",
+ "tautly-sandbox",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+ "tree-sitter",
+ "wiremock",
 ]
 
 [[package]]

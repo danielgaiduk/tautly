@@ -1,0 +1,23 @@
+[package]
+name = "tautly-memory"
+description = "Code-anchored project memory, episodic memory and recall search for the Tautly agent harness"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+tautly-index = { path = "../tautly-index" }
+tautly-session = { path = "../tautly-session" }
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+humantime.workspace = true
+rand.workspace = true
+libc.workspace = true
+
+[dev-dependencies]
+tautly-sandbox = { path = "../tautly-sandbox" }
+tokio.workspace = true
+tempfile.workspace = true
+rusqlite.workspace = true

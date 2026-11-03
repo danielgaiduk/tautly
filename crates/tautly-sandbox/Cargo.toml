@@ -1,0 +1,27 @@
+[package]
+name = "tautly-sandbox"
+description = "Filesystem, process and network confinement for Tautly"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+ignore.workspace = true
+url.workspace = true
+reqwest.workspace = true
+tempfile.workspace = true
+tree-sitter.workspace = true
+tree-sitter-bash.workspace = true
+globset.workspace = true
+serde.workspace = true
+blake3.workspace = true
+libc.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
+wiremock = "0.6"
+serde_json.workspace = true

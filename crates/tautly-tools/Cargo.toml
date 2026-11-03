@@ -1,0 +1,35 @@
+[package]
+name = "tautly-tools"
+description = "Tool trait and built-in tools for the Tautly agent harness"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+tautly-sandbox = { path = "../tautly-sandbox" }
+tautly-provider = { path = "../tautly-provider" }
+tautly-index = { path = "../tautly-index" }
+tautly-memory = { path = "../tautly-memory" }
+async-trait.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+blake3.workspace = true
+base64.workspace = true
+globset.workspace = true
+regex.workspace = true
+libc.workspace = true
+similar.workspace = true
+tree-sitter.workspace = true
+htmd.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio.workspace = true
+proptest.workspace = true
+ignore.workspace = true
+wiremock.workspace = true
+rusqlite.workspace = true
