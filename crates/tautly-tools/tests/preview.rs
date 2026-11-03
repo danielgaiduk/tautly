@@ -93,9 +93,10 @@ proptest! {
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         rt.block_on(async move {
             let e = env(EditFormat::StrReplace);
-            // Numbered lines keep every old_text unique.
+            // Fixed-width numbered lines keep every old_text unique: `str_replace` matches
+            // substrings, so unpadded numbers ("2:n" inside "12:n") would be ambiguous.
             let lines: Vec<String> =
-                words.iter().enumerate().map(|(i, w)| format!("{i}:{w}")).collect();
+                words.iter().enumerate().map(|(i, w)| format!("{i:03}:{w}")).collect();
             let eol = if crlf { "\r\n" } else { "\n" };
             let content: String = lines.iter().map(|l| format!("{l}{eol}")).collect();
             e.put("f.txt", content.as_bytes()).await;
@@ -115,6 +116,32 @@ proptest! {
             Ok(())
         })?;
     }
+}
+
+/// An `old_text` that is a substring of several lines is ambiguous: preview and apply reject
+/// it with the same error, so nothing unapproved is ever written. (The seed saved in
+/// `preview.proptest-regressions` hit this: "2:n" also occurs inside "12:n".)
+#[tokio::test]
+async fn ambiguous_edit_is_rejected_by_preview_and_run_alike() {
+    let e = env(EditFormat::StrReplace);
+    let content = "0:a\n1:a\n2:n\n3:a\n4:a\n5:a\n6:a\n7:a\n8:a\n9:a\n10:a\n11:a\n12:n\n";
+    e.put("f.txt", content.as_bytes()).await;
+    e.read("f.txt").await;
+
+    let args = json!({"path": "f.txt", "old_text": "2:n", "new_text": "X"});
+    let rejected = e.preview(&EditTool, &args).await.unwrap_err();
+    assert!(rejected.is_error);
+    assert_eq!(rejected.meta.error_kind, Some("ambiguous"));
+    assert!(
+        rejected.output.contains("matches 2 places"),
+        "{}",
+        rejected.output
+    );
+
+    let ran = EditTool.run(args, &e.sb, &e.cx).await;
+    assert_eq!(ran.output, rejected.output);
+    assert_eq!(ran.meta.error_kind, rejected.meta.error_kind);
+    assert_eq!(e.slurp("f.txt").await, content.as_bytes());
 }
 
 #[tokio::test]
