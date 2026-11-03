@@ -99,6 +99,13 @@ impl LineRange {
         start: None,
         end: None,
     };
+
+    /// Whether the two ranges share a line (an open end reaches the end of the file).
+    fn overlaps(&self, other: &Self) -> bool {
+        let (a_start, a_end) = (self.start.unwrap_or(1), self.end.unwrap_or(usize::MAX));
+        let (b_start, b_end) = (other.start.unwrap_or(1), other.end.unwrap_or(usize::MAX));
+        a_start <= b_end && b_start <= a_end
+    }
 }
 
 /// What the tracker remembers of the last read of one path and range. The content itself
@@ -107,6 +114,8 @@ impl LineRange {
 pub struct PrevRead {
     /// Hash of the whole file at that time.
     pub hash: blake3::Hash,
+    /// The edit format active when it was shown: other formats show other text.
+    pub format: EditFormat,
     /// Hash of the range's content, which decides whether a re-read is unchanged.
     pub content_hash: blake3::Hash,
     pub turn: u32,
@@ -126,36 +135,34 @@ impl ReadTracker {
     /// Record that `range` of `path` was returned at `turn` with `content` (the range's
     /// lines, newline-joined, no line numbers). `hash` is the hash of the whole file.
     /// The content is spilled through the sandbox; only a reference stays in memory. If
-    /// the spill fails the range is simply not remembered, so the next read is full.
+    /// the spill fails the range is simply not remembered, so the next read is full. The
+    /// new view supersedes every baseline of `path` whose range overlaps `range`.
     #[allow(clippy::too_many_arguments)]
     pub async fn record(
         &self,
         sb: &dyn Sandbox,
         path: &Path,
         range: LineRange,
+        format: EditFormat,
         meta: &FileMeta,
         hash: blake3::Hash,
         turn: u32,
         content: &str,
     ) {
         self.refresh(path, meta, hash);
-        let key = (path.to_path_buf(), range);
-        match sb.spill(content.as_bytes()).await {
-            Ok(content_path) => {
-                let prev = PrevRead {
-                    hash,
-                    content_hash: blake3::hash(content.as_bytes()),
-                    turn,
-                    mtime: meta.mtime,
-                    content_path,
-                };
-                let mut ranges = self.ranges.lock().unwrap_or_else(|e| e.into_inner());
-                ranges.insert(key, prev);
-            }
-            Err(_) => {
-                let mut ranges = self.ranges.lock().unwrap_or_else(|e| e.into_inner());
-                ranges.remove(&key);
-            }
+        let spilled = sb.spill(content.as_bytes()).await;
+        let mut ranges = self.ranges.lock().unwrap_or_else(|e| e.into_inner());
+        ranges.retain(|(p, r), _| p != path || !r.overlaps(&range));
+        if let Ok(content_path) = spilled {
+            let prev = PrevRead {
+                hash,
+                format,
+                content_hash: blake3::hash(content.as_bytes()),
+                turn,
+                mtime: meta.mtime,
+                content_path,
+            };
+            ranges.insert((path.to_path_buf(), range), prev);
         }
     }
 
@@ -177,10 +184,12 @@ impl ReadTracker {
         seen.get(path).copied()
     }
 
-    /// The last read of exactly this `range` of `path`, if its content was kept.
-    pub fn previous(&self, path: &Path, range: LineRange) -> Option<PrevRead> {
+    /// The last read of exactly this `range` of `path` shown in `format`, if its content
+    /// was kept.
+    pub fn previous(&self, path: &Path, range: LineRange, format: EditFormat) -> Option<PrevRead> {
         let ranges = self.ranges.lock().unwrap_or_else(|e| e.into_inner());
-        ranges.get(&(path.to_path_buf(), range)).cloned()
+        let prev = ranges.get(&(path.to_path_buf(), range))?;
+        (prev.format == format).then(|| prev.clone())
     }
 }
 
@@ -189,12 +198,17 @@ pub(crate) const MAX_READ_LINES: usize = 2000;
 
 /// Record the post-edit state of `full` (`bytes` as just written) so a later read of the
 /// whole file is diffed against what the edit left, not against the pre-edit read.
+///
+/// `whole_file_seen` is true when the model supplied the entire content (`write`). After an
+/// edit it has seen the whole file only if it holds a whole-file baseline already; an edit
+/// after a partial read must not make a whole-file read answer `unchanged`.
 pub(crate) async fn record_written_file(
     sb: &dyn Sandbox,
     cx: &ToolCx,
     full: &Path,
     meta: &FileMeta,
     bytes: &[u8],
+    whole_file_seen: bool,
 ) {
     let hash = blake3::hash(bytes);
     // Hashline edits move line numbers and the model has not seen the new anchors, so a
@@ -202,6 +216,16 @@ pub(crate) async fn record_written_file(
     // baselines (a changed range then comes back in full) and only refresh the guard.
     if cx.edit_format() == EditFormat::Hashline {
         cx.reads().refresh(full, meta, hash);
+        return;
+    }
+    let seen_whole = whole_file_seen
+        || cx
+            .reads()
+            .previous(full, LineRange::ALL, cx.edit_format())
+            .is_some();
+    if !seen_whole {
+        cx.reads().refresh(full, meta, hash);
+        cx.reads().forget(full, LineRange::ALL);
         return;
     }
     // A file beyond the 2,000-line window is only partly shown by an open-ended `read`,
@@ -213,7 +237,16 @@ pub(crate) async fn record_written_file(
     match content {
         Some(content) => {
             cx.reads()
-                .record(sb, full, LineRange::ALL, meta, hash, cx.turn(), &content)
+                .record(
+                    sb,
+                    full,
+                    LineRange::ALL,
+                    cx.edit_format(),
+                    meta,
+                    hash,
+                    cx.turn(),
+                    &content,
+                )
                 .await
         }
         None => {

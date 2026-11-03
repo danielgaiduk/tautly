@@ -216,7 +216,7 @@ async fn load_fresh(
 /// Remember what was written, so consecutive edits need no re-read.
 async fn record_written(sb: &dyn Sandbox, cx: &ToolCx, full: &Path, bytes: &[u8]) -> blake3::Hash {
     if let Ok(meta) = sb.metadata(full).await {
-        crate::record_written_file(sb, cx, full, &meta, bytes).await;
+        crate::record_written_file(sb, cx, full, &meta, bytes, false).await;
     }
     blake3::hash(bytes)
 }

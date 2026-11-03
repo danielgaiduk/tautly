@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use async_trait::async_trait;
 use hx_index::SymbolKind;
 use hx_provider::{Capabilities, EditFormat, ToolSpec};
-use hx_sandbox::{Effect, Sandbox};
+use hx_sandbox::{Effect, FileMeta, Sandbox};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -91,9 +91,36 @@ struct Lines {
     remaining: usize,
     /// The numbered (or hashline-tagged) lines, newline-joined.
     text: String,
+    /// The baseline to commit once the result is about to be returned.
+    pending: Option<Pending>,
+}
+
+/// What the tracker records for a read, committed only if the model gets all of the output.
+struct Pending {
+    meta: FileMeta,
+    /// The range's lines, newline-joined.
+    content: String,
 }
 
 impl Lines {
+    /// Make this read the baseline for the next read of its range.
+    async fn commit(&self, sb: &dyn Sandbox, cx: &ToolCx) {
+        if let Some(p) = &self.pending {
+            cx.reads()
+                .record(
+                    sb,
+                    &self.full,
+                    self.range,
+                    cx.edit_format(),
+                    &p.meta,
+                    self.hash,
+                    cx.turn(),
+                    &p.content,
+                )
+                .await;
+        }
+    }
+
     /// The output for this read within `cap` bytes, with continuation notes.
     fn render(&self, cap: usize) -> String {
         self.render_flagged(cap).0
@@ -181,42 +208,43 @@ async fn read_lines(
         .collect::<Vec<_>>()
         .join("\n");
 
-    let prev = cx.reads().previous(&full, range).filter(|_| !force_full);
-    let mut unchanged = false;
-    if let Some(prev) = prev {
-        let turn = prev.turn;
-        if prev.content_hash == blake3::hash(content.as_bytes()) {
-            // The earlier content is still in context; say nothing more.
-            unchanged = true;
-            remaining = 0;
-            text = format!("unchanged since turn {turn}");
-        } else {
-            // A hashline edit needs the anchors of the current lines, which a diff would
-            // lack, so in that format a change always returns the full content.
-            let diff = if hashline {
-                None
-            } else {
-                diff_against(sb, &prev, shown, start).await
-            };
-            text = match diff {
-                Some(diff) => {
-                    remaining = 0;
-                    format!("changed since turn {turn}:\n{diff}")
-                }
-                None => format!("changed since turn {turn} (full content):\n{text}"),
-            };
-        }
-    }
-    // An unchanged read keeps its baseline, and with it the turn the content was shown. A
-    // read cut by the line window shows only part of the range: no baseline for that
-    // (the byte cap is applied later, by the caller, which then forgets the baseline).
+    let mut pending = None;
     if remaining > 0 {
+        // The window cut the range: the model sees only part of it, so neither answer
+        // `unchanged` or with a diff (which would drop the continuation note), nor
+        // remember it.
         cx.reads().forget(&full, range);
-    } else if !unchanged {
-        let turn = cx.turn();
-        cx.reads()
-            .record(sb, &full, range, &meta, hash, turn, &content)
-            .await;
+    } else {
+        let prev = cx
+            .reads()
+            .previous(&full, range, cx.edit_format())
+            .filter(|_| !force_full);
+        let mut unchanged = false;
+        if let Some(prev) = prev {
+            let turn = prev.turn;
+            if prev.content_hash == blake3::hash(content.as_bytes()) {
+                // The earlier content is still in context; say nothing more.
+                unchanged = true;
+                text = format!("unchanged since turn {turn}");
+            } else {
+                // A hashline edit needs the anchors of the current lines, which a diff would
+                // lack, so in that format a change always returns the full content.
+                let diff = if hashline {
+                    None
+                } else {
+                    diff_against(sb, &prev, shown, start).await
+                };
+                text = match diff {
+                    Some(diff) => format!("changed since turn {turn}:\n{diff}"),
+                    None => format!("changed since turn {turn} (full content):\n{text}"),
+                };
+            }
+        }
+        // An unchanged read keeps its baseline, and with it the turn the content was shown.
+        // The commit waits until the caller knows the output was delivered whole.
+        if !unchanged {
+            pending = Some(Pending { meta, content });
+        }
     }
     Ok(Lines {
         full,
@@ -226,6 +254,7 @@ async fn read_lines(
         end,
         remaining,
         text,
+        pending,
     })
 }
 
@@ -455,6 +484,8 @@ impl Tool for ReadTool {
                         if truncated {
                             // The model did not see all of it; show it again next time.
                             cx.reads().forget(&lines.full, lines.range);
+                        } else {
+                            lines.commit(sb, cx).await;
                         }
                         let mut r = ToolResult::ok(output);
                         r.effects.push(AppliedEffect::Read(lines.full, lines.hash));
@@ -497,10 +528,18 @@ async fn read_batch(
         }
         sections.push(read_target(target, force_full, sb, cx).await);
     }
+    if cx.cancel().is_cancelled() {
+        return ToolResult::error("cancelled");
+    }
     let (output, cut) = assemble(&sections);
-    for (section, _) in sections.iter().zip(&cut).filter(|(_, c)| **c) {
+    // Baselines are committed only now that the output is about to be returned.
+    for (section, cut) in sections.iter().zip(&cut) {
         if let Ok(lines) = &section.body {
-            cx.reads().forget(&lines.full, lines.range);
+            if *cut {
+                cx.reads().forget(&lines.full, lines.range);
+            } else {
+                lines.commit(sb, cx).await;
+            }
         }
     }
     let mut result = if sections.iter().all(|s| s.body.is_err()) {

@@ -5,11 +5,16 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
+use async_trait::async_trait;
 use hx_provider::EditFormat;
-use hx_sandbox::{LocalSandbox, Sandbox};
+use hx_sandbox::{
+    Child, FileMeta, HttpResponse, LocalSandbox, Sandbox, SandboxError, SpawnSpec, Url,
+};
 use hx_tools::{EditTool, LineRange, ReadTool, ReadTracker, Tool, ToolCx, ToolResult, WriteTool};
 use serde_json::{Value, json};
+use std::path::PathBuf;
 use tempfile::TempDir;
+use tokio_util::sync::CancellationToken;
 
 struct Env {
     dir: TempDir,
@@ -199,7 +204,10 @@ async fn tracker_keeps_contents_on_disk_not_in_memory() {
     e.put("a.txt", &content).await;
     e.read_at(2, json!({"path": "a.txt"})).await;
     let full = e.sb.resolve(Path::new("a.txt")).unwrap();
-    let prev = e.reads.previous(&full, LineRange::ALL).expect("recorded");
+    let prev = e
+        .reads
+        .previous(&full, LineRange::ALL, EditFormat::StrReplace)
+        .expect("recorded");
     assert_eq!(prev.turn, 2);
     // The sandbox spills content-addressed files; the tracker holds only the reference.
     let on_disk = e.sb.read(&prev.content_path).await.unwrap();
@@ -214,7 +222,8 @@ async fn tracker_keeps_contents_on_disk_not_in_memory() {
                 LineRange {
                     start: Some(1),
                     end: Some(3)
-                }
+                },
+                EditFormat::StrReplace
             )
             .is_none()
     );
@@ -316,7 +325,10 @@ async fn missing_spilled_copy_falls_back_to_full_content() {
     e.put("a.txt", &ten_lines(&[])).await;
     e.read_at(1, json!({"path": "a.txt"})).await;
     let full = e.sb.resolve(Path::new("a.txt")).unwrap();
-    let prev = e.reads.previous(&full, LineRange::ALL).unwrap();
+    let prev = e
+        .reads
+        .previous(&full, LineRange::ALL, EditFormat::StrReplace)
+        .unwrap();
     e.sb.remove_file(&prev.content_path).await.unwrap();
     e.put("a.txt", &ten_lines(&[5])).await;
     // The read still succeeds, with everything the diff would have implied.
@@ -450,4 +462,220 @@ async fn write_of_a_file_beyond_the_window_sets_no_baseline() {
     assert!(!r.is_error, "{}", r.output);
     let out = e.read_at(5, json!({"path": "w.txt"})).await;
     assert!(out.starts_with("1\trow1\n"), "{}", &out[..40]);
+}
+
+// ---- fix round 1 ----
+
+fn rows(n: usize) -> String {
+    (1..=n).map(|i| format!("row{i}\n")).collect()
+}
+
+fn range(start: usize, end: usize) -> LineRange {
+    LineRange {
+        start: Some(start),
+        end: Some(end),
+    }
+}
+
+#[tokio::test]
+async fn edit_after_a_partial_read_does_not_claim_the_whole_file_unchanged() {
+    let e = env();
+    let hundred: String = (1..=100).map(|n| format!("line{n}\n")).collect();
+    e.put("a.txt", &hundred).await;
+    let head = json!({"path": "a.txt", "start_line": 1, "end_line": 10});
+    e.read_at(1, head.clone()).await;
+    let r = e
+        .run_at(
+            &EditTool,
+            2,
+            json!({"path": "a.txt", "old_text": "line5\n", "new_text": "EDITED5\n"}),
+        )
+        .await;
+    assert!(!r.is_error, "{}", r.output);
+    // The range that was shown is diffed against what the model saw.
+    let out = e.read_at(3, head).await;
+    assert!(out.starts_with("changed since turn 1:\n@@"), "{out}");
+    // Lines 11-100 were never shown: the whole-file read must show everything.
+    let whole = e.read_at(4, json!({"path": "a.txt"})).await;
+    assert!(whole.starts_with("1\tline1\n"), "{}", &whole[..40]);
+    assert!(whole.contains("100\tline100"));
+}
+
+#[tokio::test]
+async fn window_growth_keeps_the_continuation_note_after_an_edit() {
+    let e = env();
+    e.put("a.txt", &rows(1990)).await;
+    e.read_at(1, json!({"path": "a.txt"})).await;
+    let more: String = (1991..=2100).map(|i| format!("row{i}\n")).collect();
+    let r = e
+        .run_at(
+            &EditTool,
+            2,
+            json!({"path": "a.txt", "old_text": "row1990\n", "new_text": format!("row1990\n{more}")}),
+        )
+        .await;
+    assert!(!r.is_error, "{}", r.output);
+    let note = "[100 more lines; use start_line=2001 to continue]";
+    for turn in [3, 4] {
+        let out = e.read_at(turn, json!({"path": "a.txt"})).await;
+        assert!(out.starts_with("1\trow1\n"), "{}", &out[..30]);
+        assert!(
+            out.ends_with(note),
+            "turn {turn}: {}",
+            &out[out.len() - 60..]
+        );
+    }
+}
+
+#[tokio::test]
+async fn window_growth_by_an_outside_change_keeps_the_note_and_no_diff() {
+    let e = env();
+    e.put("a.txt", &rows(1990)).await;
+    e.read_at(1, json!({"path": "a.txt"})).await;
+    e.put("a.txt", &rows(2100)).await;
+    let out = e.read_at(2, json!({"path": "a.txt"})).await;
+    assert!(out.starts_with("1\trow1\n"), "{}", &out[..30]);
+    assert!(out.ends_with("[100 more lines; use start_line=2001 to continue]"));
+}
+
+/// Cancels `token` when `trigger` is read.
+struct CancelOnRead {
+    inner: LocalSandbox,
+    token: CancellationToken,
+    trigger: &'static str,
+}
+
+#[async_trait]
+impl Sandbox for CancelOnRead {
+    fn root(&self) -> &Path {
+        self.inner.root()
+    }
+    fn resolve(&self, p: &Path) -> Result<PathBuf, SandboxError> {
+        self.inner.resolve(p)
+    }
+    async fn read(&self, p: &Path) -> Result<Vec<u8>, SandboxError> {
+        if p.ends_with(self.trigger) {
+            self.token.cancel();
+        }
+        self.inner.read(p).await
+    }
+    async fn metadata(&self, p: &Path) -> Result<FileMeta, SandboxError> {
+        self.inner.metadata(p).await
+    }
+    async fn write_atomic(
+        &self,
+        p: &Path,
+        bytes: &[u8],
+        mode: Option<u32>,
+    ) -> Result<(), SandboxError> {
+        self.inner.write_atomic(p, bytes, mode).await
+    }
+    async fn remove_file(&self, p: &Path) -> Result<(), SandboxError> {
+        self.inner.remove_file(p).await
+    }
+    async fn spill(&self, bytes: &[u8]) -> Result<PathBuf, SandboxError> {
+        self.inner.spill(bytes).await
+    }
+    async fn spawn(&self, spec: SpawnSpec) -> Result<Child, SandboxError> {
+        self.inner.spawn(spec).await
+    }
+    fn walker(&self, base: &Path) -> Result<ignore::WalkBuilder, SandboxError> {
+        self.inner.walker(base)
+    }
+    async fn http_get(&self, url: &Url) -> Result<HttpResponse, SandboxError> {
+        self.inner.http_get(url).await
+    }
+}
+
+#[tokio::test]
+async fn cancelled_batched_read_commits_no_baselines() {
+    let e = env();
+    for f in ["a.txt", "b.txt", "c.txt"] {
+        e.put(f, "one\ntwo\n").await;
+    }
+    let token = CancellationToken::new();
+    let sb = CancelOnRead {
+        inner: LocalSandbox::new(e.dir.path().to_path_buf()).unwrap(),
+        token: token.clone(),
+        trigger: "b.txt",
+    };
+    let cx = e.cx(1, EditFormat::StrReplace).with_cancel(token);
+    let args = json!({"targets": [{"path": "a.txt"}, {"path": "b.txt"}, {"path": "c.txt"}]});
+    let r = ReadTool.run(args, &sb, &cx).await;
+    assert!(r.is_error, "{}", r.output);
+    for f in ["a.txt", "b.txt", "c.txt"] {
+        let full = e.sb.resolve(Path::new(f)).unwrap();
+        assert!(
+            e.reads
+                .previous(&full, LineRange::ALL, EditFormat::StrReplace)
+                .is_none(),
+            "{f} has a baseline for output the model never got"
+        );
+    }
+    // So the next read shows the content.
+    assert_eq!(
+        e.read_at(2, json!({"path": "a.txt"})).await,
+        "1\tone\n2\ttwo"
+    );
+}
+
+#[tokio::test]
+async fn same_range_twice_in_one_batch_is_not_unchanged_against_itself() {
+    let e = env();
+    e.put("a.txt", "one\ntwo\n").await;
+    let args = json!({"targets": [{"path": "a.txt"}, {"path": "a.txt"}]});
+    let first = e.read_at(1, args.clone()).await;
+    assert_eq!(first.matches("1\tone").count(), 2, "{first}");
+    assert!(!first.contains("unchanged"), "{first}");
+    let second = e.read_at(2, args).await;
+    assert_eq!(
+        second.matches("unchanged since turn 1").count(),
+        2,
+        "{second}"
+    );
+}
+
+#[tokio::test]
+async fn recording_a_range_invalidates_overlapping_baselines_of_the_path() {
+    let e = env();
+    e.put("a.txt", &rows(20)).await;
+    let full = e.sb.resolve(Path::new("a.txt")).unwrap();
+    let fmt = EditFormat::StrReplace;
+    for (s, t) in [(1, 5), (10, 12), (3, 8)] {
+        e.read_at(1, json!({"path": "a.txt", "start_line": s, "end_line": t}))
+            .await;
+    }
+    // (3,8) overlaps (1,5) but not (10,12).
+    assert!(e.reads.previous(&full, range(1, 5), fmt).is_none());
+    assert!(e.reads.previous(&full, range(3, 8), fmt).is_some());
+    assert!(e.reads.previous(&full, range(10, 12), fmt).is_some());
+    // An open-ended read overlaps everything.
+    e.read_at(2, json!({"path": "a.txt"})).await;
+    assert!(e.reads.previous(&full, range(3, 8), fmt).is_none());
+    assert!(e.reads.previous(&full, range(10, 12), fmt).is_none());
+    let out = e
+        .read_at(3, json!({"path": "a.txt", "start_line": 3, "end_line": 8}))
+        .await;
+    assert!(out.starts_with("3\trow3"), "{out}");
+}
+
+#[tokio::test]
+async fn baselines_from_another_edit_format_are_ignored() {
+    let e = env();
+    e.put("a.txt", "one\ntwo\n").await;
+    let read = |turn, format| {
+        let cx = e.cx(turn, format);
+        let sb = &e.sb;
+        async move { ReadTool.run(json!({"path": "a.txt"}), sb, &cx).await.output }
+    };
+    read(1, EditFormat::StrReplace).await;
+    let hashline = read(2, EditFormat::Hashline).await;
+    assert!(hashline.starts_with("1:"), "{hashline}");
+    assert!(hashline.contains("|one"), "{hashline}");
+    // The hashline read replaced the baseline, so plain format starts over too.
+    assert_eq!(read(3, EditFormat::StrReplace).await, "1\tone\n2\ttwo");
+    assert_eq!(
+        read(4, EditFormat::StrReplace).await,
+        "unchanged since turn 3"
+    );
 }
