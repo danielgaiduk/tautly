@@ -48,7 +48,7 @@ use tokio_util::sync::CancellationToken;
 use crate::approvals::{Approvals, Verdict};
 use crate::attempts::AttemptLedger;
 use crate::budget::{Budget, Budgets};
-use crate::checkpoint::{self, Checkpointer, GitCheckpoints, Point};
+use crate::checkpoint::{self, Checkpointer, GitCheckpoints, StartCheckpoint};
 use crate::config::{Config, LoadedConfig};
 use crate::evidence::{EvidenceTracker, TestMatcher};
 use crate::ledger::{CostLedger, LEDGER_FILE};
@@ -268,6 +268,16 @@ impl EngineBuilder {
             })
             .flatten()
             .map(|cp| GitCheckpoints::shared(cp.with_process_groups(groups.clone())));
+        // Checkpoints are on in a git work tree, yet none can be taken: no git to run.
+        let start_checkpoint = if config.checkpoints.enabled
+            && checkpoints.is_none()
+            && checkpoint::git_dir(&root).is_some()
+            && checkpoint::git_on_path().is_none()
+        {
+            StartCheckpoint::NoGit
+        } else {
+            StartCheckpoint::Idle
+        };
         let session = Session {
             context,
             reads: Arc::new(ReadTracker::default()),
@@ -306,6 +316,7 @@ impl EngineBuilder {
             mcp: None,
             pre_exec: self.pre_exec.unwrap_or_else(|| Arc::new(NoPreExec)),
             checkpoints,
+            start_checkpoint,
             data_home,
             header_init: init,
         };
@@ -515,9 +526,7 @@ impl Actor {
         // A log that cannot be rebuilt leaves nothing to run: every command is refused.
         let mut state = match started {
             Ok(()) => {
-                session
-                    .git_checkpoint(Point::Start, session.last_step(), None)
-                    .await;
+                session.begin_checkpoints().await;
                 prune_checkpoints(&session);
                 session.mcp = McpSession::start(
                     start.mcp,
@@ -611,6 +620,9 @@ impl Actor {
                     }
                 }
             }
+        }
+        if let Some(s) = state.as_mut() {
+            s.abandon_start_checkpoint();
         }
         // MCP servers end with their process groups. (A session lost to a crashed turn
         // dropped its servers, which kills their groups.)
@@ -736,6 +748,8 @@ impl Actor {
 
     /// A command that runs between turns.
     async fn idle_command(&mut self, session: &mut Session, cmd: Command) {
+        // A fork or undo reads the log, which must have the session-start checkpoint.
+        session.settle_start_checkpoint().await;
         match cmd {
             Command::Pin { .. } | Command::Unpin { .. } => session.context_command(cmd).await,
             Command::Diff { turn } => session.diff(turn).await,

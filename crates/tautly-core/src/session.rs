@@ -20,7 +20,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::attempts::AttemptLedger;
 use crate::budget::Budgets;
-use crate::checkpoint::GitCheckpoints;
+use crate::checkpoint::{GitCheckpoints, StartCheckpoint};
 use crate::evidence::EvidenceTracker;
 use crate::ledger::CostLedger;
 use crate::mcp::{McpSession, PreExecHook};
@@ -360,6 +360,8 @@ pub(crate) struct Session {
     pub pre_exec: Arc<dyn PreExecHook>,
     /// Checkpoints of the work tree (spec 7.11.11); none outside git or when off.
     pub checkpoints: Option<Arc<tokio::sync::Mutex<GitCheckpoints>>>,
+    /// The session-start checkpoint (spec 7.11.11), taken in the background.
+    pub start_checkpoint: StartCheckpoint,
     /// Where session logs live (a fork creates its log here).
     pub data_home: PathBuf,
     /// The header fields every log of this session shares (model, config hash).

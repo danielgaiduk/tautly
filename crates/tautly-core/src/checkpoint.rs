@@ -14,11 +14,16 @@
 //!
 //! The user's index, HEAD, branches, stash and ignored files are never read or written:
 //! only objects and `refs/tautly/` change, except on an explicit restore, which writes the
-//! work tree. Every git call runs with `core.fsmonitor=false` and `core.hooksPath=/dev/null`
-//! (no hook or fsmonitor program runs), `gc.auto=0`, no signing, literal pathspecs, the
-//! repository found at the root only (`GIT_CEILING_DIRECTORIES`), in a process group of
-//! its own that is killed at the deadline (`timeout_ms` for a snapshot), when the call is
-//! dropped (a cancel) or by the session's process-group registry.
+//! work tree. Nothing the repository configures runs: every git call names the repository
+//! and the root as its work tree (`--git-dir`, `--work-tree`: neither the environment nor
+//! `core.worktree` can move it), runs with `core.fsmonitor=false`,
+//! `core.hooksPath=/dev/null`, no submodule recursion, no transport, credential helper,
+//! askpass, pager or editor, no system configuration, and every filter driver the
+//! configuration defines switched off (so files tracked through Git LFS or another filter
+//! are snapshotted as their bytes in the work tree); also no split index, `gc.auto=0`, no
+//! signing, literal pathspecs. Each runs in a process group of its own that is killed at
+//! the deadline (`timeout_ms` for a snapshot), when the call is dropped (a cancel) or by
+//! the session's process-group registry.
 //!
 //! An unchanged tree reuses the previous checkpoint (same `n` and commit), and so does a
 //! [`Checkpointer::snapshot`] whose write generation did not move and whose caller's
@@ -37,7 +42,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::config::CheckpointConfig;
 use crate::record::SessionRecord;
-use crate::session::Session;
+use crate::session::{EventSink, Log, Session};
 
 /// Every checkpoint ref is below this.
 pub const REF_PREFIX: &str = "refs/tautly/checkpoints";
@@ -119,7 +124,19 @@ impl From<Skip> for CheckpointError {
             Skip::NoGit => CheckpointError::NoGit,
             Skip::Timeout => CheckpointError::Timeout,
             Skip::Git(why) => CheckpointError::Git(why),
-            other => CheckpointError::Git(other.to_string()),
+            limits @ Skip::TooManyUntracked { .. } => CheckpointError::Invalid(limits.to_string()),
+        }
+    }
+}
+
+impl Skip {
+    /// The reason a `CheckpointSkipped` record gives (`cancelled` is the other one).
+    pub fn code(&self) -> &'static str {
+        match self {
+            Skip::NoGit => "no_git",
+            Skip::Timeout => "timeout",
+            Skip::TooManyUntracked { .. } => "too_many_untracked",
+            Skip::Git(_) => "git_failed",
         }
     }
 }
@@ -168,66 +185,204 @@ impl From<Fail> for CheckpointError {
     }
 }
 
-/// One git invocation context: which git, where, with which index.
+/// Settings every git call runs with: no hook, fsmonitor, submodule recursion, network
+/// transport, credential helper or askpass program runs, nothing is written outside the
+/// objects and refs (no split index, no automatic gc or maintenance), nothing is signed.
+const HARDENING: [&str; 13] = [
+    "core.fsmonitor=false",
+    "core.hooksPath=/dev/null",
+    "core.splitIndex=false",
+    "submodule.recurse=false",
+    "protocol.allow=never",
+    "credential.helper=",
+    "core.askPass=",
+    "gc.auto=0",
+    "maintenance.auto=false",
+    "commit.gpgSign=false",
+    "advice.addEmbeddedRepo=false",
+    "core.quotePath=false",
+    "core.pager=cat",
+];
+/// Inherited variables that would change which repository, configuration or programs a
+/// git call uses.
+const ENV_REMOVED: [&str; 18] = [
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_COMMON_DIR",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_NAMESPACE",
+    "GIT_PREFIX",
+    "GIT_GLOB_PATHSPECS",
+    "GIT_NOGLOB_PATHSPECS",
+    "GIT_ICASE_PATHSPECS",
+    "GIT_CONFIG",
+    "GIT_CONFIG_PARAMETERS",
+    "GIT_CONFIG_COUNT",
+    "GIT_EXTERNAL_DIFF",
+    "GIT_SSH",
+    "GIT_SSH_COMMAND",
+    "SSH_ASKPASS",
+    "GIT_ATTR_SOURCE",
+];
+
+/// One git invocation context: which git, which repository and work tree, which index.
 struct Git<'a> {
     sb: &'a dyn Sandbox,
+    /// The sandbox root: the working directory of every call.
     root: &'a Path,
+    /// The repository (`--git-dir`), resolved from the root's `.git`.
+    git_dir: &'a Path,
+    /// The work tree (`--work-tree`): the root, so `core.worktree` cannot move it.
+    work_tree: &'a Path,
     program: &'a Path,
     index: Option<&'a Path>,
     groups: Option<&'a ProcessGroups>,
+    /// The filter-driver overrides, read once per `Git` (one operation).
+    filters: tokio::sync::OnceCell<Vec<String>>,
 }
 
-impl Git<'_> {
+impl<'a> Git<'a> {
+    fn new(
+        sb: &'a dyn Sandbox,
+        root: &'a Path,
+        git_dir: &'a Path,
+        program: &'a Path,
+        index: Option<&'a Path>,
+        groups: Option<&'a ProcessGroups>,
+    ) -> Git<'a> {
+        Git {
+            sb,
+            root,
+            git_dir,
+            work_tree: root,
+            program,
+            index,
+            groups,
+            filters: tokio::sync::OnceCell::new(),
+        }
+    }
+
     /// Run `git <args>` (with `input` on stdin) until `deadline`; its stdout on success.
+    /// Every call runs with every configured filter driver switched off (see
+    /// [`Git::filter_overrides`]): not only `add` and `checkout` convert content, any
+    /// command that refreshes the index (`write-tree`) may run a clean filter to compare
+    /// a racily clean file.
     async fn run(
         &self,
         args: &[&str],
         input: Option<Vec<u8>>,
         deadline: Instant,
     ) -> Result<Vec<u8>, Fail> {
-        let mut argv = vec![self.program.to_string_lossy().into_owned()];
-        for setting in [
-            "core.fsmonitor=false",
-            "core.hooksPath=/dev/null",
-            "gc.auto=0",
-            "maintenance.auto=false",
-            "commit.gpgSign=false",
-            "advice.addEmbeddedRepo=false",
-            "core.quotePath=false",
-        ] {
+        let overrides = self
+            .filters
+            .get_or_try_init(|| self.filter_overrides(deadline))
+            .await?;
+        self.exec(args, overrides, input, deadline).await
+    }
+
+    /// `-c` settings that switch off every filter driver the configuration defines (any
+    /// scope, includes followed): a repository that came with a `.git/config` and
+    /// `.gitattributes` must not get its programs run by a checkpoint. Reading the
+    /// configuration runs nothing. Driver names git cannot take on the command line fail
+    /// the call (no snapshot, rather than a filter run).
+    ///
+    /// With the filters off, files tracked through a filter (Git LFS, git-crypt) are
+    /// snapshotted and restored as their bytes in the work tree.
+    async fn filter_overrides(&self, deadline: Instant) -> Result<Vec<String>, Fail> {
+        let out = match self
+            .exec(
+                &["config", "-z", "--get-regexp", r"^filter\."],
+                &[],
+                None,
+                deadline,
+            )
+            .await
+        {
+            Ok(out) => out,
+            // Nothing matched.
+            Err(Fail::Exit { code: Some(1), .. }) => return Ok(Vec::new()),
+            Err(e) => return Err(e),
+        };
+        let mut names = std::collections::BTreeSet::new();
+        for entry in out.split(|&b| b == 0).filter(|e| !e.is_empty()) {
+            let key = entry.split(|&b| b == b'\n').next().unwrap_or_default();
+            let key = std::str::from_utf8(key)
+                .map_err(|_| Fail::Io("a filter driver name is not valid UTF-8".into()))?;
+            let Some((name, _var)) = key
+                .strip_prefix("filter.")
+                .and_then(|rest| rest.rsplit_once('.'))
+            else {
+                continue;
+            };
+            if name.contains('=') {
+                return Err(Fail::Io(format!(
+                    "filter driver {name:?} cannot be switched off"
+                )));
+            }
+            names.insert(name.to_string());
+        }
+        let mut args = Vec::with_capacity(names.len() * 8);
+        for name in names {
+            for setting in ["clean=", "smudge=", "process=", "required=false"] {
+                args.push("-c".to_string());
+                args.push(format!("filter.{name}.{setting}"));
+            }
+        }
+        Ok(args)
+    }
+
+    /// Run `git [hardening] [extra] <args>` (with `input` on stdin) until `deadline`.
+    async fn exec(
+        &self,
+        args: &[&str],
+        extra: &[String],
+        input: Option<Vec<u8>>,
+        deadline: Instant,
+    ) -> Result<Vec<u8>, Fail> {
+        let mut argv = vec![
+            self.program.to_string_lossy().into_owned(),
+            "--no-pager".into(),
+            format!("--git-dir={}", self.git_dir.to_string_lossy()),
+            format!("--work-tree={}", self.work_tree.to_string_lossy()),
+        ];
+        for setting in HARDENING {
             argv.push("-c".into());
             argv.push(setting.into());
         }
+        argv.extend(extra.iter().cloned());
         argv.extend(args.iter().map(|a| a.to_string()));
-        let mut env = vec![
-            ("GIT_TERMINAL_PROMPT".into(), "0".into()),
-            ("GIT_OPTIONAL_LOCKS".into(), "0".into()),
-            ("GIT_LITERAL_PATHSPECS".into(), "1".into()),
-            ("GIT_AUTHOR_NAME".into(), "tautly".into()),
-            ("GIT_AUTHOR_EMAIL".into(), "tautly@localhost".into()),
-            ("GIT_COMMITTER_NAME".into(), "tautly".into()),
-            ("GIT_COMMITTER_EMAIL".into(), "tautly@localhost".into()),
-        ];
+        let mut env: Vec<(String, String)> = [
+            ("GIT_CONFIG_NOSYSTEM", "1"),
+            ("GIT_TERMINAL_PROMPT", "0"),
+            ("GIT_ASKPASS", ""),
+            ("GIT_PAGER", "cat"),
+            ("PAGER", "cat"),
+            ("GIT_EDITOR", "true"),
+            ("GIT_SEQUENCE_EDITOR", "true"),
+            ("GIT_NO_LAZY_FETCH", "1"),
+            ("GIT_OPTIONAL_LOCKS", "0"),
+            ("GIT_LITERAL_PATHSPECS", "1"),
+            ("GIT_AUTHOR_NAME", "tautly"),
+            ("GIT_AUTHOR_EMAIL", "tautly@localhost"),
+            ("GIT_COMMITTER_NAME", "tautly"),
+            ("GIT_COMMITTER_EMAIL", "tautly@localhost"),
+        ]
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .to_vec();
         if let Some(parent) = self.root.parent() {
             env.push((
                 "GIT_CEILING_DIRECTORIES".into(),
                 parent.to_string_lossy().into_owned(),
             ));
         }
-        let mut env_remove: Vec<String> = [
-            "GIT_DIR",
-            "GIT_WORK_TREE",
-            "GIT_COMMON_DIR",
-            "GIT_OBJECT_DIRECTORY",
-            "GIT_ALTERNATE_OBJECT_DIRECTORIES",
-            "GIT_NAMESPACE",
-            "GIT_PREFIX",
-            "GIT_GLOB_PATHSPECS",
-            "GIT_NOGLOB_PATHSPECS",
-            "GIT_ICASE_PATHSPECS",
-        ]
-        .map(String::from)
-        .to_vec();
+        let mut env_remove: Vec<String> = ENV_REMOVED.map(String::from).to_vec();
+        // `check-ignore` takes no pathspec magic, literal included (it is given absolute
+        // paths, which have none).
+        if args.first() == Some(&"check-ignore") {
+            env.retain(|(k, _)| k != "GIT_LITERAL_PATHSPECS");
+            env_remove.push("GIT_LITERAL_PATHSPECS".into());
+        }
         match self.index {
             Some(index) => env.push((
                 "GIT_INDEX_FILE".into(),
@@ -333,7 +488,17 @@ impl Git<'_> {
     async fn diff(&self, a: &str, b: &str, deadline: Instant) -> Result<Vec<Change>, Fail> {
         let out = self
             .run(
-                &["diff-tree", "-r", "-z", "--no-renames", "--raw", a, b],
+                &[
+                    "diff-tree",
+                    "-r",
+                    "-z",
+                    "--no-renames",
+                    "--no-ext-diff",
+                    "--no-textconv",
+                    "--raw",
+                    a,
+                    b,
+                ],
                 None,
                 deadline,
             )
@@ -524,6 +689,8 @@ struct Last {
 pub struct Checkpointer {
     sb: Arc<dyn Sandbox>,
     root: PathBuf,
+    /// The repository the root's `.git` names.
+    git_dir: PathBuf,
     session: String,
     cfg: CheckpointConfig,
     program: PathBuf,
@@ -538,8 +705,8 @@ pub struct Checkpointer {
 
 impl Checkpointer {
     /// A checkpointer for the work tree at `root` (the sandbox root, a git top level):
-    /// none when `root` is not a git work tree (it has no `.git`; a bare repository has
-    /// none), when no `git` is on `PATH`, or when no temporary directory can be made.
+    /// none when `root` is not a git work tree (it has no usable `.git`; a bare repository
+    /// has none), when no `git` is on `PATH`, or when no temporary directory can be made.
     /// Runs no git.
     pub fn new(
         sb: Arc<dyn Sandbox>,
@@ -547,8 +714,8 @@ impl Checkpointer {
         session: String,
         cfg: CheckpointConfig,
     ) -> Option<Checkpointer> {
-        std::fs::symlink_metadata(root.join(".git")).ok()?;
-        let program = find_on_path("git")?;
+        let git_dir = git_dir(&root)?;
+        let program = git_on_path()?;
         let tmp = tempfile::Builder::new()
             .prefix("tautly-checkpoint-")
             .tempdir()
@@ -557,6 +724,7 @@ impl Checkpointer {
         Some(Checkpointer {
             sb,
             root,
+            git_dir,
             session,
             cfg,
             program,
@@ -621,6 +789,21 @@ impl Checkpointer {
         }
     }
 
+    /// Continue as fork `session`, whose log copied checkpoints up to `max_n` and whose
+    /// latest one is `last` (`n`, commit, tree; the branch has a ref of its own for it, or
+    /// none: nothing is reused). The parent's later checkpoints are never reused.
+    pub(crate) fn branch(
+        &mut self,
+        session: String,
+        max_n: u32,
+        last: Option<(u32, String, String)>,
+    ) {
+        self.session = session;
+        self.next = max_n.saturating_add(1);
+        self.last = None;
+        self.continue_after(max_n, last);
+    }
+
     /// Something other than a snapshot changed files (a restore): the next snapshot runs
     /// git whatever the write generation says.
     pub fn invalidate(&mut self) {
@@ -630,13 +813,14 @@ impl Checkpointer {
     }
 
     fn git(&self) -> Git<'_> {
-        Git {
-            sb: self.sb.as_ref(),
-            root: &self.root,
-            program: &self.program,
-            index: Some(&self.index),
-            groups: self.groups.as_ref(),
-        }
+        Git::new(
+            self.sb.as_ref(),
+            &self.root,
+            &self.git_dir,
+            &self.program,
+            Some(&self.index),
+            self.groups.as_ref(),
+        )
     }
 
     fn deadline(&self) -> Instant {
@@ -918,13 +1102,17 @@ impl Checkpointer {
     /// deleted through the sandbox. Ignored files and submodules are never touched. With
     /// `dry_run` nothing is written; either way the plan is returned. Take a
     /// [`backup`](Self::backup) first.
-    pub async fn restore(
+    ///
+    /// Crate-internal: it has no conflict check (a file a human changed or created since
+    /// is overwritten or deleted), which rewind and switch (spec 7.12) add on top.
+    #[allow(dead_code)] // the building block of rewind and switch (spec 7.12)
+    pub(crate) async fn restore(
         &self,
         commit: &str,
         dry_run: bool,
     ) -> Result<RestorePlan, CheckpointError> {
         let deadline = Self::housekeeping_deadline();
-        let now = self.tree_now(false, deadline).await?;
+        let now = self.tree_now(true, deadline).await?;
         let changes = self.git().diff(&now.tree, commit, deadline).await?;
         let mut plan = RestorePlan::default();
         let mut write = Vec::new();
@@ -945,6 +1133,109 @@ impl Checkpointer {
         }
         self.checkout(commit, &write, deadline).await?;
         Ok(plan)
+    }
+
+    /// Which of `paths` (root-relative) the ignore rules of tree-ish `tree` ignore: its
+    /// `.gitignore` files, with the repository's `info/exclude` and the user's excludes
+    /// file as they are now. The rules are written to a scratch directory that stands in
+    /// for the work tree (`check-ignore --no-index`), so the work tree is not touched.
+    pub(crate) async fn ignored_under(
+        &self,
+        tree: &str,
+        paths: &[PathBuf],
+        deadline: Instant,
+    ) -> Result<std::collections::HashSet<PathBuf>, CheckpointError> {
+        use std::os::unix::ffi::OsStrExt;
+        let mut ignored = std::collections::HashSet::new();
+        let paths: Vec<&PathBuf> = paths.iter().filter(|p| plain_relative(p)).collect();
+        if paths.is_empty() {
+            return Ok(ignored);
+        }
+        let disk = |e: std::io::Error| CheckpointError::Git(format!("ignore rules: {e}"));
+        let scratch = tempfile::Builder::new()
+            .prefix("rules-")
+            .tempdir_in(self.tmp.path())
+            .map_err(disk)?;
+        let rules = scratch.path().canonicalize().map_err(disk)?;
+        let git = Git {
+            index: None,
+            ..self.git()
+        };
+        let listing = git
+            .run(&["ls-tree", "-r", "-z", tree], None, deadline)
+            .await?;
+        for entry in listing.split(|&b| b == 0).filter(|e| !e.is_empty()) {
+            let Some(tab) = entry.iter().position(|&b| b == b'\t') else {
+                continue;
+            };
+            let meta = String::from_utf8_lossy(&entry[..tab]);
+            let path = PathBuf::from(bytes_to_os(&entry[tab + 1..]));
+            let [mode, "blob", id] = meta.split(' ').collect::<Vec<_>>()[..] else {
+                continue;
+            };
+            let is_rules = path.file_name().is_some_and(|n| n == ".gitignore");
+            if !is_rules || !matches!(mode, "100644" | "100755") || !plain_relative(&path) {
+                continue;
+            }
+            let text = git.run(&["cat-file", "blob", id], None, deadline).await?;
+            let dest = rules.join(&path);
+            if let Some(dir) = dest.parent() {
+                std::fs::create_dir_all(dir).map_err(disk)?;
+            }
+            std::fs::write(&dest, text).map_err(disk)?;
+        }
+        // Directory-only patterns (`target/`) match through the leading directories.
+        let mut input = Vec::new();
+        for p in &paths {
+            if let Some(dir) = p.parent() {
+                std::fs::create_dir_all(rules.join(dir)).map_err(disk)?;
+            }
+            input.extend_from_slice(rules.join(p).as_os_str().as_bytes());
+            input.push(0);
+        }
+        let check = Git {
+            work_tree: &rules,
+            ..git
+        };
+        let out = match check
+            .run(
+                &["check-ignore", "--no-index", "-z", "--stdin"],
+                Some(input),
+                deadline,
+            )
+            .await
+        {
+            Ok(out) => out,
+            // None is ignored.
+            Err(Fail::Exit { code: Some(1), .. }) => Vec::new(),
+            Err(e) => return Err(e.into()),
+        };
+        for p in out.split(|&b| b == 0).filter(|p| !p.is_empty()) {
+            if let Ok(rel) = Path::new(&bytes_to_os(p)).strip_prefix(&rules) {
+                ignored.insert(rel.to_path_buf());
+            }
+        }
+        Ok(ignored)
+    }
+
+    /// The blob id git gives `bytes` (no filter runs; nothing is written).
+    pub(crate) async fn blob_id(
+        &self,
+        bytes: Vec<u8>,
+        deadline: Instant,
+    ) -> Result<String, CheckpointError> {
+        let git = Git {
+            index: None,
+            ..self.git()
+        };
+        let out = git
+            .run(
+                &["hash-object", "--no-filters", "--stdin"],
+                Some(bytes),
+                deadline,
+            )
+            .await?;
+        Ok(String::from_utf8_lossy(&out).trim().to_string())
     }
 
     /// Give `child_session` refs of its own (`refs/tautly/checkpoints/<child>/<n>`) for
@@ -1003,47 +1294,75 @@ fn check_session(session: &str) -> Result<(), CheckpointError> {
     }
 }
 
-/// The first executable `name` on `PATH`.
-fn find_on_path(name: &str) -> Option<PathBuf> {
+/// A path of plain names only (no root, `.` or `..`).
+fn plain_relative(p: &Path) -> bool {
+    p.components()
+        .all(|c| matches!(c, std::path::Component::Normal(_)))
+}
+
+/// The first executable `git` on `PATH`.
+pub(crate) fn git_on_path() -> Option<PathBuf> {
     use std::os::unix::fs::PermissionsExt;
     let path = std::env::var_os("PATH")?;
     std::env::split_paths(&path)
-        .map(|dir| dir.join(name))
+        .map(|dir| dir.join("git"))
         .find(|p| {
             std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
         })
 }
 
-/// git from `PATH`, for the free functions.
-fn plain_git<'a>(sb: &'a dyn Sandbox, root: &'a Path, program: &'a Path) -> Git<'a> {
-    Git {
-        sb,
-        root,
-        program,
-        index: None,
-        groups: None,
+/// The repository of the work tree at `root`: its `.git` directory, or the directory a
+/// `.git` file (`gitdir: <path>`, a linked worktree or submodule) names. None when `root`
+/// has neither. Every git call names it (`--git-dir`) with the root as the work tree, so
+/// neither the environment nor `core.worktree` can point git elsewhere.
+pub(crate) fn git_dir(root: &Path) -> Option<PathBuf> {
+    let dot = root.join(".git");
+    let meta = std::fs::symlink_metadata(&dot).ok()?;
+    if meta.is_dir() {
+        return Some(dot);
     }
+    if !meta.is_file() {
+        return None;
+    }
+    let text = std::fs::read_to_string(&dot).ok()?;
+    let named = text.lines().next()?.strip_prefix("gitdir:")?.trim();
+    (!named.is_empty()).then(|| root.join(named))
+}
+
+/// Run `f` with git from `PATH` on the repository at `root`, for the free functions.
+async fn with_plain_git<T>(
+    sb: &dyn Sandbox,
+    root: &Path,
+    f: impl AsyncFnOnce(&Git<'_>) -> Result<T, CheckpointError>,
+) -> Result<T, CheckpointError> {
+    let program = git_on_path().ok_or(CheckpointError::NoGit)?;
+    let git_dir = git_dir(root).ok_or_else(|| {
+        CheckpointError::Invalid(format!("{} is not a git work tree", root.display()))
+    })?;
+    let git = Git::new(sb, root, &git_dir, &program, None, None);
+    f(&git).await
 }
 
 /// Delete every checkpoint ref (of any session of the repository at `root`) whose commit
 /// is older than `keep_days`; returns how many. Run at engine start; `git gc` is never run,
 /// so the objects stay until git's own housekeeping.
 pub async fn prune(sb: &dyn Sandbox, root: &Path, keep_days: u32) -> Result<u32, CheckpointError> {
-    let program = find_on_path("git").ok_or(CheckpointError::NoGit)?;
-    let git = plain_git(sb, root, &program);
-    let deadline = Checkpointer::housekeeping_deadline();
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs());
-    let cutoff = now.saturating_sub(u64::from(keep_days) * 24 * 3600);
-    let old: Vec<String> = git
-        .refs(&format!("{REF_PREFIX}/"), deadline)
-        .await?
-        .into_iter()
-        .filter(|(_, date)| *date < cutoff)
-        .map(|(name, _)| name)
-        .collect();
-    delete_refs(&git, &old, deadline).await
+    with_plain_git(sb, root, async |git| {
+        let deadline = Checkpointer::housekeeping_deadline();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        let cutoff = now.saturating_sub(u64::from(keep_days) * 24 * 3600);
+        let old: Vec<String> = git
+            .refs(&format!("{REF_PREFIX}/"), deadline)
+            .await?
+            .into_iter()
+            .filter(|(_, date)| *date < cutoff)
+            .map(|(name, _)| name)
+            .collect();
+        delete_refs(git, &old, deadline).await
+    })
+    .await
 }
 
 /// Delete session `session`'s checkpoint refs in the repository at `root` (`tautly
@@ -1055,16 +1374,17 @@ pub async fn delete_session_refs(
     session: &str,
 ) -> Result<u32, CheckpointError> {
     check_session(session)?;
-    let program = find_on_path("git").ok_or(CheckpointError::NoGit)?;
-    let git = plain_git(sb, root, &program);
-    let deadline = Checkpointer::housekeeping_deadline();
-    let names: Vec<String> = git
-        .refs(&format!("{REF_PREFIX}/{session}/"), deadline)
-        .await?
-        .into_iter()
-        .map(|(name, _)| name)
-        .collect();
-    delete_refs(&git, &names, deadline).await
+    with_plain_git(sb, root, async |git| {
+        let deadline = Checkpointer::housekeeping_deadline();
+        let names: Vec<String> = git
+            .refs(&format!("{REF_PREFIX}/{session}/"), deadline)
+            .await?
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        delete_refs(git, &names, deadline).await
+    })
+    .await
 }
 
 async fn delete_refs(
@@ -1116,29 +1436,40 @@ pub(crate) enum Point {
     TurnEnd,
 }
 
-impl Session {
-    /// Take a checkpoint at `point` of provider step `step` and log it (`Checkpoint`, or
-    /// `CheckpointSkipped` with a warning). Nothing without a checkpointer. A cancel
-    /// abandons the snapshot (its processes are killed), logged as skipped.
-    pub(crate) async fn git_checkpoint(
-        &self,
-        point: Point,
-        step: u32,
-        cancel: Option<&CancellationToken>,
-    ) {
-        let Some(shared) = self.checkpoints.clone() else {
-            return;
-        };
-        let turn = self.user_turn;
-        let write_gen = self.ledger.generation();
-        let watcher = self
-            .workspace
-            .index()
-            .filter(|i| i.watching())
-            .map(|i| i.fs_events());
-        let mut st = shared.lock().await;
-        let watcher_changed = watcher.is_none() || watcher != st.fs_events;
-        st.fs_events = watcher;
+/// How the session-start checkpoint stands.
+#[derive(Default)]
+pub(crate) enum StartCheckpoint {
+    /// Not started, done, or nothing to take.
+    #[default]
+    Idle,
+    /// Checkpoints are on in a git work tree, but there is no `git` on `PATH`: said once,
+    /// at session start.
+    NoGit,
+    /// Being taken in the background (it holds the checkpoint lock from the start).
+    Running(tokio::task::JoinHandle<()>),
+}
+
+/// One checkpoint to take and log, with what it needs from the session (so it can run in
+/// the background).
+struct CheckpointJob {
+    log: Log,
+    events: EventSink,
+    turn: u32,
+    step: u32,
+    write_gen: u64,
+    /// The watcher's event count (none: no watcher).
+    watcher: Option<u64>,
+}
+
+impl CheckpointJob {
+    /// Take the checkpoint at `point` and log it (`Checkpoint`, or `CheckpointSkipped`
+    /// with a warning), holding the lock throughout, so the log has checkpoints in the
+    /// order they were taken. A cancel abandons the snapshot (its processes are killed),
+    /// logged as skipped.
+    async fn run(self, st: &mut GitCheckpoints, point: Point, cancel: Option<&CancellationToken>) {
+        let watcher_changed = self.watcher.is_none() || self.watcher != st.fs_events;
+        st.fs_events = self.watcher;
+        let write_gen = self.write_gen;
         let snap = async {
             match point {
                 Point::Start => st.cp.snapshot_now().await,
@@ -1153,6 +1484,7 @@ impl Session {
             },
             None => Some(snap.await),
         };
+        let (turn, step) = (self.turn, self.step);
         let rec = match taken {
             Some(Ok(r)) => SessionRecord::Checkpoint {
                 n: r.n,
@@ -1164,13 +1496,17 @@ impl Session {
                 step,
             },
             Some(Err(skip)) => {
-                let reason = skip.to_string();
-                let fresh = st.warned.as_ref() != Some(&(turn, reason.clone()));
-                st.warned = Some((turn, reason.clone()));
+                let shown = skip.to_string();
+                let fresh = st.warned.as_ref() != Some(&(turn, shown.clone()));
+                st.warned = Some((turn, shown));
                 if fresh {
-                    self.warn(skip_warning(&skip)).await;
+                    self.events.warn(skip_warning(&skip)).await;
                 }
-                SessionRecord::CheckpointSkipped { reason, turn, step }
+                SessionRecord::CheckpointSkipped {
+                    reason: skip.code().into(),
+                    turn,
+                    step,
+                }
             }
             None => {
                 st.cp.invalidate();
@@ -1181,8 +1517,94 @@ impl Session {
                 }
             }
         };
-        drop(st);
         self.log(rec).await;
+    }
+
+    async fn log(&self, rec: SessionRecord) {
+        let log = self.log.clone();
+        if let Ok(Err(failure)) = tokio::task::spawn_blocking(move || log.append(&rec)).await
+            && let Some(ev) = failure.event()
+        {
+            self.events.emit(ev).await;
+        }
+    }
+}
+
+impl Session {
+    /// What a checkpoint of step `step` needs from the session now.
+    fn checkpoint_job(&self, step: u32) -> CheckpointJob {
+        CheckpointJob {
+            log: self.log.clone(),
+            events: self.events.clone(),
+            turn: self.user_turn,
+            step,
+            write_gen: self.ledger.generation(),
+            watcher: self
+                .workspace
+                .index()
+                .filter(|i| i.watching())
+                .map(|i| i.fs_events()),
+        }
+    }
+
+    /// Take a checkpoint at `point` of provider step `step` and log it (see
+    /// [`CheckpointJob::run`]). Nothing without a checkpointer.
+    pub(crate) async fn git_checkpoint(
+        &self,
+        point: Point,
+        step: u32,
+        cancel: Option<&CancellationToken>,
+    ) {
+        let Some(shared) = self.checkpoints.clone() else {
+            return;
+        };
+        let job = self.checkpoint_job(step);
+        let mut st = shared.lock().await;
+        job.run(&mut st, point, cancel).await;
+    }
+
+    /// At session start (after init or resume): the session-start checkpoint, in the
+    /// background, so neither MCP start nor the first command waits for it. It takes the
+    /// checkpoint lock before this returns, so every later checkpoint (the first command's
+    /// included) comes after it; a turn's tool calls wait for it
+    /// ([`settle_start_checkpoint`](Self::settle_start_checkpoint)). Without git, a
+    /// warning and a `CheckpointSkipped{no_git}` record instead.
+    pub(crate) async fn begin_checkpoints(&mut self) {
+        if matches!(self.start_checkpoint, StartCheckpoint::NoGit) {
+            self.start_checkpoint = StartCheckpoint::Idle;
+            self.warn(skip_warning(&Skip::NoGit)).await;
+            self.log(SessionRecord::CheckpointSkipped {
+                reason: Skip::NoGit.code().into(),
+                turn: self.user_turn,
+                step: self.last_step(),
+            })
+            .await;
+            return;
+        }
+        let Some(shared) = self.checkpoints.clone() else {
+            return;
+        };
+        let job = self.checkpoint_job(self.last_step());
+        let mut st = shared.lock_owned().await;
+        self.start_checkpoint = StartCheckpoint::Running(tokio::spawn(async move {
+            job.run(&mut st, Point::Start, None).await;
+        }));
+    }
+
+    /// Wait for the session-start checkpoint, if it is still being taken: before the
+    /// first tool call (whose edits it must not see) and before anything between turns.
+    pub(crate) async fn settle_start_checkpoint(&mut self) {
+        if let StartCheckpoint::Running(job) = std::mem::take(&mut self.start_checkpoint) {
+            let _ = job.await;
+        }
+    }
+
+    /// At shutdown: abandon a session-start checkpoint still being taken (its git is
+    /// killed).
+    pub(crate) fn abandon_start_checkpoint(&mut self) {
+        if let StartCheckpoint::Running(job) = std::mem::take(&mut self.start_checkpoint) {
+            job.abort();
+        }
     }
 
     /// The step a checkpoint outside a command belongs to: the last one started (0: none).
@@ -1204,6 +1626,75 @@ mod tests {
         assert_eq!(changes[0].old, Some(("100644".into(), "aaaa".into())));
         assert_eq!(changes[1].old, None);
         assert!(changes[2].is_gitlink() && changes[2].new.is_none());
+    }
+
+    #[test]
+    fn git_dir_follows_a_dot_git_file() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(git_dir(dir.path()), None);
+        std::fs::write(
+            dir.path().join(".git"),
+            "gitdir: ../main/.git/worktrees/w\n",
+        )
+        .unwrap();
+        assert_eq!(
+            git_dir(dir.path()),
+            Some(dir.path().join("../main/.git/worktrees/w"))
+        );
+        std::fs::write(dir.path().join(".git"), "gitdir: /abs/repo.git\n").unwrap();
+        assert_eq!(git_dir(dir.path()), Some(PathBuf::from("/abs/repo.git")));
+        std::fs::write(dir.path().join(".git"), "not a pointer\n").unwrap();
+        assert_eq!(git_dir(dir.path()), None);
+    }
+
+    fn git(root: &Path, args: &[&str]) {
+        let ok = std::process::Command::new("git")
+            .current_dir(root)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .args(["-c", "user.name=T", "-c", "user.email=t@example.com"])
+            .args(args)
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok, "git {args:?}");
+    }
+
+    #[tokio::test]
+    async fn restore_brings_back_a_checkpoint_without_running_filters() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::write(root.join("a.txt"), "a\n").unwrap();
+        git(&root, &["init", "-q"]);
+        git(&root, &["add", "-A"]);
+        git(&root, &["commit", "-q", "-m", "i"]);
+        let marker = root.parent().unwrap().join(format!(
+            "{}-marker",
+            root.file_name().unwrap().to_string_lossy()
+        ));
+        let touch = format!("touch '{}'; cat", marker.display());
+        git(&root, &["config", "filter.f.clean", &touch]);
+        git(&root, &["config", "filter.f.smudge", &touch]);
+        std::fs::write(root.join(".gitattributes"), "* filter=f\n").unwrap();
+        let sb: Arc<dyn Sandbox> =
+            Arc::new(tautly_sandbox::LocalSandbox::new(root.clone()).unwrap());
+        let mut cp =
+            Checkpointer::new(sb, root.clone(), "s".into(), CheckpointConfig::default()).unwrap();
+        let first = cp.snapshot_now().await.unwrap();
+        std::fs::write(root.join("a.txt"), "changed\n").unwrap();
+        std::fs::write(root.join("b.txt"), "new\n").unwrap();
+        let dry = cp.restore(&first.commit, true).await.unwrap();
+        assert_eq!(dry.restored, [root.join("a.txt")]);
+        assert_eq!(dry.deleted, [root.join("b.txt")]);
+        assert_eq!(
+            std::fs::read_to_string(root.join("a.txt")).unwrap(),
+            "changed\n"
+        );
+        let plan = cp.restore(&first.commit, false).await.unwrap();
+        assert_eq!(plan, dry);
+        assert_eq!(std::fs::read_to_string(root.join("a.txt")).unwrap(), "a\n");
+        assert!(!root.join("b.txt").exists());
+        assert!(!marker.exists(), "a filter ran");
     }
 
     #[test]

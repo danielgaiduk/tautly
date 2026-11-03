@@ -439,6 +439,9 @@ impl Session {
                 self.checkpoint().await;
                 return FinishReason::Completed;
             }
+            // The session-start checkpoint precedes the turn's first tool call in the log,
+            // and must not see its edits.
+            self.settle_start_checkpoint().await;
             self.log_all(
                 resp.calls
                     .iter()

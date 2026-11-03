@@ -1161,8 +1161,9 @@ impl Session {
         };
         let mut st = c.lock().await;
         let adopted = st.cp.adopt(branch, &logged.all).await;
-        st.cp.set_session(branch.to_string());
-        st.cp.continue_after(logged.max_n, None);
+        // The branch reuses only a checkpoint it has a ref for: its log's latest.
+        let last = adopted.is_ok().then(|| logged.last.clone()).flatten();
+        st.cp.branch(branch.to_string(), logged.max_n, last);
         drop(st);
         if let Err(e) = adopted {
             self.warn(format!(

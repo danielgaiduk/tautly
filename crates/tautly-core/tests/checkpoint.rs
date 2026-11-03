@@ -251,8 +251,12 @@ impl Run {
     }
 
     async fn fork(&mut self) -> String {
+        self.fork_at(None).await
+    }
+
+    async fn fork_at(&mut self, at: Option<u32>) -> String {
         self.send(Command::Fork {
-            at: None,
+            at,
             label: Some("branch".into()),
         })
         .await;
@@ -381,10 +385,11 @@ async fn unborn_head_repo_checkpoints() {
 }
 
 #[tokio::test]
-async fn hooks_and_fsmonitor_never_run() {
-    let repo = Repo::with(&[("a.txt", "a\n")]);
+async fn hooks_filters_and_fsmonitor_never_run() {
+    let repo = Repo::with(&[("a.txt", "a\n"), ("p.dat", "p\n")]);
     let marker = repo.home.path().join("marker");
-    let hook = format!("#!/bin/sh\ntouch '{}'\n", marker.display());
+    let touch = format!("touch '{}'", marker.display());
+    let hook = format!("#!/bin/sh\n{touch}\n");
     let hooks = repo.path(".git/hooks");
     std::fs::create_dir_all(&hooks).unwrap();
     for name in [
@@ -400,22 +405,97 @@ async fn hooks_and_fsmonitor_never_run() {
     let fsmonitor = repo.home.path().join("fsmonitor.sh");
     executable(&fsmonitor, &hook);
     repo.git(&["config", "core.fsmonitor", fsmonitor.to_str().unwrap()]);
+    // Filter drivers of every kind (clean, smudge, a long-running process), required,
+    // declared for every file, as a downloaded repository could ship them.
+    let filter = format!("{touch}; cat");
+    for (key, value) in [
+        ("filter.evil.clean", filter.as_str()),
+        ("filter.evil.smudge", filter.as_str()),
+        ("filter.evil.required", "true"),
+        ("filter.Proc.process", touch.as_str()),
+        ("filter.Proc.required", "true"),
+    ] {
+        repo.git(&["config", key, value]);
+    }
+    repo.write(".gitattributes", "*.txt filter=evil\n*.dat filter=Proc\n");
 
     let mut cp = repo.checkpointer(CheckpointConfig::default());
     let first = cp.snapshot(0, true).await.unwrap();
     repo.write("a.txt", "changed\n");
     repo.write("b.txt", "new\n");
-    cp.snapshot(1, true).await.unwrap();
+    repo.write("p.dat", "changed\n");
+    let second = cp.snapshot(1, true).await.unwrap();
+    assert_ne!(first.commit, second.commit);
+    // The snapshot holds the work tree's bytes (no clean filter ran).
+    assert_eq!(
+        repo.git(&["cat-file", "-p", &format!("{}:a.txt", second.commit)]),
+        "changed"
+    );
     cp.backup().await.unwrap();
-    let plan = cp.restore(&first.commit, false).await.unwrap();
-    assert_eq!(plan.restored, [repo.path("a.txt")]);
-    assert_eq!(plan.deleted, [repo.path("b.txt")]);
-    assert_eq!(repo.read("a.txt").as_deref(), Some("a\n"));
-    assert!(!marker.exists(), "a hook or the fsmonitor ran");
+    // A restore (undo checks files out of a checkpoint) runs no smudge or process filter.
+    let mock = MockProvider::new(vec![
+        tools_step(vec![bash(
+            "b1",
+            "printf 'bash\\n' > a.txt && printf 'bash\\n' > p.dat && touch c.txt",
+        )]),
+        text_step("done"),
+    ]);
+    let mut run = start(repo.builder(config(), &mock));
+    run.turn_with("go").await;
+    let answer = run.undo(None, false).await;
+    run.stop().await;
+    assert!(matches!(answer, Event::Undone { .. }), "{answer:?}");
+    assert_eq!(repo.read("a.txt").as_deref(), Some("changed\n"));
+    assert_eq!(repo.read("p.dat").as_deref(), Some("changed\n"));
+    assert_eq!(repo.read("c.txt"), None);
+    assert!(!marker.exists(), "a hook, filter or the fsmonitor ran");
 
     // Control: the same repository runs them for git itself.
     repo.git_ok(&["update-ref", "refs/heads/control", "HEAD"]);
     assert!(marker.exists(), "the hooks were not set up to run");
+    std::fs::remove_file(&marker).unwrap();
+    repo.git_ok(&["add", "a.txt"]);
+    assert!(marker.exists(), "the filters were not set up to run");
+}
+
+#[tokio::test]
+async fn core_worktree_cannot_redirect_checkpoints_or_undo() {
+    let repo = Repo::with(&[("a.txt", "a\n")]);
+    let outside = tempfile::tempdir().unwrap();
+    std::fs::write(outside.path().join("victim.txt"), "victim\n").unwrap();
+    repo.git(&["config", "core.worktree", outside.path().to_str().unwrap()]);
+
+    let mut cp = repo.checkpointer(CheckpointConfig::default());
+    let made = cp.snapshot(0, true).await.unwrap();
+    assert_eq!(
+        repo.git(&["ls-tree", "-r", "--name-only", &made.commit]),
+        "a.txt"
+    );
+
+    let mock = MockProvider::new(vec![
+        tools_step(vec![bash("b1", "printf 'b\\n' > a.txt && touch new.txt")]),
+        text_step("done"),
+    ]);
+    let mut run = start(repo.builder(config(), &mock));
+    run.turn_with("go").await;
+    let answer = run.undo(None, false).await;
+    run.stop().await;
+    assert!(
+        matches!(&answer, Event::Undone { restored, deleted, .. }
+            if restored == &["a.txt"] && deleted == &["new.txt"]),
+        "{answer:?}"
+    );
+    assert_eq!(repo.read("a.txt").as_deref(), Some("a\n"));
+    assert_eq!(repo.read("new.txt"), None);
+    let left: Vec<_> = std::fs::read_dir(outside.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert_eq!(left, ["victim.txt"]);
+    assert_eq!(
+        std::fs::read_to_string(outside.path().join("victim.txt")).unwrap(),
+        "victim\n"
+    );
 }
 
 #[tokio::test]
@@ -599,10 +679,17 @@ async fn checkpoints_at_session_start_and_turn_end() {
         } => Some((*n, commit.clone(), *turn, *step)),
         _ => None,
     };
-    let start_cp = (0..turn_start)
-        .find_map(at)
+    // Taken in the background at session start: logged before the turn's first tool
+    // call, perhaps after its `TurnStart`.
+    let first_call = recs
+        .iter()
+        .position(|r| matches!(r, SessionRecord::ToolCall { .. }))
+        .unwrap();
+    assert!(turn_start < first_call);
+    let start_cp = (0..first_call)
+        .filter_map(at)
+        .find(|c| (c.2, c.3) == (0, 0))
         .expect("no session-start checkpoint");
-    assert_eq!((start_cp.2, start_cp.3), (0, 0));
     let end_cp = at(turn_end - 1).expect("no checkpoint right before TurnEnd");
     assert_eq!(end_cp.2, 1);
     assert!(end_cp.0 > start_cp.0, "the edit changed the tree");
@@ -866,6 +953,175 @@ async fn undo_refuses_a_file_changed_after_the_turn() {
 }
 
 #[tokio::test]
+async fn undo_never_deletes_a_file_ignored_before_the_turn() {
+    let repo = Repo::with(&[("tracked.txt", "orig\n"), (".gitignore", ".env\n")]);
+    repo.write(".env", "SECRET=1\n");
+    repo.write("notes.txt", "mine\n");
+    // The turn stops ignoring `.env`, starts ignoring `notes.txt` and adds a file.
+    let mock = MockProvider::new(vec![
+        tools_step(vec![bash(
+            "b1",
+            "printf 'notes.txt\\n' > .gitignore && printf 'changed\\n' > tracked.txt \
+             && touch new.txt",
+        )]),
+        text_step("done"),
+    ]);
+    let mut run = start(repo.builder(config(), &mock));
+    run.turn_with("go").await;
+    let answer = run.undo(None, false).await;
+    run.stop().await;
+    let Event::Undone {
+        mut restored,
+        deleted,
+        note,
+        ..
+    } = answer
+    else {
+        panic!("{answer:?}")
+    };
+    restored.sort();
+    assert_eq!(restored, [".gitignore", "tracked.txt"]);
+    assert_eq!(deleted, ["new.txt"]);
+    let note = note.unwrap();
+    assert!(note.contains(".env"), "{note}");
+    assert_eq!(repo.read(".gitignore").as_deref(), Some(".env\n"));
+    assert_eq!(repo.read("tracked.txt").as_deref(), Some("orig\n"));
+    assert_eq!(repo.read("new.txt"), None);
+    assert_eq!(repo.read(".env").as_deref(), Some("SECRET=1\n"));
+    assert_eq!(repo.read("notes.txt").as_deref(), Some("mine\n"));
+}
+
+#[tokio::test]
+async fn undo_refuses_a_file_the_turn_ignored_and_someone_changed() {
+    let repo = Repo::with(&[("tracked.txt", "orig\n")]);
+    repo.write("notes.txt", "mine\n");
+    let mock = MockProvider::new(vec![
+        tools_step(vec![bash(
+            "b1",
+            "printf 'notes.txt\\n' > .gitignore && printf 'changed\\n' > tracked.txt",
+        )]),
+        text_step("done"),
+    ]);
+    let mut run = start(repo.builder(config(), &mock));
+    run.turn_with("go").await;
+    // Ignored now, so no checkpoint shows this edit.
+    repo.write("notes.txt", "human\n");
+    let answer = run.undo(None, false).await;
+    run.stop().await;
+    assert!(
+        matches!(&answer, Event::Error { message, .. } if message.contains("notes.txt")),
+        "{answer:?}"
+    );
+    assert_eq!(repo.read("notes.txt").as_deref(), Some("human\n"));
+    assert_eq!(repo.read("tracked.txt").as_deref(), Some("changed\n"));
+}
+
+#[tokio::test]
+async fn undo_removes_links_the_turn_made_without_following_them() {
+    let repo = Repo::with(&[("src/a.txt", "a\n"), ("keep.txt", "keep\n")]);
+    let victim = repo.home.path().join("victim.txt");
+    std::fs::write(&victim, "victim\n").unwrap();
+    let command = format!(
+        "ln -s /tmp out && ln -s src lib && ln -s missing dangling && rm keep.txt \
+         && ln -s '{}' keep.txt",
+        victim.display()
+    );
+    let mock = MockProvider::new(vec![
+        tools_step(vec![bash("b1", &command)]),
+        text_step("done"),
+    ]);
+    let mut run = start(repo.builder(config(), &mock));
+    run.turn_with("go").await;
+    let answer = run.undo(None, false).await;
+    run.stop().await;
+    let Event::Undone {
+        restored,
+        mut deleted,
+        ..
+    } = answer
+    else {
+        panic!("{answer:?}")
+    };
+    deleted.sort();
+    assert_eq!(deleted, ["dangling", "lib", "out"]);
+    assert_eq!(restored, ["keep.txt"]);
+    for link in ["out", "lib", "dangling"] {
+        assert!(
+            std::fs::symlink_metadata(repo.path(link)).is_err(),
+            "{link} is still there"
+        );
+    }
+    let keep = std::fs::symlink_metadata(repo.path("keep.txt")).unwrap();
+    assert!(keep.file_type().is_file());
+    assert_eq!(repo.read("keep.txt").as_deref(), Some("keep\n"));
+    assert_eq!(std::fs::read_to_string(&victim).unwrap(), "victim\n");
+    assert_eq!(repo.read("src/a.txt").as_deref(), Some("a\n"));
+    assert!(Path::new("/tmp").exists());
+}
+
+#[tokio::test]
+async fn failed_undo_logs_only_the_files_it_changed() {
+    // SAFETY: geteuid has no preconditions.
+    if unsafe { libc::geteuid() } == 0 {
+        return; // root ignores directory permissions
+    }
+    let repo = Repo::with(&[("a.txt", "a\n")]);
+    let mock = MockProvider::new(vec![
+        tools_step(vec![bash("b1", "mkdir d e && touch d/new1.txt e/new2.txt")]),
+        text_step("done"),
+    ]);
+    let mut run = start(repo.builder(config(), &mock));
+    run.turn_with("go").await;
+    let locked = repo.path("e");
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let answer = run.undo(None, false).await;
+    let (_, path) = run.engine.current_session();
+    run.stop().await;
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(matches!(answer, Event::Error { .. }), "{answer:?}");
+    assert_eq!(repo.read("d/new1.txt"), None);
+    assert_eq!(repo.read("e/new2.txt").as_deref(), Some(""));
+    let logged: Vec<Vec<String>> = records_at(&path)
+        .into_iter()
+        .filter_map(|r| match r {
+            SessionRecord::Undone { files, .. } => {
+                Some(files.iter().map(|f| f.path.as_str().to_string()).collect())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(logged, [["d/new1.txt"]]);
+}
+
+#[tokio::test]
+async fn undo_respects_the_untracked_limits() {
+    let repo = Repo::with(&[("a.txt", "a\n")]);
+    let mut cfg = config();
+    cfg.checkpoints.max_untracked_files = 3;
+    let mock = MockProvider::new(vec![
+        tools_step(vec![bash("b1", "printf 'b\\n' > a.txt")]),
+        text_step("done"),
+    ]);
+    let mut run = start(repo.builder(cfg, &mock));
+    run.turn_with("go").await;
+    for i in 0..5 {
+        repo.write(&format!("u{i}.txt"), "u\n");
+    }
+    let answer = run.undo(None, false).await;
+    run.stop().await;
+    assert!(
+        matches!(&answer, Event::Error { message, .. } if message.contains("untracked")),
+        "{answer:?}"
+    );
+    assert_eq!(repo.read("a.txt").as_deref(), Some("b\n"));
+    assert!(
+        repo.refs("refs/tautly/")
+            .iter()
+            .all(|r| !r.contains("/undo-"))
+    );
+}
+
+#[tokio::test]
 async fn undo_default_is_last_user_turn_and_cli_uses_same_numbering() {
     let repo = Repo::with(&[("one.txt", "1\n"), ("two.txt", "2\n")]);
     let mock = MockProvider::new(vec![
@@ -1060,5 +1316,44 @@ async fn adopted_refs_survive_parent_delete() {
         let name = format!("refs/tautly/checkpoints/{child}/{n}");
         assert_eq!(repo.git(&["rev-parse", &name]), commit);
         assert!(repo.git_ok(&["cat-file", "-e", &format!("{commit}^{{commit}}")]));
+    }
+}
+
+#[tokio::test]
+async fn fork_at_an_earlier_step_reuses_only_checkpoints_it_has_refs_for() {
+    let repo = Repo::with(&[("a.txt", "a\n")]);
+    let mock = MockProvider::new(vec![
+        tools_step(vec![bash("b1", "printf '1\\n' > a.txt")]),
+        text_step("first"),
+        tools_step(vec![bash("b2", "printf '2\\n' > a.txt")]),
+        text_step("second"),
+        text_step("on the branch"),
+    ]);
+    let mut run = start(repo.builder(config(), &mock));
+    run.turn_with("first").await;
+    run.turn_with("second").await;
+    let (_, parent_path) = run.engine.current_session();
+    let recs = records_at(&parent_path);
+    // The step of turn 1's last checkpoint (right before its `TurnEnd`).
+    let end = recs
+        .iter()
+        .position(|r| matches!(r, SessionRecord::TurnEnd { .. }))
+        .unwrap();
+    let SessionRecord::Checkpoint { step, .. } = recs[end - 1] else {
+        panic!("{:?}", recs[end - 1])
+    };
+    let child = run.fork_at(Some(step)).await;
+    let (_, child_path) = run.engine.current_session();
+    run.turn_with("on the branch").await;
+    run.stop().await;
+    let logged = checkpoints(&records_at(&child_path));
+    assert!(!logged.is_empty());
+    for (n, commit, _) in logged {
+        let name = format!("refs/tautly/checkpoints/{child}/{n}");
+        assert!(
+            repo.git_ok(&["rev-parse", "-q", "--verify", &name]),
+            "{name} is missing"
+        );
+        assert_eq!(repo.git(&["rev-parse", &name]), commit);
     }
 }

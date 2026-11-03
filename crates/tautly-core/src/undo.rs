@@ -47,6 +47,9 @@ const NOTE_NO_CHECKPOINT: &str =
 /// Added to the note when one of the turn's checkpoints was skipped.
 const NOTE_SKIPPED: &str =
     "a checkpoint of this turn was skipped, so some command effects may remain";
+/// Added to the note, with the paths, for files the turn left that were not deleted
+/// because the ignore rules at the turn's start ignore them (they may have been there).
+const NOTE_KEPT: &str = "kept (ignored before the turn)";
 
 /// What an undo did (with `dry_run`: would do). Paths are absolute.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -319,14 +322,18 @@ impl Scan {
                     }
                     current = 0;
                 }
-                SessionRecord::Checkpoint { n, commit, .. } => {
+                // A turn's own: the session-start checkpoint, taken in the background, can
+                // be logged after the next turn's `TurnStart`.
+                SessionRecord::Checkpoint {
+                    n, commit, turn, ..
+                } => {
                     scan.max_n = scan.max_n.max(n);
-                    if current > 0 {
+                    if current > 0 && turn == current {
                         let t = scan.per_turn.entry(current).or_default();
                         t.events.push(Ev::Checkpoint { commit, end: false });
                     }
                 }
-                SessionRecord::CheckpointSkipped { .. } if current > 0 => {
+                SessionRecord::CheckpointSkipped { turn, .. } if current > 0 && turn == current => {
                     scan.per_turn.entry(current).or_default().skipped = true;
                 }
                 SessionRecord::ToolResult { effects, .. } if current > 0 => {
@@ -409,8 +416,64 @@ impl Back {
     }
 }
 
-/// A path an undo writes: where it goes back to, and its content and mode now.
-type Planned = (PathBuf, Back, Option<Vec<u8>>, Option<u32>);
+/// What is at a path now, as git sees it: symbolic links are never followed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Disk {
+    /// Nothing (or the path is below a link or a file, where git does not look).
+    Absent,
+    /// A regular file and its permission bits.
+    File { bytes: Vec<u8>, mode: u32 },
+    /// A symbolic link and its target.
+    Link(Vec<u8>),
+    /// A directory or another kind of file: never written over.
+    Other,
+}
+
+impl Disk {
+    fn exists(&self) -> bool {
+        *self != Disk::Absent
+    }
+
+    /// Its tree entry's mode and content, for a file or link.
+    fn entry(&self) -> Option<(&'static str, &[u8])> {
+        match self {
+            Disk::File { bytes, mode } if mode & 0o100 != 0 => Some(("100755", bytes)),
+            Disk::File { bytes, .. } => Some(("100644", bytes)),
+            Disk::Link(target) => Some(("120000", target)),
+            Disk::Absent | Disk::Other => None,
+        }
+    }
+
+    /// Content and mode as an `Undone` record keeps them: a link as its target, with
+    /// git's mode for links (`0o120000`); nothing for a directory.
+    fn logged(&self) -> (Option<&[u8]>, Option<u32>) {
+        match self {
+            Disk::File { bytes, mode } => (Some(bytes), Some(*mode)),
+            Disk::Link(target) => (Some(target), Some(0o120000)),
+            Disk::Absent | Disk::Other => (None, None),
+        }
+    }
+
+    /// The file `pre` (none: absent) with permission bits `mode`.
+    fn is(&self, pre: Option<&[u8]>, mode: Option<u32>) -> bool {
+        match (self, pre) {
+            (Disk::Absent, None) => true,
+            (Disk::File { bytes, mode: m }, Some(pre)) => bytes == pre && Some(*m) == mode,
+            _ => false,
+        }
+    }
+}
+
+/// A tree entry: `(mode, object id)`; none: absent.
+type Side = Option<(String, String)>;
+
+/// A path an undo writes.
+struct Planned {
+    rel: PathBuf,
+    back: Back,
+    /// What is there now.
+    disk: Disk,
+}
 
 struct GitUndo<'a> {
     reader: &'a SessionReader<SessionRecord>,
@@ -419,6 +482,32 @@ struct GitUndo<'a> {
     scan: &'a Scan,
     turn: u32,
     recs: &'a TurnRecs,
+}
+
+/// The three trees of a checkpoint undo, as pairwise diffs: the turn's first and last
+/// checkpoints and the work tree now.
+struct Trees {
+    by_turn: HashMap<PathBuf, Change>,
+    since_start: HashMap<PathBuf, Change>,
+    since_end: HashMap<PathBuf, Change>,
+}
+
+impl Trees {
+    /// `rel` in the first checkpoint, the last one and the work tree now; none when all
+    /// three are the same.
+    fn sides(&self, rel: &Path) -> Option<(Side, Side, Side)> {
+        if let Some(c) = self.since_start.get(rel) {
+            let end = match self.since_end.get(rel) {
+                Some(e) => e.old.clone(),
+                None => c.new.clone(),
+            };
+            return Some((c.old.clone(), end, c.new.clone()));
+        }
+        // The same at the start and now.
+        self.by_turn
+            .get(rel)
+            .map(|c| (c.old.clone(), c.new.clone(), c.old.clone()))
+    }
 }
 
 impl GitUndo<'_> {
@@ -432,17 +521,13 @@ impl GitUndo<'_> {
         let cps: Vec<(usize, &str)> = self.recs.checkpoints().collect();
         let (start_at, start) = cps[0];
         let end = cps[cps.len() - 1].1;
-        // The work tree now, as a tree (no untracked limits: the user asked).
-        let now = self.cp.tree_id(false, deadline).await?;
-        let by_turn = self.cp.diff(start, end, deadline).await?;
-        let since_start = index_changes(self.cp.diff(start, &now, deadline).await?);
-        let since_end: HashSet<PathBuf> = self
-            .cp
-            .diff(end, &now, deadline)
-            .await?
-            .into_iter()
-            .map(|c| c.path)
-            .collect();
+        // The work tree now, as a tree (within the untracked-file limits).
+        let now = self.cp.tree_id(true, deadline).await?;
+        let trees = Trees {
+            by_turn: index_changes(self.cp.diff(start, end, deadline).await?),
+            since_start: index_changes(self.cp.diff(start, &now, deadline).await?),
+            since_end: index_changes(self.cp.diff(end, &now, deadline).await?),
+        };
 
         // Each tool-edited path: its earliest pre-image before the first checkpoint (what
         // it goes back to), and its last edit with whether a command ran after it.
@@ -472,69 +557,104 @@ impl GitUndo<'_> {
                 Ev::Checkpoint { .. } => {}
             }
         }
-        let mut paths: BTreeSet<PathBuf> = by_turn
-            .into_iter()
+        let mut paths: BTreeSet<PathBuf> = trees
+            .by_turn
+            .values()
             .filter(|c| !c.is_gitlink())
-            .map(|c| c.path)
+            .map(|c| c.path.clone())
             .collect();
         paths.extend(last_edit.keys().cloned());
 
         let mut planned: Vec<Planned> = Vec::new();
-        let mut already: Vec<(PathBuf, Option<Vec<u8>>, Option<u32>)> = Vec::new();
+        let mut already: Vec<(PathBuf, Disk)> = Vec::new();
         let mut refused = Vec::new();
         for rel in paths {
-            if since_start.get(&rel).is_some_and(Change::is_gitlink) {
+            if trees.since_start.get(&rel).is_some_and(Change::is_gitlink) {
                 continue;
             }
-            let full = root.join(&rel);
-            let (disk, disk_mode) = read_now(self.sandbox, &full).await?;
+            let disk = read_disk(&root, &rel).await?;
+            let sides = trees.sides(&rel);
             let back = match pre_edit.get(&rel) {
                 Some(b) => b.clone(),
                 None => Back::Checkpoint {
-                    present: match since_start.get(&rel) {
-                        Some(c) => c.old.is_some(),
-                        None => disk.is_some(),
+                    present: match &sides {
+                        Some((start, _, _)) => start.is_some(),
+                        None => disk.exists(),
                     },
                 },
+            };
+            // Where the trees stand: back at the start, and as the turn left it. A file
+            // the work tree's tree leaves out (ignored now) is compared by its blob id.
+            let (tree_target, tree_left) = match &sides {
+                None => (true, true),
+                Some((start, end, now)) => {
+                    let here = match (now, disk.entry()) {
+                        (Some(_), _) | (None, None) => now.clone(),
+                        (None, Some((mode, bytes))) => {
+                            let id = self.cp.blob_id(bytes.to_vec(), deadline).await?;
+                            Some((mode.to_string(), id))
+                        }
+                    };
+                    (*start == here, *end == here)
+                }
             };
             let at_target = match &back {
                 Back::Blob { pre, mode } => {
                     let to = pre.as_ref().map(|b| self.reader.read_blob(b)).transpose()?;
-                    disk == to && (to.is_none() || disk_mode == *mode)
+                    disk.is(to.as_deref(), *mode)
                 }
-                Back::Checkpoint { .. } => !since_start.contains_key(&rel),
+                // (A directory where the start had no file counts as no file.)
+                Back::Checkpoint { .. } => tree_target,
             };
-            if at_target {
-                already.push((rel, disk, disk_mode));
+            if at_target || (!back.present() && !disk.exists()) {
+                already.push((rel, disk));
                 continue;
             }
             let as_left = match last_edit.get(&rel) {
                 // The turn's tools wrote it last: what they wrote, in the mode they kept.
-                Some((post, tip_mode, false)) => {
-                    let hash = disk
-                        .as_deref()
-                        .map(|b| blake3::hash(b).to_hex().to_string());
-                    let mode_kept = disk.is_none() || tip_mode.is_none() || disk_mode == *tip_mode;
-                    hash == *post && mode_kept
-                }
+                Some((post, tip_mode, false)) => match &disk {
+                    Disk::Absent => post.is_none(),
+                    Disk::File { bytes, mode } => {
+                        let hash = blake3::hash(bytes).to_hex().to_string();
+                        post.as_deref() == Some(hash.as_str())
+                            && (tip_mode.is_none() || *tip_mode == Some(*mode))
+                    }
+                    Disk::Link(_) | Disk::Other => false,
+                },
                 // A command may have changed it after: as in the turn's last checkpoint.
-                _ => !since_end.contains(&rel),
+                _ => tree_left,
             };
-            if !as_left {
+            // Git replaces a directory in the way with everything below it: never.
+            if !as_left || (back.present() && disk == Disk::Other) {
                 refused.push(rel);
                 continue;
             }
-            planned.push((rel, back, disk, disk_mode));
+            planned.push(Planned { rel, back, disk });
         }
         if !refused.is_empty() {
             return Err(self.refusal(refused, &root, deadline).await);
         }
-        let mut note = self.recs.ran_commands.then(|| NOTE_GIT.to_string());
+        // A file the first checkpoint lacks may have been there, ignored: deleted only
+        // when the ignore rules of the turn's start (restored with it) do not ignore it.
+        let unseen: Vec<PathBuf> = planned
+            .iter()
+            .filter(|p| matches!(p.back, Back::Checkpoint { present: false }))
+            .map(|p| p.rel.clone())
+            .collect();
+        let kept = self.cp.ignored_under(start, &unseen, deadline).await?;
+        planned.retain(|p| !kept.contains(&p.rel));
+        let mut kept: Vec<PathBuf> = kept.into_iter().collect();
+        kept.sort();
+
+        let mut notes = Vec::new();
+        if self.recs.ran_commands {
+            notes.push(NOTE_GIT.to_string());
+        }
         if self.recs.skipped {
-            note = Some(match note {
-                Some(n) => format!("{n}; {NOTE_SKIPPED}"),
-                None => NOTE_SKIPPED.to_string(),
-            });
+            notes.push(NOTE_SKIPPED.to_string());
+        }
+        if !kept.is_empty() {
+            notes.push(format!("{NOTE_KEPT}: {}", list(&kept)));
         }
         let mut report = UndoReport {
             turn: self.turn,
@@ -542,13 +662,13 @@ impl GitUndo<'_> {
             deleted: Vec::new(),
             dry_run,
             backup_ref: None,
-            note,
+            note: (!notes.is_empty()).then(|| notes.join("; ")),
         };
-        for (rel, back, disk, _) in &planned {
-            if back.present() {
-                report.restored.push(root.join(rel));
-            } else if disk.is_some() {
-                report.deleted.push(root.join(rel));
+        for p in &planned {
+            if p.back.present() {
+                report.restored.push(root.join(&p.rel));
+            } else {
+                report.deleted.push(root.join(&p.rel));
             }
         }
         let Some(log) = log.filter(|_| !dry_run) else {
@@ -558,8 +678,9 @@ impl GitUndo<'_> {
             return Ok(report);
         }
         let mut files = Vec::with_capacity(planned.len() + already.len());
-        for (rel, disk, mode) in already {
-            let blob = disk.as_deref().map(|b| log.blob(b)).transpose()?;
+        for (rel, disk) in already {
+            let (bytes, mode) = disk.logged();
+            let blob = bytes.map(|b| log.blob(b)).transpose()?;
             files.push(UndoneFile {
                 path: rel_path(&root, &rel)?,
                 from_blob: blob.clone(),
@@ -574,25 +695,31 @@ impl GitUndo<'_> {
         }
         // Every file's content just before, as blobs, before the first write.
         let mut from = Vec::with_capacity(planned.len());
-        for (_, _, disk, mode) in &planned {
-            let blob = disk.as_deref().map(|b| log.blob(b)).transpose()?;
-            from.push((blob, *mode));
+        for p in &planned {
+            let (bytes, mode) = p.disk.logged();
+            from.push((bytes.map(|b| log.blob(b)).transpose()?, mode));
         }
-        let written = self.write(&planned, start, &root, deadline).await;
+        let mut applied = vec![false; planned.len()];
+        let written = self
+            .write(&planned, &mut applied, start, &root, deadline)
+            .await;
         self.cp.invalidate();
-        for ((rel, back, _, _), (from_blob, from_mode)) in planned.iter().zip(from) {
-            let (to, to_mode) = match back {
+        // Only what was written is logged (a failed undo leaves the rest as it was).
+        for ((p, (from_blob, from_mode)), done) in planned.iter().zip(from).zip(&applied) {
+            if !done {
+                continue;
+            }
+            let (to, to_mode) = match &p.back {
                 Back::Blob { pre, mode } => (pre.clone(), pre.as_ref().and(*mode)),
                 Back::Checkpoint { present: false } => (None, None),
                 Back::Checkpoint { present: true } => {
-                    match read_now(self.sandbox, &root.join(rel)).await? {
-                        (Some(bytes), mode) => (Some(log.blob(&bytes)?), mode),
-                        (None, _) => (None, None),
-                    }
+                    let disk = read_disk(&root, &p.rel).await?;
+                    let (bytes, mode) = disk.logged();
+                    (bytes.map(|b| log.blob(b)).transpose()?, mode)
                 }
             };
             files.push(UndoneFile {
-                path: rel_path(&root, rel)?,
+                path: rel_path(&root, &p.rel)?,
                 from_blob,
                 from_mode,
                 to,
@@ -608,41 +735,55 @@ impl GitUndo<'_> {
         Ok(report)
     }
 
-    /// Delete what goes, then write back what the first checkpoint or a pre-image holds.
+    /// Delete what goes (links are unlinked, never followed), then write back what the
+    /// first checkpoint or a pre-image holds, marking each path `applied` once written.
     async fn write(
         &self,
         planned: &[Planned],
+        applied: &mut [bool],
         start: &str,
         root: &Path,
         deadline: tokio::time::Instant,
     ) -> Result<(), UndoError> {
-        for (rel, back, disk, _) in planned {
-            if !back.present() && disk.is_some() {
-                checkpoint::remove(self.sandbox, &root.join(rel)).await?;
+        for (i, p) in planned.iter().enumerate() {
+            if !p.back.present() {
+                checkpoint::remove(self.sandbox, &root.join(&p.rel)).await?;
+                applied[i] = true;
             }
         }
-        let from_checkpoint: Vec<PathBuf> = planned
-            .iter()
-            .filter(|(_, b, _, _)| matches!(b, Back::Checkpoint { present: true }))
-            .map(|(rel, _, _, _)| rel.clone())
+        let from_checkpoint: Vec<usize> = (0..planned.len())
+            .filter(|&i| matches!(planned[i].back, Back::Checkpoint { present: true }))
             .collect();
-        self.cp.checkout(start, &from_checkpoint, deadline).await?;
-        for (rel, back, _, _) in planned {
-            if let Back::Blob {
+        let rels: Vec<PathBuf> = from_checkpoint
+            .iter()
+            .map(|&i| planned[i].rel.clone())
+            .collect();
+        self.cp.checkout(start, &rels, deadline).await?;
+        for i in from_checkpoint {
+            applied[i] = true;
+        }
+        for (i, p) in planned.iter().enumerate() {
+            let Back::Blob {
                 pre: Some(pre),
                 mode,
-            } = back
-            {
-                let full = root.join(rel);
-                let bytes = self.reader.read_blob(pre)?;
-                self.sandbox
-                    .write_atomic(&full, &bytes, *mode)
-                    .await
-                    .map_err(|source| UndoError::Disk {
-                        path: full.display().to_string(),
-                        source,
-                    })?;
+            } = &p.back
+            else {
+                continue;
+            };
+            let full = root.join(&p.rel);
+            // A link in its place goes first: writing through it would change its target.
+            if matches!(p.disk, Disk::Link(_)) {
+                checkpoint::remove(self.sandbox, &full).await?;
             }
+            let bytes = self.reader.read_blob(pre)?;
+            self.sandbox
+                .write_atomic(&full, &bytes, *mode)
+                .await
+                .map_err(|source| UndoError::Disk {
+                    path: full.display().to_string(),
+                    source,
+                })?;
+            applied[i] = true;
         }
         Ok(())
     }
@@ -713,6 +854,59 @@ fn rel_path(root: &Path, rel: &Path) -> Result<RelPath, UndoError> {
         path: rel.to_string_lossy().into_owned(),
         source: SandboxError::Denied("the path cannot be logged (it is not valid UTF-8)".into()),
     })
+}
+
+/// What is at `rel` below `root` now, as git sees it: no symbolic link is followed, and a
+/// path below a link or a file is absent.
+async fn read_disk(root: &Path, rel: &Path) -> Result<Disk, UndoError> {
+    use std::os::unix::ffi::OsStringExt;
+    use std::os::unix::fs::MetadataExt;
+    let full = root.join(rel);
+    let err = |e: std::io::Error| UndoError::Disk {
+        path: full.display().to_string(),
+        source: SandboxError::Io(e),
+    };
+    let (root, rel) = (root.to_path_buf(), rel.to_path_buf());
+    let read = tokio::task::spawn_blocking(move || -> std::io::Result<Disk> {
+        let names: Vec<_> = rel.components().collect();
+        let mut at = root;
+        for (i, name) in names.iter().enumerate() {
+            at.push(name);
+            let meta = match std::fs::symlink_metadata(&at) {
+                Ok(m) => m,
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                    ) =>
+                {
+                    return Ok(Disk::Absent);
+                }
+                Err(e) => return Err(e),
+            };
+            let kind = meta.file_type();
+            if i + 1 < names.len() {
+                if !kind.is_dir() {
+                    return Ok(Disk::Absent);
+                }
+                continue;
+            }
+            return Ok(if kind.is_symlink() {
+                Disk::Link(std::fs::read_link(&at)?.into_os_string().into_vec())
+            } else if kind.is_file() {
+                Disk::File {
+                    bytes: std::fs::read(&at)?,
+                    mode: meta.mode() & 0o7777,
+                }
+            } else {
+                Disk::Other
+            });
+        }
+        Ok(Disk::Other)
+    });
+    read.await
+        .map_err(|e| err(std::io::Error::other(e)))?
+        .map_err(err)
 }
 
 /// A file's content and permission bits now (none: it does not exist).
@@ -842,7 +1036,7 @@ async fn preimage_undo(
         && !planned.is_empty()
     {
         let deadline = Checkpointer::housekeeping_deadline();
-        let tree = cp.tree_id(false, deadline).await?;
+        let tree = cp.tree_id(true, deadline).await?;
         report.backup_ref = Some(cp.commit_backup(&tree, deadline).await?.refname);
         cp.invalidate();
     }
