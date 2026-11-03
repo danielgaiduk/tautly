@@ -144,6 +144,18 @@ impl Budgets {
         self.unpriced_reported = false;
     }
 
+    /// The same limits with nothing spent: a fork's or rewind's new session.
+    pub fn without_spend(&self) -> Budgets {
+        Budgets {
+            turn: Scope::new(self.turn.limit),
+            session: Scope::new(self.session.limit),
+            priced: self.priced,
+            model: self.model.clone(),
+            unpriced_reported: self.unpriced_reported,
+            unpriced_others: self.unpriced_others.clone(),
+        }
+    }
+
     /// A new user message: the turn budget starts again.
     pub fn start_turn(&mut self) {
         self.turn = Scope::new(self.turn.limit);

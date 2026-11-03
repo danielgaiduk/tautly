@@ -12,7 +12,7 @@ use tautly_context::pinned::{self, PinSource, Pinned};
 use tautly_context::{CompactionRecord, Context, Turn, agents_md};
 use tautly_provider::{Block, CanonicalRequest, ModelId, ModelInfo, Provider, ToolSpec};
 use tautly_sandbox::{Policy, Sandbox, cleanup_spills};
-use tautly_session::{BlobRef, SessionWriter};
+use tautly_session::{BlobRef, HeaderInit, SessionWriter};
 use tautly_tools::{ProcessGroups, ReadTracker, Tool};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
@@ -25,7 +25,7 @@ use crate::ledger::CostLedger;
 use crate::mcp::{McpSession, PreExecHook};
 use crate::model_switch::ModelSetup;
 use crate::protocol::{Command, ErrorKind, Event};
-use crate::record::{BlockHashes, SessionRecord};
+use crate::record::{BlockHashes, LoggedPin, SessionRecord};
 use crate::routing::Side;
 use crate::workspace::Workspace;
 
@@ -234,6 +234,14 @@ impl Log {
         self.lock().writer.path().to_path_buf()
     }
 
+    /// Write to `writer` from now on (a fork's log), for every holder of this log; the
+    /// old writer is flushed and closed.
+    pub fn replace(&self, writer: SessionWriter<SessionRecord>) {
+        let mut g = self.lock();
+        g.writer = writer;
+        g.reported = false;
+    }
+
     /// Flush and fsync (tool and turn boundaries).
     pub fn checkpoint(&self) -> Result<(), LogFailure> {
         let mut g = self.lock();
@@ -349,6 +357,10 @@ pub(crate) struct Session {
     pub mcp: Option<McpSession>,
     /// Runs before every stdio MCP call (checkpoints, Task 47).
     pub pre_exec: Arc<dyn PreExecHook>,
+    /// Where session logs live (a fork creates its log here).
+    pub data_home: PathBuf,
+    /// The header fields every log of this session shares (model, config hash).
+    pub header_init: HeaderInit,
 }
 
 impl Session {
@@ -488,25 +500,48 @@ impl Session {
     /// ledger, config pins, AGENTS.md (once), and the background build of the repo map and
     /// memory index.
     pub async fn init(&mut self, config_pins: &[String]) {
-        let root = self.sandbox.root().to_path_buf();
-        tokio::task::spawn_blocking(move || cleanup_spills(&root, SPILL_MAX_AGE, SPILL_MAX_BYTES));
-        // Off the start path: another process may hold the file for seconds.
-        self.cost_ledger.start(self.events.clone());
-        for pin in config_pins {
-            pinned::add(
-                &mut self.context.pinned,
-                Pinned::new(pin, PinSource::Config),
-            );
+        self.init_with(config_pins, false).await;
+    }
+
+    /// [`init`](Self::init); with `pins_logged` (a resumed session that never sent a
+    /// request, whose log has its `StartPins` already) the pins are the logged ones: no
+    /// configuration or AGENTS.md pin is added, nor logged again, and AGENTS.md is read
+    /// for its text only (no request logged it yet).
+    pub async fn init_with(&mut self, config_pins: &[String], pins_logged: bool) {
+        self.start_housekeeping();
+        if !pins_logged {
+            for pin in config_pins {
+                pinned::add(
+                    &mut self.context.pinned,
+                    Pinned::new(pin, PinSource::Config),
+                );
+            }
         }
         let sb = Arc::clone(&self.sandbox);
-        let found = tokio::task::spawn_blocking(move || agents_md::load(sb.as_ref()))
+        let mut found = tokio::task::spawn_blocking(move || agents_md::load(sb.as_ref()))
             .await
             .unwrap_or_default();
+        if pins_logged {
+            found.pins.clear();
+        }
         for w in &found.warnings {
             self.warn(w.clone()).await;
         }
         self.context.set_agents_md(found);
+        if !pins_logged && !self.context.pinned.is_empty() {
+            let pins = self.context.pinned.iter().map(LoggedPin::from).collect();
+            self.log(SessionRecord::StartPins { pins }).await;
+        }
         self.startup = Some(self.spawn_startup());
+    }
+
+    /// Spill cleanup in the background and the cost ledger's writer (every session start,
+    /// a resumed one included).
+    pub fn start_housekeeping(&self) {
+        let root = self.sandbox.root().to_path_buf();
+        tokio::task::spawn_blocking(move || cleanup_spills(&root, SPILL_MAX_AGE, SPILL_MAX_BYTES));
+        // Off the start path: another process may hold the file for seconds.
+        self.cost_ledger.start(self.events.clone());
     }
 
     fn spawn_startup(&self) -> Startup {

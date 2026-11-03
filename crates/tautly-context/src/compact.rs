@@ -280,6 +280,29 @@ impl Context {
                 removed: removed_tokens,
             });
         }
+        Ok(self.splice_summary(removed, summary))
+    }
+
+    /// Redo a logged compaction on resume: replace the `removed` oldest turns with
+    /// `summary` as [`apply_compaction`](Self::apply_compaction) did, without its size
+    /// check (the log says it was applied; the token estimates may differ now). The engine
+    /// calls this at the log position of the compaction, after rebuilding the history up
+    /// to there. Refused only when there is nothing to compact.
+    pub fn reapply_compaction(
+        &mut self,
+        removed: usize,
+        summary: String,
+    ) -> Result<CompactionRecord, CompactError> {
+        let removed = removed.min(self.history.len());
+        if removed == 0 || (removed == 1 && is_summary_turn(&self.history[0])) {
+            return Err(CompactError::Nothing);
+        }
+        Ok(self.splice_summary(removed, summary))
+    }
+
+    /// Put the summary turn in place of the `removed` (≥ 1) oldest turns.
+    fn splice_summary(&mut self, removed: usize, summary: String) -> CompactionRecord {
+        let replacement = summary_turn(&summary);
         let first_removed_turn = self.first_turn;
         let last_removed_turn = first_removed_turn + (removed as u32 - 1);
         // A leading summary stands for turns an earlier compaction already reported.
@@ -303,13 +326,13 @@ impl Context {
         let removed_turns: Vec<Turn> = self.history.splice(..removed, [replacement]).collect();
         // The summary stands in the slot of the last turn it replaced.
         self.first_turn = last_removed_turn;
-        Ok(CompactionRecord {
+        CompactionRecord {
             removed_turns,
             summary,
             first_removed_turn,
             last_removed_turn,
             forgotten_paths,
-        })
+        }
     }
 
     /// Undo [`apply_compaction`](Self::apply_compaction): put the removed turns back in place

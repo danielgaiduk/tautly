@@ -81,6 +81,11 @@ pub struct ResultMeta {
     pub turn: u32,
     /// Whether [`Context::collect`] has replaced the output with a stub.
     pub elided: bool,
+    /// Collect this result only for a result of a turn after this one supersedes it (it
+    /// still covers earlier ones). The engine sets it to the turn of the user's
+    /// `Uncompact` on the results it restored, so the next collection does not take them
+    /// away again for what had superseded them already, while a later re-read can.
+    pub kept_until: Option<u32>,
     /// The read targets, from the result's `Read` effects.
     pub reads: Vec<ReadTarget>,
     /// Paths the result wrote, from its `Edited` effects.
@@ -150,6 +155,7 @@ impl Context {
             tool: tool.to_string(),
             turn,
             elided: false,
+            kept_until: None,
             reads,
             writes,
             failed_edit,
@@ -227,7 +233,8 @@ impl Context {
 
     /// Undo [`collect`](Self::collect): put the original outputs back, byte for byte. A
     /// result that is no longer in the history (compacted away; restore it with
-    /// `uncompact` first) or no longer a stub is left alone.
+    /// `uncompact` first) or no longer a stub is left alone. A restored result can be
+    /// collected again, unless the caller marks it [`ResultMeta::kept_until`].
     pub fn restore_gc(&mut self, rec: &GcRecord) {
         let found: Vec<(Pos, &String, &String)> = {
             let at = result_positions(&self.history);
@@ -297,14 +304,16 @@ impl Context {
     /// The superseded results still in the history and not yet elided, oldest first.
     ///
     /// Walks the records newest to oldest, keeping what the later ones cover, so each
-    /// record sees the nearest later result that supersedes it. Elided records keep
-    /// covering: whatever superseded them covers everything they did (the relation is
-    /// transitive), and their stubs are why a path's baselines were forgotten.
+    /// record sees the nearest later result that supersedes it (for a
+    /// [`kept`](ResultMeta::kept_until) one: the nearest of a turn after it was kept).
+    /// Elided records keep covering: whatever superseded them covers everything they did
+    /// (the relation is transitive), and their stubs are why a path's baselines were
+    /// forgotten.
     fn plan(&self) -> Vec<Planned> {
         let at = result_positions(&self.history);
-        let mut later_cmd: HashMap<&str, Later> = HashMap::new();
-        let mut later_write: HashMap<&Path, Later> = HashMap::new();
-        // Newest first: the nearest covering read is the last pushed.
+        // Every list is newest first: the nearest later result is the last pushed.
+        let mut later_cmd: HashMap<&str, Vec<Later>> = HashMap::new();
+        let mut later_write: HashMap<&Path, Vec<Later>> = HashMap::new();
         let mut later_writes: Vec<(&Path, Later)> = Vec::new();
         let mut later_reads: HashMap<&Path, Vec<(LineRange, bool, Later)>> = HashMap::new();
 
@@ -318,18 +327,23 @@ impl Context {
                 turn: meta.turn,
             };
             if !meta.elided {
+                // The superseders that count: all, or those after the turn it was kept at.
+                let counts = |l: &Later| meta.kept_until.is_none_or(|k| l.turn > k);
+                let nearest_of =
+                    |v: Option<&Vec<Later>>| v?.iter().rev().find(|l| counts(l)).copied();
                 let by = if let Some(cmd) = &meta.command {
-                    later_cmd.get(cmd.as_str()).map(|l| l.turn)
+                    nearest_of(later_cmd.get(cmd.as_str())).map(|l| l.turn)
                 } else if !meta.reads.is_empty() {
                     meta.reads
                         .iter()
                         .map(|t| {
-                            let by_write = later_write.get(t.path.as_path()).copied();
+                            let by_write = nearest_of(later_write.get(t.path.as_path()));
                             let by_read = later_reads
                                 .get(t.path.as_path())
                                 .and_then(|v| {
-                                    v.iter().rev().find(|(r, full, _)| {
-                                        covers(*r, *full, t.range, t.shown == Shown::Partial)
+                                    v.iter().rev().find(|(r, full, l)| {
+                                        counts(l)
+                                            && covers(*r, *full, t.range, t.shown == Shown::Partial)
                                     })
                                 })
                                 .map(|(_, _, l)| *l);
@@ -343,7 +357,7 @@ impl Context {
                             later_writes
                                 .iter()
                                 .rev()
-                                .find(|(w, _)| same_file(f, w))
+                                .find(|(w, l)| counts(l) && same_file(f, w))
                                 .map(|(_, l)| l.turn)
                         })
                         .try_fold(0, |max: u32, turn| turn.map(|t| max.max(t)))
@@ -359,10 +373,10 @@ impl Context {
                 }
             }
             if let Some(cmd) = &meta.command {
-                later_cmd.insert(cmd, me);
+                later_cmd.entry(cmd).or_default().push(me);
             }
             for w in &meta.writes {
-                later_write.insert(w, me);
+                later_write.entry(w).or_default().push(me);
                 later_writes.push((w, me));
             }
             for t in &meta.reads {

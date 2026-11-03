@@ -62,7 +62,14 @@ expression: every_command()
     "type": "consolidate_memory"
   },
   {
-    "type": "fork"
+    "type": "fork",
+    "at": null,
+    "label": null
+  },
+  {
+    "type": "fork",
+    "at": 5,
+    "label": "try-b"
   },
   {
     "type": "diff",

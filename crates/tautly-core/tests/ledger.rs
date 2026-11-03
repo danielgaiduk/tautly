@@ -116,6 +116,29 @@ fn estimated_rows_are_counted_apart() {
 }
 
 #[test]
+fn session_totals_count_one_sessions_rows_estimated_ones_included() {
+    let dir = tempfile::tempdir().unwrap();
+    let ledger = Ledger::open(&dir.path().join("ledger.sqlite")).unwrap();
+    let model = ModelId::from("mock/test");
+    ledger
+        .record("s1", &model, &usage(100, 10, 5, 0), Some(0.25))
+        .unwrap();
+    ledger
+        .record_estimated("s1", &model, &usage(900, 40, 0, 0), None)
+        .unwrap();
+    ledger
+        .record("s2", &model, &usage(7, 7, 7, 7), Some(1.0))
+        .unwrap();
+    let t = ledger.session_totals("s1").unwrap();
+    assert_eq!(
+        (t.requests, t.estimated, t.unpriced, t.tokens()),
+        (2, 1, 1, 1055)
+    );
+    assert!((t.usd - 0.25).abs() < 1e-12);
+    assert_eq!(ledger.session_totals("none").unwrap(), Totals::default());
+}
+
+#[test]
 fn a_version_1_ledger_gains_the_estimated_column_and_keeps_its_rows() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("ledger.sqlite");

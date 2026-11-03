@@ -12,6 +12,10 @@
 //! the budgets (`budget.rs`). The budgets are checked at every step start, before every
 //! request and at every tool boundary. The turn timeout (`turn_timeout_s`) cancels the
 //! turn like `Cancel` does, and the turn ends with `timeout`.
+//!
+//! A turn starts with a `TurnStart` record (resume pushes the user message there) and
+//! always ends with `TurnEnd`. A context overflow reported by the provider triggers one
+//! compaction (`forced`) and one retry of the step (spec 6.4).
 
 use std::sync::Arc;
 use std::sync::PoisonError;
@@ -68,22 +72,22 @@ impl Call {
     }
 }
 
-/// A completed provider response.
+/// A completed provider response; resume rebuilds one from its logged events.
 #[derive(Debug, Default)]
-struct Response {
-    content: Vec<Content>,
-    calls: Vec<Call>,
+pub(crate) struct Response {
+    pub content: Vec<Content>,
+    pub calls: Vec<Call>,
     /// The events as logged: consecutive deltas merged.
     logged: Vec<ProviderEvent>,
-    usage: Option<RawUsage>,
+    pub usage: Option<RawUsage>,
     /// Usage of attempts the retry wrapper discarded.
-    discarded: Vec<RawUsage>,
+    pub discarded: Vec<RawUsage>,
     quota: Option<Quota>,
     stop: Option<StopReason>,
 }
 
 impl Response {
-    fn push(&mut self, ev: ProviderEvent) {
+    pub fn push(&mut self, ev: ProviderEvent) {
         match &ev {
             ProviderEvent::TextDelta(t) => match self.content.last_mut() {
                 Some(Content::Text(s)) => s.push_str(t),
@@ -166,7 +170,7 @@ impl Response {
 
     /// A response cut off (output limit) right after a reasoning item keeps no dangling
     /// reasoning: providers reject a reasoning item that leads nowhere.
-    fn finish(mut self) -> Self {
+    pub fn finish(mut self) -> Self {
         if self.stop == Some(StopReason::MaxTokens)
             && matches!(
                 self.content.last(),
@@ -284,6 +288,11 @@ impl Session {
         self.apply_startup().await;
         self.evidence = self.evidence.fresh();
         self.user_turn += 1;
+        self.log(SessionRecord::TurnStart {
+            turn: self.user_turn,
+            text: text.clone(),
+        })
+        .await;
         self.emit(Event::TurnStarted).await;
         // The tool set changes only here, so the turn's requests share one prefix.
         self.refresh_mcp_tools().await;
@@ -317,6 +326,9 @@ impl Session {
 
     async fn steps(&mut self, ctl: &mut TurnControl) -> FinishReason {
         let mut steps = 0u32;
+        // The provider said the context overflowed and the step was compacted to retry
+        // once (spec 6.4); reset by a response that arrives.
+        let mut overflow_retried = false;
         loop {
             if ctl.cancel.is_cancelled() {
                 return FinishReason::Cancelled;
@@ -366,10 +378,24 @@ impl Session {
                     continue;
                 }
                 Err(StreamEnd::Failed(e)) => {
+                    // One compaction and one retry; the step's request is logged again.
+                    if matches!(e, ProviderError::ContextOverflow(_))
+                        && !std::mem::replace(&mut overflow_retried, true)
+                    {
+                        self.warn(format!("{e}; compacting the context and retrying once"))
+                            .await;
+                        if self.compact(MutationReason::Forced, ctl).await {
+                            continue;
+                        }
+                        if ctl.cancel.is_cancelled() {
+                            return FinishReason::Cancelled;
+                        }
+                    }
                     self.emit(error_event(&e)).await;
                     return FinishReason::Error;
                 }
             };
+            overflow_retried = false;
             self.log_all(
                 resp.logged
                     .iter()
@@ -444,7 +470,7 @@ impl Session {
         }
     }
 
-    fn assemble(&self) -> (CanonicalRequest, ContextStatus) {
+    pub(crate) fn assemble(&self) -> (CanonicalRequest, ContextStatus) {
         self.context
             .assemble(&self.info.caps, &self.specs, &self.model)
     }
@@ -588,7 +614,7 @@ impl Session {
     }
 
     /// Log and announce a collection, and forget the read baselines it took away.
-    async fn collected(&mut self, rec: GcRecord) {
+    pub(crate) async fn collected(&mut self, rec: GcRecord) {
         for p in &rec.forgotten_paths {
             self.reads.forget_path(p);
         }
@@ -623,7 +649,7 @@ impl Session {
     /// Threshold compaction (spec 6.4): announced first, summarized by the side model
     /// (7.5), and if that fails (or the summary is not smaller) the oldest turns are dropped
     /// without a summary; never retried in a loop. True when the history changed.
-    async fn compact(&mut self, reason: MutationReason, ctl: &TurnControl) -> bool {
+    pub(crate) async fn compact(&mut self, reason: MutationReason, ctl: &TurnControl) -> bool {
         // A side model that is no use (bad key, not on the account) is given up for the
         // session and the summary is asked of the main model once.
         let mut fell_back = self.side.model == self.model;

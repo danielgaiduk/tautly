@@ -18,6 +18,7 @@ mod model_switch;
 pub mod protocol;
 mod provider_setup;
 pub mod record;
+pub mod resume;
 pub mod routing;
 mod session;
 pub mod signals;
