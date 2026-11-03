@@ -239,18 +239,31 @@ async fn usage_maps_cached_content_token_count() {
 #[tokio::test]
 async fn function_call_parts_parse() {
     let server = serve(sse(fixture("function_call.sse"))).await;
-    let evs = ok(run(&server).await);
+    let mut evs = ok(run(&server).await);
+    // Ids are generated; check their shape and that they differ, then compare the rest.
+    let ids: Vec<String> = evs
+        .iter_mut()
+        .filter_map(|e| match e {
+            ProviderEvent::ToolCall { id, .. } => Some(std::mem::replace(id, "ID".into())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(ids.len(), 2);
+    assert_ne!(ids[0], ids[1]);
+    for id in &ids {
+        assert_call_id_shape(id);
+    }
     assert_eq!(
         evs,
         vec![
             ProviderEvent::TextDelta("Let me look.".into()),
             ProviderEvent::ToolCall {
-                id: "call_0".into(),
+                id: "ID".into(),
                 name: "read_file".into(),
                 input_json: "{\"path\":\"a.rs\"}".into()
             },
             ProviderEvent::ToolCall {
-                id: "call_1".into(),
+                id: "ID".into(),
                 name: "read_file".into(),
                 input_json: "{\"path\":\"b.rs\"}".into()
             },
@@ -265,6 +278,39 @@ async fn function_call_parts_parse() {
             },
         ]
     );
+}
+
+/// `call_` followed by 12 lowercase hex digits.
+fn assert_call_id_shape(id: &str) {
+    let hex = id.strip_prefix("call_").unwrap_or_else(|| panic!("{id}"));
+    assert_eq!(hex.len(), 12, "{id}");
+    assert!(
+        hex.bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+        "{id}"
+    );
+}
+
+fn first_call_id(evs: Vec<ProviderEvent>) -> String {
+    evs.into_iter()
+        .find_map(|e| match e {
+            ProviderEvent::ToolCall { id, .. } => Some(id),
+            _ => None,
+        })
+        .expect("a tool call")
+}
+
+#[tokio::test]
+async fn call_ids_do_not_collide_across_providers_or_resumes() {
+    // A resumed session builds a new provider; its first call must not reuse the id of an
+    // earlier session's first call, which may still be in the history.
+    let server = serve(sse(fixture("function_call.sse"))).await;
+    let mut ids = std::collections::HashSet::new();
+    for _ in 0..20 {
+        let id = first_call_id(ok(run(&server).await));
+        assert_call_id_shape(&id);
+        assert!(ids.insert(id.clone()), "duplicate {id}");
+    }
 }
 
 #[tokio::test]
@@ -553,13 +599,17 @@ fn reasoning_signature_attaches_to_following_part() {
 #[tokio::test]
 async fn thought_signature_emits_event_before_its_part() {
     let server = serve(sse(fixture("thought_signature.sse"))).await;
-    let evs = ok(run(&server).await);
+    let mut evs = ok(run(&server).await);
+    if let ProviderEvent::ToolCall { id, .. } = &mut evs[1] {
+        assert_call_id_shape(id);
+        *id = "ID".into();
+    }
     assert_eq!(
         &evs[..4],
         &[
             ProviderEvent::ReasoningSignature("sigA".into()),
             ProviderEvent::ToolCall {
-                id: "call_0".into(),
+                id: "ID".into(),
                 name: "read_file".into(),
                 input_json: "{\"path\":\"a.rs\"}".into()
             },

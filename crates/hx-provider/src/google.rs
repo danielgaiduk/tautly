@@ -2,12 +2,11 @@
 //!
 //! Gemini matches a function response to its call by function name rather than by id, and
 //! returns each function call complete in a single chunk without an id. Ids are therefore
-//! generated here (`call_<n>`), and the name of each call is remembered while building the
+//! generated here (`call_<12 random hex digits>`), and the name of each call is remembered while building the
 //! request so that tool results can be sent back under the right name.
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use base64::{Engine, engine::general_purpose::STANDARD};
@@ -30,7 +29,6 @@ pub struct GoogleProvider {
     api_key: String,
     base_url: Url,
     catalog: Arc<Catalog>,
-    next_call: Arc<AtomicU64>,
 }
 
 impl GoogleProvider {
@@ -44,7 +42,6 @@ impl GoogleProvider {
             api_key,
             base_url,
             catalog,
-            next_call: Arc::default(),
         }
     }
 
@@ -271,9 +268,15 @@ fn usage_from(u: &Value) -> RawUsage {
     }
 }
 
+/// A fresh tool-call id, `call_` and 12 random hex digits. Ids must be unique over a whole
+/// session, resumed ones included (the history may hold ids from earlier processes), so they
+/// are random rather than counted.
+fn new_call_id() -> String {
+    format!("call_{:012x}", rand::random::<u64>() & 0xffff_ffff_ffff)
+}
+
 /// Per-response state machine turning Gemini SSE chunks into canonical events.
 struct StreamState {
-    next_call: Arc<AtomicU64>,
     usage: Option<RawUsage>,
     finish: Option<String>,
     has_calls: bool,
@@ -305,7 +308,7 @@ impl StreamState {
             }
             if let Some(call) = part["functionCall"].as_object() {
                 self.has_calls = true;
-                let id = format!("call_{}", self.next_call.fetch_add(1, Ordering::Relaxed));
+                let id = new_call_id();
                 let args = call.get("args").cloned().unwrap_or_else(|| json!({}));
                 out.push(ProviderEvent::ToolCall {
                     id,
@@ -375,7 +378,6 @@ impl Provider for GoogleProvider {
             .header("x-goog-api-key", &self.api_key)
             .header("content-type", "application/json")
             .body(to_wire(&req).to_string());
-        let next_call = self.next_call.clone();
 
         Box::pin(async_stream::stream! {
             let sent = tokio::select! {
@@ -398,7 +400,7 @@ impl Provider for GoogleProvider {
             }
 
             let mut events = std::pin::pin!(try_events(resp.bytes_stream()));
-            let mut state = StreamState { next_call, usage: None, finish: None, has_calls: false };
+            let mut state = StreamState { usage: None, finish: None, has_calls: false };
             loop {
                 let next = tokio::select! {
                     () = cancel.cancelled() => return,

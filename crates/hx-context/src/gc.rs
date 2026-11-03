@@ -64,8 +64,6 @@ pub struct ResultMeta {
     pub tool: String,
     /// The session turn the result belongs to, as the engine numbered it.
     pub turn: u32,
-    /// Estimated tokens of the output when recorded.
-    pub tokens: u32,
     /// Whether [`Context::collect`] has replaced the output with a stub.
     pub elided: bool,
     /// The read targets, from the result's `Read` effects.
@@ -96,14 +94,12 @@ impl Context {
     /// after. `effects` are the result's applied effects: reads and writes are keyed by the
     /// paths in them, never by what the model wrote in `args`, which is only used for the
     /// command of a `bash` call and for the paths of an `edit` that failed (no effects).
-    #[allow(clippy::too_many_arguments)]
     pub fn push_tool_result(
         &mut self,
         call_id: &str,
         tool: &str,
         args: &Value,
         effects: &[AppliedEffect],
-        output: String,
         is_error: bool,
         turn: u32,
     ) {
@@ -138,7 +134,6 @@ impl Context {
             call_id: call_id.to_string(),
             tool: tool.to_string(),
             turn,
-            tokens: self.tokens.estimate(&output),
             elided: false,
             reads,
             writes,
@@ -282,9 +277,9 @@ impl Context {
                             let by_read = later_reads
                                 .get(t.path.as_path())
                                 .and_then(|v| {
-                                    v.iter()
-                                        .rev()
-                                        .find(|(r, full, _)| covers(*r, *full, t.range))
+                                    v.iter().rev().find(|(r, full, _)| {
+                                        covers(*r, *full, t.range, t.shown == Shown::Partial)
+                                    })
                                 })
                                 .map(|(_, _, l)| *l);
                             nearest(by_write, by_read).map(|l| l.turn)
@@ -351,10 +346,12 @@ fn nearest(a: Option<Later>, b: Option<Later>) -> Option<Later> {
 }
 
 /// Whether a later read of `later` lines (`full`: shown in full, else cut short) replaces an
-/// earlier read of `earlier`: it shows the same lines again, or all of them and more.
-fn covers(later: LineRange, full: bool, earlier: LineRange) -> bool {
+/// earlier read of `earlier` (`earlier_cut`: it was cut short): a full read shows all of
+/// the earlier lines or more, and a cut-short one replaces only another cut-short read of
+/// the same lines, never a complete one.
+fn covers(later: LineRange, full: bool, earlier: LineRange, earlier_cut: bool) -> bool {
     if later == earlier {
-        return true;
+        return full || earlier_cut;
     }
     full && later.start.unwrap_or(1) <= earlier.start.unwrap_or(1)
         && later.end.unwrap_or(usize::MAX) >= earlier.end.unwrap_or(usize::MAX)
@@ -407,12 +404,9 @@ fn absolute(root: Option<&Path>, path: &Path) -> PathBuf {
     out
 }
 
-/// Whether `named` (a failed call's path) is the written file `written` (absolute). Without
-/// a root a relative path can only be matched by its tail.
+/// Whether `named` (a failed call's path, absolute when the root was known) is the written
+/// file `written`. A relative path that could not be resolved matches nothing: guessing by
+/// its tail could elide the failure of another file.
 fn same_file(named: &Path, written: &Path) -> bool {
-    if named.is_absolute() {
-        named == written
-    } else {
-        written.ends_with(named)
-    }
+    named == written
 }

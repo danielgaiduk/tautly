@@ -81,7 +81,7 @@ fn call(
             },
         ],
     });
-    c.push_tool_result(id, tool, &args, effects, output.into(), is_error, turn);
+    c.push_tool_result(id, tool, &args, effects, is_error, turn);
     turn
 }
 
@@ -586,21 +586,79 @@ fn unchanged_and_diff_reads_never_supersede_their_base() {
 }
 
 #[test]
-fn partial_read_counts_as_a_read_of_its_path() {
+fn a_cut_short_read_never_replaces_a_full_one() {
+    let partial = |path: &str| read_at(path, LineRange::ALL, Shown::Partial);
+    // Full, then the same lines cut short (the file grew): the full output stays.
     let mut c = Context::default();
     read_call(&mut c, "full", "/w/a.rs", "whole");
-    let t = call(
+    call(
         &mut c,
         "part",
         "read",
         json!({"path": "/w/a.rs"}),
-        &[read_at("/w/a.rs", LineRange::ALL, Shown::Partial)],
+        &[partial("/w/a.rs")],
         "first 2000 lines",
         false,
     );
+    assert!(c.collect(NOW).is_none());
+    assert_eq!(output_of(&c, "full"), "whole");
+
+    // Two cut-short reads of the same lines: the older is redundant.
+    let mut c = Context::default();
+    let one = |c: &mut Context, id: &str| {
+        call(
+            c,
+            id,
+            "read",
+            json!({"path": "/w/a.rs"}),
+            &[partial("/w/a.rs")],
+            "first 2000 lines",
+            false,
+        )
+    };
+    one(&mut c, "p1");
+    let t = one(&mut c, "p2");
     let rec = c.collect(NOW).unwrap();
-    assert_eq!(elided_ids(&rec), ["full"]);
-    assert_eq!(output_of(&c, "full"), stub(t));
+    assert_eq!(elided_ids(&rec), ["p1"]);
+    assert_eq!(output_of(&c, "p1"), stub(t));
+
+    // A full read replaces a cut-short one.
+    let t = read_call(&mut c, "full", "/w/a.rs", "whole");
+    let rec = c.collect(NOW).unwrap();
+    assert_eq!(elided_ids(&rec), ["p2"]);
+    assert_eq!(output_of(&c, "p2"), stub(t));
+}
+
+#[test]
+fn failed_edit_without_a_root_matches_only_the_exact_path() {
+    let mut c = Context::default();
+    assert!(c.root.is_none());
+    call(
+        &mut c,
+        "f1",
+        "edit",
+        json!({"path": "a.rs", "old_text": "x", "new_text": "y"}),
+        &[],
+        "no match",
+        true,
+    );
+    call(
+        &mut c,
+        "f2",
+        "edit",
+        json!({"path": "/x/y/b.rs", "old_text": "x", "new_text": "y"}),
+        &[],
+        "no match",
+        true,
+    );
+    // A relative name cannot be resolved without a root: another file with that tail is not it.
+    edit_call(&mut c, "e1", "/x/y/a.rs");
+    assert!(c.collect(NOW).is_none());
+    // An absolute path still matches exactly.
+    let t = edit_call(&mut c, "e2", "/x/y/b.rs");
+    let rec = c.collect(NOW).unwrap();
+    assert_eq!(elided_ids(&rec), ["f2"]);
+    assert_eq!(output_of(&c, "f2"), stub(t));
 }
 
 #[test]
