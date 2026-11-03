@@ -32,7 +32,7 @@ pub use protocol::{
     ToolMetaView, UsageRole,
 };
 pub use record::SessionRecord;
-pub use signals::{Signal, SignalPolicy, handle_signals, install_signal_handlers};
+pub use signals::{Signal, SignalPolicy, SignalRouter, handle_signals, install_signal_handlers};
 pub use workspace::Workspace;
 // Types that appear in `Event` and `Command`, re-exported so clients need no other crate.
 pub use tautly_context::{Breakdown, MutationReason};

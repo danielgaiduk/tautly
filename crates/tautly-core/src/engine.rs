@@ -233,7 +233,7 @@ impl EngineBuilder {
             shutdown: CancellationToken::new(),
             session_id: session_id.clone(),
             budgets,
-            groups,
+            groups: groups.clone(),
         };
         runtime.spawn(actor.run(
             session,
@@ -246,6 +246,7 @@ impl EngineBuilder {
                 commands: command_tx,
                 session_id,
                 session_path,
+                groups,
             },
             event_rx,
         ))
@@ -268,6 +269,7 @@ pub struct Engine {
     commands: mpsc::Sender<Command>,
     session_id: String,
     session_path: PathBuf,
+    groups: ProcessGroups,
 }
 
 impl Engine {
@@ -286,6 +288,11 @@ impl Engine {
     /// The command channel, held weakly (the signal listener).
     pub(crate) fn weak_commands(&self) -> mpsc::WeakSender<Command> {
         self.commands.downgrade()
+    }
+
+    /// The session's process groups (killed by a signal escalation).
+    pub(crate) fn process_groups(&self) -> &ProcessGroups {
+        &self.groups
     }
 
     /// The session log file.

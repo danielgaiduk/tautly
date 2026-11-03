@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use serde_json::{Value, json};
 use tautly_core::{
     BudgetLimits, BudgetScope, Command, Config, Engine, EngineBuilder, Event, FinishReason, Ledger,
-    SessionRecord, Signal, UsageRole, handle_signals, install_signal_handlers,
+    SessionRecord, Signal, SignalRouter, UsageRole, handle_signals, install_signal_handlers,
 };
 use tautly_provider::{
     CanonicalRequest, Catalog, Content, MockProvider, MockTurn, ModelId, ProviderEvent, Quota,
@@ -978,70 +978,139 @@ async fn an_unopenable_ledger_is_reported_once_and_the_session_runs() {
 
 // ---- signals ---------------------------------------------------------------------------
 
-fn signal_channel() -> (
-    mpsc::UnboundedSender<Signal>,
-    impl futures::Stream<Item = Signal> + Send + 'static,
-) {
-    let (tx, rx) = mpsc::unbounded_channel();
-    let stream =
-        futures::stream::unfold(rx, |mut rx| async move { rx.recv().await.map(|s| (s, rx)) });
-    (tx, stream)
+/// A router whose escalation is recorded instead of ending the process.
+fn router() -> (Arc<SignalRouter>, Arc<std::sync::Mutex<Vec<Signal>>>) {
+    let escalated = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen = Arc::clone(&escalated);
+    let router = SignalRouter::new(move |sig| seen.lock().unwrap().push(sig));
+    (router, escalated)
 }
 
 #[tokio::test]
-async fn an_interrupt_cancels_the_turn_and_a_second_one_shuts_down() {
+async fn an_interrupt_cancels_the_turn_a_second_shuts_down_and_a_third_escalates() {
     let fx = Fx::new();
     let mock = MockProvider::new(vec![MockTurn::Stall]);
     let mut run = start(fx.builder(config(false), &mock));
-    let (tx, signals) = signal_channel();
-    let listener = handle_signals(&run.engine, signals);
+    let (router, escalated) = router();
+    router.add(&run.engine);
     run.say("go").await;
     run.until(|e| matches!(e, Event::TurnStarted)).await;
-    tx.send(Signal::Interrupt).unwrap();
+    router.deliver(Signal::Interrupt).await;
     assert_eq!(finish_reason(&run.turn().await), FinishReason::Cancelled);
-    tx.send(Signal::Interrupt).unwrap();
-    run.until_closed().await;
-    assert!(run.engine.send(Command::Cancel).await.is_err());
-    tokio::time::timeout(WAIT, listener).await.unwrap().unwrap();
-}
-
-#[tokio::test]
-async fn sigterm_shuts_the_session_down() {
-    let fx = Fx::new();
-    let mock = MockProvider::new(vec![]);
-    let mut run = start(fx.builder(config(false), &mock));
-    let (tx, signals) = signal_channel();
-    let _listener = handle_signals(&run.engine, signals);
-    tx.send(Signal::Terminate).unwrap();
+    router.deliver(Signal::Interrupt).await;
+    assert!(escalated.lock().unwrap().is_empty());
+    // Shutting down (or already gone): the next one ends the process.
+    router.deliver(Signal::Interrupt).await;
+    assert_eq!(*escalated.lock().unwrap(), [Signal::Interrupt]);
     run.until_closed().await;
     assert!(run.engine.send(Command::Cancel).await.is_err());
 }
 
 #[tokio::test]
-async fn the_signal_listener_does_not_keep_the_engine_alive() {
+async fn sigterm_shuts_every_session_down() {
     let fx = Fx::new();
-    let mock = MockProvider::new(vec![]);
-    let run = start(fx.builder(config(false), &mock));
-    let (tx, signals) = signal_channel();
-    let listener = handle_signals(&run.engine, signals);
+    let other = Fx::new();
+    let mut a = start(fx.builder(config(false), &MockProvider::new(vec![])));
+    let mut b = start(other.builder(config(false), &MockProvider::new(vec![])));
+    let (router, escalated) = router();
+    router.add(&a.engine);
+    router.add(&b.engine);
+    router.deliver(Signal::Terminate).await;
+    a.until_closed().await;
+    b.until_closed().await;
+    assert!(escalated.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn with_no_session_alive_a_signal_escalates_and_the_router_keeps_none_alive() {
+    let fx = Fx::new();
+    let run = start(fx.builder(config(false), &MockProvider::new(vec![])));
+    let (router, escalated) = router();
+    router.add(&run.engine);
     let Run { engine, mut events } = run;
     drop(engine);
     let closed = tokio::time::timeout(WAIT, async { while events.recv().await.is_some() {} }).await;
-    assert!(closed.is_ok(), "the listener kept the engine running");
-    // The next signal finds no engine and ends the listener.
-    tx.send(Signal::Interrupt).unwrap();
-    tokio::time::timeout(WAIT, listener).await.unwrap().unwrap();
+    assert!(closed.is_ok(), "the router kept the engine running");
+    router.deliver(Signal::Hangup).await;
+    assert_eq!(*escalated.lock().unwrap(), [Signal::Hangup]);
 }
 
 #[tokio::test]
-async fn a_real_sighup_shuts_the_session_down() {
-    // The only test in this binary that installs real handlers (they are process-wide).
+async fn handle_signals_feeds_the_router() {
     let fx = Fx::new();
-    let mock = MockProvider::new(vec![]);
-    let mut run = start(fx.builder(config(false), &mock));
-    let listener = install_signal_handlers(&run.engine).unwrap();
-    // SAFETY: raise only delivers a signal to this process, whose SIGHUP is now handled.
-    assert_eq!(unsafe { libc::raise(libc::SIGHUP) }, 0);
+    let mut run = start(fx.builder(config(false), &MockProvider::new(vec![])));
+    let (router, _) = router();
+    router.add(&run.engine);
+    let (tx, rx) = mpsc::unbounded_channel();
+    let signals =
+        futures::stream::unfold(rx, |mut rx| async move { rx.recv().await.map(|s| (s, rx)) });
+    let listener = handle_signals(&router, signals);
+    tx.send(Signal::Terminate).unwrap();
     run.until_closed().await;
+    drop(tx);
     tokio::time::timeout(WAIT, listener).await.unwrap().unwrap();
+}
+
+/// Child half of the real-signal tests: run only when the parent asks (by env var).
+#[test]
+#[ignore = "run by real_signals_end_the_process_after_shutdown in a child process"]
+fn signal_child() {
+    let Ok(mode) = std::env::var("TAUTLY_SIGNAL_CHILD") else {
+        return;
+    };
+    let sig = match mode.as_str() {
+        "int" => libc::SIGINT,
+        "term" => libc::SIGTERM,
+        _ => libc::SIGHUP,
+    };
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let fx = Fx::new();
+        let mock = MockProvider::new(vec![MockTurn::Stall]);
+        let mut run = start(fx.builder(config(false), &mock));
+        install_signal_handlers(&run.engine).unwrap();
+        // SAFETY (all raises): delivers a signal to this process, which handles it.
+        if sig == libc::SIGINT {
+            run.say("go").await;
+            run.until(|e| matches!(e, Event::TurnStarted)).await;
+            assert_eq!(unsafe { libc::raise(sig) }, 0);
+            assert_eq!(finish_reason(&run.turn().await), FinishReason::Cancelled);
+            println!("CANCELLED");
+        }
+        assert_eq!(unsafe { libc::raise(sig) }, 0);
+        run.until_closed().await;
+        println!("CLOSED");
+        assert_eq!(unsafe { libc::raise(sig) }, 0);
+        tokio::time::sleep(Duration::from_secs(10)).await;
+    });
+    println!("STILL ALIVE");
+}
+
+#[test]
+fn real_signals_end_the_process_after_shutdown() {
+    use std::os::unix::process::ExitStatusExt;
+    let exe = std::env::current_exe().unwrap();
+    for (mode, sig) in [
+        ("int", libc::SIGINT),
+        ("term", libc::SIGTERM),
+        ("hup", libc::SIGHUP),
+    ] {
+        let out = std::process::Command::new(&exe)
+            .args(["--ignored", "--exact", "signal_child", "--nocapture"])
+            .env("TAUTLY_SIGNAL_CHILD", mode)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains("CLOSED"),
+            "{mode}: {stdout}\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(!stdout.contains("STILL ALIVE"), "{mode}: {stdout}");
+        if mode == "int" {
+            assert!(stdout.contains("CANCELLED"), "{stdout}");
+        }
+        // Killed by the signal: a shell reports 128 + n (130 for SIGINT, 143 for SIGTERM).
+        assert_eq!(out.status.signal(), Some(sig), "{mode}: {:?}", out.status);
+    }
 }
