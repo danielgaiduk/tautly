@@ -10,6 +10,7 @@
 
 use std::collections::HashSet;
 use std::fmt::Write;
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use hx_provider::{Block, CanonicalRequest, Capabilities, Content, Message, ModelId, Price, Role};
@@ -22,6 +23,8 @@ use crate::{Context, assemble, pinned};
 pub const DEFAULT_THRESHOLD: f32 = 0.8;
 /// Recent turns left verbatim.
 pub const DEFAULT_KEEP_RECENT: usize = 4;
+/// Most output tokens a summary may take.
+pub const MAX_SUMMARY_TOKENS: u32 = 4_096;
 
 /// System prompt of the summarizing request.
 const COMPACT_PROMPT: &str = include_str!("../prompts/compact.md");
@@ -30,11 +33,20 @@ const COMPACT_PROMPT: &str = include_str!("../prompts/compact.md");
 ///
 /// Turns are numbered absolutely over the whole session, from 1 (see [`Context::first_turn`]),
 /// the numbering the read tracker's baselines use. The summary turn takes the number of the
-/// last turn it replaced, so every kept turn keeps its number. The engine passes
-/// `last_removed_turn` to `ReadTracker::forget_shown_at` after applying a compaction: a
-/// re-read must not answer `unchanged since turn N` for a turn the model can no longer see.
-/// When the first removed turn is the summary of an earlier compaction, `first_removed_turn`
-/// is that summary's number (the last turn it covered).
+/// last turn it replaced, so every kept turn keeps its number. When the first removed turn
+/// is the summary of an earlier compaction, `first_removed_turn` is that summary's number
+/// (the last turn it covered).
+///
+/// After applying a compaction the engine forgets the read tracker's baselines that rest on
+/// removed output, so a re-read never answers `unchanged since turn N` or a diff against
+/// content the model can no longer see:
+///
+/// - `ReadTracker::forget_shown_at(last_removed_turn)` drops the baselines shown in the
+///   removed turns;
+/// - `ReadTracker::forget_path(p)` for every `p` in `forgotten_paths` drops the baselines
+///   recorded *later* that still depend on a removed read: a post-edit baseline (the model
+///   knows the file from the removed read plus the edit) and a diff answer (only a diff
+///   against the removed read). Like collection's `GcRecord::forgotten_paths`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CompactionRecord {
     pub removed_turns: Vec<Turn>,
@@ -42,6 +54,22 @@ pub struct CompactionRecord {
     pub summary: String,
     pub first_removed_turn: u32,
     pub last_removed_turn: u32,
+    /// Every path a tool result of the removed turns read or wrote (from
+    /// [`Context::results`]), in first-seen order. Turns an earlier compaction removed are
+    /// not listed again.
+    pub forgotten_paths: Vec<PathBuf>,
+}
+
+/// Why [`Context::apply_compaction`] did nothing.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum CompactError {
+    /// No turn to remove, or only the summary of an earlier compaction.
+    #[error("nothing to compact")]
+    Nothing,
+    /// The summary would not make the context smaller (estimated tokens of the summary
+    /// turn and of the removed turns).
+    #[error("the summary ({summary} tokens) is not smaller than the {removed} tokens it replaces")]
+    SummaryTooLong { summary: u32, removed: u32 },
 }
 
 /// Why [`Context::uncompact`] did nothing.
@@ -128,7 +156,8 @@ impl Context {
     ///   call that has no result yet is never removed;
     /// - a lone summary turn is not worth summarizing again;
     /// - the request must fit the window of `model` (`caps`): the transcript may use
-    ///   `context_window - max_output` less the prompt. Tool inputs and results are cut to
+    ///   `context_window - max_output` less the prompt, where the summary's `max_output` is
+    ///   the model's capped at [`MAX_SUMMARY_TOKENS`]. Tool inputs and results are cut to
     ///   their first and last [`KEEP_BYTES`] bytes, and if the transcript is still too big
     ///   the count shrinks to the longest oldest prefix that fits. Repeated compaction
     ///   handles the rest; 0 here with a long history means one turn alone is too big.
@@ -146,10 +175,11 @@ impl Context {
         const CLOSE: &str = "</transcript>\n\nWrite the summary now.";
         let est = &self.tokens;
 
+        let max_output = caps.max_output.min(MAX_SUMMARY_TOKENS);
         let overhead = est.estimate(COMPACT_PROMPT) + est.estimate(OPEN) + est.estimate(CLOSE);
         let budget = caps
             .context_window
-            .saturating_sub(caps.max_output)
+            .saturating_sub(max_output)
             .saturating_sub(overhead);
 
         // Largest cut up to the wanted one that is valid and whose transcript fits. The cost
@@ -180,7 +210,7 @@ impl Context {
                 role: Role::User,
                 content: vec![Content::Text(transcript)],
             }],
-            max_output: caps.max_output,
+            max_output,
             reasoning: None,
             cache_breakpoints: Vec::new(),
         };
@@ -190,29 +220,73 @@ impl Context {
     /// Replace the `removed` oldest turns (from [`compaction_request`](Self::compaction_request))
     /// with `summary` as one user turn, `<summary>…</summary>`, at the start of the history:
     /// pinned, summary, recent turns, state. `removed` is capped at the history length.
-    /// None, and no change, when it is 0 or only the summary of an earlier compaction.
+    ///
+    /// Nothing changes on error: [`CompactError::Nothing`] when `removed` is 0 or only the
+    /// summary of an earlier compaction, and [`CompactError::SummaryTooLong`] when the
+    /// summary's estimate is not smaller than the turns it would replace. The engine then
+    /// compacts without a summary: it calls this again with an empty `summary` (or a short
+    /// placeholder note), and skips the compaction if that is refused as well.
+    ///
+    /// The record's `forgotten_paths` lists every path the removed turns' tool results read
+    /// or wrote (from [`Context::results`]); see [`CompactionRecord`] for what the engine
+    /// does with them.
     pub fn apply_compaction(
         &mut self,
         removed: usize,
         summary: String,
-    ) -> Option<CompactionRecord> {
+    ) -> Result<CompactionRecord, CompactError> {
         let removed = removed.min(self.history.len());
         if removed == 0 || (removed == 1 && is_summary_turn(&self.history[0])) {
-            return None;
+            return Err(CompactError::Nothing);
+        }
+        let est = &self.tokens;
+        let turn_tokens = |t: &Turn| -> u32 {
+            t.messages
+                .iter()
+                .map(|m| message_tokens(m, est))
+                .fold(0, u32::saturating_add)
+        };
+        let replacement = summary_turn(&summary);
+        let summary_tokens = turn_tokens(&replacement);
+        let removed_tokens = self.history[..removed]
+            .iter()
+            .map(turn_tokens)
+            .fold(0, u32::saturating_add);
+        if summary_tokens >= removed_tokens {
+            return Err(CompactError::SummaryTooLong {
+                summary: summary_tokens,
+                removed: removed_tokens,
+            });
         }
         let first_removed_turn = self.first_turn;
         let last_removed_turn = first_removed_turn + (removed as u32 - 1);
-        let removed_turns: Vec<Turn> = self
-            .history
-            .splice(..removed, [summary_turn(&summary)])
-            .collect();
+        // A leading summary stands for turns an earlier compaction already reported.
+        let after = if is_summary_turn(&self.history[0]) {
+            first_removed_turn
+        } else {
+            first_removed_turn - 1
+        };
+        let mut forgotten_paths: Vec<PathBuf> = Vec::new();
+        for meta in self
+            .results
+            .iter()
+            .filter(|r| r.turn > after && r.turn <= last_removed_turn)
+        {
+            for path in meta.reads.iter().map(|t| &t.path).chain(&meta.writes) {
+                if !forgotten_paths.contains(path) {
+                    forgotten_paths.push(path.clone());
+                }
+            }
+        }
+        let removed_turns: Vec<Turn> = self.history.splice(..removed, [replacement]).collect();
         // The summary stands in the slot of the last turn it replaced.
         self.first_turn = last_removed_turn;
-        Some(CompactionRecord {
+        Ok(CompactionRecord {
             removed_turns,
             summary,
             first_removed_turn,
             last_removed_turn,
+            forgotten_paths,
         })
     }
 

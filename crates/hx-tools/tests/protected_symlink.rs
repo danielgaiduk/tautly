@@ -23,7 +23,7 @@ fn repo(format: EditFormat) -> (TempDir, LocalSandbox, ToolCx) {
     std::os::unix::fs::symlink(".git/config", root.join("NOTES.md")).unwrap();
     std::os::unix::fs::symlink(".git/hooks/pre-commit", root.join("hook.sh")).unwrap();
     let sb = LocalSandbox::new(root.to_path_buf()).unwrap();
-    let cx = ToolCx::new(format, root.join(".spill"));
+    let cx = ToolCx::new(format, root.join(".spill")).with_turn(1);
     (dir, sb, cx)
 }
 

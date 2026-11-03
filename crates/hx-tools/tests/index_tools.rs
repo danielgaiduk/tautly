@@ -43,7 +43,9 @@ async fn env_with(files: &[(&str, &str)], ready: bool, format: EditFormat) -> En
         index.refresh().await.unwrap();
         assert!(index.is_ready());
     }
-    let cx = ToolCx::new(format, dir.path().join(".spill")).with_index(index.clone());
+    let cx = ToolCx::new(format, dir.path().join(".spill"))
+        .with_index(index.clone())
+        .with_turn(1);
     Env {
         _dir: dir,
         _db: db,

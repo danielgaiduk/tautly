@@ -131,7 +131,7 @@ impl Env {
 
     /// A context without the index, over the same directory.
     pub fn cx_without_index(&self) -> ToolCx {
-        ToolCx::new(EditFormat::StrReplace, self.dir.path().join(".spill"))
+        ToolCx::new(EditFormat::StrReplace, self.dir.path().join(".spill")).with_turn(1)
     }
 
     pub async fn run(&self, tool: &dyn Tool, args: Value) -> ToolResult {
@@ -171,7 +171,7 @@ pub async fn env(files: &[(&str, &[u8])], built: Built) -> Env {
         index.build_trigrams().await.unwrap();
         assert!(index.trigrams_ready());
     }
-    let mut cx = ToolCx::new(EditFormat::StrReplace, dir.path().join(".spill"));
+    let mut cx = ToolCx::new(EditFormat::StrReplace, dir.path().join(".spill")).with_turn(1);
     let mut watch = None;
     if built != Built::None {
         cx = cx.with_index(Arc::clone(&index));

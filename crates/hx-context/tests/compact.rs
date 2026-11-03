@@ -1,6 +1,7 @@
-use hx_context::compact::{DEFAULT_KEEP_RECENT, DEFAULT_THRESHOLD};
+use hx_context::compact::{DEFAULT_KEEP_RECENT, DEFAULT_THRESHOLD, MAX_SUMMARY_TOKENS};
 use hx_context::{
-    CompactionRecord, Context, PinSource, Pinned, TokenEstimator, Turn, UncompactError,
+    CompactError, CompactionRecord, Context, PinSource, Pinned, TokenEstimator, Turn,
+    UncompactError,
 };
 use hx_provider::{
     Block, CacheStyle, Capabilities, Content, EditFormat, Message, ModelId, ReasoningStyle, Role,
@@ -174,7 +175,10 @@ fn nothing_to_remove_when_history_is_short() {
     let (_, removed) = c.compaction_request(&m(), &caps(), 9);
     assert_eq!(removed, 0);
     let before = c.history.clone();
-    assert!(c.apply_compaction(0, "s".into()).is_none());
+    assert_eq!(
+        c.apply_compaction(0, "s".into()),
+        Err(CompactError::Nothing)
+    );
     assert_eq!(c.history, before);
     assert_eq!(c.first_turn, 1);
 }
@@ -300,7 +304,7 @@ fn compaction_request_instructs_to_preserve_open_questions_and_decisions() {
     assert_eq!(req.system.len(), 1);
     assert!(req.tools.is_empty());
     assert_eq!(req.model, m());
-    assert_eq!(req.max_output, 8_000);
+    assert_eq!(req.max_output, MAX_SUMMARY_TOKENS);
     assert!(req.cache_breakpoints.is_empty());
     // The removed turns are the input; the kept ones are not.
     assert_eq!(req.messages.len(), 1);
@@ -368,7 +372,8 @@ fn never_splits_a_tool_use_from_its_result() {
                     is_error: false,
                 }],
             },
-            i if i % 2 == 0 => msg(Role::User, &format!("u{i}")),
+            // Long enough that a short summary of them is smaller.
+            i if i % 2 == 0 => msg(Role::User, &format!("u{i} {}", "words ".repeat(10))),
             i => msg(Role::Assistant, &format!("a{i}")),
         };
         c.history.push(Turn { messages: vec![t] });
@@ -658,7 +663,10 @@ fn a_lone_summary_is_not_compacted_again() {
     let mut c = summary_first(4);
     assert_eq!(removed_for(&c, 4), 0);
     let before = c.history.clone();
-    assert!(c.apply_compaction(1, "again".into()).is_none());
+    assert_eq!(
+        c.apply_compaction(1, "again".into()),
+        Err(CompactError::Nothing)
+    );
     assert_eq!(c.history, before);
 
     // The summary plus a real turn is worth it.
@@ -769,7 +777,7 @@ fn request_fits_the_summarizers_window_by_cutting_tool_results() {
     let c = ctx_of(turns);
     let (req, removed) = c.compaction_request(&m(), &small_window(), 0);
     assert!(
-        request_tokens(&req) + 8_000 <= 50_000,
+        request_tokens(&req) + req.max_output <= 50_000,
         "{}",
         request_tokens(&req)
     );
@@ -786,7 +794,7 @@ fn request_fits_the_summarizers_window_by_shrinking_the_prefix() {
     }
     let (req, removed) = c.compaction_request(&m(), &small_window(), 0);
     assert!(
-        request_tokens(&req) + 8_000 <= 50_000,
+        request_tokens(&req) + req.max_output <= 50_000,
         "{}",
         request_tokens(&req)
     );
@@ -825,11 +833,224 @@ fn shrinking_for_the_window_never_splits_a_tool_pair() {
     // A window 500 tokens short of the whole transcript: the first two turns would fit
     // (the result costs about 1k), but that cut would leave the result without its call.
     let tight = Capabilities {
-        context_window: full + 8_000 - 500,
+        context_window: full + MAX_SUMMARY_TOKENS - 500,
         max_output: 8_000,
         ..caps()
     };
     let (req, removed) = c.compaction_request(&m(), &tight, 0);
     assert_eq!(removed, 1);
-    assert!(request_tokens(&req) + 8_000 <= tight.context_window);
+    assert!(request_tokens(&req) + req.max_output <= tight.context_window);
+}
+
+// ---- summary bound (M6) ----
+
+#[test]
+fn summary_request_asks_for_at_most_4k_tokens() {
+    let c = ctx_with(10);
+    let (req, _) = c.compaction_request(&m(), &caps(), 4);
+    assert_eq!(MAX_SUMMARY_TOKENS, 4_096);
+    assert_eq!(req.max_output, MAX_SUMMARY_TOKENS);
+    // A model with a smaller output limit keeps its own.
+    let small = Capabilities {
+        max_output: 2_000,
+        ..caps()
+    };
+    assert_eq!(c.compaction_request(&m(), &small, 4).0.max_output, 2_000);
+}
+
+#[test]
+fn summary_not_smaller_than_what_it_replaces_is_rejected() {
+    let mut c = ctx_with(10);
+    let before = c.history.clone();
+    // Six short turns (a few tokens each) against a long summary.
+    let err = c.apply_compaction(6, "word ".repeat(200)).unwrap_err();
+    let CompactError::SummaryTooLong { summary, removed } = err else {
+        panic!("{err:?}")
+    };
+    assert!(summary >= removed, "{summary} < {removed}");
+    // Nothing changed: the engine falls back to compacting without a summary.
+    assert_eq!(c.history, before);
+    assert_eq!(c.first_turn, 1);
+    assert!(c.apply_compaction(6, String::new()).is_ok());
+}
+
+// ---- forgetting baselines by path (I1) ----
+
+fn read_fx(path: &str) -> hx_tools::AppliedEffect {
+    hx_tools::AppliedEffect::Read {
+        path: PathBuf::from(path),
+        range: LineRange::ALL,
+        file_hash: blake3::hash(path.as_bytes()),
+        shown: hx_tools::Shown::Full,
+    }
+}
+
+fn edit_fx(path: &str) -> hx_tools::AppliedEffect {
+    hx_tools::AppliedEffect::Edited {
+        path: PathBuf::from(path),
+        pre_image: None,
+        pre_mode: None,
+        post_hash: blake3::hash(b"new"),
+    }
+}
+
+#[test]
+fn compaction_lists_every_path_read_or_written_in_the_removed_turns() {
+    let mut c = ctx_with(0);
+    let effects = [
+        vec![read_fx("/p/a.rs"), read_fx("/p/b.rs")],
+        vec![edit_fx("/p/c.rs")],
+        vec![read_fx("/p/a.rs")],
+        vec![read_fx("/p/d.rs")],
+        vec![],
+        vec![read_fx("/p/e.rs")],
+        vec![],
+        vec![],
+        vec![],
+    ];
+    for (i, fx) in effects.iter().enumerate() {
+        let turn = c.next_turn();
+        c.history.push(turn_n(i, &"x".repeat(400)));
+        c.push_tool_result(&format!("c{i}"), "read", &json!({}), fx, false, turn);
+    }
+    // Turns 1..=4 go: their paths, in first-seen order, once each.
+    let rec = c.apply_compaction(4, "s".into()).unwrap();
+    let paths = |r: &CompactionRecord| -> Vec<String> {
+        r.forgotten_paths
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect()
+    };
+    assert_eq!(paths(&rec), ["/p/a.rs", "/p/b.rs", "/p/c.rs", "/p/d.rs"]);
+
+    // The next compaction (summary slot 4, then 5 and 6) lists only what it removed.
+    let rec = c.apply_compaction(3, "s".into()).unwrap();
+    assert_eq!(rec.last_removed_turn, 6);
+    assert_eq!(paths(&rec), ["/p/e.rs"]);
+}
+
+/// Turn `i`: a user prompt and an answer of `answer`.
+fn turn_n(i: usize, answer: &str) -> Turn {
+    Turn {
+        messages: vec![
+            msg(Role::User, &format!("question {i}")),
+            msg(Role::Assistant, answer),
+        ],
+    }
+}
+
+/// Runs real tools against a temp directory the way the engine does: one turn per call,
+/// numbered with `next_turn()`, the result pushed to the history and the collector.
+struct Steps {
+    _dir: tempfile::TempDir,
+    sb: hx_sandbox::LocalSandbox,
+    tracker: std::sync::Arc<ReadTracker>,
+    c: Context,
+}
+
+impl Steps {
+    fn new(files: &[(&str, &str)]) -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, body) in files {
+            std::fs::write(dir.path().join(name), body).unwrap();
+        }
+        let sb = hx_sandbox::LocalSandbox::new(dir.path().to_path_buf()).unwrap();
+        let c = Context {
+            root: Some(hx_sandbox::Sandbox::root(&sb).to_path_buf()),
+            ..Default::default()
+        };
+        Self {
+            _dir: dir,
+            sb,
+            tracker: Default::default(),
+            c,
+        }
+    }
+
+    fn path(&self, name: &str) -> PathBuf {
+        hx_sandbox::Sandbox::root(&self.sb).join(name)
+    }
+
+    async fn run(&mut self, tool: &dyn hx_tools::Tool, args: serde_json::Value) -> String {
+        let turn = self.c.next_turn();
+        let cx = hx_tools::ToolCx::new(EditFormat::StrReplace, self.path(".spill"))
+            .with_reads(self.tracker.clone())
+            .with_turn(turn);
+        let r = tool.run(args.clone(), &self.sb, &cx).await;
+        assert!(!r.is_error, "{}", r.output);
+        let id = format!("call{turn}");
+        self.c.history.push(Turn {
+            messages: vec![
+                Message {
+                    role: Role::Assistant,
+                    content: vec![Content::ToolUse {
+                        id: id.clone(),
+                        name: tool.name().into(),
+                        input: args.clone(),
+                    }],
+                },
+                Message {
+                    role: Role::User,
+                    content: vec![Content::ToolResult {
+                        id: id.clone(),
+                        output: r.output.clone(),
+                        is_error: false,
+                    }],
+                },
+            ],
+        });
+        self.c
+            .push_tool_result(&id, tool.name(), &args, &r.effects, false, turn);
+        self.c.apply_effects(&r.effects);
+        r.output
+    }
+}
+
+#[tokio::test]
+async fn compaction_forgets_post_edit_and_diff_baselines_of_removed_reads() {
+    let b_lines: Vec<String> = (1..=10).map(|i| format!("let b{i} = {i};")).collect();
+    let mut s = Steps::new(&[
+        ("a.rs", "fn a() {\n    1\n}\n"),
+        ("b.rs", &(b_lines.join("\n") + "\n")),
+    ]);
+    let read = hx_tools::ReadTool;
+    // Turn 1: both files in full.
+    s.run(
+        &read,
+        json!({"targets": [{"path": "a.rs"}, {"path": "b.rs"}]}),
+    )
+    .await;
+    // Turn 2: an exact edit of a.rs, whose new baseline rests on the turn-1 read.
+    s.run(
+        &hx_tools::EditTool,
+        json!({"path": "a.rs", "old_text": "    1", "new_text": "    2"}),
+    )
+    .await;
+    // b.rs changes outside hx; turn 3's re-read is a diff against turn 1.
+    let mut changed = b_lines.clone();
+    changed[4] = "let b5 = 50;".into();
+    std::fs::write(s.path("b.rs"), changed.join("\n") + "\n").unwrap();
+    let out = s.run(&read, json!({"path": "b.rs"})).await;
+    assert!(out.starts_with("changed since turn 1"), "{out}");
+
+    // Turn 1 is compacted away; the engine forgets as the record says.
+    let rec = s.c.apply_compaction(1, "s".into()).unwrap();
+    assert_eq!(rec.last_removed_turn, 1);
+    assert!(rec.forgotten_paths.contains(&s.path("a.rs")), "{rec:?}");
+    assert!(rec.forgotten_paths.contains(&s.path("b.rs")), "{rec:?}");
+    s.tracker.forget_shown_at(rec.last_removed_turn);
+    for p in &rec.forgotten_paths {
+        s.tracker.forget_path(p);
+    }
+
+    // Neither file's content is in context any more, so re-reads return it in full.
+    let a = s.run(&read, json!({"path": "a.rs"})).await;
+    assert!(!a.contains("unchanged since"), "{a}");
+    assert!(a.contains("fn a() {") && a.contains("    2"), "{a}");
+    let b = s.run(&read, json!({"path": "b.rs"})).await;
+    assert!(!b.contains("unchanged since"), "{b}");
+    assert!(
+        b.contains("let b1 = 1;") && b.contains("let b5 = 50;"),
+        "{b}"
+    );
 }

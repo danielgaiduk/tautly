@@ -190,7 +190,7 @@ struct Env {
 fn env() -> Env {
     let dir = TempDir::new().unwrap();
     let sb = LocalSandbox::new(dir.path().to_path_buf()).unwrap();
-    let cx = ToolCx::new(EditFormat::StrReplace, dir.path().join(".spill"));
+    let cx = ToolCx::new(EditFormat::StrReplace, dir.path().join(".spill")).with_turn(1);
     Env { _dir: dir, sb, cx }
 }
 

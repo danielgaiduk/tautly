@@ -23,7 +23,7 @@ struct Env<S: Sandbox = LocalSandbox> {
 fn env_with(format: EditFormat) -> Env {
     let dir = TempDir::new().unwrap();
     let sb = LocalSandbox::new(dir.path().to_path_buf()).unwrap();
-    let cx = ToolCx::new(format, dir.path().join(".spill"));
+    let cx = ToolCx::new(format, dir.path().join(".spill")).with_turn(1);
     Env { dir, sb, cx }
 }
 
@@ -693,7 +693,7 @@ async fn patch_write_failure_rolls_back_earlier_files() {
     let dir = TempDir::new().unwrap();
     let local = LocalSandbox::new(dir.path().to_path_buf()).unwrap();
     let e = Env {
-        cx: ToolCx::new(EditFormat::Patch, dir.path().join(".spill")),
+        cx: ToolCx::new(EditFormat::Patch, dir.path().join(".spill")).with_turn(1),
         sb: FailingSandbox {
             inner: local,
             fail_suffix: "boom.txt",

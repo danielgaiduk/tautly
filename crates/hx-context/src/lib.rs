@@ -21,7 +21,7 @@ use hx_tools::{AppliedEffect, ContextOp};
 
 pub use assemble::STABLE_LEN;
 pub use blocks::{Breakdown, ContextStatus, Turn};
-pub use compact::{CompactionRecord, UncompactError};
+pub use compact::{CompactError, CompactionRecord, UncompactError};
 pub use gc::{GcRecord, ReadTarget, ResultMeta};
 pub use pinned::{PinSource, Pinned};
 pub use schedule::{CacheClock, MutationReason};

@@ -775,3 +775,24 @@ async fn cancelled_single_read_commits_nothing() {
             .is_none()
     );
 }
+
+/// A baseline needs the 1-based turn it was shown in: `ToolCx::new` without `with_turn`
+/// leaves 0, which would tell the model "unchanged since turn 0" and defeat compaction's
+/// forgetting.
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "1-based turn")]
+fn recording_a_baseline_at_turn_zero_panics_in_debug_builds() {
+    ReadTracker::default().supersede(
+        Path::new("/p/a.rs"),
+        hx_tools::LineRange::ALL,
+        Some(hx_tools::PrevRead {
+            hash: blake3::hash(b"a"),
+            format: EditFormat::StrReplace,
+            content_hash: blake3::hash(b"a"),
+            turn: 0,
+            mtime: std::time::SystemTime::UNIX_EPOCH,
+            content_path: ".spill/x".into(),
+        }),
+    );
+}

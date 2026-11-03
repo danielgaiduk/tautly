@@ -220,7 +220,15 @@ impl ReadTracker {
 
     /// Make `new` the baseline of `range` of `path`, dropping every baseline of the path
     /// that overlaps it. `None` (the content could not be kept) only drops them.
+    ///
+    /// Every baseline goes through here. Its `turn` must be the 1-based turn it was shown
+    /// in (debug builds check): a call whose `ToolCx` lacks `with_turn` would record turn
+    /// 0, answer `unchanged since turn 0`, and escape compaction's `forget_shown_at`.
     pub fn supersede(&self, path: &Path, range: LineRange, new: Option<PrevRead>) {
+        debug_assert!(
+            new.as_ref().is_none_or(|p| p.turn >= 1),
+            "a re-read baseline needs the 1-based turn it was shown in (ToolCx::with_turn)"
+        );
         let mut ranges = self.ranges.lock().unwrap_or_else(|e| e.into_inner());
         ranges.retain(|(p, r), _| p != path || !r.overlaps(&range));
         if let Some(prev) = new {

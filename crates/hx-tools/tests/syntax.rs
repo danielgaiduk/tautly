@@ -111,7 +111,7 @@ struct Env {
 fn env(format: EditFormat) -> Env {
     let dir = TempDir::new().unwrap();
     let sb = LocalSandbox::new(dir.path().to_path_buf()).unwrap();
-    let cx = ToolCx::new(format, dir.path().join(".spill"));
+    let cx = ToolCx::new(format, dir.path().join(".spill")).with_turn(1);
     Env { dir, sb, cx }
 }
 
