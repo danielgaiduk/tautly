@@ -1,12 +1,9 @@
 //! Encoding-preserving atomic write (spec 5.4 step 3).
 //!
 //! Matching runs on BOM-less, LF-only text; [`restore`] puts the file's own BOM, line
-//! endings and trailing-newline state back before the bytes reach the sandbox, whose
-//! `write_atomic` (temp file, fsync, rename) keeps the existing file mode.
-
-use std::path::Path;
-
-use tautly_sandbox::Sandbox;
+//! endings and trailing-newline state back, and the edit writes those bytes (the same
+//! bytes its diff shows) with `Sandbox::write_atomic` (temp file, fsync, rename), which
+//! keeps the existing file mode.
 
 use super::EditError;
 use crate::spec::decode_text;
@@ -54,17 +51,4 @@ pub fn restore(original: &[u8], new_text: &str) -> Vec<u8> {
     }
     out.extend_from_slice(text.as_bytes());
     out
-}
-
-/// Write `new_text` over `path`, restoring `original`'s CRLF, BOM, trailing-newline state
-/// and file mode.
-pub async fn preserve_and_write(
-    sb: &dyn Sandbox,
-    path: &Path,
-    original: &[u8],
-    new_text: &str,
-) -> Result<(), EditError> {
-    sb.write_atomic(path, &restore(original, new_text), None)
-        .await?;
-    Ok(())
 }

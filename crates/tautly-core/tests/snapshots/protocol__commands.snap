@@ -65,6 +65,14 @@ expression: every_command()
     "type": "fork"
   },
   {
+    "type": "diff",
+    "turn": null
+  },
+  {
+    "type": "diff",
+    "turn": 3
+  },
+  {
     "type": "shutdown"
   }
 ]

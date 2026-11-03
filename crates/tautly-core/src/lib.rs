@@ -8,6 +8,7 @@ pub mod attempts;
 pub mod auth;
 pub mod budget;
 pub mod config;
+pub mod diff;
 mod dispatch;
 pub mod engine;
 pub mod evidence;
@@ -32,8 +33,8 @@ pub use evidence::{
 };
 pub use ledger::{Ledger, LedgerError, Totals};
 pub use protocol::{
-    BudgetScope, Command, EffectView, ErrorKind, Event, FinishReason, PROTOCOL_VERSION,
-    ToolMetaView, UsageRole,
+    BudgetScope, Command, DiffFile, DiffStatus, EffectView, ErrorKind, Event, FinishReason,
+    PROTOCOL_VERSION, ToolMetaView, UsageRole,
 };
 pub use record::SessionRecord;
 pub use signals::{Signal, SignalPolicy, SignalRouter, handle_signals, install_signal_handlers};
@@ -42,3 +43,4 @@ pub use workspace::Workspace;
 pub use tautly_context::{Breakdown, MutationReason};
 pub use tautly_memory::{MemAnchor, MemoryChange, MemoryEntry};
 pub use tautly_provider::Quota;
+pub use tautly_tools::DiffPreview;

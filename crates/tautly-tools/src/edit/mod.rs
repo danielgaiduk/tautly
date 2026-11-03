@@ -22,6 +22,10 @@ use self::hashline::{Anchor, HashlineError, HashlineOp};
 use self::patch::{Kind, PatchError, PatchOp};
 use self::str_replace::MatchError;
 use self::tolerant::RepairStage;
+use crate::preview::{
+    Base, DiffPreview, FileChange, Preview, check_approved, display_diff, explain_failure,
+    shown_path,
+};
 use crate::spec::{parse_args, tool_spec};
 use crate::{AppliedEffect, Tool, ToolCx, ToolError, ToolResult};
 
@@ -361,43 +365,117 @@ fn join_notes(notes: impl IntoIterator<Item = Option<String>>) -> Option<String>
     (!notes.is_empty()).then(|| notes.join("\n"))
 }
 
-/// Write `edited` (LF text) over a loaded file, keeping its encoding, and report the effect
-/// plus a syntax warning if the edit introduced parse errors.
-async fn write_edited(
-    sb: &dyn Sandbox,
-    cx: &ToolCx,
-    path: &str,
-    file: Loaded,
-    edited: &str,
-    repaired: bool,
-) -> Result<(AppliedEffect, Option<String>), String> {
+/// What an edit writes, worked out by the whole pipeline (guard, matching, checks) up to
+/// the commit point: [`EditTool::preview`] stops here, `run` goes on to [`commit`].
+enum Prepared {
+    /// One file (`str_replace`, `hashline`).
+    One {
+        /// The path as the call names it.
+        path: String,
+        file: Loaded,
+        /// The new content as LF text.
+        edited: String,
+        /// What is written: `edited` with the file's encoding restored.
+        bytes: Vec<u8>,
+        /// A tolerant stage located the change.
+        repaired: bool,
+        /// The result's first line.
+        summary: String,
+    },
+    /// Every file of a patch, in patch order, and the repair notes.
+    Patch {
+        steps: Vec<Step>,
+        notes: Vec<String>,
+    },
+}
+
+impl Prepared {
+    /// `(root-relative path, before, after)` per file, for the diff.
+    fn sides(&self, sb: &dyn Sandbox) -> Vec<FileChange<'_>> {
+        match self {
+            Prepared::One {
+                path, file, bytes, ..
+            } => vec![(
+                shown_path(sb, &file.full, path),
+                Some(file.original.as_slice()),
+                Some(bytes.as_slice()),
+            )],
+            Prepared::Patch { steps, .. } => steps.iter().map(|s| s.sides(sb)).collect(),
+        }
+    }
+
+    /// The hash of each file as the pipeline read it (None: it does not exist).
+    fn bases(&self) -> Vec<Base> {
+        match self {
+            Prepared::One { file, .. } => {
+                vec![(file.full.clone(), Some(blake3::hash(&file.original)))]
+            }
+            Prepared::Patch { steps, .. } => steps
+                .iter()
+                .map(|s| (s.full.clone(), s.original.as_deref().map(blake3::hash)))
+                .collect(),
+        }
+    }
+}
+
+/// Parse the call in the active format and run the pipeline up to the commit point.
+async fn prepare(args: &Value, sb: &dyn Sandbox, cx: &ToolCx) -> Result<Prepared, ToolResult> {
+    let bad = |e: ToolError| ToolResult::error_kind(e.to_string(), kind::BAD_ARGS);
+    match cx.edit_format() {
+        EditFormat::StrReplace => {
+            prepare_str_replace(parse_args::<StrReplaceArgs>(args).map_err(bad)?, sb, cx).await
+        }
+        EditFormat::Patch => {
+            prepare_patch(parse_args::<PatchArgs>(args).map_err(bad)?, sb, cx).await
+        }
+        EditFormat::Hashline => {
+            prepare_hashline(parse_args::<HashlineArgs>(args).map_err(bad)?, sb, cx).await
+        }
+    }
+}
+
+/// Write what [`prepare`] worked out and report it, with the diff applied.
+async fn commit(p: Prepared, sb: &dyn Sandbox, cx: &ToolCx) -> ToolResult {
+    let (path, file, edited, bytes, repaired, summary) = match p {
+        Prepared::One {
+            path,
+            file,
+            edited,
+            bytes,
+            repaired,
+            summary,
+        } => (path, file, edited, bytes, repaired, summary),
+        Prepared::Patch { steps, notes } => return commit_patch(steps, notes, sb, cx).await,
+    };
     if cx.cancel().is_cancelled() {
-        return Err(crate::CANCELLED_BEFORE_WRITE.to_string());
+        return ToolResult::error_kind(crate::CANCELLED_BEFORE_WRITE, kind::IO);
     }
     // The requested path, not `file.full`: the sandbox refuses symlinks into protected paths.
-    atomic::preserve_and_write(sb, Path::new(path), &file.original, edited)
-        .await
-        .map_err(|e| format!("{path}: {e}"))?;
-    let post_hash = record_written(
-        sb,
-        cx,
-        &file.full,
-        Some(&file.original),
-        &atomic::restore(&file.original, edited),
-        repaired,
-    )
-    .await;
+    if let Err(e) = sb.write_atomic(Path::new(&path), &bytes, None).await {
+        return ToolResult::error_kind(format!("{path}: {e}"), kind::IO);
+    }
+    let shown = shown_path(sb, &file.full, &path);
+    let diff = display_diff(&[(shown, Some(&file.original), Some(&bytes))]).await;
+    let post_hash =
+        record_written(sb, cx, &file.full, Some(&file.original), &bytes, repaired).await;
     let warning = join_notes([
-        syntax_warning(path, &file.text, edited),
-        reindex(cx, path).await,
+        syntax_warning(&path, &file.text, &edited),
+        reindex(cx, &path).await,
     ]);
-    let effect = AppliedEffect::Edited {
+    let mut output = summary;
+    if let Some(w) = warning {
+        output.push('\n');
+        output.push_str(&w);
+    }
+    let mut r = ToolResult::ok(output);
+    r.applied_diff = Some(diff);
+    r.effects.push(AppliedEffect::Edited {
         path: file.full,
         pre_image: Some(file.original),
         pre_mode: Some(file.meta.mode & 0o7777),
         post_hash,
-    };
-    Ok((effect, warning))
+    });
+    r
 }
 
 #[async_trait]
@@ -435,60 +513,76 @@ impl Tool for EditTool {
     }
 
     async fn run(&self, args: Value, sb: &dyn Sandbox, cx: &ToolCx) -> ToolResult {
-        match cx.edit_format() {
-            EditFormat::StrReplace => match parse_args(&args) {
-                Ok(a) => run_str_replace(a, sb, cx).await,
-                Err(e) => ToolResult::error_kind(e.to_string(), kind::BAD_ARGS),
-            },
-            EditFormat::Patch => match parse_args(&args) {
-                Ok(a) => run_patch(a, sb, cx).await,
-                Err(e) => ToolResult::error_kind(e.to_string(), kind::BAD_ARGS),
-            },
-            EditFormat::Hashline => match parse_args(&args) {
-                Ok(a) => run_hashline(a, sb, cx).await,
-                Err(e) => ToolResult::error_kind(e.to_string(), kind::BAD_ARGS),
-            },
+        let p = match prepare(&args, sb, cx).await {
+            Ok(p) => p,
+            Err(r) => return explain_failure(sb, cx, r).await,
+        };
+        match check_approved(sb, cx, &p.bases()) {
+            Ok(()) => commit(p, sb, cx).await,
+            Err(r) => r,
         }
+    }
+
+    async fn preview(
+        &self,
+        args: &Value,
+        sb: &dyn Sandbox,
+        cx: &ToolCx,
+    ) -> Option<Result<Preview, ToolResult>> {
+        let p = match prepare(args, sb, cx).await {
+            Ok(p) => p,
+            Err(r) => return Some(Err(r)),
+        };
+        let diff = if cx.preview_diff() {
+            display_diff(&p.sides(sb)).await
+        } else {
+            DiffPreview::default()
+        };
+        Some(Ok(Preview {
+            diff,
+            bases: p.bases(),
+        }))
     }
 }
 
-async fn run_str_replace(a: StrReplaceArgs, sb: &dyn Sandbox, cx: &ToolCx) -> ToolResult {
+async fn prepare_str_replace(
+    a: StrReplaceArgs,
+    sb: &dyn Sandbox,
+    cx: &ToolCx,
+) -> Result<Prepared, ToolResult> {
     if a.old_text.is_empty() {
-        return ToolResult::error_kind("old_text must not be empty", kind::BAD_ARGS);
+        return Err(ToolResult::error_kind(
+            "old_text must not be empty",
+            kind::BAD_ARGS,
+        ));
     }
     if a.old_text == a.new_text {
-        return ToolResult::error_kind(
+        return Err(ToolResult::error_kind(
             "old_text and new_text are identical; nothing to change",
             kind::BAD_ARGS,
-        );
+        ));
     }
-    let file = match load_fresh(sb, cx, &a.path, true).await {
-        Ok(f) => f,
-        Err(e) => return e,
-    };
-    let spliced = match str_replace::apply_staged_for(
-        Path::new(&a.path),
-        &file.text,
-        &a.old_text,
-        &a.new_text,
-    ) {
-        Ok(r) => r,
-        Err(e) => {
-            return ToolResult::error_kind(
-                match_error_message(&a.path, "old_text", &e),
-                match_error_kind(&e),
-            );
-        }
-    };
+    let file = load_fresh(sb, cx, &a.path, true).await?;
+    let spliced =
+        str_replace::apply_staged_for(Path::new(&a.path), &file.text, &a.old_text, &a.new_text)
+            .map_err(|e| {
+                ToolResult::error_kind(
+                    match_error_message(&a.path, "old_text", &e),
+                    match_error_kind(&e),
+                )
+            })?;
     let (edited, stage) = (spliced.text, spliced.stage);
     if needs_seen(stage) && !seen_now(cx, &file, spliced.lines) {
-        return ToolResult::error_kind(unseen_repair(&a.path, stage, spliced.lines), kind::STALE);
+        return Err(ToolResult::error_kind(
+            unseen_repair(&a.path, stage, spliced.lines),
+            kind::STALE,
+        ));
     }
     // A symbol-level guess must leave the file parsing at least as well as before. Nothing
     // has been written yet, so rejecting it leaves the pre-image in place.
     if stage == RepairStage::Structural {
         if let Some(errors) = new_error_list(&a.path, &file.text, &edited) {
-            return ToolResult::error_kind(
+            return Err(ToolResult::error_kind(
                 format!(
                     "{}: old_text not found exactly; the symbol it names was matched structurally, \
                  but replacing it would introduce syntax errors at {errors}, so nothing was \
@@ -496,66 +590,65 @@ async fn run_str_replace(a: StrReplaceArgs, sb: &dyn Sandbox, cx: &ToolCx) -> To
                     a.path
                 ),
                 kind::SYNTAX,
-            );
+            ));
         }
     }
-    let repaired = stage != RepairStage::Exact;
-    let (effect, warning) = match write_edited(sb, cx, &a.path, file, &edited, repaired).await {
-        Ok(e) => e,
-        Err(e) => return ToolResult::error_kind(e, kind::IO),
-    };
-    let mut output = format!("edited {}", a.path);
+    let mut summary = format!("edited {}", a.path);
     if stage != RepairStage::Exact {
-        output.push_str(&format!("; applied via {}", stage.describe()));
+        summary.push_str(&format!("; applied via {}", stage.describe()));
     }
-    if let Some(w) = warning {
-        output.push('\n');
-        output.push_str(&w);
-    }
-    let mut r = ToolResult::ok(output);
-    r.effects.push(effect);
-    r
+    let bytes = atomic::restore(&file.original, &edited);
+    Ok(Prepared::One {
+        path: a.path,
+        file,
+        edited,
+        bytes,
+        repaired: stage != RepairStage::Exact,
+        summary,
+    })
 }
 
-async fn run_hashline(a: HashlineArgs, sb: &dyn Sandbox, cx: &ToolCx) -> ToolResult {
+async fn prepare_hashline(
+    a: HashlineArgs,
+    sb: &dyn Sandbox,
+    cx: &ToolCx,
+) -> Result<Prepared, ToolResult> {
     if a.ops.is_empty() {
-        return ToolResult::error_kind("ops must not be empty", kind::BAD_ARGS);
+        return Err(ToolResult::error_kind(
+            "ops must not be empty",
+            kind::BAD_ARGS,
+        ));
     }
     let count = a.ops.len();
-    let ops: Vec<HashlineOp> = match (a.ops.into_iter().enumerate())
+    let ops: Vec<HashlineOp> = (a.ops.into_iter().enumerate())
         .map(|(i, op)| op.into_op(i + 1))
-        .collect()
-    {
-        Ok(ops) => ops,
-        Err(e) => return ToolResult::error_kind(format!("{}: {e}", a.path), kind::BAD_ARGS),
-    };
-    let file = match load_fresh(sb, cx, &a.path, true).await {
-        Ok(f) => f,
-        Err(e) => return e,
-    };
+        .collect::<Result<_, _>>()
+        .map_err(|e| ToolResult::error_kind(format!("{}: {e}", a.path), kind::BAD_ARGS))?;
+    let file = load_fresh(sb, cx, &a.path, true).await?;
     let edited = match hashline::apply(&file.text, &ops) {
         Ok(t) => t,
         Err(e @ (HashlineError::Stale { .. } | HashlineError::OutOfRange { .. })) => {
-            return ToolResult::error_kind(
+            return Err(ToolResult::error_kind(
                 format!("{}: {e}; read the file again to get fresh anchors", a.path),
                 kind::STALE_ANCHOR,
-            );
+            ));
         }
-        Err(e) => return ToolResult::error_kind(format!("{}: {e}", a.path), kind::INVALID_OPS),
+        Err(e) => {
+            return Err(ToolResult::error_kind(
+                format!("{}: {e}", a.path),
+                kind::INVALID_OPS,
+            ));
+        }
     };
-    match write_edited(sb, cx, &a.path, file, &edited, false).await {
-        Ok((effect, warning)) => {
-            let mut output = format!("edited {} ({count} ops)", a.path);
-            if let Some(w) = warning {
-                output.push('\n');
-                output.push_str(&w);
-            }
-            let mut r = ToolResult::ok(output);
-            r.effects.push(effect);
-            r
-        }
-        Err(e) => ToolResult::error_kind(e, kind::IO),
-    }
+    let bytes = atomic::restore(&file.original, &edited);
+    Ok(Prepared::One {
+        summary: format!("edited {} ({count} ops)", a.path),
+        path: a.path,
+        file,
+        edited,
+        bytes,
+        repaired: false,
+    })
 }
 
 /// One file of a validated patch, ready to write.
@@ -596,13 +689,28 @@ impl Step {
             None => sb.remove_file(path).await,
         }
     }
+
+    /// `(root-relative path, before, after)` for the diff.
+    fn sides(&self, sb: &dyn Sandbox) -> FileChange<'_> {
+        let after = match self.op {
+            PatchOp::Delete => None,
+            PatchOp::Update(_) | PatchOp::Add(_) => Some(self.bytes.as_slice()),
+        };
+        (
+            shown_path(sb, &self.full, &self.rel),
+            self.original.as_deref(),
+            after,
+        )
+    }
 }
 
-async fn run_patch(a: PatchArgs, sb: &dyn Sandbox, cx: &ToolCx) -> ToolResult {
-    let touched = match patch::touched(&a.patch) {
-        Ok(t) => t,
-        Err(e) => return ToolResult::error_kind(e.to_string(), patch_error_kind(&e)),
-    };
+async fn prepare_patch(
+    a: PatchArgs,
+    sb: &dyn Sandbox,
+    cx: &ToolCx,
+) -> Result<Prepared, ToolResult> {
+    let touched = patch::touched(&a.patch)
+        .map_err(|e| ToolResult::error_kind(e.to_string(), patch_error_kind(&e)))?;
     // Load and guard every file before looking at any hunk. `texts` holds the content the
     // pure applier sees; added files only need to be known to exist (or not).
     let mut texts: HashMap<PathBuf, String> = HashMap::new();
@@ -611,30 +719,26 @@ async fn run_patch(a: PatchArgs, sb: &dyn Sandbox, cx: &ToolCx) -> ToolResult {
         let rel = t.path.to_string_lossy().into_owned();
         let file = match t.kind {
             Kind::Add => {
-                let full = match sb.resolve(&t.path) {
-                    Ok(p) => p,
-                    Err(e) => return ToolResult::error_kind(e.to_string(), kind::IO),
-                };
+                let full = sb
+                    .resolve(&t.path)
+                    .map_err(|e| ToolResult::error_kind(e.to_string(), kind::IO))?;
                 match sb.metadata(&full).await {
                     Ok(_) => {
                         texts.insert(t.path.clone(), String::new());
                     }
                     Err(SandboxError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(e) => return ToolResult::error_kind(format!("{rel}: {e}"), kind::IO),
+                    Err(e) => {
+                        return Err(ToolResult::error_kind(format!("{rel}: {e}"), kind::IO));
+                    }
                 }
                 loaded.push((full, None));
                 continue;
             }
-            Kind::Update => load_fresh(sb, cx, &rel, true).await,
-            Kind::Delete => load_fresh(sb, cx, &rel, false).await,
+            Kind::Update => load_fresh(sb, cx, &rel, true).await?,
+            Kind::Delete => load_fresh(sb, cx, &rel, false).await?,
         };
-        match file {
-            Ok(f) => {
-                texts.insert(t.path.clone(), f.text.clone());
-                loaded.push((f.full.clone(), Some(f)));
-            }
-            Err(e) => return e,
-        }
+        texts.insert(t.path.clone(), file.text.clone());
+        loaded.push((file.full.clone(), Some(file)));
     }
     // Two spellings of one path would otherwise be written twice.
     if let Some((i, _)) = loaded
@@ -642,19 +746,17 @@ async fn run_patch(a: PatchArgs, sb: &dyn Sandbox, cx: &ToolCx) -> ToolResult {
         .enumerate()
         .find(|(i, (p, _))| loaded[..*i].iter().any(|(q, _)| q == p))
     {
-        return ToolResult::error_kind(
+        return Err(ToolResult::error_kind(
             format!(
                 "{}: appears more than once in the patch",
                 touched[i].path.display()
             ),
             kind::INVALID_PATCH,
-        );
+        ));
     }
 
-    let applied = match patch::apply_staged(&|p| texts.get(p).cloned(), &a.patch) {
-        Ok(v) => v,
-        Err(e) => return ToolResult::error_kind(e.to_string(), patch_error_kind(&e)),
-    };
+    let applied = patch::apply_staged(&|p| texts.get(p).cloned(), &a.patch)
+        .map_err(|e| ToolResult::error_kind(e.to_string(), patch_error_kind(&e)))?;
 
     let mut steps: Vec<Step> = Vec::with_capacity(applied.len());
     let mut notes: Vec<String> = Vec::new();
@@ -664,10 +766,10 @@ async fn run_patch(a: PatchArgs, sb: &dyn Sandbox, cx: &ToolCx) -> ToolResult {
             for r in ap.repairs.iter().filter(|r| needs_seen(r.stage)) {
                 if !seen_now(cx, f, r.lines) {
                     let subject = format!("{rel}: hunk {}", r.hunk);
-                    return ToolResult::error_kind(
+                    return Err(ToolResult::error_kind(
                         unseen_repair(&subject, r.stage, r.lines),
                         kind::STALE,
-                    );
+                    ));
                 }
             }
         }
@@ -706,8 +808,16 @@ async fn run_patch(a: PatchArgs, sb: &dyn Sandbox, cx: &ToolCx) -> ToolResult {
             repaired: !ap.repairs.is_empty(),
         });
     }
+    Ok(Prepared::Patch { steps, notes })
+}
 
-    // All hunks are validated; now write. A failure undoes the files already written.
+/// Write every file of a validated patch; a failure undoes the files already written.
+async fn commit_patch(
+    steps: Vec<Step>,
+    notes: Vec<String>,
+    sb: &dyn Sandbox,
+    cx: &ToolCx,
+) -> ToolResult {
     if cx.cancel().is_cancelled() {
         return ToolResult::error(crate::CANCELLED_BEFORE_WRITE);
     }
@@ -734,6 +844,8 @@ async fn run_patch(a: PatchArgs, sb: &dyn Sandbox, cx: &ToolCx) -> ToolResult {
         }
         return ToolResult::error_kind(msg, kind::IO);
     }
+    let sides: Vec<_> = steps.iter().map(|s| s.sides(sb)).collect();
+    let diff = display_diff(&sides).await;
 
     let mut lines = Vec::with_capacity(steps.len() + notes.len());
     let mut warnings = Vec::new();
@@ -783,6 +895,7 @@ async fn run_patch(a: PatchArgs, sb: &dyn Sandbox, cx: &ToolCx) -> ToolResult {
     lines.extend(warnings);
     let mut r = ToolResult::ok(lines.join("\n"));
     r.effects = effects;
+    r.applied_diff = Some(diff);
     r
 }
 

@@ -508,6 +508,7 @@ impl Actor {
     async fn idle_command(&self, session: &mut Session, cmd: Command) {
         match cmd {
             Command::Pin { .. } | Command::Unpin { .. } => session.context_command(cmd).await,
+            Command::Diff { turn } => session.diff(turn).await,
             other => {
                 let name = serde_json::to_value(&other)
                     .ok()

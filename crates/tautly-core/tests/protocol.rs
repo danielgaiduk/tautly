@@ -4,8 +4,8 @@ use std::time::{Duration, UNIX_EPOCH};
 use serde_json::json;
 use tautly_context::{Breakdown, ContextStatus, MutationReason};
 use tautly_core::{
-    BudgetScope, Command, EffectView, ErrorKind, Event, FinishReason, MemAnchor, MemoryChange,
-    PROTOCOL_VERSION, ToolMetaView, UsageRole,
+    BudgetScope, Command, DiffFile, DiffPreview, DiffStatus, EffectView, ErrorKind, Event,
+    FinishReason, MemAnchor, MemoryChange, PROTOCOL_VERSION, ToolMetaView, UsageRole,
 };
 use tautly_memory::{MemoryEntry, MemoryKind};
 use tautly_provider::Quota;
@@ -53,6 +53,7 @@ fn every_event() -> Vec<Event> {
             tool: "bash".into(),
             args: json!({"command": "cargo test"}),
             reason: "commands need approval in ask mode".into(),
+            diff: None,
         },
         Event::ToolStarted {
             call_id: "call_1".into(),
@@ -91,6 +92,11 @@ fn every_event() -> Vec<Event> {
                 exit_code: Some(1),
                 error_kind: Some("stale".into()),
             },
+            diff: Some(DiffPreview {
+                unified: "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1 @@\n-a\n+b\n".into(),
+                lines: 5,
+                truncated: false,
+            }),
         },
         Event::Usage {
             role: UsageRole::Side,
@@ -144,6 +150,25 @@ fn every_event() -> Vec<Event> {
             retryable: true,
             hint: Some("retrying in 2s".into()),
         },
+        Event::SessionDiff {
+            turn: Some(2),
+            files: vec![
+                DiffFile {
+                    path: "src/lib.rs".into(),
+                    status: DiffStatus::Modified,
+                    added: 1,
+                    removed: 1,
+                },
+                DiffFile {
+                    path: "new.txt".into(),
+                    status: DiffStatus::Added,
+                    added: 1,
+                    removed: 0,
+                },
+            ],
+            unified: "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1 @@\n-a\n+b\n".into(),
+            truncated: false,
+        },
         Event::Warning {
             message: "non-UTF-8 path not tracked".into(),
         },
@@ -166,6 +191,7 @@ fn every_event() -> Vec<Event> {
             | Event::SessionChanged { .. }
             | Event::TurnFinished { .. }
             | Event::Error { .. }
+            | Event::SessionDiff { .. }
             | Event::Warning { .. }
             | Event::Unknown => {}
         }
@@ -216,6 +242,8 @@ fn every_command() -> Vec<Command> {
         },
         Command::ConsolidateMemory,
         Command::Fork,
+        Command::Diff { turn: None },
+        Command::Diff { turn: Some(3) },
         Command::Shutdown,
     ];
     for c in &commands {
@@ -233,6 +261,7 @@ fn every_command() -> Vec<Command> {
             | Command::RejectMemory { .. }
             | Command::ConsolidateMemory
             | Command::Fork
+            | Command::Diff { .. }
             | Command::Shutdown => {}
         }
     }
@@ -424,6 +453,7 @@ fn non_utf8_path_serializes_lossily_instead_of_failing() {
             EffectView::Deleted { path },
         ],
         meta: ToolMetaView::default(),
+        diff: None,
     };
     let v = serde_json::to_value(&event).unwrap();
     assert_eq!(v["effects"][0]["path"], "/tmp/caf\u{fffd}/\u{fffd}.txt");

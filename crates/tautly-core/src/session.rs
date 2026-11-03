@@ -219,6 +219,11 @@ impl Log {
         Self::fail(&mut g, r)
     }
 
+    /// The log file.
+    pub fn path(&self) -> PathBuf {
+        self.lock().writer.path().to_path_buf()
+    }
+
     /// Flush and fsync (tool and turn boundaries).
     pub fn checkpoint(&self) -> Result<(), LogFailure> {
         let mut g = self.lock();
