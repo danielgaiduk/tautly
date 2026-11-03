@@ -53,6 +53,10 @@ pub enum ContextOp {
     Remember(MemoryDraft),
 }
 
+/// Longest pin text, in bytes (trimmed). A pin is a short constraint or fact that every
+/// request carries; file content or long notes belong elsewhere.
+pub const MAX_PIN_BYTES: usize = 2 * 1024;
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PinArgs {
@@ -61,8 +65,15 @@ struct PinArgs {
 
 fn parse_pin(args: &Value) -> Result<String, ToolError> {
     let a: PinArgs = parse_args(args)?;
-    if a.text.trim().is_empty() {
+    let len = a.text.trim().len();
+    if len == 0 {
         return Err(ToolError::BadArgs("text must not be empty".into()));
+    }
+    if len > MAX_PIN_BYTES {
+        return Err(ToolError::BadArgs(format!(
+            "text is {len} bytes; a pin holds at most {MAX_PIN_BYTES} bytes (2 KB). \
+             Pin a short constraint or fact, not file content."
+        )));
     }
     Ok(a.text)
 }
@@ -93,7 +104,7 @@ impl Tool for PinTool {
         tool_spec(
             "pin",
             "Pin a constraint or fact that must stay in context for the rest of the session; \
-             pinned text is never summarized or dropped. Keep it short and use it sparingly.",
+             pinned text is never summarized or dropped. Keep it short (at most 2 KB) and use it sparingly.",
             json!({
                 "type": "object",
                 "properties": {

@@ -49,6 +49,7 @@ impl Context {
             .sum();
 
         let pinned_text = pinned::render(&self.pinned);
+        let session_pins_text = pinned::render_session(&self.session_pins);
         let state_text = self.state.render(self.root.as_deref(), est);
         let tokens_of = |t: &Option<String>| t.as_deref().map_or(0, |t| est.estimate(t));
 
@@ -78,16 +79,22 @@ impl Context {
         }
 
         // The working state changes on almost every tool call, so it is a tail block after the
-        // last message, built fresh for each request. It is always its own user message: the
+        // last message, built fresh for each request, led by the pins added this session
+        // (folded into `<pinned>` only at a cache epoch). It is always its own user message: the
         // last cache breakpoint marks the final content block of its message, and appending
         // to a user message (tool results) would put the volatile state inside the cached
         // prefix. That leaves two user messages in a row; Anthropic merges them server-side
         // and the Google and compat adapters merge same-role messages themselves.
         let cached_len = messages.len();
-        if let Some(state) = &state_text {
+        let tail: Vec<Content> = [&session_pins_text, &state_text]
+            .into_iter()
+            .flatten()
+            .map(|t| Content::Text(t.clone()))
+            .collect();
+        if !tail.is_empty() {
             messages.push(Message {
                 role: Role::User,
-                content: vec![Content::Text(state.clone())],
+                content: tail,
             });
         }
 
@@ -119,7 +126,7 @@ impl Context {
             agents_md: est.estimate(&agents_text),
             memory: est.estimate(&memory_text),
             repo_map: est.estimate(&repo_map_text),
-            pinned: tokens_of(&pinned_text),
+            pinned: tokens_of(&pinned_text) + tokens_of(&session_pins_text),
             state: tokens_of(&state_text),
             history: history_tokens,
         };
@@ -129,7 +136,7 @@ impl Context {
         let cached_prefix = if caps.cache == CacheStyle::None {
             0
         } else {
-            used - breakdown.state
+            used - breakdown.state - tokens_of(&session_pins_text)
         };
 
         let mut warnings = self.load_warnings.clone();

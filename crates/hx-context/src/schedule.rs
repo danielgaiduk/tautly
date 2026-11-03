@@ -4,7 +4,9 @@
 //! which says whether a mutation is worth it right now and why.
 //!
 //! The engine decides once at turn start and applies everything it decided together, one
-//! "cache epoch", so the prefix breaks at most once.
+//! "cache epoch", so the prefix breaks at most once. Folding the session's new pins into
+//! `<pinned>` ([`Context::fold_session_pins`](crate::Context::fold_session_pins)) rides on
+//! the same epoch.
 
 use std::time::{Duration, Instant};
 

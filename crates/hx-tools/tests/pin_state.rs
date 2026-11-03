@@ -1,8 +1,8 @@
 use hx_provider::EditFormat;
 use hx_sandbox::{Effect, LocalSandbox};
 use hx_tools::{
-    ContextOp, PinTool, PlanStep, StatePatch, StateTool, StepStatus, Tool, ToolCx, ToolResult,
-    parse_context_op,
+    ContextOp, MAX_PIN_BYTES, PinTool, PlanStep, StatePatch, StateTool, StepStatus, Tool, ToolCx,
+    ToolResult, parse_context_op,
 };
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -137,4 +137,20 @@ fn effects_are_read_only_and_specs_are_strict() {
         assert_eq!(s.name, t.name());
         assert_eq!(s.schema["additionalProperties"], json!(false));
     }
+}
+
+#[tokio::test]
+async fn pin_over_2_kb_is_refused_with_a_clear_error() {
+    let big = "x".repeat(MAX_PIN_BYTES + 1);
+    assert_eq!(parse_context_op("pin", &json!({"text": big})), None);
+    let r = run(&PinTool, json!({"text": big})).await;
+    assert!(r.is_error);
+    assert!(r.output.contains("2048"), "{}", r.output);
+    assert!(r.output.contains("2049"), "{}", r.output);
+    // Exactly the limit is fine.
+    let ok = "y".repeat(MAX_PIN_BYTES);
+    assert_eq!(
+        parse_context_op("pin", &json!({"text": ok})),
+        Some(ContextOp::Pin(ok.clone()))
+    );
 }

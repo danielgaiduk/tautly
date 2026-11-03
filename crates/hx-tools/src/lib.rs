@@ -39,7 +39,8 @@ pub use grep::GrepTool;
 pub use index_tools::{OutlineTool, RefsTool, SymbolTool};
 pub use memory_tools::{RecallTool, RememberTool};
 pub use pin_state::{
-    ContextOp, PinTool, PlanStep, StatePatch, StateTool, StepStatus, parse_context_op,
+    ContextOp, MAX_PIN_BYTES, PinTool, PlanStep, StatePatch, StateTool, StepStatus,
+    parse_context_op,
 };
 pub use read::ReadTool;
 pub use web_fetch::WebFetchTool;

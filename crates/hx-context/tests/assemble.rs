@@ -74,11 +74,13 @@ fn tail_text(req: &hx_provider::CanonicalRequest) -> &str {
 #[test]
 fn block_order_is_system_tools_agents_memory_pinned_history_state() {
     let mut c = ctx();
-    c.apply_op(ContextOp::Pin("never drop tables".into()));
+    c.pinned
+        .push(Pinned::new("never drop tables", PinSource::User));
     c.apply_op(ContextOp::StateUpdate(StatePatch {
         decisions_add: vec!["use sqlite".into()],
         ..Default::default()
-    }));
+    }))
+    .unwrap();
     c.history.push(turn("do the thing"));
     let (req, _) = c.assemble(&caps(), &tools(), &m());
 
@@ -115,7 +117,7 @@ fn stable_prefix_is_byte_identical_across_turns() {
     let mut c = ctx();
     let (a, _) = c.assemble(&caps(), &tools(), &m());
     c.history.push(turn("hi"));
-    c.apply_op(ContextOp::Pin("x".into()));
+    c.apply_op(ContextOp::Pin("x".into())).unwrap();
     let (b, _) = c.assemble(&caps(), &tools(), &m());
     assert_eq!(
         serde_json::to_vec(&a.system[..STABLE_LEN]).unwrap(),
@@ -219,7 +221,7 @@ fn system_prompt_has_no_volatile_text() {
 #[test]
 fn breakdown_sums_to_used() {
     let mut c = ctx();
-    c.apply_op(ContextOp::Pin("pin me".into()));
+    c.apply_op(ContextOp::Pin("pin me".into())).unwrap();
     c.state.task = Some("fix bug".into());
     c.history.push(turn("a fairly long user message to count"));
     let (_, st) = c.assemble(&caps(), &tools(), &m());
@@ -277,7 +279,7 @@ fn pinned_over_10_percent_warns() {
     let mut c = Context::default();
     let mut small = caps();
     small.context_window = 1_000;
-    c.apply_op(ContextOp::Pin("y".repeat(600))); // ~150 tokens: 15% of the window
+    c.apply_op(ContextOp::Pin("y".repeat(600))).unwrap(); // ~150 tokens: 15% of the window
     let (_, st) = c.assemble(&small, &[], &m());
     assert!(
         st.warnings.iter().any(|w| w.contains("pinned")),
@@ -285,7 +287,7 @@ fn pinned_over_10_percent_warns() {
         st.warnings
     );
     let mut ok = Context::default();
-    ok.apply_op(ContextOp::Pin("short".into()));
+    ok.apply_op(ContextOp::Pin("short".into())).unwrap();
     let (_, st) = ok.assemble(&caps(), &[], &m());
     assert!(st.warnings.is_empty(), "{:?}", st.warnings);
 }
@@ -317,15 +319,19 @@ fn read_effect(path: &str, hash: &[u8], shown: Shown) -> AppliedEffect {
 fn files_list_comes_from_effects_not_model() {
     let mut c = Context::default();
     // A model-driven state patch cannot touch the files list.
-    c.apply_op(ContextOp::StateUpdate(StatePatch::default()));
+    c.apply_op(ContextOp::StateUpdate(StatePatch::default()))
+        .unwrap();
     assert!(c.state.files.is_empty());
 
-    c.apply_effects(&[AppliedEffect::Edited {
-        path: "/p/a.rs".into(),
-        pre_image: None,
-        pre_mode: None,
-        post_hash: blake3::hash(b"new"),
-    }]);
+    c.apply_effects(
+        &[AppliedEffect::Edited {
+            path: "/p/a.rs".into(),
+            pre_image: None,
+            pre_mode: None,
+            post_hash: blake3::hash(b"new"),
+        }],
+        1,
+    );
     let note = &c.state.files[&PathBuf::from("/p/a.rs")];
     assert!(note.edited);
     assert!(!note.deleted);
@@ -348,7 +354,7 @@ fn read_effect_records_hash_for_any_shown_variant() {
     .enumerate()
     {
         let path = format!("/p/f{i}.rs");
-        c.apply_effects(&[read_effect(&path, path.as_bytes(), shown)]);
+        c.apply_effects(&[read_effect(&path, path.as_bytes(), shown)], 1);
         let note = &c.state.files[&PathBuf::from(&path)];
         assert_eq!(
             note.read_hash,
@@ -361,27 +367,33 @@ fn read_effect_records_hash_for_any_shown_variant() {
 #[test]
 fn delete_clears_edited_and_marks_deleted_and_exec_is_ignored() {
     let mut c = Context::default();
-    c.apply_effects(&[AppliedEffect::Edited {
-        path: "/p/a.rs".into(),
-        pre_image: None,
-        pre_mode: None,
-        post_hash: blake3::hash(b"x"),
-    }]);
-    c.apply_effects(&[
-        AppliedEffect::Exec { may_write: true },
-        AppliedEffect::Deleted {
+    c.apply_effects(
+        &[AppliedEffect::Edited {
             path: "/p/a.rs".into(),
-            pre_image: b"x".to_vec(),
-            pre_mode: 0o644,
-        },
-    ]);
+            pre_image: None,
+            pre_mode: None,
+            post_hash: blake3::hash(b"x"),
+        }],
+        1,
+    );
+    c.apply_effects(
+        &[
+            AppliedEffect::Exec { may_write: true },
+            AppliedEffect::Deleted {
+                path: "/p/a.rs".into(),
+                pre_image: b"x".to_vec(),
+                pre_mode: 0o644,
+            },
+        ],
+        1,
+    );
     assert_eq!(c.state.files.len(), 1);
     let note = &c.state.files[&PathBuf::from("/p/a.rs")];
     assert!(!note.edited);
     assert!(note.deleted);
     assert_eq!(note.read_hash, None);
     // Reading it again (recreated) clears the deleted mark.
-    c.apply_effects(&[read_effect("/p/a.rs", b"y", Shown::Full)]);
+    c.apply_effects(&[read_effect("/p/a.rs", b"y", Shown::Full)], 1);
     assert!(!c.state.files[&PathBuf::from("/p/a.rs")].deleted);
 }
 
@@ -391,14 +403,17 @@ fn files_render_root_relative() {
         root: Some("/p".into()),
         ..Default::default()
     };
-    c.apply_effects(&[
-        read_effect("/p/src/a.rs", b"a", Shown::Full),
-        AppliedEffect::Deleted {
-            path: "/p/old.rs".into(),
-            pre_image: vec![],
-            pre_mode: 0o644,
-        },
-    ]);
+    c.apply_effects(
+        &[
+            read_effect("/p/src/a.rs", b"a", Shown::Full),
+            AppliedEffect::Deleted {
+                path: "/p/old.rs".into(),
+                pre_image: vec![],
+                pre_mode: 0o644,
+            },
+        ],
+        1,
+    );
     let (req, _) = c.assemble(&caps(), &[], &m());
     let t = tail_text(&req);
     assert!(t.contains("src/a.rs"), "{t}");
@@ -417,12 +432,14 @@ fn state_patch_updates_plan_decisions_questions() {
         decisions_add: vec!["d1".into()],
         questions_add: vec!["q0".into(), "q1".into(), "q2".into()],
         ..Default::default()
-    }));
+    }))
+    .unwrap();
     c.apply_op(ContextOp::StateUpdate(StatePatch {
         questions_resolve: vec![1, 1, 9],
         decisions_add: vec!["d1".into(), "d2".into()],
         ..Default::default()
-    }));
+    }))
+    .unwrap();
     assert_eq!(c.state.plan.len(), 1);
     assert_eq!(c.state.questions, ["q0", "q2"]);
     assert_eq!(c.state.decisions, ["d1", "d2"]);
@@ -433,10 +450,12 @@ fn state_patch_updates_plan_decisions_questions() {
 #[test]
 fn model_pin_is_recorded_once() {
     let mut c = Context::default();
-    c.apply_op(ContextOp::Pin("same".into()));
-    c.apply_op(ContextOp::Pin("same".into()));
-    assert_eq!(c.pinned.len(), 1);
-    assert_eq!(c.pinned[0].source, PinSource::Model);
+    c.apply_op(ContextOp::Pin("same".into())).unwrap();
+    c.apply_op(ContextOp::Pin("same".into())).unwrap();
+    // Mid-session pins wait in the session list until the next cache epoch.
+    assert!(c.pinned.is_empty());
+    assert_eq!(c.session_pins.len(), 1);
+    assert_eq!(c.session_pins[0].source, PinSource::Model);
 }
 
 #[test]
@@ -527,7 +546,7 @@ fn edited_effect(path: &str, body: &[u8]) -> AppliedEffect {
 /// A context with pinned items and a history ending in a user tool-result message.
 fn ctx_with_history() -> Context {
     let mut c = ctx();
-    c.apply_op(ContextOp::Pin("keep me".into()));
+    c.pinned.push(Pinned::new("keep me", PinSource::User));
     c.history.push(turn("start"));
     c.history.push(Turn {
         messages: vec![
@@ -555,7 +574,7 @@ fn ctx_with_history() -> Context {
 #[test]
 fn state_tail_follows_last_history_message() {
     let mut c = ctx_with_history();
-    c.apply_effects(&[edited_effect("/p/a.rs", b"1")]);
+    c.apply_effects(&[edited_effect("/p/a.rs", b"1")], 1);
     let (req, _) = c.assemble(&caps(), &tools(), &m());
     // 3 history messages, then the state tail as its own final user message; the history
     // message before it is untouched.
@@ -592,12 +611,15 @@ fn state_tail_follows_last_history_message() {
 #[test]
 fn state_change_keeps_history_prefix_byte_identical() {
     let mut c = ctx_with_history();
-    c.apply_effects(&[edited_effect("/p/a.rs", b"1")]);
+    c.apply_effects(&[edited_effect("/p/a.rs", b"1")], 1);
     let (a, _) = c.assemble(&caps(), &tools(), &m());
-    c.apply_effects(&[
-        read_effect("/p/b.rs", b"b", Shown::Full),
-        edited_effect("/p/a.rs", b"2"),
-    ]);
+    c.apply_effects(
+        &[
+            read_effect("/p/b.rs", b"b", Shown::Full),
+            edited_effect("/p/a.rs", b"2"),
+        ],
+        1,
+    );
     c.state.task = Some("a different task".into());
     let (b, _) = c.assemble(&caps(), &tools(), &m());
 
@@ -618,7 +640,7 @@ fn state_change_keeps_history_prefix_byte_identical() {
 #[test]
 fn cache_breakpoint_precedes_state_tail() {
     let mut c = ctx_with_history();
-    c.apply_effects(&[edited_effect("/p/a.rs", b"1")]);
+    c.apply_effects(&[edited_effect("/p/a.rs", b"1")], 1);
     let (req, _) = c.assemble(&caps(), &tools(), &m());
     assert_eq!(req.messages.len(), 4);
     assert_eq!(
@@ -902,19 +924,22 @@ fn cached_prefix_is_everything_before_the_state_tail() {
 #[test]
 fn exec_that_may_write_marks_every_file_maybe_stale_until_reread() {
     let mut c = Context::default();
-    c.apply_effects(&[
-        read_effect("/p/a.rs", b"a", Shown::Full),
-        read_effect("/p/b.rs", b"b", Shown::Full),
-    ]);
-    c.apply_effects(&[AppliedEffect::Exec { may_write: false }]);
+    c.apply_effects(
+        &[
+            read_effect("/p/a.rs", b"a", Shown::Full),
+            read_effect("/p/b.rs", b"b", Shown::Full),
+        ],
+        1,
+    );
+    c.apply_effects(&[AppliedEffect::Exec { may_write: false }], 1);
     assert!(c.state.files.values().all(|n| !n.maybe_stale));
-    c.apply_effects(&[AppliedEffect::Exec { may_write: true }]);
+    c.apply_effects(&[AppliedEffect::Exec { may_write: true }], 1);
     assert!(c.state.files.values().all(|n| n.maybe_stale));
-    c.apply_effects(&[read_effect("/p/a.rs", b"a2", Shown::Full)]);
-    c.apply_effects(&[edited_effect("/p/b.rs", b"b2")]);
+    c.apply_effects(&[read_effect("/p/a.rs", b"a2", Shown::Full)], 1);
+    c.apply_effects(&[edited_effect("/p/b.rs", b"b2")], 1);
     assert!(c.state.files.values().all(|n| !n.maybe_stale));
 
-    c.apply_effects(&[AppliedEffect::Exec { may_write: true }]);
+    c.apply_effects(&[AppliedEffect::Exec { may_write: true }], 1);
     let (req, _) = c.assemble(&caps(), &[], &m());
     let t = tail_text(&req);
     assert_eq!(t.matches("maybe stale").count(), 2, "{t}");

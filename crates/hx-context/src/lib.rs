@@ -24,7 +24,7 @@ pub use assemble::STABLE_LEN;
 pub use blocks::{Breakdown, ContextStatus, ReasoningWire, Turn};
 pub use compact::{CompactError, CompactionRecord, UncompactError};
 pub use gc::{GcRecord, ReadTarget, ResultMeta};
-pub use pinned::{PinSource, Pinned};
+pub use pinned::{PinError, PinSource, Pinned};
 pub use schedule::{CacheClock, MutationReason};
 pub use state::{FileNote, WorkingState};
 pub use tokens::TokenEstimator;
@@ -54,6 +54,11 @@ pub struct Context {
     pub results: Vec<ResultMeta>,
     /// When the provider last saw the prefix, see [`Context::note_request`].
     pub clock: CacheClock,
+    /// Pins added after session start ([`Context::pin`], the model's `pin` calls). They
+    /// travel in the uncached state tail as `<pinned_this_session>`, so a pin never
+    /// rewrites the cached history, until the engine folds them into `pinned` at the next
+    /// cache epoch ([`Context::fold_session_pins`]).
+    pub session_pins: Vec<Pinned>,
     /// Problems found while loading the session's inputs (an AGENTS.md that was truncated
     /// or refused), repeated in the warnings of every [`ContextStatus`].
     pub load_warnings: Vec<String>,
@@ -74,6 +79,7 @@ impl Default for Context {
             results: Vec::new(),
             clock: CacheClock::default(),
             load_warnings: Vec::new(),
+            session_pins: Vec::new(),
         }
     }
 }
@@ -91,8 +97,8 @@ impl Context {
 
     /// Record what tools actually did to files. The files list is maintained from these
     /// effects only, never from what the model says.
-    pub fn apply_effects(&mut self, effects: &[AppliedEffect]) {
-        self.state.apply_effects(effects);
+    pub fn apply_effects(&mut self, effects: &[AppliedEffect], turn: u32) {
+        self.state.apply_effects(effects, turn);
     }
 
     /// Calibrate token estimation after a request: `status` is what [`assemble`](Self::assemble)
@@ -143,15 +149,60 @@ impl Context {
         };
     }
 
-    /// Apply a `pin` or `state` tool call. A `remember` proposal changes nothing here: the
+    /// Apply a `pin` or `state` tool call. A pin becomes a session pin ([`Context::pin`]);
+    /// an oversize or empty one is refused. A `remember` proposal changes nothing here: the
     /// engine takes it to the user (`MemoryProposed`) and the memory store, not the context.
-    pub fn apply_op(&mut self, op: ContextOp) {
+    pub fn apply_op(&mut self, op: ContextOp) -> Result<(), PinError> {
         match op {
             ContextOp::Pin(text) => {
-                pinned::add(&mut self.pinned, Pinned::new(text, PinSource::Model))
+                self.pin(text, PinSource::Model)?;
             }
             ContextOp::StateUpdate(patch) => self.state.apply_patch(patch),
             ContextOp::Remember(_) => {}
         }
+        Ok(())
+    }
+
+    /// Pin `text` mid-session: it joins [`session_pins`](Self::session_pins) and is shown
+    /// in the state tail until the next cache epoch. False when the same text is already
+    /// pinned. Refused when empty or over [`pinned::MAX_PIN_BYTES`] (trimmed); the `pin`
+    /// tool refuses the same, so the model gets the error as its tool result. Session-start
+    /// pins (config, AGENTS.md, the user's startup pins) go into `pinned` directly.
+    pub fn pin(&mut self, text: impl Into<String>, source: PinSource) -> Result<bool, PinError> {
+        let text = text.into();
+        let bytes = text.trim().len();
+        if bytes == 0 {
+            return Err(PinError::Empty);
+        }
+        if bytes > pinned::MAX_PIN_BYTES {
+            return Err(PinError::TooLong {
+                bytes,
+                max: pinned::MAX_PIN_BYTES,
+            });
+        }
+        if self
+            .pinned
+            .iter()
+            .chain(&self.session_pins)
+            .any(|p| p.text == text)
+        {
+            return Ok(false);
+        }
+        self.session_pins.push(Pinned::new(text, source));
+        Ok(true)
+    }
+
+    /// Move the session pins into `pinned`, where they become part of the cached prefix.
+    /// That rewrites the first message and so the whole cached history: the engine calls
+    /// this only when it applies a cache epoch anyway (a collection or compaction the
+    /// scheduler allowed, or a cold cache), never on its own. True when anything moved.
+    pub fn fold_session_pins(&mut self) -> bool {
+        if self.session_pins.is_empty() {
+            return false;
+        }
+        for pin in std::mem::take(&mut self.session_pins) {
+            pinned::add(&mut self.pinned, pin);
+        }
+        true
     }
 }

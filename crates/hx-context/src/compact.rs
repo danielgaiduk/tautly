@@ -346,7 +346,8 @@ impl Context {
         let tagged = |tag: &str, text: &Option<String>| {
             est.estimate(&assemble::tagged(tag, text.as_deref()))
         };
-        let pinned = pinned::render(&self.pinned).map_or(0, |t| est.estimate(&t));
+        let pinned = pinned::render(&self.pinned).map_or(0, |t| est.estimate(&t))
+            + pinned::render_session(&self.session_pins).map_or(0, |t| est.estimate(&t));
         let state = self
             .state
             .render(self.root.as_deref(), est)

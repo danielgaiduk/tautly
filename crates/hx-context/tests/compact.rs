@@ -1000,7 +1000,7 @@ impl Steps {
         });
         self.c
             .push_tool_result(&id, tool.name(), &args, &r.effects, false, turn);
-        self.c.apply_effects(&r.effects);
+        self.c.apply_effects(&r.effects, turn);
         r.output
     }
 }
