@@ -127,18 +127,15 @@ impl Summary {
 /// The filter for the command that produced the output, if any. The last command
 /// of the line must be the tool (anything after it, such as a pipe into `tail` or a
 /// trailing `echo`, changes what the output is). Without knowing the separators
-/// every earlier command must be a harmless prefix (`cd`, `export`, ...) or the same
-/// kind of tool: another command's output would go through this tool's parser, and a
-/// failure of its own (`ruff check .; pytest`) could be hidden. See [`detect_command`].
+/// every earlier command must be a harmless prefix (`cd`, `export`, ...); any earlier
+/// tool, even of the same kind, may have failed where the last one passed
+/// (`pytest a; pytest b`). See [`detect_command`] for `&&` chains.
 pub fn detect(cmds: &[SimpleCommand]) -> Option<FilterKind> {
     let (last, before) = cmds.split_last()?;
     let kind = tool_kind(&last.argv)?;
     before
         .iter()
-        .all(|c| match tool_kind(&c.argv) {
-            Some(k) => k == kind,
-            None => is_harmless(&c.argv),
-        })
+        .all(|c| tool_kind(&c.argv).is_none() && is_harmless(&c.argv))
         .then_some(kind)
 }
 
@@ -154,7 +151,7 @@ fn is_harmless(argv: &[String]) -> bool {
 /// Like [`detect`], for a command line: when every separator between the commands is
 /// `&&`, an earlier command that fails stops the line, so it cannot hide behind the
 /// tool; with any other separator (`;`, `||`, `|`, `&`, newline) every earlier
-/// command must be a harmless prefix (`cd`, `export`, ...) or the same tool.
+/// command must be a harmless prefix (`cd`, `export`, ...).
 pub fn detect_command(src: &str) -> Option<FilterKind> {
     let cmds = parse_commands(src).ok()?;
     if !only_and_separators(src) {
@@ -222,11 +219,15 @@ pub fn has_unparsed_crash(output: &str, summary: &Summary) -> bool {
         "FATAL ERROR",
         "Debug Failure",
         "INTERNALERROR",
+        "Fatal Python error",
+        "Segmentation fault",
+        "RangeError: Maximum call stack",
     ];
     output.lines().any(|line| {
         let line = line.trim();
         let crash = MARKERS.iter().any(|m| line.contains(m))
-            || line.starts_with("!!! ")
+            // pytest's banners (`!!!!! KeyboardInterrupt !!!!!`, `!!! stopping ... !!!`).
+            || re!(r"^!{3,}\s*\S").is_match(line)
             || line.starts_with("panic:");
         crash
             && !summary.items.iter().any(|i| {

@@ -25,7 +25,13 @@ const GOTEST_FAIL: &str = include_str!("fixtures/filters/gotest_fail.txt");
 const TSC_ERR: &str = include_str!("fixtures/filters/tsc_err.txt");
 const ESLINT_ERR: &str = include_str!("fixtures/filters/eslint_err.txt");
 
+/// The production path (`bash` uses `detect_command`).
 fn kind(cmd: &str) -> Option<FilterKind> {
+    detect_command(cmd)
+}
+
+/// `detect` alone, which cannot see operators and so allows only harmless prefixes.
+fn kind_strict(cmd: &str) -> Option<FilterKind> {
     detect(&parse_commands(cmd).unwrap_or_else(|e| panic!("{cmd}: {e}")))
 }
 
@@ -742,10 +748,19 @@ fn detect_requires_harmless_prefixes_around_other_separators() {
         ("ruff check . & pytest", None),
         ("cd web; npx jest", Some(Jest)),
         ("export CI=1; pytest", Some(Pytest)),
-        ("cargo test; cargo clippy", Some(Cargo)),
-        ("cargo test && cargo clippy", Some(Cargo)),
+        // An earlier run of a tool can fail where the last one passes.
+        ("pytest a; pytest b", None),
+        ("pytest a || pytest b", None),
+        ("cargo test; cargo clippy", None),
+        // Separators are invisible here, so no earlier tool is allowed at all.
+        ("cargo test && cargo clippy", None),
+        ("cd web && npx jest", Some(Jest)),
     ];
     for (cmd, want) in cases {
+        assert_eq!(kind_strict(cmd), *want, "{cmd}");
+        if *cmd == "cargo test && cargo clippy" {
+            continue;
+        }
         assert_eq!(kind(cmd), *want, "{cmd}");
     }
 }
@@ -770,6 +785,10 @@ fn detect_command_allows_any_prefix_only_with_and_chains() {
         ("cargo test 2>&1 | tail", None),
         ("cd web; npx jest", Some(Jest)),
         ("cargo test", Some(Cargo)),
+        ("pytest a && pytest b", Some(Pytest)),
+        ("pytest a; pytest b", None),
+        ("pytest a || pytest b", None),
+        ("cargo test; cargo clippy", None),
     ];
     for (cmd, want) in cases {
         assert_eq!(detect_command(cmd), *want, "{cmd}");
@@ -819,4 +838,39 @@ async fn failing_unrecognized_command_before_the_tool_is_not_hidden() {
     );
     let (_d, r) = run(PYTEST_FAIL, &cmd, None).await;
     assert!(r.output.contains("pytest summary:"), "{}", r.output);
+}
+
+const CARGO_RUNNING: &str = include_str!("fixtures/filters/cargo_running.txt");
+
+#[test]
+fn captured_output_that_looks_like_a_running_line_does_not_split_a_binary() {
+    let s = apply(FilterKind::Cargo, CARGO_RUNNING).expect("parsed");
+    assert_eq!(counts(&s), (Some(0), 2, 0, 0), "{s:?}");
+    assert_eq!(s.items.len(), 2, "{:?}", s.items);
+    assert_eq!(first(&s).name, "a");
+    assert_eq!(first(&s).location.as_deref(), Some("src/lib.rs:9:5"));
+    assert_eq!(first(&s).message, "real cause of a");
+    // Cargo's own headers still end a binary.
+    let two = "     Running unittests src/lib.rs (target/debug/deps/x-1)\n\n---- t stdout ----\nthread 't' panicked at a.rs:1:1:\nfirst\n\nfailures:\n    t\n\nerror: test failed, to rerun pass `--lib`\n     Running tests/b.rs (target/debug/deps/b-2)\n\n---- t stdout ----\nthread 't' panicked at b.rs:2:2:\nsecond\n\nfailures:\n    t\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n";
+    let s = apply(FilterKind::Cargo, two).expect("parsed");
+    let msgs: Vec<&str> = s.items.iter().map(|i| i.message.as_str()).collect();
+    assert_eq!(msgs, ["first", "second"]);
+}
+
+#[test]
+fn more_crash_markers_are_recognized() {
+    let summary = apply(FilterKind::Pytest, PYTEST_QUIET_FAIL).unwrap();
+    for marker in [
+        "!!!!!!!!!!!!!!!!!!!! KeyboardInterrupt !!!!!!!!!!!!!!!!!!!!",
+        "!!! stopping after 1 failures !!!",
+        "Fatal Python error: Segmentation fault",
+        "Segmentation fault (core dumped)",
+        "RangeError: Maximum call stack size exceeded",
+    ] {
+        let out = format!("{PYTEST_QUIET_FAIL}{marker}\n");
+        assert!(has_unparsed_crash(&out, &summary), "{marker}");
+    }
+    // Plain text with exclamation marks is not a banner.
+    let out = format!("{PYTEST_QUIET_FAIL}!! not a banner\nWow!!!\n");
+    assert!(!has_unparsed_crash(&out, &summary));
 }

@@ -163,6 +163,13 @@ impl<'a> Segment<'a> {
     }
 }
 
+/// Cargo's own `     Running unittests src/lib.rs (target/debug/deps/x-1)` and
+/// `   Doc-tests name` lines, not test output that happens to look like them.
+fn is_binary_header(line: &str) -> bool {
+    re!(r"^\s+Running (?:unittests |tests/|benches/|examples/)|^\s+Running .* \((?:\S*/)?target/\S+\)$|^\s+Doc-tests \S+$")
+        .is_match(line)
+}
+
 pub(super) fn parse(output: &str) -> Option<Summary> {
     let lines: Vec<&str> = output.lines().collect();
     let d = diagnostics(&lines);
@@ -174,7 +181,7 @@ pub(super) fn parse(output: &str) -> Option<Summary> {
     let mut result_lines = 0;
     let (mut passed, mut failed) = (0, 0);
     for line in &lines {
-        if re!(r"^\s+(?:Running|Doc-tests) ").is_match(line) {
+        if is_binary_header(line) {
             // A binary that crashed has no result line; its failures end here.
             failures.extend(seg.items());
             seg = Segment::default();

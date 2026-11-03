@@ -24,5 +24,6 @@ Small review probes (hand-written, below the 2 KB filter threshold; they are
 passed to `apply` directly): `cargo_quiet_warn.txt` (`cargo test -q`, one warning and
 one failing test with no `... FAILED` line), `cargo_dup.txt` (same test name failing
 in two test binaries), `tsc_crash.txt` (tsc errors followed by a compiler crash),
-`go_two_panics.txt` (two packages each panicking), `pytest_internal.txt` (pytest
+`go_two_panics.txt` (two packages each panicking), `cargo_running.txt` (captured stdout
+that looks like a cargo `Running` line), `pytest_internal.txt` (pytest
 `INTERNALERROR`).

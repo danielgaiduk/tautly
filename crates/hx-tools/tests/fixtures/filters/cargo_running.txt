@@ -1,0 +1,22 @@
+running 2 tests
+test a ... FAILED
+test b ... FAILED
+
+failures:
+
+---- a stdout ----
+    Running migrations
+thread 'a' panicked at src/lib.rs:9:5:
+real cause of a
+
+---- b stdout ----
+thread 'b' panicked at src/lib.rs:20:5:
+real cause of b
+
+failures:
+    a
+    b
+
+test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `--lib`
