@@ -1,4 +1,8 @@
-//! Retry wrapper: re-issues a request on transient errors before any event is yielded.
+//! Retry wrapper: re-issues a request on transient errors before any content is yielded.
+//!
+//! Adapters emit `Quota` (from response headers) and may emit `Usage` before any content,
+//! so those are held back until the first content-bearing event: a transient error before
+//! content discards them and retries, as if the attempt never happened.
 
 use std::time::Duration;
 
@@ -55,23 +59,38 @@ impl<P: Provider + Clone + 'static> Provider for Retrying<P> {
                     return;
                 }
                 let mut s = inner.stream(req.clone(), cancel.clone());
-                let mut yielded = false;
+                // Metadata events held back until the first content event of this attempt.
+                let mut held: Vec<ProviderEvent> = Vec::new();
+                let mut content = false;
                 let mut retry_err = None;
                 while let Some(item) = s.next().await {
                     match item {
-                        Err(e) if !yielded && e.is_transient() => {
+                        Ok(ev) if !content && !is_content(&ev) => held.push(ev),
+                        Err(e) if !content && e.is_transient() => {
                             retry_err = Some(e);
                             break;
                         }
                         other => {
-                            yielded = true;
+                            content = true;
+                            for ev in held.drain(..) {
+                                yield Ok(ev);
+                            }
                             yield other;
                         }
                     }
                 }
-                let Some(err) = retry_err else { return };
+                let Some(err) = retry_err else {
+                    // Ended without content: deliver what was held.
+                    for ev in held {
+                        yield Ok(ev);
+                    }
+                    return;
+                };
                 failures += 1;
                 if failures >= max_attempts {
+                    for ev in held {
+                        yield Ok(ev);
+                    }
                     yield Err(err);
                     return;
                 }
@@ -86,4 +105,9 @@ impl<P: Provider + Clone + 'static> Provider for Retrying<P> {
             }
         })
     }
+}
+
+/// Whether an event carries response content (as opposed to quota/usage metadata).
+fn is_content(ev: &ProviderEvent) -> bool {
+    !matches!(ev, ProviderEvent::Quota(_) | ProviderEvent::Usage(_))
 }

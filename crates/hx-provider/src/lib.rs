@@ -35,3 +35,31 @@ pub trait Provider: Send + Sync {
         cancel: CancellationToken,
     ) -> BoxStream<'static, Result<ProviderEvent, ProviderError>>;
 }
+
+/// Providers are shared behind `Arc<dyn Provider>` (engine, side runner) and wrapped
+/// in [`Retrying`], which needs `Provider + Clone`.
+impl<T: Provider + ?Sized> Provider for std::sync::Arc<T> {
+    fn name(&self) -> &str {
+        (**self).name()
+    }
+    fn stream(
+        &self,
+        req: CanonicalRequest,
+        cancel: CancellationToken,
+    ) -> BoxStream<'static, Result<ProviderEvent, ProviderError>> {
+        (**self).stream(req, cancel)
+    }
+}
+
+impl<T: Provider + ?Sized> Provider for Box<T> {
+    fn name(&self) -> &str {
+        (**self).name()
+    }
+    fn stream(
+        &self,
+        req: CanonicalRequest,
+        cancel: CancellationToken,
+    ) -> BoxStream<'static, Result<ProviderEvent, ProviderError>> {
+        (**self).stream(req, cancel)
+    }
+}

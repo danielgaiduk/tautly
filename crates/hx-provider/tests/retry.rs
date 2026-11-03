@@ -169,3 +169,90 @@ async fn mock_script_exhausted_and_names() {
         vec![Err(ProviderError::Other("mock script exhausted".into()))]
     );
 }
+
+// ---- checkpoint fix: I5 quota/usage before content do not block a retry ----
+fn quota() -> ProviderEvent {
+    ProviderEvent::Quota(Quota {
+        remaining_requests: Some(9),
+        remaining_tokens: None,
+        reset_at: None,
+    })
+}
+
+#[tokio::test(start_paused = true)]
+async fn transient_error_after_quota_only_is_retried() {
+    let m = MockProvider::new(vec![
+        MockTurn::DropAfter(vec![quota()]),
+        MockTurn::DropAfter(vec![quota(), ProviderEvent::Usage(RawUsage::default())]),
+        MockTurn::Events(vec![quota(), text("ok"), done()]),
+    ]);
+    let out = collect(Retrying::new(m.clone()).stream(req(), CancellationToken::new())).await;
+    assert_eq!(out, vec![Ok(quota()), Ok(text("ok")), Ok(done())]);
+    assert_eq!(m.requests().len(), 3);
+}
+
+#[tokio::test(start_paused = true)]
+async fn buffered_events_are_flushed_in_order() {
+    let usage = ProviderEvent::Usage(RawUsage::default());
+    let m = MockProvider::new(vec![MockTurn::Events(vec![
+        quota(),
+        usage.clone(),
+        text("a"),
+        quota(),
+        done(),
+    ])]);
+    let out = collect(Retrying::new(m.clone()).stream(req(), CancellationToken::new())).await;
+    assert_eq!(
+        out,
+        vec![
+            Ok(quota()),
+            Ok(usage),
+            Ok(text("a")),
+            Ok(quota()),
+            Ok(done())
+        ]
+    );
+    // A fatal error after buffered events still delivers them first.
+    let m = MockProvider::new(vec![MockTurn::Events(vec![quota()])]);
+    let out = collect(Retrying::new(m).stream(req(), CancellationToken::new())).await;
+    assert_eq!(out, vec![Ok(quota())]);
+    // Giving up delivers the last attempt's buffered events, then the error.
+    let m = MockProvider::new(vec![MockTurn::DropAfter(vec![quota()]); 5]);
+    let out = collect(Retrying::new(m.clone()).stream(req(), CancellationToken::new())).await;
+    assert_eq!(out.len(), 2);
+    assert_eq!(out[0], Ok(quota()));
+    assert!(matches!(out[1], Err(ProviderError::Transient { .. })));
+    assert_eq!(m.requests().len(), 5);
+}
+
+#[tokio::test(start_paused = true)]
+async fn mid_stream_drop_after_content_still_surfaces() {
+    let m = MockProvider::new(vec![MockTurn::DropAfter(vec![quota(), text("partial")])]);
+    let out = collect(Retrying::new(m.clone()).stream(req(), CancellationToken::new())).await;
+    assert_eq!(out.len(), 3);
+    assert!(matches!(out[2], Err(ProviderError::Transient { .. })));
+    assert_eq!(m.requests().len(), 1);
+}
+
+// ---- checkpoint fix: I6 providers behind Arc / Box ----
+#[tokio::test(start_paused = true)]
+async fn arc_dyn_provider_can_be_wrapped_and_box_is_a_provider() {
+    use std::sync::Arc;
+    let m = MockProvider::new(vec![
+        MockTurn::Error(transient()),
+        MockTurn::Events(vec![text("ok"), done()]),
+    ]);
+    let shared: Arc<dyn Provider> = Arc::new(m.clone());
+    let r = Retrying::new(shared);
+    assert_eq!(r.name(), "mock");
+    let out = collect(r.stream(req(), CancellationToken::new())).await;
+    assert_eq!(out, vec![Ok(text("ok")), Ok(done())]);
+    assert_eq!(m.requests().len(), 2);
+
+    let boxed: Box<dyn Provider> =
+        Box::new(MockProvider::new(vec![MockTurn::Events(vec![done()])]));
+    fn stream_of<P: Provider>(p: &P) -> BoxStream<'static, Result<ProviderEvent, ProviderError>> {
+        p.stream(req(), CancellationToken::new())
+    }
+    assert_eq!(collect(stream_of(&boxed)).await, vec![Ok(done())]);
+}
