@@ -5,6 +5,8 @@
 //! the permission policy can judge each one. Anything that cannot be analyzed
 //! statically is reported as [`Unparseable`].
 
+use std::path::PathBuf;
+
 use tree_sitter::{Node, Parser};
 
 use crate::runners::{base, reject_unanalyzable, runs_module};
@@ -15,6 +17,10 @@ use crate::runners::{base, reject_unanalyzable, runs_module};
 pub struct SimpleCommand {
     /// Leading `NAME=VALUE` words (environment for this command only), verbatim source text.
     pub assignments: Vec<String>,
+    /// Every working directory the command may run in, as lexical paths relative to
+    /// the workspace root (empty = the root itself) or absolute; earlier `cd`/`pushd`
+    /// in the same input change it. Relative paths in the command resolve against each.
+    pub cwds: Vec<PathBuf>,
     pub argv: Vec<String>,
     pub redirects: Vec<Redirect>,
 }
@@ -52,7 +58,7 @@ pub fn parse_commands(src: &str) -> Result<Vec<SimpleCommand>, Unparseable> {
         return Err(Unparseable(describe_error(root, src)));
     }
     let mut out = Vec::new();
-    walk(root, src.as_bytes(), &mut out, 0)?;
+    walk(root, src.as_bytes(), &mut out, &mut Cwd::default(), 0)?;
     if out.is_empty() && !src.trim().is_empty() {
         // Fail closed: only plain assignments and comments may yield nothing.
         let mut cur = root.walk();
@@ -101,18 +107,13 @@ fn snippet(s: &str) -> String {
 /// Node kinds that are walked into without further checks.
 const STRUCTURAL: &[&str] = &[
     "program",
-    "list",
-    "subshell",
     "if_statement",
     "elif_clause",
     "else_clause",
-    "while_statement",
     "case_statement",
     "case_item",
     "do_group",
     "negated_command",
-    "command_substitution",
-    "process_substitution",
     "concatenation",
     "string",
     "translated_string",
@@ -149,6 +150,7 @@ fn walk(
     node: Node,
     src: &[u8],
     out: &mut Vec<SimpleCommand>,
+    cx: &mut Cwd,
     depth: usize,
 ) -> Result<(), Unparseable> {
     if depth > MAX_DEPTH {
@@ -156,19 +158,25 @@ fn walk(
     }
     let depth = depth + 1;
     match node.kind() {
-        "command" => walk_command(node, src, out, depth),
-        "declaration_command" | "unset_command" => walk_declaration(node, src, out, depth),
+        "command" => walk_command(node, src, out, cx, depth),
+        "declaration_command" | "unset_command" => walk_declaration(node, src, out, cx, depth),
         "test_command" => {
-            out.push(SimpleCommand {
-                assignments: Vec::new(),
-                argv: vec!["[[".into()],
-                redirects: Vec::new(),
-            });
-            walk_children(node, src, out, depth)
+            cx.push(
+                out,
+                SimpleCommand {
+                    cwds: vec![PathBuf::new()],
+                    assignments: Vec::new(),
+                    argv: vec!["[[".into()],
+                    redirects: Vec::new(),
+                },
+            )?;
+            walk_children(node, src, out, cx, depth)
         }
         // Every element after the first reads the previous one's output.
-        "pipeline" => walk_pipeline(node, src, out, depth),
-        "redirected_statement" | "function_definition" => walk_redirected(node, src, out, depth),
+        "pipeline" => walk_pipeline(node, src, out, cx, depth),
+        "redirected_statement" | "function_definition" => {
+            walk_redirected(node, src, out, cx, depth)
+        }
         // Redirects are only understood in the contexts above; anywhere else
         // they could hide a write, so refuse.
         "file_redirect" | "heredoc_redirect" | "herestring_redirect" => {
@@ -183,7 +191,7 @@ fn walk(
                     "assignment to `{name}` changes how later commands run"
                 )));
             }
-            walk_children(node, src, out, depth)
+            walk_children(node, src, out, cx, depth)
         }
         // bash evaluates the *values* of variables named in arithmetic (including
         // any `$(...)` stored in them), so only literal arithmetic is analyzable.
@@ -195,22 +203,31 @@ fn walk(
                 .or_else(|| t.strip_prefix("$[").and_then(|t| t.strip_suffix(']')))
                 .unwrap_or(t);
             require_literal_arith(inner)?;
-            walk_children(node, src, out, depth)
+            walk_children(node, src, out, cx, depth)
         }
         "compound_statement" => {
             let t = text(node, src);
             if let Some(inner) = t.strip_prefix("((") {
                 require_literal_arith(inner.strip_suffix("))").unwrap_or(inner))?;
             }
-            walk_children(node, src, out, depth)
+            walk_children(node, src, out, cx, depth)
         }
         // `for NAME in ...` / `select NAME in ...` assign NAME.
         "for_statement" => {
             if let Some(var) = node.child_by_field_name("variable") {
                 reject_dangerous_name(text(var, src))?;
             }
-            walk_children(node, src, out, depth)
+            cx.in_loop(|cx| walk_children(node, src, out, cx, depth))
         }
+        "while_statement" => cx.in_loop(|cx| walk_children(node, src, out, cx, depth)),
+        // Subshells and substitutions keep their `cd` to themselves.
+        "subshell" | "command_substitution" | "process_substitution" => {
+            let saved = cx.save();
+            let r = walk_children(node, src, out, cx, depth);
+            cx.restore(saved);
+            r
+        }
+        "list" => walk_list(node, src, out, cx, depth),
         "c_style_for_statement" => {
             let mut cur = node.walk();
             for child in node.named_children(&mut cur) {
@@ -218,13 +235,13 @@ fn walk(
                     require_literal_arith(text(child, src))?;
                 }
             }
-            walk_children(node, src, out, depth)
+            cx.in_loop(|cx| walk_children(node, src, out, cx, depth))
         }
         "subscript" => {
             if let Some(index) = node.child_by_field_name("index") {
                 require_literal_index(text(index, src))?;
             }
-            walk_children(node, src, out, depth)
+            walk_children(node, src, out, cx, depth)
         }
         "array" => {
             // `a=([i]=v)`: explicit indices are arithmetic too.
@@ -235,11 +252,11 @@ fn walk(
                     require_literal_index(index)?;
                 }
             }
-            walk_children(node, src, out, depth)
+            walk_children(node, src, out, cx, depth)
         }
         "expansion" => {
             check_expansion(text(node, src))?;
-            walk_children(node, src, out, depth)
+            walk_children(node, src, out, cx, depth)
         }
         "binary_expression" => {
             // `[[ a -eq b ]]` evaluates both operands arithmetically.
@@ -252,7 +269,7 @@ fn walk(
                     }
                 }
             }
-            walk_children(node, src, out, depth)
+            walk_children(node, src, out, cx, depth)
         }
         "unary_expression" => {
             // `[[ -v name ]]` evaluates a subscript in `name`.
@@ -263,9 +280,9 @@ fn walk(
                     require_static_name(&unquote(*k, src))?;
                 }
             }
-            walk_children(node, src, out, depth)
+            walk_children(node, src, out, cx, depth)
         }
-        k if STRUCTURAL.contains(&k) => walk_children(node, src, out, depth),
+        k if STRUCTURAL.contains(&k) => walk_children(node, src, out, cx, depth),
         k if LEAVES.contains(&k) || !node.is_named() => Ok(()),
         other => Err(Unparseable(format!(
             "unsupported shell construct `{other}`"
@@ -277,6 +294,7 @@ fn walk_command(
     node: Node,
     src: &[u8],
     out: &mut Vec<SimpleCommand>,
+    cx: &mut Cwd,
     depth: usize,
 ) -> Result<(), Unparseable> {
     let mut assignments = Vec::new();
@@ -295,7 +313,7 @@ fn walk_command(
                 rest.push(child);
             }
             "file_redirect" | "heredoc_redirect" | "herestring_redirect" => {
-                collect_redirects(child, src, &mut redirects, &mut extra, depth)?
+                collect_redirects(child, src, &mut redirects, &mut extra, cx, depth)?
             }
             "comment" => {}
             _ if child.is_named() => {
@@ -312,22 +330,31 @@ fn walk_command(
     } else {
         reject_unanalyzable(&argv)?;
         reject_dynamic_names(&argv)?;
+        reject_dynamic_numbers(&argv)?;
         if fed && runs_module(&argv) {
             return Err(fed_module(&argv));
         }
-        out.push(SimpleCommand {
-            assignments,
-            argv,
-            redirects,
-        });
+        let dir_change = is_dir_change(&argv).then(|| argv.clone());
+        cx.push(
+            out,
+            SimpleCommand {
+                cwds: vec![PathBuf::new()],
+                assignments,
+                argv,
+                redirects,
+            },
+        )?;
+        if let Some(argv) = dir_change {
+            cx.change_dir(&argv);
+        }
     }
     for child in rest {
         // A command's own assignments only reach its environment; the policy
         // judges them, so only look inside for substitutions.
         if child.kind() == "variable_assignment" {
-            walk_children(child, src, out, depth)?;
+            walk_children(child, src, out, cx, depth)?;
         } else {
-            walk(child, src, out, depth)?;
+            walk(child, src, out, cx, depth)?;
         }
     }
     out.append(&mut extra);
@@ -338,6 +365,7 @@ fn walk_declaration(
     node: Node,
     src: &[u8],
     out: &mut Vec<SimpleCommand>,
+    cx: &mut Cwd,
     depth: usize,
 ) -> Result<(), Unparseable> {
     let mut argv = Vec::new();
@@ -350,18 +378,22 @@ fn walk_declaration(
         }
     }
     reject_dynamic_names(&argv)?;
-    out.push(SimpleCommand {
-        assignments: Vec::new(),
-        argv,
-        redirects: Vec::new(),
-    });
+    cx.push(
+        out,
+        SimpleCommand {
+            cwds: vec![PathBuf::new()],
+            assignments: Vec::new(),
+            argv,
+            redirects: Vec::new(),
+        },
+    )?;
     // Assignments here are argv words the policy judges; only look inside them.
     let mut cur = node.walk();
     for child in node.children(&mut cur) {
         if child.kind() == "variable_assignment" {
-            walk_children(child, src, out, depth)?;
+            walk_children(child, src, out, cx, depth)?;
         } else {
-            walk(child, src, out, depth)?;
+            walk(child, src, out, cx, depth)?;
         }
     }
     Ok(())
@@ -371,13 +403,17 @@ fn walk_pipeline(
     node: Node,
     src: &[u8],
     out: &mut Vec<SimpleCommand>,
+    cx: &mut Cwd,
     depth: usize,
 ) -> Result<(), Unparseable> {
     let mut cur = node.walk();
     let mut first = true;
     for child in node.children(&mut cur) {
         let start = out.len();
-        walk(child, src, out, depth)?;
+        // Each element runs in its own subshell; a `cd` there does not last.
+        let saved = cx.save();
+        walk(child, src, out, cx, depth)?;
+        cx.restore(saved);
         if child.is_named() {
             if !first {
                 reject_fed_modules(&out[start..])?;
@@ -392,22 +428,27 @@ fn walk_redirected(
     node: Node,
     src: &[u8],
     out: &mut Vec<SimpleCommand>,
+    cx: &mut Cwd,
     depth: usize,
 ) -> Result<(), Unparseable> {
     let start = out.len();
     let mut redirects = Vec::new();
     let mut extra = Vec::new();
     let mut fed = false;
+    // A function body runs later, any number of times: a `cd` in it cannot be followed.
+    let function = node.kind() == "function_definition";
+    cx.loops += usize::from(function);
     let mut cur = node.walk();
     for child in node.children(&mut cur) {
         fed |= feeds_stdin(child, src);
         match child.kind() {
             "file_redirect" | "heredoc_redirect" | "herestring_redirect" => {
-                collect_redirects(child, src, &mut redirects, &mut extra, depth)?
+                collect_redirects(child, src, &mut redirects, &mut extra, cx, depth)?
             }
-            _ => walk(child, src, out, depth)?,
+            _ => walk(child, src, out, cx, depth)?,
         }
     }
+    cx.loops -= usize::from(function);
     if fed {
         reject_fed_modules(&out[start..])?;
     }
@@ -424,15 +465,179 @@ fn walk_redirected(
     Ok(())
 }
 
+/// `a && b` runs `b` only after `a` succeeded (so after any `cd` in it); `a || b`
+/// runs `b` after `a` failed, so either directory is possible.
+fn walk_list(
+    node: Node,
+    src: &[u8],
+    out: &mut Vec<SimpleCommand>,
+    cx: &mut Cwd,
+    depth: usize,
+) -> Result<(), Unparseable> {
+    let mut cur = node.walk();
+    let kids: Vec<Node> = node.children(&mut cur).collect();
+    let named: Vec<Node> = kids.iter().copied().filter(|k| k.is_named()).collect();
+    let op = kids.iter().find(|k| !k.is_named()).map(|k| text(*k, src));
+    let (Some(left), Some(right), true) = (named.first(), named.last(), named.len() == 2) else {
+        return walk_children(node, src, out, cx, depth);
+    };
+    let before = cx.cwds.clone();
+    walk(*left, src, out, cx, depth)?;
+    if op == Some("||") {
+        let after_left = cx.cwds.clone();
+        cx.merge(before);
+        walk(*right, src, out, cx, depth)?;
+        cx.merge(after_left);
+    } else {
+        walk(*right, src, out, cx, depth)?;
+    }
+    Ok(())
+}
+
+/// Most working directories tracked at once before giving up.
+const MAX_CWDS: usize = 8;
+
+/// Working-directory state while walking: every directory the next command may
+/// run in (lexical, relative to the workspace root or absolute).
+struct Cwd {
+    cwds: Vec<PathBuf>,
+    /// Set once the directory changed in a way we cannot follow; any later
+    /// command is then unparseable.
+    lost: Option<String>,
+    /// Inside a loop or function body.
+    loops: usize,
+}
+
+impl Default for Cwd {
+    fn default() -> Self {
+        Cwd {
+            cwds: vec![PathBuf::new()],
+            lost: None,
+            loops: 0,
+        }
+    }
+}
+
+impl Cwd {
+    fn push(
+        &self,
+        out: &mut Vec<SimpleCommand>,
+        mut cmd: SimpleCommand,
+    ) -> Result<(), Unparseable> {
+        if let Some(why) = &self.lost {
+            return Err(Unparseable(format!(
+                "{why}, so `{}` runs in an unknown directory",
+                cmd.argv.join(" ")
+            )));
+        }
+        cmd.cwds = self.cwds.clone();
+        out.push(cmd);
+        Ok(())
+    }
+
+    fn save(&self) -> (Vec<PathBuf>, Option<String>) {
+        (self.cwds.clone(), self.lost.clone())
+    }
+
+    fn restore(&mut self, (cwds, lost): (Vec<PathBuf>, Option<String>)) {
+        self.cwds = cwds;
+        self.lost = lost;
+    }
+
+    /// Union with directories that remain possible (`before` first).
+    fn merge(&mut self, before: Vec<PathBuf>) {
+        let mut all = before;
+        for c in self.cwds.drain(..) {
+            if !all.contains(&c) {
+                all.push(c);
+            }
+        }
+        self.cwds = all;
+        if self.cwds.len() > MAX_CWDS && self.lost.is_none() {
+            self.lost = Some("too many possible working directories".into());
+        }
+    }
+
+    fn in_loop<T>(&mut self, f: impl FnOnce(&mut Self) -> T) -> T {
+        self.loops += 1;
+        let r = f(self);
+        self.loops -= 1;
+        r
+    }
+
+    /// Apply a `cd`/`pushd`/`popd`/`dirs` that has just been recorded.
+    fn change_dir(&mut self, argv: &[String]) {
+        let target = match base(&argv[0]) {
+            "cd" | "pushd" if self.loops == 0 => literal_dir(&argv[1..]),
+            _ => None,
+        };
+        match target {
+            Some(t) => {
+                let mut next: Vec<PathBuf> = Vec::new();
+                for c in &self.cwds {
+                    let n = c.join(&t); // an absolute target replaces `c`
+                    if !next.contains(&n) {
+                        next.push(n);
+                    }
+                }
+                self.cwds = next;
+            }
+            None => {
+                self.lost.get_or_insert_with(|| {
+                    format!(
+                        "`{}` changes directory in a way we cannot follow",
+                        argv.join(" ")
+                    )
+                });
+            }
+        }
+    }
+}
+
+fn is_dir_change(argv: &[String]) -> bool {
+    matches!(base(&argv[0]), "cd" | "pushd" | "popd" | "dirs")
+}
+
+/// The target of `cd`/`pushd` when it is one literal path: no glob, expansion,
+/// `~`, `-` (previous directory), stack index or missing argument (home).
+fn literal_dir(args: &[String]) -> Option<PathBuf> {
+    let mut operands = Vec::new();
+    let mut options_done = false;
+    for a in args {
+        if !options_done && a == "--" {
+            options_done = true;
+        } else if !options_done && a.len() > 1 && a.starts_with('-') {
+            if !matches!(a.as_str(), "-P" | "-L") {
+                return None;
+            }
+        } else {
+            operands.push(a.as_str());
+        }
+    }
+    let [t] = operands[..] else {
+        return None;
+    };
+    let unsafe_target = t.is_empty()
+        || t == "-"
+        || t.starts_with(['~', '+'])
+        || t.contains(['*', '?', '[', '{', '$', '`']);
+    (!unsafe_target).then(|| PathBuf::from(t))
+}
+
 fn walk_children(
     node: Node,
     src: &[u8],
     out: &mut Vec<SimpleCommand>,
+    cx: &mut Cwd,
     depth: usize,
 ) -> Result<(), Unparseable> {
     let mut cur = node.walk();
     for child in node.children(&mut cur) {
-        walk(child, src, out, depth)?;
+        // A `cd` in a statement may fail, so afterwards the old directories are
+        // still possible too.
+        let before = cx.cwds.clone();
+        walk(child, src, out, cx, depth)?;
+        cx.merge(before);
     }
     Ok(())
 }
@@ -445,6 +650,7 @@ fn collect_redirects(
     src: &[u8],
     redirects: &mut Vec<Redirect>,
     extra: &mut Vec<SimpleCommand>,
+    cx: &mut Cwd,
     depth: usize,
 ) -> Result<(), Unparseable> {
     if depth > MAX_DEPTH {
@@ -455,7 +661,7 @@ fn collect_redirects(
     match node.kind() {
         "file_redirect" => {
             redirects.extend(redirect_of(node, src)?);
-            walk_children(node, src, extra, depth)
+            walk_children(node, src, extra, cx, depth)
         }
         "heredoc_redirect" => {
             // With an unquoted delimiter bash expands the body, and the grammar
@@ -474,19 +680,19 @@ fn collect_redirects(
             for child in node.children(&mut cur) {
                 match child.kind() {
                     "file_redirect" | "heredoc_redirect" | "herestring_redirect" => {
-                        collect_redirects(child, src, redirects, extra, depth)?
+                        collect_redirects(child, src, redirects, extra, cx, depth)?
                     }
                     _ => {
                         // `cmd <<EOF | next`: `next` reads `cmd`'s output.
                         let start = extra.len();
-                        walk(child, src, extra, depth)?;
+                        walk(child, src, extra, cx, depth)?;
                         reject_fed_modules(&extra[start..])?;
                     }
                 }
             }
             Ok(())
         }
-        _ => walk_children(node, src, extra, depth),
+        _ => walk_children(node, src, extra, cx, depth),
     }
 }
 
@@ -730,6 +936,85 @@ fn reject_dangerous_name(name: &str) -> Result<(), Unparseable> {
     } else {
         Ok(())
     }
+}
+
+/// Numeric operands are evaluated arithmetically by bash (>= 4 evaluates
+/// `a[$(cmd)]` subscripts there too), so a dynamic one may hide commands:
+/// `test`/`[` with `-eq`..`-ge`, `shift`/`ulimit`/`return`/`exit`/`break`/
+/// `continue`, and `printf` with a numeric conversion (or `*` width/precision,
+/// or a dynamic format). Literal numbers stay fine.
+fn reject_dynamic_numbers(argv: &[String]) -> Result<(), Unparseable> {
+    const ARITH_TESTS: &[&str] = &["-eq", "-ne", "-lt", "-le", "-gt", "-ge"];
+    let dynamic = |w: &String| w.contains(['$', '`']);
+    let cmd = base(&argv[0]);
+    let args = &argv[1..];
+    let bad = match cmd {
+        "test" | "[" => {
+            args.iter().any(|a| ARITH_TESTS.contains(&a.as_str())) && args.iter().any(dynamic)
+        }
+        "shift" | "ulimit" | "return" | "exit" | "break" | "continue" => args.iter().any(dynamic),
+        "printf" => {
+            // Skip `-v NAME` / `-vNAME` and `--`; the next word is the format.
+            let mut rest = args;
+            loop {
+                match rest.first().map(String::as_str) {
+                    Some("-v") => rest = rest.get(2..).unwrap_or(&[]),
+                    Some("--") => {
+                        rest = &rest[1..];
+                        break;
+                    }
+                    Some(a) if a.starts_with("-v") => rest = &rest[1..],
+                    _ => break,
+                }
+            }
+            match rest.split_first() {
+                Some((format, values)) => {
+                    (dynamic(format) || numeric_format(format)) && values.iter().any(dynamic)
+                }
+                None => false,
+            }
+        }
+        _ => false,
+    };
+    if bad {
+        Err(hidden(&format!(
+            "numeric operand of `{}`",
+            snippet(&argv.join(" "))
+        )))
+    } else {
+        Ok(())
+    }
+}
+
+/// Whether a printf format has a numeric conversion (`%d %i %o %u %x %X`) or a
+/// `*` width/precision, whose argument bash evaluates arithmetically.
+fn numeric_format(f: &str) -> bool {
+    let b = f.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] != b'%' {
+            i += 1;
+            continue;
+        }
+        i += 1;
+        if b.get(i) == Some(&b'%') {
+            i += 1;
+            continue;
+        }
+        let mut star = false;
+        while let Some(&c) = b.get(i) {
+            if b"-+ #0'.123456789*".contains(&c) {
+                star |= c == b'*';
+                i += 1;
+            } else {
+                break;
+            }
+        }
+        if star || matches!(b.get(i), Some(b'd' | b'i' | b'o' | b'u' | b'x' | b'X')) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Split getopt-style `args` into the values of options in `name_opts` (which

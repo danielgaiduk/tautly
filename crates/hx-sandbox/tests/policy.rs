@@ -691,3 +691,49 @@ fn argv_word_symlinked_to_a_device_path_asks() {
         Decision::Allow
     );
 }
+
+// --- checkpoint fix round 3: working directory tracking ---
+#[test]
+fn paths_after_cd_resolve_against_the_new_directory() {
+    let pol = with_rules(
+        Mode::Ask,
+        &[
+            "bash(cd*)",
+            "bash(pushd*)",
+            "bash(echo*)",
+            "bash(cat*)",
+            "bash(cargo test*)",
+            "bash(dd*)",
+        ],
+        &[],
+    );
+    for cmd in [
+        "cd .g*/hooks; echo pwn > pre-commit",
+        "pushd .g*/hooks; echo pwn > pre-commit",
+        "cd ..; echo pwn > outside",
+        "cd subdir && cat ../.git/config",
+        "cd subdir && echo x > ../.git/config",
+        "cd subdir && dd if=x of=../Makefile",
+        "cd a && cd ../.. && echo x > y",
+        "(cd subdir; echo x > ../.git/config)",
+        "cd /etc && cat x",
+        "cd .git/hooks && echo pwn > pre-commit",
+    ] {
+        assert!(asks(pol.decide("bash", &exec("cd"), Some(cmd))), "{cmd}");
+        assert!(
+            asks(p(Mode::Yolo).decide("bash", &exec("cd"), Some(cmd))),
+            "{cmd}"
+        );
+    }
+    for cmd in [
+        "cd sub && cargo test",
+        "cd crates/x && cat src/lib.rs",
+        "cd /ws/sub && cargo test",
+    ] {
+        assert_eq!(
+            pol.decide("bash", &exec("cd"), Some(cmd)),
+            Decision::Allow,
+            "{cmd}"
+        );
+    }
+}

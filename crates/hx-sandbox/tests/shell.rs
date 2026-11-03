@@ -628,3 +628,107 @@ fn builtins_that_load_or_run_code_are_unparseable() {
         assert!(parse_commands(s).is_ok(), "{s}");
     }
 }
+
+// ---- checkpoint fix round 3 ----
+
+fn cwds(c: &SimpleCommand) -> Vec<String> {
+    c.cwds.iter().map(|p| p.display().to_string()).collect()
+}
+
+#[test]
+fn literal_cd_is_tracked_lexically() {
+    let c = parse_commands("cd sub && cargo test").unwrap();
+    assert_eq!(argv0s(&c), ["cd", "cargo"]);
+    assert_eq!(cwds(&c[0]), [""]);
+    assert_eq!(cwds(&c[1]), ["sub"]);
+    // After `;` (or `||`) the cd may have failed, so both directories are possible.
+    let c = parse_commands("cd sub; ls").unwrap();
+    assert_eq!(cwds(&c[1]), ["", "sub"]);
+    let c = parse_commands("cd a && cd b && ls").unwrap();
+    assert_eq!(cwds(&c[2]), ["a/b"]);
+    let c = parse_commands("pushd -P crates/x && cat src/lib.rs").unwrap();
+    assert_eq!(cwds(&c[1]), ["crates/x"]);
+    // Subshells, substitutions and pipeline elements do not leak their cd.
+    let c = parse_commands("(cd sub; ls); pwd").unwrap();
+    assert_eq!(cwds(&c[1]), ["", "sub"]);
+    let c = parse_commands("(cd sub && ls); pwd").unwrap();
+    assert_eq!(cwds(&c[1]), ["sub"]);
+    assert_eq!(cwds(&c[2]), [""]);
+    let c = parse_commands("echo $(cd sub); cd x | true; pwd").unwrap();
+    assert_eq!(cwds(c.last().unwrap()), [""]);
+    let c = parse_commands("cd /abs && ls").unwrap();
+    assert_eq!(cwds(&c[1]), ["/abs"]);
+}
+
+#[test]
+fn unanalyzable_directory_changes_followed_by_commands_are_unparseable() {
+    for s in [
+        "cd .g*/hooks; echo pwn > pre-commit",
+        "pushd .g*/hooks; echo pwn > pre-commit",
+        "cd $D; ls",
+        "cd \"$D\" && ls",
+        "cd `x` && ls",
+        "cd ~/x; ls",
+        "cd ~; ls",
+        "cd -; ls",
+        "cd; ls",
+        "cd a b; ls",
+        "popd; ls",
+        "pushd; ls",
+        "pushd +1; ls",
+        "dirs -c; ls",
+        "for d in a b; do cd sub; done; ls",
+        "while true; do cd sub; done; ls",
+        "f() { cd sub; }; f; ls",
+        "(cd $D; ls)",
+    ] {
+        assert!(parse_commands(s).is_err(), "{s}");
+    }
+    for s in [
+        "cd $D",
+        "(cd $D); ls",
+        "cd sub && cargo test",
+        "cd -P sub && ls",
+    ] {
+        assert!(parse_commands(s).is_ok(), "{s}");
+    }
+}
+
+#[test]
+fn arithmetic_operands_of_builtins_are_unparseable() {
+    // bash >= 4 evaluates `a[$(cmd)]` subscripts in these numeric operands.
+    for s in [
+        "test \"$x\" -eq 1",
+        "test 1 -lt $x",
+        "[ \"$x\" -gt 0 ]",
+        "[ `x` -ne 0 ]",
+        "shift \"$x\"",
+        "ulimit -n \"$x\"",
+        "return $x",
+        "exit \"$x\"",
+        "break $n",
+        "continue $n",
+        "printf '%d' \"$x\"",
+        "printf '%5.2x\\n' $x",
+        "printf '%i %s' 1 \"$x\"",
+        "printf '%*s' \"$w\" x",
+        "printf \"$fmt\" \"$x\"",
+        "printf -v out '%u' \"$x\"",
+    ] {
+        assert!(parse_commands(s).is_err(), "{s}");
+    }
+    for s in [
+        "test 1 -eq 1",
+        "test -f \"$x\"",
+        "[ \"$a\" = \"$b\" ]",
+        "shift 2",
+        "exit 1",
+        "ulimit -n 4096",
+        "printf '%s\\n' \"$x\"",
+        "printf '%d' 5",
+        "printf '100%%\\n'",
+        "printf '%d%%' 5",
+    ] {
+        assert!(parse_commands(s).is_ok(), "{s}");
+    }
+}

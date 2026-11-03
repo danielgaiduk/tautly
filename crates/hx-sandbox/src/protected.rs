@@ -56,10 +56,12 @@ pub fn is_protected(rel: &Path) -> bool {
 /// approval: outside the workspace or protected, judged on both the lexical
 /// path and the path a write would actually reach after following symlinks
 /// (a repository can commit `NOTES.md -> .git/config`).
-pub(crate) fn path_reason(root: &Path, target: &str) -> Option<String> {
+pub(crate) fn path_reason(root: &Path, cwd: &Path, target: &str) -> Option<String> {
     if target == "/dev/null" {
         return None;
     }
+    let rebased = rebase(cwd, target);
+    let target = rebased.as_str();
     let Some(rel) = normalize(root, target) else {
         return Some(format!("path outside workspace: {target}"));
     };
@@ -83,6 +85,16 @@ pub(crate) fn path_reason(root: &Path, target: &str) -> Option<String> {
             real.display()
         )),
         Resolved::Loop => Some(format!("too many levels of symlinks: {target}")),
+    }
+}
+
+/// `target` as seen from working directory `cwd` (lexical; root-relative or
+/// absolute). Absolute targets are unchanged.
+pub(crate) fn rebase(cwd: &Path, target: &str) -> String {
+    if cwd.as_os_str().is_empty() || target.starts_with('/') {
+        target.to_string()
+    } else {
+        cwd.join(target).to_string_lossy().into_owned()
     }
 }
 
@@ -148,7 +160,7 @@ pub(crate) fn resolve_links(root: &Path, target: &Path) -> Option<Resolved> {
 }
 
 /// Reason a write-redirect target (a literal shell word) needs approval.
-pub(crate) fn redirect_reason(root: &Path, target: &str) -> Option<String> {
+pub(crate) fn redirect_reason(root: &Path, cwd: &Path, target: &str) -> Option<String> {
     if target == "/dev/null" {
         return None;
     }
@@ -158,23 +170,25 @@ pub(crate) fn redirect_reason(root: &Path, target: &str) -> Option<String> {
     if target.contains(['{', '*', '?', '[']) {
         return Some(format!("unresolvable path pattern: {target}"));
     }
-    path_reason(root, target)
+    path_reason(root, cwd, target)
 }
 
 /// Reason an argv word (a literal shell word, not necessarily a path) needs
 /// approval. Only words that are or may be protected paths trigger. For
 /// `--opt=value` only the value is checked; for `key=value` (`dd of=x`) both the
 /// whole word and the value are.
-pub(crate) fn argv_word_reason(root: &Path, word: &str) -> Option<String> {
+pub(crate) fn argv_word_reason(root: &Path, cwd: &Path, word: &str) -> Option<String> {
     match word.split_once('=') {
-        Some((_, value)) if word.starts_with('-') => path_word_reason(root, value),
-        Some((_, value)) => path_word_reason(root, word).or_else(|| path_word_reason(root, value)),
+        Some((_, value)) if word.starts_with('-') => path_word_reason(root, cwd, value),
+        Some((_, value)) => {
+            path_word_reason(root, cwd, word).or_else(|| path_word_reason(root, cwd, value))
+        }
         None if word.starts_with('-') => None,
-        None => path_word_reason(root, word),
+        None => path_word_reason(root, cwd, word),
     }
 }
 
-fn path_word_reason(root: &Path, word: &str) -> Option<String> {
+fn path_word_reason(root: &Path, cwd: &Path, word: &str) -> Option<String> {
     if matches!(word, "~" | "$HOME" | "${HOME}") {
         return None;
     }
@@ -196,6 +210,8 @@ fn path_word_reason(root: &Path, word: &str) -> Option<String> {
             .any(|t| lower.contains(t));
         return token.then(|| format!("unresolvable path pattern: {word}"));
     }
+    let rebased = rebase(cwd, word);
+    let word = rebased.as_str();
     let rel = normalize(root, word)?;
     if is_protected(&rel) {
         return Some(format!("protected path: {}", rel.display()));

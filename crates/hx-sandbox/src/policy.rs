@@ -209,6 +209,7 @@ impl Policy {
                     },
                 },
                 None => Subjects::Commands(vec![SimpleCommand {
+                    cwds: vec![PathBuf::new()],
                     assignments: Vec::new(),
                     argv: argv.clone(),
                     redirects: vec![],
@@ -250,7 +251,9 @@ impl Policy {
 
     fn needs_approval(&self, subjects: &Subjects) -> Option<String> {
         match subjects {
-            Subjects::Paths(ps) => ps.iter().find_map(|p| path_reason(&self.root, &p.raw)),
+            Subjects::Paths(ps) => ps
+                .iter()
+                .find_map(|p| path_reason(&self.root, Path::new(""), &p.raw)),
             Subjects::Commands(cmds) => cmds.iter().find_map(|c| self.command_reason(c)),
             Subjects::Unparseable { reason, .. } => Some(format!("unparseable command: {reason}")),
             Subjects::None => None,
@@ -294,19 +297,37 @@ impl Policy {
     /// Approval needed for one command: dangerous environment assignments,
     /// protected paths touched by write redirects or any non-flag argv word, and
     /// git config/`-c` invocations.
+    ///
+    /// Relative paths are judged from every directory an earlier `cd` in the same
+    /// input may have left the command in.
     fn command_reason(&self, c: &SimpleCommand) -> Option<String> {
+        let root_only = [PathBuf::new()];
+        let cwds: &[PathBuf] = if c.cwds.is_empty() {
+            &root_only
+        } else {
+            &c.cwds
+        };
         env_reason(c)
             .or_else(|| {
-                c.redirects
-                    .iter()
-                    .filter(|r| r.write)
-                    .find_map(|r| redirect_reason(&self.root, &r.target))
+                cwds.iter().find_map(|cwd| {
+                    normalize(&self.root, &cwd.to_string_lossy())
+                        .is_none()
+                        .then(|| format!("runs outside the workspace after cd: {}", cwd.display()))
+                })
             })
             .or_else(|| {
-                c.argv
-                    .iter()
-                    .skip(1)
-                    .find_map(|w| argv_word_reason(&self.root, w))
+                cwds.iter().find_map(|cwd| {
+                    c.redirects
+                        .iter()
+                        .filter(|r| r.write)
+                        .find_map(|r| redirect_reason(&self.root, cwd, &r.target))
+                        .or_else(|| {
+                            c.argv
+                                .iter()
+                                .skip(1)
+                                .find_map(|w| argv_word_reason(&self.root, cwd, w))
+                        })
+                })
             })
             .or_else(|| git_reason(&c.argv))
     }
