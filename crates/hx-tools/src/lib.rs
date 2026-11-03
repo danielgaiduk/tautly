@@ -159,6 +159,13 @@ impl ReadTracker {
         }
     }
 
+    /// Drop the remembered content of `range` of `path`: the model did not see all of it
+    /// (the output was truncated), so the next read of the range must return content.
+    pub fn forget(&self, path: &Path, range: LineRange) {
+        let mut ranges = self.ranges.lock().unwrap_or_else(|e| e.into_inner());
+        ranges.remove(&(path.to_path_buf(), range));
+    }
+
     /// Update only the stale-read guard's view of `path`.
     pub fn refresh(&self, path: &Path, meta: &FileMeta, hash: blake3::Hash) {
         let mut seen = self.seen.lock().unwrap_or_else(|e| e.into_inner());
@@ -197,22 +204,22 @@ pub(crate) async fn record_written_file(
         cx.reads().refresh(full, meta, hash);
         return;
     }
-    // `read` shows only the first 2,000 lines of an open-ended range, so that is what a
-    // whole-file baseline holds.
-    let window = crate::spec::decode_text(bytes).map(|t| {
-        t.lines()
-            .take(MAX_READ_LINES)
-            .collect::<Vec<_>>()
-            .join("\n")
-    });
-    match window {
-        Ok(content) => {
-            let reads = cx.reads();
-            reads
+    // A file beyond the 2,000-line window is only partly shown by an open-ended `read`,
+    // so no baseline: a read that did not see the rest must not be answered `unchanged`.
+    let content = crate::spec::decode_text(bytes)
+        .ok()
+        .filter(|t| t.lines().count() <= MAX_READ_LINES)
+        .map(|t| t.lines().collect::<Vec<_>>().join("\n"));
+    match content {
+        Some(content) => {
+            cx.reads()
                 .record(sb, full, LineRange::ALL, meta, hash, cx.turn(), &content)
                 .await
         }
-        Err(_) => cx.reads().refresh(full, meta, hash),
+        None => {
+            cx.reads().refresh(full, meta, hash);
+            cx.reads().forget(full, LineRange::ALL);
+        }
     }
 }
 

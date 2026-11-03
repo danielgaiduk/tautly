@@ -82,6 +82,8 @@ impl From<KindArg> for SymbolKind {
 struct Lines {
     full: PathBuf,
     hash: blake3::Hash,
+    /// The range as requested, which identifies the read for re-read tracking.
+    range: LineRange,
     /// 1-based inclusive range actually read.
     start: usize,
     end: usize,
@@ -94,6 +96,11 @@ struct Lines {
 impl Lines {
     /// The output for this read within `cap` bytes, with continuation notes.
     fn render(&self, cap: usize) -> String {
+        self.render_flagged(cap).0
+    }
+
+    /// Like [`render`](Self::render), also saying whether the byte cap cut the text.
+    fn render_flagged(&self, cap: usize) -> (String, bool) {
         let (mut output, truncated) = cap_text(&self.text, cap);
         if truncated {
             output.push_str("\n[output truncated; request a narrower line range]");
@@ -105,7 +112,7 @@ impl Lines {
                 self.end + 1
             ));
         }
-        output
+        (output, truncated)
     }
 }
 
@@ -200,8 +207,12 @@ async fn read_lines(
             };
         }
     }
-    // An unchanged read keeps its baseline, and with it the turn the content was shown.
-    if !unchanged {
+    // An unchanged read keeps its baseline, and with it the turn the content was shown. A
+    // read cut by the line window shows only part of the range: no baseline for that
+    // (the byte cap is applied later, by the caller, which then forgets the baseline).
+    if remaining > 0 {
+        cx.reads().forget(&full, range);
+    } else if !unchanged {
         let turn = cx.turn();
         cx.reads()
             .record(sb, &full, range, &meta, hash, turn, &content)
@@ -210,6 +221,7 @@ async fn read_lines(
     Ok(Lines {
         full,
         hash,
+        range,
         start,
         end,
         remaining,
@@ -339,7 +351,9 @@ impl Section {
 /// Concatenate the sections under the shared output cap by water-filling: the smallest
 /// sections get their full size, and what is left is split evenly among the larger ones,
 /// so the result does not depend on the order of the targets.
-fn assemble(sections: &[Section]) -> String {
+///
+/// Also returns, per section, whether its body was cut by the cap.
+fn assemble(sections: &[Section]) -> (String, Vec<bool>) {
     const SEPARATOR: &str = "\n\n";
     let full: Vec<String> = sections.iter().map(|s| s.body_text(usize::MAX)).collect();
     let size = |i: usize| sections[i].header.len() + 1 + full[i].len();
@@ -353,12 +367,14 @@ fn assemble(sections: &[Section]) -> String {
         budget -= allowed[i];
     }
     let mut out = String::new();
+    let mut cut = Vec::with_capacity(sections.len());
     for (i, section) in sections.iter().enumerate() {
         if i > 0 {
             out.push_str(SEPARATOR);
         }
         out.push_str(&section.header);
         out.push('\n');
+        cut.push(size(i) > allowed[i]);
         if size(i) <= allowed[i] {
             out.push_str(&full[i]);
         } else {
@@ -366,7 +382,7 @@ fn assemble(sections: &[Section]) -> String {
             out.push_str(&section.body_text(cap));
         }
     }
-    out
+    (out, cut)
 }
 
 #[async_trait]
@@ -435,7 +451,12 @@ impl Tool for ReadTool {
             (Some(path), None) => {
                 match read_lines(path, a.start_line, a.end_line, full, sb, cx).await {
                     Ok(lines) => {
-                        let mut r = ToolResult::ok(lines.render(OUTPUT_CAP));
+                        let (output, truncated) = lines.render_flagged(OUTPUT_CAP);
+                        if truncated {
+                            // The model did not see all of it; show it again next time.
+                            cx.reads().forget(&lines.full, lines.range);
+                        }
+                        let mut r = ToolResult::ok(output);
                         r.effects.push(AppliedEffect::Read(lines.full, lines.hash));
                         r
                     }
@@ -476,10 +497,16 @@ async fn read_batch(
         }
         sections.push(read_target(target, force_full, sb, cx).await);
     }
+    let (output, cut) = assemble(&sections);
+    for (section, _) in sections.iter().zip(&cut).filter(|(_, c)| **c) {
+        if let Ok(lines) = &section.body {
+            cx.reads().forget(&lines.full, lines.range);
+        }
+    }
     let mut result = if sections.iter().all(|s| s.body.is_err()) {
-        ToolResult::error(assemble(&sections))
+        ToolResult::error(output)
     } else {
-        ToolResult::ok(assemble(&sections))
+        ToolResult::ok(output)
     };
     for section in sections {
         if let Ok(lines) = section.body {

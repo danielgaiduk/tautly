@@ -385,3 +385,69 @@ async fn hashline_edit_does_not_make_the_next_read_unchanged() {
     );
     assert!(r.output.contains("|2b"), "{}", r.output);
 }
+
+// ---- truncated output never becomes a baseline ----
+
+#[tokio::test]
+async fn output_cut_by_the_byte_cap_is_returned_again_not_unchanged() {
+    let e = env();
+    let huge: String = (1..=3)
+        .map(|n| format!("{n}{}\n", "x".repeat(20_000)))
+        .collect();
+    e.put("huge.txt", &huge).await;
+    let first = e.read_at(1, json!({"path": "huge.txt"})).await;
+    assert!(first.contains("truncated"), "{}", first.len());
+    let second = e.read_at(2, json!({"path": "huge.txt"})).await;
+    assert!(!second.contains("unchanged"), "{}", &second[..80]);
+    assert!(second.starts_with("1\t1xxx"), "{}", &second[..80]);
+    // Narrowing to a range that fits is a different read and works as usual.
+    let args = json!({"path": "huge.txt", "start_line": 1, "end_line": 1});
+    e.read_at(3, args.clone()).await;
+    assert_eq!(e.read_at(4, args).await, "unchanged since turn 3");
+}
+
+#[tokio::test]
+async fn output_cut_by_the_line_window_is_returned_again_not_unchanged() {
+    let e = env();
+    let long: String = (1..=2500).map(|n| format!("row{n}\n")).collect();
+    e.put("long.txt", &long).await;
+    let first = e.read_at(1, json!({"path": "long.txt"})).await;
+    assert!(first.ends_with("[500 more lines; use start_line=2001 to continue]"));
+    let second = e.read_at(2, json!({"path": "long.txt"})).await;
+    assert!(second.starts_with("1\trow1\n"), "{}", &second[..40]);
+    assert!(second.ends_with("[500 more lines; use start_line=2001 to continue]"));
+}
+
+#[tokio::test]
+async fn truncated_batch_target_is_returned_again_but_whole_ones_are_unchanged() {
+    let e = env();
+    let big: String = (0..520)
+        .map(|i| format!("big {i:04} {}\n", "x".repeat(30)))
+        .collect();
+    e.put("big.txt", &big).await;
+    e.put("big2.txt", &big).await;
+    e.put("small.txt", "tiny\n").await;
+    let args =
+        json!({"targets": [{"path": "big.txt"}, {"path": "big2.txt"}, {"path": "small.txt"}]});
+    let first = e.read_at(1, args.clone()).await;
+    assert_eq!(first.matches("truncated").count(), 2, "{}", first.len());
+    let second = e.read_at(2, args).await;
+    assert!(
+        second.contains("== small.txt ==\nunchanged since turn 1"),
+        "{second}"
+    );
+    assert!(second.contains("== big.txt ==\n1\tbig 0000"), "{second}");
+    assert!(second.contains("== big2.txt ==\n1\tbig 0000"), "{second}");
+}
+
+#[tokio::test]
+async fn write_of_a_file_beyond_the_window_sets_no_baseline() {
+    let e = env();
+    let long: String = (1..=2500).map(|n| format!("row{n}\n")).collect();
+    let r = e
+        .run_at(&WriteTool, 4, json!({"path": "w.txt", "content": long}))
+        .await;
+    assert!(!r.is_error, "{}", r.output);
+    let out = e.read_at(5, json!({"path": "w.txt"})).await;
+    assert!(out.starts_with("1\trow1\n"), "{}", &out[..40]);
+}
