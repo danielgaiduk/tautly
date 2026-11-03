@@ -50,11 +50,11 @@ fn normalize(p: &Path) -> Option<PathBuf> {
 }
 
 impl LocalSandbox {
-    /// Refuse to modify a protected path reached through a symlink from a path
-    /// that is not itself protected (`NOTES.md -> .git/config`). Naming a
-    /// protected path directly is the permission policy's decision (it asks);
-    /// following a repository-planted link to one never is. `p` is the path as
-    /// the caller requested it; `resolved` is `self.resolve(p)`.
+    /// Refuse to modify a protected path (`.git/`, `.hx/`, ...) reached through a
+    /// symlink: a repository can commit `NOTES.md -> .git/config` or `.hx/tmp ->
+    /// ../.git/hooks`. Naming the protected path itself is the permission
+    /// policy's decision (it asks); following a link into one never is. `p` is
+    /// the path as the caller requested it; `resolved` is `self.resolve(p)`.
     fn guard_protected_target(&self, p: &Path, resolved: &Path) -> Result<(), SandboxError> {
         let Ok(real) = resolved.strip_prefix(&self.root) else {
             return Ok(());
@@ -62,8 +62,10 @@ impl LocalSandbox {
         if !is_protected(real) {
             return Ok(());
         }
+        // Protected-path matching is case-insensitive, so this comparison is too.
+        let lower = |q: &Path| q.to_string_lossy().to_lowercase();
         let named = protected::normalize(&self.root, &p.to_string_lossy())
-            .is_some_and(|rel| is_protected(&rel));
+            .is_some_and(|rel| lower(&rel) == lower(real));
         if named {
             Ok(())
         } else {

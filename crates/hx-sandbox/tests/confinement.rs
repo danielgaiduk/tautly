@@ -284,3 +284,26 @@ async fn explicit_protected_and_ordinary_symlink_writes_still_work() {
     let spilled = sb.spill(b"spill").await.unwrap();
     assert!(spilled.starts_with(".hx/tmp"));
 }
+
+#[tokio::test]
+async fn symlink_between_protected_paths_is_denied_too() {
+    let (t, sb) = protected_repo();
+    std::fs::create_dir_all(t.path().join(".hx")).unwrap();
+    // A repository-planted `.hx/tmp -> ../.git/hooks` must not let spills land in hooks.
+    std::os::unix::fs::symlink("../.git/hooks", t.path().join(".hx/tmp")).unwrap();
+    std::os::unix::fs::symlink("../.git/config", t.path().join(".hx/notes")).unwrap();
+    assert!(matches!(
+        sb.write_atomic(Path::new(".hx/notes"), b"x", None).await,
+        Err(SandboxError::Denied(_))
+    ));
+    assert!(sb.spill(b"output").await.is_err());
+    assert!(!t.path().join(".git/hooks/.gitignore").exists());
+    assert_eq!(
+        std::fs::read_to_string(t.path().join(".git/config")).unwrap(),
+        "[core]\n"
+    );
+    // Naming the protected path itself is still the policy's call.
+    sb.write_atomic(Path::new(".git/config"), b"ok\n", None)
+        .await
+        .unwrap();
+}
