@@ -659,6 +659,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "hx-memory"
+version = "0.1.0"
+dependencies = [
+ "humantime",
+ "hx-index",
+ "hx-sandbox",
+ "hx-session",
+ "rand 0.9.5",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "hx-provider"
 version = "0.1.0"
 dependencies = [
@@ -723,6 +739,7 @@ dependencies = [
  "globset",
  "htmd",
  "hx-index",
+ "hx-memory",
  "hx-provider",
  "hx-sandbox",
  "ignore",

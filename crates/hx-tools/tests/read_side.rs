@@ -239,6 +239,8 @@ fn registry_order_is_stable() {
             "symbol",
             "refs",
             "web_fetch",
+            "recall",
+            "remember",
             "pin",
             "state"
         ]

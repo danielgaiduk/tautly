@@ -8,6 +8,7 @@ mod find;
 mod glob;
 mod grep;
 mod index_tools;
+mod memory_tools;
 mod pin_state;
 mod read;
 mod reread;
@@ -17,11 +18,12 @@ mod write;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::SystemTime;
 
 use async_trait::async_trait;
 use hx_index::Index;
+use hx_memory::MemoryStore;
 use hx_provider::{Capabilities, EditFormat, ToolSpec};
 use hx_sandbox::{Effect, FileMeta, Sandbox};
 use serde_json::Value;
@@ -35,6 +37,7 @@ pub use find::FindTool;
 pub use glob::GlobTool;
 pub use grep::GrepTool;
 pub use index_tools::{OutlineTool, RefsTool, SymbolTool};
+pub use memory_tools::{RecallTool, RememberTool};
 pub use pin_state::{
     ContextOp, PinTool, PlanStep, StatePatch, StateTool, StepStatus, parse_context_op,
 };
@@ -400,6 +403,7 @@ pub struct ToolCx {
     cancel: CancellationToken,
     output_tx: Option<mpsc::Sender<String>>,
     index: Option<Arc<Index>>,
+    memory: Option<Arc<RwLock<MemoryStore>>>,
     turn: u32,
 }
 
@@ -409,6 +413,7 @@ impl std::fmt::Debug for ToolCx {
             .field("edit_format", &self.edit_format)
             .field("spill_dir", &self.spill_dir)
             .field("index", &self.index.is_some())
+            .field("memory", &self.memory.is_some())
             .field("turn", &self.turn)
             .finish_non_exhaustive()
     }
@@ -423,6 +428,7 @@ impl ToolCx {
             cancel: CancellationToken::new(),
             output_tx: None,
             index: None,
+            memory: None,
             turn: 0,
         }
     }
@@ -445,6 +451,12 @@ impl ToolCx {
     /// The code index the index tools query and edits keep current.
     pub fn with_index(mut self, index: Arc<Index>) -> Self {
         self.index = Some(index);
+        self
+    }
+
+    /// The project memory `recall` searches and `remember` validates drafts against.
+    pub fn with_memory(mut self, memory: Arc<RwLock<MemoryStore>>) -> Self {
+        self.memory = Some(memory);
         self
     }
 
@@ -478,6 +490,10 @@ impl ToolCx {
         self.index.as_ref()
     }
 
+    pub fn memory(&self) -> Option<&Arc<RwLock<MemoryStore>>> {
+        self.memory.as_ref()
+    }
+
     pub fn turn(&self) -> u32 {
         self.turn
     }
@@ -507,6 +523,8 @@ pub fn registry(_caps: &Capabilities) -> Vec<Arc<dyn Tool>> {
         Arc::new(SymbolTool),
         Arc::new(RefsTool),
         Arc::new(WebFetchTool),
+        Arc::new(RecallTool),
+        Arc::new(RememberTool),
         Arc::new(PinTool),
         Arc::new(StateTool),
     ]

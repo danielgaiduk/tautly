@@ -10,6 +10,7 @@ license.workspace = true
 hx-sandbox = { path = "../hx-sandbox" }
 hx-provider = { path = "../hx-provider" }
 hx-index = { path = "../hx-index" }
+hx-memory = { path = "../hx-memory" }
 async-trait.workspace = true
 thiserror.workspace = true
 tokio.workspace = true

@@ -3,6 +3,7 @@
 //! context. `run` only validates and acknowledges.
 
 use async_trait::async_trait;
+use hx_memory::MemoryDraft;
 use hx_provider::{Capabilities, ToolSpec};
 use hx_sandbox::{Effect, Sandbox};
 use serde::{Deserialize, Serialize};
@@ -48,6 +49,8 @@ pub struct StatePatch {
 pub enum ContextOp {
     Pin(String),
     StateUpdate(StatePatch),
+    /// A memory entry the model proposes; the engine asks the user before writing it.
+    Remember(MemoryDraft),
 }
 
 #[derive(Deserialize)]
@@ -64,12 +67,15 @@ fn parse_pin(args: &Value) -> Result<String, ToolError> {
     Ok(a.text)
 }
 
-/// The context operation `tool` called with `args` stands for. None if `tool` is neither
-/// `pin` nor `state`, or the arguments are invalid (the tool's own `run` reports why).
+/// The context operation `tool` called with `args` stands for. None if `tool` is not `pin`,
+/// `state` or `remember`, or the arguments are invalid (the tool's own `run` reports why).
 pub fn parse_context_op(tool: &str, args: &Value) -> Option<ContextOp> {
     match tool {
         "pin" => parse_pin(args).ok().map(ContextOp::Pin),
         "state" => parse_args(args).ok().map(ContextOp::StateUpdate),
+        "remember" => crate::memory_tools::parse_remember(args)
+            .ok()
+            .map(ContextOp::Remember),
         _ => None,
     }
 }

@@ -128,13 +128,15 @@ impl Context {
         };
     }
 
-    /// Apply a `pin` or `state` tool call.
+    /// Apply a `pin` or `state` tool call. A `remember` proposal changes nothing here: the
+    /// engine takes it to the user (`MemoryProposed`) and the memory store, not the context.
     pub fn apply_op(&mut self, op: ContextOp) {
         match op {
             ContextOp::Pin(text) => {
                 pinned::add(&mut self.pinned, Pinned::new(text, PinSource::Model))
             }
             ContextOp::StateUpdate(patch) => self.state.apply_patch(patch),
+            ContextOp::Remember(_) => {}
         }
     }
 }
