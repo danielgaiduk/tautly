@@ -162,6 +162,7 @@ trait Tool: Send + Sync {
 | `bash` | Runs via sandbox in its own process group; default timeout 120 s; output > 2 KB passed through output filters (7.3), else/fallback capped at 30 KB (head + tail kept); full output spilled to a temp file referenced in the result |
 | `grep`, `glob` | ripgrep crates (`grep-searcher`, `ignore`); `.gitignore`-aware |
 | `outline`, `symbol`, `refs` | Code-index queries (7.1) |
+| `find` | One ranked search over paths, symbols and text (7.10) |
 | `web_fetch` | HTML → markdown; subject to sandbox network policy; optional `question` arg answered by the side model (7.5) |
 | `recall`, `remember` | Memory search and memory proposals (7.4) |
 | `pin`, `state` | Context-management tools (section 6) |
@@ -192,7 +193,7 @@ Rules are evaluated in `hx-core`; OS-level enforcement is sub-project 2.
 ### 6.1 Block model
 Requests are assembled in fixed order:
 ```
-[stable]   system prompt · tool schemas · AGENTS.md · memory index (7.4)
+[stable]   system prompt · tool schemas · AGENTS.md · memory index (7.4) · repo map (7.10)
 [pinned]   constraints and facts that survive compaction
 [state]    structured working state
 [history]  recent turns, verbatim
@@ -285,6 +286,13 @@ Structured record: task, plan steps with status, files read/edited with content 
 - When every stage fails, the error shows the single nearest window of real lines (≤ 20, line-numbered) so the model can retry without re-reading the file.
 - `hx eval` reports edit repairs per stage alongside the edit-failure rate.
 
+### 7.10 Workspace engine (fast file access, fewer lookup steps)
+- **Live workspace** (`hx-index`): an in-memory file tree (path, size, mtime, content hash; ~100 bytes per file) loaded from the index database at start-up, reconciled by the background refresh, and kept current by a file-system watcher (`notify`, 50 ms debounce) that re-indexes only changed files. Edits made by hx tools update it synchronously. `glob` and directory listings are answered from memory. The tree honors `.gitignore` and the same size/binary skips as the index.
+- **Trigram text index:** stored on disk in the index database (`trigrams(tri, file_id)`), not in memory, so the idle-RSS target (1.6) holds. `grep` extracts the required literals from the pattern (`regex-syntax`), intersects the postings of their trigrams to get candidate files, then confirms with the real regex. Patterns without a literal of ≥ 3 bytes, and any index miss or error, fall back to the full scan (5.2). Target: a selective search on a 100,000-file repository < 50 ms.
+- **`find(query, kind?, limit = 20)`:** one call searches file paths (fuzzy), symbol names (index) and text (trigram) concurrently and returns one ranked list — exact symbol definitions, then path matches, then text matches — as `path:line  <kind>  <one-line snippet>`. `kind` ∈ `symbol | path | text`.
+- **Repo map:** a generated block of ≤ 400 tokens — top-level directories with file counts, languages, entry points (e.g. `main.rs`, `lib.rs`, workspace members, `package.json` scripts) and the most-referenced symbols — placed in the stable block after the memory index (6.1). Generated once at session start (never mid-session, to keep the cache prefix stable).
+- **Batched reads:** `read` also accepts `targets: [{path, start_line?, end_line?} | {symbol}]` (≤ 10 per call); results are concatenated with headers and share the 30 KB cap. Each target goes through the same stale-tracking and diff-on-re-read rules (7.2).
+
 ### 7.6 Measurement
 - `hx eval` reports tokens per solved task (total input + output tokens across main and side roles, divided by solved tasks) and cache hit ratio (`cache_read / (input + cache_read)`).
 
@@ -317,6 +325,7 @@ Structured record: task, plan steps with status, files read/edited with content 
 - 100 MB tool output: RSS bounded, output spilled to disk.
 - Release binary size tracked and reported (not gated).
 - Index build of a generated 10,000-file repository < 10 s; single-file reindex < 50 ms.
+- Selective `grep` via the trigram index on a generated 100,000-file repository < 50 ms; `glob` from the live tree < 5 ms.
 - Token regression: tokens per solved task on the starter set (scripted mock replay, deterministic) must not exceed the committed baseline by more than 10%.
 
 ### 9.2 Eval runner (interface for sub-project 5)

@@ -23,6 +23,8 @@
 - Paths: config `~/.config/hx/config.toml`, project `.hx/config.toml`, sessions `~/.local/share/hx/sessions/<project-hash>/<session-id>.jsonl` (+ `blobs/`), ledger `~/.local/share/hx/ledger.db`. Honor `XDG_CONFIG_HOME` / `XDG_DATA_HOME` and an `HX_HOME` override (used by tests).
 - Fixed values: bash timeout 120 s; tool output cap 30 KB (head + tail); max 5 retry attempts; compaction threshold 80%; budget warning 80%; system prompt < 2,000 tokens; pinned warning at 10% of window; cancel kills children within 200 ms.
 - Token-efficiency values: diff re-read when < 50% of lines changed; context GC threshold max(2,000 tokens, 5% of window), only at turn start; output filters apply above 2 KB, ≤ 20 detail lines per item; memory index ≤ 500 tokens; cache scheduler: default cache TTL 300 s, warm-cache benefit multiplier 5, forced mutation at ≥ 90% of window, threshold compaction deferrable from 80% to 90%; loop breaker: failed-attempts list 10 entries / ≤ 300 tokens, previous-result excerpt 5 lines; tolerant edits: anchor interior similarity ≥ 0.9, structural similarity ≥ 0.8, nearest-window ≤ 20 lines; memory entry body ≤ 300 tokens; `recall` top 5, ≤ 2,000 tokens; `web_fetch` question answers ≤ 1,000 tokens; index build of 10,000 files < 10 s, single-file reindex < 50 ms; token regression gate 10%.
+- Workspace engine: watcher debounce 50 ms; trigram literal minimum 3 bytes; `find` default limit 20 (max 50); batched read ≤ 10 targets; repo map ≤ 400 tokens; selective trigram grep on 100,000 files < 50 ms; tree glob < 5 ms.
+- Execution order note: Tasks 36–37 run right after Task 15; Task 38 runs right after Task 19.
 - Exit codes for `hx -p`: 0 completed, 1 error, 2 budget/max_turns/timeout, 130 cancelled.
 
 ## Review Focus
@@ -886,6 +888,7 @@ proptest! { #[test] fn apply_then_inverse_restores(text in "[a-z\\n]{1,200}", ..
   - Idle RSS: start `hx --rpc --mock-script …`, send `initialize`, sleep 2 s, read RSS (`ps -o rss=`); fail if > 30 MB.
   - `soak.rs`: drive `Engine` with a looping mock (text + read/grep/edit tool calls) under `tokio::time::pause`, simulating 4 h of turns with compaction; sample RSS (`memory-stats` crate) at the 10-minute mark and every simulated 10 min; fail if any sample is outside ±10% of the 10-minute sample.
   - `big_output.rs`: bash tool emitting 100 MB (`head -c 100000000 /dev/zero | tr '\0' a`); assert peak RSS growth < 20 MB and spill file size == 100,000,000.
+  - Workspace: on a generated 100,000-file repo, selective `grep` via trigram candidates < 50 ms and tree `glob` < 5 ms (median of 20).
   - Index: generate a 10,000-file synthetic Rust/TS/Python repo (`benches/perf/gen_repo.rs`, fixed seed); assert `Index::refresh` from empty < 10 s and `reindex_file` on a 500-line file < 50 ms (median of 20).
   - Binary size: print `ls -l target/release/hx` to the job summary (not gated).
 - [ ] **Step 2: Run** `cargo build --release && bash benches/perf/startup.sh && cargo test --release -p perf -- --ignored` — Expected: currently may FAIL; record numbers.
@@ -919,3 +922,56 @@ proptest! { #[test] fn apply_then_inverse_restores(text in "[a-z\\n]{1,200}", ..
 - [ ] **Step 3: Acceptance (manual, recorded in `docs/acceptance/2026-xx-daily-driver.md`):** use `hx` REPL for one real task per adapter on a real repository; note any failure as a new issue.
 - [ ] **Step 4: Run** full suite `cargo test --workspace && cargo clippy --workspace -- -D warnings` — Expected: PASS.
 - [ ] **Step 5: Commit** `git commit -m "test: nightly live smoke suite across four adapters"`
+
+### Task 36: Live workspace tree and trigram index (execute after Task 15)
+
+**Files:**
+- Create: `crates/hx-index/src/{tree.rs,watch.rs,trigram.rs}`; modify `lib.rs`, `store.rs`, `update.rs`
+- Test: `crates/hx-index/tests/{tree.rs,trigram.rs}`
+
+**Interfaces:**
+- Consumes: `Index`, `Sandbox::walker` (Tasks 1, 14).
+- Produces:
+  - `struct FileEntry { path: PathBuf, size: u64, mtime: SystemTime, hash: String }`
+  - `Index::tree(&self) -> TreeView` with `fn glob(&self, pattern: &str, base: &Path) -> Vec<PathBuf>` (sorted, literal_separator semantics like the glob tool), `fn list_dir(&self, dir: &Path) -> Vec<FileEntry>`, `fn len(&self) -> usize`
+  - `Index::start_watcher(self: Arc<Self>) -> Result<WatchHandle, IndexError>` (`notify`, 50 ms debounce; changed files → `reindex_file`, removed → delete rows; dropping the handle stops it)
+  - `Index::grep_candidates(&self, pattern: &str) -> Candidates` with `enum Candidates { Files(Vec<PathBuf>), FullScan }` (`regex-syntax` literal extraction; any literal < 3 bytes, parse error, or index not ready → FullScan)
+  - Trigram rows maintained by `refresh` and `reindex_file` in table `trigrams(tri INTEGER, file_id INTEGER, PRIMARY KEY(tri, file_id)) WITHOUT ROWID`
+
+- [ ] **Step 1: Write the failing tests:** `tree_loads_from_db_and_matches_disk`; `tree_glob_matches_glob_tool_semantics` (`src/*.rs` excludes `src/a/b.rs`); `edit_via_reindex_updates_tree_synchronously`; `watcher_picks_up_external_create_modify_delete_within_1s`; `watcher_ignores_gitignored_paths`; `grep_candidates_narrows_to_files_containing_literal`; `grep_candidates_alternation_unions_postings` (`foo|barbaz` → files with foo ∪ files with barbaz); `short_literal_or_complex_pattern_falls_back_to_full_scan`; `candidates_never_miss_a_true_match` (proptest: random files + random literal patterns; every file the full scan matches is in Candidates or FullScan is returned); `binary_and_oversize_files_have_no_trigrams`.
+- [ ] **Step 2: Run** `cargo test -p hx-index --test tree --test trigram` — Expected: FAIL.
+- [ ] **Step 3: Implement.** Trigrams are over raw bytes, lowercased ASCII for a case-insensitive flag, deduplicated per file; batch inserts in the existing per-500-files transaction.
+- [ ] **Step 4: Run** — Expected: PASS.
+- [ ] **Step 5: Commit** `git commit -m "feat(index): live workspace tree, file watcher, trigram index"`
+
+### Task 37: `find` tool, batched reads, index-backed grep/glob (execute after Task 36)
+
+**Files:**
+- Create: `crates/hx-tools/src/find.rs`; modify `read.rs`, `grep.rs`, `glob.rs`, `lib.rs` (registry)
+- Test: `crates/hx-tools/tests/{find.rs,batched_read.rs}`; extend `read_side.rs`
+
+**Interfaces:**
+- Consumes: `Index::{tree, grep_candidates, find_symbol}` (Tasks 14, 36), `ToolCx.index`.
+- Produces: `FindTool` (`Effect::ReadOnly`, args `{query, kind?: "symbol"|"path"|"text", limit?: 1..=50 default 20}`); registry order becomes `read, edit, write, bash, grep, glob, find, outline, symbol, refs, …` (insert `find` after `glob`; later tasks keep their relative order); `read` args gain `targets: [{path, start_line?, end_line?} | {symbol, kind?}]` (≤ 10; mutually exclusive with `path`).
+
+- [ ] **Step 1: Write the failing tests:** `find_ranks_symbol_definition_over_path_over_text`; `find_fuzzy_path_match` (`pymtretry` finds `payment/retry.rs`); `find_kind_filter`; `find_limit_and_snippet_format` (`path:line  kind  snippet`); `find_without_index_falls_back_to_grep_and_glob`; `batched_read_returns_each_target_with_header_and_shares_30kb_cap`; `batched_read_symbol_target_uses_index`; `batched_read_rejects_more_than_10_targets`; `batched_read_records_each_file_in_tracker`; `grep_uses_trigram_candidates_when_available` (counts sandbox reads: only candidate files read); `grep_results_identical_with_and_without_index` (same output on a fixture repo); `glob_served_from_tree_when_index_ready`.
+- [ ] **Step 2: Run** `cargo test -p hx-tools --test find --test batched_read --test read_side` — Expected: FAIL.
+- [ ] **Step 3: Implement.** Fuzzy path scoring: subsequence match with bonuses for path-segment starts and consecutive characters (no new dependency needed). Text matches come from `grep` on candidates, at most 5 per file. Output capped by `cap_text` at 30 KB.
+- [ ] **Step 4: Run** — Expected: PASS.
+- [ ] **Step 5: Commit** `git commit -m "feat(tools): find tool, batched reads, index-backed grep and glob"`
+
+### Task 38: Repo map (execute after Task 19)
+
+**Files:**
+- Create: `crates/hx-context/src/repo_map.rs`; modify `assemble.rs`, `lib.rs`
+- Test: `crates/hx-context/tests/repo_map.rs`
+
+**Interfaces:**
+- Consumes: `Index::{tree, stats}` and a new `Index::top_referenced(limit: usize) -> Vec<(String, u64)>` (add in this task), `TokenEstimator`, `Context` (Task 19).
+- Produces: `fn repo_map::build(index: &Index, est: &TokenEstimator, budget: u32 /* 400 */) -> String`; `Context.repo_map: Option<String>` rendered in the stable block after the memory index; `Breakdown.repo_map: u32`.
+
+- [ ] **Step 1: Write the failing tests:** `map_lists_top_level_dirs_with_counts_and_languages`; `map_lists_entry_points` (main.rs, lib.rs, Cargo workspace members, package.json scripts); `map_lists_most_referenced_symbols`; `map_never_exceeds_400_tokens_on_large_repo` (drops lowest-value sections first); `map_is_deterministic` (same repo → byte-identical output); `map_rendered_after_memory_index_in_stable_block`; `map_not_regenerated_mid_session`.
+- [ ] **Step 2: Run** `cargo test -p hx-context --test repo_map` — Expected: FAIL.
+- [ ] **Step 3: Implement.** Section order: languages, directories, entry points, key symbols; truncate the last sections first to fit the budget.
+- [ ] **Step 4: Run** — Expected: PASS.
+- [ ] **Step 5: Commit** `git commit -m "feat(context): repo map in the stable prompt prefix"`
