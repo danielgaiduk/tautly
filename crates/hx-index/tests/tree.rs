@@ -532,6 +532,7 @@ async fn events_under_ignored_directories_cause_no_work_even_with_symlinks() {
     let _watch = idx.clone().start_watcher().unwrap();
     tokio::time::sleep(Duration::from_millis(300)).await;
     let before = sb.calls();
+    let refreshes = idx.refresh_count();
 
     for i in 0..20 {
         write_all(fx.root.path(), &[(&format!("target/debug/f{i}.o"), "obj")]);
@@ -541,14 +542,21 @@ async fn events_under_ignored_directories_cause_no_work_even_with_symlinks() {
     assert_eq!(
         sb.calls(),
         before,
-        "ignored paths must not trigger a refresh or reindex"
+        "ignored paths must not trigger a reindex"
+    );
+    assert_eq!(
+        idx.refresh_count(),
+        refreshes,
+        "ignored paths must not trigger a refresh"
     );
 
-    // Control: a change to an admitted file is picked up (and, with links in the tree,
-    // reconciled by a full refresh that stats every file).
+    // Control: a change to an admitted file is picked up (re-indexed, and with links in
+    // the tree, reconciled by a full refresh).
     std::fs::write(fx.path("src/a.rs"), "fn a() {}\nfn extra() {}\n").unwrap();
     assert!(
-        eventually(WATCH_WAIT, || sb.calls() > before + 5).await,
+        eventually(WATCH_WAIT, || sb.calls() > before
+            && idx.refresh_count() > refreshes)
+        .await,
         "admitted change must be processed"
     );
 }
@@ -966,4 +974,64 @@ async fn background_refresh_runs_again_for_a_mark_made_during_it() {
     *sb.on_walk.lock().unwrap() = Some(Box::new(move || hook_slot.get().unwrap().mark_stale()));
     idx.refresh_stale_in_background().unwrap().await.unwrap();
     assert!(!idx.is_stale(), "a second pass covered the second mark");
+}
+
+#[tokio::test]
+async fn dirs_count_files_and_languages_per_directory() {
+    let fx = Fixture::new(&[
+        ("top.md", "# top\n"),
+        ("a/x.rs", "fn x() {}\n"),
+        ("a/b/y.py", "def y(): pass\n"),
+        ("a/b/z.rs", "fn z() {}\n"),
+        ("a-b/w.txt", "w\n"),
+        ("c/d/e/deep.go", "package e\n"),
+    ]);
+    let idx = fx.open();
+    idx.refresh().await.unwrap();
+    let tree = idx.tree();
+    let got: Vec<(String, usize)> = tree
+        .dirs(1)
+        .into_iter()
+        .map(|d| (d.path.display().to_string(), d.files))
+        .collect();
+    assert_eq!(got, [("a".into(), 3), ("a-b".into(), 1), ("c".into(), 1)]);
+    let two = tree.dirs(2);
+    let names: Vec<String> = two.iter().map(|d| d.path.display().to_string()).collect();
+    assert_eq!(names, ["a", "a/b", "a-b", "c", "c/d"]);
+    let a = &two[0];
+    assert_eq!(
+        a.langs,
+        [(hx_index::Lang::Rust, 2), (hx_index::Lang::Python, 1)]
+    );
+    assert!(tree.dirs(0).is_empty());
+    assert_eq!(
+        tree.get(Path::new("a/b/y.py")).unwrap().lang,
+        Some(hx_index::Lang::Python)
+    );
+    assert_eq!(tree.get(Path::new("top.md")).unwrap().lang, None);
+}
+
+#[tokio::test]
+async fn list_dir_and_glob_keep_path_order_across_sibling_directories() {
+    let fx = Fixture::new(&[
+        ("a/z.rs", ""),
+        ("a/b/x.rs", ""),
+        ("a-b/y.rs", ""),
+        ("a.rs", ""),
+    ]);
+    let idx = fx.open();
+    idx.refresh().await.unwrap();
+    let tree = idx.tree();
+    assert_eq!(
+        paths(&tree.glob("**/*.rs", Path::new("."))),
+        ["a-b/y.rs", "a.rs", "a/b/x.rs", "a/z.rs"]
+    );
+    let listed: Vec<String> = tree
+        .list_dir(Path::new("a"))
+        .into_iter()
+        .map(|e| e.path.display().to_string())
+        .collect();
+    assert_eq!(listed, ["a/z.rs"]);
+    assert!(tree.contains(Path::new("a/b")));
+    assert!(!tree.contains(Path::new("a/c")));
 }

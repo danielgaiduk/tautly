@@ -746,3 +746,35 @@ fn name_indexes_dropped_by_an_interrupted_build_come_back_on_open() {
     drop(open_at(t.path(), &db));
     assert_eq!(index_names(&db), ["refs_name_file_line", "symbols_name"]);
 }
+
+/// Memory anchors name a symbol by file, name, parent and kind (checkpoint 2, triage #27).
+#[tokio::test]
+async fn symbol_hash_in_narrows_by_parent_and_kind() {
+    let src = "fn new() -> u8 { 0 }\n\
+               struct A;\nimpl A {\n    fn new() -> A { A }\n}\n\
+               struct B;\nimpl B {\n    fn new() -> B { B }\n}\n";
+    let (_t, idx) = index_with(&[("src/m.rs", src)]);
+    idx.refresh().await.unwrap();
+    let rel = Path::new("src/m.rs");
+    let hash = |s: &str| blake3::hash(s.as_bytes()).to_hex().to_string();
+    assert_eq!(
+        idx.symbol_hash_in(rel, "new", Some("B"), None).unwrap(),
+        hash("fn new() -> B { B }")
+    );
+    assert_eq!(
+        idx.symbol_hash_in(rel, "new", Some("A"), Some(Method))
+            .unwrap(),
+        hash("fn new() -> A { A }")
+    );
+    assert_eq!(
+        idx.symbol_hash_in(rel, "new", None, Some(Function))
+            .unwrap(),
+        hash("fn new() -> u8 { 0 }")
+    );
+    assert_eq!(
+        idx.symbol_hash_in(rel, "new", None, None),
+        idx.symbol_hash(rel, "new")
+    );
+    assert_eq!(idx.symbol_hash_in(rel, "new", Some("C"), None), None);
+    assert_eq!(idx.symbol_hash_in(rel, "new", Some("A"), Some(Type)), None);
+}

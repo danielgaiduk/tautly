@@ -7,7 +7,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use async_trait::async_trait;
-use hx_index::Index;
+use hx_index::{Index, WatchHandle};
 use hx_provider::EditFormat;
 use hx_sandbox::{
     Child, FileMeta, HttpResponse, LocalSandbox, Sandbox, SandboxError, SpawnSpec, Url,
@@ -119,9 +119,16 @@ pub struct Env {
     pub sb: Counting,
     pub index: Arc<Index>,
     pub cx: ToolCx,
+    /// The index's file watcher; the tools trust the index only while it runs.
+    watch: Option<WatchHandle>,
 }
 
 impl Env {
+    /// Stop the index's file watcher.
+    pub fn stop_watcher(&mut self) {
+        self.watch = None;
+    }
+
     /// A context without the index, over the same directory.
     pub fn cx_without_index(&self) -> ToolCx {
         ToolCx::new(EditFormat::StrReplace, self.dir.path().join(".spill"))
@@ -165,8 +172,10 @@ pub async fn env(files: &[(&str, &[u8])], built: Built) -> Env {
         assert!(index.trigrams_ready());
     }
     let mut cx = ToolCx::new(EditFormat::StrReplace, dir.path().join(".spill"));
+    let mut watch = None;
     if built != Built::None {
         cx = cx.with_index(Arc::clone(&index));
+        watch = Some(Arc::clone(&index).start_watcher().unwrap());
     }
     Env {
         dir,
@@ -174,5 +183,6 @@ pub async fn env(files: &[(&str, &[u8])], built: Built) -> Env {
         sb,
         index,
         cx,
+        watch,
     }
 }

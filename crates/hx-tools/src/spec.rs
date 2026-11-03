@@ -57,10 +57,12 @@ pub(crate) fn display_rel(sb: &dyn hx_sandbox::Sandbox, p: &std::path::Path) -> 
 }
 
 /// The index when its tree and trigram candidates can be trusted: it has completed a
-/// refresh, and nothing (a shell command) may have changed files since without a refresh or
-/// watcher batch having caught up.
+/// refresh, its file watcher is running (otherwise changes made outside hx never reach
+/// it), and nothing (a shell command) may have changed files since without the index
+/// having caught up.
 pub(crate) fn live_index(cx: &ToolCx) -> Option<&Arc<Index>> {
-    cx.index().filter(|i| i.is_ready() && !i.is_stale())
+    cx.index()
+        .filter(|i| i.is_ready() && i.watching() && !i.is_stale())
 }
 
 /// Whether the tree can answer for the search directory or file `base` (absolute, as the

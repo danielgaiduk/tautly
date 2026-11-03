@@ -1,6 +1,7 @@
 //! Incremental tree-sitter symbol and reference index (spec 7.1).
 
 pub mod extract;
+mod fresh;
 mod lang;
 mod store;
 mod tree;
@@ -10,7 +11,9 @@ mod watch;
 
 pub use extract::{Extracted, extract};
 pub use lang::Lang;
-pub use store::{Index, IndexError, IndexStats, RefRow, RefreshStats, SymbolKind, SymbolRow};
-pub use tree::{FileEntry, TreeView};
+pub use store::{
+    Index, IndexError, IndexStats, RefRow, RefreshHold, RefreshStats, SymbolKind, SymbolRow,
+};
+pub use tree::{DirInfo, FileEntry, TreeView};
 pub use trigram::Candidates;
 pub use watch::WatchHandle;

@@ -1,17 +1,19 @@
 //! SQLite-backed storage and queries (WAL mode, shared by several handles).
 
-use std::collections::HashMap;
+use std::collections::HashSet;
 use std::path::{Component, Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock};
 use std::time::Duration;
 
 use hx_sandbox::Sandbox;
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
+use crate::fresh::Freshness;
 use crate::lang::Lang;
-use crate::tree::{SharedTree, TreeData};
+use crate::tree::{SharedTree, Slot, TreeData};
 
 /// Version written by this build; bump and append a [`MIGRATIONS`] step when the schema
 /// changes.
@@ -120,10 +122,8 @@ pub enum IndexError {
     Task(String),
 }
 
-/// What the index remembers about a file, to decide whether it changed.
+/// What the index remembers about a file's content, to decide whether it changed.
 pub(crate) struct KnownFile {
-    pub mtime: i64,
-    pub size: i64,
     pub hash: String,
     /// One of the `TRI_*` states.
     pub tri_state: u8,
@@ -152,18 +152,26 @@ pub(crate) struct ParsedFile {
 pub(crate) struct Inner {
     conn: Mutex<Connection>,
     pub sb: Arc<dyn Sandbox>,
-    ready: AtomicBool,
-    trigrams_ready: AtomicBool,
-    /// How many times [`Index::mark_stale`] was called.
-    stale_marks: AtomicU64,
-    /// The highest mark count a completed refresh is known to cover.
-    covered_marks: AtomicU64,
-    /// A background refresh loop is running or about to.
-    bg_refresh: AtomicBool,
+    pub fresh: Freshness,
+    /// The generation the next write gets (see [`Inner::apply`]).
+    next_generation: AtomicU32,
+    /// While a refresh runs: keys other writers removed since it started, which it must
+    /// not bring back from its scan.
+    tombstones: Mutex<Option<HashSet<String>>>,
+    /// Held for the whole of a refresh: refreshes of one index never overlap.
+    pub refresh_lock: tokio::sync::Mutex<()>,
+    /// SQLite's `data_version` when the tree last mirrored the database: it moves when
+    /// another handle commits.
+    data_version: AtomicI64,
     /// The last scan met symlinks: a change under one path may alias another.
     has_links: AtomicBool,
     last_error: Mutex<Option<String>>,
     tree: SharedTree,
+    /// Completed refreshes (diagnostics and tests).
+    refreshes: AtomicU64,
+    /// Test hook: the next refresh pauses after its scan (see
+    /// [`Index::hold_next_refresh_after_scan`]).
+    scan_hold: Mutex<Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>>,
 }
 
 /// Incremental symbol and reference index of the sandbox root, persisted in SQLite.
@@ -190,18 +198,21 @@ impl Index {
         // A bulk refresh that was interrupted may have left these dropped.
         ensure_indexes(&conn)?;
         let tree = load_tree(&conn)?;
+        let data_version = data_version(&conn)?;
         Ok(Index {
             inner: Arc::new(Inner {
                 conn: Mutex::new(conn),
                 sb,
-                ready: AtomicBool::new(false),
-                trigrams_ready: AtomicBool::new(false),
-                stale_marks: AtomicU64::new(0),
-                covered_marks: AtomicU64::new(0),
-                bg_refresh: AtomicBool::new(false),
+                fresh: Freshness::default(),
+                next_generation: AtomicU32::new(1),
+                tombstones: Mutex::new(None),
+                refresh_lock: tokio::sync::Mutex::new(()),
+                data_version: AtomicI64::new(data_version),
                 has_links: AtomicBool::new(false),
                 last_error: Mutex::new(None),
                 tree: RwLock::new(tree),
+                refreshes: AtomicU64::new(0),
+                scan_hold: Mutex::new(None),
             }),
         })
     }
@@ -216,64 +227,6 @@ impl Index {
                 let _ = self.build_trigrams().await;
             }
         })
-    }
-
-    /// True once a refresh has completed since this handle was opened: symbols,
-    /// references and the workspace tree are current.
-    pub fn is_ready(&self) -> bool {
-        self.inner.ready.load(Ordering::Acquire)
-    }
-
-    /// True once [`Index::build_trigrams`] has completed since this handle was opened;
-    /// until then [`Index::grep_candidates`] answers [`crate::Candidates::FullScan`].
-    pub fn trigrams_ready(&self) -> bool {
-        self.inner.trigrams_ready.load(Ordering::Acquire)
-    }
-
-    /// Record that files may have changed behind the index's back (a shell command ran).
-    /// Until a full [`Index::refresh`] that started after this call completes successfully,
-    /// [`Index::is_stale`] is true and callers should not trust the tree or the trigram
-    /// candidates for files that may have just appeared. The watcher does not clear it:
-    /// the OS may deliver the events of the change after any batch that began earlier.
-    pub fn mark_stale(&self) {
-        self.inner.stale_marks.fetch_add(1, Ordering::SeqCst);
-    }
-
-    /// True between [`Index::mark_stale`] and the next successful refresh that started
-    /// after it.
-    pub fn is_stale(&self) -> bool {
-        self.inner.stale_marks.load(Ordering::SeqCst)
-            > self.inner.covered_marks.load(Ordering::SeqCst)
-    }
-
-    /// Refresh in the background until the index is no longer stale. Refreshes are
-    /// coalesced: if a loop is already running, this returns None and that loop does one
-    /// more pass when a mark arrived after its refresh started. A failed refresh stops the
-    /// loop (see [`Index::last_error`]); the next call retries. Also None outside a
-    /// Tokio runtime.
-    pub fn refresh_stale_in_background(self: &Arc<Self>) -> Option<JoinHandle<()>> {
-        let runtime = tokio::runtime::Handle::try_current().ok()?;
-        if self.inner.bg_refresh.swap(true, Ordering::AcqRel) {
-            return None;
-        }
-        let this = Arc::clone(self);
-        Some(runtime.spawn(async move {
-            loop {
-                let mut ok = true;
-                while this.is_stale() {
-                    if this.refresh().await.is_err() {
-                        ok = false;
-                        break;
-                    }
-                }
-                this.inner.bg_refresh.store(false, Ordering::Release);
-                // A mark that landed after the last check but before the flag cleared
-                // saw the flag set and started nothing: take the loop back.
-                if !ok || !this.is_stale() || this.inner.bg_refresh.swap(true, Ordering::AcqRel) {
-                    break;
-                }
-            }
-        }))
     }
 
     /// The error of the most recent refresh, if it failed.
@@ -362,6 +315,51 @@ impl Index {
             .flatten()
     }
 
+    /// blake3 hex of the first definition (in source order) named `name` in the file,
+    /// narrowed to the definitions whose parent is `parent` and whose kind is `kind` when
+    /// those are given (None: any).
+    pub fn symbol_hash_in(
+        &self,
+        rel: &Path,
+        name: &str,
+        parent: Option<&str>,
+        kind: Option<SymbolKind>,
+    ) -> Option<String> {
+        let key = self.inner.key(rel);
+        self.inner
+            .conn()
+            .query_row(
+                "SELECT hash FROM symbols WHERE file = ?1 AND name = ?2 \
+                 AND (?3 IS NULL OR parent = ?3) AND (?4 IS NULL OR kind = ?4) \
+                 ORDER BY start_line, id LIMIT 1",
+                params![key, name, parent, kind.map(SymbolKind::as_str)],
+                |r| r.get(0),
+            )
+            .optional()
+            .ok()
+            .flatten()
+    }
+
+    /// How many refreshes have completed on this handle.
+    #[doc(hidden)]
+    pub fn refresh_count(&self) -> u64 {
+        self.inner.refreshes.load(Ordering::SeqCst)
+    }
+
+    /// Test hook: the next refresh pauses right after its scan until the returned hold is
+    /// released, so a test can act between the scan and the writes.
+    #[doc(hidden)]
+    pub fn hold_next_refresh_after_scan(&self) -> RefreshHold {
+        let (reached_tx, reached) = oneshot::channel();
+        let (release, release_rx) = oneshot::channel();
+        *self
+            .inner
+            .scan_hold
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some((reached_tx, release_rx));
+        RefreshHold { reached, release }
+    }
+
     /// blake3 hex of the first definition named `name` in the file.
     pub fn symbol_hash(&self, rel: &Path, name: &str) -> Option<String> {
         let key = self.inner.key(rel);
@@ -389,6 +387,25 @@ impl Index {
             symbols: count("symbols"),
             refs: count("refs"),
         }
+    }
+}
+
+/// See [`Index::hold_next_refresh_after_scan`].
+#[doc(hidden)]
+pub struct RefreshHold {
+    reached: oneshot::Receiver<()>,
+    release: oneshot::Sender<()>,
+}
+
+impl RefreshHold {
+    /// Wait until the refresh has finished its scan.
+    pub async fn reached(&mut self) {
+        let _ = (&mut self.reached).await;
+    }
+
+    /// Let the refresh go on.
+    pub fn release(self) {
+        let _ = self.release.send(());
     }
 }
 
@@ -480,19 +497,94 @@ impl Inner {
 
     /// Marks up to `seen` (the mark count read when an operation started) as covered.
     pub fn cover_marks(&self, seen: u64) {
-        self.covered_marks.fetch_max(seen, Ordering::SeqCst);
+        self.fresh.cover_marks(seen);
     }
 
     pub fn stale_mark_count(&self) -> u64 {
-        self.stale_marks.load(Ordering::SeqCst)
+        self.fresh.stale_mark_count()
     }
 
     pub fn mark_ready(&self) {
-        self.ready.store(true, Ordering::Release);
+        self.fresh.mark_ready();
     }
 
     pub fn mark_trigrams_ready(&self) {
-        self.trigrams_ready.store(true, Ordering::Release);
+        self.fresh.mark_trigrams_ready();
+    }
+
+    /// Start a refresh's snapshot: rows written from now on carry a generation of at least
+    /// the one returned, and keys removed from now on are remembered, so the refresh can
+    /// leave both alone ([`Inner::apply_guarded`]). Taken with the connection held, so no
+    /// write is half done.
+    ///
+    /// When another handle has written to the database since, the tree is reloaded first,
+    /// so the refresh compares the disk with what the database holds.
+    pub fn begin_refresh(&self) -> Result<u32, IndexError> {
+        let conn = self.conn();
+        let version = data_version(&conn)?;
+        if version != self.data_version.load(Ordering::SeqCst) {
+            let tree = load_tree(&conn)?;
+            *self.tree.write().unwrap_or_else(PoisonError::into_inner) = tree;
+            self.data_version.store(version, Ordering::SeqCst);
+        }
+        *self
+            .tombstones
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(HashSet::new());
+        Ok(self.next_generation.load(Ordering::SeqCst))
+    }
+
+    pub fn end_refresh(&self) {
+        *self
+            .tombstones
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = None;
+    }
+
+    /// Whether any file waits for its postings.
+    pub fn has_pending_trigrams(&self) -> Result<bool, IndexError> {
+        Ok(self.conn().query_row(
+            &format!("SELECT EXISTS (SELECT 1 FROM files WHERE trigram_state = {TRI_PENDING})"),
+            [],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// The stored content hash of each key (empty when it has none).
+    pub fn stored_hashes(&self, keys: &[&str]) -> Vec<String> {
+        let conn = self.conn();
+        let Ok(mut stmt) = conn.prepare_cached("SELECT hash FROM files WHERE path = ?1") else {
+            return vec![String::new(); keys.len()];
+        };
+        keys.iter()
+            .map(|k| {
+                stmt.query_row([k], |r| r.get(0))
+                    .optional()
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default()
+            })
+            .collect()
+    }
+
+    /// What the index remembers about each key, if anything.
+    pub fn known_files_for(&self, keys: &[String]) -> Result<Vec<Option<KnownFile>>, IndexError> {
+        let conn = self.conn();
+        let mut stmt =
+            conn.prepare_cached("SELECT hash, trigram_state FROM files WHERE path = ?1")?;
+        let mut out = Vec::with_capacity(keys.len());
+        for key in keys {
+            out.push(
+                stmt.query_row([key], |r| {
+                    Ok(KnownFile {
+                        hash: r.get(0)?,
+                        tri_state: r.get(1)?,
+                    })
+                })
+                .optional()?,
+            );
+        }
+        Ok(out)
     }
 
     pub fn set_has_links(&self, v: bool) {
@@ -549,6 +641,23 @@ impl Inner {
         Ok(())
     }
 
+    /// Pause at the test hook if one is armed (see [`Index::hold_next_refresh_after_scan`]).
+    pub async fn scan_hold_point(&self) {
+        let hold = self
+            .scan_hold
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        if let Some((reached, release)) = hold {
+            let _ = reached.send(());
+            let _ = release.await;
+        }
+    }
+
+    pub fn count_refresh(&self) {
+        self.refreshes.fetch_add(1, Ordering::SeqCst);
+    }
+
     pub fn record_refresh<T>(&self, result: &Result<T, IndexError>) {
         let mut slot = self
             .last_error
@@ -593,36 +702,16 @@ impl Inner {
             .join("/")
     }
 
-    pub fn known_files(&self) -> Result<HashMap<String, KnownFile>, IndexError> {
-        let conn = self.conn();
-        let mut stmt =
-            conn.prepare_cached("SELECT path, mtime, size, hash, trigram_state FROM files")?;
-        let rows = stmt.query_map([], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                KnownFile {
-                    mtime: r.get(1)?,
-                    size: r.get(2)?,
-                    hash: r.get(3)?,
-                    tri_state: r.get(4)?,
-                },
-            ))
-        })?;
-        Ok(rows.collect::<Result<_, _>>()?)
-    }
-
     pub fn known_file(&self, key: &str) -> Result<Option<KnownFile>, IndexError> {
         Ok(self
             .conn()
             .query_row(
-                "SELECT mtime, size, hash, trigram_state FROM files WHERE path = ?1",
+                "SELECT hash, trigram_state FROM files WHERE path = ?1",
                 [key],
                 |r| {
                     Ok(KnownFile {
-                        mtime: r.get(0)?,
-                        size: r.get(1)?,
-                        hash: r.get(2)?,
-                        tri_state: r.get(3)?,
+                        hash: r.get(0)?,
+                        tri_state: r.get(1)?,
                     })
                 },
             )
@@ -630,13 +719,58 @@ impl Inner {
     }
 
     /// Apply one batch of changes in a single transaction, then mirror it in the tree.
+    /// Every row written gets a new generation.
     pub fn apply(
         &self,
         parsed: &[ParsedFile],
         touched: &[(String, i64, i64)],
         removed: &[String],
     ) -> Result<(), IndexError> {
+        self.apply_guarded(parsed, touched, removed, None)
+    }
+
+    /// [`Inner::apply`] for a refresh whose snapshot started at generation `since`
+    /// ([`Inner::begin_refresh`]): a row another writer wrote since then (generation at
+    /// least `since`), or a key it removed since then, is left alone. The check and the
+    /// write happen with the connection held, which every writer holds for its whole write.
+    pub fn apply_guarded(
+        &self,
+        parsed: &[ParsedFile],
+        touched: &[(String, i64, i64)],
+        removed: &[String],
+        since: Option<u32>,
+    ) -> Result<(), IndexError> {
         let mut conn = self.conn();
+        let (parsed, touched, removed): (Vec<&ParsedFile>, Vec<_>, Vec<&String>) = match since {
+            None => (
+                parsed.iter().collect(),
+                touched.iter().collect(),
+                removed.iter().collect(),
+            ),
+            Some(since) => {
+                let tree = self.tree.read().unwrap_or_else(PoisonError::into_inner);
+                let tombstones = self
+                    .tombstones
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                let untouched = |key: &str| match tree.get(key) {
+                    Some(slot) => slot.generation < since,
+                    None => !tombstones.as_ref().is_some_and(|t| t.contains(key)),
+                };
+                (
+                    parsed.iter().filter(|f| untouched(&f.path)).collect(),
+                    touched.iter().filter(|t| untouched(&t.0)).collect(),
+                    removed
+                        .iter()
+                        .filter(|k| tree.get(k).is_some_and(|s| s.generation < since))
+                        .collect(),
+                )
+            }
+        };
+        if parsed.is_empty() && touched.is_empty() && removed.is_empty() {
+            return Ok(());
+        }
+        let generation = self.next_generation.fetch_add(1, Ordering::SeqCst);
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         {
             // Postings carry no foreign key (they point at `files.id`), so they go first.
@@ -644,13 +778,13 @@ impl Inner {
                 "DELETE FROM trigrams WHERE file_id = (SELECT id FROM files WHERE path = ?1)",
             )?;
             let mut delete = tx.prepare_cached("DELETE FROM files WHERE path = ?1")?;
-            for path in removed {
+            for path in &removed {
                 delete_tris.execute([path])?;
                 delete.execute([path])?;
             }
             let mut touch =
                 tx.prepare_cached("UPDATE files SET mtime = ?2, size = ?3 WHERE path = ?1")?;
-            for (path, mtime, size) in touched {
+            for (path, mtime, size) in &touched {
                 touch.execute(params![path, mtime, size])?;
             }
             let mut insert_file = tx.prepare_cached(
@@ -669,7 +803,7 @@ impl Inner {
             let mut insert_tri =
                 tx.prepare_cached("INSERT INTO trigrams (tri, file_id) VALUES (?1, ?2)")?;
             let mut postings: Vec<u64> = Vec::new();
-            for f in parsed {
+            for f in &parsed {
                 delete_tris.execute([&f.path])?;
                 delete.execute([&f.path])?;
                 insert_file.execute(params![
@@ -709,15 +843,27 @@ impl Inner {
             }
         }
         tx.commit()?;
+        if since.is_none() {
+            if let Some(t) = self
+                .tombstones
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .as_mut()
+            {
+                t.extend(removed.iter().map(|k| k.to_string()));
+            }
+        }
         let mut tree = self.tree.write().unwrap_or_else(PoisonError::into_inner);
         for path in removed {
             tree.remove(path);
         }
         for (path, mtime, size) in touched {
-            tree.touch(path, *size, *mtime);
+            if let Some(slot) = tree.get_mut(path) {
+                *slot = Slot::new(path, *size, *mtime, generation);
+            }
         }
         for f in parsed {
-            tree.insert(f.path.clone(), f.size, f.mtime, &f.hash);
+            tree.insert(&f.path, Slot::new(&f.path, f.size, f.mtime, generation));
         }
         Ok(())
     }
@@ -800,22 +946,22 @@ fn pack_posting(tri: u32, file_id: i64) -> u64 {
     (u64::from(tri) << POSTING_ID_BITS) | (file_id as u64 & POSTING_ID_MASK)
 }
 
-/// The tree as the database remembers it.
+/// Moves whenever another connection commits to the database.
+fn data_version(conn: &Connection) -> Result<i64, IndexError> {
+    Ok(conn.pragma_query_value(None, "data_version", |r| r.get(0))?)
+}
+
+/// The tree as the database remembers it. In path order (the unique index on `path`),
+/// so every file is appended to its directory's list.
 fn load_tree(conn: &Connection) -> Result<TreeData, IndexError> {
     let mut tree = TreeData::default();
-    let mut stmt = conn.prepare("SELECT path, size, mtime, hash FROM files")?;
-    let rows = stmt.query_map([], |r| {
-        Ok((
-            r.get::<_, String>(0)?,
-            r.get::<_, i64>(1)?,
-            r.get::<_, i64>(2)?,
-            r.get::<_, String>(3)?,
-        ))
-    })?;
-    for row in rows {
-        let (path, size, mtime, hash) = row?;
-        tree.insert(path, size, mtime, &hash);
+    let mut stmt = conn.prepare("SELECT path, size, mtime FROM files ORDER BY path")?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let path: String = row.get(0)?;
+        tree.insert(&path, Slot::new(&path, row.get(1)?, row.get(2)?, 0));
     }
+    tree.shrink();
     Ok(tree)
 }
 

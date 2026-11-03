@@ -18,6 +18,30 @@ pub enum Lang {
 }
 
 impl Lang {
+    /// Every language, in declaration order (the order of [`Lang::code`]).
+    const ALL: [Lang; 9] = [
+        Lang::Rust,
+        Lang::TypeScript,
+        Lang::Tsx,
+        Lang::JavaScript,
+        Lang::Python,
+        Lang::Go,
+        Lang::Json,
+        Lang::Toml,
+        Lang::Yaml,
+    ];
+
+    /// A one-byte code for an optional language (0: none), as the tree stores it.
+    pub(crate) fn code(lang: Option<Lang>) -> u8 {
+        lang.map_or(0, |l| l as u8 + 1)
+    }
+
+    /// The inverse of [`Lang::code`].
+    pub(crate) fn from_code(code: u8) -> Option<Lang> {
+        code.checked_sub(1)
+            .and_then(|i| Self::ALL.get(usize::from(i)).copied())
+    }
+
     /// The language for `path`'s extension (case-insensitive); None if unsupported.
     pub fn from_path(path: &Path) -> Option<Lang> {
         let ext = path.extension()?.to_str()?.to_ascii_lowercase();

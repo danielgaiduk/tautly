@@ -8,6 +8,7 @@ use std::time::UNIX_EPOCH;
 use futures::{StreamExt, stream};
 use hx_sandbox::{FileMeta, Sandbox, SandboxError};
 use rayon::prelude::*;
+use std::os::unix::fs::MetadataExt;
 
 use crate::extract::extract;
 use crate::lang::Lang;
@@ -25,6 +26,9 @@ const MAX_BATCH_BYTES: u64 = 16 * 1024 * 1024;
 /// A refresh of an index that is not ready yet, with at least this many files to
 /// (re)write, drops the name indexes for the duration and rebuilds them at the end.
 const BULK_REBUILD_FILES: usize = 2000;
+/// A refresh or postings build with at least this many files to (re)write gets the large
+/// SQLite page cache for the duration; smaller ones keep the idle cache.
+const BULK_CACHE_FILES: usize = 2000;
 /// Concurrent sandbox reads.
 const IO_CONCURRENCY: usize = 64;
 /// Longest stored reference context, in characters.
@@ -57,10 +61,18 @@ impl Index {
     /// files left as they were. After a change of extractor version every file is
     /// reparsed. A failure is also recorded in [`Index::last_error`] and leaves
     /// `is_ready` as it was.
+    ///
+    /// Refreshes of one index run one at a time. A refresh never undoes a write made while
+    /// it runs: rows another writer (an edit's re-index, the watcher) wrote or removed after
+    /// the refresh started are left as that writer left them.
     pub async fn refresh(&self) -> Result<RefreshStats, IndexError> {
+        let _one_at_a_time = self.inner.refresh_lock.lock().await;
         let marks_seen = self.inner.stale_mark_count();
-        self.inner.run(|i| i.set_bulk_cache(true)).await?;
-        let mut result = self.refresh_inner().await;
+        let mut result = match self.inner.run(|i| i.begin_refresh()).await {
+            Ok(since) => self.refresh_inner(since).await,
+            Err(e) => Err(e),
+        };
+        self.inner.end_refresh();
         // A bulk build may have dropped the name indexes; they must be back whatever
         // happened (a no-op otherwise).
         if let Err(e) = self.inner.run(|i| i.ensure_indexes()).await {
@@ -71,6 +83,7 @@ impl Index {
         self.inner.record_refresh(&result);
         if result.is_ok() {
             self.inner.cover_marks(marks_seen);
+            self.inner.count_refresh();
         }
         result
     }
@@ -84,7 +97,6 @@ impl Index {
     /// refresh are skipped (they stay candidates until the next refresh re-reads them).
     /// Edits made through [`Index::reindex_file`] never wait for this phase.
     pub async fn build_trigrams(&self) -> Result<u32, IndexError> {
-        self.inner.run(|i| i.set_bulk_cache(true)).await?;
         let result = self.build_trigrams_inner().await;
         let _ = self.inner.run(|i| i.set_bulk_cache(false)).await;
         if result.is_ok() {
@@ -96,6 +108,10 @@ impl Index {
     async fn build_trigrams_inner(&self) -> Result<u32, IndexError> {
         let inner = &self.inner;
         let pending = inner.run(|i| i.pending_trigram_files()).await?;
+        // A large cache only pays for a large build; an idle index stays small.
+        if pending.len() >= BULK_CACHE_FILES {
+            inner.run(|i| i.set_bulk_cache(true)).await?;
+        }
         let sizes: Vec<u64> = pending.iter().map(|p| p.size as u64).collect();
         let mut pending = pending.into_iter();
         let mut pos = 0;
@@ -143,35 +159,33 @@ impl Index {
         Ok(done)
     }
 
-    async fn refresh_inner(&self) -> Result<RefreshStats, IndexError> {
+    async fn refresh_inner(&self, since: u32) -> Result<RefreshStats, IndexError> {
         let inner = &self.inner;
         let current = scan(inner).await?;
-        let known = Arc::new(inner.run(|i| i.known_files()).await?);
+        inner.scan_hold_point().await;
         let force = inner.run(|i| i.extractor_changed()).await?;
 
-        let present: HashSet<&str> = current.iter().map(|c| c.key.as_str()).collect();
-        let gone: Vec<String> = known
-            .keys()
-            .filter(|k| !present.contains(k.as_str()))
-            .cloned()
-            .collect();
+        // Compare with the in-memory tree (which has every row's size and mtime) instead
+        // of reading the whole table.
+        let Diff {
+            stale,
+            unchanged,
+            gone,
+        } = diff(inner, current, force);
         let mut stats = RefreshStats {
             parsed: 0,
             removed: gone.len() as u32,
-            unchanged: 0,
+            unchanged,
         };
         for chunk in gone.chunks(BATCH_FILES) {
             let chunk = chunk.to_vec();
-            inner.run(move |i| i.apply(&[], &[], &chunk)).await?;
+            inner
+                .run(move |i| i.apply_guarded(&[], &[], &chunk, Some(since)))
+                .await?;
         }
-
-        let (stale, fresh): (Vec<Candidate>, Vec<Candidate>) = current.into_iter().partition(|c| {
-            force
-                || known
-                    .get(&c.key)
-                    .is_none_or(|k| (k.mtime, k.size) != (c.mtime, c.size))
-        });
-        stats.unchanged = fresh.len() as u32;
+        if stale.len() >= BULK_CACHE_FILES {
+            inner.run(|i| i.set_bulk_cache(true)).await?;
+        }
         if !self.is_ready() && stale.len() >= BULK_REBUILD_FILES {
             inner.run(|i| i.drop_name_indexes()).await?;
         }
@@ -179,7 +193,7 @@ impl Index {
         // Files over the cap are never read, so they cost no batch budget.
         let sizes: Vec<u64> = stale
             .iter()
-            .map(|c| {
+            .map(|(c, _)| {
                 if is_oversize(c.size) {
                     0
                 } else {
@@ -193,27 +207,45 @@ impl Index {
         while pos < sizes.len() {
             let n = batch_end(&sizes[pos..], BATCH_FILES, MAX_BATCH_BYTES);
             pos += n;
-            let (big, batch): (Vec<Candidate>, Vec<Candidate>) =
-                stale.by_ref().take(n).partition(|c| is_oversize(c.size));
-            let wanted: Vec<String> = batch.iter().map(|c| c.key.clone()).collect();
-            let read = read_all(inner, batch).await;
+            let (big, batch): (Vec<Known>, Vec<Known>) = stale
+                .by_ref()
+                .take(n)
+                .partition(|(c, _)| is_oversize(c.size));
+            let known: HashSet<String> = batch
+                .iter()
+                .filter(|(_, known)| *known)
+                .map(|(c, _)| c.key.clone())
+                .collect();
+            let wanted: Vec<String> = batch.iter().map(|(c, _)| c.key.clone()).collect();
+            let read = read_all(inner, batch.into_iter().map(|(c, _)| c).collect()).await;
             // A known file that changed but could not be read: its old postings no
             // longer describe it, so it must become a candidate.
             let readable: HashSet<&str> = read.iter().map(|(c, _)| c.key.as_str()).collect();
             let unreadable: Vec<String> = wanted
                 .iter()
-                .filter(|k| !readable.contains(k.as_str()) && known.contains_key(k.as_str()))
+                .filter(|k| !readable.contains(k.as_str()) && known.contains(k.as_str()))
                 .cloned()
                 .collect();
-            let olds: Vec<Option<(String, u8)>> = read
+            // The stored hash and trigram state of the known files that were read, which
+            // decide whether a re-read file needs parsing.
+            let lookup: Vec<String> = read
                 .iter()
-                .map(|(c, _)| {
-                    known
-                        .get(&c.key)
-                        .filter(|_| !force)
-                        .map(|k| (k.hash.clone(), k.tri_state))
-                })
+                .map(|(c, _)| c.key.clone())
+                .filter(|k| !force && known.contains(k))
                 .collect();
+            let mut stored: HashMap<String, (String, u8)> = HashMap::new();
+            if !lookup.is_empty() {
+                let rows = inner
+                    .run(move |i| Ok((i.known_files_for(&lookup)?, lookup)))
+                    .await?;
+                for (row, key) in rows.0.into_iter().zip(rows.1) {
+                    if let Some(k) = row {
+                        stored.insert(key, (k.hash, k.tri_state));
+                    }
+                }
+            }
+            let olds: Vec<Option<(String, u8)>> =
+                read.iter().map(|(c, _)| stored.remove(&c.key)).collect();
             let outcomes = tokio::task::spawn_blocking(move || {
                 read.into_par_iter()
                     .zip(olds)
@@ -227,7 +259,7 @@ impl Index {
             .map_err(|e| IndexError::Task(e.to_string()))?;
 
             let (mut parsed, touched) = split(outcomes);
-            parsed.extend(big.into_iter().map(oversize_file));
+            parsed.extend(big.into_iter().map(|(c, _)| oversize_file(c)));
             stats.parsed += parsed.len() as u32;
             stats.unchanged += touched.len() as u32;
             // Write this batch while the next one is read and parsed.
@@ -235,7 +267,7 @@ impl Index {
                 prev.finish().await?;
             }
             write = Some(Write::start(inner, move |i| {
-                i.apply(&parsed, &touched, &[])?;
+                i.apply_guarded(&parsed, &touched, &[], Some(since))?;
                 i.mark_pending(&unreadable)
             }));
         }
@@ -563,15 +595,17 @@ async fn files_under(inner: &Inner, dir: &str) -> Result<Vec<String>, IndexError
 }
 
 /// Walk the root (honoring ignore files, even outside a git checkout) and stat every
-/// file.
+/// file. The stat data comes from the walk itself (the sandbox's walker, which already
+/// enforces confinement), so no per-file sandbox call is made.
 async fn scan(inner: &Inner) -> Result<Vec<Candidate>, IndexError> {
     let builder = walker_at(inner.sb.as_ref(), "")?;
     let root = inner.sb.root().to_path_buf();
-    let (paths, links) = tokio::task::spawn_blocking(move || {
+    let (found, links) = tokio::task::spawn_blocking(move || {
         let mut out = Vec::new();
         // Symlinked directories seen so far (the walk is depth-first, so a directory
         // comes before its contents).
         let mut link_dirs: HashSet<std::path::PathBuf> = HashSet::new();
+        let mut any_alias = false;
         for entry in builder.build().flatten() {
             let is_link = entry.path_is_symlink();
             let Ok(rel) = entry.path().strip_prefix(&root) else {
@@ -584,25 +618,92 @@ async fn scan(inner: &Inner) -> Result<Vec<Candidate>, IndexError> {
                 continue;
             }
             let aliased = is_link || rel.ancestors().skip(1).any(|a| link_dirs.contains(a));
-            out.push((rel.to_path_buf(), aliased));
+            any_alias |= aliased;
+            // Follows the link when the walker does (it is configured to).
+            let Ok(meta) = entry.metadata() else {
+                continue;
+            };
+            let Ok(mtime) = meta.modified() else {
+                continue;
+            };
+            let meta = FileMeta {
+                mtime,
+                len: meta.len(),
+                mode: meta.mode(),
+                nlink: meta.nlink(),
+            };
+            out.push((rel_key(rel), meta, aliased));
         }
-        let links = !link_dirs.is_empty() || out.iter().any(|(_, a)| *a);
+        let links = !link_dirs.is_empty() || any_alias;
         (out, links)
     })
     .await
     .map_err(|e| IndexError::Task(e.to_string()))?;
     inner.set_has_links(links);
+    Ok(found
+        .into_iter()
+        .map(|(key, meta, aliased)| candidate(key, &meta, aliased))
+        .collect())
+}
 
-    let sb = &inner.sb;
-    let stats: Vec<Option<Candidate>> = stream::iter(paths)
-        .map(|(rel, aliased)| async move {
-            let meta = sb.metadata(&rel).await.ok()?;
-            Some(candidate(inner.key(&rel), &meta, aliased))
+/// The `/`-separated key of a root-relative path, as [`Inner::key`] spells it.
+fn rel_key(rel: &Path) -> String {
+    rel.components()
+        .filter_map(|c| match c {
+            std::path::Component::CurDir => None,
+            c => Some(c.as_os_str().to_string_lossy()),
         })
-        .buffer_unordered(IO_CONCURRENCY)
-        .collect()
-        .await;
-    Ok(stats.into_iter().flatten().collect())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// A file to re-read, with whether the tree knew it.
+type Known = (Candidate, bool);
+
+/// What a refresh has to do, from comparing a scan with the tree.
+struct Diff {
+    stale: Vec<Known>,
+    unchanged: u32,
+    /// Rows of files that are gone.
+    gone: Vec<String>,
+}
+
+/// Compare a scan with the in-memory tree. `force` (a new extractor) makes every file
+/// stale.
+fn diff(inner: &Inner, current: Vec<Candidate>, force: bool) -> Diff {
+    let tree = inner
+        .tree()
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut gone = Vec::new();
+    {
+        let present: HashSet<&str> = current.iter().map(|c| c.key.as_str()).collect();
+        let mut key = String::new();
+        tree.for_each(|dir, name, _| {
+            key.clear();
+            if !dir.is_empty() {
+                key.push_str(dir);
+                key.push('/');
+            }
+            key.push_str(name);
+            if !present.contains(key.as_str()) {
+                gone.push(key.clone());
+            }
+        });
+    }
+    let mut stale = Vec::new();
+    let mut unchanged = 0;
+    for c in current {
+        match tree.get(&c.key) {
+            Some(slot) if !force && slot.same_stat(c.size, c.mtime) => unchanged += 1,
+            slot => stale.push((c, slot.is_some())),
+        }
+    }
+    Diff {
+        stale,
+        unchanged,
+        gone,
+    }
 }
 
 /// Read a batch of files; ones that vanished or cannot be read are left out.

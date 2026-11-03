@@ -622,6 +622,25 @@ async fn stale_index_sends_grep_glob_and_find_to_the_walker_until_refreshed() {
     );
 }
 
+/// Without a running watcher, changes made outside hx never reach the index, so a fresh
+/// and ready index is still not trusted (checkpoint 2, I4).
+#[tokio::test]
+async fn without_a_watcher_grep_glob_and_find_use_the_walker() {
+    let mut e = repo(common::Built::Full).await;
+    e.stop_watcher();
+    assert!(e.index.is_ready() && !e.index.is_stale());
+    e.sb.reset();
+    let r = e.run(&GlobTool, json!({"pattern": "*.md"})).await;
+    assert!(e.sb.walks() > 0, "glob walks");
+    assert_eq!(r.output, "docs/readme.md");
+    e.sb.reset();
+    e.run(&GrepTool, json!({"pattern": "fn main"})).await;
+    assert!(e.sb.walks() > 0, "grep walks");
+    e.sb.reset();
+    e.run(&FindTool, json!({"query": "readme"})).await;
+    assert!(e.sb.walks() > 0, "find walks");
+}
+
 #[tokio::test]
 async fn bash_marks_the_index_stale_so_files_it_creates_are_found() {
     let e = common::env(REPO, common::Built::Full).await;

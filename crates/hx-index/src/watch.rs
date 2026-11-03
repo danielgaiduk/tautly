@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use tokio::runtime::Handle;
 
+use crate::fresh::{cookie_id, cookie_path};
 use crate::store::{Index, IndexError, Inner};
 use crate::update::{Admission, admission};
 
@@ -20,9 +21,11 @@ const MAX_DEBOUNCE: Duration = Duration::from_millis(500);
 /// How often an idle watcher thread checks whether it was asked to stop.
 const IDLE_POLL: Duration = Duration::from_millis(100);
 
-/// Keeps the watcher running; dropping it stops it.
+/// Keeps the watcher running; dropping it stops it (and [`Index::watching`] turns false).
 pub struct WatchHandle {
     stop: Arc<AtomicBool>,
+    id: u64,
+    inner: Arc<Inner>,
     // Held for its Drop: closing the OS watch disconnects the event channel.
     _watcher: RecommendedWatcher,
 }
@@ -30,6 +33,7 @@ pub struct WatchHandle {
 impl Drop for WatchHandle {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
+        self.inner.fresh.watcher_stopped(self.id);
     }
 }
 
@@ -47,6 +51,10 @@ impl Index {
     /// while the workspace contains symlinks (the OS reports the target's path, not its
     /// aliases). Must be called inside a Tokio runtime, which the watcher thread borrows
     /// for the index's async work.
+    ///
+    /// [`Index::watching`] is true from here until the handle is dropped, the watcher
+    /// thread ends, or the OS watcher reports an error (it may have missed changes).
+    /// Cookies written by [`Index::refresh_stale_in_background`] are answered here.
     pub fn start_watcher(self: Arc<Self>) -> Result<WatchHandle, IndexError> {
         let runtime = Handle::try_current()
             .map_err(|_| IndexError::Task("start_watcher needs a Tokio runtime".into()))?;
@@ -56,12 +64,22 @@ impl Index {
         watcher.watch(&root, RecursiveMode::Recursive)?;
         let stop = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&stop);
-        std::thread::Builder::new()
+        let id = self.inner.fresh.watcher_started();
+        let inner = Arc::clone(&self.inner);
+        let spawned = std::thread::Builder::new()
             .name("hx-index-watch".into())
-            .spawn(move || run(&self, &root, &rx, &flag, &runtime))
-            .map_err(IndexError::Io)?;
+            .spawn(move || {
+                run(&self, &root, &rx, &flag, &runtime, id);
+                self.inner.fresh.watcher_stopped(id);
+            });
+        if let Err(e) = spawned {
+            inner.fresh.watcher_stopped(id);
+            return Err(IndexError::Io(e));
+        }
         Ok(WatchHandle {
             stop,
+            id,
+            inner,
             _watcher: watcher,
         })
     }
@@ -73,6 +91,11 @@ struct Batch {
     paths: BTreeSet<PathBuf>,
     /// The OS watcher lost track of something: resync whatever the paths are.
     refresh: bool,
+    /// The OS watcher reported an error: it can no longer vouch for having seen every
+    /// change.
+    failed: bool,
+    /// Cookies seen (see [`Index::refresh_stale_in_background`]).
+    cookies: Vec<u64>,
 }
 
 impl Batch {
@@ -82,6 +105,7 @@ impl Batch {
             // The watcher lost track of something (queue overflow, limits): resync.
             Err(_) => {
                 self.refresh = true;
+                self.failed = true;
                 return;
             }
         };
@@ -95,7 +119,9 @@ impl Batch {
             let Ok(rel) = path.strip_prefix(root) else {
                 continue;
             };
-            if !rel.as_os_str().is_empty() {
+            if let Some(id) = cookie_id(rel) {
+                self.cookies.push(id);
+            } else if !rel.as_os_str().is_empty() {
                 self.paths.insert(rel.to_path_buf());
             }
         }
@@ -108,6 +134,7 @@ fn run(
     rx: &Receiver<notify::Result<Event>>,
     stop: &AtomicBool,
     runtime: &Handle,
+    id: u64,
 ) {
     loop {
         let first = match rx.recv_timeout(IDLE_POLL) {
@@ -118,7 +145,8 @@ fn run(
         let mut batch = Batch::default();
         batch.add(root, first);
         let give_up = Instant::now() + MAX_DEBOUNCE;
-        while Instant::now() < give_up {
+        // A cookie comes after everything it vouches for: no need to wait for more.
+        while Instant::now() < give_up && batch.cookies.is_empty() {
             match rx.recv_timeout(DEBOUNCE) {
                 Ok(e) => batch.add(root, e),
                 Err(_) => break,
@@ -126,6 +154,9 @@ fn run(
         }
         if stop.load(Ordering::Acquire) {
             return;
+        }
+        if batch.failed {
+            index.inner.fresh.watcher_stopped(id);
         }
         runtime.block_on(process(index, batch, stop));
     }
@@ -235,6 +266,12 @@ async fn process(index: &Index, batch: Batch, stop: &AtomicBool) {
     resync |= inner.has_links() && !work.is_empty();
     if resync && !stop.load(Ordering::Acquire) && index.refresh().await.is_ok() {
         let _ = index.build_trigrams().await;
+    }
+    // Everything that happened before these cookies were written is processed now.
+    for id in batch.cookies {
+        inner.fresh.cookie_seen(id);
+        let rel = cookie_path(id);
+        let _ = inner.sb.remove_file(&rel).await;
     }
 }
 
