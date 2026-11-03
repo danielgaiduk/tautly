@@ -129,6 +129,21 @@ impl Fx {
     fn ledger(&self) -> Ledger {
         Ledger::open(&self.home.path().join("ledger.sqlite")).unwrap()
     }
+
+    /// The ledger's totals once it holds `n` rows (rows are written in the background).
+    async fn ledger_rows(&self, n: u64) -> tautly_core::Totals {
+        let end = Instant::now() + WAIT;
+        loop {
+            if let Ok(t) = self.ledger().totals(UNIX_EPOCH)
+                && t.requests >= n
+            {
+                assert_eq!(t.requests, n, "{t:?}");
+                return t;
+            }
+            assert!(Instant::now() < end, "the ledger never reached {n} rows");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
 }
 
 struct Run {
@@ -828,8 +843,8 @@ async fn usage_event_includes_cost_and_quota() {
     assert_eq!(got[0].2, Some(quota));
     assert_eq!((got[0].3, got[0].4), (1000, 5000));
 
-    // The same response is in the ledger before the turn is reported finished.
-    let t = fx.ledger().totals(UNIX_EPOCH).unwrap();
+    // The same response reaches the ledger (written in the background).
+    let t = fx.ledger_rows(1).await;
     assert_eq!(t.requests, 1);
     assert_eq!(t.tokens(), 6300);
     assert!((t.usd - expected).abs() < 1e-12, "{}", t.usd);
@@ -860,7 +875,7 @@ async fn usage_of_a_discarded_attempt_counts_in_ledger_and_budget() {
     // 330 of 400 tokens: only the sum of both attempts reaches 80%.
     let w = budget_warnings(&events);
     assert_eq!(w.len(), 1, "{w:?}");
-    let t = fx.ledger().totals(UNIX_EPOCH).unwrap();
+    let t = fx.ledger_rows(2).await;
     assert_eq!((t.requests, t.tokens()), (2, 330));
 }
 
@@ -910,7 +925,7 @@ async fn usage_of_a_stream_broken_mid_way_is_estimated_and_counted() {
     assert!(u[0].1 > 20, "{u:?}");
     assert!(u[0].2, "the broken attempt is marked estimated");
     assert_eq!(u[1], (1000, 20, false));
-    let t = fx.ledger().totals(UNIX_EPOCH).unwrap();
+    let t = fx.ledger_rows(2).await;
     assert_eq!((t.requests, t.estimated), (2, 1));
     assert_eq!(t.input, 2000);
 }
@@ -929,7 +944,7 @@ async fn a_cancelled_request_counts_its_estimated_input() {
     let u = usage_events(&events);
     assert_eq!(u.len(), 1, "{events:?}");
     assert!(u[0].0 > 0 && u[0].2, "{u:?}");
-    let t = fx.ledger().totals(UNIX_EPOCH).unwrap();
+    let t = fx.ledger_rows(1).await;
     assert_eq!((t.requests, t.estimated), (1, 1));
 }
 
@@ -945,7 +960,7 @@ async fn usage_of_an_attempt_the_retry_wrapper_discarded_is_counted() {
     let events = run.turn_with("go").await;
     assert_eq!(finish_reason(&events), FinishReason::Completed);
     assert_eq!(mock.requests().len(), 2);
-    let t = fx.ledger().totals(UNIX_EPOCH).unwrap();
+    let t = fx.ledger_rows(2).await;
     assert_eq!((t.requests, t.input, t.estimated), (2, 1000, 0));
     // The calibrated context status comes from the completed response only.
     assert_eq!(usage_events(&events).last(), Some(&(300, 5, false)));
@@ -995,7 +1010,7 @@ async fn a_corrupt_ledger_is_moved_aside_with_one_warning_and_recording_goes_on(
         .collect();
     assert_eq!(about_ledger.len(), 1, "{about_ledger:?}");
     assert!(about_ledger[0].contains("corrupt"), "{about_ledger:?}");
-    assert_eq!(fx.ledger().totals(UNIX_EPOCH).unwrap().requests, 2);
+    fx.ledger_rows(2).await;
 }
 
 #[tokio::test]
@@ -1026,6 +1041,35 @@ async fn a_locked_ledger_does_not_delay_the_session_and_its_rows_arrive_later() 
         assert!(Instant::now() < end, "the buffered row never arrived");
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+}
+
+#[tokio::test]
+async fn a_held_ledger_lock_does_not_slow_a_cancel() {
+    let fx = Fx::new();
+    let mock = MockProvider::new(vec![text_step("one", tokens(10, 2)), MockTurn::Stall]);
+    let mut run = start(fx.builder(config(true), &mock));
+    run.turn_with("first").await;
+    fx.ledger_rows(1).await;
+    // Another process now holds the write lock of the (WAL) ledger.
+    let holder = rusqlite::Connection::open(fx.home.path().join("ledger.sqlite")).unwrap();
+    holder.execute_batch("BEGIN IMMEDIATE;").unwrap();
+    run.say("second").await;
+    run.until(|e| matches!(e, Event::TurnStarted)).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let t0 = Instant::now();
+    run.send(Command::Cancel).await;
+    let events = run.turn().await;
+    let took = t0.elapsed();
+    assert_eq!(finish_reason(&events), FinishReason::Cancelled);
+    assert!(
+        took < Duration::from_millis(250),
+        "TurnFinished after {took:?}"
+    );
+    holder.execute_batch("COMMIT;").unwrap();
+    drop(holder);
+    // The cancelled request's estimated row arrives once the lock is gone.
+    let t = fx.ledger_rows(2).await;
+    assert_eq!(t.estimated, 1);
 }
 
 // ---- signals ---------------------------------------------------------------------------

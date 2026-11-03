@@ -309,10 +309,9 @@ pub(crate) struct Session {
     pub budgets: Arc<Mutex<Budgets>>,
     /// Wall-clock limit per user message.
     pub turn_timeout: Option<Duration>,
-    /// The cost ledger file; opened in the background at [`Session::init`].
-    pub cost_ledger_path: PathBuf,
+    /// Its background writer starts at [`Session::init`].
     pub cost_ledger: CostLedger,
-    /// A lost ledger row was reported; later ones are not.
+    /// A dropped ledger row was reported; later ones are not.
     pub cost_ledger_reported: bool,
     /// The process groups this session's commands started (killed at shutdown).
     pub groups: ProcessGroups,
@@ -400,7 +399,7 @@ impl Session {
         }
     }
 
-    /// A usage row could not be written: said once; the ledger stays in use.
+    /// A usage row was dropped: said once; the ledger stays in use.
     pub async fn ledger_row_lost(&mut self, why: String) {
         if !std::mem::replace(&mut self.cost_ledger_reported, true) {
             self.warn(format!(
@@ -418,18 +417,7 @@ impl Session {
         let root = self.sandbox.root().to_path_buf();
         tokio::task::spawn_blocking(move || cleanup_spills(&root, SPILL_MAX_AGE, SPILL_MAX_BYTES));
         // Off the start path: another process may hold the file for seconds.
-        let (ledger, path, events) = (
-            self.cost_ledger.clone(),
-            self.cost_ledger_path.clone(),
-            self.events.clone(),
-        );
-        tokio::spawn(async move {
-            if let Ok(notes) = tokio::task::spawn_blocking(move || ledger.open(&path)).await {
-                for n in notes {
-                    events.warn(n).await;
-                }
-            }
-        });
+        self.cost_ledger.start(self.events.clone());
         for pin in config_pins {
             pinned::add(
                 &mut self.context.pinned,

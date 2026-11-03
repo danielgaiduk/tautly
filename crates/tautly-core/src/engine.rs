@@ -221,8 +221,7 @@ impl EngineBuilder {
             session_id: session_id.clone(),
             budgets: Arc::clone(&budgets),
             turn_timeout: config.turn_timeout_s.map(Duration::from_secs),
-            cost_ledger_path: data_home.join(LEDGER_FILE),
-            cost_ledger: CostLedger::opening(),
+            cost_ledger: CostLedger::new(data_home.join(LEDGER_FILE)),
             cost_ledger_reported: false,
             groups: groups.clone(),
         };

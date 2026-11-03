@@ -717,11 +717,11 @@ impl Session {
         self.spend(role, u, resp.quota.clone(), estimated).await;
     }
 
-    /// Account for one provider response: the ledger first, then `Usage`, then the budgets
-    /// (whose 80% and exhausted warnings follow the `Usage` that caused them).
+    /// Account for one provider response: queue its ledger row, emit `Usage`, then count it
+    /// against the budgets (whose 80% and exhausted warnings follow the `Usage`).
     async fn spend(&mut self, role: UsageRole, u: RawUsage, quota: Option<Quota>, estimated: bool) {
         let cost = cost_usd(&u, self.info.price.as_ref());
-        let ledger = self.cost_ledger.clone();
+        // Queued for the background writer: never waits (not even on the cancel path).
         let row = Row {
             session: self.session_id.clone(),
             model: self.model.clone(),
@@ -729,10 +729,8 @@ impl Session {
             cost,
             estimated,
         };
-        match tokio::task::spawn_blocking(move || ledger.record(row)).await {
-            Ok(Ok(())) => {}
-            Ok(Err(why)) => self.ledger_row_lost(why).await,
-            Err(e) => self.ledger_row_lost(e.to_string()).await,
+        if let Err(why) = self.cost_ledger.record(row) {
+            self.ledger_row_lost(why).await;
         }
         self.emit(Event::Usage {
             role,

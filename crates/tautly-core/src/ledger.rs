@@ -1,12 +1,15 @@
 //! The cost ledger (spec 4.6): one SQLite row per provider response, across sessions and
 //! processes, at `<data home>/ledger.sqlite`.
 
-use std::path::Path;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, params};
 use tautly_provider::{ModelId, RawUsage};
+
+use crate::protocol::Event;
+use crate::session::EventSink;
 
 /// The ledger's file name in the data home.
 pub const LEDGER_FILE: &str = "ledger.sqlite";
@@ -303,7 +306,7 @@ fn unix_ms(t: SystemTime) -> i64 {
         .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
 }
 
-/// Most rows kept while the ledger is still opening.
+/// Rows queued for the writer; past this a row is dropped (and said once).
 const PENDING_ROWS: usize = 1000;
 
 /// One row on its way to the ledger.
@@ -315,85 +318,75 @@ pub(crate) struct Row {
     pub estimated: bool,
 }
 
-enum Slot {
-    /// Opening in the background; rows wait here.
-    Opening(Vec<Row>),
-    Open(Arc<Ledger>),
-    /// Could not be opened (said once); rows are dropped.
-    Off,
-}
-
-/// A session's way to the ledger: opened off the start path, rows recorded meanwhile are
-/// kept (up to [`PENDING_ROWS`]) and written once it is open. A failed write loses only
-/// that row; the handle stays in use.
-#[derive(Clone)]
+/// A session's way to the ledger. Rows go to a background writer that opens the ledger
+/// (off the start path) and writes them in order, so recording never waits on the file:
+/// not at start, not on the cancel path, not while another process holds the lock. A
+/// failed write loses only that row; the writer goes on.
 pub(crate) struct CostLedger {
-    slot: Arc<Mutex<Slot>>,
+    tx: std::sync::mpsc::SyncSender<Row>,
+    /// Taken by [`CostLedger::start`].
+    pending: Mutex<Option<(std::sync::mpsc::Receiver<Row>, PathBuf)>>,
 }
 
 impl CostLedger {
-    pub fn opening() -> Self {
+    pub fn new(path: PathBuf) -> Self {
+        let (tx, rx) = std::sync::mpsc::sync_channel(PENDING_ROWS);
         CostLedger {
-            slot: Arc::new(Mutex::new(Slot::Opening(Vec::new()))),
+            tx,
+            pending: Mutex::new(Some((rx, path))),
         }
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, Slot> {
-        self.slot.lock().unwrap_or_else(PoisonError::into_inner)
-    }
-
-    /// Open `path` and write the rows that waited. Blocking. Returns what the user should
-    /// be told.
-    pub fn open(&self, path: &Path) -> Vec<String> {
-        let mut notes = Vec::new();
-        let ledger = match Ledger::open_recovering(path) {
-            Ok((ledger, n)) => {
-                notes.extend(n);
-                Arc::new(ledger)
-            }
-            Err(e) => {
-                *self.lock() = Slot::Off;
-                notes.push(format!(
-                    "the cost ledger is unavailable ({e}); this session's usage is not recorded"
-                ));
-                return notes;
-            }
+    /// Start the writer (once; inside a Tokio runtime). What the user should be told (the
+    /// ledger moved aside, unavailable, rows lost) goes to `events`.
+    pub fn start(&self, events: EventSink) {
+        let Some((rx, path)) = self
+            .pending
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+        else {
+            return;
         };
-        // Rows that arrive while the waiting ones are written queue up behind them.
-        loop {
-            let pending = match &mut *self.lock() {
-                Slot::Opening(rows) if !rows.is_empty() => std::mem::take(rows),
-                slot => {
-                    *slot = Slot::Open(Arc::clone(&ledger));
-                    break;
+        tokio::task::spawn_blocking(move || {
+            let warn = |message: String| events.try_emit(Event::Warning { message });
+            let ledger = match Ledger::open_recovering(&path) {
+                Ok((ledger, notes)) => {
+                    notes.into_iter().for_each(warn);
+                    ledger
+                }
+                Err(e) => {
+                    warn(format!(
+                        "the cost ledger is unavailable ({e}); this session's usage is not \
+                         recorded"
+                    ));
+                    return;
                 }
             };
-            let failed = pending
-                .iter()
-                .filter(|r| write(&ledger, r).is_err())
-                .count();
-            if failed > 0 {
-                notes.push(format!(
-                    "{failed} usage row(s) could not be written to the cost ledger"
-                ));
+            let mut reported = false;
+            // Ends when the session (the sender) is gone and every queued row is written.
+            while let Ok(row) = rx.recv() {
+                if let Err(e) = write(&ledger, &row)
+                    && !std::mem::replace(&mut reported, true)
+                {
+                    warn(format!(
+                        "a usage row could not be written to the cost ledger ({e}); later \
+                         rows are still recorded, and further failures are not reported"
+                    ));
+                }
             }
-        }
-        notes
+        });
     }
 
-    /// Record one row. Blocking when the ledger is open. An error says the row was lost.
+    /// Queue one row; never waits. An error says it was dropped (the writer is too far
+    /// behind). After the ledger turned out unavailable, rows are dropped silently.
     pub fn record(&self, row: Row) -> std::result::Result<(), String> {
-        let ledger = match &mut *self.lock() {
-            Slot::Opening(rows) => {
-                if rows.len() < PENDING_ROWS {
-                    rows.push(row);
-                }
-                return Ok(());
-            }
-            Slot::Off => return Ok(()),
-            Slot::Open(l) => Arc::clone(l),
-        };
-        write(&ledger, &row).map_err(|e| e.to_string())
+        match self.tx.try_send(row) {
+            Ok(()) | Err(std::sync::mpsc::TrySendError::Disconnected(_)) => Ok(()),
+            Err(std::sync::mpsc::TrySendError::Full(_)) => Err(format!(
+                "{PENDING_ROWS} rows are waiting for the cost ledger, so this one was dropped"
+            )),
+        }
     }
 }
 
