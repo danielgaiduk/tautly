@@ -312,20 +312,16 @@ impl Index {
     /// most referenced first (ties by name). Only names the index has a non-method
     /// definition for count: identifiers like `self` or library calls are not symbols of
     /// this repository, and method names (`new`, `len`) are shared noise. The cap is
-    /// applied in SQL.
-    pub fn top_referenced(&self, limit: usize) -> Vec<(String, u64)> {
+    /// applied in SQL; a database error is returned, not folded into an empty list.
+    pub fn top_referenced(&self, limit: usize) -> Result<Vec<(String, u64)>, IndexError> {
         let conn = self.inner.conn();
-        let Ok(mut stmt) = conn.prepare_cached(
+        let mut stmt = conn.prepare_cached(
             "SELECT r.name, COUNT(*) AS n FROM refs r \
              WHERE r.name IN (SELECT name FROM symbols WHERE kind != 'method') \
              GROUP BY r.name ORDER BY n DESC, r.name ASC LIMIT ?1",
-        ) else {
-            return Vec::new();
-        };
-        let Ok(rows) = stmt.query_map([limit as i64], |r| Ok((r.get(0)?, r.get(1)?))) else {
-            return Vec::new();
-        };
-        rows.filter_map(Result::ok).collect()
+        )?;
+        let rows = stmt.query_map([limit as i64], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(rows.collect::<Result<_, _>>()?)
     }
 
     /// The workspace root the index reads from.

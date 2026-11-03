@@ -797,7 +797,7 @@ async fn top_referenced_ranks_defined_symbols_by_reference_count() {
     ]);
     idx.refresh().await.unwrap();
 
-    let top = idx.top_referenced(10);
+    let top = idx.top_referenced(10).unwrap();
     // Widget is referenced most (impl, return type and body in a.rs, twice in b.rs).
     let names: Vec<&str> = top.iter().map(|(n, _)| n.as_str()).collect();
     assert_eq!(names.first().copied(), Some("Widget"));
@@ -812,6 +812,6 @@ async fn top_referenced_ranks_defined_symbols_by_reference_count() {
     let helper = top.iter().find(|(n, _)| n == "helper").unwrap().1;
     assert_eq!(helper, idx.refs("helper", 100).unwrap().len() as u64);
     // The cap is honored.
-    assert_eq!(idx.top_referenced(1).len(), 1);
-    assert!(idx.top_referenced(0).is_empty());
+    assert_eq!(idx.top_referenced(1).unwrap().len(), 1);
+    assert!(idx.top_referenced(0).unwrap().is_empty());
 }

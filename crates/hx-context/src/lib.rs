@@ -7,6 +7,7 @@ pub mod blocks;
 pub mod pinned;
 pub mod prompt;
 pub mod repo_map;
+pub mod sanitize;
 pub mod state;
 pub mod tokens;
 
@@ -61,10 +62,25 @@ impl Context {
 
     /// Build the repo map from `index` and keep it for the rest of the session. The engine
     /// calls this once at session start, off the startup path (see [`repo_map::build`]);
-    /// [`Context::assemble`] only renders the stored text and never rebuilds it.
-    pub fn init_repo_map(&mut self, index: &hx_index::Index) {
-        let map = repo_map::build(index, &self.tokens, repo_map::BUDGET);
-        self.repo_map = Some(map).filter(|m| !m.is_empty());
+    /// [`Context::assemble`] only renders the stored text and never rebuilds it. The map is
+    /// set once: a later call changes nothing and returns false, as does a call that finds
+    /// nothing to map yet (an empty workspace), which leaves the slot free. The budget is
+    /// for the whole rendered block, tag wrapper included.
+    pub fn init_repo_map(&mut self, index: &hx_index::Index) -> bool {
+        if self.repo_map.is_some() {
+            return false;
+        }
+        let wrapper = self
+            .tokens
+            .estimate(&assemble::tagged("repo_map", Some("x")));
+        // One more for the rounding of the two estimates.
+        let budget = repo_map::BUDGET.saturating_sub(wrapper + 1);
+        let map = repo_map::build(index, &self.tokens, budget);
+        if map.is_empty() {
+            return false;
+        }
+        self.repo_map = Some(map);
+        true
     }
 
     /// Apply a `pin` or `state` tool call.

@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 
 use hx_tools::{AppliedEffect, PlanStep, StatePatch, StepStatus};
 
+use crate::sanitize;
 use crate::tokens::TokenEstimator;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -135,10 +136,13 @@ impl WorkingState {
         if !self.files.is_empty() {
             out.push_str("files:\n");
             for (path, note) in &self.files {
-                let shown = root
-                    .and_then(|r| path.strip_prefix(r).ok())
-                    .unwrap_or(path)
-                    .display();
+                // Paths are repo-controlled: escaped so one cannot end the block.
+                let shown = sanitize::escape(
+                    &root
+                        .and_then(|r| path.strip_prefix(r).ok())
+                        .unwrap_or(path)
+                        .to_string_lossy(),
+                );
                 let mut tags = Vec::new();
                 if note.deleted {
                     tags.push("deleted".to_string());

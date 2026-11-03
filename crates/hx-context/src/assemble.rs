@@ -162,7 +162,7 @@ impl Context {
 }
 
 /// `<tag>\ntext\n</tag>`; an empty tag when there is no text.
-fn tagged(tag: &str, text: Option<&str>) -> String {
+pub(crate) fn tagged(tag: &str, text: Option<&str>) -> String {
     match text.map(str::trim).filter(|t| !t.is_empty()) {
         Some(t) => format!("<{tag}>\n{t}\n</{tag}>"),
         None => format!("<{tag}></{tag}>"),

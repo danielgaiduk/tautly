@@ -8,11 +8,14 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 use hx_index::{DirInfo, Index, Lang};
 
+use crate::sanitize;
 use crate::tokens::TokenEstimator;
 
-/// Token budget of the whole map.
+/// Token budget of the rendered `<repo_map>` block, wrapper included ([`crate::Context::init_repo_map`]
+/// takes the wrapper off before calling [`build`]).
 pub const BUDGET: u32 = 400;
 
 /// How long [`build`] waits for the index's first refresh before using the tree as loaded
@@ -22,7 +25,13 @@ const READY_POLL: Duration = Duration::from_millis(10);
 /// Directory levels listed below the root.
 const DIR_DEPTH: usize = 2;
 const MAX_LANGS: usize = 6;
-const MAX_DIRS: usize = 16;
+/// Top-level directories listed (largest first); the budget cuts further.
+const MAX_TOP_DIRS: usize = 64;
+/// Nested directories listed after all top-level ones.
+const MAX_NESTED_DIRS: usize = 16;
+/// Workspace `members` / `exclude` patterns considered; a manifest can hold thousands and
+/// each is compiled, so the rest are ignored.
+const MAX_PATTERNS: usize = 256;
 const MAX_DIR_LANGS: usize = 3;
 const MAX_LIST: usize = 8;
 const MAX_MEMBERS: usize = 24;
@@ -124,20 +133,28 @@ fn languages(total: usize, root_files: &[hx_index::FileEntry], dirs: &[DirInfo])
     }
 }
 
+/// Every top-level directory first (most files first, then name), then nested ones as a
+/// lower-priority tail, which the budget drops before any top-level line.
 fn directories(dirs: &[DirInfo]) -> Section {
-    let mut dirs: Vec<&DirInfo> = dirs.iter().collect();
-    dirs.sort_by(|a, b| b.files.cmp(&a.files).then(a.path.cmp(&b.path)));
-    let items = dirs
+    let mut ranked: Vec<(&DirInfo, String)> = dirs
+        .iter()
+        .filter_map(|d| Some((d, clean_path(&d.path)?)))
+        .collect();
+    ranked.sort_by(|a, b| b.0.files.cmp(&a.0.files).then(a.1.cmp(&b.1)));
+    let (top, nested): (Vec<_>, Vec<_>) = ranked
         .into_iter()
-        .take(MAX_DIRS)
-        .map(|d| {
+        .partition(|(d, _)| d.path.components().count() == 1);
+    let items = top
+        .into_iter()
+        .take(MAX_TOP_DIRS)
+        .chain(nested.into_iter().take(MAX_NESTED_DIRS))
+        .map(|(d, name)| {
             let langs: Vec<String> = d
                 .langs
                 .iter()
                 .take(MAX_DIR_LANGS)
                 .map(|(l, n): &(Lang, usize)| format!("{} {n}", l.as_str()))
                 .collect();
-            let name = slashed(&d.path);
             if langs.is_empty() {
                 format!("{name}/ {}", d.files)
             } else {
@@ -169,17 +186,17 @@ fn entry_points(index: &Index) -> Section {
                 .then(a.cmp(b))
         });
         parents.dedup();
-        if !parents.is_empty() {
-            let names: Vec<String> = parents
-                .iter()
-                .map(|p| {
-                    if p.as_os_str().is_empty() {
-                        ".".into()
-                    } else {
-                        slashed(p)
-                    }
-                })
-                .collect();
+        let names: Vec<String> = parents
+            .iter()
+            .filter_map(|p| {
+                if p.as_os_str().is_empty() {
+                    Some(".".to_string())
+                } else {
+                    clean_path(p)
+                }
+            })
+            .collect();
+        if !names.is_empty() {
             items.push(format!("{name}: {}", capped(names, MAX_LIST)));
         }
     }
@@ -196,41 +213,46 @@ fn entry_points(index: &Index) -> Section {
     }
 }
 
-/// `[workspace] members` of the root `Cargo.toml`, patterns expanded against the tree and
-/// grouped by parent directory (`crates/{a,b}`).
+/// `[workspace] members` (minus `exclude`) of the root `Cargo.toml`, matched in one pass
+/// against the directories that hold a `Cargo.toml` in the tree, and grouped by parent
+/// directory (`crates/{a,b}`). At most [`MAX_PATTERNS`] patterns of each list are used.
 fn workspace_members(index: &Index) -> Option<String> {
     let text = read_manifest(index, "Cargo.toml")?;
     let manifest: toml::Table = text.parse().ok()?;
-    let patterns = manifest.get("workspace")?.get("members")?.as_array()?;
-    let tree = index.tree();
-    let mut dirs: Vec<PathBuf> = Vec::new();
-    for pattern in patterns.iter().filter_map(toml::Value::as_str) {
-        let pattern = pattern.trim_start_matches("./").trim_end_matches('/');
-        if pattern.is_empty() {
-            continue;
-        }
-        for manifest in tree.glob(&format!("{pattern}/Cargo.toml"), Path::new("")) {
-            if let Some(dir) = manifest.parent().filter(|d| !d.as_os_str().is_empty()) {
-                dirs.push(dir.to_path_buf());
-            }
-        }
-    }
+    let workspace = manifest.get("workspace")?;
+    let members = pattern_set(workspace.get("members"))?;
+    let exclude = pattern_set(workspace.get("exclude"));
+
+    let mut dirs: Vec<PathBuf> = index
+        .tree()
+        .glob("Cargo.toml", Path::new(""))
+        .into_iter()
+        .filter_map(|m| m.parent().map(Path::to_path_buf))
+        .filter(|d| !d.as_os_str().is_empty())
+        .filter(|d| members.is_match(d) && !exclude.as_ref().is_some_and(|e| e.is_match(d)))
+        .collect();
     dirs.sort();
     dirs.dedup();
+    dirs.retain(|d| clean_path(d).is_some());
     if dirs.is_empty() {
         return None;
     }
     let extra = dirs.len().saturating_sub(MAX_MEMBERS);
-    dirs.truncate(MAX_MEMBERS);
     // Group by parent in path order; BTreeMap keeps the groups sorted.
     let mut groups: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    for dir in &dirs {
-        let parent = dir.parent().map(slashed).unwrap_or_default();
-        let name = dir.file_name().map(|n| n.to_string_lossy().into_owned());
+    for dir in dirs.iter().take(MAX_MEMBERS) {
+        let parent = dir
+            .parent()
+            .map(|p| clean_path(p).unwrap_or_default())
+            .unwrap_or_default();
+        let name = dir
+            .file_name()
+            .and_then(|n| sanitize::clean(&n.to_string_lossy()));
         groups.entry(parent).or_default().extend(name);
     }
     let mut parts: Vec<String> = groups
         .into_iter()
+        .filter(|(_, names)| !names.is_empty())
         .map(
             |(parent, names)| match (parent.is_empty(), names.as_slice()) {
                 (true, _) => names.join(", "),
@@ -245,15 +267,36 @@ fn workspace_members(index: &Index) -> Option<String> {
     Some(parts.join(", "))
 }
 
+/// The first [`MAX_PATTERNS`] strings of a TOML array as one path matcher (`*` does not
+/// cross `/`); invalid patterns are skipped. None when there is no array or no pattern.
+fn pattern_set(value: Option<&toml::Value>) -> Option<GlobSet> {
+    let mut builder = GlobSetBuilder::new();
+    let mut any = false;
+    for pattern in value?
+        .as_array()?
+        .iter()
+        .filter_map(toml::Value::as_str)
+        .take(MAX_PATTERNS)
+    {
+        let pattern = pattern.trim_start_matches("./").trim_end_matches('/');
+        if let Ok(glob) = GlobBuilder::new(pattern).literal_separator(true).build() {
+            builder.add(glob);
+            any = true;
+        }
+    }
+    any.then(|| builder.build().ok()).flatten()
+}
+
 /// The keys of the root `package.json` `scripts` object, sorted.
 fn package_scripts(index: &Index) -> Option<String> {
     let text = read_manifest(index, "package.json")?;
     let value: serde_json::Value = serde_json::from_str(&text).ok()?;
     let mut names: Vec<String> = value.get("scripts")?.as_object()?.keys().cloned().collect();
+    names.sort();
+    let names: Vec<String> = names.iter().filter_map(|n| sanitize::clean(n)).collect();
     if names.is_empty() {
         return None;
     }
-    names.sort();
     Some(capped(names, MAX_SCRIPTS))
 }
 
@@ -263,8 +306,9 @@ fn key_symbols(index: &Index) -> Section {
         inline: true,
         items: index
             .top_referenced(MAX_SYMBOLS)
+            .unwrap_or_default()
             .into_iter()
-            .map(|(name, n)| format!("{name} {n}"))
+            .filter_map(|(name, n)| Some(format!("{} {n}", sanitize::clean(&name)?)))
             .collect(),
     }
 }
@@ -300,9 +344,11 @@ fn capped(mut names: Vec<String>, max: usize) -> String {
     out
 }
 
-fn slashed(p: &Path) -> String {
-    p.components()
-        .map(|c| c.as_os_str().to_string_lossy())
-        .collect::<Vec<_>>()
-        .join("/")
+/// A root-relative path as `a/b`, or None if any component is unsafe to show.
+fn clean_path(p: &Path) -> Option<String> {
+    let parts: Option<Vec<String>> = p
+        .components()
+        .map(|c| sanitize::clean(&c.as_os_str().to_string_lossy()))
+        .collect();
+    parts.map(|parts| parts.join("/"))
 }
