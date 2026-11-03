@@ -145,11 +145,12 @@ fn text_step(text: &str, u: RawUsage) -> MockTurn {
 fn runner(mock: &MockProvider) -> (SideRunner, mpsc::Receiver<SideUsage>) {
     let (tx, rx) = mpsc::channel(8);
     (
-        SideRunner {
-            provider: Arc::new(mock.clone()),
-            model: ModelId::from("mock/small"),
-            usage: tx,
-        },
+        SideRunner::new(
+            Arc::new(mock.clone()),
+            ModelId::from("mock/small"),
+            tx,
+            16_000,
+        ),
         rx,
     )
 }
@@ -158,6 +159,8 @@ fn runner(mock: &MockProvider) -> (SideRunner, mpsc::Receiver<SideUsage>) {
 async fn the_runner_sends_one_bare_request_and_reports_its_usage() {
     let mock = MockProvider::new(vec![text_step("  the answer \n", usage(120, 8))]);
     let (side, mut rx) = runner(&mock);
+    // About three bytes a token of the 16,000-token window, less room for the answer.
+    assert_eq!(side.max_input_bytes(), (16_000 - 2_500) * 3);
     let answer = side.complete("SYSTEM", "USER", 321).await.unwrap();
     assert_eq!(answer, "the answer");
     let reqs = mock.requests();
@@ -210,6 +213,16 @@ const MAIN_PRICE: &str = "input = 3.0\noutput = 15.0\ncache_read = 0.3\ncache_wr
 const SMALL_PRICE: &str = "input = 1.0\noutput = 5.0\ncache_read = 0.1\ncache_write = 1.25";
 
 fn model_toml(id: &str, tier: Option<&str>, price: Option<&str>) -> String {
+    sized_toml(id, tier, price, 16000, 1000)
+}
+
+fn sized_toml(
+    id: &str,
+    tier: Option<&str>,
+    price: Option<&str>,
+    window: u32,
+    max_output: u32,
+) -> String {
     let tier = tier
         .map(|t| format!("tier = \"{t}\"\n"))
         .unwrap_or_default();
@@ -217,7 +230,7 @@ fn model_toml(id: &str, tier: Option<&str>, price: Option<&str>) -> String {
         .map(|p| format!("[models.\"{id}\".price]\n{p}\n"))
         .unwrap_or_default();
     format!(
-        "[models.\"{id}\"]\n{tier}context_window = 16000\nmax_output = 1000\n\
+        "[models.\"{id}\"]\n{tier}context_window = {window}\nmax_output = {max_output}\n\
          parallel_tools = true\nreasoning = \"none\"\ncache = \"none\"\nimages = false\n\
          edit_format = \"str_replace\"\n{price}"
     )
@@ -615,6 +628,138 @@ async fn an_unusable_side_model_falls_back_to_the_main_model_with_a_warning() {
     );
     assert_eq!(main.requests().len(), 6);
     assert_eq!(main.requests()[4].model, ModelId::from(MAIN));
+}
+
+#[tokio::test]
+async fn compaction_is_sized_for_the_side_models_window_and_output_cap() {
+    let fx = compaction_fx();
+    // The side model has the smaller window (14,000 against 16,000) and a big output cap.
+    let toml = format!(
+        "{}{}",
+        sized_toml(MAIN, None, Some(MAIN_PRICE), 16_000, 1_000),
+        sized_toml(SMALL, Some("small"), Some(SMALL_PRICE), 14_000, 6_000)
+    );
+    let mut cfg = config(Some(SMALL_PRICE));
+    cfg.catalog_overrides = Some(Catalog::from_toml(&toml).unwrap());
+    cfg.compaction_threshold = Some(0.6);
+    let main = MockProvider::new(compaction_script());
+    let side = MockProvider::new(vec![text_step("SUMMARY-TEXT", usage(2000, 300))]);
+    let mut run = start(fx.builder(cfg, &main, &side));
+    let prompt = format!(
+        "PROMPT-MARKER {}",
+        "lorem ipsum dolor sit amet ".repeat(1200)
+    );
+    let events = run.turn_with(&prompt).await;
+    assert_eq!(
+        finish_reason(&events),
+        FinishReason::Completed,
+        "{events:?}"
+    );
+    let reqs = side.requests();
+    assert_eq!(reqs.len(), 1, "{events:?}");
+    // min(side max_output, the 4k summary cap), not the main model's 1,000.
+    assert_eq!(reqs[0].max_output, 4_096);
+    // The transcript and the reply fit the side model's window (4 bytes a token, loosely).
+    let sent = serde_json::to_string(&reqs[0]).unwrap().len() as u64 / 4;
+    assert!(sent + 4_096 <= 14_000, "{sent} tokens of request");
+}
+
+#[tokio::test]
+async fn a_failing_side_model_falls_back_to_the_main_model_once_and_stays_there() {
+    let fx = compaction_fx();
+    let mut script = compaction_script();
+    script.insert(4, text_step("SUMMARY-TEXT", usage(2000, 300)));
+    let main = MockProvider::new(script);
+    let side = MockProvider::new(vec![MockTurn::Error(ProviderError::Auth("bad key".into()))]);
+    let mut run = start(fx.builder(config(Some(SMALL_PRICE)), &main, &side));
+    let events = run.turn_with(&long_prompt()).await;
+    assert_eq!(
+        finish_reason(&events),
+        FinishReason::Completed,
+        "{events:?}"
+    );
+    // The side model was tried once; then the main model wrote the summary.
+    assert_eq!(side.requests().len(), 1);
+    let reqs = main.requests();
+    assert_eq!(reqs.len(), 6, "{events:?}");
+    assert!(request_text(&reqs[4]).contains("<transcript>"));
+    assert_eq!(reqs[4].model, ModelId::from(MAIN));
+    assert!(reqs[4].tools.is_empty());
+    assert!(request_text(&reqs[5]).contains("SUMMARY-TEXT"));
+    let w: Vec<String> = warnings(&events)
+        .into_iter()
+        .filter(|w| w.contains(SMALL))
+        .collect();
+    assert_eq!(w.len(), 1, "{w:?}");
+    assert!(
+        w[0].contains("main model") && w[0].contains("bad key"),
+        "{}",
+        w[0]
+    );
+    // The summary is billed to the main model.
+    let rows = fx.ledger_rows(2).await;
+    assert!(
+        rows.iter().all(|r| r.0 == MAIN),
+        "a refused request bills nothing: {rows:?}"
+    );
+    assert!(
+        rows.iter()
+            .any(|r| r.0 == MAIN && r.2 == 2000 && r.3 == 300),
+        "{rows:?}"
+    );
+
+    // Sticky: a later web_fetch question goes straight to the main model (no second try of
+    // the side provider), and no second warning.
+    let fx = Fx::new();
+    let main = MockProvider::new(vec![
+        tools_step(vec![call(
+            "w1",
+            "web_fetch",
+            json!({"url": "https://docs.example.test/a", "question": "first?"}),
+        )]),
+        tools_step(vec![call(
+            "w2",
+            "web_fetch",
+            json!({"url": "https://docs.example.test/b", "question": "second?"}),
+        )]),
+        text_step("ANSWER-FROM-MAIN", usage(300, 12)),
+        text_step("done", usage(100, 10)),
+    ]);
+    let side = MockProvider::new(vec![MockTurn::Error(ProviderError::Auth("bad key".into()))]);
+    let sandbox: Arc<dyn Sandbox> = Arc::new(Web(LocalSandbox::new(fx.root()).unwrap()));
+    let mut run = start(EngineBuilder {
+        sandbox: Some(sandbox),
+        ..fx.builder(config(Some(SMALL_PRICE)), &main, &side)
+    });
+    let events = run.turn_with("go").await;
+    assert_eq!(
+        finish_reason(&events),
+        FinishReason::Completed,
+        "{events:?}"
+    );
+    assert_eq!(
+        side.requests().len(),
+        1,
+        "the side provider was tried again"
+    );
+    let outputs: Vec<String> = events
+        .iter()
+        .filter_map(|e| match e {
+            Event::ToolFinished { output, .. } => Some(output.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(outputs[0].contains("could not be answered"), "{outputs:?}");
+    assert!(outputs[1].contains("ANSWER-FROM-MAIN"), "{outputs:?}");
+    let answer_req = &main.requests()[2];
+    assert!(answer_req.tools.is_empty());
+    assert_eq!(
+        warnings(&events)
+            .iter()
+            .filter(|w| w.contains(SMALL))
+            .count(),
+        1
+    );
 }
 
 // ---- web_fetch through the engine ------------------------------------------------------

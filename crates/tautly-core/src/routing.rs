@@ -8,7 +8,7 @@
 //! accounts every request like a main one, but with the side model's id and price (ledger
 //! row, `Usage{role: side}`, budgets), never the main model's.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -66,11 +66,50 @@ fn estimate(bytes: usize) -> u64 {
     bytes.div_ceil(4) as u64
 }
 
-/// A [`SideModel`] backed by a provider. Every request's usage goes to `usage`.
+/// The error says the side model itself is unusable (bad key, not available on the
+/// account, request refused): trying it again will not help, so the session falls back to
+/// the main model. Transient errors were already retried; a context overflow is about the
+/// input, not the model.
+pub(crate) fn model_failed(e: &ProviderError) -> bool {
+    matches!(
+        e,
+        ProviderError::Auth(_) | ProviderError::InvalidRequest(_) | ProviderError::Other(_)
+    )
+}
+
+/// Room kept free for the answer and the instructions when sizing input to a window.
+const WINDOW_RESERVE_TOKENS: u32 = 2_500;
+
+/// A [`SideModel`] backed by a provider. Every request's usage goes to `usage`; a request
+/// that fails with [`model_failed`] is remembered for the session
+/// ([`Side::take_failure`]).
+///
+/// Usage can be under-reported: a request that fails before any content arrives reports
+/// nothing, even if the provider billed for it.
 pub struct SideRunner {
     pub provider: Arc<dyn Provider>,
     pub model: ModelId,
     pub usage: mpsc::Sender<SideUsage>,
+    window: u32,
+    failure: Arc<Mutex<Option<String>>>,
+}
+
+impl SideRunner {
+    /// `window` is the model's context window in tokens (it sizes [`SideModel::max_input_bytes`]).
+    pub fn new(
+        provider: Arc<dyn Provider>,
+        model: ModelId,
+        usage: mpsc::Sender<SideUsage>,
+        window: u32,
+    ) -> SideRunner {
+        SideRunner {
+            provider,
+            model,
+            usage,
+            window,
+            failure: Arc::default(),
+        }
+    }
 }
 
 /// Reports what a request used, once, whichever way the request ends: complete, failed, or
@@ -113,6 +152,11 @@ impl Drop for Meter<'_> {
 
 #[async_trait]
 impl SideModel for SideRunner {
+    /// About three bytes per token of the window, less room for the answer and the prompt.
+    fn max_input_bytes(&self) -> usize {
+        self.window.saturating_sub(WINDOW_RESERVE_TOKENS) as usize * 3
+    }
+
     async fn complete(
         &self,
         system: &str,
@@ -153,6 +197,10 @@ impl SideModel for SideRunner {
                 Ok(_) => {}
                 Err(e) => {
                     meter.settle(false);
+                    if model_failed(&e) {
+                        *self.failure.lock().unwrap_or_else(PoisonError::into_inner) =
+                            Some(e.to_string());
+                    }
                     return Err(e);
                 }
             }
@@ -171,23 +219,35 @@ pub(crate) struct Side {
     /// For tools (`ToolCx::with_side`).
     pub runner: Arc<dyn SideModel>,
     pub usage: mpsc::Receiver<SideUsage>,
+    failure: Arc<Mutex<Option<String>>>,
 }
 
 impl Side {
     pub fn new(provider: Arc<dyn Provider>, model: ModelId, info: ModelInfo) -> Side {
         let (tx, usage) = mpsc::channel(USAGE_CAPACITY);
-        let runner = Arc::new(SideRunner {
-            provider: Arc::clone(&provider),
-            model: model.clone(),
-            usage: tx,
-        });
+        let runner = SideRunner::new(
+            Arc::clone(&provider),
+            model.clone(),
+            tx,
+            info.caps.context_window,
+        );
+        let failure = Arc::clone(&runner.failure);
         Side {
             provider,
             model,
             info,
-            runner,
+            runner: Arc::new(runner),
             usage,
+            failure,
         }
+    }
+
+    /// Why a tool's side request failed for good ([`model_failed`]), once.
+    pub fn take_failure(&self) -> Option<String> {
+        self.failure
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
     }
 
     /// The side route of a session whose main provider is `main` (already wrapped in

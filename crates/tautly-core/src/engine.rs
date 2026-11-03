@@ -88,7 +88,8 @@ pub struct EngineBuilder {
     pub provider: Option<Arc<dyn Provider>>,
     /// Serves the side model (spec 7.5) when it is not the main model's provider. Default:
     /// the main provider when the side model has the same provider, else an adapter built
-    /// from the configuration. Always wrapped in `Retrying`.
+    /// from the configuration (which looks up an API key and may block, like `provider`).
+    /// Always wrapped in `Retrying`.
     pub side_provider: Option<Arc<dyn Provider>>,
     /// Default: a `LocalSandbox` on the root (or the workspace's sandbox).
     pub sandbox: Option<Arc<dyn Sandbox>>,

@@ -30,8 +30,17 @@ use tokio_util::sync::CancellationToken;
 /// A cheap model for work off the main conversation: summaries, memory work and `web_fetch`
 /// answers (spec 7.5). One request, no tools, no reasoning; the answer's text comes back,
 /// and what the request cost is reported by the implementation to its owner.
+///
+/// The report can under-count: a request that fails before any content arrives is not
+/// reported even if the provider billed for it, so callers must not treat it as complete.
 #[async_trait]
 pub trait SideModel: Send + Sync {
+    /// The most input text (bytes) one request should carry, from the model's context window.
+    /// Callers that feed in arbitrary text (a fetched page) cut it to this.
+    fn max_input_bytes(&self) -> usize {
+        usize::MAX
+    }
+
     async fn complete(
         &self,
         system: &str,

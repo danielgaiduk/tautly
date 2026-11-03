@@ -34,6 +34,7 @@ use crate::approvals::Approvals;
 use crate::ledger::Row;
 use crate::protocol::{BudgetScope, Command, ErrorKind, Event, FinishReason, UsageRole};
 use crate::record::SessionRecord;
+use crate::routing::{Side, model_failed};
 use crate::session::Session;
 
 /// A response that breaks off after content is sent again at most this many times.
@@ -621,29 +622,41 @@ impl Session {
     /// (7.5), and if that fails (or the summary is not smaller) the oldest turns are dropped
     /// without a summary; never retried in a loop. True when the history changed.
     async fn compact(&mut self, reason: MutationReason, ctl: &TurnControl) -> bool {
-        // The request is sized for the side model's window.
-        let (req, removed) = self.context.compaction_request(
-            &self.side.model,
-            &self.side.info.caps,
-            DEFAULT_KEEP_RECENT,
-        );
-        if removed == 0 {
-            return false;
-        }
-        let (_, mut status) = self.assemble();
-        status.warnings.push(format!(
-            "compacting: summarizing the {removed} oldest turns"
-        ));
-        self.emit(Event::context_status(&status)).await;
-        let summary = match self.summarize(req, ctl).await {
-            Ok(s) => Some(s),
-            Err(StreamEnd::Cancelled | StreamEnd::Budget) => return false,
-            Err(StreamEnd::Failed(e)) => {
-                self.warn(format!(
-                    "the compaction summary failed ({e}); dropping the oldest turns without one"
-                ))
-                .await;
-                None
+        // A side model that is no use (bad key, not on the account) is given up for the
+        // session and the summary is asked of the main model once.
+        let mut fell_back = self.side.model == self.model;
+        let mut announced = false;
+        let (summary, removed) = loop {
+            // The request is sized for the side model's window.
+            let (req, removed) = self.context.compaction_request(
+                &self.side.model,
+                &self.side.info.caps,
+                DEFAULT_KEEP_RECENT,
+            );
+            if removed == 0 {
+                return false;
+            }
+            if !std::mem::replace(&mut announced, true) {
+                let (_, mut status) = self.assemble();
+                status.warnings.push(format!(
+                    "compacting: summarizing the {removed} oldest turns"
+                ));
+                self.emit(Event::context_status(&status)).await;
+            }
+            match self.summarize(req, ctl).await {
+                Ok(s) => break (Some(s), removed),
+                Err(StreamEnd::Cancelled | StreamEnd::Budget) => return false,
+                Err(StreamEnd::Failed(e)) if !fell_back && model_failed(&e) => {
+                    fell_back = true;
+                    self.side_to_main(&e.to_string()).await;
+                }
+                Err(StreamEnd::Failed(e)) => {
+                    self.warn(format!(
+                        "the compaction summary failed ({e}); dropping the oldest turns without one"
+                    ))
+                    .await;
+                    break (None, removed);
+                }
             }
         };
         let rec = match summary.map(|s| self.context.apply_compaction(removed, s)) {
@@ -719,10 +732,16 @@ impl Session {
             self.spend_side(u, false).await;
             return Ok(text.trim().to_string());
         }
-        // Failed or cancelled: what it reported, or an estimate, still counts.
-        let est_output = u64::from(self.context.tokens.estimate(&text));
-        let (u, estimated) = partial_usage(usage, est_input, est_output);
-        self.spend_side(u, estimated).await;
+        // Failed or cancelled: what it reported, or an estimate, still counts. A request the
+        // provider refused outright (bad key, not available) was never billed.
+        let refused = matches!(&ended, Ended::Failed(e) if model_failed(e))
+            && usage.is_none()
+            && text.is_empty();
+        if !refused {
+            let est_output = u64::from(self.context.tokens.estimate(&text));
+            let (u, estimated) = partial_usage(usage, est_input, est_output);
+            self.spend_side(u, estimated).await;
+        }
         match ended {
             Ended::Done => Ok(text.trim().to_string()),
             Ended::Cancelled => Err(StreamEnd::Cancelled),
@@ -756,9 +775,35 @@ impl Session {
     /// call. Run at tool boundaries, before the call's result is shown, so the budgets know
     /// what a call spent before the next one is admitted.
     pub(crate) async fn drain_side_usage(&mut self) {
+        self.drain_usage().await;
+        if self.side.model != self.model
+            && let Some(why) = self.side.take_failure()
+        {
+            self.side_to_main(&why).await;
+        }
+    }
+
+    async fn drain_usage(&mut self) {
         while let Ok(s) = self.side.usage.try_recv() {
             self.spend_side(s.usage, s.estimated).await;
         }
+    }
+
+    /// The side model failed for good: the main model does side work from now on, for the
+    /// rest of the session. Said once, since afterwards the side model is the main model.
+    async fn side_to_main(&mut self, why: &str) {
+        self.drain_usage().await;
+        self.warn(format!(
+            "the side model {} failed ({why}); the main model {} does side work for the rest \
+             of the session",
+            self.side.model, self.model
+        ))
+        .await;
+        self.side = Side::new(
+            Arc::clone(&self.provider),
+            self.model.clone(),
+            self.info.clone(),
+        );
     }
 
     /// Account for one provider response of `model`: queue its ledger row, emit `Usage`, then

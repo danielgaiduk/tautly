@@ -28,6 +28,8 @@ pub struct Price {
 #[serde(rename_all = "snake_case")]
 pub enum Tier {
     Small,
+    /// Only `Small` has a meaning today (side routing looks for it); `Large` marks a model
+    /// as not small, for the catalog's vocabulary.
     Large,
 }
 
