@@ -438,3 +438,25 @@ fn wrappers_with_dynamic_or_hidden_commands_are_unparseable() {
         assert!(parse_commands(s).is_ok(), "{s}");
     }
 }
+
+#[test]
+fn backquotes_in_unquoted_heredoc_bodies_are_unparseable() {
+    // The grammar keeps `...` in heredoc bodies as plain text, but bash runs it.
+    for s in [
+        "cat <<EOF\na `rm x` b\nEOF\n",
+        "cat <<-EOF\n\t`rm x`\n\tEOF\n",
+        "cat <<EOF\n${x:-`rm x`}\nEOF\n",
+    ] {
+        assert!(parse_commands(s).is_err(), "{s}");
+    }
+    // Quoted delimiters make the body literal.
+    for s in [
+        "cat <<'EOF'\n`rm x`\nEOF\n",
+        "cat <<\"EOF\"\n`rm x`\nEOF\n",
+        "cat <<\\EOF\n`rm x`\nEOF\n",
+    ] {
+        assert!(parse_commands(s).is_ok(), "{s}");
+    }
+    let c = parse_commands("cat <<EOF\n$(rm x)\nEOF\n").unwrap();
+    assert_eq!(argv0s(&c), ["cat", "rm"]);
+}

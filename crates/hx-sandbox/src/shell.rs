@@ -397,6 +397,20 @@ fn collect_redirects(
             walk_children(node, src, extra, depth)
         }
         "heredoc_redirect" => {
+            // With an unquoted delimiter bash runs `...` in the body, but the grammar
+            // keeps it as plain text, so it cannot be analyzed.
+            let quoted = node
+                .named_children(&mut node.walk())
+                .find(|c| c.kind() == "heredoc_start")
+                .is_some_and(|c| text(c, src).contains(['\'', '"', '\\']));
+            let body_has_backquote = node
+                .named_children(&mut node.walk())
+                .any(|c| c.kind() == "heredoc_body" && text(c, src).contains('`'));
+            if !quoted && body_has_backquote {
+                return Err(Unparseable(
+                    "backquote substitution in a heredoc body".into(),
+                ));
+            }
             for child in node.children(&mut cur) {
                 match child.kind() {
                     "file_redirect" | "heredoc_redirect" | "herestring_redirect" => {
