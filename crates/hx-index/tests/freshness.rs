@@ -235,3 +235,59 @@ async fn wait_ready_waits_for_the_first_refresh() {
     assert!(idx.is_ready());
     assert!(idx.wait_ready(Duration::ZERO).await);
 }
+
+// ------------------------------------------------------------------ cookie directory
+
+/// Run the post-bash check with a live watcher, so a cookie (and `.hx/tmp/.gitignore`) is
+/// written when it safely can be.
+async fn post_bash_check(fx: &Fixture) {
+    let idx = built(fx).await;
+    let _watch = Arc::clone(&idx).start_watcher().unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    idx.mark_stale();
+    idx.refresh_stale_in_background()
+        .expect("spawned")
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_cookie_directory_gets_a_gitignore() {
+    let fx = sample();
+    post_bash_check(&fx).await;
+    assert_eq!(std::fs::read(fx.path(".hx/tmp/.gitignore")).unwrap(), b"*");
+}
+
+/// A symlinked `.hx/tmp` points somewhere else in the project. The cookie is refused
+/// there, and so must be the `.gitignore`: writing it would replace the project's own file.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_symlinked_cookie_dir_does_not_get_a_gitignore_written_through_it() {
+    let fx = Fixture::new(&[
+        ("src/a.rs", "fn alpha() {}\n"),
+        (".gitignore", "target/\n"),
+        ("elsewhere/keep.txt", "x\n"),
+    ]);
+    std::fs::create_dir_all(fx.path(".hx")).unwrap();
+    // Target 1: a directory of the project; target 2: the project root itself.
+    for target in ["../elsewhere", ".."] {
+        let link = fx.path(".hx/tmp");
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(target, &link).unwrap();
+        post_bash_check(&fx).await;
+        assert!(!fx.path("elsewhere/.gitignore").exists(), "{target}");
+        assert_eq!(
+            std::fs::read_to_string(fx.path(".gitignore")).unwrap(),
+            "target/\n",
+            "{target}"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_symlinked_dot_hx_does_not_get_a_gitignore_written_through_it() {
+    let fx = Fixture::new(&[("src/a.rs", "fn alpha() {}\n"), ("real_hx/x", "x\n")]);
+    std::os::unix::fs::symlink("real_hx", fx.path(".hx")).unwrap();
+    post_bash_check(&fx).await;
+    assert!(!fx.path("real_hx/tmp/.gitignore").exists());
+    assert!(!fx.path("real_hx/tmp").exists());
+}

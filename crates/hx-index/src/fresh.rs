@@ -20,6 +20,39 @@ const COOKIE_TIMEOUT: Duration = Duration::from_secs(2);
 const COOKIE_DIR: &str = ".hx/tmp";
 const COOKIE_PREFIX: &str = "cookie-";
 
+/// What to do about the cookie directory's `.gitignore`.
+#[derive(Debug, PartialEq, Eq)]
+enum GitignorePlan {
+    /// The directory is plain (or absent) and has no `.gitignore` yet.
+    Write,
+    /// Something is already there; leave it.
+    Keep,
+}
+
+/// Whether `<root>/<ignore>` may be written, judged on the links themselves
+/// (`symlink_metadata`, never following): None when `.hx` or `.hx/tmp` is a symlink or not
+/// a directory, or cannot be inspected, so no cookie can be written there either.
+fn gitignore_plan(root: &Path, ignore: &Path) -> Option<GitignorePlan> {
+    let dir = ignore.parent()?;
+    // Each directory component of the cookie dir (`.hx`, `.hx/tmp`) must be a real
+    // directory, or not exist yet (the write creates it).
+    let mut at = PathBuf::new();
+    for part in dir.components() {
+        at.push(part);
+        match std::fs::symlink_metadata(root.join(&at)) {
+            Ok(m) if m.is_dir() => {}
+            Ok(_) => return None,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => break,
+            Err(_) => return None,
+        }
+    }
+    match std::fs::symlink_metadata(root.join(ignore)) {
+        Ok(_) => Some(GitignorePlan::Keep),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(GitignorePlan::Write),
+        Err(_) => None,
+    }
+}
+
 pub(crate) struct Freshness {
     /// Set once a refresh has completed since open; the channel wakes [`Index::wait_ready`].
     ready: watch::Sender<bool>,
@@ -245,9 +278,16 @@ impl Index {
         let sb = &self.inner.sb;
         let fresh = &self.inner.fresh;
         if !fresh.cookie_dir_ready.load(Ordering::SeqCst) {
+            // The sandbox lets a write through a symlink that stays inside the project,
+            // which would put (or replace) a `.gitignore` in whatever directory
+            // `.hx/tmp` points at. Look at the links themselves before writing.
+            let root = sb.root().to_path_buf();
             let ignore = Path::new(COOKIE_DIR).join(".gitignore");
-            let exists = sb.resolve(&ignore).ok().is_some_and(|p| p.exists());
-            if !exists {
+            let check = ignore.clone();
+            let plan = tokio::task::spawn_blocking(move || gitignore_plan(&root, &check))
+                .await
+                .ok()??;
+            if plan == GitignorePlan::Write {
                 sb.write_atomic(&ignore, b"*", None).await.ok()?;
             }
             fresh.cookie_dir_ready.store(true, Ordering::SeqCst);
