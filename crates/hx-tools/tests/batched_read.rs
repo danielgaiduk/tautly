@@ -157,7 +157,7 @@ async fn batched_read_records_each_file_in_tracker() {
         assert!(
             r.effects
                 .iter()
-                .any(|f| matches!(f, AppliedEffect::Read(p, h) if *p == full && *h == hash)),
+                .any(|f| matches!(f, AppliedEffect::Read { path, file_hash, .. } if *path == full && *file_hash == hash)),
             "{rel}"
         );
     }

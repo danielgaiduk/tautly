@@ -11,7 +11,7 @@ use crate::cap::{OUTPUT_CAP, cap_text};
 use crate::reread::small_diff;
 use crate::spec::{decode_text, parse_args, tool_spec};
 use crate::{
-    AppliedEffect, LineRange, MAX_READ_LINES, PrevRead, Tool, ToolCx, ToolError, ToolResult,
+    AppliedEffect, LineRange, MAX_READ_LINES, PrevRead, Shown, Tool, ToolCx, ToolError, ToolResult,
 };
 
 /// Most targets in one batched read.
@@ -93,6 +93,8 @@ struct Lines {
     text: String,
     /// The baseline to commit once the result is about to be returned.
     pending: Option<Pending>,
+    /// How the lines were shown, unless the output cap cuts them.
+    shown: Shown,
 }
 
 /// What the tracker records for a read, committed only if the model gets all of the output.
@@ -100,6 +102,16 @@ struct Lines {
 struct Pending(Option<PrevRead>);
 
 impl Lines {
+    /// The effect this read reports; `cut` when the output cap cut it.
+    fn effect(&self, cut: bool) -> AppliedEffect {
+        AppliedEffect::Read {
+            path: self.full.clone(),
+            range: self.range,
+            file_hash: self.hash,
+            shown: if cut { Shown::Partial } else { self.shown },
+        }
+    }
+
     /// Make this read the baseline for the next read of its range. Synchronous (all the
     /// I/O was done by `read_lines`), so it either happens whole or not at all.
     fn commit(&self, cx: &ToolCx) {
@@ -201,7 +213,9 @@ async fn read_lines(
         .join("\n");
 
     let mut pending = None;
+    let mut how = Shown::Full;
     if remaining > 0 {
+        how = Shown::Partial;
         // The window cut the range: the model sees only part of it, so neither answer
         // `unchanged` or with a diff (which would drop the continuation note), nor
         // remember it.
@@ -217,6 +231,7 @@ async fn read_lines(
             if prev.content_hash == blake3::hash(content.as_bytes()) {
                 // The earlier content is still in context; say nothing more.
                 unchanged = true;
+                how = Shown::Unchanged { since: turn };
                 text = format!("unchanged since turn {turn}");
             } else {
                 // A hashline edit needs the anchors of the current lines, which a diff would
@@ -227,7 +242,10 @@ async fn read_lines(
                     diff_against(sb, &prev, shown, start).await
                 };
                 text = match diff {
-                    Some(diff) => format!("changed since turn {turn}:\n{diff}"),
+                    Some(diff) => {
+                        how = Shown::Diff { since: turn };
+                        format!("changed since turn {turn}:\n{diff}")
+                    }
                     None => format!("changed since turn {turn} (full content):\n{text}"),
                 };
             }
@@ -260,6 +278,7 @@ async fn read_lines(
         remaining,
         text,
         pending,
+        shown: how,
     })
 }
 
@@ -495,7 +514,7 @@ impl Tool for ReadTool {
                             lines.commit(cx);
                         }
                         let mut r = ToolResult::ok(output);
-                        r.effects.push(AppliedEffect::Read(lines.full, lines.hash));
+                        r.effects.push(lines.effect(truncated));
                         r
                     }
                     Err(e) => ToolResult::error(e),
@@ -554,11 +573,9 @@ async fn read_batch(
     } else {
         ToolResult::ok(output)
     };
-    for section in sections {
-        if let Ok(lines) = section.body {
-            result
-                .effects
-                .push(AppliedEffect::Read(lines.full, lines.hash));
+    for (section, cut) in sections.iter().zip(&cut) {
+        if let Ok(lines) = &section.body {
+            result.effects.push(lines.effect(*cut));
         }
     }
     result

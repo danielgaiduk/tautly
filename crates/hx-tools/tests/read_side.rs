@@ -49,7 +49,18 @@ async fn read_line_range_numbers_lines() {
     let full = e.sb.resolve(Path::new("f.txt")).unwrap();
     let (_, hash) = e.cx.reads().last(&full).expect("tracked");
     assert_eq!(hash, blake3::hash(b"a\nb\nc\nd"));
-    assert_eq!(r.effects, vec![AppliedEffect::Read(full, hash)]);
+    assert_eq!(
+        r.effects,
+        vec![AppliedEffect::Read {
+            path: full,
+            range: hx_tools::LineRange {
+                start: Some(2),
+                end: Some(3)
+            },
+            file_hash: hash,
+            shown: hx_tools::Shown::Full,
+        }]
+    );
 }
 
 #[tokio::test]
@@ -117,6 +128,7 @@ async fn write_effect_lists_path() {
 async fn write_records_pre_image_of_existing_file() {
     let e = env(EditFormat::StrReplace);
     put(&e, "a.txt", b"old").await;
+    let mode = e.sb.metadata(Path::new("a.txt")).await.unwrap().mode & 0o7777;
     let r = run(&e, &WriteTool, json!({"path":"a.txt","content":"new"})).await;
     assert!(!r.is_error, "{}", r.output);
     let full = e.sb.resolve(Path::new("a.txt")).unwrap();
@@ -125,6 +137,7 @@ async fn write_records_pre_image_of_existing_file() {
         vec![AppliedEffect::Edited {
             path: full.clone(),
             pre_image: Some(b"old".to_vec()),
+            pre_mode: Some(mode),
             post_hash: blake3::hash(b"new"),
         }]
     );

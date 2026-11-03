@@ -309,11 +309,13 @@ async fn result_carries_pre_image() {
     let r = edit(&e, "a.rs", "a()", "b()").await;
     assert!(!r.is_error, "{}", r.output);
     let full = e.sb.resolve(Path::new("a.rs")).unwrap();
+    let mode = e.sb.metadata(&full).await.unwrap().mode & 0o7777;
     assert_eq!(
         r.effects,
         vec![AppliedEffect::Edited {
             path: full,
             pre_image: Some(b"fn a() {}\n".to_vec()),
+            pre_mode: Some(mode),
             post_hash: blake3::hash(b"fn b() {}\n"),
         }]
     );

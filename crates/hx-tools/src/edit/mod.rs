@@ -19,7 +19,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use self::hashline::{Anchor, HashlineError, HashlineOp};
-use self::patch::{Kind, PatchOp};
+use self::patch::{Kind, PatchError, PatchOp};
 use self::str_replace::MatchError;
 use self::tolerant::RepairStage;
 use crate::spec::{parse_args, tool_spec};
@@ -186,25 +186,67 @@ struct Loaded {
     text: String,
 }
 
-/// Resolve `path`, read it, and apply the stale-read guard. Errors are ready to show.
+/// Stable [`crate::ToolMeta::error_kind`] values of the edit tool.
+mod kind {
+    pub const BAD_ARGS: &str = "bad_args";
+    pub const IO: &str = "io";
+    pub const UNDECODABLE: &str = "undecodable";
+    pub const NOT_READ: &str = "not_read";
+    pub const STALE: &str = "stale";
+    pub const NOT_FOUND: &str = "not_found";
+    pub const AMBIGUOUS: &str = "ambiguous";
+    pub const MIXED_ARTIFACTS: &str = "mixed_artifacts";
+    pub const SYNTAX: &str = "syntax";
+    pub const STALE_ANCHOR: &str = "stale_anchor";
+    pub const INVALID_OPS: &str = "invalid_ops";
+    pub const INVALID_PATCH: &str = "invalid_patch";
+}
+
+fn match_error_kind(e: &MatchError) -> &'static str {
+    match e {
+        MatchError::NotFound { .. } => kind::NOT_FOUND,
+        MatchError::Ambiguous { .. } => kind::AMBIGUOUS,
+        MatchError::MixedArtifacts => kind::MIXED_ARTIFACTS,
+    }
+}
+
+fn patch_error_kind(e: &PatchError) -> &'static str {
+    match e {
+        PatchError::Hunk { error, .. } => match_error_kind(error),
+        _ => kind::INVALID_PATCH,
+    }
+}
+
+/// Resolve `path`, read it, and apply the stale-read guard. Errors are ready to return.
 async fn load_fresh(
     sb: &dyn Sandbox,
     cx: &ToolCx,
     path: &str,
     decode: bool,
-) -> Result<Loaded, String> {
-    let full = sb.resolve(Path::new(path)).map_err(|e| e.to_string())?;
+) -> Result<Loaded, ToolResult> {
+    let full = sb
+        .resolve(Path::new(path))
+        .map_err(|e| ToolResult::error_kind(e.to_string(), kind::IO))?;
     let (meta, original) = match (sb.metadata(&full).await, sb.read(&full).await) {
         (Ok(m), Ok(b)) => (m, b),
-        (Err(e), _) | (_, Err(e)) => return Err(format!("{path}: {e}")),
+        (Err(e), _) | (_, Err(e)) => {
+            return Err(ToolResult::error_kind(format!("{path}: {e}"), kind::IO));
+        }
     };
     // Binary files can never be `read`, so say why before asking for a read.
     let text = if decode {
-        atomic::to_lf_text(&original).map_err(|e| format!("{path}: {e}"))?
+        atomic::to_lf_text(&original)
+            .map_err(|e| ToolResult::error_kind(format!("{path}: {e}"), kind::UNDECODABLE))?
     } else {
         String::new()
     };
-    guard::check_fresh(cx.reads(), &full, &meta, &original).map_err(|e| format!("{path}: {e}"))?;
+    guard::check_fresh(cx.reads(), &full, &meta, &original).map_err(|e| {
+        let k = match e {
+            EditError::NotRead => kind::NOT_READ,
+            _ => kind::STALE,
+        };
+        ToolResult::error_kind(format!("{path}: {e}"), k)
+    })?;
     Ok(Loaded {
         full,
         meta,
@@ -340,6 +382,7 @@ async fn write_edited(
     let effect = AppliedEffect::Edited {
         path: file.full,
         pre_image: Some(file.original),
+        pre_mode: Some(file.meta.mode & 0o7777),
         post_hash,
     };
     Ok((effect, warning))
@@ -383,15 +426,15 @@ impl Tool for EditTool {
         match cx.edit_format() {
             EditFormat::StrReplace => match parse_args(&args) {
                 Ok(a) => run_str_replace(a, sb, cx).await,
-                Err(e) => ToolResult::error(e.to_string()),
+                Err(e) => ToolResult::error_kind(e.to_string(), kind::BAD_ARGS),
             },
             EditFormat::Patch => match parse_args(&args) {
                 Ok(a) => run_patch(a, sb, cx).await,
-                Err(e) => ToolResult::error(e.to_string()),
+                Err(e) => ToolResult::error_kind(e.to_string(), kind::BAD_ARGS),
             },
             EditFormat::Hashline => match parse_args(&args) {
                 Ok(a) => run_hashline(a, sb, cx).await,
-                Err(e) => ToolResult::error(e.to_string()),
+                Err(e) => ToolResult::error_kind(e.to_string(), kind::BAD_ARGS),
             },
         }
     }
@@ -399,14 +442,17 @@ impl Tool for EditTool {
 
 async fn run_str_replace(a: StrReplaceArgs, sb: &dyn Sandbox, cx: &ToolCx) -> ToolResult {
     if a.old_text.is_empty() {
-        return ToolResult::error("old_text must not be empty");
+        return ToolResult::error_kind("old_text must not be empty", kind::BAD_ARGS);
     }
     if a.old_text == a.new_text {
-        return ToolResult::error("old_text and new_text are identical; nothing to change");
+        return ToolResult::error_kind(
+            "old_text and new_text are identical; nothing to change",
+            kind::BAD_ARGS,
+        );
     }
     let file = match load_fresh(sb, cx, &a.path, true).await {
         Ok(f) => f,
-        Err(e) => return ToolResult::error(e),
+        Err(e) => return e,
     };
     let spliced = match str_replace::apply_staged_for(
         Path::new(&a.path),
@@ -415,28 +461,36 @@ async fn run_str_replace(a: StrReplaceArgs, sb: &dyn Sandbox, cx: &ToolCx) -> To
         &a.new_text,
     ) {
         Ok(r) => r,
-        Err(e) => return ToolResult::error(match_error_message(&a.path, "old_text", &e)),
+        Err(e) => {
+            return ToolResult::error_kind(
+                match_error_message(&a.path, "old_text", &e),
+                match_error_kind(&e),
+            );
+        }
     };
     let (edited, stage) = (spliced.text, spliced.stage);
     if needs_seen(stage) && !seen_now(cx, &file, spliced.lines) {
-        return ToolResult::error(unseen_repair(&a.path, stage, spliced.lines));
+        return ToolResult::error_kind(unseen_repair(&a.path, stage, spliced.lines), kind::STALE);
     }
     // A symbol-level guess must leave the file parsing at least as well as before. Nothing
     // has been written yet, so rejecting it leaves the pre-image in place.
     if stage == RepairStage::Structural {
         if let Some(errors) = new_error_list(&a.path, &file.text, &edited) {
-            return ToolResult::error(format!(
-                "{}: old_text not found exactly; the symbol it names was matched structurally, \
+            return ToolResult::error_kind(
+                format!(
+                    "{}: old_text not found exactly; the symbol it names was matched structurally, \
                  but replacing it would introduce syntax errors at {errors}, so nothing was \
                  changed. Retry with old_text copied from `read` or `symbol` output.",
-                a.path
-            ));
+                    a.path
+                ),
+                kind::SYNTAX,
+            );
         }
     }
     let repaired = stage != RepairStage::Exact;
     let (effect, warning) = match write_edited(sb, cx, &a.path, file, &edited, repaired).await {
         Ok(e) => e,
-        Err(e) => return ToolResult::error(e),
+        Err(e) => return ToolResult::error_kind(e, kind::IO),
     };
     let mut output = format!("edited {}", a.path);
     if stage != RepairStage::Exact {
@@ -453,7 +507,7 @@ async fn run_str_replace(a: StrReplaceArgs, sb: &dyn Sandbox, cx: &ToolCx) -> To
 
 async fn run_hashline(a: HashlineArgs, sb: &dyn Sandbox, cx: &ToolCx) -> ToolResult {
     if a.ops.is_empty() {
-        return ToolResult::error("ops must not be empty");
+        return ToolResult::error_kind("ops must not be empty", kind::BAD_ARGS);
     }
     let count = a.ops.len();
     let ops: Vec<HashlineOp> = match (a.ops.into_iter().enumerate())
@@ -461,21 +515,21 @@ async fn run_hashline(a: HashlineArgs, sb: &dyn Sandbox, cx: &ToolCx) -> ToolRes
         .collect()
     {
         Ok(ops) => ops,
-        Err(e) => return ToolResult::error(format!("{}: {e}", a.path)),
+        Err(e) => return ToolResult::error_kind(format!("{}: {e}", a.path), kind::BAD_ARGS),
     };
     let file = match load_fresh(sb, cx, &a.path, true).await {
         Ok(f) => f,
-        Err(e) => return ToolResult::error(e),
+        Err(e) => return e,
     };
     let edited = match hashline::apply(&file.text, &ops) {
         Ok(t) => t,
         Err(e @ (HashlineError::Stale { .. } | HashlineError::OutOfRange { .. })) => {
-            return ToolResult::error(format!(
-                "{}: {e}; read the file again to get fresh anchors",
-                a.path
-            ));
+            return ToolResult::error_kind(
+                format!("{}: {e}; read the file again to get fresh anchors", a.path),
+                kind::STALE_ANCHOR,
+            );
         }
-        Err(e) => return ToolResult::error(format!("{}: {e}", a.path)),
+        Err(e) => return ToolResult::error_kind(format!("{}: {e}", a.path), kind::INVALID_OPS),
     };
     match write_edited(sb, cx, &a.path, file, &edited, false).await {
         Ok((effect, warning)) => {
@@ -488,7 +542,7 @@ async fn run_hashline(a: HashlineArgs, sb: &dyn Sandbox, cx: &ToolCx) -> ToolRes
             r.effects.push(effect);
             r
         }
-        Err(e) => ToolResult::error(e),
+        Err(e) => ToolResult::error_kind(e, kind::IO),
     }
 }
 
@@ -535,7 +589,7 @@ impl Step {
 async fn run_patch(a: PatchArgs, sb: &dyn Sandbox, cx: &ToolCx) -> ToolResult {
     let touched = match patch::touched(&a.patch) {
         Ok(t) => t,
-        Err(e) => return ToolResult::error(e.to_string()),
+        Err(e) => return ToolResult::error_kind(e.to_string(), patch_error_kind(&e)),
     };
     // Load and guard every file before looking at any hunk. `texts` holds the content the
     // pure applier sees; added files only need to be known to exist (or not).
@@ -547,14 +601,14 @@ async fn run_patch(a: PatchArgs, sb: &dyn Sandbox, cx: &ToolCx) -> ToolResult {
             Kind::Add => {
                 let full = match sb.resolve(&t.path) {
                     Ok(p) => p,
-                    Err(e) => return ToolResult::error(e.to_string()),
+                    Err(e) => return ToolResult::error_kind(e.to_string(), kind::IO),
                 };
                 match sb.metadata(&full).await {
                     Ok(_) => {
                         texts.insert(t.path.clone(), String::new());
                     }
                     Err(SandboxError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(e) => return ToolResult::error(format!("{rel}: {e}")),
+                    Err(e) => return ToolResult::error_kind(format!("{rel}: {e}"), kind::IO),
                 }
                 loaded.push((full, None));
                 continue;
@@ -567,7 +621,7 @@ async fn run_patch(a: PatchArgs, sb: &dyn Sandbox, cx: &ToolCx) -> ToolResult {
                 texts.insert(t.path.clone(), f.text.clone());
                 loaded.push((f.full.clone(), Some(f)));
             }
-            Err(e) => return ToolResult::error(e),
+            Err(e) => return e,
         }
     }
     // Two spellings of one path would otherwise be written twice.
@@ -576,15 +630,18 @@ async fn run_patch(a: PatchArgs, sb: &dyn Sandbox, cx: &ToolCx) -> ToolResult {
         .enumerate()
         .find(|(i, (p, _))| loaded[..*i].iter().any(|(q, _)| q == p))
     {
-        return ToolResult::error(format!(
-            "{}: appears more than once in the patch",
-            touched[i].path.display()
-        ));
+        return ToolResult::error_kind(
+            format!(
+                "{}: appears more than once in the patch",
+                touched[i].path.display()
+            ),
+            kind::INVALID_PATCH,
+        );
     }
 
     let applied = match patch::apply_staged(&|p| texts.get(p).cloned(), &a.patch) {
         Ok(v) => v,
-        Err(e) => return ToolResult::error(e.to_string()),
+        Err(e) => return ToolResult::error_kind(e.to_string(), patch_error_kind(&e)),
     };
 
     let mut steps: Vec<Step> = Vec::with_capacity(applied.len());
@@ -595,7 +652,10 @@ async fn run_patch(a: PatchArgs, sb: &dyn Sandbox, cx: &ToolCx) -> ToolResult {
             for r in ap.repairs.iter().filter(|r| needs_seen(r.stage)) {
                 if !seen_now(cx, f, r.lines) {
                     let subject = format!("{rel}: hunk {}", r.hunk);
-                    return ToolResult::error(unseen_repair(&subject, r.stage, r.lines));
+                    return ToolResult::error_kind(
+                        unseen_repair(&subject, r.stage, r.lines),
+                        kind::STALE,
+                    );
                 }
             }
         }
@@ -657,15 +717,15 @@ async fn run_patch(a: PatchArgs, sb: &dyn Sandbox, cx: &ToolCx) -> ToolResult {
                 failures.join("; ")
             ));
         }
-        return ToolResult::error(msg);
+        return ToolResult::error_kind(msg, kind::IO);
     }
 
     let mut lines = Vec::with_capacity(steps.len() + notes.len());
     let mut warnings = Vec::new();
     let mut effects = Vec::with_capacity(steps.len());
     for step in steps {
-        let (verb, post_hash) = match step.op {
-            PatchOp::Delete => ("deleted", blake3::hash(b"")),
+        let post_hash = match step.op {
+            PatchOp::Delete => None,
             PatchOp::Update(_) | PatchOp::Add(_) => {
                 let h = record_written(
                     sb,
@@ -676,22 +736,32 @@ async fn run_patch(a: PatchArgs, sb: &dyn Sandbox, cx: &ToolCx) -> ToolResult {
                     step.repaired,
                 )
                 .await;
-                let verb = if matches!(step.op, PatchOp::Add(_)) {
-                    "added"
-                } else {
-                    "updated"
-                };
-                (verb, h)
+                Some(h)
             }
+        };
+        let verb = match step.op {
+            PatchOp::Delete => "deleted",
+            PatchOp::Add(_) => "added",
+            PatchOp::Update(_) => "updated",
         };
         lines.push(format!("{verb} {}", step.rel));
         warnings.extend(step.warning);
         // The path as the patch names it; a deleted file is dropped from the index.
         warnings.extend(reindex(cx, &step.rel).await);
-        effects.push(AppliedEffect::Edited {
-            path: step.full,
-            pre_image: step.original,
-            post_hash,
+        let pre_mode = step.mode.map(|m| m & 0o7777);
+        effects.push(match post_hash {
+            Some(post_hash) => AppliedEffect::Edited {
+                path: step.full,
+                pre_image: step.original,
+                pre_mode,
+                post_hash,
+            },
+            // Only an existing file can be deleted, so it has a pre-image and a mode.
+            None => AppliedEffect::Deleted {
+                path: step.full,
+                pre_image: step.original.unwrap_or_default(),
+                pre_mode: pre_mode.unwrap_or(0o644),
+            },
         });
     }
     lines.extend(notes);

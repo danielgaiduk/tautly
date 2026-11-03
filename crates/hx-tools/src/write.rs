@@ -61,6 +61,13 @@ impl Tool for WriteTool {
             Err(SandboxError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => None,
             Err(e) => return ToolResult::error(format!("{}: {e}", a.path)),
         };
+        let pre_mode = match &pre_image {
+            Some(_) => match sb.metadata(&full).await {
+                Ok(m) => Some(m.mode & 0o7777),
+                Err(e) => return ToolResult::error(format!("{}: {e}", a.path)),
+            },
+            None => None,
+        };
         // The requested path, not `full`: the sandbox refuses symlinks into protected paths.
         if let Err(e) = sb
             .write_atomic(Path::new(&a.path), a.content.as_bytes(), None)
@@ -94,6 +101,7 @@ impl Tool for WriteTool {
         r.effects.push(AppliedEffect::Edited {
             path: full,
             pre_image,
+            pre_mode,
             post_hash,
         });
         r

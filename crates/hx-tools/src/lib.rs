@@ -49,15 +49,58 @@ pub enum ToolError {
     BadArgs(String),
 }
 
-/// A side effect a tool actually applied, reported to the engine.
+/// A side effect a tool actually applied, reported to the engine. Paths are absolute and
+/// canonical (as the sandbox resolved them).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AppliedEffect {
-    Read(PathBuf, blake3::Hash),
+    /// One read target: `range` as requested (a symbol target: the symbol's lines),
+    /// `file_hash` of the whole file, and how it was shown.
+    Read {
+        path: PathBuf,
+        range: LineRange,
+        file_hash: blake3::Hash,
+        shown: Shown,
+    },
+    /// A file was written. `pre_image`/`pre_mode` (permission bits) describe it before the
+    /// write; both are None when the write created it.
     Edited {
         path: PathBuf,
         pre_image: Option<Vec<u8>>,
+        pre_mode: Option<u32>,
         post_hash: blake3::Hash,
     },
+    /// A file was deleted; `pre_mode` holds its permission bits.
+    Deleted {
+        path: PathBuf,
+        pre_image: Vec<u8>,
+        pre_mode: u32,
+    },
+    /// A command ran that may have changed any file.
+    Exec { may_write: bool },
+}
+
+/// How a read target was shown, which tells the engine what the output depends on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Shown {
+    /// The requested lines in full; this output is now the target's re-read baseline.
+    Full,
+    /// Cut short (the 2,000-line window or the output cap); no baseline was kept.
+    Partial,
+    /// `unchanged since turn N`: only meaningful while the turn-`since` output is in context.
+    Unchanged { since: u32 },
+    /// A diff against the turn-`since` output, which must stay in context; this output is
+    /// also the new baseline.
+    Diff { since: u32 },
+}
+
+/// Structured facts about a result, so the engine never parses `output`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ToolMeta {
+    /// A command's exit code (signals as 128 + n); None when it was killed or never ran.
+    pub exit_code: Option<i32>,
+    /// A stable name for why the call failed (e.g. `not_found`, `ambiguous`, `stale`).
+    pub error_kind: Option<&'static str>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -65,6 +108,7 @@ pub struct ToolResult {
     pub output: String,
     pub is_error: bool,
     pub effects: Vec<AppliedEffect>,
+    pub meta: ToolMeta,
 }
 
 impl ToolResult {
@@ -73,15 +117,22 @@ impl ToolResult {
             output: output.into(),
             is_error: false,
             effects: Vec::new(),
+            meta: ToolMeta::default(),
         }
     }
 
     pub fn error(output: impl Into<String>) -> Self {
         Self {
-            output: output.into(),
             is_error: true,
-            effects: Vec::new(),
+            ..Self::ok(output)
         }
+    }
+
+    /// An error result with a stable [`ToolMeta::error_kind`].
+    pub fn error_kind(output: impl Into<String>, kind: &'static str) -> Self {
+        let mut r = Self::error(output);
+        r.meta.error_kind = Some(kind);
+        r
     }
 }
 
@@ -189,6 +240,26 @@ impl ReadTracker {
     pub fn forget(&self, path: &Path, range: LineRange) {
         let mut ranges = self.ranges.lock().unwrap_or_else(|e| e.into_inner());
         ranges.remove(&(path.to_path_buf(), range));
+    }
+
+    /// Drop every re-read baseline of `path` (a read result of it left the context).
+    /// Like [`clear`](Self::clear), this keeps the stale-read guard, which tracks the disk.
+    pub fn forget_path(&self, path: &Path) {
+        let mut ranges = self.ranges.lock().unwrap_or_else(|e| e.into_inner());
+        ranges.retain(|(p, _), _| p != path);
+    }
+
+    /// Drop every baseline shown at or before `turn` (those turns were compacted away).
+    pub fn forget_shown_at(&self, turn: u32) {
+        let mut ranges = self.ranges.lock().unwrap_or_else(|e| e.into_inner());
+        ranges.retain(|_, prev| prev.turn > turn);
+    }
+
+    /// Drop every baseline. The stale-read guard is kept: it says what is on disk, not
+    /// what is in context.
+    pub fn clear(&self) {
+        let mut ranges = self.ranges.lock().unwrap_or_else(|e| e.into_inner());
+        ranges.clear();
     }
 
     /// Update only the stale-read guard's view of `path`.

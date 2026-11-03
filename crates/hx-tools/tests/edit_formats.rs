@@ -550,6 +550,10 @@ async fn patch_tool_updates_adds_and_deletes_with_effects() {
     put(&e, "old.txt", b"bye\n").await;
     read(&e, "a.txt").await;
     read(&e, "old.txt").await;
+    let mut modes = Vec::new();
+    for f in ["a.txt", "old.txt"] {
+        modes.push(e.sb.metadata(Path::new(f)).await.unwrap().mode & 0o7777);
+    }
     let p = text(&[
         "*** Begin Patch",
         "*** Update File: a.txt",
@@ -575,17 +579,19 @@ async fn patch_tool_updates_adds_and_deletes_with_effects() {
             AppliedEffect::Edited {
                 path: root.join("a.txt"),
                 pre_image: Some(b"one\ntwo\n".to_vec()),
+                pre_mode: Some(modes[0]),
                 post_hash: blake3::hash(b"one\n2\n"),
             },
             AppliedEffect::Edited {
                 path: root.join("sub/new.txt"),
                 pre_image: None,
+                pre_mode: None,
                 post_hash: blake3::hash(b"fresh\n"),
             },
-            AppliedEffect::Edited {
+            AppliedEffect::Deleted {
                 path: root.join("old.txt"),
-                pre_image: Some(b"bye\n".to_vec()),
-                post_hash: blake3::hash(b""),
+                pre_image: b"bye\n".to_vec(),
+                pre_mode: modes[1],
             },
         ]
     );
@@ -1150,11 +1156,13 @@ async fn hashline_tool_edits_using_read_anchors() {
     .await;
     assert!(!r.is_error, "{}", r.output);
     assert_eq!(slurp(&e, "a.txt").await, b"one\nTWO\n2b\nthree\nfour\n");
+    let mode = e.sb.metadata(Path::new("a.txt")).await.unwrap().mode & 0o7777;
     assert_eq!(
         r.effects,
         vec![AppliedEffect::Edited {
             path: e.sb.root().join("a.txt"),
             pre_image: Some(b"one\ntwo\nthree\n".to_vec()),
+            pre_mode: Some(mode),
             post_hash: blake3::hash(b"one\nTWO\n2b\nthree\nfour\n"),
         }]
     );

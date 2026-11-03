@@ -15,7 +15,7 @@ use tokio::time::Instant;
 use crate::cap::{OUTPUT_CAP, cap_text};
 use crate::filters;
 use crate::spec::{parse_args, tool_spec};
-use crate::{Tool, ToolCx, ToolError, ToolResult};
+use crate::{AppliedEffect, Tool, ToolCx, ToolError, ToolResult};
 
 const DEFAULT_TIMEOUT_S: u64 = 120;
 const MAX_TIMEOUT_S: u64 = 600;
@@ -314,7 +314,12 @@ impl Tool for BashTool {
                         exit = Some(status);
                         drain_until = Some(Instant::now() + DRAIN_GRACE);
                     }
-                    Err(e) => return ToolResult::error(format!("wait failed: {e}")),
+                    Err(e) => {
+                        // The command started, so it may have written files.
+                        let mut r = ToolResult::error(format!("wait failed: {e}"));
+                        r.effects.push(AppliedEffect::Exec { may_write: true });
+                        return r;
+                    }
                 },
             }
         };
@@ -369,10 +374,10 @@ impl Tool for BashTool {
             text.push_str(&format!("[full output saved to {}]\n", p.display()));
         }
         text.push_str(&trailer);
-        ToolResult {
-            output: text,
-            is_error,
-            effects: Vec::new(),
-        }
+        let mut r = ToolResult::ok(text);
+        r.is_error = is_error;
+        r.meta.exit_code = exit_code;
+        r.effects.push(AppliedEffect::Exec { may_write: true });
+        r
     }
 }
