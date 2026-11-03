@@ -2,7 +2,8 @@
 //!
 //! [`locate`] finds the single place the model's `old` text refers to. Stages run in
 //! order and each needs exactly one candidate: none moves on to the next stage, more
-//! than one is an error. Stage 5 (structural, via the code index) is added separately.
+//! than one is an error. Stage 5 ([`locate_structural`], str_replace only) is tried by the
+//! caller after these fail.
 //!
 //! Stages 2 and 3 share one candidate search: two blocks equal after removing common
 //! indentation are also equal after trimming every line, so an indentation-relative
@@ -12,7 +13,10 @@
 //! offset, and `Whitespace` otherwise.
 
 use std::ops::Range;
+use std::path::Path;
+use std::time::Duration;
 
+use hx_index::Lang;
 use similar::TextDiff;
 
 use super::str_replace::MatchError;
@@ -24,6 +28,10 @@ const ANCHOR_SIMILARITY: f32 = 0.9;
 /// Window similarity needed to be offered as a candidate location.
 const CANDIDATE_SCORE: f32 = 0.6;
 const MAX_CANDIDATES: usize = 5;
+/// Symbol similarity needed for the structural fallback.
+const STRUCTURAL_SIMILARITY: f32 = 0.8;
+/// Longest a similarity comparison may run before settling for an approximate ratio.
+const SIMILARITY_TIMEOUT: Duration = Duration::from_millis(200);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RepairStage {
@@ -150,6 +158,89 @@ fn locate_with(text: &str, old: &str, whole_lines: bool) -> Result<Located, Matc
     })
 }
 
+/// Stage 5: the symbol the first definition line of `old` names, located in `text` by
+/// parsing it (never a stale index). The symbol's lines are the range to replace when their
+/// source resembles `old` (ratio >= [`STRUCTURAL_SIMILARITY`]) and exactly one same-named
+/// symbol does. `Ok(None)` when `old` does not start with a definition or nothing resembles it.
+pub fn locate_structural(
+    path: &Path,
+    text: &str,
+    old: &str,
+) -> Result<Option<Located>, MatchError> {
+    let Some(lang) = Lang::from_path(path).filter(|l| l.has_symbols()) else {
+        return Ok(None);
+    };
+    let norm = normalize_old(old).text;
+    let Some(first) = norm.split('\n').position(|l| !l.trim().is_empty()) else {
+        return Ok(None);
+    };
+    // Parse the model's block on its own, without the indentation it was nested in.
+    let wanted = hx_index::extract(lang, &dedent(&norm));
+    let Some(def) = wanted
+        .symbols
+        .iter()
+        .filter(|s| s.start_line as usize == first + 1)
+        .max_by_key(|s| s.end_line)
+    else {
+        return Ok(None);
+    };
+    let want_text = squash(&norm);
+
+    let file = Lines::new(text);
+    let hits: Vec<(usize, usize)> = hx_index::extract(lang, text)
+        .symbols
+        .iter()
+        .filter(|s| s.name == def.name)
+        .map(|s| (s.start_line as usize - 1, s.end_line as usize - 1))
+        .filter(|&(start, end)| end < file.len() && start <= end)
+        .filter(|&(start, end)| {
+            let source: Vec<&str> = (start..=end).map(|i| file.line(i)).collect();
+            similarity(&squash(&source.join("\n")), &want_text) >= STRUCTURAL_SIMILARITY
+        })
+        .collect();
+    match hits.as_slice() {
+        [] => Ok(None),
+        &[(start, end)] => Ok(Some(Located {
+            range: file.start(start)..file.end_of(end, norm.ends_with('\n')),
+            stage: RepairStage::Structural,
+            reindent: None,
+        })),
+        many => Err(MatchError::Ambiguous {
+            lines: many.iter().map(|(start, _)| start + 1).collect(),
+        }),
+    }
+}
+
+/// Lines trimmed, blank lines dropped: what similarity is measured on.
+fn squash(text: &str) -> String {
+    text.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn similarity(a: &str, b: &str) -> f32 {
+    TextDiff::configure()
+        .timeout(SIMILARITY_TIMEOUT)
+        .diff_chars(a, b)
+        .ratio()
+}
+
+/// `text` with the indentation common to all its non-blank lines removed.
+fn dedent(text: &str) -> String {
+    let common = text
+        .split('\n')
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| leading_ws_len(l).min(l.len()))
+        .min()
+        .unwrap_or(0);
+    text.split('\n')
+        .map(|l| l.get(common..).unwrap_or(l.trim_start()))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// The replacement text to splice in for a match found at `stage`. The model's text is
 /// brought in line with how its `old` text was repaired: CRLF always becomes LF (the
 /// file is matched and edited as LF), copied line-number artifacts and BOMs are stripped
@@ -175,7 +266,10 @@ pub fn adapt_new_text(old: &str, new: &str, matched: &str, stage: RepairStage) -
     }
     if matches!(
         stage,
-        RepairStage::Whitespace | RepairStage::Indentation | RepairStage::Anchor
+        RepairStage::Whitespace
+            | RepairStage::Indentation
+            | RepairStage::Anchor
+            | RepairStage::Structural
     ) {
         out = reindent_to_match(&out, &norm.text, matched);
     }

@@ -225,9 +225,10 @@ async fn record_written(sb: &dyn Sandbox, cx: &ToolCx, full: &Path, bytes: &[u8]
 /// Most errors a syntax warning lists.
 const MAX_WARNED_ERRORS: usize = 5;
 
-/// The warning to append to an edit's output when `after` has parse errors `before` did
-/// not. The edit is already on disk; this only tells the model.
-fn syntax_warning(path: &str, before: &str, after: &str) -> Option<String> {
+/// New parse errors `after` has that `before` did not, as `line N (message)` items (at
+/// most [`MAX_WARNED_ERRORS`], then `N more`). None when there are none or the language
+/// has no syntax check.
+fn new_error_list(path: &str, before: &str, after: &str) -> Option<String> {
     let errors = syntax::new_errors(Path::new(path), before, after)?;
     if errors.is_empty() {
         return None;
@@ -240,11 +241,35 @@ fn syntax_warning(path: &str, before: &str, after: &str) -> Option<String> {
     if errors.len() > MAX_WARNED_ERRORS {
         listed.push(format!("{} more", errors.len() - MAX_WARNED_ERRORS));
     }
+    Some(listed.join(", "))
+}
+
+/// The warning to append to an edit's output when `after` has parse errors `before` did
+/// not. The edit is already on disk; this only tells the model.
+fn syntax_warning(path: &str, before: &str, after: &str) -> Option<String> {
+    let listed = new_error_list(path, before, after)?;
     Some(format!(
-        "syntax warning: new parse errors in {path} at lines {}. The edit was applied; \
-         check it and fix the syntax with another edit if it is unintended.",
-        listed.join(", ")
+        "syntax warning: new parse errors in {path} at lines {listed}. The edit was applied; \
+         check it and fix the syntax with another edit if it is unintended."
     ))
+}
+
+/// Re-index `path` after a successful write so `outline`/`symbol`/`refs` see it at once
+/// (spec 7.1). A failure never fails the edit; it comes back as a note for the output.
+pub(crate) async fn reindex(cx: &ToolCx, path: &str) -> Option<String> {
+    let index = cx.index()?;
+    match index.reindex_file(Path::new(path)).await {
+        Ok(()) => None,
+        Err(e) => Some(format!(
+            "index note: could not re-index {path} ({e}); outline/symbol/refs may be stale for it"
+        )),
+    }
+}
+
+/// Join the optional notes (syntax warning, index note) that follow an edit's output.
+fn join_notes(notes: impl IntoIterator<Item = Option<String>>) -> Option<String> {
+    let notes: Vec<String> = notes.into_iter().flatten().collect();
+    (!notes.is_empty()).then(|| notes.join("\n"))
 }
 
 /// Write `edited` (LF text) over a loaded file, keeping its encoding, and report the effect
@@ -262,7 +287,10 @@ async fn write_edited(
         .map_err(|e| format!("{path}: {e}"))?;
     let post_hash =
         record_written(sb, cx, &file.full, &atomic::restore(&file.original, edited)).await;
-    let warning = syntax_warning(path, &file.text, edited);
+    let warning = join_notes([
+        syntax_warning(path, &file.text, edited),
+        reindex(cx, path).await,
+    ]);
     let effect = AppliedEffect::Edited {
         path: file.full,
         pre_image: Some(file.original),
@@ -334,10 +362,27 @@ async fn run_str_replace(a: StrReplaceArgs, sb: &dyn Sandbox, cx: &ToolCx) -> To
         Ok(f) => f,
         Err(e) => return ToolResult::error(e),
     };
-    let (edited, stage) = match str_replace::apply_staged(&file.text, &a.old_text, &a.new_text) {
+    let (edited, stage) = match str_replace::apply_staged_for(
+        Path::new(&a.path),
+        &file.text,
+        &a.old_text,
+        &a.new_text,
+    ) {
         Ok(r) => r,
         Err(e) => return ToolResult::error(match_error_message(&a.path, "old_text", &e)),
     };
+    // A symbol-level guess must leave the file parsing at least as well as before. Nothing
+    // has been written yet, so rejecting it leaves the pre-image in place.
+    if stage == RepairStage::Structural {
+        if let Some(errors) = new_error_list(&a.path, &file.text, &edited) {
+            return ToolResult::error(format!(
+                "{}: old_text not found exactly; the symbol it names was matched structurally, \
+                 but replacing it would introduce syntax errors at {errors}, so nothing was \
+                 changed. Retry with old_text copied from `read` or `symbol` output.",
+                a.path
+            ));
+        }
+    }
     let (effect, warning) = match write_edited(sb, cx, &a.path, file, &edited).await {
         Ok(e) => e,
         Err(e) => return ToolResult::error(e),
@@ -570,6 +615,8 @@ async fn run_patch(a: PatchArgs, sb: &dyn Sandbox, cx: &ToolCx) -> ToolResult {
         };
         lines.push(format!("{verb} {}", step.rel));
         warnings.extend(step.warning);
+        // The path as the patch names it; a deleted file is dropped from the index.
+        warnings.extend(reindex(cx, &step.rel).await);
         effects.push(AppliedEffect::Edited {
             path: step.full,
             pre_image: step.original,

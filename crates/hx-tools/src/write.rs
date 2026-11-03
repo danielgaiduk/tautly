@@ -77,7 +77,12 @@ impl Tool for WriteTool {
         } else {
             "created"
         };
-        let mut r = ToolResult::ok(format!("{verb} {} ({} bytes)", a.path, a.content.len()));
+        let mut output = format!("{verb} {} ({} bytes)", a.path, a.content.len());
+        if let Some(note) = crate::edit::reindex(cx, &a.path).await {
+            output.push('\n');
+            output.push_str(&note);
+        }
+        let mut r = ToolResult::ok(output);
         r.effects.push(AppliedEffect::Edited {
             path: full,
             pre_image,

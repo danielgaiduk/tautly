@@ -9,6 +9,78 @@ use proptest::prelude::*;
 use serde_json::json;
 use tempfile::TempDir;
 
+// ---------------------------------------------------------------- structural (stage 5)
+
+const STRUCTURAL_SRC: &str = "fn keep() {}\n\nfn compute(a: i32, b: i32) -> i32 {\n    let sum = a + b;\n    let doubled = sum * 2;\n    doubled - 1\n}\n\nfn tail() {}\n";
+
+#[tokio::test]
+async fn structural_fallback_replaces_symbol_body_when_similar() {
+    let e = env();
+    put(&e, "a.rs", STRUCTURAL_SRC.as_bytes()).await;
+    read(&e, "a.rs").await;
+    // Two identifiers differ from the file, so stages 1-4 all fail.
+    let old = "fn compute(a: i32, b: i32) -> i32 {\n    let sum = a + b;\n    let twice = sum * 2;\n    twice - 1\n}";
+    let new = "fn compute(a: i32, b: i32) -> i32 {\n    (a + b) * 3\n}";
+    let r = edit(&e, "a.rs", old, new).await;
+    assert!(!r.is_error, "{}", r.output);
+    assert!(
+        r.output.contains("applied via structural match"),
+        "{}",
+        r.output
+    );
+    let got = String::from_utf8(slurp(&e, "a.rs").await).unwrap();
+    assert_eq!(
+        got,
+        "fn keep() {}\n\nfn compute(a: i32, b: i32) -> i32 {\n    (a + b) * 3\n}\n\nfn tail() {}\n"
+    );
+}
+
+#[tokio::test]
+async fn structural_fallback_reindents_a_method() {
+    let e = env();
+    let src =
+        "impl S {\n    fn m(&self) -> u8 {\n        let v = self.base;\n        v + 1\n    }\n}\n";
+    put(&e, "a.rs", src.as_bytes()).await;
+    read(&e, "a.rs").await;
+    let old = "fn m(&self) -> u8 {\n    let w = self.base;\n    w + 1\n}";
+    let new = "fn m(&self) -> u8 {\n    self.base + 2\n}";
+    let r = edit(&e, "a.rs", old, new).await;
+    assert!(!r.is_error, "{}", r.output);
+    assert!(r.output.contains("structural"), "{}", r.output);
+    let got = String::from_utf8(slurp(&e, "a.rs").await).unwrap();
+    assert_eq!(
+        got,
+        "impl S {\n    fn m(&self) -> u8 {\n        self.base + 2\n    }\n}\n"
+    );
+}
+
+#[tokio::test]
+async fn structural_fallback_rejected_below_0_8() {
+    let e = env();
+    put(&e, "a.rs", STRUCTURAL_SRC.as_bytes()).await;
+    read(&e, "a.rs").await;
+    let old = "fn compute(a: i32, b: i32) -> i32 {\n    println!(\"something else entirely\");\n    unreachable!()\n}";
+    let r = edit(&e, "a.rs", old, "fn compute() {}").await;
+    assert!(r.is_error);
+    assert!(r.output.contains("not found"), "{}", r.output);
+    assert_eq!(slurp(&e, "a.rs").await, STRUCTURAL_SRC.as_bytes());
+}
+
+#[tokio::test]
+async fn structural_fallback_reverts_on_new_parse_error() {
+    let e = env();
+    put(&e, "a.rs", STRUCTURAL_SRC.as_bytes()).await;
+    read(&e, "a.rs").await;
+    let old = "fn compute(a: i32, b: i32) -> i32 {\n    let sum = a + b;\n    let twice = sum * 2;\n    twice - 1\n}";
+    // The replacement leaves its brace open.
+    let new = "fn compute(a: i32, b: i32) -> i32 {\n    let sum = a + b;\n";
+    let r = edit(&e, "a.rs", old, new).await;
+    assert!(r.is_error);
+    assert!(r.output.contains("syntax errors"), "{}", r.output);
+    assert!(r.output.contains("nothing was changed"), "{}", r.output);
+    assert_eq!(slurp(&e, "a.rs").await, STRUCTURAL_SRC.as_bytes());
+}
+
 // ---------------------------------------------------------------- tool-level
 
 struct Env {

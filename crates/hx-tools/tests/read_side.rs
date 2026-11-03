@@ -218,6 +218,9 @@ fn registry_order_is_stable() {
             "bash",
             "grep",
             "glob",
+            "outline",
+            "symbol",
+            "refs",
             "web_fetch",
             "pin",
             "state"

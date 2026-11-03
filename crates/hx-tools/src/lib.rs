@@ -5,6 +5,7 @@ mod cap;
 pub mod edit;
 mod glob;
 mod grep;
+mod index_tools;
 mod pin_state;
 mod read;
 mod spec;
@@ -17,6 +18,7 @@ use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
 use async_trait::async_trait;
+use hx_index::Index;
 use hx_provider::{Capabilities, EditFormat, ToolSpec};
 use hx_sandbox::{Effect, FileMeta, Sandbox};
 use serde_json::Value;
@@ -28,6 +30,7 @@ pub use cap::cap_text;
 pub use edit::EditTool;
 pub use glob::GlobTool;
 pub use grep::GrepTool;
+pub use index_tools::{OutlineTool, RefsTool, SymbolTool};
 pub use pin_state::{
     ContextOp, PinTool, PlanStep, StatePatch, StateTool, StepStatus, parse_context_op,
 };
@@ -97,13 +100,25 @@ impl ReadTracker {
 }
 
 /// Per-call context handed to tools. Fields are private so later tasks can add more.
-#[derive(Debug)]
 pub struct ToolCx {
     edit_format: EditFormat,
     reads: Arc<ReadTracker>,
     spill_dir: PathBuf,
     cancel: CancellationToken,
     output_tx: Option<mpsc::Sender<String>>,
+    index: Option<Arc<Index>>,
+    turn: u32,
+}
+
+impl std::fmt::Debug for ToolCx {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ToolCx")
+            .field("edit_format", &self.edit_format)
+            .field("spill_dir", &self.spill_dir)
+            .field("index", &self.index.is_some())
+            .field("turn", &self.turn)
+            .finish_non_exhaustive()
+    }
 }
 
 impl ToolCx {
@@ -114,6 +129,8 @@ impl ToolCx {
             spill_dir,
             cancel: CancellationToken::new(),
             output_tx: None,
+            index: None,
+            turn: 0,
         }
     }
 
@@ -129,6 +146,18 @@ impl ToolCx {
 
     pub fn with_output_tx(mut self, tx: mpsc::Sender<String>) -> Self {
         self.output_tx = Some(tx);
+        self
+    }
+
+    /// The code index the index tools query and edits keep current.
+    pub fn with_index(mut self, index: Arc<Index>) -> Self {
+        self.index = Some(index);
+        self
+    }
+
+    /// The 1-based turn this call belongs to.
+    pub fn with_turn(mut self, turn: u32) -> Self {
+        self.turn = turn;
         self
     }
 
@@ -151,6 +180,14 @@ impl ToolCx {
     pub fn output_tx(&self) -> Option<&mpsc::Sender<String>> {
         self.output_tx.as_ref()
     }
+
+    pub fn index(&self) -> Option<&Arc<Index>> {
+        self.index.as_ref()
+    }
+
+    pub fn turn(&self) -> u32 {
+        self.turn
+    }
 }
 
 #[async_trait]
@@ -172,6 +209,9 @@ pub fn registry(_caps: &Capabilities) -> Vec<Arc<dyn Tool>> {
         Arc::new(BashTool),
         Arc::new(GrepTool),
         Arc::new(GlobTool),
+        Arc::new(OutlineTool),
+        Arc::new(SymbolTool),
+        Arc::new(RefsTool),
         Arc::new(WebFetchTool),
         Arc::new(PinTool),
         Arc::new(StateTool),
