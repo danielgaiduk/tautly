@@ -298,8 +298,23 @@ async fn cancel_ends_turn_with_cancelled_and_kills_children_within_200ms() {
     assert!(done[0].1.contains("killed: cancelled"), "{}", done[0].1);
 }
 
-/// A sandbox whose reads of `hang.txt` never finish and ignore cancellation.
-struct Hang(LocalSandbox);
+/// A sandbox whose reads of `hang.txt` never finish and ignore cancellation, and which
+/// can make every spill after a write stall (also ignoring cancellation).
+struct Hang {
+    sb: LocalSandbox,
+    stall_after_write: Option<Duration>,
+    written: std::sync::atomic::AtomicBool,
+}
+
+impl Hang {
+    fn new(sb: LocalSandbox) -> Self {
+        Hang {
+            sb,
+            stall_after_write: None,
+            written: Default::default(),
+        }
+    }
+}
 
 fn hangs(p: &Path) -> bool {
     p.file_name().is_some_and(|n| n == "hang.txt")
@@ -308,22 +323,22 @@ fn hangs(p: &Path) -> bool {
 #[async_trait]
 impl Sandbox for Hang {
     fn root(&self) -> &Path {
-        self.0.root()
+        self.sb.root()
     }
     fn resolve(&self, p: &Path) -> Result<PathBuf, SandboxError> {
-        self.0.resolve(p)
+        self.sb.resolve(p)
     }
     async fn read(&self, p: &Path) -> Result<Vec<u8>, SandboxError> {
         if hangs(p) {
             std::future::pending::<()>().await;
         }
-        self.0.read(p).await
+        self.sb.read(p).await
     }
     async fn metadata(&self, p: &Path) -> Result<FileMeta, SandboxError> {
         if hangs(p) {
             std::future::pending::<()>().await;
         }
-        self.0.metadata(p).await
+        self.sb.metadata(p).await
     }
     async fn write_atomic(
         &self,
@@ -331,22 +346,35 @@ impl Sandbox for Hang {
         bytes: &[u8],
         mode: Option<u32>,
     ) -> Result<(), SandboxError> {
-        self.0.write_atomic(p, bytes, mode).await
+        if hangs(p) {
+            std::future::pending::<()>().await;
+        }
+        let r = self.sb.write_atomic(p, bytes, mode).await;
+        if r.is_ok() {
+            self.written
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        r
     }
     async fn remove_file(&self, p: &Path) -> Result<(), SandboxError> {
-        self.0.remove_file(p).await
+        self.sb.remove_file(p).await
     }
     async fn spill(&self, bytes: &[u8]) -> Result<PathBuf, SandboxError> {
-        self.0.spill(bytes).await
+        if let Some(d) = self.stall_after_write
+            && self.written.load(std::sync::atomic::Ordering::SeqCst)
+        {
+            tokio::time::sleep(d).await;
+        }
+        self.sb.spill(bytes).await
     }
     async fn spawn(&self, spec: SpawnSpec) -> Result<Child, SandboxError> {
-        self.0.spawn(spec).await
+        self.sb.spawn(spec).await
     }
     fn walker(&self, base: &Path) -> Result<ignore::WalkBuilder, SandboxError> {
-        self.0.walker(base)
+        self.sb.walker(base)
     }
     async fn http_get(&self, url: &Url) -> Result<HttpResponse, SandboxError> {
-        self.0.http_get(url).await
+        self.sb.http_get(url).await
     }
 }
 
@@ -366,7 +394,7 @@ async fn a_call_that_ignores_cancel_is_abandoned_and_its_step_baselines_forgotte
         tools_step(vec![call("r3", "read", json!({"path": "a.txt"}))], None),
         text_step("done", tokens(10, 1)),
     ]);
-    let sb: Arc<dyn Sandbox> = Arc::new(Hang(LocalSandbox::new(fx.root()).unwrap()));
+    let sb: Arc<dyn Sandbox> = Arc::new(Hang::new(LocalSandbox::new(fx.root()).unwrap()));
     let mut run = start(EngineBuilder {
         sandbox: Some(sb),
         ..fx.builder(config(false), &mock)
@@ -394,6 +422,100 @@ async fn a_call_that_ignores_cancel_is_abandoned_and_its_step_baselines_forgotte
     let results = tool_results(mock.requests().last().unwrap());
     let r3 = results.iter().find(|r| r.0 == "r3").expect("r3 result");
     assert!(r3.1.contains("alpha line"), "{}", r3.1);
+}
+
+#[tokio::test]
+async fn a_write_cancelled_after_its_commit_is_awaited_and_its_edit_recorded() {
+    let fx = Fx::new();
+    fx.write("a.txt", "alpha\n");
+    let mock = MockProvider::new(vec![tools_step(
+        vec![call(
+            "w1",
+            "write",
+            json!({"path": "a.txt", "content": "beta\n"}),
+        )],
+        None,
+    )]);
+    let sb: Arc<dyn Sandbox> = Arc::new(Hang {
+        // Longer than the 150 ms an abandoned call gets.
+        stall_after_write: Some(Duration::from_millis(600)),
+        ..Hang::new(LocalSandbox::new(fx.root()).unwrap())
+    });
+    let mut run = start(EngineBuilder {
+        sandbox: Some(sb),
+        ..fx.builder(config(false), &mock)
+    });
+    run.say("go").await;
+    run.until(|e| matches!(e, Event::ToolStarted { .. })).await;
+    let end = Instant::now() + WAIT;
+    while std::fs::read_to_string(fx.dir.path().join("a.txt")).unwrap() != "beta\n" {
+        assert!(Instant::now() < end, "the write never landed");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    // The file is committed; the tool is still busy after it.
+    run.send(Command::Cancel).await;
+    let events = run.turn().await;
+    assert_eq!(finish_reason(&events), FinishReason::Cancelled);
+    let done = finished(&events);
+    assert!(
+        !done[0].2,
+        "the committed write must report its result: {:?}",
+        done[0]
+    );
+
+    // The log knows the change and its pre-image, which is what undo restores from.
+    let reader = SessionReader::<SessionRecord>::open(run.engine.session_path()).unwrap();
+    let pre = reader
+        .records()
+        .filter_map(|r| match r.unwrap().1 {
+            SessionRecord::Edit {
+                path, pre_image, ..
+            } if path.ends_with("a.txt") => Some(pre_image),
+            _ => None,
+        })
+        .next()
+        .expect("an Edit record for a.txt");
+    let pre = pre.expect("a.txt existed before");
+    assert_eq!(reader.read_blob(&pre).unwrap(), b"alpha\n");
+}
+
+#[tokio::test]
+async fn a_write_stuck_past_its_bound_is_abandoned_and_reported() {
+    let fx = Fx::new();
+    let mock = MockProvider::new(vec![tools_step(
+        vec![call(
+            "w1",
+            "write",
+            json!({"path": "hang.txt", "content": "x"}),
+        )],
+        None,
+    )]);
+    let sb: Arc<dyn Sandbox> = Arc::new(Hang::new(LocalSandbox::new(fx.root()).unwrap()));
+    let mut run = start(EngineBuilder {
+        sandbox: Some(sb),
+        ..fx.builder(config(false), &mock)
+    });
+    run.say("go").await;
+    run.until(|e| matches!(e, Event::ToolStarted { .. })).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let t0 = Instant::now();
+    run.send(Command::Cancel).await;
+    let events = run.turn().await;
+    let took = t0.elapsed();
+    assert_eq!(finish_reason(&events), FinishReason::Cancelled);
+    // Not the 150 ms other calls get: a write is waited for up to 10 s.
+    assert!(took >= Duration::from_secs(10), "{took:?}");
+    let done = finished(&events);
+    assert!(
+        done[0].2 && done[0].1.contains("undo cannot restore"),
+        "{done:?}"
+    );
+    assert!(
+        warnings(&events)
+            .iter()
+            .any(|w| w.contains("hang.txt may have changed")),
+        "{events:?}"
+    );
 }
 
 #[tokio::test]

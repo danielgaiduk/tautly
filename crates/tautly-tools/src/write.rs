@@ -68,6 +68,11 @@ impl Tool for WriteTool {
             },
             None => None,
         };
+        // The commit point: a cancel seen before it changes nothing; after it, the write
+        // is reported in full (the engine waits for it rather than abandon it).
+        if cx.cancel().is_cancelled() {
+            return ToolResult::error(crate::CANCELLED_BEFORE_WRITE);
+        }
         // The requested path, not `full`: the sandbox refuses symlinks into protected paths.
         if let Err(e) = sb
             .write_atomic(Path::new(&a.path), a.content.as_bytes(), None)

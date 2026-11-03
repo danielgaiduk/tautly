@@ -338,6 +338,15 @@ fn syntax_warning(path: &str, before: &str, after: &str) -> Option<String> {
 /// (spec 7.1). A failure never fails the edit; it comes back as a note for the output.
 pub(crate) async fn reindex(cx: &ToolCx, path: &str) -> Option<String> {
     let index = cx.index()?;
+    if cx.cancel().is_cancelled() {
+        // The turn is ending: leave the catch-up to the background refresh.
+        index.mark_stale();
+        drop(index.refresh_stale_in_background());
+        return Some(format!(
+            "index note: {path} was not re-indexed (the turn was cancelled); \
+             outline/symbol/refs may be stale for it"
+        ));
+    }
     match index.reindex_file(Path::new(path)).await {
         Ok(()) => None,
         Err(e) => Some(format!(
@@ -362,6 +371,9 @@ async fn write_edited(
     edited: &str,
     repaired: bool,
 ) -> Result<(AppliedEffect, Option<String>), String> {
+    if cx.cancel().is_cancelled() {
+        return Err(crate::CANCELLED_BEFORE_WRITE.to_string());
+    }
     // The requested path, not `file.full`: the sandbox refuses symlinks into protected paths.
     atomic::preserve_and_write(sb, Path::new(path), &file.original, edited)
         .await
@@ -696,6 +708,9 @@ async fn run_patch(a: PatchArgs, sb: &dyn Sandbox, cx: &ToolCx) -> ToolResult {
     }
 
     // All hunks are validated; now write. A failure undoes the files already written.
+    if cx.cancel().is_cancelled() {
+        return ToolResult::error(crate::CANCELLED_BEFORE_WRITE);
+    }
     for (i, step) in steps.iter().enumerate() {
         let Err(e) = step.apply(sb).await else {
             continue;

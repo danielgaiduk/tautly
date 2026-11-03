@@ -12,9 +12,15 @@
 //!
 //! Every run boundary is a tool boundary for the budgets: once one is used up, the calls
 //! not started are answered "not run" (a call already running finishes). After a cancel,
-//! running calls get [`ABANDON_AFTER`] to stop; one that has not is dropped (`bash` kills
-//! its process group when dropped), answered as abandoned, and every read baseline
-//! recorded in that step is forgotten, since what the dropped call showed is unknown.
+//! running read, command and network calls get [`ABANDON_AFTER`] to stop; one that has not
+//! is dropped (`bash` kills its process group when dropped), answered as abandoned, and
+//! every read baseline recorded in that step is forgotten, since what the dropped call
+//! showed is unknown. A write is never abandoned that way: it is local and short, it
+//! checks the cancel before its commit point and skips its slow bookkeeping after it, so
+//! it is awaited and its change logged for undo. Only a write still running
+//! [`WRITE_BOUND`] after the cancel is dropped; its paths are then treated as changed
+//! (baselines forgotten, write generation bumped) and the user is told undo cannot
+//! restore them.
 
 use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
@@ -27,6 +33,7 @@ use serde_json::Value;
 use tautly_provider::Content;
 use tautly_sandbox::{Decision, Effect, SPILL_DIR};
 use tautly_session::BlobRef;
+use tautly_tools::AppliedEffect;
 use tautly_tools::{ContextOp, PersistedEffect, Tool, ToolCx, ToolResult, parse_context_op};
 use tokio::sync::mpsc;
 
@@ -41,6 +48,8 @@ const OUTPUT_BUFFER: usize = 64;
 /// How long a running call may take to stop after a cancel before it is dropped; with the
 /// log writes after it, the turn still ends within spec 8's 200 ms.
 const ABANDON_AFTER: Duration = Duration::from_millis(150);
+/// How long a write may still run after a cancel before it is dropped.
+const WRITE_BOUND: Duration = Duration::from_secs(10);
 
 /// One call, checked for what can be known before running it.
 struct Planned<'a> {
@@ -209,29 +218,68 @@ impl Session {
             .collect();
         let this = &*self;
         let bounded = admitted.iter().map(|p| async move {
+            let grace = match &p.runnable {
+                Some((_, Effect::Write { .. })) => WRITE_BOUND,
+                _ => ABANDON_AFTER,
+            };
             tokio::select! {
                 r = this.invoke(p, turn, ctl) => Some(r),
-                () = abandon_after_cancel(ctl) => None,
+                () = after_cancel(ctl, grace) => None,
             }
         });
         let ran: Vec<Option<ToolResult>> = join_all(bounded).await;
+        let mut lost_writes = Vec::new();
+        for (p, r) in admitted.iter().zip(&ran) {
+            if let (None, Some((_, Effect::Write { paths }))) = (r, &p.runnable) {
+                lost_writes.extend(paths.iter().cloned());
+            }
+        }
         if ran.iter().any(Option::is_none) {
             self.reads.forget_recorded_at(turn);
         }
-        let mut ran = ran.into_iter();
+        if !lost_writes.is_empty() {
+            self.lost_writes(&lost_writes).await;
+        }
+        let mut ran = admitted.iter().zip(ran);
         gated
             .into_iter()
             .map(|g| {
                 g.unwrap_or_else(|| match ran.next().expect("one result per admitted call") {
-                    Some(result) => Outcome {
+                    (_, Some(result)) => Outcome {
                         result,
                         blocked: false,
                         ran: true,
                     },
-                    None => Outcome::abandoned(),
+                    (p, None) if matches!(&p.runnable, Some((_, Effect::Write { .. }))) => {
+                        Outcome::refused(ToolResult::error(
+                            "cancelled: the write did not finish in time and was abandoned; \
+                             its files may have changed, and undo cannot restore them",
+                        ))
+                    }
+                    (_, None) => Outcome::abandoned(),
                 })
             })
             .collect()
+    }
+
+    /// A write was dropped half way: treat its paths as changed in ways nobody saw.
+    async fn lost_writes(&mut self, paths: &[PathBuf]) {
+        for p in paths {
+            if let Ok(full) = self.sandbox.resolve(p) {
+                self.reads.forget_path(&full);
+            }
+            self.reads.forget_path(p);
+        }
+        self.ledger
+            .note_effects(&[AppliedEffect::Exec { may_write: true }]);
+        let list: Vec<String> = paths.iter().map(|p| p.display().to_string()).collect();
+        self.warn(format!(
+            "a write was abandoned after the cancel; {} may have changed, and undo cannot \
+             restore {}",
+            list.join(", "),
+            if list.len() == 1 { "it" } else { "them" }
+        ))
+        .await;
     }
 
     /// Whether the call may run: None if so, else how it ended without running.
@@ -424,10 +472,10 @@ impl Session {
     }
 }
 
-/// Completes [`ABANDON_AFTER`] after the turn is cancelled.
-async fn abandon_after_cancel(ctl: &TurnControl) {
+/// Completes `grace` after the turn is cancelled.
+async fn after_cancel(ctl: &TurnControl, grace: Duration) {
     ctl.cancel.cancelled().await;
-    tokio::time::sleep(ABANDON_AFTER).await;
+    tokio::time::sleep(grace).await;
 }
 
 /// What [`persist_result`] left out of the log.

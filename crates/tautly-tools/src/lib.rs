@@ -344,6 +344,10 @@ impl ReadTracker {
     }
 }
 
+/// A write tool saw the cancel before its commit point.
+pub(crate) const CANCELLED_BEFORE_WRITE: &str =
+    "cancelled: the turn was cancelled before this write; nothing was changed";
+
 /// Most lines a read returns when no end line is given.
 pub(crate) const MAX_READ_LINES: usize = 2000;
 
@@ -374,6 +378,13 @@ pub(crate) async fn record_written_file(
     by: WrittenBy<'_>,
 ) {
     let hash = blake3::hash(bytes);
+    // Cancelled after the commit: keep only the guard (cheap), no spilled baseline, so
+    // the result comes back at once.
+    if cx.cancel().is_cancelled() {
+        cx.reads().refresh(full, meta, hash);
+        cx.reads().forget(full, LineRange::ALL);
+        return;
+    }
     // Hashline edits move line numbers and the model has not seen the new anchors, so a
     // read after one must return the anchored lines, never `unchanged`: keep the older
     // baselines (a changed range then comes back in full) and only refresh the guard.
