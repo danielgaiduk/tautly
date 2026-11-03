@@ -20,7 +20,9 @@
 //! it is awaited and its change logged for undo. Only a write still running
 //! [`WRITE_BOUND`] after the cancel is dropped; its paths are then treated as changed
 //! (baselines forgotten, write generation bumped) and the user is told undo cannot
-//! restore them.
+//! restore them. Dropping the future does not stop a blocking write already under way, so
+//! those paths stay watched: one that changes later is treated as changed again at the
+//! next step start (each check waits at most 100 ms on the file system).
 
 use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
@@ -269,6 +271,9 @@ impl Session {
                 self.reads.forget_path(&full);
             }
             self.reads.forget_path(p);
+            // Its blocking write may still land later: watched at every step start.
+            let seen = self.quick_meta(p).await;
+            self.lost_write_paths.insert(p.clone(), seen);
         }
         self.ledger
             .note_effects(&[AppliedEffect::Exec { may_write: true }]);
@@ -280,6 +285,43 @@ impl Session {
             if list.len() == 1 { "it" } else { "them" }
         ))
         .await;
+    }
+
+    /// At a step start: a path whose write was abandoned and that has changed since is
+    /// treated as changed again (baselines forgotten, write generation bumped), and said.
+    pub(crate) async fn check_lost_writes(&mut self) {
+        if self.lost_write_paths.is_empty() {
+            return;
+        }
+        let paths: Vec<PathBuf> = self.lost_write_paths.keys().cloned().collect();
+        for p in paths {
+            let now = self.quick_meta(&p).await;
+            if self.lost_write_paths.get(&p) == Some(&now) {
+                continue;
+            }
+            self.lost_write_paths.insert(p.clone(), now);
+            if let Ok(full) = self.sandbox.resolve(&p) {
+                self.reads.forget_path(&full);
+            }
+            self.reads.forget_path(&p);
+            self.ledger
+                .note_effects(&[AppliedEffect::Exec { may_write: true }]);
+            self.warn(format!(
+                "{} changed after its write was abandoned; undo cannot restore it",
+                p.display()
+            ))
+            .await;
+        }
+    }
+
+    /// `(mtime, len)` of `p`, or None when it is missing or does not answer quickly (a file
+    /// system that hangs is what got the write abandoned).
+    async fn quick_meta(&self, p: &std::path::Path) -> Option<(std::time::SystemTime, u64)> {
+        let meta = tokio::time::timeout(Duration::from_millis(100), self.sandbox.metadata(p));
+        match meta.await {
+            Ok(Ok(m)) => Some((m.mtime, m.len)),
+            _ => None,
+        }
     }
 
     /// Whether the call may run: None if so, else how it ended without running.

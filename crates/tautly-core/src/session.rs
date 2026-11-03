@@ -2,11 +2,11 @@
 //! while one runs, plus the two outlets everything goes through: the event channel and
 //! the session log.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use tautly_context::pinned::{self, PinSource, Pinned};
 use tautly_context::{CompactionRecord, Context, agents_md};
@@ -315,6 +315,9 @@ pub(crate) struct Session {
     pub cost_ledger_reported: bool,
     /// The process groups this session's commands started (killed at shutdown).
     pub groups: ProcessGroups,
+    /// Paths of writes abandoned at their bound, with `(mtime, len)` last seen: a blocking
+    /// write may still land after its future was dropped.
+    pub lost_write_paths: HashMap<PathBuf, Option<(SystemTime, u64)>>,
 }
 
 impl Session {

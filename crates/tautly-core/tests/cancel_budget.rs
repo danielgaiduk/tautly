@@ -319,6 +319,9 @@ struct Hang {
     sb: LocalSandbox,
     stall_after_write: Option<Duration>,
     written: std::sync::atomic::AtomicBool,
+    /// A write of `late.txt` never returns, but lands on disk this long after it began
+    /// (like a blocking write that outlives its dropped future).
+    late_write: Option<Duration>,
 }
 
 impl Hang {
@@ -327,6 +330,7 @@ impl Hang {
             sb,
             stall_after_write: None,
             written: Default::default(),
+            late_write: None,
         }
     }
 }
@@ -362,6 +366,16 @@ impl Sandbox for Hang {
         mode: Option<u32>,
     ) -> Result<(), SandboxError> {
         if hangs(p) {
+            std::future::pending::<()>().await;
+        }
+        if let Some(d) = self.late_write
+            && p.file_name().is_some_and(|n| n == "late.txt")
+        {
+            let (full, bytes) = (self.sb.root().join(p), bytes.to_vec());
+            std::thread::spawn(move || {
+                std::thread::sleep(d);
+                std::fs::write(full, bytes).unwrap();
+            });
             std::future::pending::<()>().await;
         }
         let r = self.sb.write_atomic(p, bytes, mode).await;
@@ -530,6 +544,53 @@ async fn a_write_stuck_past_its_bound_is_abandoned_and_reported() {
             .iter()
             .any(|w| w.contains("hang.txt may have changed")),
         "{events:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_write_that_lands_after_its_bound_is_noticed_at_the_next_step() {
+    let fx = Fx::new();
+    let mock = MockProvider::new(vec![
+        tools_step(
+            vec![call(
+                "w1",
+                "write",
+                json!({"path": "late.txt", "content": "x"}),
+            )],
+            None,
+        ),
+        text_step("ok", tokens(1, 1)),
+    ]);
+    let sb: Arc<dyn Sandbox> = Arc::new(Hang {
+        late_write: Some(Duration::from_millis(10_800)),
+        ..Hang::new(LocalSandbox::new(fx.root()).unwrap())
+    });
+    let mut run = start(EngineBuilder {
+        sandbox: Some(sb),
+        ..fx.builder(config(false), &mock)
+    });
+    run.say("go").await;
+    run.until(|e| matches!(e, Event::ToolStarted { .. })).await;
+    run.send(Command::Cancel).await;
+    let first = run.turn().await;
+    assert!(
+        warnings(&first)
+            .iter()
+            .any(|w| w.contains("late.txt may have changed")),
+        "{first:?}"
+    );
+    // The abandoned write lands after the 10 s bound.
+    let end = Instant::now() + WAIT;
+    while !fx.dir.path().join("late.txt").exists() {
+        assert!(Instant::now() < end, "the late write never landed");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let second = run.turn_with("again").await;
+    assert!(
+        warnings(&second)
+            .iter()
+            .any(|w| w.contains("late.txt changed after its write was abandoned")),
+        "{second:?}"
     );
 }
 

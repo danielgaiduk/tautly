@@ -224,6 +224,7 @@ impl EngineBuilder {
             cost_ledger: CostLedger::new(data_home.join(LEDGER_FILE)),
             cost_ledger_reported: false,
             groups: groups.clone(),
+            lost_write_paths: Default::default(),
         };
         let actor = Actor {
             log: session.log.clone(),

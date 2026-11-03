@@ -328,6 +328,7 @@ impl Session {
             while let Ok(cmd) = ctl.inbox.try_recv() {
                 self.context_command(cmd).await;
             }
+            self.check_lost_writes().await;
             self.check_index().await;
             if self.model.provider() != self.history_provider {
                 strip_reasoning(&mut self.context.history);
