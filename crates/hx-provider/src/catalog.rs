@@ -9,6 +9,10 @@ use crate::{
 
 const BUILTIN: &str = include_str!("../catalog/models.toml");
 
+/// Cache lifetime assumed for models with a prompt cache (`explicit` or `automatic`) whose
+/// catalog entry sets no `cache_ttl_s`.
+pub const DEFAULT_CACHE_TTL_S: u32 = 300;
+
 /// USD per million tokens.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Price {
@@ -22,6 +26,9 @@ pub struct Price {
 pub struct ModelInfo {
     pub caps: Capabilities,
     pub price: Option<Price>,
+    /// How long the provider keeps a prompt-cache entry alive after a request, in seconds;
+    /// `None` when the model has no prompt cache.
+    pub cache_ttl_s: Option<u32>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -38,6 +45,9 @@ struct Entry {
     images: bool,
     edit_format: EditFormat,
     price: Option<Price>,
+    /// Overrides the default for the cache style (see [`DEFAULT_CACHE_TTL_S`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cache_ttl_s: Option<u32>,
 }
 
 impl Entry {
@@ -53,6 +63,10 @@ impl Entry {
                 edit_format: self.edit_format,
             },
             price: self.price,
+            cache_ttl_s: self.cache_ttl_s.or(match self.cache {
+                CacheStyle::None => None,
+                CacheStyle::Explicit | CacheStyle::Automatic => Some(DEFAULT_CACHE_TTL_S),
+            }),
         }
     }
 }
@@ -87,6 +101,7 @@ impl Catalog {
             || ModelInfo {
                 caps: Capabilities::conservative(),
                 price: None,
+                cache_ttl_s: None,
             },
             Entry::info,
         )

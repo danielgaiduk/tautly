@@ -9,7 +9,7 @@ use hx_tools::{LineRange, PrevRead, ReadTracker};
 use hx_tools::{PlanStep, StepStatus};
 use serde_json::json;
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::time::{Instant, SystemTime};
 
 fn caps() -> Capabilities {
     Capabilities {
@@ -51,6 +51,10 @@ fn ctx_with(n: usize) -> Context {
     }
 }
 
+fn now() -> Instant {
+    Instant::now()
+}
+
 fn status(used: u32, budget: u32) -> hx_context::ContextStatus {
     hx_context::ContextStatus {
         used,
@@ -82,25 +86,25 @@ fn system_text(req: &hx_provider::CanonicalRequest) -> String {
 fn triggers_at_80_percent_not_below() {
     let c = Context::default();
     let t = Some(DEFAULT_THRESHOLD);
-    assert!(c.needs_compaction(&status(80_000, 100_000), t));
-    assert!(c.needs_compaction(&status(95_000, 100_000), t));
-    assert!(!c.needs_compaction(&status(79_999, 100_000), t));
-    assert!(!c.needs_compaction(&status(0, 100_000), t));
+    assert!(c.needs_compaction(&status(80_000, 100_000), t, now(), None, None));
+    assert!(c.needs_compaction(&status(95_000, 100_000), t, now(), None, None));
+    assert!(!c.needs_compaction(&status(79_999, 100_000), t, now(), None, None));
+    assert!(!c.needs_compaction(&status(0, 100_000), t, now(), None, None));
     // A zero window never triggers (nothing sensible to compare against).
-    assert!(!c.needs_compaction(&status(10, 0), t));
+    assert!(!c.needs_compaction(&status(10, 0), t, now(), None, None));
     // Other thresholds work the same way.
-    assert!(c.needs_compaction(&status(50_000, 100_000), Some(0.5)));
-    assert!(!c.needs_compaction(&status(49_999, 100_000), Some(0.5)));
+    assert!(c.needs_compaction(&status(50_000, 100_000), Some(0.5), now(), None, None));
+    assert!(!c.needs_compaction(&status(49_999, 100_000), Some(0.5), now(), None, None));
 }
 
 #[test]
 fn disabled_threshold_never_triggers() {
     let c = Context::default();
-    assert!(!c.needs_compaction(&status(100_000, 100_000), None));
-    assert!(!c.needs_compaction(&status(500_000, 100_000), None));
+    assert!(!c.needs_compaction(&status(100_000, 100_000), None, now(), None, None));
+    assert!(!c.needs_compaction(&status(500_000, 100_000), None, now(), None, None));
     // A nonsensical threshold is treated as disabled rather than always firing.
-    assert!(!c.needs_compaction(&status(100_000, 100_000), Some(0.0)));
-    assert!(!c.needs_compaction(&status(100_000, 100_000), Some(f32::NAN)));
+    assert!(!c.needs_compaction(&status(100_000, 100_000), Some(0.0), now(), None, None));
+    assert!(!c.needs_compaction(&status(100_000, 100_000), Some(f32::NAN), now(), None, None));
 }
 
 fn rich_ctx() -> Context {

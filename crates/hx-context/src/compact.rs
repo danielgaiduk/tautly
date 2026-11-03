@@ -10,10 +10,12 @@
 
 use std::collections::HashSet;
 use std::fmt::Write;
+use std::time::{Duration, Instant};
 
-use hx_provider::{Block, CanonicalRequest, Capabilities, Content, Message, ModelId, Role};
+use hx_provider::{Block, CanonicalRequest, Capabilities, Content, Message, ModelId, Price, Role};
 
 use crate::blocks::{ContextStatus, Turn, message_tokens};
+use crate::schedule::{self, MutationReason};
 use crate::{Context, assemble, pinned};
 
 /// Share of the window at which compaction starts (80%).
@@ -55,19 +57,66 @@ pub enum UncompactError {
 }
 
 impl Context {
-    /// Whether `status` is at or over `threshold` (a share of the window, normally
-    /// [`DEFAULT_THRESHOLD`]). `None` disables automatic compaction, as does a threshold that
-    /// is not a positive number.
-    pub fn needs_compaction(&self, status: &ContextStatus, threshold: Option<f32>) -> bool {
-        let Some(t) = threshold.filter(|t| t.is_finite() && *t > 0.0) else {
-            return false;
-        };
+    /// Whether compaction should run now: [`compaction_decision`](Self::compaction_decision)
+    /// found a reason.
+    pub fn needs_compaction(
+        &self,
+        status: &ContextStatus,
+        threshold: Option<f32>,
+        now: Instant,
+        ttl: Option<Duration>,
+        price: Option<&Price>,
+    ) -> bool {
+        self.compaction_decision(status, threshold, now, ttl, price)
+            .is_some()
+    }
+
+    /// Why compaction should run now, if it should. `status` at or over `threshold` (a share
+    /// of the window, normally [`DEFAULT_THRESHOLD`]) makes it a candidate; the cache-aware
+    /// scheduler ([`schedule::decide`]) then lets it run at once when the cache is cold or the
+    /// context is at 90%, and while the cache is warm only when the tokens it frees repay
+    /// rebuilding the cached prefix. `None` for `threshold` disables automatic compaction, as
+    /// does a threshold that is not a positive number. The engine applies the result together
+    /// with any collection decided at the same turn start.
+    pub fn compaction_decision(
+        &self,
+        status: &ContextStatus,
+        threshold: Option<f32>,
+        now: Instant,
+        ttl: Option<Duration>,
+        price: Option<&Price>,
+    ) -> Option<MutationReason> {
+        let t = threshold.filter(|t| t.is_finite() && *t > 0.0)?;
         if status.budget == 0 {
-            return false;
+            return None;
         }
         // Basis points: exact for round thresholds such as 0.8, which f32 cannot hold.
         let bp = (f64::from(t) * 10_000.0).round() as u64;
-        u64::from(status.used) * 10_000 >= u64::from(status.budget) * bp
+        if u64::from(status.used) * 10_000 < u64::from(status.budget) * bp {
+            return None;
+        }
+        schedule::decide(
+            &self.clock,
+            now,
+            ttl,
+            self.compactable_tokens(),
+            price,
+            status.used,
+            status.budget,
+        )
+    }
+
+    /// Estimated tokens a compaction with [`DEFAULT_KEEP_RECENT`] would remove, taking the
+    /// summary that replaces them as small. An estimate for the scheduler: the real cut
+    /// ([`compaction_request`](Self::compaction_request)) can be shorter.
+    fn compactable_tokens(&self) -> u32 {
+        let est = &self.tokens;
+        let cut = self.history.len().saturating_sub(DEFAULT_KEEP_RECENT);
+        self.history[..cut]
+            .iter()
+            .flat_map(|t| &t.messages)
+            .map(|m| message_tokens(m, est))
+            .fold(0, u32::saturating_add)
     }
 
     /// The request that produces the summary, and how many of the oldest turns it covers

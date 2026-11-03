@@ -5,21 +5,26 @@ pub mod agents_md;
 pub mod assemble;
 pub mod blocks;
 pub mod compact;
+pub mod gc;
 pub mod pinned;
 pub mod prompt;
 pub mod repo_map;
 pub mod sanitize;
+pub mod schedule;
 pub mod state;
 pub mod tokens;
 
 use std::path::PathBuf;
+use std::time::Instant;
 
 use hx_tools::{AppliedEffect, ContextOp};
 
 pub use assemble::STABLE_LEN;
 pub use blocks::{Breakdown, ContextStatus, Turn};
 pub use compact::{CompactionRecord, UncompactError};
+pub use gc::{GcRecord, ReadTarget, ResultMeta};
 pub use pinned::{PinSource, Pinned};
+pub use schedule::{CacheClock, MutationReason};
 pub use state::{FileNote, WorkingState};
 pub use tokens::TokenEstimator;
 
@@ -43,6 +48,11 @@ pub struct Context {
     pub tokens: TokenEstimator,
     /// Project root; file paths in the working state are displayed relative to it.
     pub root: Option<PathBuf>,
+    /// One entry per tool result recorded with [`Context::push_tool_result`], oldest first;
+    /// the facts [`Context::collect`] decides on.
+    pub results: Vec<ResultMeta>,
+    /// When the provider last saw the prefix, see [`Context::note_request`].
+    pub clock: CacheClock,
 }
 
 impl Default for Context {
@@ -57,6 +67,8 @@ impl Default for Context {
             repo_map: None,
             tokens: TokenEstimator::default(),
             root: None,
+            results: Vec::new(),
+            clock: CacheClock::default(),
         }
     }
 }
@@ -104,6 +116,16 @@ impl Context {
         }
         self.repo_map = Some(map);
         true
+    }
+
+    /// Record that a provider request went out at `at` whose cache-marked prefix (up to the
+    /// last cache breakpoint) was `cached_prefix_tokens` long. The scheduler measures the
+    /// cache's age from `at`.
+    pub fn note_request(&mut self, at: Instant, cached_prefix_tokens: u32) {
+        self.clock = CacheClock {
+            last_request: Some(at),
+            cached_prefix_tokens,
+        };
     }
 
     /// Apply a `pin` or `state` tool call.

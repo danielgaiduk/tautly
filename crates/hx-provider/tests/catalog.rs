@@ -178,3 +178,50 @@ fn only_transient_errors_are_transient() {
     );
     assert!(!ProviderError::Auth("x".into()).is_transient());
 }
+
+#[test]
+fn cache_ttl_defaults_follow_the_cache_style() {
+    let c = Catalog::builtin();
+    // explicit and automatic caches default to five minutes
+    assert_eq!(
+        c.get(&"anthropic/claude-sonnet-5-5".into()).cache_ttl_s,
+        Some(300)
+    );
+    assert_eq!(c.get(&"openai/gpt-5".into()).cache_ttl_s, Some(300));
+    assert_eq!(c.get(&"google/gemini-3-pro".into()).cache_ttl_s, Some(300));
+    // no cache: no TTL, and the same for models missing from the catalog
+    assert_eq!(c.get(&"compat/some-local".into()).cache_ttl_s, None);
+    let none = Catalog::from_toml(
+        r#"
+[models."compat/nocache"]
+context_window = 8000
+max_output = 1000
+parallel_tools = false
+reasoning = "none"
+cache = "none"
+images = false
+edit_format = "hashline"
+"#,
+    )
+    .unwrap();
+    assert_eq!(none.get(&"compat/nocache".into()).cache_ttl_s, None);
+}
+
+#[test]
+fn cache_ttl_can_be_set_per_model() {
+    let c = Catalog::from_toml(
+        r#"
+[models."anthropic/long"]
+context_window = 8000
+max_output = 1000
+parallel_tools = false
+reasoning = "none"
+cache = "explicit"
+images = false
+edit_format = "hashline"
+cache_ttl_s = 3600
+"#,
+    )
+    .unwrap();
+    assert_eq!(c.get(&"anthropic/long".into()).cache_ttl_s, Some(3600));
+}
