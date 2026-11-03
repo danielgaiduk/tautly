@@ -510,3 +510,112 @@ fn key_value_argv_values_are_checked_as_paths() {
     assert!(asks(y.decide("write", &write("GNUmakefile"), None)));
     assert!(asks(y.decide("write", &write("sub/gnumakefile"), None)));
 }
+
+// --- checkpoint fix: C1 writes classified after symlink resolution ---
+mod symlinks {
+    use super::*;
+    use std::os::unix::fs::symlink;
+
+    /// A workspace with `.git/config`, `NOTES.md -> .git/config`,
+    /// `docs/hooks -> ../.git/hooks` and a dangling `x -> .git/hooks/post-checkout`.
+    fn repo() -> (tempfile::TempDir, PathBuf) {
+        let t = tempfile::tempdir().unwrap();
+        let root = t.path().to_path_buf();
+        std::fs::create_dir_all(root.join(".git/hooks")).unwrap();
+        std::fs::create_dir_all(root.join("docs")).unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join("secret")).unwrap();
+        std::fs::write(root.join(".git/config"), "[core]\n").unwrap();
+        std::fs::write(root.join("src/main.rs"), "").unwrap();
+        symlink(".git/config", root.join("NOTES.md")).unwrap();
+        symlink("../.git/hooks", root.join("docs/hooks")).unwrap();
+        symlink(".git/hooks/post-checkout", root.join("x")).unwrap();
+        symlink("../src/main.rs", root.join("docs/link.rs")).unwrap();
+        symlink("secret/k", root.join("pub.txt")).unwrap();
+        symlink("/etc", root.join("out")).unwrap();
+        symlink("loop2", root.join("loop1")).unwrap();
+        symlink("loop1", root.join("loop2")).unwrap();
+        (t, root)
+    }
+
+    fn policy(root: &std::path::Path, mode: Mode, allow: &[&str], deny: &[&str]) -> Policy {
+        Policy::new(
+            PolicyConfig {
+                mode,
+                allow: allow.iter().map(|s| s.to_string()).collect(),
+                deny: deny.iter().map(|s| s.to_string()).collect(),
+            },
+            root.to_path_buf(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn writes_through_symlinks_into_protected_paths_ask() {
+        let (_t, root) = repo();
+        for mode in [Mode::AutoEdit, Mode::Yolo] {
+            let p = policy(&root, mode, &["write"], &[]);
+            for f in [
+                "NOTES.md",
+                "docs/hooks/pre-commit",
+                "x",
+                "docs/hooks/../config",
+                "out/passwd",
+                "loop1",
+            ] {
+                assert!(asks(p.decide("write", &write(f), None)), "{f}");
+            }
+            let abs = root.join("NOTES.md");
+            assert!(asks(p.decide("write", &write(abs.to_str().unwrap()), None)));
+            assert_eq!(
+                p.decide("write", &write("src/main.rs"), None),
+                Decision::Allow
+            );
+        }
+        let Decision::Ask { reason } =
+            policy(&root, Mode::AutoEdit, &[], &[]).decide("edit", &write("NOTES.md"), None)
+        else {
+            panic!("expected ask");
+        };
+        assert!(reason.contains(".git/config"), "{reason}");
+        // A protected path that is itself a link names its real target as well.
+        std::fs::create_dir_all(root.join(".hx")).unwrap();
+        symlink("../.git/config", root.join(".hx/notes")).unwrap();
+        let Decision::Ask { reason } =
+            policy(&root, Mode::Yolo, &[], &[]).decide("edit", &write(".hx/notes"), None)
+        else {
+            panic!("expected ask");
+        };
+        assert!(reason.contains(".git/config"), "{reason}");
+    }
+
+    #[test]
+    fn bash_targets_through_symlinks_ask() {
+        let (_t, root) = repo();
+        let y = policy(&root, Mode::Yolo, &[], &[]);
+        for cmd in [
+            "echo x > NOTES.md",
+            "echo x >> docs/hooks/pre-commit",
+            "cp evil NOTES.md",
+            "tee x",
+            "dd if=evil of=NOTES.md",
+        ] {
+            assert!(asks(y.decide("bash", &exec("x"), Some(cmd))), "{cmd}");
+        }
+        assert_eq!(
+            y.decide("bash", &exec("x"), Some("cp a docs/link.rs")),
+            Decision::Allow
+        );
+    }
+
+    #[test]
+    fn path_rules_see_the_resolved_path() {
+        let (_t, root) = repo();
+        let p = policy(&root, Mode::Ask, &["edit(docs/**)"], &["edit(secret/**)"]);
+        assert!(asks(p.decide("edit", &write("docs/link.rs"), None)));
+        assert!(matches!(
+            p.decide("edit", &write("pub.txt"), None),
+            Decision::Deny { .. }
+        ));
+    }
+}

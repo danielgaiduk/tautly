@@ -229,7 +229,8 @@ async fn write_edited(
     file: Loaded,
     edited: &str,
 ) -> Result<AppliedEffect, String> {
-    atomic::preserve_and_write(sb, &file.full, &file.original, edited)
+    // The requested path, not `file.full`: the sandbox refuses symlinks into protected paths.
+    atomic::preserve_and_write(sb, Path::new(path), &file.original, edited)
         .await
         .map_err(|e| format!("{path}: {e}"))?;
     let post_hash =
@@ -359,6 +360,8 @@ async fn run_hashline(a: HashlineArgs, sb: &dyn Sandbox, cx: &ToolCx) -> ToolRes
 
 /// One file of a validated patch, ready to write.
 struct Step {
+    /// The path as the patch names it; writes go through this (not `full`) so the
+    /// sandbox can refuse symlinks into protected paths.
     rel: String,
     full: PathBuf,
     op: PatchOp,
@@ -371,22 +374,22 @@ struct Step {
 
 impl Step {
     async fn apply(&self, sb: &dyn Sandbox) -> Result<(), SandboxError> {
+        let path = Path::new(&self.rel);
         match self.op {
-            PatchOp::Delete => sb.remove_file(&self.full).await,
-            PatchOp::Update(_) | PatchOp::Add(_) => {
-                sb.write_atomic(&self.full, &self.bytes, None).await
-            }
+            PatchOp::Delete => sb.remove_file(path).await,
+            PatchOp::Update(_) | PatchOp::Add(_) => sb.write_atomic(path, &self.bytes, None).await,
         }
     }
 
     /// Put the file back as it was before this step.
     async fn undo(&self, sb: &dyn Sandbox) -> Result<(), SandboxError> {
+        let path = Path::new(&self.rel);
         match &self.original {
             Some(original) => {
                 let mode = self.mode.map(|m| m & 0o7777);
-                sb.write_atomic(&self.full, original, mode).await
+                sb.write_atomic(path, original, mode).await
             }
-            None => sb.remove_file(&self.full).await,
+            None => sb.remove_file(path).await,
         }
     }
 }

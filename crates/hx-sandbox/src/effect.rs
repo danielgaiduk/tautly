@@ -54,6 +54,9 @@ pub trait Sandbox: Send + Sync {
     fn resolve(&self, p: &Path) -> Result<PathBuf, SandboxError>;
     async fn read(&self, p: &Path) -> Result<Vec<u8>, SandboxError>;
     async fn metadata(&self, p: &Path) -> Result<FileMeta, SandboxError>;
+    /// Atomically replace the file at `p`. Pass `p` as the caller requested it, not
+    /// pre-resolved: a path that reaches a protected path (`.git/`, `.hx/`, ...) only
+    /// through a symlink is refused with [`SandboxError::Denied`].
     async fn write_atomic(
         &self,
         p: &Path,
@@ -61,6 +64,7 @@ pub trait Sandbox: Send + Sync {
         mode: Option<u32>,
     ) -> Result<(), SandboxError>;
     /// Delete the file at `p` (confined to the root). Errors if it does not exist.
+    /// Same symlink rule as [`Sandbox::write_atomic`].
     async fn remove_file(&self, p: &Path) -> Result<(), SandboxError>;
     /// Persist `bytes` (e.g. over-long tool output) in a sandbox-managed scratch area and
     /// return its root-relative path, so the model can `read` it later. Content-addressed.

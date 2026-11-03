@@ -7,6 +7,7 @@ use tokio::process::{Child, Command};
 use url::Url;
 
 use crate::effect::{FileMeta, HttpResponse, Sandbox, SandboxError, SpawnSpec};
+use crate::protected::{self, is_protected};
 
 const MAX_BODY: usize = 10 * 1024 * 1024;
 
@@ -46,6 +47,33 @@ fn normalize(p: &Path) -> Option<PathBuf> {
         }
     }
     Some(out)
+}
+
+impl LocalSandbox {
+    /// Refuse to modify a protected path reached through a symlink from a path
+    /// that is not itself protected (`NOTES.md -> .git/config`). Naming a
+    /// protected path directly is the permission policy's decision (it asks);
+    /// following a repository-planted link to one never is. `p` is the path as
+    /// the caller requested it; `resolved` is `self.resolve(p)`.
+    fn guard_protected_target(&self, p: &Path, resolved: &Path) -> Result<(), SandboxError> {
+        let Ok(real) = resolved.strip_prefix(&self.root) else {
+            return Ok(());
+        };
+        if !is_protected(real) {
+            return Ok(());
+        }
+        let named = protected::normalize(&self.root, &p.to_string_lossy())
+            .is_some_and(|rel| is_protected(&rel));
+        if named {
+            Ok(())
+        } else {
+            Err(SandboxError::Denied(format!(
+                "{} resolves through a symlink to protected path {}",
+                p.display(),
+                real.display()
+            )))
+        }
+    }
 }
 
 #[async_trait]
@@ -122,6 +150,7 @@ impl Sandbox for LocalSandbox {
         mode: Option<u32>,
     ) -> Result<(), SandboxError> {
         let path = self.resolve(p)?;
+        self.guard_protected_target(p, &path)?;
         let bytes = bytes.to_vec();
         tokio::task::spawn_blocking(move || -> Result<(), SandboxError> {
             use std::io::Write;
@@ -154,6 +183,7 @@ impl Sandbox for LocalSandbox {
 
     async fn remove_file(&self, p: &Path) -> Result<(), SandboxError> {
         let path = self.resolve(p)?;
+        self.guard_protected_target(p, &path)?;
         Ok(tokio::fs::remove_file(path).await?)
     }
 

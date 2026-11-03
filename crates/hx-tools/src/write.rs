@@ -61,7 +61,11 @@ impl Tool for WriteTool {
             Err(SandboxError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => None,
             Err(e) => return ToolResult::error(format!("{}: {e}", a.path)),
         };
-        if let Err(e) = sb.write_atomic(&full, a.content.as_bytes(), None).await {
+        // The requested path, not `full`: the sandbox refuses symlinks into protected paths.
+        if let Err(e) = sb
+            .write_atomic(Path::new(&a.path), a.content.as_bytes(), None)
+            .await
+        {
             return ToolResult::error(format!("{}: {e}", a.path));
         }
         let post_hash = blake3::hash(a.content.as_bytes());

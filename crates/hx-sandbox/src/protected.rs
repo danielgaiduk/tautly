@@ -1,5 +1,7 @@
 //! Paths that always require approval, regardless of mode (spec 5.5).
 
+use std::collections::VecDeque;
+use std::ffi::OsString;
 use std::path::{Component, Path, PathBuf};
 
 /// Directories whose entire subtree is protected, at any depth.
@@ -51,7 +53,9 @@ pub fn is_protected(rel: &Path) -> bool {
 }
 
 /// Reason a tool-supplied path (taken literally, no shell expansion) needs
-/// approval: outside the workspace or protected.
+/// approval: outside the workspace or protected, judged on both the lexical
+/// path and the path a write would actually reach after following symlinks
+/// (a repository can commit `NOTES.md -> .git/config`).
 pub(crate) fn path_reason(root: &Path, target: &str) -> Option<String> {
     if target == "/dev/null" {
         return None;
@@ -59,10 +63,88 @@ pub(crate) fn path_reason(root: &Path, target: &str) -> Option<String> {
     let Some(rel) = normalize(root, target) else {
         return Some(format!("path outside workspace: {target}"));
     };
+    let resolved = resolve_links(root, Path::new(target));
     if is_protected(&rel) {
-        return Some(format!("protected path: {}", rel.display()));
+        // Name the real target too, so an approval prompt cannot hide it.
+        return Some(match resolved {
+            Some(Resolved::Inside(real)) if real != rel => format!(
+                "protected path: {} (symlink to {})",
+                rel.display(),
+                real.display()
+            ),
+            _ => format!("protected path: {}", rel.display()),
+        });
     }
-    None
+    match resolved? {
+        Resolved::Inside(real) => is_protected(&real)
+            .then(|| format!("protected path: {} (via symlink {target})", real.display())),
+        Resolved::Outside(real) => Some(format!(
+            "path outside workspace: {} (via symlink {target})",
+            real.display()
+        )),
+        Resolved::Loop => Some(format!("too many levels of symlinks: {target}")),
+    }
+}
+
+/// What a path names once every symlink along it is followed.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Resolved {
+    /// Root-relative path (the lexical one when no symlink is involved).
+    Inside(PathBuf),
+    /// A symlink leads outside the root; the absolute path reached.
+    Outside(PathBuf),
+    /// Too many symlinks (a loop).
+    Loop,
+}
+
+const MAX_LINKS: usize = 40;
+
+/// Follow symlinks along `target` (relative to `root`, or absolute) the way the
+/// kernel would, including dangling links (a shell redirect creates their
+/// target) and `..` after a link. Missing components are taken lexically.
+/// `None` when `root` does not exist, so there is nothing on disk to follow.
+pub(crate) fn resolve_links(root: &Path, target: &Path) -> Option<Resolved> {
+    let root = root.canonicalize().ok()?;
+    let mut cur = if target.is_absolute() {
+        PathBuf::from("/")
+    } else {
+        root.clone()
+    };
+    let mut queue: VecDeque<OsString> = target
+        .components()
+        .map(|c| c.as_os_str().to_owned())
+        .collect();
+    let mut links = 0;
+    while let Some(part) = queue.pop_front() {
+        match Path::new(&part).components().next() {
+            Some(Component::RootDir) => cur = PathBuf::from("/"),
+            Some(Component::ParentDir) => {
+                cur.pop();
+            }
+            Some(Component::Normal(name)) => {
+                let next = cur.join(name);
+                let link =
+                    std::fs::symlink_metadata(&next).is_ok_and(|m| m.file_type().is_symlink());
+                match link.then(|| std::fs::read_link(&next).ok()).flatten() {
+                    Some(dest) => {
+                        links += 1;
+                        if links > MAX_LINKS {
+                            return Some(Resolved::Loop);
+                        }
+                        for c in dest.components().rev() {
+                            queue.push_front(c.as_os_str().to_owned());
+                        }
+                    }
+                    None => cur = next,
+                }
+            }
+            _ => {}
+        }
+    }
+    Some(match cur.strip_prefix(&root) {
+        Ok(rel) => Resolved::Inside(rel.to_path_buf()),
+        Err(_) => Resolved::Outside(cur),
+    })
 }
 
 /// Reason a write-redirect target (a literal shell word) needs approval.
@@ -115,7 +197,17 @@ fn path_word_reason(root: &Path, word: &str) -> Option<String> {
         return token.then(|| format!("unresolvable path pattern: {word}"));
     }
     let rel = normalize(root, word)?;
-    is_protected(&rel).then(|| format!("protected path: {}", rel.display()))
+    if is_protected(&rel) {
+        return Some(format!("protected path: {}", rel.display()));
+    }
+    // A word is not necessarily a path, so only a protected symlink target counts.
+    match resolve_links(root, Path::new(word))? {
+        Resolved::Inside(real) if is_protected(&real) => Some(format!(
+            "protected path: {} (via symlink {word})",
+            real.display()
+        )),
+        _ => None,
+    }
 }
 
 /// Lexically normalize `target` against `root`; `None` if it lands outside.

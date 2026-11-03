@@ -224,3 +224,63 @@ async fn remove_file_rejects_escape_and_symlink_outside() {
     ));
     assert!(outside.path().join("victim.txt").exists());
 }
+
+// --- checkpoint fix: C1 defense in depth ---
+fn protected_repo() -> (tempfile::TempDir, LocalSandbox) {
+    let (t, sb) = sandbox();
+    std::fs::create_dir_all(t.path().join(".git/hooks")).unwrap();
+    std::fs::create_dir_all(t.path().join("docs")).unwrap();
+    std::fs::write(t.path().join(".git/config"), "[core]\n").unwrap();
+    std::fs::write(t.path().join("a.txt"), "a").unwrap();
+    std::os::unix::fs::symlink(".git/config", t.path().join("NOTES.md")).unwrap();
+    std::os::unix::fs::symlink("../.git/hooks", t.path().join("docs/hooks")).unwrap();
+    std::os::unix::fs::symlink("a.txt", t.path().join("link.txt")).unwrap();
+    (t, sb)
+}
+
+#[tokio::test]
+async fn write_through_symlink_to_protected_path_is_denied() {
+    let (t, sb) = protected_repo();
+    for p in ["NOTES.md", "docs/hooks/pre-commit"] {
+        let r = sb
+            .write_atomic(Path::new(p), b"[core]\n\tfsmonitor = x\n", None)
+            .await;
+        assert!(matches!(r, Err(SandboxError::Denied(_))), "{p}: {r:?}");
+    }
+    let abs = t.path().join("NOTES.md");
+    assert!(matches!(
+        sb.write_atomic(&abs, b"x", None).await,
+        Err(SandboxError::Denied(_))
+    ));
+    assert!(matches!(
+        sb.remove_file(Path::new("NOTES.md")).await,
+        Err(SandboxError::Denied(_))
+    ));
+    assert_eq!(
+        std::fs::read_to_string(t.path().join(".git/config")).unwrap(),
+        "[core]\n"
+    );
+    assert!(!t.path().join(".git/hooks/pre-commit").exists());
+}
+
+#[tokio::test]
+async fn explicit_protected_and_ordinary_symlink_writes_still_work() {
+    let (t, sb) = protected_repo();
+    // Naming the protected path itself is the policy's call (it asks), not a symlink trick.
+    sb.write_atomic(Path::new(".git/config"), b"ok\n", None)
+        .await
+        .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(t.path().join(".git/config")).unwrap(),
+        "ok\n"
+    );
+    sb.write_atomic(Path::new("link.txt"), b"b", None)
+        .await
+        .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(t.path().join("a.txt")).unwrap(),
+        "b"
+    );
+    let spilled = sb.spill(b"spill").await.unwrap();
+    assert!(spilled.starts_with(".hx/tmp"));
+}

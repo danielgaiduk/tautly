@@ -6,7 +6,9 @@ use globset::{Glob, GlobMatcher};
 use serde::{Deserialize, Serialize};
 
 use crate::effect::Effect;
-use crate::protected::{argv_word_reason, normalize, path_reason, redirect_reason};
+use crate::protected::{
+    Resolved, argv_word_reason, normalize, path_reason, redirect_reason, resolve_links,
+};
 use crate::shell::{SimpleCommand, is_dangerous_env, parse_commands};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -104,13 +106,26 @@ impl Rule {
 /// What a tool call touches, normalized for rule matching.
 enum Subjects {
     Commands(Vec<SimpleCommand>),
-    Unparseable {
-        reason: String,
-        raw: String,
-    },
-    /// Raw path and its root-relative lexical normalization, if inside the root.
-    Paths(Vec<(String, Option<PathBuf>)>),
+    Unparseable { reason: String, raw: String },
+    Paths(Vec<PathSubject>),
     None,
+}
+
+/// A write path as the tool named it, plus the root-relative forms rules match.
+struct PathSubject {
+    raw: String,
+    /// Lexical normalization, if inside the root.
+    rel: Option<PathBuf>,
+    /// The path after following symlinks, when that differs from `rel`.
+    real: Option<PathBuf>,
+}
+
+impl PathSubject {
+    /// Every form a rule may match: the normalized path (else the raw one) and the
+    /// symlink-resolved one.
+    fn forms(&self) -> impl Iterator<Item = String> + '_ {
+        std::iter::once(subject_str(&self.raw, &self.rel)).chain(self.real.as_deref().map(path_str))
+    }
 }
 
 #[derive(Debug)]
@@ -141,6 +156,11 @@ impl Policy {
     }
 
     /// Order: deny rules, protected paths, unparseable commands, allow rules, mode default.
+    ///
+    /// Write paths are judged both as written and after following symlinks under
+    /// the workspace root (read from disk at decision time), so a committed
+    /// `NOTES.md -> .git/config` asks like `.git/config` does. The sandbox
+    /// re-checks at write time (see `LocalSandbox::write_atomic`).
     pub fn decide(&self, tool: &str, effect: &Effect, raw_cmd: Option<&str>) -> Decision {
         if matches!(effect, Effect::ReadOnly) {
             // Deny rules still apply to reads of a bare-tool rule.
@@ -170,7 +190,13 @@ impl Policy {
                     .map(|p| {
                         let raw = p.to_string_lossy().into_owned();
                         let rel = normalize(&self.root, &raw);
-                        (raw, rel)
+                        let real = match resolve_links(&self.root, p) {
+                            Some(Resolved::Inside(real)) if Some(&real) != rel.as_ref() => {
+                                Some(real)
+                            }
+                            _ => None,
+                        };
+                        PathSubject { raw, rel, real }
                     })
                     .collect(),
             ),
@@ -212,7 +238,7 @@ impl Policy {
                     r.glob.is_none()
                         || ps
                             .iter()
-                            .any(|(raw, rel)| r.matches_str(tool, &subject_str(raw, rel)))
+                            .any(|p| p.forms().any(|f| r.matches_str(tool, &f)))
                 }
             };
             if hit {
@@ -224,7 +250,7 @@ impl Policy {
 
     fn needs_approval(&self, subjects: &Subjects) -> Option<String> {
         match subjects {
-            Subjects::Paths(ps) => ps.iter().find_map(|(raw, _)| path_reason(&self.root, raw)),
+            Subjects::Paths(ps) => ps.iter().find_map(|p| path_reason(&self.root, &p.raw)),
             Subjects::Commands(cmds) => cmds.iter().find_map(|c| self.command_reason(c)),
             Subjects::Unparseable { reason, .. } => Some(format!("unparseable command: {reason}")),
             Subjects::None => None,
@@ -240,9 +266,10 @@ impl Policy {
             }
             Subjects::Paths(ps) => {
                 !ps.is_empty()
-                    && ps
-                        .iter()
-                        .all(|(_, rel)| rel.as_ref().is_some_and(|r| any(&path_str(r))))
+                    && ps.iter().all(|p| {
+                        p.rel.as_ref().is_some_and(|r| any(&path_str(r)))
+                            && p.real.as_ref().is_none_or(|r| any(&path_str(r)))
+                    })
             }
             Subjects::Unparseable { .. } | Subjects::None => false,
         }
