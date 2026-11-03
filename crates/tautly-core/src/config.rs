@@ -241,20 +241,33 @@ pub struct CliOverrides {
 
 /// Directory of the user config file: `TAUTLY_HOME` as is (tests), else
 /// `$XDG_CONFIG_HOME/tautly`, else `~/.config/tautly`. Empty variables are ignored.
-pub fn config_home() -> PathBuf {
+/// An error when the result would not be an absolute path (no `HOME`, or a relative
+/// variable): a relative path would resolve against the working directory, which is
+/// usually the repository, and make repository content the trusted user layer.
+pub fn config_home() -> Result<PathBuf, String> {
     config_home_from(|name| std::env::var_os(name))
 }
 
 /// [`config_home`] with the environment lookup injected.
-pub fn config_home_from(get: impl Fn(&str) -> Option<OsString>) -> PathBuf {
+pub fn config_home_from(get: impl Fn(&str) -> Option<OsString>) -> Result<PathBuf, String> {
     let non_empty = |name: &str| get(name).filter(|v| !v.is_empty()).map(PathBuf::from);
+    let absolute = |name: &str, dir: PathBuf| {
+        if dir.is_absolute() {
+            Ok(dir)
+        } else {
+            Err(format!("{name} is not an absolute path"))
+        }
+    };
     if let Some(home) = non_empty("TAUTLY_HOME") {
-        return home;
+        return absolute("TAUTLY_HOME", home);
     }
-    non_empty("XDG_CONFIG_HOME")
-        .or_else(|| non_empty("HOME").map(|h| h.join(".config")))
-        .unwrap_or_else(|| PathBuf::from(".config"))
-        .join("tautly")
+    if let Some(xdg) = non_empty("XDG_CONFIG_HOME") {
+        return absolute("XDG_CONFIG_HOME", xdg).map(|d| d.join("tautly"));
+    }
+    match non_empty("HOME") {
+        Some(home) => absolute("HOME", home).map(|d| d.join(".config").join("tautly")),
+        None => Err("HOME is not set".to_string()),
+    }
 }
 
 /// A loaded [`Config`] and what loading ignored.
@@ -268,34 +281,87 @@ pub struct LoadedConfig {
 
 impl Config {
     /// Defaults, then `<config home>/config.toml`, then `<root>/.tautly/config.toml`, then
-    /// `cli`. A missing file is skipped.
+    /// `cli`. A missing file is skipped. Without a usable (absolute) config home the user
+    /// layer is skipped with a warning.
     pub fn load(root: &Path, cli: CliOverrides) -> Result<LoadedConfig, ConfigError> {
-        Config::load_from(Some(&config_home().join("config.toml")), root, cli)
+        Config::load_with_env(root, cli, |name| std::env::var_os(name))
     }
 
-    /// Like [`Config::load`] with an explicit user file (`None` = no user layer).
+    /// [`Config::load`] with the environment lookup injected.
+    pub fn load_with_env(
+        root: &Path,
+        cli: CliOverrides,
+        env: impl Fn(&str) -> Option<OsString>,
+    ) -> Result<LoadedConfig, ConfigError> {
+        match config_home_from(env) {
+            Ok(dir) => Config::load_from(Some(&dir.join("config.toml")), root, cli),
+            Err(why) => {
+                let mut loaded = Config::load_from(None, root, cli)?;
+                loaded
+                    .warnings
+                    .insert(0, format!("user config not read: {why}"));
+                Ok(loaded)
+            }
+        }
+    }
+
+    /// Like [`Config::load`] with an explicit user file (`None` = no user layer; a
+    /// relative path is skipped with a warning, see [`config_home`]).
     ///
-    /// The project file is repository content, so it must be a plain file in place (not a
-    /// symlink); the user file may be a symlink (dotfile managers). Both are capped in size
-    /// and never opened in a way that can block (FIFOs).
+    /// The user file is strict: unknown keys and bad values are errors. The project file is
+    /// repository content and untrusted (module docs): it is restricted before it is
+    /// checked, what it may not set is dropped with a warning (unknown keys too, so a
+    /// newer teammate's file does not break an older binary), and a project file that is a
+    /// symlink, not a regular file or too large is skipped with a warning. It must be a
+    /// plain file in a real `.tautly` directory. The user file may be a symlink (dotfile
+    /// managers). Both are capped in size and never opened in a way that can block (FIFOs).
+    /// A syntax error in either is an error.
     pub fn load_from(
         user_file: Option<&Path>,
         root: &Path,
         cli: CliOverrides,
     ) -> Result<LoadedConfig, ConfigError> {
         let mut warnings = Vec::new();
-        let project_file = root.join(".tautly").join("config.toml");
-        // The user file is the user's own; the project file is repository content.
-        let layers = [
-            user_file.map(|p| (p.to_path_buf(), Trust::User)),
-            Some((project_file, Trust::Project)),
-        ];
+        let user_file = match user_file {
+            Some(p) if !p.is_absolute() => {
+                warnings.push(format!(
+                    "user config not read: {} is not an absolute path",
+                    p.display()
+                ));
+                None
+            }
+            other => other,
+        };
+        let project_dir = root.join(".tautly");
+        let mut layers = vec![user_file.map(|p| (p.to_path_buf(), Trust::User))];
+        if std::fs::symlink_metadata(&project_dir).is_ok_and(|m| m.file_type().is_symlink()) {
+            warnings.push(format!(
+                "{}: project config not read: it is a symbolic link",
+                project_dir.display()
+            ));
+        } else {
+            layers.push(Some((project_dir.join("config.toml"), Trust::Project)));
+        }
 
         let mut merged = Table::new();
         for (path, trust) in layers.into_iter().flatten() {
-            let Some(mut layer) = read_layer(&path, trust == Trust::User)? else {
+            let layer = match (read_layer(&path, trust == Trust::User), trust) {
+                (Ok(layer), _) => layer,
+                (Err(ConfigError::Unsafe { path, why }), Trust::Project) => {
+                    warnings.push(format!(
+                        "{}: project config not read: {why}",
+                        path.display()
+                    ));
+                    None
+                }
+                (Err(e), _) => return Err(e),
+            };
+            let Some(mut layer) = layer else {
                 continue;
             };
+            if trust == Trust::Project {
+                restrict_project_layer(&mut layer, &merged, &path, &mut warnings);
+            }
             // Check the layer alone so a bad value names the file it came from.
             Value::Table(layer.clone())
                 .try_into::<Config>()
@@ -304,9 +370,6 @@ impl Config {
                     message: e.to_string(),
                 })
                 .and_then(|cfg| cfg.check(Some(&path)))?;
-            if trust == Trust::Project {
-                restrict_project_layer(&mut layer, &merged, &path, &mut warnings);
-            }
             deep_merge(&mut merged, layer);
         }
         deep_merge(&mut merged, cli_table(&cli));
@@ -456,10 +519,38 @@ const USER_ONLY_KEYS: &[&str] = &[
     "routing",
 ];
 
+/// Everything else a project file may set (some of it only to tighten).
+const PROJECT_KEYS: &[&str] = &[
+    "model",
+    "permissions",
+    "compaction_threshold",
+    "max_turns",
+    "turn_timeout_s",
+    "budget",
+    "pins",
+];
+
+/// Repository pins are authoritative and never summarized, so they are capped like the
+/// ones from AGENTS.md: each at [`MAX_PIN_BYTES`], all together at this.
+const MAX_PROJECT_PINS_BYTES: usize = tautly_context::agents_md::MAX_PINNED_BYTES;
+
+/// The lowest compaction threshold a project may ask for (a floor so a repository cannot
+/// make compaction thrash).
+const MIN_PROJECT_THRESHOLD: f64 = 0.5;
+
 /// Strips from a project layer everything that would loosen what the user set up, and
-/// says what it dropped. `so_far` is the merged defaults and user layer: a project may
-/// lower `permissions.mode` below it and add `permissions.deny` rules to it, nothing else.
-/// (`PolicyConfig` has no `ask` rules, so deny rules are the only rule a project can add.)
+/// says what it dropped. This runs before the layer is checked, so nothing it drops can
+/// fail the load. `so_far` is the merged defaults and user layer:
+/// - unknown keys and [`USER_ONLY_KEYS`] are dropped;
+/// - `permissions.mode` may only go lower than so far, `permissions.allow` is dropped and
+///   `permissions.deny` rules are added to the user's (`PolicyConfig` has no `ask` rules,
+///   so deny rules are the only rule a project can add);
+/// - `max_turns`, `turn_timeout_s`, `budget.*.max_usd` / `max_tokens` may only go lower,
+///   `compaction_threshold` only lower and within 0.5..1 (it can neither disable
+///   compaction nor raise the threshold);
+/// - `model` must be a priced model of the catalog the trusted layers produce, else a
+///   repository could make every USD budget unenforceable;
+/// - `pins` are capped.
 fn restrict_project_layer(
     layer: &mut Table,
     so_far: &Table,
@@ -469,9 +560,26 @@ fn restrict_project_layer(
     let mut ignore = |key: &str, why: &str| {
         warnings.push(format!("{}: ignored `{key}`: {why}", path.display()));
     };
-    for key in USER_ONLY_KEYS {
-        if layer.remove(*key).is_some() {
-            ignore(key, "a project config may not set this");
+
+    for key in layer.keys().cloned().collect::<Vec<_>>() {
+        if USER_ONLY_KEYS.contains(&key.as_str()) {
+            layer.remove(&key);
+            ignore(&key, "a project config may not set this");
+        } else if !PROJECT_KEYS.contains(&key.as_str()) {
+            layer.remove(&key);
+            ignore(&key, "unknown setting");
+        }
+    }
+
+    if let Some(Value::String(model)) = layer.get("model") {
+        let catalog = trusted_catalog(so_far);
+        let id = ModelId::from(model.as_str());
+        if !(catalog.contains(&id) && catalog.get(&id).price.is_some()) {
+            layer.remove("model");
+            ignore(
+                "model",
+                "a project config may only choose a priced model from the catalog",
+            );
         }
     }
 
@@ -483,30 +591,95 @@ fn restrict_project_layer(
             ignore(key, loosening);
         }
     }
-    for scope in ["turn", "session"] {
-        let Some(Value::Table(project)) = layer
-            .get_mut("budget")
-            .and_then(Value::as_table_mut)
-            .and_then(|b| b.get_mut(scope))
-        else {
-            continue;
+    if let Some(wanted) = layer.get("compaction_threshold").and_then(number) {
+        let current = match so_far.get("compaction_threshold").and_then(number) {
+            None => 0.8,
+            Some(0.0) => f64::INFINITY, // the user turned compaction off
+            Some(c) => c,
         };
-        let user = so_far
-            .get("budget")
-            .and_then(Value::as_table)
-            .and_then(|b| b.get(scope))
-            .and_then(Value::as_table);
-        for key in ["max_usd", "max_tokens"] {
-            if !tightens(project, user, key, None) {
-                project.remove(key);
-                ignore(&format!("budget.{scope}.{key}"), loosening);
+        if !((MIN_PROJECT_THRESHOLD..1.0).contains(&wanted) && wanted <= current) {
+            layer.remove("compaction_threshold");
+            ignore(
+                "compaction_threshold",
+                "a project config can only lower it, to between 0.5 and 1 (it cannot disable compaction)",
+            );
+        }
+    }
+
+    if let Some(Value::Table(budget)) = layer.get_mut("budget") {
+        retain_known(budget, &["turn", "session"], "budget", &mut ignore);
+        for scope in ["turn", "session"] {
+            let Some(Value::Table(project)) = budget.get_mut(scope) else {
+                continue;
+            };
+            retain_known(
+                project,
+                &["max_usd", "max_tokens"],
+                &format!("budget.{scope}"),
+                &mut ignore,
+            );
+            let user = so_far
+                .get("budget")
+                .and_then(Value::as_table)
+                .and_then(|b| b.get(scope))
+                .and_then(Value::as_table);
+            for key in ["max_usd", "max_tokens"] {
+                if !tightens(project, user, key, None) {
+                    project.remove(key);
+                    ignore(&format!("budget.{scope}.{key}"), loosening);
+                }
             }
         }
     }
 
-    let Some(Value::Table(perms)) = layer.get_mut("permissions") else {
-        return;
-    };
+    if let Some(Value::Array(pins)) = layer.get_mut("pins") {
+        let mut kept = Vec::new();
+        let mut total = 0;
+        let mut full = false;
+        for (i, pin) in std::mem::take(pins).into_iter().enumerate() {
+            let Value::String(text) = &pin else {
+                kept.push(pin); // a type error, for the check to report
+                continue;
+            };
+            let key = format!("pins[{i}]");
+            if text.trim().is_empty() {
+                ignore(&key, "empty pin");
+            } else if text.len() > MAX_PIN_BYTES {
+                ignore(
+                    &key,
+                    &format!(
+                        "a pin holds at most {MAX_PIN_BYTES} bytes, this one {}",
+                        text.len()
+                    ),
+                );
+            } else if full || total + text.len() > MAX_PROJECT_PINS_BYTES {
+                full = true;
+                ignore(
+                    &key,
+                    &format!(
+                        "a project's pins hold at most {MAX_PROJECT_PINS_BYTES} bytes together"
+                    ),
+                );
+            } else {
+                total += text.len();
+                kept.push(pin);
+            }
+        }
+        *pins = kept;
+    }
+
+    if let Some(Value::Table(perms)) = layer.get_mut("permissions") {
+        retain_known(
+            perms,
+            &["mode", "allow", "deny"],
+            "permissions",
+            &mut ignore,
+        );
+        restrict_permissions(perms, so_far, &mut ignore);
+    }
+}
+
+fn restrict_permissions(perms: &mut Table, so_far: &Table, ignore: &mut impl FnMut(&str, &str)) {
     let user_perms = so_far.get("permissions").and_then(Value::as_table);
 
     if let Some(mode) = perms.get("mode").cloned() {
@@ -552,14 +725,44 @@ fn restrict_project_layer(
     }
 }
 
-/// Whether `project[key]` is absent or at most the value `user` sets (else `default`);
-/// no current value means unlimited, so any project value tightens.
-fn tightens(project: &Table, user: Option<&Table>, key: &str, default: Option<f64>) -> bool {
-    let number = |v: &Value| match v {
+/// Drops (and reports) the keys of `table` not in `known`; `scope` names the table.
+fn retain_known(
+    table: &mut Table,
+    known: &[&str],
+    scope: &str,
+    ignore: &mut impl FnMut(&str, &str),
+) {
+    for key in table.keys().cloned().collect::<Vec<_>>() {
+        if !known.contains(&key.as_str()) {
+            table.remove(&key);
+            ignore(&format!("{scope}.{key}"), "unknown setting");
+        }
+    }
+}
+
+/// The built-in catalog with the trusted layers' overrides applied.
+fn trusted_catalog(so_far: &Table) -> Catalog {
+    let mut catalog = Catalog::builtin();
+    if let Some(overrides) = so_far
+        .get("catalog_overrides")
+        .and_then(|v| v.clone().try_into::<Catalog>().ok())
+    {
+        catalog.merge(overrides);
+    }
+    catalog
+}
+
+fn number(v: &Value) -> Option<f64> {
+    match v {
         Value::Integer(i) => Some(*i as f64),
         Value::Float(f) => Some(*f),
         _ => None,
-    };
+    }
+}
+
+/// Whether `project[key]` is absent or at most the value `user` sets (else `default`);
+/// no current value means unlimited, so any project value tightens.
+fn tightens(project: &Table, user: Option<&Table>, key: &str, default: Option<f64>) -> bool {
     let Some(wanted) = project.get(key).and_then(number) else {
         return true;
     };
@@ -625,7 +828,7 @@ fn read_layer(path: &Path, follow_symlinks: bool) -> Result<Option<Table>, Confi
     let file = match File::options().read(true).custom_flags(flags).open(path) {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) if e.raw_os_error() == Some(libc::ELOOP) => {
+        Err(e) if !follow_symlinks && e.raw_os_error() == Some(libc::ELOOP) => {
             return Err(unsafe_file("it is a symbolic link"));
         }
         Err(e) => return Err(io(e)),

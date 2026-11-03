@@ -267,3 +267,29 @@ fn compaction_deferred_between_80_and_90_while_warm() {
     // The threshold stays configurable and can be disabled.
     assert!(!big.needs_compaction(&status(99_999), None, now, Some(TTL), Some(&p)));
 }
+
+#[test]
+fn forced_compaction_at_90_percent_whatever_the_threshold() {
+    let now = Instant::now();
+    let p = price();
+    let mut c = big_history(11);
+    c.note_request(now - WARM, 80_000);
+    // A threshold above 90% (or 100%) does not push the forced rule out of reach, and the
+    // warm-cache cost check does not apply to it.
+    for t in [0.95_f32, 1.0, 2.0] {
+        assert_eq!(
+            c.compaction_decision(&status(90_000), Some(t), now, Some(TTL), Some(&p)),
+            Some(MutationReason::Forced),
+            "threshold {t}"
+        );
+        assert_eq!(
+            c.compaction_decision(&status(120_000), Some(t), now, Some(TTL), Some(&p)),
+            Some(MutationReason::Forced)
+        );
+        assert!(!c.needs_compaction(&status(89_999), Some(t), now, Some(TTL), Some(&p)));
+    }
+    // Disabling compaction (spec 6.4) still disables everything, forced included.
+    for t in [None, Some(0.0)] {
+        assert!(!c.needs_compaction(&status(95_000), t, now, Some(TTL), Some(&p)));
+    }
+}

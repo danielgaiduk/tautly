@@ -241,11 +241,12 @@ fn bad_values_are_rejected_with_their_file() {
     );
     assert!(err.to_string().contains("config.toml"), "{err}");
 
+    // The user layer is strict about unknown keys.
     let f = Fixture::new();
-    f.project("unknown_key = 1\n");
+    f.user("unknown_key = 1\n");
     let err = f.load(CliOverrides::default()).unwrap_err();
     assert!(err.to_string().contains("unknown_key"), "{err}");
-    assert!(err.to_string().contains(".tautly"), "{err}");
+    assert!(err.to_string().contains("config.toml"), "{err}");
 
     let f = Fixture::new();
     f.project("model = [unterminated\n");
@@ -254,7 +255,7 @@ fn bad_values_are_rejected_with_their_file() {
 }
 
 #[test]
-fn out_of_range_values_are_rejected() {
+fn out_of_range_values_in_the_user_layer_are_rejected() {
     for bad in [
         "compaction_threshold = 1.5\n",
         "compaction_threshold = -0.2\n",
@@ -267,7 +268,7 @@ fn out_of_range_values_are_rejected() {
         "pins = [\"\"]\n",
     ] {
         let f = Fixture::new();
-        f.project(bad);
+        f.user(bad);
         let err = f.load(CliOverrides::default()).unwrap_err();
         assert!(
             matches!(err, ConfigError::Invalid { .. }),
@@ -277,22 +278,35 @@ fn out_of_range_values_are_rejected() {
 }
 
 #[test]
-fn project_config_that_is_not_a_plain_file_is_refused() {
+fn project_config_that_is_not_a_plain_file_is_skipped_with_a_warning() {
     let f = Fixture::new();
     let dir = f.root().join(".tautly");
     fs::create_dir_all(&dir).unwrap();
     fs::create_dir(dir.join("config.toml")).unwrap();
-    let err = f.load(CliOverrides::default()).unwrap_err();
-    assert!(matches!(err, ConfigError::Unsafe { .. }), "{err}");
+    let loaded = f.load_full(CliOverrides::default()).unwrap();
+    assert_eq!(loaded.config.max_turns, 100);
+    assert!(
+        loaded
+            .warnings
+            .iter()
+            .any(|w| w.contains("not a regular file")),
+        "{:?}",
+        loaded.warnings
+    );
 
     let f = Fixture::new();
     f.project(&format!("pins = [\"{}\"]\n", "x".repeat(300 * 1024)));
-    let err = f.load(CliOverrides::default()).unwrap_err();
-    assert!(matches!(err, ConfigError::Unsafe { .. }), "{err}");
+    let loaded = f.load_full(CliOverrides::default()).unwrap();
+    assert!(loaded.config.pins.is_empty());
+    assert!(
+        loaded.warnings.iter().any(|w| w.contains("larger than")),
+        "{:?}",
+        loaded.warnings
+    );
 }
 
 #[test]
-fn project_config_symlink_is_refused_but_user_symlink_is_followed() {
+fn project_config_symlink_is_skipped_but_user_symlink_is_followed() {
     let f = Fixture::new();
     let real = f.dir.path().join("real.toml");
     fs::write(&real, "max_turns = 7\n").unwrap();
@@ -300,8 +314,13 @@ fn project_config_symlink_is_refused_but_user_symlink_is_followed() {
     let dir = f.root().join(".tautly");
     fs::create_dir_all(&dir).unwrap();
     std::os::unix::fs::symlink(&real, dir.join("config.toml")).unwrap();
-    let err = f.load(CliOverrides::default()).unwrap_err();
-    assert!(matches!(err, ConfigError::Unsafe { .. }), "{err}");
+    let loaded = f.load_full(CliOverrides::default()).unwrap();
+    assert_eq!(loaded.config.max_turns, 100, "the target was not read");
+    assert!(
+        loaded.warnings.iter().any(|w| w.contains("symbolic link")),
+        "{:?}",
+        loaded.warnings
+    );
 
     let f2 = Fixture::new();
     let real = f2.dir.path().join("real.toml");
@@ -309,6 +328,35 @@ fn project_config_symlink_is_refused_but_user_symlink_is_followed() {
     fs::create_dir_all(f2.user_file().parent().unwrap()).unwrap();
     std::os::unix::fs::symlink(&real, f2.user_file()).unwrap();
     assert_eq!(f2.load(CliOverrides::default()).unwrap().max_turns, 7);
+}
+
+#[test]
+fn symlinked_project_config_directory_is_skipped_with_a_warning() {
+    let f = Fixture::new();
+    let outside = f.dir.path().join("outside");
+    fs::create_dir_all(&outside).unwrap();
+    fs::write(outside.join("config.toml"), "max_turns = 7\n").unwrap();
+    fs::create_dir_all(f.root()).unwrap();
+    std::os::unix::fs::symlink(&outside, f.root().join(".tautly")).unwrap();
+    let loaded = f.load_full(CliOverrides::default()).unwrap();
+    assert_eq!(loaded.config.max_turns, 100);
+    assert!(
+        loaded
+            .warnings
+            .iter()
+            .any(|w| w.contains(".tautly") && w.contains("symbolic link")),
+        "{:?}",
+        loaded.warnings
+    );
+}
+
+#[test]
+fn a_user_symlink_loop_is_not_called_a_project_symlink() {
+    let f = Fixture::new();
+    fs::create_dir_all(f.user_file().parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(f.user_file(), f.user_file()).unwrap();
+    let err = f.load(CliOverrides::default()).unwrap_err();
+    assert!(matches!(err, ConfigError::Io { .. }), "{err}");
 }
 
 #[test]
@@ -324,15 +372,15 @@ fn config_home_resolution() {
             ("XDG_CONFIG_HOME", "/x"),
             ("HOME", "/h")
         ])),
-        Path::new("/t")
+        Ok(PathBuf::from("/t"))
     );
     assert_eq!(
         config_home_from(env(&[("XDG_CONFIG_HOME", "/x"), ("HOME", "/h")])),
-        Path::new("/x/tautly")
+        Ok(PathBuf::from("/x/tautly"))
     );
     assert_eq!(
         config_home_from(env(&[("HOME", "/h")])),
-        Path::new("/h/.config/tautly")
+        Ok(PathBuf::from("/h/.config/tautly"))
     );
     // Empty variables count as unset.
     assert_eq!(
@@ -341,11 +389,50 @@ fn config_home_resolution() {
             ("XDG_CONFIG_HOME", ""),
             ("HOME", "/h")
         ])),
-        Path::new("/h/.config/tautly")
+        Ok(PathBuf::from("/h/.config/tautly"))
     );
-    // The real function agrees with itself and ends in `tautly` unless overridden.
-    let home = config_home();
-    assert!(home.ends_with("tautly") || std::env::var_os("TAUTLY_HOME").is_some());
+    // The real function ends in `tautly` unless overridden.
+    if let Ok(home) = config_home() {
+        assert!(home.ends_with("tautly") || std::env::var_os("TAUTLY_HOME").is_some());
+    }
+}
+
+#[test]
+fn a_home_that_is_not_absolute_is_an_error_not_a_cwd_relative_path() {
+    let env = |pairs: &'static [(&'static str, &'static str)]| {
+        let map: HashMap<&str, OsString> =
+            pairs.iter().map(|(k, v)| (*k, OsString::from(v))).collect();
+        move |name: &str| map.get(name).cloned()
+    };
+    for pairs in [
+        &[][..],
+        &[("HOME", "")][..],
+        &[("HOME", "relative/home")][..],
+        &[("XDG_CONFIG_HOME", "rel"), ("HOME", "/h")][..],
+        &[("TAUTLY_HOME", "rel"), ("HOME", "/h")][..],
+    ] {
+        let pairs: &'static [(&'static str, &'static str)] =
+            Box::leak(pairs.to_vec().into_boxed_slice());
+        let err = config_home_from(env(pairs)).unwrap_err();
+        assert!(!err.is_empty(), "{pairs:?}");
+    }
+}
+
+#[test]
+fn a_relative_explicit_user_file_is_skipped_with_a_warning() {
+    let f = Fixture::new();
+    fs::create_dir_all(f.root()).unwrap();
+    let loaded = Config::load_from(
+        Some(Path::new(".config/tautly/config.toml")),
+        &f.root(),
+        CliOverrides::default(),
+    )
+    .unwrap();
+    assert!(
+        loaded.warnings.iter().any(|w| w.contains("user config")),
+        "{:?}",
+        loaded.warnings
+    );
 }
 
 // ---- auth ----
@@ -871,4 +958,252 @@ fn user_layer_may_set_any_limit() {
     assert!(loaded.warnings.is_empty());
     assert_eq!(loaded.config.max_turns, 500);
     assert_eq!(loaded.config.budget.session.max_usd, Some(1000.0));
+}
+
+// ---- project layer: pins, threshold, model, unknown keys ----
+
+#[test]
+fn project_pins_are_capped_each_and_in_total() {
+    let f = Fixture::new();
+    let big = "b".repeat(2 * 1024 + 1);
+    let ok = "o".repeat(1500);
+    f.project(&format!(
+        "pins = [\"first\", \"{big}\", \"{ok}\", \"{ok}\", \"{ok}\", \"late\", \"   \"]\n"
+    ));
+    let loaded = f.load_full(CliOverrides::default()).unwrap();
+    // "first" + 1500 + 1500 fit under 4 KB; the third 1500 does not, and nothing after it
+    // is kept (nearest first, in file order).
+    assert_eq!(
+        loaded.config.pins,
+        ["first".to_string(), ok.clone(), ok.clone()]
+    );
+    let w = loaded.warnings.join("\n");
+    assert!(w.contains("pins[1]") && w.contains("2048"), "{w}");
+    assert!(
+        w.contains("pins[4]") && w.contains("pins[5]") && w.contains("4096"),
+        "{w}"
+    );
+    assert!(w.contains("pins[6]"), "blank pin: {w}");
+    let total: usize = loaded.config.pins.iter().map(String::len).sum();
+    assert!(total <= 4 * 1024);
+
+    // 120 pins of 2000 bytes (the reviewer's probe): at most two survive.
+    let f = Fixture::new();
+    let pin = "p".repeat(2000);
+    let all = std::iter::repeat_n(format!("\"{pin}\""), 120)
+        .collect::<Vec<_>>()
+        .join(",");
+    f.project(&format!("pins = [{all}]\n"));
+    let loaded = f.load_full(CliOverrides::default()).unwrap();
+    assert_eq!(loaded.config.pins.len(), 2);
+
+    // The user's own pins are not capped by this rule.
+    let f = Fixture::new();
+    f.user(&format!("pins = [{all}]\n"));
+    assert_eq!(f.load(CliOverrides::default()).unwrap().pins.len(), 120);
+}
+
+#[test]
+fn project_compaction_threshold_is_tighten_only_with_a_floor() {
+    let threshold = |user: &str, project: &str| {
+        let f = Fixture::new();
+        if !user.is_empty() {
+            f.user(user);
+        }
+        f.project(project);
+        let loaded = f.load_full(CliOverrides::default()).unwrap();
+        (loaded.config.compaction_threshold, loaded.warnings)
+    };
+    // Lower than the default: accepted. Equal: accepted silently.
+    assert_eq!(
+        threshold("", "compaction_threshold = 0.6\n"),
+        (Some(0.6), vec![])
+    );
+    assert_eq!(
+        threshold("", "compaction_threshold = 0.8\n"),
+        (Some(0.8), vec![])
+    );
+    assert_eq!(
+        threshold("", "compaction_threshold = 0.5\n"),
+        (Some(0.5), vec![])
+    );
+    // Raised, disabled, at or above 1, below the floor: ignored with a warning.
+    for bad in ["0.95", "1.0", "1", "0", "0.49", "0.01", "-1.0"] {
+        let (t, w) = threshold("", &format!("compaction_threshold = {bad}\n"));
+        assert_eq!(t, Some(0.8), "{bad}");
+        assert!(
+            w.iter().any(|w| w.contains("`compaction_threshold`")),
+            "{bad}: {w:?}"
+        );
+    }
+    // Measured against the user's value.
+    let (t, w) = threshold(
+        "compaction_threshold = 0.7\n",
+        "compaction_threshold = 0.75\n",
+    );
+    assert_eq!((t, w.len()), (Some(0.7), 1));
+    let (t, w) = threshold(
+        "compaction_threshold = 0.7\n",
+        "compaction_threshold = 0.6\n",
+    );
+    assert_eq!((t, w.len()), (Some(0.6), 0));
+    // A user who turned compaction off can have a project turn it on, never off.
+    let (t, w) = threshold("compaction_threshold = 0\n", "compaction_threshold = 0.6\n");
+    assert_eq!((t, w.len()), (Some(0.6), 0));
+    let (t, w) = threshold("compaction_threshold = 0\n", "compaction_threshold = 0\n");
+    assert_eq!((t, w.len()), (None, 1));
+    // The user layer may set anything valid.
+    let f = Fixture::new();
+    f.user("compaction_threshold = 0.95\n");
+    assert_eq!(
+        f.load(CliOverrides::default())
+            .unwrap()
+            .compaction_threshold,
+        Some(0.95)
+    );
+}
+
+#[test]
+fn project_model_must_be_a_priced_catalog_model() {
+    let model = |user: &str, project: &str| {
+        let f = Fixture::new();
+        if !user.is_empty() {
+            f.user(user);
+        }
+        f.project(project);
+        let loaded = f.load_full(CliOverrides::default()).unwrap();
+        (loaded.config.model.as_str().to_string(), loaded.warnings)
+    };
+    let (m, w) = model("", "model = \"openai/gpt-5\"\n");
+    assert_eq!((m.as_str(), w.len()), ("openai/gpt-5", 0));
+
+    for unpriced in ["anthropic/claude-opus-9-unpriced", "compat:evil/m", "gpt-5"] {
+        let (m, w) = model(
+            "model = \"openai/gpt-5-mini\"\n",
+            &format!("model = \"{unpriced}\"\n"),
+        );
+        assert_eq!(
+            m, "openai/gpt-5-mini",
+            "{unpriced} ignored, the user's model stays"
+        );
+        assert!(w.iter().any(|w| w.contains("`model`")), "{w:?}");
+    }
+
+    // A model the user's own catalog overrides price counts as in the catalog.
+    let user = r#"
+[catalog_overrides.models."compat:local/llama"]
+context_window = 32000
+max_output = 4096
+parallel_tools = false
+reasoning = "none"
+cache = "none"
+images = false
+edit_format = "str_replace"
+[catalog_overrides.models."compat:local/llama".price]
+input = 0.1
+output = 0.2
+cache_read = 0.0
+cache_write = 0.0
+[catalog_overrides.models."compat:local/free"]
+context_window = 32000
+max_output = 4096
+parallel_tools = false
+reasoning = "none"
+cache = "none"
+images = false
+edit_format = "str_replace"
+"#;
+    let (m, w) = model(user, "model = \"compat:local/llama\"\n");
+    assert_eq!((m.as_str(), w.len()), ("compat:local/llama", 0));
+    let (m, w) = model(user, "model = \"compat:local/free\"\n");
+    assert_eq!(m, "anthropic/claude-sonnet-5-5");
+    assert_eq!(w.len(), 1, "an override without a price is unpriced");
+
+    // The CLI is the user's own words: any model.
+    let f = Fixture::new();
+    let cli = CliOverrides {
+        model: Some(ModelId::from("compat:anything/x")),
+        ..Default::default()
+    };
+    assert_eq!(f.load(cli).unwrap().model.as_str(), "compat:anything/x");
+}
+
+#[test]
+fn restricting_comes_before_validating_so_dropped_keys_never_fail_the_load() {
+    let f = Fixture::new();
+    f.project(
+        r#"
+future_setting = 1
+[providers.openai]
+base_url = "ftp://example.com/"
+[[providers.compat]]
+name = "a/b"
+base_url = "http://x/"
+[telemetry]
+endpoint = "gopher://x"
+[permissions]
+mode = "yolo"
+allow = ["not a rule ("]
+ask = ["bash(ls*)"]
+[budget]
+weekly = 3
+[budget.turn]
+max_usd = -5.0
+unknown = 1
+"#,
+    );
+    // Only the value that survives restriction (the negative max_usd, which is a
+    // tightening of "unlimited") is validated, and that one is a real error.
+    let err = f.load(CliOverrides::default()).unwrap_err();
+    assert!(matches!(err, ConfigError::Invalid { .. }), "{err}");
+
+    let f = Fixture::new();
+    f.project(
+        r#"
+future_setting = 1
+[providers.openai]
+base_url = "ftp://example.com/"
+[[providers.compat]]
+name = "a/b"
+base_url = "http://x/"
+[telemetry]
+endpoint = "gopher://x"
+[permissions]
+mode = "yolo"
+allow = ["not a rule ("]
+ask = ["bash(ls*)"]
+[budget]
+weekly = 3
+[budget.turn]
+unknown = 1
+"#,
+    );
+    let loaded = f.load_full(CliOverrides::default()).unwrap();
+    assert_eq!(loaded.config.permissions.mode, Mode::Ask);
+    for key in [
+        "future_setting",
+        "providers",
+        "telemetry",
+        "permissions.mode",
+        "permissions.allow",
+        "permissions.ask",
+        "budget.weekly",
+        "budget.turn.unknown",
+    ] {
+        assert!(
+            loaded
+                .warnings
+                .iter()
+                .any(|w| w.contains(&format!("`{key}`"))),
+            "no warning for {key}: {:?}",
+            loaded.warnings
+        );
+    }
+    // Syntax errors in the project file are still errors.
+    let f = Fixture::new();
+    f.project("max_turns = [\n");
+    assert!(matches!(
+        f.load(CliOverrides::default()).unwrap_err(),
+        ConfigError::Parse { .. }
+    ));
 }

@@ -67,7 +67,8 @@ expression: events
       {
         "type": "edited",
         "path": "/p/src/lib.rs",
-        "created": false
+        "created": false,
+        "post_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
       },
       {
         "type": "deleted",
@@ -94,10 +95,7 @@ expression: events
     "quota": {
       "remaining_requests": 99,
       "remaining_tokens": null,
-      "reset_at": {
-        "secs_since_epoch": 1700000060,
-        "nanos_since_epoch": 0
-      }
+      "reset_at": 1700000060
     }
   },
   {
@@ -145,10 +143,7 @@ expression: events
             "hash": "abc123"
           }
         ],
-        "created": {
-          "secs_since_epoch": 1700000000,
-          "nanos_since_epoch": 0
-        },
+        "created": 1700000000,
         "verified": null,
         "body": "cargo build --workspace"
       },

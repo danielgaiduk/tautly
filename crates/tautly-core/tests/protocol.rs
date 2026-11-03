@@ -80,6 +80,7 @@ fn every_event() -> Vec<Event> {
                 EffectView::Edited {
                     path: "/p/src/lib.rs".into(),
                     created: false,
+                    post_hash: "a".repeat(64),
                 },
                 EffectView::Deleted {
                     path: "/p/old.rs".into(),
@@ -163,7 +164,8 @@ fn every_event() -> Vec<Event> {
             | Event::SessionChanged { .. }
             | Event::TurnFinished { .. }
             | Event::Error { .. }
-            | Event::Warning { .. } => {}
+            | Event::Warning { .. }
+            | Event::Unknown => {}
         }
     }
     events
@@ -391,6 +393,7 @@ fn non_utf8_path_serializes_lossily_instead_of_failing() {
             EffectView::Edited {
                 path: path.clone(),
                 created: true,
+                post_hash: "b".repeat(64),
             },
             EffectView::Read {
                 path: path.clone(),
@@ -414,7 +417,8 @@ fn non_utf8_path_serializes_lossily_instead_of_failing() {
         effects[0],
         EffectView::Edited {
             path: PathBuf::from("/tmp/caf\u{fffd}/\u{fffd}.txt"),
-            created: true
+            created: true,
+            post_hash: "b".repeat(64),
         }
     );
 }
@@ -454,14 +458,16 @@ fn effect_views_drop_file_contents() {
         EffectView::from(&edited),
         EffectView::Edited {
             path: "/p/a.rs".into(),
-            created: false
+            created: false,
+            post_hash: hash.to_hex().to_string(),
         }
     );
     assert_eq!(
         EffectView::from(&created),
         EffectView::Edited {
             path: "/p/new.rs".into(),
-            created: true
+            created: true,
+            post_hash: hash.to_hex().to_string(),
         }
     );
     assert_eq!(
@@ -534,4 +540,114 @@ fn context_status_event_from_status() {
             warnings: status.warnings.clone(),
         }
     );
+}
+
+#[test]
+fn unknown_events_and_values_read_as_unknown_not_as_errors() {
+    use serde_json::json;
+    // A newer engine's event type.
+    let e: Event = serde_json::from_value(json!({"type": "hologram", "x": 1})).unwrap();
+    assert_eq!(e, Event::Unknown);
+    // Extra fields on a known event are ignored.
+    let e: Event =
+        serde_json::from_value(json!({"type": "text_delta", "text": "hi", "lang": "en"})).unwrap();
+    assert_eq!(e, Event::TextDelta { text: "hi".into() });
+    // New values of the wire enums.
+    let e: Event = serde_json::from_value(json!({
+        "type": "error", "kind": "quota_exhausted", "message": "m", "retryable": false, "hint": null
+    }))
+    .unwrap();
+    assert!(matches!(
+        e,
+        Event::Error {
+            kind: ErrorKind::Unknown,
+            ..
+        }
+    ));
+    let e: Event =
+        serde_json::from_value(json!({"type": "turn_finished", "reason": "refused"})).unwrap();
+    assert_eq!(
+        e,
+        Event::TurnFinished {
+            reason: FinishReason::Unknown
+        }
+    );
+    let e: Event = serde_json::from_value(json!({
+        "type": "usage", "role": "judge", "tokens_in": 1, "tokens_out": 2,
+        "cache_read": 0, "cache_write": 0, "cost_usd": null, "quota": null
+    }))
+    .unwrap();
+    assert!(matches!(
+        e,
+        Event::Usage {
+            role: UsageRole::Unknown,
+            ..
+        }
+    ));
+    let e: Event = serde_json::from_value(json!({
+        "type": "tool_finished", "call_id": "c", "tool": "t", "output": "", "is_error": false,
+        "blocked": false, "meta": {}, "effects": [{"type": "moved", "from": "a", "to": "b"}, {"type": "exec", "may_write": true}]
+    }))
+    .unwrap();
+    let Event::ToolFinished { effects, .. } = e else {
+        panic!()
+    };
+    assert_eq!(
+        effects,
+        [EffectView::Unknown, EffectView::Exec { may_write: true }]
+    );
+    // A command the engine does not know is still an error: it cannot be ignored.
+    assert!(serde_json::from_value::<Command>(json!({"type": "explode"})).is_err());
+}
+
+#[test]
+fn timestamps_are_unix_seconds_on_the_wire() {
+    let events = every_event();
+    let usage = serde_json::to_value(&events[8]).unwrap();
+    assert_eq!(usage["quota"]["reset_at"], 1_700_000_060_u64);
+    let proposed = serde_json::to_value(&events[12]).unwrap();
+    assert_eq!(proposed["change"]["upsert"]["created"], 1_700_000_000_u64);
+    assert_eq!(
+        proposed["change"]["upsert"]["verified"],
+        serde_json::Value::Null
+    );
+    assert!(proposed["change"]["upsert"].get("stale").is_none());
+
+    // They read back, and sub-second parts do not survive the wire.
+    for e in &events {
+        let back: Event = serde_json::from_value(serde_json::to_value(e).unwrap()).unwrap();
+        assert_eq!(&back, e);
+    }
+    let change = MemoryChange {
+        upsert: Some(MemoryEntry {
+            created: UNIX_EPOCH + Duration::from_millis(1_700_000_000_999),
+            verified: Some(UNIX_EPOCH + Duration::from_secs(1_700_000_100)),
+            ..match &events[12] {
+                Event::MemoryProposed { change, .. } => change.upsert.clone().unwrap(),
+                _ => unreachable!(),
+            }
+        }),
+        delete: vec![],
+    };
+    let v = serde_json::to_value(Event::MemoryProposed {
+        proposal_id: "p".into(),
+        change,
+    })
+    .unwrap();
+    assert_eq!(v["change"]["upsert"]["created"], 1_700_000_000_u64);
+    assert_eq!(v["change"]["upsert"]["verified"], 1_700_000_100_u64);
+    // A client that omits optional timestamps is understood.
+    let e: Event = serde_json::from_value(json!({
+        "type": "usage", "role": "main", "tokens_in": 1, "tokens_out": 1,
+        "cache_read": 0, "cache_write": 0
+    }))
+    .unwrap();
+    assert!(matches!(
+        e,
+        Event::Usage {
+            quota: None,
+            cost_usd: None,
+            ..
+        }
+    ));
 }

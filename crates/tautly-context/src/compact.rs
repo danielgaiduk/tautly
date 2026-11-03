@@ -107,7 +107,8 @@ impl Context {
     /// scheduler ([`schedule::decide`]) then lets it run at once when the cache is cold or the
     /// context is at 90%, and while the cache is warm only when the tokens it frees repay
     /// rebuilding the cached prefix. `None` for `threshold` disables automatic compaction, as
-    /// does a threshold that is not a positive number. The engine applies the result together
+    /// does a threshold that is not a positive number; with any positive threshold the
+    /// context at 90% of the window is compacted regardless of its value. The engine applies the result together
     /// with any collection decided at the same turn start.
     pub fn compaction_decision(
         &self,
@@ -123,7 +124,12 @@ impl Context {
         }
         // Basis points: exact for round thresholds such as 0.8, which f32 cannot hold.
         let bp = (f64::from(t) * 10_000.0).round() as u64;
-        if u64::from(status.used) * 10_000 < u64::from(status.budget) * bp {
+        let below_threshold = u64::from(status.used) * 10_000 < u64::from(status.budget) * bp;
+        // With a threshold set, the scheduler's forced rule (at 90% of the window) holds
+        // whatever the threshold is, so a high one cannot keep compaction away.
+        let forced =
+            u64::from(status.used) * 100 >= u64::from(status.budget) * schedule::FORCED_PERCENT;
+        if below_threshold && !forced {
             return None;
         }
         schedule::decide(

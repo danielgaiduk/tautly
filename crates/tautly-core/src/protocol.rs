@@ -4,9 +4,22 @@
 //! Event and field additions are backwards compatible; removing or changing the meaning of
 //! one is a major-version bump of [`PROTOCOL_VERSION`].
 //!
+//! # Compatibility
+//!
+//! Readers ignore fields they do not know (no wire type denies unknown fields), so adding
+//! a field is a minor-version change; every new field that is not an `Option` must carry
+//! `#[serde(default)]`. An event type, [`EffectView`] kind, [`ErrorKind`],
+//! [`FinishReason`] or [`UsageRole`] value a reader does not know reads as its `Unknown`
+//! variant instead of failing the message, so those can also grow in minor versions
+//! (match with a wildcard arm). New values of enums defined in other crates
+//! ([`MutationReason`], `Shown`, `MemoryKind`) are a major-version change. An unknown
+//! [`Command`] is an error: the engine cannot ignore what it was asked to do.
+//! Timestamps are unix seconds (`u64`).
+//!
 //! An event never carries a session id: the transport (JSON-RPC) adds it per notification.
 
 use std::path::PathBuf;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -26,6 +39,9 @@ pub enum UsageRole {
     Main,
     /// A side model (compaction summaries, memory consolidation, `web_fetch` questions).
     Side,
+    /// A role this version does not know.
+    #[serde(other)]
+    Unknown,
 }
 
 /// Why a turn ended.
@@ -38,6 +54,9 @@ pub enum FinishReason {
     MaxTurns,
     Timeout,
     Error,
+    /// A reason this version does not know.
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -49,6 +68,9 @@ pub enum ErrorKind {
     Tool,
     Policy,
     Internal,
+    /// A kind this version does not know.
+    #[serde(other)]
+    Unknown,
 }
 
 /// What a finished tool call changed, as shown to clients. File contents (pre-images) are
@@ -68,6 +90,8 @@ pub enum EffectView {
         path: PathBuf,
         /// The write created the file.
         created: bool,
+        /// blake3 of the file as written, lowercase hex.
+        post_hash: String,
     },
     Deleted {
         #[serde(with = "lossy_path")]
@@ -76,6 +100,9 @@ pub enum EffectView {
     Exec {
         may_write: bool,
     },
+    /// An effect kind this version does not know.
+    #[serde(other)]
+    Unknown,
 }
 
 impl From<&AppliedEffect> for EffectView {
@@ -89,10 +116,14 @@ impl From<&AppliedEffect> for EffectView {
                 shown: *shown,
             },
             AppliedEffect::Edited {
-                path, pre_image, ..
+                path,
+                pre_image,
+                post_hash,
+                ..
             } => EffectView::Edited {
                 path: path.clone(),
                 created: pre_image.is_none(),
+                post_hash: post_hash.to_hex().to_string(),
             },
             AppliedEffect::Deleted { path, .. } => EffectView::Deleted { path: path.clone() },
             AppliedEffect::Exec { may_write } => EffectView::Exec {
@@ -172,6 +203,7 @@ pub enum Event {
         cache_write: u64,
         /// `None` when the model has no known price.
         cost_usd: Option<f64>,
+        #[serde(default, with = "quota_wire")]
         quota: Option<Quota>,
     },
     /// Emitted every turn.
@@ -195,6 +227,7 @@ pub enum Event {
     /// [`Command::ApproveMemory`] or [`Command::RejectMemory`].
     MemoryProposed {
         proposal_id: String,
+        #[serde(with = "memory_change_wire")]
         change: MemoryChange,
     },
     SessionChanged {
@@ -214,6 +247,9 @@ pub enum Event {
     Warning {
         message: String,
     },
+    /// An event type this version does not know.
+    #[serde(other)]
+    Unknown,
 }
 
 impl Event {
@@ -291,5 +327,110 @@ pub mod lossy_path {
 
     pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<PathBuf, D::Error> {
         Ok(PathBuf::from(String::deserialize(d)?))
+    }
+}
+
+fn unix_secs(t: SystemTime) -> u64 {
+    t.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs())
+}
+
+fn from_unix_secs(secs: u64) -> SystemTime {
+    UNIX_EPOCH + Duration::from_secs(secs)
+}
+
+/// `#[serde(with = "...")]` for [`Quota`], whose `reset_at` goes on the wire as unix
+/// seconds instead of Rust's `SystemTime` form.
+mod quota_wire {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use tautly_provider::Quota;
+
+    use super::{from_unix_secs, unix_secs};
+
+    #[derive(Serialize, Deserialize)]
+    struct Wire {
+        remaining_requests: Option<u64>,
+        remaining_tokens: Option<u64>,
+        #[serde(default)]
+        reset_at: Option<u64>,
+    }
+
+    pub fn serialize<S: Serializer>(quota: &Option<Quota>, s: S) -> Result<S::Ok, S::Error> {
+        quota
+            .as_ref()
+            .map(|q| Wire {
+                remaining_requests: q.remaining_requests,
+                remaining_tokens: q.remaining_tokens,
+                reset_at: q.reset_at.map(unix_secs),
+            })
+            .serialize(s)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Quota>, D::Error> {
+        Ok(Option::<Wire>::deserialize(d)?.map(|w| Quota {
+            remaining_requests: w.remaining_requests,
+            remaining_tokens: w.remaining_tokens,
+            reset_at: w.reset_at.map(from_unix_secs),
+        }))
+    }
+}
+
+/// `#[serde(with = "...")]` for [`MemoryChange`], whose entry timestamps (`created`,
+/// `verified`) go on the wire as unix seconds; the entry's `stale` flag is not sent.
+mod memory_change_wire {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use tautly_memory::{MemAnchor, MemoryChange, MemoryEntry, MemoryKind};
+
+    use super::{from_unix_secs, unix_secs};
+
+    #[derive(Serialize, Deserialize)]
+    struct Wire {
+        upsert: Option<EntryWire>,
+        #[serde(default)]
+        delete: Vec<String>,
+    }
+
+    #[derive(Serialize, Deserialize)]
+    struct EntryWire {
+        id: String,
+        title: String,
+        kind: MemoryKind,
+        anchors: Vec<MemAnchor>,
+        created: u64,
+        #[serde(default)]
+        verified: Option<u64>,
+        body: String,
+    }
+
+    pub fn serialize<S: Serializer>(change: &MemoryChange, s: S) -> Result<S::Ok, S::Error> {
+        Wire {
+            upsert: change.upsert.as_ref().map(|e| EntryWire {
+                id: e.id.clone(),
+                title: e.title.clone(),
+                kind: e.kind,
+                anchors: e.anchors.clone(),
+                created: unix_secs(e.created),
+                verified: e.verified.map(unix_secs),
+                body: e.body.clone(),
+            }),
+            delete: change.delete.clone(),
+        }
+        .serialize(s)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<MemoryChange, D::Error> {
+        let w = Wire::deserialize(d)?;
+        Ok(MemoryChange {
+            upsert: w.upsert.map(|e| MemoryEntry {
+                id: e.id,
+                title: e.title,
+                kind: e.kind,
+                anchors: e.anchors,
+                created: from_unix_secs(e.created),
+                verified: e.verified.map(from_unix_secs),
+                body: e.body,
+                stale: false,
+            }),
+            delete: w.delete,
+        })
     }
 }
