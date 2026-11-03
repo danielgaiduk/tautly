@@ -82,6 +82,15 @@ pub trait Sandbox: Send + Sync {
     /// return its root-relative path, so the model can `read` it later. Content-addressed.
     async fn spill(&self, bytes: &[u8]) -> Result<PathBuf, SandboxError>;
     async fn spawn(&self, spec: SpawnSpec) -> Result<Child, SandboxError>;
+    /// Like [`Sandbox::spawn`], with the child's stdin piped as well: for a process that
+    /// speaks a protocol over stdin and stdout (an MCP stdio server). A sandbox that cannot
+    /// run such processes refuses.
+    async fn spawn_stdio(&self, spec: SpawnSpec) -> Result<Child, SandboxError> {
+        let _ = spec;
+        Err(SandboxError::Denied(
+            "this sandbox cannot run stdio servers".into(),
+        ))
+    }
     fn walker(&self, base: &Path) -> Result<ignore::WalkBuilder, SandboxError>;
     async fn http_get(&self, url: &Url) -> Result<HttpResponse, SandboxError>;
 }

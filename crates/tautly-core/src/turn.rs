@@ -294,6 +294,8 @@ impl Session {
         self.evidence = self.evidence.fresh();
         self.user_turn += 1;
         self.emit(Event::TurnStarted).await;
+        // The tool set changes only here, so the turn's requests share one prefix.
+        self.refresh_mcp_tools().await;
         self.budgets
             .lock()
             .unwrap_or_else(PoisonError::into_inner)

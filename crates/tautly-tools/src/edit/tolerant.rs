@@ -93,10 +93,10 @@ fn locate_with(text: &str, old: &str, whole_lines: bool) -> Result<Located, Matc
     if norm.trim().is_empty() {
         return Err(no_match());
     }
-    if norm != old {
-        if let Some(range) = unique(text, find_hits(text, &norm, whole_lines), norm.len())? {
-            return Ok(exact(range, RepairStage::Normalized));
-        }
+    if norm != old
+        && let Some(range) = unique(text, find_hits(text, &norm, whole_lines), norm.len())?
+    {
+        return Ok(exact(range, RepairStage::Normalized));
     }
 
     let file = Lines::new(text);

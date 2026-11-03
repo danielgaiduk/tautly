@@ -953,3 +953,54 @@ fn commands_that_escape_session_cleanup_ask_even_in_yolo() {
         );
     }
 }
+
+#[test]
+fn mcp_rules_match_tool_names_and_globs() {
+    let stdio = Effect::Exec {
+        argv: vec!["npx".into(), "-y".into(), "server".into()],
+    };
+    let http = Effect::Network {
+        host: "mcp.example.com".into(),
+    };
+    // No rule: an MCP call asks in `ask` and `auto-edit`, runs in `yolo`.
+    for mode in [Mode::Ask, Mode::AutoEdit] {
+        assert!(asks(p(mode).decide("mcp__gh__create_issue", &stdio, None)));
+        assert!(asks(p(mode).decide("mcp__web__fetch", &http, None)));
+    }
+    assert_eq!(
+        p(Mode::Yolo).decide("mcp__gh__create_issue", &stdio, None),
+        Decision::Allow
+    );
+
+    let pol = with_rules(
+        Mode::Ask,
+        &["mcp__gh__*", "mcp__web__fetch"],
+        &["mcp__gh__delete_*"],
+    );
+    assert_eq!(
+        pol.decide("mcp__gh__create_issue", &stdio, None),
+        Decision::Allow
+    );
+    assert_eq!(pol.decide("mcp__web__fetch", &http, None), Decision::Allow);
+    assert!(asks(pol.decide("mcp__web__other", &http, None)));
+    assert!(asks(pol.decide("mcp__ghost__x", &stdio, None)));
+    // Deny beats allow, in every mode.
+    let deny = Decision::Deny {
+        rule: "mcp__gh__delete_*".into(),
+    };
+    assert_eq!(pol.decide("mcp__gh__delete_repo", &stdio, None), deny);
+    let yolo = with_rules(Mode::Yolo, &[], &["mcp__gh__delete_*"]);
+    assert_eq!(yolo.decide("mcp__gh__delete_repo", &stdio, None), deny);
+    // A glob rule never reaches built-in tools.
+    let wide = with_rules(Mode::Ask, &["mcp__*"], &[]);
+    assert!(asks(wide.decide("bash", &exec("ls"), Some("ls"))));
+
+    for bad in ["mcp__gh__x(*)", "mcp__gh x", "mcp__gh__[", "mcp__gh__.*"] {
+        let cfg = PolicyConfig {
+            mode: Mode::Ask,
+            allow: vec![bad.into()],
+            deny: vec![],
+        };
+        assert!(Policy::new(cfg, PathBuf::from("/ws")).is_err(), "{bad}");
+    }
+}

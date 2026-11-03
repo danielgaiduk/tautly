@@ -5,7 +5,7 @@ use serde_json::json;
 use tautly_context::{Breakdown, ContextStatus, MutationReason};
 use tautly_core::{
     BudgetScope, Command, DiffFile, DiffPreview, DiffStatus, EffectView, ErrorKind, Event,
-    FinishReason, MemAnchor, MemoryChange, PROTOCOL_VERSION, ToolMetaView, UsageRole,
+    FinishReason, McpState, MemAnchor, MemoryChange, PROTOCOL_VERSION, ToolMetaView, UsageRole,
 };
 use tautly_memory::{MemoryEntry, MemoryKind};
 use tautly_provider::Quota;
@@ -172,6 +172,18 @@ fn every_event() -> Vec<Event> {
         Event::Warning {
             message: "non-UTF-8 path not tracked".into(),
         },
+        Event::McpServerApprovalRequested {
+            request_id: "approval-3".into(),
+            server: "github".into(),
+            source: "project".into(),
+            launch: "stdio: npx -y @modelcontextprotocol/server-github (env: GITHUB_TOKEN)".into(),
+        },
+        Event::McpServerStatus {
+            server: "github".into(),
+            state: McpState::Ready,
+            tools: 12,
+            message: None,
+        },
     ];
     for e in &events {
         match e {
@@ -193,6 +205,8 @@ fn every_event() -> Vec<Event> {
             | Event::Error { .. }
             | Event::SessionDiff { .. }
             | Event::Warning { .. }
+            | Event::McpServerApprovalRequested { .. }
+            | Event::McpServerStatus { .. }
             | Event::Unknown => {}
         }
     }
@@ -603,6 +617,18 @@ fn unknown_events_and_values_read_as_unknown_not_as_errors() {
     let e: Event =
         serde_json::from_value(json!({"type": "text_delta", "text": "hi", "lang": "en"})).unwrap();
     assert_eq!(e, Event::TextDelta { text: "hi".into() });
+    // A new MCP server state.
+    let e: Event = serde_json::from_value(json!({
+        "type": "mcp_server_status", "server": "s", "state": "sleeping", "tools": 0, "message": null
+    }))
+    .unwrap();
+    assert!(matches!(
+        e,
+        Event::McpServerStatus {
+            state: McpState::Unknown,
+            ..
+        }
+    ));
     // New values of the wire enums.
     let e: Event = serde_json::from_value(json!({
         "type": "error", "kind": "quota_exhausted", "message": "m", "retryable": false, "hint": null

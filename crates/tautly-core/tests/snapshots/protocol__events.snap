@@ -196,5 +196,19 @@ expression: events
   {
     "type": "warning",
     "message": "non-UTF-8 path not tracked"
+  },
+  {
+    "type": "mcp_server_approval_requested",
+    "request_id": "approval-3",
+    "server": "github",
+    "source": "project",
+    "launch": "stdio: npx -y @modelcontextprotocol/server-github (env: GITHUB_TOKEN)"
+  },
+  {
+    "type": "mcp_server_status",
+    "server": "github",
+    "state": "ready",
+    "tools": 12,
+    "message": null
   }
 ]

@@ -440,7 +440,7 @@ impl Session {
     ) -> Result<Option<Result<Preview, ToolResult>>, Outcome> {
         let mut cx = self.tool_cx(turn, ctl);
         // Headless, nobody sees the diff: the preview only says whether the call fails.
-        if !ctl.approvals.interactive() {
+        if !ctl.approvals.is_interactive() {
             cx = cx.without_preview_diff();
         }
         let preview =
@@ -480,8 +480,9 @@ impl Session {
         turn: u32,
         ctl: &TurnControl,
     ) -> ToolResult {
-        let (tool, _) = p.runnable.as_ref().expect("admitted calls are runnable");
+        let (tool, effect) = p.runnable.as_ref().expect("admitted calls are runnable");
         let call = p.call;
+        self.before_exec(&call.name, effect, turn).await;
         self.emit(Event::ToolStarted {
             call_id: call.id.clone(),
             tool: call.name.clone(),

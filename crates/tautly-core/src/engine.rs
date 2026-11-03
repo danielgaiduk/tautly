@@ -6,6 +6,10 @@
 //! (further messages included) waits for the turn to end. Every command is logged as it
 //! arrives.
 //!
+//! MCP servers (`mcp.rs`) start in the background after session start; `Approve`/`Deny`
+//! also answer repository servers' approval requests. At shutdown the servers are stopped
+//! before the left-behind process groups.
+//!
 //! `SetBudget` is applied at once, even mid-turn: the running turn sees the new limits at
 //! its next tool boundary (`budget.rs`). At shutdown, after the turn has ended, every
 //! process group the session's commands left behind is terminated.
@@ -23,6 +27,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use tautly_context::Context;
+use tautly_mcp::ServerSpec;
 use tautly_provider::{Catalog, Provider, Retrying};
 use tautly_sandbox::{LocalSandbox, Policy, PolicyError, Sandbox, SandboxError};
 use tautly_session::{HeaderInit, SessionWriter};
@@ -37,6 +42,7 @@ use crate::budget::{Budget, Budgets};
 use crate::config::{Config, LoadedConfig};
 use crate::evidence::{EvidenceTracker, TestMatcher};
 use crate::ledger::{CostLedger, LEDGER_FILE};
+use crate::mcp::{McpSession, McpSetup, NoPreExec, PreExecHook};
 use crate::protocol::{BudgetScope, Command, ErrorKind, Event, FinishReason};
 use crate::provider_setup::provider_for;
 use crate::record::SessionRecord;
@@ -101,6 +107,13 @@ pub struct EngineBuilder {
     /// Lines from loading the configuration ([`LoadedConfig::warnings`]), shown as
     /// warnings at session start.
     pub config_warnings: Vec<String>,
+    /// Start repository-declared MCP servers the user has not approved, for this session
+    /// only; nothing is remembered (`--approve-mcp`, spec 3.4).
+    pub approve_mcp: bool,
+    /// MCP servers from the client (an editor over ACP); trusted like the user's own.
+    pub client_mcp: Vec<(String, ServerSpec)>,
+    /// Runs before every stdio MCP call. Default: [`NoPreExec`].
+    pub pre_exec: Option<Arc<dyn PreExecHook>>,
 }
 
 impl EngineBuilder {
@@ -115,6 +128,9 @@ impl EngineBuilder {
             interactive: false,
             data_home: None,
             config_warnings: Vec::new(),
+            approve_mcp: false,
+            client_mcp: Vec::new(),
+            pre_exec: None,
         }
     }
 
@@ -193,8 +209,10 @@ impl EngineBuilder {
 
         let (event_tx, event_rx) = mpsc::channel(EVENT_CAPACITY);
         let (command_tx, command_rx) = mpsc::channel(COMMAND_CAPACITY);
-        let tools = registry(&info.caps);
+        // MCP tools join at the first user-turn start (`Session::refresh_mcp_tools`).
+        let tools = registry(&info.caps, Vec::new());
         let specs = tools.iter().map(|t| t.spec(&info.caps)).collect();
+        let mcp = McpSetup::new(&config, self.client_mcp, self.approve_mcp, &data_home);
         let context = Context {
             root: Some(root.clone()),
             ..Context::default()
@@ -238,6 +256,8 @@ impl EngineBuilder {
             groups: groups.clone(),
             lost_write_paths: Default::default(),
             evidence: EvidenceTracker::new(test_matcher),
+            mcp: None,
+            pre_exec: self.pre_exec.unwrap_or_else(|| Arc::new(NoPreExec)),
         };
         let actor = Actor {
             log: session.log.clone(),
@@ -253,6 +273,7 @@ impl EngineBuilder {
             command_rx,
             self.config_warnings,
             config.pins.clone(),
+            mcp,
         ));
         Ok((
             Engine {
@@ -358,6 +379,7 @@ impl Actor {
         mut commands: mpsc::Receiver<Command>,
         config_warnings: Vec<String>,
         config_pins: Vec<String>,
+        mcp: McpSetup,
     ) {
         self.events.try_emit(Event::SessionChanged {
             session_id: self.session_id.clone(),
@@ -367,6 +389,13 @@ impl Actor {
             self.events.try_emit(Event::Warning { message: w });
         }
         session.init(&config_pins).await;
+        session.mcp = McpSession::start(
+            mcp,
+            Arc::clone(&session.sandbox),
+            session.events.clone(),
+            self.approvals.clone(),
+        )
+        .await;
 
         let mut state = Some(session);
         let mut running: Option<Running> = None;
@@ -447,6 +476,11 @@ impl Actor {
                 }
             }
         }
+        // MCP servers end with their process groups. (A session lost to a crashed turn
+        // dropped its servers, which kills their groups.)
+        if let Some(mcp) = state.as_ref().and_then(|s| s.mcp.as_ref()) {
+            mcp.shutdown().await;
+        }
         // The turn has ended (its own command was killed with it); what is left are groups
         // with background children, such as dev servers.
         self.groups.terminate_all(GROUP_GRACE).await;
@@ -477,10 +511,10 @@ impl Actor {
     /// Run `f` on the log off the async workers; a first failure is shown.
     async fn with_log(&self, f: impl FnOnce(&Log) -> Result<(), LogFailure> + Send + 'static) {
         let log = self.log.clone();
-        if let Ok(Err(failure)) = tokio::task::spawn_blocking(move || f(&log)).await {
-            if let Some(ev) = failure.event() {
-                self.events.try_emit(ev);
-            }
+        if let Ok(Err(failure)) = tokio::task::spawn_blocking(move || f(&log)).await
+            && let Some(ev) = failure.event()
+        {
+            self.events.try_emit(ev);
         }
     }
 

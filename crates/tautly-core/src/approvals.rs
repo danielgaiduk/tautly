@@ -35,8 +35,8 @@ impl Approvals {
         }
     }
 
-    /// Whether a client can answer requests (else `ask` resolves to deny).
-    pub fn interactive(&self) -> bool {
+    /// Whether a client can answer requests (otherwise [`Approvals::open`] gives None).
+    pub fn is_interactive(&self) -> bool {
         self.interactive
     }
 

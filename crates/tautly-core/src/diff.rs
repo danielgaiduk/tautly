@@ -45,10 +45,10 @@ pub fn pre_images(
     turn: Option<u32>,
 ) -> Result<Vec<PreImage>, DiffError> {
     let (first, turns) = earliest_pre_images(reader, turn)?;
-    if let Some(t) = turn {
-        if t == 0 || t > turns {
-            return Err(DiffError::NoSuchTurn { turn: t, turns });
-        }
+    if let Some(t) = turn
+        && (t == 0 || t > turns)
+    {
+        return Err(DiffError::NoSuchTurn { turn: t, turns });
     }
     first
         .into_iter()

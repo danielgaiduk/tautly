@@ -81,6 +81,30 @@ impl LocalSandbox {
             )))
         }
     }
+
+    /// Spawn `spec` with the given stdin; stdout and stderr are piped.
+    fn spawn_with(&self, spec: SpawnSpec, stdin: Stdio) -> Result<Child, SandboxError> {
+        let (prog, args) = spec
+            .argv
+            .split_first()
+            .ok_or_else(|| SandboxError::Denied("empty argv".into()))?;
+        let cwd = self.resolve(&spec.cwd)?;
+        let mut cmd = Command::new(prog);
+        cmd.args(args)
+            .current_dir(cwd)
+            .envs(spec.env.iter().map(|(k, v)| (k, v)))
+            .stdin(stdin)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        for k in &spec.env_remove {
+            cmd.env_remove(k);
+        }
+        if spec.new_process_group {
+            cmd.process_group(0);
+        }
+        Ok(cmd.spawn()?)
+    }
 }
 
 #[async_trait]
@@ -218,26 +242,11 @@ impl Sandbox for LocalSandbox {
     }
 
     async fn spawn(&self, spec: SpawnSpec) -> Result<Child, SandboxError> {
-        let (prog, args) = spec
-            .argv
-            .split_first()
-            .ok_or_else(|| SandboxError::Denied("empty argv".into()))?;
-        let cwd = self.resolve(&spec.cwd)?;
-        let mut cmd = Command::new(prog);
-        cmd.args(args)
-            .current_dir(cwd)
-            .envs(spec.env.iter().map(|(k, v)| (k, v)))
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-        for k in &spec.env_remove {
-            cmd.env_remove(k);
-        }
-        if spec.new_process_group {
-            cmd.process_group(0);
-        }
-        Ok(cmd.spawn()?)
+        self.spawn_with(spec, Stdio::null())
+    }
+
+    async fn spawn_stdio(&self, spec: SpawnSpec) -> Result<Child, SandboxError> {
+        self.spawn_with(spec, Stdio::piped())
     }
 
     fn walker(&self, base: &Path) -> Result<ignore::WalkBuilder, SandboxError> {

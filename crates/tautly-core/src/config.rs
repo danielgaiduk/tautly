@@ -5,10 +5,12 @@
 //! The project file is repository content, so it is untrusted: it cannot set `providers`,
 //! `telemetry`, `approve_memory`, `catalog_overrides`, `routing` or `evidence`, and in
 //! `permissions` it can only lower the mode and add `deny` rules; `budget`, `max_turns`
-//! and `turn_timeout_s` can only go down. Dropped settings come back as
+//! and `turn_timeout_s` can only go down. Of `[mcp]` it may only declare `servers`, which
+//! never merge with the user's: they are kept apart in [`Config::project_mcp_servers`] and
+//! each needs the user's approval before it starts. Dropped settings come back as
 //! [`LoadedConfig::warnings`]. Command-line flags are the user's own and override all.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::ffi::OsString;
 use std::fs::File;
 use std::io::Read;
@@ -16,6 +18,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Deserializer, Serialize};
+use tautly_mcp::{McpConfig, ServerSpec};
 use tautly_provider::{Catalog, ModelId};
 use tautly_sandbox::{Mode, Policy, PolicyConfig};
 use tautly_tools::MAX_PIN_BYTES;
@@ -94,6 +97,14 @@ pub struct Config {
     /// `[evidence]`: which commands count as test runs (user layer only).
     #[serde(default)]
     pub evidence: EvidenceConfig,
+    /// `[mcp]`: from the user layer, except the project's servers, which are kept apart in
+    /// [`Config::project_mcp_servers`].
+    #[serde(default)]
+    pub mcp: McpConfig,
+    /// The project layer's `[mcp.servers]`: repository-declared, so each needs the user's
+    /// approval before it starts (spec 7.11.10).
+    #[serde(skip)]
+    pub project_mcp_servers: BTreeMap<String, ServerSpec>,
 }
 
 fn default_model() -> ModelId {
@@ -156,6 +167,8 @@ impl Default for Config {
             routing: RoutingConfig::default(),
             approve_memory: false,
             evidence: EvidenceConfig::default(),
+            mcp: McpConfig::default(),
+            project_mcp_servers: BTreeMap::new(),
         }
     }
 }
@@ -362,6 +375,7 @@ impl Config {
         }
 
         let mut merged = Table::new();
+        let mut project_mcp_servers = BTreeMap::new();
         for (path, trust) in layers.into_iter().flatten() {
             let layer = match (read_layer(&path, trust == Trust::User), trust) {
                 (Ok(layer), _) => layer,
@@ -388,6 +402,7 @@ impl Config {
             };
             if trust == Trust::Project {
                 restrict_project_layer(&mut layer, &merged, &path, &mut warnings);
+                project_mcp_servers = take_project_servers(&mut layer, &path, &mut warnings);
             }
             // Check the layer alone so a bad value names the file it came from.
             Value::Table(layer.clone())
@@ -401,13 +416,14 @@ impl Config {
         }
         deep_merge(&mut merged, cli_table(&cli));
 
-        let cfg: Config = Value::Table(merged)
+        let mut cfg: Config = Value::Table(merged)
             .try_into()
             .map_err(|e: toml::de::Error| ConfigError::Invalid {
                 origin: None,
                 message: e.to_string(),
             })?;
         cfg.validate()?;
+        cfg.project_mcp_servers = project_mcp_servers;
         Ok(LoadedConfig {
             config: cfg,
             warnings,
@@ -431,12 +447,12 @@ impl Config {
         if self.model.as_str().is_empty() {
             return Err("model must not be empty".into());
         }
-        if let Some(t) = self.compaction_threshold {
-            if !(t.is_finite() && t > 0.0 && t <= 1.0) {
-                return Err(format!(
-                    "compaction_threshold must be in (0, 1], or 0 to disable; got {t}"
-                ));
-            }
+        if let Some(t) = self.compaction_threshold
+            && !(t.is_finite() && t > 0.0 && t <= 1.0)
+        {
+            return Err(format!(
+                "compaction_threshold must be in (0, 1], or 0 to disable; got {t}"
+            ));
         }
         if self.max_turns == 0 {
             return Err("max_turns must be at least 1".into());
@@ -455,10 +471,10 @@ impl Config {
                 return Err(format!("budget.{scope}.max_tokens must be at least 1"));
             }
         }
-        if let Some(m) = &self.routing.side_model {
-            if m.as_str().is_empty() {
-                return Err("routing.side_model must not be empty".into());
-            }
+        if let Some(m) = &self.routing.side_model
+            && m.as_str().is_empty()
+        {
+            return Err("routing.side_model must not be empty".into());
         }
         for pin in &self.pins {
             if pin.trim().is_empty() {
@@ -558,6 +574,8 @@ const PROJECT_KEYS: &[&str] = &[
     "turn_timeout_s",
     "budget",
     "pins",
+    // Only `mcp.servers`, kept apart from the user's servers (they need approval).
+    "mcp",
 ];
 
 /// Repository pins are authoritative and never summarized, so they are capped like the
@@ -734,6 +752,25 @@ fn restrict_project_layer(
         restrict_permissions(perms, so_far, &mut ignore);
     }
 
+    match layer.get_mut("mcp") {
+        Some(Value::Table(mcp)) => {
+            for key in mcp.keys().cloned().collect::<Vec<_>>() {
+                if key != "servers" {
+                    mcp.remove(&key);
+                    ignore(
+                        &format!("mcp.{key}"),
+                        "a project config may only declare `mcp.servers`",
+                    );
+                }
+            }
+        }
+        Some(_) => {
+            layer.remove("mcp");
+            ignore("mcp", "not a table");
+        }
+        None => {}
+    }
+
     // A hostile file can name tens of thousands of unknown keys: say so a bounded number
     // of times.
     if warnings.len() - first > MAX_PROJECT_WARNINGS {
@@ -744,6 +781,56 @@ fn restrict_project_layer(
             path.display()
         ));
     }
+}
+
+/// Take the project layer's `[mcp.servers]` out of it: they never merge with the user's
+/// servers (a same-named project server must not replace the user's), and each needs an
+/// approval (spec 7.11.10). A malformed one is dropped with a warning, like any other
+/// project setting the loader cannot use.
+fn take_project_servers(
+    layer: &mut Table,
+    path: &Path,
+    warnings: &mut Vec<String>,
+) -> BTreeMap<String, ServerSpec> {
+    let mut servers = BTreeMap::new();
+    let Some(Value::Table(mut mcp)) = layer.remove("mcp") else {
+        return servers;
+    };
+    match mcp.remove("servers") {
+        Some(Value::Table(table)) => {
+            let mut bad = 0;
+            for (name, spec) in table {
+                match spec.try_into::<ServerSpec>() {
+                    Ok(spec) => {
+                        servers.insert(name, spec);
+                    }
+                    Err(e) => {
+                        bad += 1;
+                        if bad <= MAX_PROJECT_WARNINGS {
+                            warnings.push(format!(
+                                "{}: ignored `mcp.servers.{name}`: {}",
+                                path.display(),
+                                e.message()
+                            ));
+                        }
+                    }
+                }
+            }
+            if bad > MAX_PROJECT_WARNINGS {
+                warnings.push(format!(
+                    "{}: and {} more ignored MCP servers",
+                    path.display(),
+                    bad - MAX_PROJECT_WARNINGS
+                ));
+            }
+        }
+        Some(_) => warnings.push(format!(
+            "{}: ignored `mcp.servers`: not a table",
+            path.display()
+        )),
+        None => {}
+    }
+    servers
 }
 
 fn restrict_permissions(perms: &mut Table, so_far: &Table, ignore: &mut impl FnMut(&str, &str)) {

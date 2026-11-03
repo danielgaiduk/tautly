@@ -1,0 +1,29 @@
+[package]
+name = "tautly-mcp-fixture"
+description = "Test-only MCP server (`echo_server`) for the tautly-mcp and tautly-core tests"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+# The server side of rmcp and an HTTP server live here, not in `tautly-mcp`, so nothing
+# that ships depends on them.
+[dependencies]
+rmcp = { workspace = true, features = [
+    "server",
+    "transport-io",
+    "transport-streamable-http-server",
+] }
+tokio = { workspace = true, features = ["net", "io-std"] }
+serde_json.workspace = true
+hyper = { workspace = true, features = ["server", "http1"] }
+hyper-util = { workspace = true, features = ["tokio"] }
+tower-service.workspace = true
+http.workspace = true
+
+[[bin]]
+name = "echo_server"
+path = "src/main.rs"
+test = false
+doc = false

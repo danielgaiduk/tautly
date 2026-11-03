@@ -888,15 +888,14 @@ impl Inner {
             }
         }
         tx.commit()?;
-        if since.is_none() {
-            if let Some(t) = self
+        if since.is_none()
+            && let Some(t) = self
                 .tombstones
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .as_mut()
-            {
-                t.extend(removed.iter().map(|k| k.to_string()));
-            }
+        {
+            t.extend(removed.iter().map(|k| k.to_string()));
         }
         let mut tree = self.tree.write().unwrap_or_else(PoisonError::into_inner);
         for path in removed {

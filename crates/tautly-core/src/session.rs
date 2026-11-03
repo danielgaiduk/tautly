@@ -22,6 +22,7 @@ use crate::attempts::AttemptLedger;
 use crate::budget::Budgets;
 use crate::evidence::EvidenceTracker;
 use crate::ledger::CostLedger;
+use crate::mcp::{McpSession, PreExecHook};
 use crate::protocol::{Command, ErrorKind, Event};
 use crate::record::{BlockHashes, SessionRecord};
 use crate::workspace::Workspace;
@@ -150,6 +151,13 @@ impl EventSink {
         if let Err(mpsc::error::TrySendError::Full(_)) = self.tx.try_send(ev) {
             self.dropped.fetch_add(1, Ordering::Relaxed);
         }
+    }
+
+    /// Send now if there is room; false when it was not sent (not counted as dropped: the
+    /// caller sends it again later). Never waits.
+    pub fn try_send(&self, ev: Event) -> bool {
+        self.announce_dropped();
+        self.tx.try_send(ev).is_ok()
     }
 
     pub async fn warn(&self, message: impl Into<String>) {
@@ -330,6 +338,11 @@ pub(crate) struct Session {
     pub lost_write_paths: HashMap<PathBuf, Option<(SystemTime, u64)>>,
     /// The running turn's test evidence (spec 7.11.7); replaced at every turn start.
     pub evidence: EvidenceTracker,
+    /// The session's MCP servers, once started (`mcp.rs`); their tools join `tools` at
+    /// user-turn starts only.
+    pub mcp: Option<McpSession>,
+    /// Runs before every stdio MCP call (checkpoints, Task 47).
+    pub pre_exec: Arc<dyn PreExecHook>,
 }
 
 impl Session {
