@@ -7,6 +7,12 @@
 //! it reports through a channel. The session drains that channel at tool boundaries and
 //! accounts every request like a main one, but with the side model's id and price (ledger
 //! row, `Usage{role: side}`, budgets), never the main model's.
+//!
+//! A side model that fails for good falls back to the main model for the rest of the
+//! session (`Session::side_to_main`). A `SetModel` resolves the side route again for the
+//! new main model ([`Side::resolve_with`]), which also ends such a fallback: an explicit
+//! switch is a fresh start, and a side model that still fails falls back again, with its
+//! one warning.
 
 use std::sync::{Arc, Mutex, PoisonError};
 
@@ -20,7 +26,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::Config;
-use crate::provider_setup::provider_for;
+use crate::provider_setup::{ProviderSetupError, provider_for};
 use crate::turn::partial_usage;
 
 /// What one side-model request billed.
@@ -261,6 +267,20 @@ impl Side {
         main: &Arc<dyn Provider>,
         provider: Option<Arc<dyn Provider>>,
     ) -> (Side, Option<String>) {
+        Side::resolve_with(config, catalog, main, provider, |id| {
+            provider_for(config, id, Arc::clone(catalog))
+        })
+    }
+
+    /// [`resolve`](Self::resolve) with `build` making the adapter for a side model of
+    /// another provider (`SetModel` passes its provider factory). It may block.
+    pub fn resolve_with(
+        config: &Config,
+        catalog: &Arc<Catalog>,
+        main: &Arc<dyn Provider>,
+        provider: Option<Arc<dyn Provider>>,
+        build: impl FnOnce(&ModelId) -> Result<Arc<dyn Provider>, ProviderSetupError>,
+    ) -> (Side, Option<String>) {
         let id = side_model_id(config, catalog);
         let same_as_main = |id: &ModelId| Side::new(Arc::clone(main), id.clone(), catalog.get(id));
         if id == config.model {
@@ -269,8 +289,7 @@ impl Side {
         let built = match provider {
             Some(p) => Ok(Arc::new(Retrying::new(p)) as Arc<dyn Provider>),
             None if provider_of(&id) == provider_of(&config.model) => Ok(Arc::clone(main)),
-            None => provider_for(config, &id, Arc::clone(catalog))
-                .map(|p| Arc::new(Retrying::new(p)) as Arc<dyn Provider>),
+            None => build(&id).map(|p| Arc::new(Retrying::new(p)) as Arc<dyn Provider>),
         };
         match built {
             Ok(p) => (Side::new(p, id.clone(), catalog.get(&id)), None),

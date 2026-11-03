@@ -8,7 +8,7 @@ use tautly_core::{
     FinishReason, McpState, MemAnchor, MemoryChange, PROTOCOL_VERSION, ToolMetaView, UsageRole,
 };
 use tautly_memory::{MemoryEntry, MemoryKind};
-use tautly_provider::Quota;
+use tautly_provider::{ModelId, Quota};
 use tautly_tools::{AppliedEffect, LineRange, Shown, ToolMeta};
 
 fn memory_change() -> MemoryChange {
@@ -169,6 +169,10 @@ fn every_event() -> Vec<Event> {
             unified: "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1 @@\n-a\n+b\n".into(),
             truncated: false,
         },
+        Event::ModelChanged {
+            model: ModelId::from("compat:local/llama"),
+            provider: "compat:local".into(),
+        },
         Event::Warning {
             message: "non-UTF-8 path not tracked".into(),
         },
@@ -204,6 +208,7 @@ fn every_event() -> Vec<Event> {
             | Event::TurnFinished { .. }
             | Event::Error { .. }
             | Event::SessionDiff { .. }
+            | Event::ModelChanged { .. }
             | Event::Warning { .. }
             | Event::McpServerApprovalRequested { .. }
             | Event::McpServerStatus { .. }
@@ -258,6 +263,9 @@ fn every_command() -> Vec<Command> {
         Command::Fork,
         Command::Diff { turn: None },
         Command::Diff { turn: Some(3) },
+        Command::SetModel {
+            model: ModelId::from("openai/gpt-5"),
+        },
         Command::Shutdown,
     ];
     for c in &commands {
@@ -276,6 +284,7 @@ fn every_command() -> Vec<Command> {
             | Command::ConsolidateMemory
             | Command::Fork
             | Command::Diff { .. }
+            | Command::SetModel { .. }
             | Command::Shutdown => {}
         }
     }

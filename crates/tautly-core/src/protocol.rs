@@ -26,7 +26,7 @@ use serde_json::Value;
 use tautly_context::{Breakdown, ContextStatus, MutationReason};
 pub use tautly_mcp::McpState;
 use tautly_memory::MemoryChange;
-use tautly_provider::Quota;
+use tautly_provider::{ModelId, Quota};
 use tautly_tools::{AppliedEffect, DiffPreview, LineRange, Shown, ToolMeta};
 
 use crate::evidence::TestEvidence;
@@ -269,6 +269,12 @@ pub enum Event {
         unified: String,
         truncated: bool,
     },
+    /// The answer to a successful [`Command::SetModel`]: the model requests go to from now
+    /// on, and its provider (`anthropic`, `openai`, `google` or `compat:<name>`).
+    ModelChanged {
+        model: ModelId,
+        provider: String,
+    },
     /// Something the user should know that does not end the turn (a skipped non-UTF-8
     /// path, a malformed AGENTS.md section, memory entries that failed to load).
     Warning {
@@ -379,6 +385,12 @@ pub enum Command {
     /// (1-based).
     Diff {
         turn: Option<u32>,
+    },
+    /// Switch the session to `model` (spec 7.11.5): at once when idle, else at the start of
+    /// the next user turn. Answered with [`Event::ModelChanged`], or an `Error` that leaves
+    /// the model as it was.
+    SetModel {
+        model: ModelId,
     },
     Shutdown,
 }

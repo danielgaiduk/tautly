@@ -17,7 +17,7 @@ pub mod tokens;
 use std::path::PathBuf;
 use std::time::Instant;
 
-use tautly_provider::RawUsage;
+use tautly_provider::{Content, RawUsage, Role};
 use tautly_tools::{AppliedEffect, ContextOp};
 
 pub use assemble::STABLE_LEN;
@@ -62,6 +62,13 @@ pub struct Context {
     /// Problems found while loading the session's inputs (an AGENTS.md that was truncated
     /// or refused), repeated in the warnings of every [`ContextStatus`].
     pub load_warnings: Vec<String>,
+    /// The provider (`anthropic`, `openai`, `google`, `compat:<name>`) whose reasoning
+    /// items the history holds; see [`Context::strip_reasoning`]. `None`: unknown, so the
+    /// next strip with a provider removes them all. A rebuilt session sets it from the
+    /// model it resumes on.
+    pub reasoning_provider: Option<String>,
+    /// Set by [`Context::force_cold_epoch`] until the next request.
+    pub cold_epoch_forced: bool,
 }
 
 impl Default for Context {
@@ -80,6 +87,8 @@ impl Default for Context {
             clock: CacheClock::default(),
             load_warnings: Vec::new(),
             session_pins: Vec::new(),
+            reasoning_provider: None,
+            cold_epoch_forced: false,
         }
     }
 }
@@ -147,6 +156,7 @@ impl Context {
             last_request: Some(at),
             cached_prefix_tokens,
         };
+        self.cold_epoch_forced = false;
     }
 
     /// Apply a `pin` or `state` tool call. A pin becomes a session pin ([`Context::pin`]);
@@ -197,6 +207,41 @@ impl Context {
         }
         self.session_pins.push(Pinned::new(text, source));
         Ok(true)
+    }
+
+    /// Treat the next step start as a cold cache (a model switch: prompt caches are per
+    /// model, so nothing cached is lost): the scheduler decides
+    /// [`MutationReason::ColdCache`] until the next [`note_request`](Self::note_request),
+    /// so pending collection, compaction, pin folds and the memory index apply then. A
+    /// compaction forced by the window (at [`schedule::FORCED_PERCENT`] of it, as when the
+    /// new model's window is smaller) is reported as [`MutationReason::Forced`].
+    pub fn force_cold_epoch(&mut self) {
+        self.clock = CacheClock::default();
+        self.cold_epoch_forced = true;
+    }
+
+    /// Remove the reasoning items (`Reasoning`, `RedactedReasoning`) that the provider
+    /// `keep_provider` cannot take: all of them, unless the history's reasoning came from
+    /// that provider ([`reasoning_provider`](Self::reasoning_provider)). `None` strips
+    /// everything. Assistant messages left empty are dropped. From here on the history's
+    /// reasoning is `keep_provider`'s.
+    pub fn strip_reasoning(&mut self, keep_provider: Option<&str>) {
+        if keep_provider.is_some() && keep_provider == self.reasoning_provider.as_deref() {
+            return;
+        }
+        for turn in &mut self.history {
+            for m in &mut turn.messages {
+                m.content.retain(|c| {
+                    !matches!(
+                        c,
+                        Content::Reasoning { .. } | Content::RedactedReasoning { .. }
+                    )
+                });
+            }
+            turn.messages
+                .retain(|m| !(m.role == Role::Assistant && m.content.is_empty()));
+        }
+        self.reasoning_provider = keep_provider.map(str::to_string);
     }
 
     /// Move the session pins into `pinned`, where they become part of the cached prefix.

@@ -4,22 +4,28 @@
 //! While a turn runs, the actor still answers `Approve`/`Deny` (by request id), `Cancel`
 //! and `Shutdown`; `Pin`/`Unpin` reach the turn at its next step start; everything else
 //! (further messages included) waits for the turn to end. Every command is logged as it
-//! arrives.
+//! arrives (one that arrives while a `SetModel` builds its provider, once the build ends).
 //!
 //! MCP servers (`mcp.rs`) start in the background after session start; `Approve`/`Deny`
 //! also answer repository servers' approval requests. At shutdown the servers are stopped
 //! before the left-behind process groups.
 //!
 //! `SetBudget` is applied at once, even mid-turn: the running turn sees the new limits at
-//! its next tool boundary (`budget.rs`). At shutdown, after the turn has ended, every
-//! process group the session's commands left behind is terminated.
+//! its next tool boundary (`budget.rs`). `SetModel` waits for the turn to end like other
+//! commands, so it applies at once when idle and otherwise before the next user turn
+//! (`model_switch.rs`); while its provider is built the actor keeps taking commands, and a
+//! `Shutdown` abandons the switch. At shutdown, after the turn has ended, every process
+//! group the session's commands left behind is terminated.
 //!
-//! Seams for later tasks: resume and fork (Task 26) build the
-//! `Session` from a log instead of [`Session::init`]'s fresh state (`EngineBuilder::resume`
-//! is refused until then); memory proposals (Task 28) plug in at the `ContextOp::Remember`
-//! arm of `dispatch.rs` and fill `Session::pending_memory_index`, which the cache epoch
-//! already applies, and ask the side model through `Session::side` (`routing.rs`), which
-//! already serves compaction summaries and `web_fetch` answers.
+//! Seams for later tasks: resume and fork (Task 26) build the `Session` from a log
+//! instead of [`Session::init`]'s fresh state (`EngineBuilder::resume` is refused until
+//! then); a resumed session starts on `record::session_model` and sets
+//! `Context::reasoning_provider` to that model's provider, and its rebuild applies the
+//! `ModelSet` and `ReasoningStripped` records at their positions (`record.rs`). Memory
+//! proposals (Task 28) plug in at the `ContextOp::Remember` arm of `dispatch.rs` and fill
+//! `Session::pending_memory_index`, which the cache epoch already applies, and ask the side
+//! model through `Session::side` (`routing.rs`), which already serves compaction summaries
+//! and `web_fetch` answers (and is recomputed by every `SetModel`).
 
 use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -43,8 +49,9 @@ use crate::config::{Config, LoadedConfig};
 use crate::evidence::{EvidenceTracker, TestMatcher};
 use crate::ledger::{CostLedger, LEDGER_FILE};
 use crate::mcp::{McpSession, McpSetup, NoPreExec, PreExecHook};
+use crate::model_switch::ModelSetup;
 use crate::protocol::{BudgetScope, Command, ErrorKind, Event, FinishReason};
-use crate::provider_setup::provider_for;
+use crate::provider_setup::{ProviderFactory, provider_for, provider_label};
 use crate::record::SessionRecord;
 use crate::routing::Side;
 use crate::session::{EventSink, Log, LogFailure, Session};
@@ -97,6 +104,10 @@ pub struct EngineBuilder {
     /// from the configuration (which looks up an API key and may block, like `provider`).
     /// Always wrapped in `Retrying`.
     pub side_provider: Option<Arc<dyn Provider>>,
+    /// Builds the provider for the model a `SetModel` names (on the blocking pool; it may
+    /// read the keychain). Default: the adapter for that model's provider, with its key
+    /// from the environment or the keychain. Wrapped in `Retrying` like `provider`.
+    pub provider_factory: Option<ProviderFactory>,
     /// Default: a `LocalSandbox` on the root (or the workspace's sandbox).
     pub sandbox: Option<Arc<dyn Sandbox>>,
     /// A session id to resume (Task 26).
@@ -129,6 +140,7 @@ impl EngineBuilder {
             root: root.into(),
             provider: None,
             side_provider: None,
+            provider_factory: None,
             sandbox: None,
             resume: None,
             workspace: None,
@@ -202,7 +214,7 @@ impl EngineBuilder {
         let provider = match self.provider {
             Some(p) => p,
             None => provider_for(&config, &config.model, Arc::clone(&catalog))
-                .map_err(EngineError::Provider)?,
+                .map_err(|e| EngineError::Provider(e.to_string()))?,
         };
         let provider: Arc<dyn Provider> = Arc::new(Retrying::new(provider));
         let (side, side_note) = Side::resolve(&config, &catalog, &provider, self.side_provider);
@@ -225,6 +237,7 @@ impl EngineBuilder {
         let mcp = McpSetup::new(&config, self.client_mcp, self.approve_mcp, &data_home);
         let context = Context {
             root: Some(root.clone()),
+            reasoning_provider: Some(provider_label(&config.model)),
             ..Context::default()
         };
         let budgets = Arc::new(Mutex::new(Budgets::new(
@@ -243,7 +256,8 @@ impl EngineBuilder {
             sandbox,
             workspace,
             provider,
-            history_provider: config.model.provider().to_string(),
+            setup: ModelSetup::new(config.clone(), Arc::clone(&catalog), self.provider_factory),
+            reasoning_retry: false,
             model: config.model.clone(),
             info,
             side,
@@ -375,6 +389,22 @@ struct Actor {
     groups: ProcessGroups,
 }
 
+/// Collect the commands that arrive into `early` until a `Shutdown` (or the client going
+/// away, which means the same) is among them. Cancel-safe: a received command is stored
+/// before the next await, so dropping this future loses none. The caller handles `early`
+/// (logging each) afterwards, so their `Command` records follow what the interrupted
+/// command logged.
+async fn until_shutdown(commands: &mut mpsc::Receiver<Command>, early: &mut Vec<Command>) {
+    loop {
+        let cmd = commands.recv().await.unwrap_or(Command::Shutdown);
+        let stop = cmd == Command::Shutdown;
+        early.push(cmd);
+        if stop {
+            return;
+        }
+    }
+}
+
 /// The actor's task dropped without a shutdown (the runtime went away): no process group
 /// may outlive the session. After a normal shutdown the registry is already empty.
 impl Drop for Actor {
@@ -424,7 +454,22 @@ impl Actor {
                             None => self.lost(),
                         }
                     } else if let Some(s) = state.as_mut() {
-                        self.idle_command(s, cmd).await;
+                        if let Command::SetModel { model } = cmd {
+                            // The provider build may wait on a keychain prompt: keep taking
+                            // commands meanwhile, and let a `Shutdown` abandon the switch.
+                            let mut early = Vec::new();
+                            s.set_model(model, until_shutdown(&mut commands, &mut early))
+                                .await;
+                            for cmd in early {
+                                self.received(cmd, false, None, &mut queue, &mut stopping)
+                                    .await;
+                            }
+                            if stopping {
+                                break;
+                            }
+                        } else {
+                            self.idle_command(s, cmd).await;
+                        }
                     } else {
                         self.lost();
                     }
@@ -436,41 +481,9 @@ impl Actor {
             tokio::select! {
                 cmd = commands.recv(), if !stopping => {
                     let cmd = cmd.unwrap_or(Command::Shutdown);
-                    self.with_log({
-                        let rec = SessionRecord::Command(cmd.clone());
-                        move |l| l.append(&rec)
-                    })
-                    .await;
                     let lost = state.is_none() && running.is_none();
-                    match cmd {
-                        Command::Shutdown => {
-                            stopping = true;
-                            self.approvals.deny_all("the session is shutting down");
-                            self.shutdown.cancel();
-                        }
-                        // After a crashed turn every command gets the same answer.
-                        _ if lost => self.lost(),
-                        Command::Approve { request_id } => {
-                            self.resolve(&request_id, Verdict::Approved);
-                        }
-                        Command::Deny { request_id, reason } => {
-                            self.resolve(&request_id, Verdict::Denied { reason });
-                        }
-                        Command::Cancel => {
-                            if let Some(r) = &running {
-                                r.cancel.cancel();
-                            }
-                        }
-                        Command::SetBudget { scope, max_usd, max_tokens } => {
-                            self.set_budget(scope, max_usd, max_tokens);
-                        }
-                        cmd @ (Command::Pin { .. } | Command::Unpin { .. }) if running.is_some() => {
-                            if let Some(r) = &running {
-                                let _ = r.inbox.send(cmd);
-                            }
-                        }
-                        other => queue.push_back(other),
-                    }
+                    self.received(cmd, lost, running.as_ref(), &mut queue, &mut stopping)
+                        .await;
                 }
                 joined = async { (&mut running.as_mut().expect("guarded").handle).await }, if running.is_some() => {
                     running = None;
@@ -496,6 +509,56 @@ impl Actor {
         // with background children, such as dev servers.
         self.groups.terminate_all(GROUP_GRACE).await;
         self.with_log(|l| l.checkpoint()).await;
+    }
+
+    /// A command from the channel: logged, then handled at once (shutdown, approvals,
+    /// cancel, budgets, pins for the running turn) or queued for when no turn runs.
+    async fn received(
+        &self,
+        cmd: Command,
+        lost: bool,
+        running: Option<&Running>,
+        queue: &mut VecDeque<Command>,
+        stopping: &mut bool,
+    ) {
+        self.with_log({
+            let rec = SessionRecord::Command(cmd.clone());
+            move |l| l.append(&rec)
+        })
+        .await;
+        match cmd {
+            Command::Shutdown => {
+                *stopping = true;
+                self.approvals.deny_all("the session is shutting down");
+                self.shutdown.cancel();
+            }
+            // After a crashed turn every command gets the same answer.
+            _ if lost => self.lost(),
+            Command::Approve { request_id } => {
+                self.resolve(&request_id, Verdict::Approved);
+            }
+            Command::Deny { request_id, reason } => {
+                self.resolve(&request_id, Verdict::Denied { reason });
+            }
+            Command::Cancel => {
+                if let Some(r) = running {
+                    r.cancel.cancel();
+                }
+            }
+            Command::SetBudget {
+                scope,
+                max_usd,
+                max_tokens,
+            } => {
+                self.set_budget(scope, max_usd, max_tokens);
+            }
+            cmd @ (Command::Pin { .. } | Command::Unpin { .. }) if running.is_some() => {
+                if let Some(r) = running {
+                    let _ = r.inbox.send(cmd);
+                }
+            }
+            other => queue.push_back(other),
+        }
     }
 
     /// `SetBudget`: replace one scope's limits. Clients are trusted (the project layer's

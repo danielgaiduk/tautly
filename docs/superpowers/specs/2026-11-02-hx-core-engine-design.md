@@ -429,11 +429,11 @@ This section covers what a user sees in the first ten minutes and in every turn.
 - `Command::Diff{turn?}` answers with `SessionDiff{turn?, files, unified, truncated}`. `None` = the whole session; `n` = user turn `n`. It shows the net change per file that Tautly's tools edited, created or deleted in that scope: the earliest pre-image in scope against the current disk content. `files` = `[{path, status: added|modified|deleted, added, removed}]`. Cap: 2,000 lines and 256 KiB (so a few very long lines cannot make a multi-megabyte event), with the same marker. Changes made by commands are not included (see 7.11.11 for undo).
 
 #### 7.11.5 Mid-session model switch
-- `Command::SetModel{model}` takes effect at once when idle; during a turn it is queued for the start of the next user turn. An unknown model, or a provider without a key, gives `Error{kind: provider_fatal, hint}`, and the model is unchanged. On success the engine logs a `ModelSet{model}` session record (resume uses it) and emits `ModelChanged{model, provider}`. `provider` ∈ `anthropic | openai | google | compat:<name>`.
+- `Command::SetModel{model}` takes effect at once when idle; during a turn it is queued for the start of the next user turn. An unknown provider (or a `compat:` model without its `[[providers.compat]]` entry), or a provider without a key, gives `Error{kind: provider_fatal, hint}`, and the model is unchanged. A model of a known provider that the catalog does not list is accepted with conservative defaults and no price, with a `Warning` that names the `catalog_overrides` entry to add (as at start-up, 4.3). On success the engine logs a `ModelSet{model}` session record (resume uses it) and emits `ModelChanged{model, provider}`. `provider` ∈ `anthropic | openai | google | compat:<name>`.
 - Recomputed for the new model:
   - capabilities and the context budget;
   - the edit format: the new model's default unless config overrides it (prompt caches are per model, so the schema change costs nothing extra);
-  - the side model: the new provider's small tier unless `routing.side_model` is set.
+  - the side model: the new provider's small tier unless `routing.side_model` is set (7.5). A switch also ends a fallback of side work to the main model after the side model failed; a side model that cannot be built for the new provider leaves side work to the new main model, with a `Warning`.
 - Budgets carry over. An unpriced model with `max_usd` set warns and enforces token budgets only (Task 25 rule).
 - Cache: the first request after a switch is treated as a cold-cache epoch (7.7): pending GC, compaction, pin folds and the memory index apply then, at no extra cost. If context use exceeds 90% of the new window, forced compaction runs at that step start.
 - Reasoning:

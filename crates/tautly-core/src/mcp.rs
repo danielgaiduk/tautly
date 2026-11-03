@@ -40,7 +40,7 @@ use crate::protocol::Event;
 use crate::session::{EventSink, Session};
 
 /// Every MCP tool's name starts with this (`mcp__<server>__<tool>`).
-const MCP_TOOL_PREFIX: &str = "mcp__";
+pub(crate) const MCP_TOOL_PREFIX: &str = "mcp__";
 /// The repository root's Claude-style server list.
 const MCP_JSON: &str = ".mcp.json";
 /// A larger `.mcp.json` is not read.

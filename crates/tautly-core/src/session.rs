@@ -23,6 +23,7 @@ use crate::budget::Budgets;
 use crate::evidence::EvidenceTracker;
 use crate::ledger::CostLedger;
 use crate::mcp::{McpSession, PreExecHook};
+use crate::model_switch::ModelSetup;
 use crate::protocol::{Command, ErrorKind, Event};
 use crate::record::{BlockHashes, SessionRecord};
 use crate::routing::Side;
@@ -313,9 +314,11 @@ pub(crate) struct Session {
     /// A memory index text waiting for the next cache epoch (spec 7.4/7.7). Set by the
     /// memory flows (Task 28); applied, and logged as `MemoryIndexApplied`, at an epoch.
     pub pending_memory_index: Option<String>,
-    /// The provider whose reasoning items the history holds; a request to another provider
-    /// first strips them (they are provider-specific).
-    pub history_provider: String,
+    /// Configuration, catalog and provider factory for `SetModel` (`model_switch.rs`).
+    pub setup: ModelSetup,
+    /// Set by a switch within one provider: the next request, if refused for its
+    /// reasoning, is sent again once without it.
+    pub reasoning_retry: bool,
     /// Paths already reported as not tracked (outside the root, or not valid UTF-8).
     pub untracked_paths: HashSet<PathBuf>,
     /// User turns started in this session (1-based once the first message runs).

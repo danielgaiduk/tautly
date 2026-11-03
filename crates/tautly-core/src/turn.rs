@@ -32,7 +32,9 @@ use tokio_util::sync::CancellationToken;
 
 use crate::approvals::Approvals;
 use crate::ledger::Row;
+use crate::model_switch::rejects_reasoning;
 use crate::protocol::{BudgetScope, Command, ErrorKind, Event, FinishReason, UsageRole};
+use crate::provider_setup::provider_label;
 use crate::record::SessionRecord;
 use crate::routing::{Side, model_failed};
 use crate::session::Session;
@@ -231,22 +233,6 @@ enum StreamEnd {
     Budget,
 }
 
-/// Remove reasoning items from every turn: they belong to the provider that produced them.
-pub fn strip_reasoning(history: &mut [Turn]) {
-    for turn in history {
-        for m in &mut turn.messages {
-            m.content.retain(|c| {
-                !matches!(
-                    c,
-                    Content::Reasoning { .. } | Content::RedactedReasoning { .. }
-                )
-            });
-        }
-        turn.messages
-            .retain(|m| !(m.role == Role::Assistant && m.content.is_empty()));
-    }
-}
-
 fn error_event(e: &ProviderError) -> Event {
     let (kind, hint) = match e {
         ProviderError::Transient { .. } => (
@@ -346,10 +332,10 @@ impl Session {
             }
             self.check_lost_writes().await;
             self.check_index().await;
-            if self.model.provider() != self.history_provider {
-                strip_reasoning(&mut self.context.history);
-                self.history_provider = self.model.provider().to_string();
-            }
+            // Reasoning is provider-specific (a switch strips it already; this holds the
+            // invariant for any other way the model changes).
+            self.context
+                .strip_reasoning(Some(&provider_label(&self.model)));
             let (req, status) = self.epoch(ctl).await;
             if ctl.cancel.is_cancelled() {
                 return FinishReason::Cancelled;
@@ -361,10 +347,24 @@ impl Session {
             let turn = self.context.next_turn();
             self.log_request(&req, turn).await;
             let sent_at = Instant::now();
+            let retry_without_reasoning = std::mem::take(&mut self.reasoning_retry);
             let resp = match self.stream(req, u64::from(status.used), ctl).await {
                 Ok(r) => r,
                 Err(StreamEnd::Cancelled) => return FinishReason::Cancelled,
                 Err(StreamEnd::Budget) => return FinishReason::Budget,
+                // The first request after a switch within one provider: the new model may
+                // refuse the old one's reasoning. Strip it and send the step once more.
+                Err(StreamEnd::Failed(e)) if retry_without_reasoning && rejects_reasoning(&e) => {
+                    self.context.strip_reasoning(None);
+                    // Logged, so a rebuild strips at the same point (`record.rs`).
+                    self.log(SessionRecord::ReasoningStripped).await;
+                    self.warn(format!(
+                        "the new model refused the reasoning carried over from the previous \
+                         one ({e}); sending the request again without it"
+                    ))
+                    .await;
+                    continue;
+                }
                 Err(StreamEnd::Failed(e)) => {
                     self.emit(error_event(&e)).await;
                     return FinishReason::Error;
@@ -785,7 +785,8 @@ impl Session {
         }
     }
 
-    async fn drain_usage(&mut self) {
+    /// Account what the side model's runner reported, without acting on its failures.
+    pub(crate) async fn drain_usage(&mut self) {
         while let Ok(s) = self.side.usage.try_recv() {
             self.spend_side(s.usage, s.estimated).await;
         }
@@ -981,30 +982,5 @@ mod tests {
         assert!(parse_args("[1]").is_err());
         assert!(parse_args("{x").is_err());
         assert!(parse_args(r#"{"a":1}"#).is_ok());
-    }
-
-    #[test]
-    fn stripping_reasoning_drops_emptied_assistant_messages() {
-        let mut h = vec![Turn {
-            messages: vec![
-                Message {
-                    role: Role::Assistant,
-                    content: vec![Content::RedactedReasoning { data: "x".into() }],
-                },
-                Message {
-                    role: Role::Assistant,
-                    content: vec![
-                        Content::Reasoning {
-                            text: "t".into(),
-                            signature: Some("s".into()),
-                        },
-                        Content::Text("hi".into()),
-                    ],
-                },
-            ],
-        }];
-        strip_reasoning(&mut h);
-        assert_eq!(h[0].messages.len(), 1);
-        assert_eq!(h[0].messages[0].content, vec![Content::Text("hi".into())]);
     }
 }

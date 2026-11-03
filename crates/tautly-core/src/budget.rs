@@ -135,6 +135,15 @@ impl Budgets {
         }
     }
 
+    /// The session switched to `model` (`SetModel`): its price decides whether USD limits
+    /// apply from now on. Spend so far is kept. An unpriced model with a USD limit is said
+    /// again (once for this model), at the next [`news`](Self::news).
+    pub fn set_model(&mut self, priced: bool, model: &str) {
+        self.priced = priced;
+        self.model = model.to_string();
+        self.unpriced_reported = false;
+    }
+
     /// A new user message: the turn budget starts again.
     pub fn start_turn(&mut self) {
         self.turn = Scope::new(self.turn.limit);
