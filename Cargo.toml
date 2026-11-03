@@ -50,3 +50,5 @@ streaming-iterator = "0.1"
 notify = "8"
 regex-syntax = "0.8"
 ulid = "1"
+keyring = { version = "3.6", default-features = false }
+insta = { version = "1", features = ["json"] }

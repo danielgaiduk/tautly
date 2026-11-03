@@ -1,0 +1,179 @@
+---
+source: crates/tautly-core/tests/protocol.rs
+expression: events
+---
+[
+  {
+    "type": "turn_started"
+  },
+  {
+    "type": "text_delta",
+    "text": "Hello"
+  },
+  {
+    "type": "reasoning_delta",
+    "text": "thinking"
+  },
+  {
+    "type": "tool_call_proposed",
+    "call_id": "call_1",
+    "tool": "edit",
+    "args": {
+      "new": "b",
+      "old": "a",
+      "path": "src/lib.rs"
+    }
+  },
+  {
+    "type": "tool_approval_requested",
+    "request_id": "req_1",
+    "call_id": "call_1",
+    "tool": "bash",
+    "args": {
+      "command": "cargo test"
+    },
+    "reason": "commands need approval in ask mode"
+  },
+  {
+    "type": "tool_started",
+    "call_id": "call_1",
+    "tool": "bash"
+  },
+  {
+    "type": "tool_output_delta",
+    "call_id": "call_1",
+    "text": "running 3 tests\n"
+  },
+  {
+    "type": "tool_finished",
+    "call_id": "call_1",
+    "tool": "edit",
+    "output": "edited src/lib.rs",
+    "is_error": false,
+    "blocked": false,
+    "effects": [
+      {
+        "type": "read",
+        "path": "/p/src/main.rs",
+        "range": {
+          "start": 1,
+          "end": 40
+        },
+        "shown": {
+          "type": "unchanged",
+          "since": 3
+        }
+      },
+      {
+        "type": "edited",
+        "path": "/p/src/lib.rs",
+        "created": false
+      },
+      {
+        "type": "deleted",
+        "path": "/p/old.rs"
+      },
+      {
+        "type": "exec",
+        "may_write": true
+      }
+    ],
+    "meta": {
+      "exit_code": 1,
+      "error_kind": "stale"
+    }
+  },
+  {
+    "type": "usage",
+    "role": "side",
+    "tokens_in": 1200,
+    "tokens_out": 300,
+    "cache_read": 900,
+    "cache_write": 0,
+    "cost_usd": 0.0042,
+    "quota": {
+      "remaining_requests": 99,
+      "remaining_tokens": null,
+      "reset_at": {
+        "secs_since_epoch": 1700000060,
+        "nanos_since_epoch": 0
+      }
+    }
+  },
+  {
+    "type": "context_status",
+    "used": 5000,
+    "budget": 200000,
+    "breakdown": {
+      "system": 1500,
+      "tools": 1000,
+      "agents_md": 0,
+      "memory": 0,
+      "repo_map": 0,
+      "pinned": 0,
+      "state": 0,
+      "history": 2500
+    },
+    "warnings": [
+      "compacting"
+    ]
+  },
+  {
+    "type": "compacted",
+    "removed_turns": 12,
+    "summary": "did things",
+    "reason": "forced"
+  },
+  {
+    "type": "context_collected",
+    "elided_results": 4,
+    "tokens_freed": 3200,
+    "reason": "cold_cache"
+  },
+  {
+    "type": "memory_proposed",
+    "proposal_id": "prop_1",
+    "change": {
+      "upsert": {
+        "id": "build-cmd",
+        "title": "How to build",
+        "kind": "command",
+        "anchors": [
+          {
+            "path": "Cargo.toml",
+            "symbol": null,
+            "hash": "abc123"
+          }
+        ],
+        "created": {
+          "secs_since_epoch": 1700000000,
+          "nanos_since_epoch": 0
+        },
+        "verified": null,
+        "body": "cargo build --workspace"
+      },
+      "delete": [
+        "old-entry"
+      ]
+    }
+  },
+  {
+    "type": "session_changed",
+    "session_id": "01J0SESSION"
+  },
+  {
+    "type": "turn_finished",
+    "reason": "max_turns"
+  },
+  {
+    "type": "error",
+    "kind": "provider_transient",
+    "message": "429 from provider",
+    "retryable": true,
+    "hint": "retrying in 2s"
+  },
+  {
+    "type": "warning",
+    "message": "non-UTF-8 path not tracked"
+  }
+]

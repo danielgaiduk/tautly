@@ -1,0 +1,70 @@
+---
+source: crates/tautly-core/tests/protocol.rs
+expression: every_command()
+---
+[
+  {
+    "type": "send_message",
+    "text": "fix the bug"
+  },
+  {
+    "type": "approve",
+    "request_id": "req_1"
+  },
+  {
+    "type": "deny",
+    "request_id": "req_1",
+    "reason": "too risky"
+  },
+  {
+    "type": "deny",
+    "request_id": "req_2",
+    "reason": null
+  },
+  {
+    "type": "cancel"
+  },
+  {
+    "type": "set_budget",
+    "scope": "session",
+    "max_usd": 2.5,
+    "max_tokens": null
+  },
+  {
+    "type": "set_budget",
+    "scope": "turn",
+    "max_usd": null,
+    "max_tokens": 50000
+  },
+  {
+    "type": "compact"
+  },
+  {
+    "type": "uncompact"
+  },
+  {
+    "type": "pin",
+    "text": "never touch generated/"
+  },
+  {
+    "type": "unpin",
+    "text": "never touch generated/"
+  },
+  {
+    "type": "approve_memory",
+    "proposal_id": "prop_1"
+  },
+  {
+    "type": "reject_memory",
+    "proposal_id": "prop_1"
+  },
+  {
+    "type": "consolidate_memory"
+  },
+  {
+    "type": "fork"
+  },
+  {
+    "type": "shutdown"
+  }
+]
