@@ -481,22 +481,35 @@ impl Session {
     /// ledger, config pins, AGENTS.md (once), and the background build of the repo map and
     /// memory index.
     pub async fn init(&mut self, config_pins: &[String]) {
+        self.init_with(config_pins, false).await;
+    }
+
+    /// [`init`](Self::init); with `pins_logged` (a resumed session that never sent a
+    /// request, whose log has its `StartPins` already) the pins are the logged ones: no
+    /// configuration or AGENTS.md pin is added, nor logged again, and AGENTS.md is read
+    /// for its text only (no request logged it yet).
+    pub async fn init_with(&mut self, config_pins: &[String], pins_logged: bool) {
         self.start_housekeeping();
-        for pin in config_pins {
-            pinned::add(
-                &mut self.context.pinned,
-                Pinned::new(pin, PinSource::Config),
-            );
+        if !pins_logged {
+            for pin in config_pins {
+                pinned::add(
+                    &mut self.context.pinned,
+                    Pinned::new(pin, PinSource::Config),
+                );
+            }
         }
         let sb = Arc::clone(&self.sandbox);
-        let found = tokio::task::spawn_blocking(move || agents_md::load(sb.as_ref()))
+        let mut found = tokio::task::spawn_blocking(move || agents_md::load(sb.as_ref()))
             .await
             .unwrap_or_default();
+        if pins_logged {
+            found.pins.clear();
+        }
         for w in &found.warnings {
             self.warn(w.clone()).await;
         }
         self.context.set_agents_md(found);
-        if !self.context.pinned.is_empty() {
+        if !pins_logged && !self.context.pinned.is_empty() {
             let pins = self.context.pinned.iter().map(LoggedPin::from).collect();
             self.log(SessionRecord::StartPins { pins }).await;
         }

@@ -441,7 +441,7 @@ fn restore_gc_restores_original_outputs() {
 }
 
 #[test]
-fn a_kept_result_is_never_collected_but_still_covers() {
+fn a_kept_result_is_not_collected_for_what_superseded_it_before() {
     let mut c = Context::default();
     read_call(&mut c, "r1", "/w/a.rs", "old");
     read_call(&mut c, "r2", "/w/a.rs", "mid");
@@ -449,15 +449,41 @@ fn a_kept_result_is_never_collected_but_still_covers() {
     let rec = c.collect(NOW).unwrap();
     assert_eq!(elided_ids(&rec), ["r1", "r2"]);
     c.restore_gc(&rec);
-    // The user's Uncompact keeps r2: the next collection takes r1 only.
+    // The user's Uncompact after turn 3 keeps r2: the next collection takes r1 only, and
+    // r2 still covers it.
     c.results
         .iter_mut()
         .find(|m| m.call_id == "r2")
         .unwrap()
-        .kept = true;
+        .kept_until = Some(3);
     let again = c.collect(NOW).unwrap();
     assert_eq!(elided_ids(&again), ["r1"]);
     assert_eq!(output_of(&c, "r2"), "mid");
+}
+
+#[test]
+fn a_kept_result_is_collected_again_once_a_later_turn_supersedes_it() {
+    let mut c = Context::default();
+    read_call(&mut c, "r1", "/w/a.rs", "old");
+    read_call(&mut c, "r2", "/w/a.rs", "new");
+    let rec = c.collect(NOW).unwrap();
+    assert_eq!(elided_ids(&rec), ["r1"]);
+    c.restore_gc(&rec);
+    // Restored after turn 2.
+    c.results
+        .iter_mut()
+        .find(|m| m.call_id == "r1")
+        .unwrap()
+        .kept_until = Some(2);
+    assert!(
+        c.collect(NOW).is_none(),
+        "only r2 supersedes it, from before the restore"
+    );
+    // A read at turn 3, after the restore, supersedes both again.
+    read_call(&mut c, "r3", "/w/a.rs", "newer");
+    let again = c.collect(NOW).unwrap();
+    assert_eq!(elided_ids(&again), ["r1", "r2"]);
+    assert!(again.elided.iter().all(|e| e.by_turn == 3), "{again:?}");
 }
 
 #[test]

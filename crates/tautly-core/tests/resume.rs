@@ -8,7 +8,7 @@ use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use serde_json::{Value, json};
 use tautly_core::record::UndoneFile;
-use tautly_core::resume::{self, Rebuilt};
+use tautly_core::resume::{self, Rebuilt, UndoError};
 use tautly_core::{
     BudgetScope, Command, Config, Engine, EngineBuilder, Event, FinishReason, Ledger,
     SessionRecord, Workspace,
@@ -159,6 +159,18 @@ impl Fx {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     }
+}
+
+/// Make the cost ledger unusable: a directory where its file should be.
+fn break_ledger(fx: &Fx) {
+    let ledger = fx.home.path().join("ledger.sqlite");
+    std::fs::remove_file(&ledger).unwrap();
+    for ext in ["-wal", "-shm"] {
+        let mut p = ledger.clone().into_os_string();
+        p.push(ext);
+        let _ = std::fs::remove_file(PathBuf::from(p));
+    }
+    std::fs::create_dir(&ledger).unwrap();
 }
 
 struct Run {
@@ -567,14 +579,7 @@ async fn resume_restores_budget_spend_and_set_budget() {
     fx.ledger_rows(4).await;
 
     // Without the ledger the spend comes from the log's usage records, with a warning.
-    let ledger = fx.home.path().join("ledger.sqlite");
-    std::fs::remove_file(&ledger).unwrap();
-    for ext in ["-wal", "-shm"] {
-        let mut p = ledger.clone().into_os_string();
-        p.push(ext);
-        let _ = std::fs::remove_file(PathBuf::from(p));
-    }
-    std::fs::create_dir(&ledger).unwrap();
+    break_ledger(&fx);
     let mock = MockProvider::new(vec![text_step("ok"), text_step("ok")]);
     let mut run = start(fx.resume(cfg(), &mock, &id));
     // 440 spent: this turn's 110 uses up the 500, so the next one sends nothing.
@@ -587,6 +592,116 @@ async fn resume_restores_budget_spend_and_set_budget() {
     assert_eq!(finish_reason(&events), FinishReason::Budget, "{events:?}");
     assert_eq!(mock.requests().len(), 1);
     run.stop().await;
+}
+
+#[tokio::test]
+async fn resume_warns_when_the_logged_system_prompt_differs() {
+    let fx = Fx::new();
+    let mock = MockProvider::new(vec![text_step("ok")]);
+    let mut run = start(fx.builder(config(Mode::Ask), &mock));
+    run.turn_with("one").await;
+    let id = run.engine.session_id().to_string();
+    let path = run.engine.session_path().to_path_buf();
+    run.stop().await;
+    // As if an older version, with another system prompt, had written the log.
+    let text = std::fs::read_to_string(&path).unwrap();
+    let mut rewritten = 0;
+    let lines: Vec<String> = text
+        .lines()
+        .map(|l| {
+            let mut v: Value = serde_json::from_str(l).unwrap();
+            if v["data"]["type"] == "prefix_applied" {
+                v["data"]["data"]["system_prompt_hash"] = json!("0".repeat(64));
+                rewritten += 1;
+                v.to_string()
+            } else {
+                l.to_string()
+            }
+        })
+        .collect();
+    assert_eq!(rewritten, 1, "{text}");
+    std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+
+    let mock = MockProvider::new(vec![text_step("ok")]);
+    let mut run = start(fx.resume(config(Mode::Ask), &mock, &id));
+    let events = run.turn_with("two").await;
+    let w = warnings(&events);
+    assert!(
+        w.iter()
+            .any(|w| w.contains("system prompt differs") && w.contains("cold")),
+        "{w:?}"
+    );
+    assert!(!w.iter().any(|w| w.contains("tools differ")), "{w:?}");
+    run.stop().await;
+}
+
+/// A call that failed, the same call blocked, then another call: the escape hatch is
+/// spent, so the same call is blocked again after a resume, as it would be live.
+#[tokio::test]
+async fn resume_replays_the_attempt_ledger_escape_hatch() {
+    let fx = Fx::new();
+    fx.write("f1.txt", "file one\n");
+    let missing = |id: &str| call(id, "read", json!({"path": "missing.txt"}));
+    let mock = MockProvider::new(vec![
+        tools_step(vec![missing("m1")]),
+        tools_step(vec![missing("m2")]),
+        tools_step(vec![call("r1", "read", json!({"path": "f1.txt"}))]),
+        text_step("done"),
+    ]);
+    let mut run = start(fx.builder(config(Mode::Ask), &mock));
+    run.turn_with("try").await;
+    let id = run.engine.session_id().to_string();
+    run.stop().await;
+    let results = tool_results(mock.requests().last().unwrap());
+    assert!(results[1].1.contains("already tried"), "{results:?}");
+
+    let mock = MockProvider::new(vec![tools_step(vec![missing("m3")]), text_step("end")]);
+    let mut run = start(fx.resume(config(Mode::Ask), &mock, &id));
+    run.turn_with("again").await;
+    let results = tool_results(mock.requests().last().unwrap());
+    let last = results.last().unwrap();
+    assert!(last.2 && last.1.contains("already tried"), "{results:?}");
+    run.stop().await;
+}
+
+/// A session stopped before its first message is resumed: its start pins are the logged
+/// ones, never added or logged again, even when AGENTS.md changed.
+#[tokio::test]
+async fn resuming_a_session_without_requests_keeps_its_start_pins() {
+    let fx = Fx::new();
+    fx.write("AGENTS.md", "# Project\n\n## Rules\n- OLD-RULE\n");
+    let cfg = || {
+        let mut c = config(Mode::Ask);
+        c.pins = vec!["CFG-PIN stay small".into()];
+        c
+    };
+    let mock = MockProvider::new(vec![]);
+    let run = start(fx.builder(cfg(), &mock));
+    let id = run.engine.session_id().to_string();
+    let path = run.engine.session_path().to_path_buf();
+    run.stop().await;
+    let start_pins = || {
+        records_at(&path)
+            .iter()
+            .filter(|r| matches!(r, SessionRecord::StartPins { .. }))
+            .count()
+    };
+    assert_eq!(start_pins(), 1);
+
+    fx.write("AGENTS.md", "# Project\n\n## Rules\n- NEW-RULE\n");
+    let run = start(fx.resume(cfg(), &mock, &id));
+    run.stop().await;
+    assert_eq!(start_pins(), 1);
+
+    let mock = MockProvider::new(vec![text_step("ok")]);
+    let mut run = start(fx.resume(cfg(), &mock, &id));
+    run.turn_with("hello").await;
+    let text = text_of(mock.requests().last().unwrap());
+    assert!(text.contains("OLD-RULE"), "{text}");
+    assert!(!text.contains("NEW-RULE"), "{text}");
+    assert_eq!(text.matches("CFG-PIN").count(), 1, "{text}");
+    run.stop().await;
+    assert_eq!(start_pins(), 1);
 }
 
 // ------------------------------------------------------------------------------- fork
@@ -654,6 +769,148 @@ async fn fork_creates_child_with_parent_offset() {
     run.stop().await;
 }
 
+/// Pins and budgets set between turns are part of the tip: the branch keeps them, live and
+/// once resumed.
+#[tokio::test]
+async fn fork_at_tip_keeps_idle_pins_and_budgets() {
+    let fx = Fx::new();
+    let mock = MockProvider::new(vec![text_step("answer one"), text_step("answer two")]);
+    let mut run = start(fx.builder(config(Mode::Ask), &mock));
+    run.turn_with("one").await;
+    run.send(Command::Pin {
+        text: "IDLE-PIN keep it".into(),
+    })
+    .await;
+    // 110 tokens a turn: the branch's second turn reaches 88% of it.
+    run.send(Command::SetBudget {
+        scope: BudgetScope::Session,
+        max_usd: None,
+        max_tokens: Some(250),
+    })
+    .await;
+    let parent = run.engine.session_path().to_path_buf();
+    let child_id = run.fork(None, "tip").await;
+    let child = log_of(&parent, &child_id);
+    let recs = records_at(&child);
+    assert!(recs.iter().any(|r| matches!(
+        r,
+        SessionRecord::Command(Command::Pin { text }) if text.starts_with("IDLE-PIN")
+    )));
+    assert!(
+        recs.iter()
+            .any(|r| matches!(r, SessionRecord::Command(Command::SetBudget { .. })))
+    );
+    assert!(
+        !recs
+            .iter()
+            .any(|r| matches!(r, SessionRecord::Command(Command::Fork { .. }))),
+        "{recs:?}"
+    );
+
+    run.turn_with("two").await;
+    let text = text_of(mock.requests().last().unwrap());
+    assert!(text.contains("IDLE-PIN"), "{text}");
+    run.stop().await;
+    fx.ledger_rows(2).await;
+
+    let mock = MockProvider::new(vec![text_step("answer three")]);
+    let mut run = start(fx.resume(config(Mode::Ask), &mock, &child_id));
+    let events = run.turn_with("three").await;
+    let text = text_of(mock.requests().last().unwrap());
+    assert!(text.contains("IDLE-PIN"), "{text}");
+    let w = warnings(&events);
+    assert!(
+        w.iter().any(|w| w.contains("session budget 88% used")),
+        "{w:?}"
+    );
+    run.stop().await;
+}
+
+/// A branch is a new session with nothing spent, even resumed before its first request
+/// (no ledger rows of its own) or without the ledger (its own usage records only).
+#[tokio::test]
+async fn a_resumed_fork_counts_only_its_own_spend() {
+    let fx = Fx::new();
+    let mock = MockProvider::new(vec![text_step("answer one")]);
+    let mut run = start(fx.builder(config(Mode::Ask), &mock));
+    run.send(Command::SetBudget {
+        scope: BudgetScope::Session,
+        max_usd: None,
+        max_tokens: Some(300),
+    })
+    .await;
+    run.turn_with("one").await;
+    let child_id = run.fork(None, "branch").await;
+    run.stop().await;
+    fx.ledger_rows(1).await;
+
+    // 110 of 300: no warning, and the ledger (no rows of the branch yet) is the source.
+    let mock = MockProvider::new(vec![text_step("answer two")]);
+    let mut run = start(fx.resume(config(Mode::Ask), &mock, &child_id));
+    let events = run.turn_with("two").await;
+    let w = warnings(&events);
+    assert!(!w.iter().any(|w| w.contains("budget")), "{w:?}");
+    assert!(!w.iter().any(|w| w.contains("session log")), "{w:?}");
+    run.stop().await;
+    fx.ledger_rows(2).await;
+
+    // Without the ledger: the branch's own 110 plus this turn's is 220 of 300 (73%); the
+    // parent's usage, copied into the branch's log, would make it 330.
+    break_ledger(&fx);
+    let mock = MockProvider::new(vec![text_step("answer three")]);
+    let mut run = start(fx.resume(config(Mode::Ask), &mock, &child_id));
+    let events = run.turn_with("three").await;
+    assert_eq!(finish_reason(&events), FinishReason::Completed);
+    let w = warnings(&events);
+    assert!(w.iter().any(|w| w.contains("session log")), "{w:?}");
+    assert!(
+        !w.iter()
+            .any(|w| w.contains("exhausted") || w.contains("budget")),
+        "{w:?}"
+    );
+    run.stop().await;
+}
+
+#[tokio::test]
+async fn fork_with_nothing_to_branch_from_is_refused() {
+    let fx = Fx::new();
+    let mock = MockProvider::new(vec![]);
+    let mut run = start(fx.builder(config(Mode::Ask), &mock));
+    let parent = run.engine.session_path().to_path_buf();
+    run.send(Command::Fork {
+        at: None,
+        label: None,
+    })
+    .await;
+    let events = run
+        .until(|e| matches!(e, Event::SessionChanged { .. } | Event::Error { .. }))
+        .await;
+    // The first event is the session's own SessionChanged.
+    let events = if matches!(events.last(), Some(Event::SessionChanged { .. })) {
+        run.until(|e| matches!(e, Event::SessionChanged { .. } | Event::Error { .. }))
+            .await
+    } else {
+        events
+    };
+    assert!(
+        matches!(events.last(), Some(Event::Error { message, .. }) if message.contains("nothing")),
+        "{events:?}"
+    );
+    let logs = std::fs::read_dir(parent.parent().unwrap())
+        .unwrap()
+        .filter(|e| {
+            e.as_ref()
+                .unwrap()
+                .path()
+                .extension()
+                .is_some_and(|x| x == "jsonl")
+        })
+        .count();
+    assert_eq!(logs, 1);
+    assert_eq!(run.engine.current_session().1, parent);
+    run.stop().await;
+}
+
 #[tokio::test]
 async fn fork_at_step_copies_records_and_sets_parent_label_origin() {
     let fx = Fx::new();
@@ -701,14 +958,19 @@ async fn fork_at_step_copies_records_and_sets_parent_label_origin() {
     assert_eq!(header.label.as_deref(), Some("at-two"));
     let copied = raw_records(&child);
     assert_eq!(copied[..=end], raw_records(&parent)[..=end]);
-    // The cut turn is closed in the branch.
-    assert!(matches!(
-        records_at(&child)[end + 1],
-        SessionRecord::TurnEnd {
-            reason: FinishReason::Cancelled,
-            ..
-        }
-    ));
+    // The copy is marked, and the cut turn is closed in the branch.
+    let own = &records_at(&child)[end + 1..];
+    assert!(matches!(own[0], SessionRecord::Forked), "{own:?}");
+    assert!(
+        matches!(
+            own[1],
+            SessionRecord::TurnEnd {
+                reason: FinishReason::Cancelled,
+                ..
+            }
+        ),
+        "{own:?}"
+    );
 
     // The branch's next request continues from step 2: f1 read, f2 not.
     run.turn_with("and now?").await;
@@ -950,10 +1212,77 @@ async fn uncompact_command_restores() {
         SessionRecord::Uncompacted { compaction: true, restored } if !restored.is_empty()
     )));
     // A resume rebuilds the restored context too.
-    let rebuilt = assemble(&rebuild_at(&path, None));
+    let rebuilt = rebuild_at(&path, None);
+    assert!(rebuilt.warnings.is_empty(), "{:?}", rebuilt.warnings);
+    let rebuilt = assemble(&rebuilt);
     let results = tool_results(&rebuilt);
     assert!(results.iter().all(|r| !r.1.starts_with("[elided")));
     assert!(text_of(&rebuilt).contains("PROMPT-MARKER"));
+
+    // A restored result whose blob is gone stays collected, and the rebuild says so.
+    let blob = records_at(&path)
+        .into_iter()
+        .find_map(|r| match r {
+            SessionRecord::ToolResult { result_blob, .. } => Some(result_blob),
+            _ => None,
+        })
+        .unwrap();
+    let (head, rest) = blob.as_str().split_at(2);
+    std::fs::remove_file(path.with_file_name("blobs").join(head).join(rest)).unwrap();
+    let rebuilt = rebuild_at(&path, None);
+    assert!(
+        rebuilt.warnings.iter().any(|w| w.contains("uncompact")),
+        "{:?}",
+        rebuilt.warnings
+    );
+}
+
+/// A manual compaction is a network call: Cancel stops it, and so does Shutdown.
+#[tokio::test]
+async fn a_manual_compaction_can_be_cancelled() {
+    let fx = Fx::new();
+    let mut script: Vec<MockTurn> = (1..=3).map(|i| text_step(&format!("answer {i}"))).collect();
+    script.push(MockTurn::Stall);
+    script.push(text_step("after"));
+    script.push(MockTurn::Stall);
+    let mock = MockProvider::new(script);
+    let mut run = start(fx.builder(config(Mode::Ask), &mock));
+    for i in 1..=3 {
+        run.turn_with(&format!("message {i}")).await;
+    }
+    let compacting = |e: &Event| {
+        matches!(e, Event::ContextStatus { warnings, .. }
+            if warnings.iter().any(|w| w.contains("compacting")))
+    };
+    run.send(Command::Compact).await;
+    run.until(compacting).await;
+    run.send(Command::Cancel).await;
+    let quick = Duration::from_secs(5);
+    let events = tokio::time::timeout(
+        quick,
+        run.until(|e| matches!(e, Event::Warning { message } if message.contains("cancelled"))),
+    )
+    .await
+    .expect("the compaction was not cancelled");
+    assert!(
+        !events.iter().any(|e| matches!(e, Event::Compacted { .. })),
+        "{events:?}"
+    );
+    // The session goes on, uncompacted.
+    run.turn_with("next").await;
+    assert!(text_of(mock.requests().last().unwrap()).contains("answer 1"));
+
+    run.send(Command::Compact).await;
+    run.until(compacting).await;
+    let path = run.engine.session_path().to_path_buf();
+    tokio::time::timeout(quick, run.stop())
+        .await
+        .expect("shutdown waited for the compaction");
+    assert!(
+        !records_at(&path)
+            .iter()
+            .any(|r| matches!(r, SessionRecord::Compaction { .. }))
+    );
 }
 
 // ------------------------------------------------------------------------------- undo
@@ -1102,4 +1431,53 @@ async fn undo_appends_undone_record_with_from_and_to_blobs() {
     let rebuilt = rebuild_at(&path, None);
     let note = &rebuilt.context.state.files[&fx.root().join("a.txt")];
     assert!(note.maybe_stale, "{note:?}");
+}
+
+#[tokio::test]
+async fn undo_refuses_files_changed_since_the_turn() {
+    let fx = Fx::new();
+    let path = two_turns_of_edits(&fx).await;
+    let records = records_at(&path).len();
+    let refused = |fx: &Fx| {
+        let reader = SessionReader::<SessionRecord>::open(&path).unwrap();
+        let sandbox = fx.sandbox();
+        async move { resume::undo(&reader, &sandbox, None).await }
+    };
+    // A human edit after the turn.
+    fx.write("a.txt", "HUMAN EDIT\n");
+    match refused(&fx).await {
+        Err(UndoError::Changed { paths }) => assert_eq!(paths, [fx.root().join("a.txt")]),
+        other => panic!("{other:?}"),
+    }
+    // Nothing was written: not even the files that did not change.
+    assert_eq!(fx.read("a.txt").as_deref(), Some("HUMAN EDIT\n"));
+    assert!(fx.read("run.sh").is_none());
+    assert_eq!(fx.read("new/made.txt").as_deref(), Some("made\n"));
+    assert_eq!(records_at(&path).len(), records);
+
+    // A file the turn deleted was made again.
+    fx.write("a.txt", "v2\n");
+    fx.write("run.sh", "mine now\n");
+    match refused(&fx).await {
+        Err(UndoError::Changed { paths }) => assert_eq!(paths, [fx.root().join("run.sh")]),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(fx.read("run.sh").as_deref(), Some("mine now\n"));
+    assert_eq!(records_at(&path).len(), records);
+}
+
+#[tokio::test]
+async fn undo_refuses_an_earlier_turn_whose_files_later_turns_changed() {
+    let fx = Fx::new();
+    let path = two_turns_of_edits(&fx).await;
+    let reader = SessionReader::<SessionRecord>::open(&path).unwrap();
+    match resume::undo(&reader, &fx.sandbox(), Some(1)).await {
+        Err(UndoError::LaterTurns { turns, paths }) => {
+            assert_eq!(turns, [2]);
+            assert_eq!(paths, [fx.root().join("a.txt")]);
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(fx.read("a.txt").as_deref(), Some("v2\n"));
+    // Once turn 2 is undone, turn 1 can be (undo_deletes_files_created_in_turn).
 }

@@ -18,11 +18,16 @@
 //!   latest compaction stay in memory.
 //! - `Pin`/`Unpin` sent while a turn runs reach it at its next step start, as they did
 //!   live (at the step's first epoch record, its request, or the turn's end).
+//! - `Forked` (a branch's first own record) starts the spend over: the usage logged
+//!   before it is the parent's.
 //!
 //! `rebuild(reader, Some(n))` stops at the end of step `n` (spec 7.12.1: steps 1..=n kept;
 //! steps are numbered by the context turn counter, so user messages count too). It cuts
 //! only at step boundaries: everything from the first record that belongs to a later
-//! step (its user message, an epoch at its start, its request) is left out.
+//! step (its user message, an epoch at its start, its request) is left out. The state at
+//! the cut is what step `n + 1` would be built from, so pins sent during step `n` are in
+//! it (live, they reach the next step start, or the turn's end); a fork's branch closes a
+//! cut turn with `TurnEnd{cancelled}`, which applies them in the same place.
 //!
 //! The read tracker is not rebuilt from the log (what it remembers lives in spill files):
 //! a resumed session starts with no re-read baselines, so a re-read returns the full
@@ -34,7 +39,10 @@
 //! [`undo`] restores the files Tautly's tools changed in one user turn to their content
 //! (and mode) before it, newest change first, deleting files the turn created, and logs
 //! `Undone` with each file's content just before (H7), so the undone state can be
-//! restored in turn.
+//! restored in turn. It never overwrites what it did not write (spec 7.12): a file whose
+//! content differs from what the log says it is now (a human edit, or a command) is
+//! [`UndoError::Changed`], and a file a later turn changed is [`UndoError::LaterTurns`]
+//! until that turn is undone; either way nothing is written.
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -84,13 +92,17 @@ pub struct Rebuilt {
     pub(crate) budgets: Vec<(BudgetScope, Budget)>,
     /// The usage of every logged response (and of the attempts discarded before it).
     pub(crate) usage: Vec<RawUsage>,
-    /// The last record that is part of the state (commands after it are left out).
+    /// The last record that is part of the state: commands that change nothing (the
+    /// `Fork` itself, a message whose turn has not started) are left out after it. None:
+    /// no record is.
     pub(crate) end_offset: Option<u64>,
     /// The model of the last request.
     pub(crate) model: Option<ModelId>,
     /// What the session last saw of each file: the hash its last read showed or its last
     /// edit wrote.
     pub(crate) seen: HashMap<PathBuf, blake3::Hash>,
+    /// A `StartPins` record was replayed: the session's start pins are the logged ones.
+    pub(crate) start_pins: bool,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -111,6 +123,21 @@ pub enum UndoError {
     Path(#[from] ConfineError),
     #[error("{path}: {source}")]
     Disk { path: String, source: SandboxError },
+    #[error("changed since the turn: {}", list(paths))]
+    Changed { paths: Vec<PathBuf> },
+    #[error("changed by later turns: {}", list(paths))]
+    LaterTurns {
+        turns: Vec<u32>,
+        paths: Vec<PathBuf>,
+    },
+}
+
+fn list(paths: &[PathBuf]) -> String {
+    paths
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// What the live loop assembled each request with, so a rebuild calibrates the token
@@ -158,6 +185,7 @@ pub(crate) fn rebuild_with(
             end_offset: None,
             model: None,
             seen: HashMap::new(),
+            start_pins: false,
         },
         root,
         step: None,
@@ -169,19 +197,20 @@ pub(crate) fn rebuild_with(
     let mut stopped = false;
     for rec in reader.records() {
         let (offset, rec) = rec?;
-        let command = matches!(rec, SessionRecord::Command(_));
-        if r.apply(rec) == Flow::Stop {
-            stopped = true;
-            break;
-        }
-        if !command {
-            r.out.end_offset = Some(offset);
+        match r.apply(rec) {
+            Flow::Go => r.out.end_offset = Some(offset),
+            Flow::Skip => {}
+            Flow::Stop => {
+                stopped = true;
+                break;
+            }
         }
     }
     r.close_step();
+    // Pins of a turn the log ends in (or the cut closes) reach the context as its
+    // leftovers would have.
+    r.apply_pending();
     if !stopped {
-        // Pins of a turn the log ends in reach the context as its leftovers would have.
-        r.apply_pending();
         let last = r.out.context.next_turn() - 1;
         if let Some(at) = until.filter(|&at| at > last) {
             return Err(ResumeError::NoSuchStep { at, last });
@@ -193,7 +222,11 @@ pub(crate) fn rebuild_with(
 
 #[derive(Debug, PartialEq, Eq)]
 enum Flow {
+    /// Replayed: part of the state.
     Go,
+    /// Replayed, but changes nothing (a command such as `Fork` or `SendMessage`).
+    Skip,
+    /// Past the cut: the replay ends before this record.
     Stop,
 }
 
@@ -274,13 +307,12 @@ impl Replay<'_> {
             }
             SessionRecord::TurnEnd { .. } => {
                 self.close_step();
-                if self.beyond() {
-                    // Sent after the boundary: not part of the state there.
-                    self.pending.clear();
-                } else {
-                    self.apply_pending();
-                }
+                self.apply_pending();
                 self.running = false;
+            }
+            SessionRecord::Forked => {
+                self.close_step();
+                self.out.usage.clear();
             }
             SessionRecord::Request { step, model, .. } => {
                 self.close_step();
@@ -359,7 +391,7 @@ impl Replay<'_> {
                 }
                 context_command(self.ctx(), cmd);
             }
-            _ => {}
+            _ => return Flow::Skip,
         }
         Flow::Go
     }
@@ -414,6 +446,7 @@ impl Replay<'_> {
                 for p in &pins {
                     pinned::add(&mut self.out.context.pinned, p.into());
                 }
+                self.out.start_pins = true;
             }
             SessionRecord::Uncompacted {
                 compaction,
@@ -429,18 +462,31 @@ impl Replay<'_> {
                         None => self.warn("a logged uncompact has no compaction to undo".into()),
                     }
                 }
-                let elided = restored
-                    .iter()
-                    .filter_map(|id| {
-                        let blob = self.results.get(id)?;
-                        let original = self.reader.read_blob(blob).ok()?;
-                        Some(GcElision {
-                            call_id: id.clone(),
-                            original: String::from_utf8_lossy(&original).into_owned(),
-                            by_turn: 0,
-                        })
-                    })
-                    .collect();
+                let mut elided = Vec::with_capacity(restored.len());
+                for id in restored {
+                    let original = match self.results.get(&id).map(|b| self.reader.read_blob(b)) {
+                        Some(Ok(bytes)) => bytes,
+                        Some(Err(e)) => {
+                            self.warn(format!(
+                                "the uncompacted result of call {id} could not be read ({e}); \
+                                 it stays collected"
+                            ));
+                            continue;
+                        }
+                        None => {
+                            self.warn(format!(
+                                "the uncompacted result of call {id} is not in the log; it \
+                                 stays collected"
+                            ));
+                            continue;
+                        }
+                    };
+                    elided.push(GcElision {
+                        call_id: id,
+                        original: String::from_utf8_lossy(&original).into_owned(),
+                        by_turn: 0,
+                    });
+                }
                 restore_and_keep(self.ctx(), elided);
             }
             SessionRecord::Undone { files, .. } => {
@@ -517,7 +563,10 @@ impl Replay<'_> {
         }
         let number = self.step.as_ref().map_or(0, |s| s.number);
         let r = &mut self.out;
-        if blocked {
+        // Live, every call that ran or was blocked went through `check` first, which also
+        // spends the escape hatch. (A call the permission policy denied did too; the log
+        // does not say which those were.)
+        if ran || blocked {
             r.attempts.check(&name, &args);
         }
         if ran {
@@ -649,9 +698,10 @@ fn context_command(ctx: &mut Context, cmd: Command) {
     }
 }
 
-/// Put collected outputs back and keep them from being collected again; the call ids
-/// restored.
+/// Put collected outputs back and keep them from being collected again for what
+/// superseded them so far (a later turn's result can); the call ids restored.
 fn restore_and_keep(ctx: &mut Context, elided: Vec<GcElision>) -> Vec<String> {
+    let now = ctx.next_turn().saturating_sub(1);
     let ids: HashSet<String> = elided.iter().map(|e| e.call_id.clone()).collect();
     ctx.restore_gc(&GcRecord {
         elided,
@@ -662,7 +712,7 @@ fn restore_and_keep(ctx: &mut Context, elided: Vec<GcElision>) -> Vec<String> {
     let mut restored = Vec::new();
     for meta in ctx.results.iter_mut() {
         if ids.contains(&meta.call_id) && !meta.elided {
-            meta.kept = true;
+            meta.kept_until = Some(now);
             restored.push(meta.call_id.clone());
         }
     }
@@ -699,30 +749,20 @@ fn originals(path: &std::path::Path, ids: &[String]) -> Result<Vec<GcElision>, R
     Ok(out)
 }
 
-/// Reopen the log of session `id` in the work tree `root` for resuming, and rebuild it.
-/// A turn the log ends in (a crash) gets its missing `TurnEnd` before anything else is
-/// written. Only a session of this very work tree is found ("continue here").
+/// Reopen the log of session `id` in the work tree `root` for resuming: the writer lock
+/// is taken and a torn tail cut off, and every record is checked. The rebuild follows in
+/// the session's actor ([`Session::resume`]). Only a session of this very work tree is
+/// found ("continue here").
 pub(crate) fn open(
     data_home: &std::path::Path,
     root: &std::path::Path,
     id: &str,
-    calibration: &Calibration,
-) -> Result<(SessionWriter<SessionRecord>, Rebuilt), OpenError> {
+) -> Result<SessionWriter<SessionRecord>, OpenError> {
     let found = tautly_session::list_here_in(data_home, root)?
         .into_iter()
         .find(|s| s.id == id)
         .ok_or_else(|| OpenError::NotFound(id.to_string()))?;
-    let mut writer = SessionWriter::<SessionRecord>::reopen(&found.path)?;
-    let reader = SessionReader::<SessionRecord>::open(&found.path)?;
-    let rebuilt = rebuild_with(&reader, None, Some(calibration))?;
-    if rebuilt.incomplete_turn {
-        writer.append(&SessionRecord::TurnEnd {
-            reason: FinishReason::Error,
-            evidence: None,
-        })?;
-        writer.checkpoint()?;
-    }
-    Ok((writer, rebuilt))
+    Ok(SessionWriter::<SessionRecord>::reopen(&found.path)?)
 }
 
 /// Why [`open`] failed.
@@ -732,20 +772,55 @@ pub enum OpenError {
     NotFound(String),
     #[error("{0}")]
     Session(#[from] tautly_session::Error),
-    #[error("{0}")]
-    Rebuild(#[from] ResumeError),
 }
 
-/// What a resumed session still has to do once it runs (in the actor, after the first
-/// event).
+/// What a resumed session still has to do once it took the rebuilt state.
 pub(crate) struct Resumed {
     prefix: Option<SessionRecord>,
     usage: Vec<RawUsage>,
     seen: HashMap<PathBuf, blake3::Hash>,
     warnings: Vec<String>,
+    start_pins: bool,
 }
 
 impl Session {
+    /// Session start of a resumed session (in the actor, after the first event; in place
+    /// of [`Session::init`]): rebuild the context from the log, off the async workers,
+    /// and close a turn the log ends in (a crash) with its missing `TurnEnd` before
+    /// anything else is written; then take the rebuilt state and restore the rest
+    /// ([`resume_start`](Self::resume_start)). An error leaves the session unusable.
+    pub(crate) async fn resume(&mut self, config_pins: &[String]) -> Result<(), String> {
+        let path = self.log.path();
+        let log = self.log.clone();
+        let calibration = Calibration {
+            caps: self.info.caps.clone(),
+            specs: self.specs.clone(),
+        };
+        let (rebuilt, closed) = tokio::task::spawn_blocking(move || -> Result<_, String> {
+            let reader = SessionReader::<SessionRecord>::open(&path).map_err(err)?;
+            let rebuilt = rebuild_with(&reader, None, Some(&calibration)).map_err(err)?;
+            let closed = if rebuilt.incomplete_turn {
+                log.append(&SessionRecord::TurnEnd {
+                    reason: FinishReason::Error,
+                    evidence: None,
+                })
+                .and_then(|()| log.checkpoint())
+                .err()
+            } else {
+                None
+            };
+            Ok((rebuilt, closed))
+        })
+        .await
+        .map_err(err)??;
+        if let Some(failure) = closed {
+            self.report(failure).await;
+        }
+        let resumed = self.adopt(rebuilt);
+        self.resume_start(resumed, config_pins).await;
+        Ok(())
+    }
+
     /// Take the state `r` rebuilt (a resume or a fork) in place of the session's own. The
     /// read tracker starts fresh. Without a logged prefix (no request was sent yet) the
     /// session keeps its own AGENTS.md text and repo map.
@@ -781,19 +856,21 @@ impl Session {
             usage: r.usage,
             seen: r.seen,
             warnings: r.warnings,
+            start_pins: r.start_pins,
         }
     }
 
-    /// Session start for a resumed session (in place of [`Session::init`]): the spend so
-    /// far, the stale-read guard of files unchanged since, and a warning when this build's
-    /// system prompt or tools differ from the logged ones. AGENTS.md and the repo map are
-    /// the logged ones; a session that never sent a request starts up as a new one.
-    pub(crate) async fn resume_start(&mut self, resumed: Resumed, config_pins: &[String]) {
+    /// The rest of a resumed session's start: the spend so far, the stale-read guard of
+    /// files unchanged since, and a warning when this build's system prompt or tools
+    /// differ from the logged ones. AGENTS.md and the repo map are the logged ones; a
+    /// session that never sent a request starts up as a new one, keeping the start pins
+    /// it logged.
+    async fn resume_start(&mut self, resumed: Resumed, config_pins: &[String]) {
         for w in resumed.warnings {
             self.warn(format!("resume: {w}")).await;
         }
         match &resumed.prefix {
-            None => self.init(config_pins).await,
+            None => self.init_with(config_pins, resumed.start_pins).await,
             Some(prefix) => {
                 self.start_housekeeping();
                 self.warn_if_prefix_changed(prefix).await;
@@ -932,28 +1009,35 @@ impl Session {
         let made = tokio::task::spawn_blocking(move || -> Result<_, String> {
             let parent = SessionReader::<SessionRecord>::open(&parent_path).map_err(err)?;
             let cut = rebuild(&parent, at).map_err(err)?;
-            let end = cut.end_offset;
+            // The parent offset names the last record copied: with none, a branch would
+            // read as one cut after record 0.
+            let end = cut.end_offset.ok_or_else(|| {
+                "there is nothing to branch from yet: the session has no records before \
+                 that point"
+                    .to_string()
+            })?;
             let init = HeaderInit {
-                parent: Some((parent_id, end.unwrap_or(0))),
+                parent: Some((parent_id, end)),
                 ..init
             };
-            let mut child =
-                SessionWriter::<SessionRecord>::create_in(&data_home, &root, init).map_err(err)?;
-            child
-                .copy_from(&parent_path, end.map_or(0, |e| e + 1))
-                .map_err(err)?;
-            if cut.incomplete_turn {
-                child
-                    .append(&SessionRecord::TurnEnd {
-                        reason: FinishReason::Cancelled,
-                        evidence: None,
-                    })
-                    .map_err(err)?;
+            let child = branch(
+                &data_home,
+                &root,
+                init,
+                &parent_path,
+                end + 1,
+                cut.incomplete_turn,
+            )?;
+            let rebuilt = SessionReader::<SessionRecord>::open(child.path())
+                .map_err(ResumeError::from)
+                .and_then(|reader| rebuild_with(&reader, None, Some(&calibration)));
+            match rebuilt {
+                Ok(rebuilt) => Ok((child, rebuilt)),
+                Err(e) => {
+                    discard(child);
+                    Err(e.to_string())
+                }
             }
-            child.checkpoint().map_err(err)?;
-            let reader = SessionReader::<SessionRecord>::open(child.path()).map_err(err)?;
-            let rebuilt = rebuild_with(&reader, None, Some(&calibration)).map_err(err)?;
-            Ok((child, rebuilt))
         })
         .await
         .map_err(err)??;
@@ -976,8 +1060,8 @@ impl Session {
         Ok((id, path))
     }
 
-    /// `Command::Compact` (between turns): collect and compact now, as one epoch, reason
-    /// `manual`.
+    /// `Command::Compact` (between turns, as a task the user can cancel): collect and
+    /// compact now, as one epoch, reason `manual`.
     pub(crate) async fn compact_command(&mut self, ctl: &TurnControl) {
         let mut applied = false;
         if let Some(rec) = self.context.collect(Some(MutationReason::Manual)) {
@@ -985,9 +1069,14 @@ impl Session {
             applied = true;
         }
         applied |= self.compact(MutationReason::Manual, ctl).await;
-        if !applied {
+        if ctl.cancel.is_cancelled() {
+            self.warn("compaction cancelled: the history is not compacted")
+                .await;
+        } else if !applied {
             self.warn("nothing to compact: the history is too short")
                 .await;
+        }
+        if !applied {
             return;
         }
         if let Some(text) = self.pending_memory_index.take() {
@@ -1083,11 +1172,54 @@ fn err(e: impl std::fmt::Display) -> String {
     e.to_string()
 }
 
-/// One file to undo: its log path and what it is restored to (none: deleted).
+/// A fork's log: the first `count` records of the log at `parent`, copied verbatim, then
+/// `Forked` (what follows is the branch's own) and a `TurnEnd{cancelled}` when the copy
+/// ends inside a turn (`close_turn`). On a failure the half-written log is removed, so no
+/// broken branch is listed.
+fn branch(
+    data_home: &std::path::Path,
+    root: &std::path::Path,
+    init: HeaderInit,
+    parent: &std::path::Path,
+    count: u64,
+    close_turn: bool,
+) -> Result<SessionWriter<SessionRecord>, String> {
+    let mut child =
+        SessionWriter::<SessionRecord>::create_in(data_home, root, init).map_err(err)?;
+    let written = (|| {
+        child.copy_from(parent, count)?;
+        child.append(&SessionRecord::Forked)?;
+        if close_turn {
+            child.append(&SessionRecord::TurnEnd {
+                reason: FinishReason::Cancelled,
+                evidence: None,
+            })?;
+        }
+        child.checkpoint()
+    })();
+    match written {
+        Ok(()) => Ok(child),
+        Err(e) => {
+            discard(child);
+            Err(e.to_string())
+        }
+    }
+}
+
+/// Close and remove a branch's log that could not be completed.
+fn discard(child: SessionWriter<SessionRecord>) {
+    let path = child.path().to_path_buf();
+    drop(child);
+    let _ = std::fs::remove_file(path);
+}
+
+/// One file to undo: its log path, what it is restored to (none: deleted), and what the
+/// log says its content is now (blake3 hex; none: absent).
 struct Target {
     path: RelPath,
     pre: Option<BlobRef>,
     mode: Option<u32>,
+    tip: Option<String>,
 }
 
 /// Undo the file changes Tautly's tools made in user turn `turn` (default: the last one
@@ -1095,7 +1227,15 @@ struct Target {
 /// turn's first change of it, newest change first; a file the turn created is deleted.
 /// Each file's content just before the undo is stored as a blob first, and the undo is
 /// logged as `Undone`, so it can itself be reverted. Changes made by commands are not
-/// undone. Returns the paths changed.
+/// undone. Returns the paths changed (none: nothing was left to undo, and nothing is
+/// logged).
+///
+/// Nothing the undo did not write is overwritten (spec 7.12), and every check comes before
+/// the first write, so a refusal writes nothing:
+/// - [`UndoError::LaterTurns`]: a later turn changed one of the files and is not undone;
+///   undo the later turns first (newest first).
+/// - [`UndoError::Changed`]: a file's content is not what the log says the session left
+///   it at (the last tool edit or delete, or undo, of it): a human edit, or a command.
 ///
 /// The log is reopened for writing, so the session must not be running in an engine
 /// ([`tautly_session::Error::AlreadyOpen`]). Blocking file I/O on the log.
@@ -1104,15 +1244,27 @@ pub async fn undo(
     sandbox: &dyn Sandbox,
     turn: Option<u32>,
 ) -> Result<Vec<PathBuf>, UndoError> {
-    let (turn, targets) = undo_plan(reader, turn)?;
+    let plan = undo_plan(reader, turn)?;
+    let turn = plan.turn;
+    if !plan.later.is_empty() {
+        return Err(UndoError::LaterTurns {
+            turns: plan.later_turns,
+            paths: plan
+                .later
+                .iter()
+                .map(|p| p.resolve(sandbox.root()))
+                .collect::<Result<_, _>>()?,
+        });
+    }
     let mut writer = SessionWriter::<SessionRecord>::reopen(reader.path())?;
     let disk = |path: &PathBuf, source: SandboxError| UndoError::Disk {
         path: path.display().to_string(),
         source,
     };
-    // First the current content of every file, as blobs.
-    let mut planned = Vec::with_capacity(targets.len());
-    for t in targets {
+    // First what every file is now, checked against what the session left it at.
+    let mut planned = Vec::with_capacity(plan.targets.len());
+    let mut changed = Vec::new();
+    for t in plan.targets {
         let full = t.path.resolve(sandbox.root())?;
         let now = match sandbox.read(&full).await {
             Ok(bytes) => Some(bytes),
@@ -1134,19 +1286,36 @@ pub async fn undo(
         if now == to && (to.is_none() || now_mode == t.mode) {
             continue;
         }
-        let from_blob = now.as_deref().map(|b| writer.blob(b)).transpose()?;
-        planned.push((t, full, to, from_blob, now_mode));
+        let now_hash = now.as_deref().map(|b| blake3::hash(b).to_hex().to_string());
+        if now_hash != t.tip && now != to {
+            changed.push(full);
+            continue;
+        }
+        planned.push((t, full, now, to, now_mode));
     }
-    let mut files = Vec::with_capacity(planned.len());
-    let mut changed = Vec::with_capacity(planned.len());
+    if !changed.is_empty() {
+        changed.sort();
+        return Err(UndoError::Changed { paths: changed });
+    }
+    if planned.is_empty() {
+        return Ok(Vec::new());
+    }
+    // Then their current content, as blobs.
+    let mut blobbed = Vec::with_capacity(planned.len());
+    for (t, full, now, to, now_mode) in planned {
+        let from_blob = now.as_deref().map(|b| writer.blob(b)).transpose()?;
+        blobbed.push((t, full, to, from_blob, now_mode));
+    }
+    let mut files = Vec::with_capacity(blobbed.len());
+    let mut done = Vec::with_capacity(blobbed.len());
     let mut failed = None;
-    for (t, full, to, from_blob, from_mode) in planned {
-        let done = match &to {
+    for (t, full, to, from_blob, from_mode) in blobbed {
+        let written = match &to {
             Some(bytes) => sandbox.write_atomic(&full, bytes, t.mode).await,
             None if from_blob.is_some() => sandbox.remove_file(&full).await,
             None => Ok(()),
         };
-        if let Err(e) = done {
+        if let Err(e) = written {
             failed = Some(disk(&full, e));
             break;
         }
@@ -1157,7 +1326,7 @@ pub async fn undo(
             to: t.pre,
             to_mode: to.as_ref().and(t.mode),
         });
-        changed.push(full);
+        done.push(full);
     }
     writer.append(&SessionRecord::Undone {
         turn,
@@ -1167,19 +1336,34 @@ pub async fn undo(
     writer.checkpoint()?;
     match failed {
         Some(e) => Err(e),
-        None => Ok(changed),
+        None => Ok(done),
     }
 }
 
-/// The user turn to undo and its files, newest change first.
+/// What [`undo`] does for one user turn.
+struct UndoPlan {
+    turn: u32,
+    /// Its files, newest change first; changes an earlier undo of the turn reverted are
+    /// left out.
+    targets: Vec<Target>,
+    /// Of those, the files a later turn changed (and was not undone for), and those turns.
+    later: Vec<RelPath>,
+    later_turns: Vec<u32>,
+}
+
+/// The user turn to undo, its files and what the log says of them since.
 fn undo_plan(
     reader: &SessionReader<SessionRecord>,
     turn: Option<u32>,
-) -> Result<(u32, Vec<Target>), UndoError> {
+) -> Result<UndoPlan, UndoError> {
     let mut current = 0u32;
     let mut turns = 0u32;
     // Per user turn: each path's earliest pre-image, in order of its latest change.
     let mut changes: HashMap<u32, Vec<Target>> = HashMap::new();
+    // Per path: its content as the session last left it, and the turns that changed it
+    // (in order), less those an undo reverted.
+    let mut tips: HashMap<RelPath, Option<String>> = HashMap::new();
+    let mut changed_in: HashMap<RelPath, Vec<u32>> = HashMap::new();
     for rec in reader.records() {
         match rec?.1 {
             SessionRecord::TurnStart { turn, .. } => {
@@ -1188,27 +1372,55 @@ fn undo_plan(
             }
             SessionRecord::ToolResult { effects, .. } => {
                 for e in effects {
-                    let (path, pre, mode) = match e {
+                    let (path, pre, mode, tip) = match e {
                         PersistedEffect::Edited {
                             path,
                             pre_image_blob,
                             pre_mode,
+                            post_hash,
                             ..
-                        } => (path, pre_image_blob, pre_mode),
+                        } => (
+                            path,
+                            pre_image_blob,
+                            pre_mode,
+                            Some(post_hash.to_hex().to_string()),
+                        ),
                         PersistedEffect::Deleted {
                             path,
                             pre_image_blob,
                             pre_mode,
-                        } => (path, Some(pre_image_blob), Some(pre_mode)),
+                        } => (path, Some(pre_image_blob), Some(pre_mode), None),
                         _ => continue,
                     };
                     let pre = pre.map(|b| BlobRef::parse(&b)).transpose()?;
+                    tips.insert(path.clone(), tip);
+                    let by = changed_in.entry(path.clone()).or_default();
+                    if by.last() != Some(&current) {
+                        by.push(current);
+                    }
                     let list = changes.entry(current).or_default();
                     let first = match list.iter().position(|t| t.path == path) {
                         Some(i) => list.remove(i),
-                        None => Target { path, pre, mode },
+                        None => Target {
+                            path,
+                            pre,
+                            mode,
+                            tip: None,
+                        },
                     };
                     list.push(first);
+                }
+            }
+            SessionRecord::Undone { turn, files, .. } => {
+                for f in files {
+                    // A blob reference is the blake3 hex of its content.
+                    tips.insert(f.path.clone(), f.to.map(|b| b.as_str().to_string()));
+                    if let Some(by) = changed_in.get_mut(&f.path) {
+                        by.retain(|&t| t != turn);
+                    }
+                    if let Some(list) = changes.get_mut(&turn) {
+                        list.retain(|t| t.path != f.path);
+                    }
                 }
             }
             _ => {}
@@ -1220,5 +1432,65 @@ fn undo_plan(
     }
     let mut targets = changes.remove(&turn).unwrap_or_default();
     targets.reverse();
-    Ok((turn, targets))
+    let mut later = Vec::new();
+    let mut later_turns = Vec::new();
+    for t in &mut targets {
+        t.tip = tips.get(&t.path).cloned().flatten();
+        let after: Vec<u32> = changed_in
+            .get(&t.path)
+            .into_iter()
+            .flatten()
+            .copied()
+            .filter(|&k| k > turn)
+            .collect();
+        if !after.is_empty() {
+            later.push(t.path.clone());
+            later_turns.extend(after);
+        }
+    }
+    later.sort();
+    later_turns.sort_unstable();
+    later_turns.dedup();
+    Ok(UndoPlan {
+        turn,
+        targets,
+        later,
+        later_turns,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every `.jsonl` file below `dir`.
+    fn logs(dir: &std::path::Path) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                out.extend(logs(&path));
+            } else if path.extension().is_some_and(|x| x == "jsonl") {
+                out.push(path);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn a_failed_branch_leaves_no_log_behind() {
+        let home = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let missing = root.path().join("no-such-parent.jsonl");
+        let made = branch(
+            home.path(),
+            root.path(),
+            HeaderInit::default(),
+            &missing,
+            3,
+            false,
+        );
+        assert!(made.is_err());
+        assert_eq!(logs(home.path()), Vec::<PathBuf>::new());
+    }
 }

@@ -161,6 +161,10 @@ pub enum SessionRecord {
     /// another turn runs is logged as a command when it arrives, and its turn starts only
     /// after that turn's `TurnEnd`; rebuild pushes the user turn here.
     TurnStart { turn: u32, text: String },
+    /// The first record a fork writes itself: every record before it was copied from the
+    /// parent session (the header's `parent`). The usage logged before it is the parent's
+    /// spend, not the branch's.
+    Forked,
     /// A user message's turn ended.
     TurnEnd {
         reason: FinishReason,
@@ -282,6 +286,7 @@ const KNOWN_TYPES: &[&str] = &[
     "labeled",
     "engine_error",
     "turn_start",
+    "forked",
     "turn_end",
 ];
 
@@ -563,6 +568,7 @@ mod tests {
                 turn: 1,
                 text: "hi".into(),
             },
+            SessionRecord::Forked,
             SessionRecord::TurnEnd {
                 reason: FinishReason::Error,
                 evidence: None,
