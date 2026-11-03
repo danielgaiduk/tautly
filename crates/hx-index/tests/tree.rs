@@ -570,3 +570,185 @@ async fn watcher_failure_leaves_the_file_a_candidate_and_is_reported() {
         hx_index::Candidates::FullScan => {}
     }
 }
+
+// ------------------------------------------------------ review round 2 (RED first)
+
+fn has_candidate(idx: &Index, pattern: &str, rel: &str) -> bool {
+    match idx.grep_candidates(pattern, false) {
+        hx_index::Candidates::Files(f) => paths(&f).contains(&rel),
+        hx_index::Candidates::FullScan => true,
+    }
+}
+
+fn row(db: &Path, rel: &str) -> (i64, i64) {
+    let c = rusqlite::Connection::open(db).unwrap();
+    c.query_row(
+        "SELECT trigram_state, (SELECT COUNT(*) FROM trigrams t WHERE t.file_id = f.id) \
+         FROM files f WHERE path = ?1",
+        [rel],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+async fn an_edit_via_a_link_after_an_edit_via_the_real_path_keeps_the_real_row_correct() {
+    let fx = Fixture::new(&[("real/x.rs", "fn h0() {}\n")]);
+    std::os::unix::fs::symlink("real", fx.path("alias")).unwrap();
+    let idx = fx.open();
+    idx.refresh().await.unwrap();
+    idx.build_trigrams().await.unwrap();
+    std::fs::write(fx.path("real/x.rs"), "fn h1_first_edit() {}\n").unwrap();
+    idx.reindex_file(Path::new("real/x.rs")).await.unwrap();
+    std::fs::write(fx.path("alias/x.rs"), "fn h2_second_token() {}\n").unwrap();
+    idx.reindex_file(Path::new("alias/x.rs")).await.unwrap();
+    for rel in ["real/x.rs", "alias/x.rs"] {
+        assert!(has_candidate(&idx, "h2_second_token", rel), "{rel}");
+    }
+    // The canonical row was re-read, so it is narrowed again rather than pending forever.
+    assert!(!has_candidate(&idx, "zzz_absent_zzz", "real/x.rs"));
+    assert_eq!(row(&fx.db(), "real/x.rs").0, 1);
+}
+
+#[tokio::test]
+async fn an_edit_via_a_link_does_not_invalidate_unrelated_copies() {
+    let fx = Fixture::new(&[
+        ("real/x.rs", "fn same() {}\n"),
+        ("copy1.rs", "fn same() {}\n"),
+        ("copy2.rs", "fn same() {}\n"),
+    ]);
+    std::os::unix::fs::symlink("real", fx.path("alias")).unwrap();
+    let idx = fx.open();
+    idx.refresh().await.unwrap();
+    idx.build_trigrams().await.unwrap();
+    std::fs::write(fx.path("alias/x.rs"), "fn changed() {}\n").unwrap();
+    idx.reindex_file(Path::new("alias/x.rs")).await.unwrap();
+    for rel in ["copy1.rs", "copy2.rs"] {
+        assert!(
+            !has_candidate(&idx, "zzz_absent_zzz", rel),
+            "{rel} was swept"
+        );
+        assert_eq!(row(&fx.db(), rel).0, 1);
+    }
+}
+
+#[tokio::test]
+async fn reindexing_unchanged_content_restores_postings_after_the_pending_mark() {
+    let fx = Fixture::new(&[
+        ("a.rs", "fn alpha_token() {}\n"),
+        ("b.rs", "fn beta_token() {}\n"),
+    ]);
+    let idx = fx.open();
+    idx.refresh().await.unwrap();
+    idx.build_trigrams().await.unwrap();
+    // What the watcher does before re-reading: postings dropped, file pending.
+    {
+        let c = rusqlite::Connection::open(fx.db()).unwrap();
+        c.execute_batch(
+            "DELETE FROM trigrams WHERE file_id = (SELECT id FROM files WHERE path = 'a.rs');
+             UPDATE files SET trigram_state = 2 WHERE path = 'a.rs';",
+        )
+        .unwrap();
+    }
+    idx.reindex_file(Path::new("a.rs")).await.unwrap();
+    let (state, postings) = row(&fx.db(), "a.rs");
+    assert_eq!(state, 1, "unchanged content must not leave the row pending");
+    assert!(postings > 0);
+    assert!(!has_candidate(&idx, "beta_token", "a.rs"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_same_content_save_with_the_watcher_running_keeps_postings() {
+    let fx = Fixture::new(&[
+        ("src/a.rs", "fn alpha_token() {}\n"),
+        ("src/b.rs", "fn beta_token() {}\n"),
+    ]);
+    let idx = Arc::new(fx.open());
+    idx.refresh().await.unwrap();
+    idx.build_trigrams().await.unwrap();
+    let _w = idx.clone().start_watcher().unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let (_, before) = row(&fx.db(), "src/a.rs");
+    std::fs::write(fx.path("src/a.rs"), "fn alpha_token() {}\n").unwrap();
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    assert_eq!(row(&fx.db(), "src/a.rs"), (1, before));
+    assert!(!has_candidate(&idx, "beta_token", "src/a.rs"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn events_in_many_ignored_directories_cost_one_walk_per_ignored_ancestor() {
+    let (fx, sb, idx) = probe_fixture(&[]);
+    idx.refresh().await.unwrap();
+    let _watch = idx.clone().start_watcher().unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let before = sb.walks();
+    for i in 0..30 {
+        write_all(fx.root.path(), &[(&format!("target/gen/d{i}/f.o"), "obj")]);
+    }
+    tokio::time::sleep(Duration::from_millis(900)).await;
+    let walks = sb.walks() - before;
+    assert!(
+        walks <= 3,
+        "{walks} walks for events under one ignored directory"
+    );
+}
+
+#[tokio::test]
+async fn failures_before_the_read_also_leave_the_file_a_candidate() {
+    let (fx, sb, idx) = probe_fixture(&[]);
+    idx.refresh().await.unwrap();
+    idx.build_trigrams().await.unwrap();
+
+    std::fs::write(fx.path("src/a.rs"), "fn a() { meta_marker(); }\n").unwrap();
+    sb.fail_metadata_of("src/a.rs", true);
+    assert!(idx.reindex_file(Path::new("src/a.rs")).await.is_err());
+    assert!(has_candidate(&idx, "meta_marker", "src/a.rs"));
+    assert!(!has_candidate(&idx, "meta_marker", "src/b.rs"));
+
+    std::fs::write(fx.path("src/b.rs"), "fn b() { walk_marker(); }\n").unwrap();
+    sb.fail_walk
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    assert!(idx.reindex_file(Path::new("src/b.rs")).await.is_err());
+    sb.fail_walk
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    assert!(has_candidate(&idx, "walk_marker", "src/b.rs"));
+    assert!(!has_candidate(&idx, "walk_marker", "src/c.rs"));
+}
+
+#[tokio::test]
+async fn hard_linked_files_are_never_vouched_for_by_postings() {
+    let fx = Fixture::new(&[("a.rs", "fn shared() {}\n"), ("lone.rs", "fn lone() {}\n")]);
+    std::fs::hard_link(fx.path("a.rs"), fx.path("sub_link.rs")).unwrap();
+    let idx = fx.open();
+    idx.refresh().await.unwrap();
+    idx.build_trigrams().await.unwrap();
+    for rel in ["a.rs", "sub_link.rs"] {
+        assert!(has_candidate(&idx, "zzz_absent_zzz", rel), "{rel}");
+        assert_eq!(row(&fx.db(), rel), (0, 0));
+    }
+    assert!(!has_candidate(&idx, "zzz_absent_zzz", "lone.rs"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn watcher_reconciles_after_git_info_exclude_changes() {
+    let fx = Fixture::new(&[
+        ("keep.rs", "fn k() {}\n"),
+        ("later.rs", "fn l() {}\n"),
+        (".git/info/exclude", "# nothing yet\n"),
+    ]);
+    let idx = Arc::new(fx.open());
+    idx.refresh().await.unwrap();
+    assert_eq!(idx.tree().len(), 2);
+    let _watch = idx.clone().start_watcher().unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    std::fs::write(fx.path(".git/info/exclude"), "later.rs\n").unwrap();
+    assert!(
+        eventually(WATCH_WAIT, || idx
+            .tree()
+            .get(Path::new("later.rs"))
+            .is_none())
+        .await,
+        "newly excluded file leaves the tree"
+    );
+    assert!(idx.tree().get(Path::new("keep.rs")).is_some());
+}

@@ -153,7 +153,10 @@ pub fn synthetic_corpus(root: &Path, files: usize, fns: usize) {
 pub struct ProbeSandbox {
     pub inner: LocalSandbox,
     pub metadata_calls: std::sync::atomic::AtomicUsize,
+    pub walker_calls: std::sync::atomic::AtomicUsize,
     pub fail_read: std::sync::Mutex<std::collections::HashSet<PathBuf>>,
+    pub fail_metadata: std::sync::Mutex<std::collections::HashSet<PathBuf>>,
+    pub fail_walk: std::sync::atomic::AtomicBool,
 }
 
 impl ProbeSandbox {
@@ -161,13 +164,29 @@ impl ProbeSandbox {
         Arc::new(ProbeSandbox {
             inner: LocalSandbox::new(root.to_path_buf()).unwrap(),
             metadata_calls: std::sync::atomic::AtomicUsize::new(0),
+            walker_calls: std::sync::atomic::AtomicUsize::new(0),
             fail_read: Default::default(),
+            fail_metadata: Default::default(),
+            fail_walk: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
     pub fn calls(&self) -> usize {
         self.metadata_calls
             .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub fn walks(&self) -> usize {
+        self.walker_calls.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub fn fail_metadata_of(&self, rel: &str, on: bool) {
+        let mut set = self.fail_metadata.lock().unwrap();
+        if on {
+            set.insert(PathBuf::from(rel));
+        } else {
+            set.remove(Path::new(rel));
+        }
     }
 
     pub fn fail_reads_of(&self, rel: &str, on: bool) {
@@ -201,6 +220,13 @@ impl Sandbox for ProbeSandbox {
     async fn metadata(&self, p: &Path) -> Result<FileMeta, SandboxError> {
         self.metadata_calls
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let rel = p.strip_prefix(self.inner.root()).unwrap_or(p);
+        if self.fail_metadata.lock().unwrap().contains(rel) {
+            return Err(SandboxError::Io(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "injected metadata failure",
+            )));
+        }
         self.inner.metadata(p).await
     }
     async fn write_atomic(
@@ -221,6 +247,11 @@ impl Sandbox for ProbeSandbox {
         self.inner.spawn(spec).await
     }
     fn walker(&self, base: &Path) -> Result<ignore::WalkBuilder, SandboxError> {
+        self.walker_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if self.fail_walk.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(SandboxError::Denied("injected walk failure".into()));
+        }
         self.inner.walker(base)
     }
     async fn http_get(

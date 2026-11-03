@@ -26,6 +26,8 @@ pub struct FileMeta {
     pub mtime: SystemTime,
     pub len: u64,
     pub mode: u32,
+    /// Hard-link count: above 1 the content is reachable under other names.
+    pub nlink: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

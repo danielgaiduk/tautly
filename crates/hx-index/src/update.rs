@@ -35,9 +35,9 @@ struct Candidate {
     lang: Option<Lang>,
     mtime: i64,
     size: i64,
-    /// Reached through a symlink (the file itself or a directory on the way): its
-    /// content can change through another path without this one being told, so the
-    /// trigram index never vouches for it.
+    /// Reached through a symlink (the file itself or a directory on the way), or hard
+    /// linked: its content can change through another name without this one being told,
+    /// so the trigram index never vouches for it.
     aliased: bool,
 }
 
@@ -247,38 +247,65 @@ impl Index {
 
     /// Re-index one file now (the post-edit hook). A file that no longer exists or is
     /// no longer admitted (ignored, hidden, outside the root) is dropped from the
-    /// index; a directory is ignored.
+    /// index; a directory is ignored. When the path leads through a symlink, the
+    /// canonical in-root path of the same file is re-indexed too: it is the only row
+    /// that can hold postings for it, and nobody told it about the change. Whenever the
+    /// file cannot be re-read (metadata, walk or read fails) its old postings stop
+    /// vouching for it and the error is returned.
     pub async fn reindex_file(&self, rel: &Path) -> Result<(), IndexError> {
+        let key = self.inner.key(rel);
+        if let Some(canonical) = self.reindex_one(key).await? {
+            self.reindex_one(canonical).await?;
+        }
+        Ok(())
+    }
+
+    /// [`Index::reindex_file`] for one path; returns the canonical path to follow when
+    /// this one is reached through a symlink.
+    async fn reindex_one(&self, key: String) -> Result<Option<String>, IndexError> {
         let inner = &self.inner;
-        let key = inner.key(rel);
         if key.is_empty() {
-            return Ok(());
+            return Ok(None);
         }
         let meta = match inner.sb.metadata(Path::new(&key)).await {
             Ok(m) => m,
             Err(SandboxError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
-                return forget(inner, key).await;
+                return forget(inner, key).await.map(|()| None);
             }
-            Err(SandboxError::OutsideRoot(_)) => return forget(inner, key).await,
-            Err(e) => return Err(e.into()),
+            Err(SandboxError::OutsideRoot(_)) => return forget(inner, key).await.map(|()| None),
+            Err(e) => {
+                distrust(inner, vec![key]).await;
+                return Err(e.into());
+            }
         };
-        let aliased = match admission(inner, &key).await? {
-            Admission::File { aliased } => aliased,
-            Admission::Dir => return Ok(()),
-            Admission::No => return forget(inner, key).await,
+        let aliased = match admission(inner, &key).await {
+            Ok(Admission::File { aliased }) => aliased,
+            Ok(Admission::Dir) => return Ok(None),
+            Ok(Admission::No) => return forget(inner, key).await.map(|()| None),
+            Err(e) => {
+                distrust(inner, vec![key]).await;
+                return Err(e);
+            }
         };
         let cand = candidate(key.clone(), &meta, aliased);
+        // Reached through a link: the canonical row's postings may be stale from now on.
+        let canonical = if cand.aliased {
+            canonical_key(inner, &key).filter(|c| *c != key)
+        } else {
+            None
+        };
+        if let Some(c) = &canonical {
+            distrust(inner, vec![c.clone()]).await;
+        }
         if is_oversize(cand.size) {
             let file = oversize_file(cand);
-            return inner.run(move |i| i.apply(&[file], &[], &[])).await;
+            inner.run(move |i| i.apply(&[file], &[], &[])).await?;
+            return Ok(canonical);
         }
         let bytes = match inner.sb.read(Path::new(&key)).await {
             Ok(b) => b,
             Err(e) => {
-                // The edit could not be read: whatever the postings said about the old
-                // content must not vouch for the file any more.
-                let key = key.clone();
-                let _ = inner.run(move |i| i.mark_pending(&[key])).await;
+                distrust(inner, vec![key]).await;
                 return Err(e.into());
             }
         };
@@ -286,7 +313,6 @@ impl Index {
             let key = key.clone();
             inner.run(move |i| i.known_file(&key)).await?
         };
-        let old_hash = old.as_ref().map(|k| k.hash.clone());
         let outcome = tokio::task::spawn_blocking(move || {
             let old = old.as_ref().map(|k| (k.hash.as_str(), k.tri_state));
             process(cand, &bytes, old, true)
@@ -294,18 +320,8 @@ impl Index {
         .await
         .map_err(|e| IndexError::Task(e.to_string()))?;
         let (parsed, touched) = split(vec![outcome]);
-        let new_hash = parsed.first().map(|p| p.hash.clone());
         inner.run(move |i| i.apply(&parsed, &touched, &[])).await?;
-        // The same file under other paths (links, copies) has the old content in its
-        // postings: they must be re-read before they can vouch for anything again.
-        if aliased {
-            if let Some(old) = old_hash.filter(|h| !h.is_empty() && new_hash.as_ref() != Some(h)) {
-                inner
-                    .run(move |i| i.mark_pending_with_hash(&old, &key))
-                    .await?;
-            }
-        }
-        Ok(())
+        Ok(canonical)
     }
 
     /// Bring whatever is at `rel` in line with the disk: a file is re-indexed, a
@@ -356,6 +372,24 @@ impl Index {
             }
         }
     }
+}
+
+/// Make these files candidates for every search (best effort: the caller is already
+/// handling a failure).
+async fn distrust(inner: &Arc<Inner>, keys: Vec<String>) {
+    let _ = inner.run(move |i| i.mark_pending(&keys)).await;
+}
+
+/// The root-relative path of `key` with every symlink resolved.
+fn canonical_key(inner: &Inner, key: &str) -> Option<String> {
+    let real = inner.sb.resolve(Path::new(key)).ok()?;
+    let rel = real.strip_prefix(inner.sb.root()).ok()?;
+    Some(
+        rel.components()
+            .map(|c| c.as_os_str().to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("/"),
+    )
 }
 
 /// Drop the rows of `key` if it has any; a path that was never indexed costs a lookup,
@@ -424,7 +458,8 @@ fn candidate(key: String, meta: &FileMeta, aliased: bool) -> Candidate {
         .map_or(0, |d| d.as_nanos() as i64);
     Candidate {
         lang: Lang::from_path(Path::new(&key)),
-        aliased,
+        // Hard links: the content is reachable under names this index is never told about.
+        aliased: aliased || meta.nlink > 1,
         key,
         mtime,
         size: meta.len as i64,
@@ -591,9 +626,9 @@ fn split(outcomes: Vec<Outcome>) -> Split {
 /// postings are computed too, otherwise the file is left pending for
 /// [`Index::build_trigrams`]. Content that is over the cap (it grew since the stat) or
 /// not UTF-8 is recorded by hash only, and a file reached through a symlink never gets
-/// postings (see [`Candidate::aliased`]). `old` is the stored (hash, trigram state): a
-/// row is only left alone if the content is unchanged and the row is the kind of row
-/// this file needs now.
+/// postings (see [`Candidate::aliased`]). `old` is the stored (hash, trigram state); a
+/// row is only left alone if the content is unchanged and the row is already settled
+/// (a pending row, e.g. one the watcher marked before re-reading, is rebuilt).
 fn process(c: Candidate, bytes: &[u8], old: Option<(&str, u8)>, with_trigrams: bool) -> Outcome {
     let hash = blake3::hash(bytes).to_hex().to_string();
     let src = if bytes.len() as u64 > MAX_FILE_BYTES {
@@ -603,7 +638,14 @@ fn process(c: Candidate, bytes: &[u8], old: Option<(&str, u8)>, with_trigrams: b
     };
     let wants_postings = src.is_some() && !c.aliased;
     if let Some((old_hash, old_state)) = old {
-        if old_hash == hash && (old_state != TRI_NONE) == wants_postings {
+        // Unchanged content leaves the row alone only if the row is already what this
+        // call would write: postings in place (or, for a refresh, left for phase 2).
+        let settled = if wants_postings {
+            old_state == TRI_DONE || (!with_trigrams && old_state == TRI_PENDING)
+        } else {
+            old_state == TRI_NONE
+        };
+        if old_hash == hash && settled {
             return Outcome::Touch(c.key, c.mtime, c.size);
         }
     }

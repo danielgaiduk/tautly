@@ -142,6 +142,7 @@ impl Sandbox for LocalSandbox {
             mtime: m.modified()?,
             len: m.len(),
             mode: m.mode(),
+            nlink: m.nlink(),
         })
     }
 

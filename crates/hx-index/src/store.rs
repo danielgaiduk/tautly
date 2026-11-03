@@ -462,24 +462,6 @@ impl Inner {
         self.mark_pending_where("(path >= ?1 || '/' AND path < ?1 || '0')", dirs)
     }
 
-    /// [`Inner::mark_pending`] for every other file with this content hash: the paths
-    /// that lead to the same file through symlinks, and copies.
-    pub fn mark_pending_with_hash(&self, hash: &str, except: &str) -> Result<(), IndexError> {
-        let mut conn = self.conn();
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let rows = format!("hash = ?1 AND path != ?2 AND trigram_state = {TRI_DONE}");
-        tx.execute(
-            &format!("DELETE FROM trigrams WHERE file_id IN (SELECT id FROM files WHERE {rows})"),
-            params![hash, except],
-        )?;
-        tx.execute(
-            &format!("UPDATE files SET trigram_state = {TRI_PENDING} WHERE {rows}"),
-            params![hash, except],
-        )?;
-        tx.commit()?;
-        Ok(())
-    }
-
     fn mark_pending_where(&self, condition: &str, keys: &[String]) -> Result<(), IndexError> {
         if keys.is_empty() {
             return Ok(());

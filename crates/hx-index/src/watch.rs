@@ -42,7 +42,7 @@ impl Index {
     /// [`Index::last_error`]) never leaves stale postings vouching for them. Each path is
     /// then brought in line with the disk ([`Index::reindex_file`] for files, a walk for
     /// directories, row removal for paths that are gone or not admitted). A change to an
-    /// ignore file in an admitted directory triggers a full [`Index::refresh`], and so
+    /// ignore file in an admitted directory (or to `.git/info/exclude`) triggers a full [`Index::refresh`], and so
     /// does an overflow or error from the OS watcher, and so does any relevant change
     /// while the workspace contains symlinks (the OS reports the target's path, not its
     /// aliases). Must be called inside a Tokio runtime, which the watcher thread borrows
@@ -135,21 +135,41 @@ fn is_ignore_file(key: &str) -> bool {
     matches!(key.rsplit('/').next(), Some(".gitignore" | ".ignore"))
 }
 
+/// The repository directory whose `.git/info/exclude` is `key`, if it is one.
+fn git_exclude_repo(key: &str) -> Option<&str> {
+    if key == ".git/info/exclude" {
+        return Some("");
+    }
+    key.strip_suffix("/.git/info/exclude")
+}
+
 /// Whether directory `dir` is one the walker descends into; memoized for the batch.
+/// Ancestors are decided first, shallowest first, so everything under one ignored
+/// directory costs a single walk.
 async fn dir_admitted(inner: &Inner, cache: &mut HashMap<String, bool>, dir: &str) -> bool {
-    if dir.is_empty() {
-        return true;
+    let mut prefix = String::new();
+    for part in dir.split('/').filter(|p| !p.is_empty()) {
+        if !prefix.is_empty() {
+            prefix.push('/');
+        }
+        prefix.push_str(part);
+        let admitted = match cache.get(&prefix) {
+            Some(&known) => known,
+            None => {
+                // When in doubt, process the path.
+                let admitted = !matches!(
+                    admission(inner, &prefix).await,
+                    Ok(Admission::No | Admission::File { .. })
+                );
+                cache.insert(prefix.clone(), admitted);
+                admitted
+            }
+        };
+        if !admitted {
+            return false;
+        }
     }
-    if let Some(&known) = cache.get(dir) {
-        return known;
-    }
-    // When in doubt, process the path.
-    let admitted = !matches!(
-        admission(inner, dir).await,
-        Ok(Admission::No | Admission::File { .. })
-    );
-    cache.insert(dir.to_string(), admitted);
-    admitted
+    true
 }
 
 /// Handle one debounced batch. Only paths that can matter are processed: admitted ones,
@@ -169,6 +189,12 @@ async fn process(index: &Index, batch: Batch, stop: &AtomicBool) {
         let parent_ok = dir_admitted(inner, &mut dirs, parent).await;
         if parent_ok && is_ignore_file(&key) {
             resync = true;
+        }
+        // `.git` itself is never admitted; the exclude file counts if its repository is.
+        if let Some(repo) = git_exclude_repo(&key) {
+            if dir_admitted(inner, &mut dirs, repo).await {
+                resync = true;
+            }
         }
         let known = tree_has(inner, &key);
         if !parent_ok && !known {
