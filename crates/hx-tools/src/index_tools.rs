@@ -19,7 +19,7 @@ const MAX_REFS_LIMIT: usize = 500;
 const REFS_HEADER_NOTE: &str = "name-based, may include unrelated identifiers with the same name";
 
 /// The line that says why results do not come from a ready index, if they do not.
-fn fallback_header(cx: &ToolCx) -> Option<String> {
+pub(crate) fn fallback_header(cx: &ToolCx) -> Option<String> {
     match cx.index() {
         Some(index) if index.is_ready() => None,
         Some(index) => {

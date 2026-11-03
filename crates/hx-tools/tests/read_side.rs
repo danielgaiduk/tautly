@@ -1,3 +1,5 @@
+mod common;
+
 use std::path::Path;
 
 use hx_provider::{Capabilities, EditFormat};
@@ -218,6 +220,7 @@ fn registry_order_is_stable() {
             "bash",
             "grep",
             "glob",
+            "find",
             "outline",
             "symbol",
             "refs",
@@ -377,4 +380,145 @@ async fn huge_line_numbers_do_not_panic() {
     .await;
     assert!(!r.is_error, "{}", r.output);
     assert_eq!(r.output, "1\ta\n2\tb");
+}
+
+/// A repository with nested directories, a name that sorts differently as a string and as
+/// a path, a symlinked directory, an ignored directory, hidden files and a binary file.
+const REPO: &[(&str, &[u8])] = &[
+    (".gitignore", b"ignored/\n"),
+    ("src/main.rs", b"fn main() { needle(); }\nlet x = needle;\n"),
+    ("src/util/mod.rs", b"// needle in nested\n"),
+    ("src/util.rs", b"needle at util.rs\n"),
+    ("ignored/skip.rs", b"needle ignored\n"),
+    ("real/lib.rs", b"needle in real\nsecond line\n"),
+    ("docs/readme.md", b"Needle capital\nnothing\n"),
+    (".hidden/x.txt", b"needle hidden\n"),
+    ("bin.dat", &[0xff, 0xfe, 0x00, 0x01]),
+    ("other.txt", b"no match here\n"),
+];
+
+async fn repo(built: common::Built) -> common::Env {
+    let e = common::env(REPO, built).await;
+    let root = e.sb.root().to_path_buf();
+    std::os::unix::fs::symlink(root.join("real"), root.join("linked")).unwrap();
+    // The index learns about the new link on its next refresh.
+    if built != common::Built::None {
+        e.index.refresh().await.unwrap();
+        if built == common::Built::Full {
+            e.index.build_trigrams().await.unwrap();
+        }
+    }
+    e
+}
+
+#[tokio::test]
+async fn grep_uses_trigram_candidates_when_available() {
+    let mut files: Vec<(String, Vec<u8>)> = (0..12)
+        .map(|i| {
+            (
+                format!("d{}/file{i}.txt", i % 3),
+                format!("plain text {i}\n").into_bytes(),
+            )
+        })
+        .collect();
+    files.push(("hit/one.txt".into(), b"has zebra_marker inside\n".to_vec()));
+    files.push((
+        "hit/two.txt".into(),
+        b"zebra_marker again\nand more\n".to_vec(),
+    ));
+    let files: Vec<(&str, &[u8])> = files
+        .iter()
+        .map(|(p, c)| (p.as_str(), c.as_slice()))
+        .collect();
+
+    let e = common::env(&files, common::Built::Full).await;
+    e.sb.reset();
+    let r = e.run(&GrepTool, json!({"pattern": "zebra_marker"})).await;
+    assert!(!r.is_error, "{}", r.output);
+    assert_eq!(
+        r.output,
+        "hit/one.txt:1:has zebra_marker inside\nhit/two.txt:1:zebra_marker again"
+    );
+    assert_eq!(
+        e.sb.reads(),
+        ["hit/one.txt", "hit/two.txt"],
+        "only candidates are read"
+    );
+
+    // Without trigrams (or without the index) every file is read.
+    let e = common::env(&files, common::Built::Refreshed).await;
+    e.sb.reset();
+    let r = e.run(&GrepTool, json!({"pattern": "zebra_marker"})).await;
+    assert!(r.output.starts_with("hit/one.txt:1:"), "{}", r.output);
+    assert_eq!(e.sb.reads().len(), files.len());
+}
+
+#[tokio::test]
+async fn grep_results_identical_with_and_without_index() {
+    let patterns = [
+        json!({"pattern": "needle"}),
+        json!({"pattern": "needle", "case_insensitive": true}),
+        json!({"pattern": "needle", "glob": "*.rs"}),
+        json!({"pattern": "needle", "path": "src"}),
+        json!({"pattern": "needle", "path": "src/util.rs"}),
+        json!({"pattern": "needle", "path": "linked"}),
+        json!({"pattern": "need.e [a-z]+"}),
+        json!({"pattern": "second"}),
+        json!({"pattern": "ne"}),
+        json!({"pattern": "zzzzz"}),
+        json!({"pattern": "(needle|second)", "case_insensitive": true, "glob": "**/*.rs"}),
+    ];
+    for built in [common::Built::Refreshed, common::Built::Full] {
+        let e = repo(built).await;
+        for args in &patterns {
+            let with = e.run(&GrepTool, args.clone()).await;
+            let without = e.run_without_index(&GrepTool, args.clone()).await;
+            assert_eq!(with, without, "{args}");
+            assert!(!with.is_error, "{args}: {}", with.output);
+        }
+        // Nested directories sort as path components: `util/mod.rs` before `util.rs`.
+        let r = e.run(&GrepTool, json!({"pattern": "needle"})).await;
+        let order: Vec<&str> = r
+            .output
+            .lines()
+            .map(|l| l.split(':').next().unwrap())
+            .collect();
+        let pos = |p: &str| order.iter().position(|x| *x == p).unwrap_or(usize::MAX);
+        assert!(pos("src/util/mod.rs") < pos("src/util.rs"), "{}", r.output);
+        assert!(order.contains(&"linked/lib.rs") && order.contains(&"real/lib.rs"));
+        assert!(!r.output.contains("ignored/") && !r.output.contains(".hidden"));
+        assert!(r.output.contains("skipped 1 files"), "{}", r.output);
+    }
+}
+
+#[tokio::test]
+async fn glob_served_from_tree_when_index_ready() {
+    let patterns = [
+        json!({"pattern": "**/*.rs"}),
+        json!({"pattern": "*.rs"}),
+        json!({"pattern": "*.rs", "path": "src"}),
+        json!({"pattern": "*.rs", "path": "linked"}),
+        json!({"pattern": "src/*/*.rs"}),
+        json!({"pattern": "**/*"}),
+        json!({"pattern": "*.nothing"}),
+    ];
+    let e = repo(common::Built::Refreshed).await;
+    for args in &patterns {
+        e.sb.reset();
+        let with = e.run(&GlobTool, args.clone()).await;
+        assert_eq!(e.sb.walks(), 0, "{args}: answered from the tree, no walk");
+        let without = e.run_without_index(&GlobTool, args.clone()).await;
+        assert!(e.sb.walks() > 0, "{args}: the fallback walks");
+        assert_eq!(with, without, "{args}");
+        assert!(!with.is_error, "{args}");
+    }
+    let r = e.run(&GlobTool, json!({"pattern": "**/*.rs"})).await;
+    assert_eq!(
+        r.output,
+        "linked/lib.rs\nreal/lib.rs\nsrc/main.rs\nsrc/util.rs\nsrc/util/mod.rs"
+    );
+    // An index that is not ready is not an answer.
+    let e = common::env(REPO, common::Built::None).await;
+    let r = e.run(&GlobTool, json!({"pattern": "*.md"})).await;
+    assert_eq!(r.output, "docs/readme.md");
 }

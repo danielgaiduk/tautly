@@ -79,20 +79,35 @@ impl Tool for GlobTool {
             Ok(p) => p,
             Err(e) => return ToolResult::error(e.to_string()),
         };
-        let files = match walk_files(sb, &base_rel).await {
-            Ok(f) => f,
-            Err(e) => return ToolResult::error(e),
-        };
-        // Patterns match relative to the search directory; output is root-relative.
-        let mut hits: Vec<String> = Vec::new();
-        for f in &files {
+        // A ready index answers from its in-memory tree; its paths are sorted as
+        // strings, like `hits` below.
+        let mut hits: Vec<String> = if let Some(index) = cx.index().filter(|i| i.is_ready()) {
             if cx.cancel().is_cancelled() {
                 return ToolResult::error("cancelled");
             }
-            if matcher.is_match(f.strip_prefix(&base_rel).unwrap_or(f)) {
-                hits.push(display_rel(sb, f));
+            index
+                .tree()
+                .glob(&a.pattern, &base_rel)
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect()
+        } else {
+            let files = match walk_files(sb, &base_rel).await {
+                Ok(f) => f,
+                Err(e) => return ToolResult::error(e),
+            };
+            // Patterns match relative to the search directory; output is root-relative.
+            let mut hits = Vec::new();
+            for f in &files {
+                if cx.cancel().is_cancelled() {
+                    return ToolResult::error("cancelled");
+                }
+                if matcher.is_match(f.strip_prefix(&base_rel).unwrap_or(f)) {
+                    hits.push(display_rel(sb, f));
+                }
             }
-        }
+            hits
+        };
         if hits.is_empty() {
             return ToolResult::ok("no files matched");
         }
