@@ -38,23 +38,6 @@ impl LocalSandbox {
     }
 }
 
-/// Lexically normalize `.` and `..`; `..` past the start yields None.
-fn normalize(p: &Path) -> Option<PathBuf> {
-    let mut out = PathBuf::new();
-    for c in p.components() {
-        match c {
-            Component::ParentDir => {
-                if !out.pop() {
-                    return None;
-                }
-            }
-            Component::CurDir => {}
-            other => out.push(other.as_os_str()),
-        }
-    }
-    Some(out)
-}
-
 impl LocalSandbox {
     /// Create `.hx/tmp` with a `.gitignore` of `*` (unless one exists) and the spill
     /// directory. Done once, and again only if the directory disappears.
@@ -109,46 +92,59 @@ impl Sandbox for LocalSandbox {
         let outside = || SandboxError::OutsideRoot(p.to_path_buf());
         // A relative `p` starts at the root, which is canonical already and is never
         // canonicalized again; an absolute `p` replaces it.
-        let (base, rest) = if p.is_absolute() {
-            (PathBuf::from("/"), p.strip_prefix("/").unwrap_or(p))
+        let mut cur = if p.is_absolute() {
+            p.to_path_buf()
         } else {
-            (self.root.clone(), p)
+            self.root.join(p)
         };
-        let parts: Vec<Component> = rest.components().collect();
-        // Canonicalize the longest prefix that exists, in one call (the kernel resolves
-        // `..` after a symlink against the real directory); the missing tail is appended
-        // lexically below.
-        let mut keep = parts.len();
-        let existing = loop {
-            if keep == 0 {
-                break base.clone();
-            }
-            let mut prefix = base.clone();
-            prefix.extend(parts[..keep].iter().map(|c| c.as_os_str()));
-            match prefix.canonicalize() {
-                Ok(canon) => break canon,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => keep -= 1,
-                Err(e) => return Err(e.into()),
-            }
-        };
-        let mut result = existing;
-        for c in &parts[keep..] {
-            match c {
-                Component::ParentDir => {
-                    if !result.pop() {
-                        return Err(outside());
-                    }
+        // Each round canonicalizes the longest prefix that exists, in one call (the
+        // kernel resolves `..` after a symlink against the real directory), then
+        // normalizes the missing tail lexically. A `..` in that tail can pop back onto
+        // components that do exist, which may be symlinks (`missing/../link_out/x`), so
+        // when the tail held a `..` the result is resolved again against the filesystem
+        // and the loop repeats until the tail has none: the final path is checked
+        // against the root exactly as one written without `..` would be. (Rejecting
+        // every `..` after a missing component would be simpler, but would also refuse
+        // the legitimate `src/new_dir/../new_file.rs`.) Each round that repeats has
+        // removed at least one `..`, so this ends within `p`'s component count.
+        let limit = cur.components().count() + 1;
+        for _ in 0..limit {
+            let parts: Vec<Component> = cur.components().collect();
+            let mut keep = parts.len();
+            let existing = loop {
+                if keep == 0 {
+                    break PathBuf::new();
                 }
-                Component::CurDir => {}
-                other => result.push(other.as_os_str()),
+                let prefix: PathBuf = parts[..keep].iter().collect();
+                match prefix.canonicalize() {
+                    Ok(canon) => break canon,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => keep -= 1,
+                    Err(e) => return Err(e.into()),
+                }
+            };
+            let tail = &parts[keep..];
+            let mut result = existing;
+            for c in tail {
+                match c {
+                    Component::ParentDir => {
+                        if !result.pop() {
+                            return Err(outside());
+                        }
+                    }
+                    Component::CurDir => {}
+                    other => result.push(other.as_os_str()),
+                }
             }
+            if !tail.contains(&Component::ParentDir) {
+                return if result.starts_with(&self.root) {
+                    Ok(result)
+                } else {
+                    Err(outside())
+                };
+            }
+            cur = result;
         }
-        let result = normalize(&result).ok_or_else(outside)?;
-        if result.starts_with(&self.root) {
-            Ok(result)
-        } else {
-            Err(outside())
-        }
+        Err(outside())
     }
 
     async fn read(&self, p: &Path) -> Result<Vec<u8>, SandboxError> {

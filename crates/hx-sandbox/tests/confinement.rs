@@ -340,3 +340,103 @@ async fn resolve_of_a_deep_path_costs_about_one_canonicalize() {
         "resolve {resolve:?} vs canonicalize {one:?} for {rounds} rounds"
     );
 }
+
+// --- `..` after a missing component must not skip the filesystem check ---
+fn dotdot_repo() -> (tempfile::TempDir, tempfile::TempDir, LocalSandbox) {
+    let (t, sb) = protected_repo();
+    let outside = tempfile::tempdir().unwrap();
+    std::os::unix::fs::symlink(outside.path(), t.path().join("link_out")).unwrap();
+    (t, outside, sb)
+}
+
+#[tokio::test]
+async fn resolve_follows_symlink_reached_after_dotdot_over_missing_component() {
+    let (t, outside, sb) = dotdot_repo();
+    for p in [
+        "missing/../link_out/x",
+        "a/b/../../link_out/x/y",
+        "missing/../link_out/../../escape",
+    ] {
+        assert!(
+            matches!(sb.resolve(Path::new(p)), Err(SandboxError::OutsideRoot(_))),
+            "{p}: {:?}",
+            sb.resolve(Path::new(p))
+        );
+    }
+    // The write that used to escape (it creates parent directories) is refused.
+    let r = sb
+        .write_atomic(Path::new("missing/../link_out/new/x.txt"), b"pwn", None)
+        .await;
+    assert!(matches!(r, Err(SandboxError::OutsideRoot(_))), "{r:?}");
+    assert!(std::fs::read_dir(outside.path()).unwrap().next().is_none());
+    assert!(!t.path().join("missing").exists());
+}
+
+#[tokio::test]
+async fn resolve_follows_symlink_after_dotdot_on_absolute_paths() {
+    let (t, outside, sb) = dotdot_repo();
+    let root = t.path().canonicalize().unwrap();
+    let abs = root.join("missing/../link_out/x");
+    assert!(matches!(
+        sb.resolve(&abs),
+        Err(SandboxError::OutsideRoot(_))
+    ));
+    let r = sb.write_atomic(&abs, b"pwn", None).await;
+    assert!(matches!(r, Err(SandboxError::OutsideRoot(_))), "{r:?}");
+    assert!(std::fs::read_dir(outside.path()).unwrap().next().is_none());
+    // An absolute path that lexically leaves the root through a missing component too.
+    let out = root.join("missing/../../etc/passwd");
+    assert!(matches!(
+        sb.resolve(&out),
+        Err(SandboxError::OutsideRoot(_))
+    ));
+}
+
+#[tokio::test]
+async fn dotdot_over_missing_component_cannot_dodge_protected_symlink_targets() {
+    let (t, _outside, sb) = dotdot_repo();
+    // `docs/hooks -> ../.git/hooks`: reached after a lexical `..`, it is still a link into .git.
+    for p in ["missing/../docs/hooks/pre-commit", "missing/../NOTES.md"] {
+        let r = sb.write_atomic(Path::new(p), b"evil", None).await;
+        assert!(matches!(r, Err(SandboxError::Denied(_))), "{p}: {r:?}");
+    }
+    assert!(!t.path().join(".git/hooks/pre-commit").exists());
+    assert_eq!(
+        std::fs::read_to_string(t.path().join(".git/config")).unwrap(),
+        "[core]\n"
+    );
+    // Naming the protected path itself (through a `..`) resolves to it, for the policy to ask about.
+    let root = t.path().canonicalize().unwrap();
+    assert_eq!(
+        sb.resolve(Path::new("nope/../.git/hooks/pre-commit"))
+            .unwrap(),
+        root.join(".git/hooks/pre-commit")
+    );
+}
+
+#[tokio::test]
+async fn dotdot_inside_an_all_missing_tail_still_resolves_inside_root() {
+    let (t, _outside, sb) = dotdot_repo();
+    let root = t.path().canonicalize().unwrap();
+    assert_eq!(
+        sb.resolve(Path::new("a/b/../c.rs")).unwrap(),
+        root.join("a/c.rs")
+    );
+    assert_eq!(
+        sb.resolve(Path::new("src/new_dir/../new_file.rs")).unwrap(),
+        root.join("src/new_file.rs")
+    );
+    assert_eq!(
+        sb.resolve(&root.join("a/b/../c.rs")).unwrap(),
+        root.join("a/c.rs")
+    );
+    // Over an existing directory, too.
+    assert_eq!(
+        sb.resolve(Path::new("docs/x/../y.md")).unwrap(),
+        root.join("docs/y.md")
+    );
+    sb.write_atomic(Path::new("a/b/../c.rs"), b"ok", None)
+        .await
+        .unwrap();
+    assert_eq!(std::fs::read(root.join("a/c.rs")).unwrap(), b"ok");
+}

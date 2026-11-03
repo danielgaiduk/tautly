@@ -31,6 +31,17 @@ fn asks(d: Decision) -> bool {
 }
 
 #[test]
+fn dotdot_after_a_missing_component_cannot_dodge_the_protected_list() {
+    for f in [
+        "nope/../.git/hooks/pre-commit",
+        "a/b/../../.git/config",
+        "/ws/nope/../.git/hooks/pre-commit",
+        "nope/../.github/workflows/ci.yml",
+    ] {
+        assert!(asks(p(Mode::Yolo).decide("write", &write(f), None)), "{f}");
+    }
+}
+#[test]
 fn read_only_always_allowed() {
     assert_eq!(
         p(Mode::Ask).decide("read", &Effect::ReadOnly, None),
@@ -587,6 +598,28 @@ mod symlinks {
             panic!("expected ask");
         };
         assert!(reason.contains(".git/config"), "{reason}");
+    }
+
+    #[test]
+    fn dotdot_over_a_missing_component_still_follows_symlinks() {
+        let (_t, root) = repo();
+        let p = policy(&root, Mode::Yolo, &["write"], &[]);
+        for f in [
+            "missing/../docs/hooks/pre-commit",
+            "missing/../NOTES.md",
+            "missing/../out/passwd",
+        ] {
+            assert!(asks(p.decide("write", &write(f), None)), "{f}");
+            let abs = root.join(f);
+            assert!(
+                asks(p.decide("write", &write(abs.to_str().unwrap()), None)),
+                "{f}"
+            );
+        }
+        assert_eq!(
+            p.decide("write", &write("missing/../src/main.rs"), None),
+            Decision::Allow
+        );
     }
 
     #[test]
