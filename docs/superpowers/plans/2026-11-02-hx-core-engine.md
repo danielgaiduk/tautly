@@ -861,6 +861,8 @@ proptest! { #[test] fn apply_then_inverse_restores(text in "[a-z\\n]{1,200}", ..
 
 ### Task 29: JSON-RPC server and `tautly -p` one-shot
 
+**Task 23 note (binding):** protocol enums have `Unknown` catch-all variants for forward compatibility; match them with a wildcard arm, and map `FinishReason::Unknown` to exit code 1.
+
 **Client-protocol amendment (binding, user-approved 2026-11-03; spec 3.4):** `initialize` accepts `client: {interactive, name, version}`; interactive clients get `ToolApprovalRequested{request_id}` / `MemoryProposed` answered by `approve`/`deny`/`approve_memory`/`reject_memory` with ids, and pending requests resolve to deny on disconnect or `shutdown`. Add `session/new {root, resume?, fork?}`, `session/list`, `session/close`; session-scoped methods take `session_id`; `event` notifications carry `session_id`. Sessions on one root share a `Workspace` hub (index, watcher, memory store; `Arc`, opened once, closed with the last session). Tests: `interactive_ask_waits_for_client_approval`, `pending_approval_denied_on_disconnect`, `two_sessions_share_one_index_and_route_events_by_session_id`, `single_session_form_still_works`.
 
 **Files:**
