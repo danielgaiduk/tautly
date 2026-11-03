@@ -4,6 +4,7 @@ mod effect;
 mod local;
 mod policy;
 mod protected;
+mod runners;
 mod shell;
 
 pub use effect::{Effect, FileMeta, HttpResponse, Sandbox, SandboxError, SpawnSpec};

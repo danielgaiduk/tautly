@@ -200,12 +200,16 @@ fn path_word_reason(root: &Path, word: &str) -> Option<String> {
     if is_protected(&rel) {
         return Some(format!("protected path: {}", rel.display()));
     }
-    // A word is not necessarily a path, so only a protected symlink target counts.
+    // A word is not necessarily a path, so only a protected symlink target, or a
+    // link to a device (`s.sh -> /dev/stdin` fed to an interpreter), counts.
     match resolve_links(root, Path::new(word))? {
         Resolved::Inside(real) if is_protected(&real) => Some(format!(
             "protected path: {} (via symlink {word})",
             real.display()
         )),
+        Resolved::Outside(real) if real.starts_with("/dev") || real.starts_with("/proc") => Some(
+            format!("symlink to device path: {word} -> {}", real.display()),
+        ),
         _ => None,
     }
 }

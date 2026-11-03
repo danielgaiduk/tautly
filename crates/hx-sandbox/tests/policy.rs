@@ -619,3 +619,75 @@ mod symlinks {
         ));
     }
 }
+
+// --- checkpoint fix round 2 ---
+#[test]
+fn round_two_probes_ask_with_allowlist_and_in_yolo() {
+    let allow = with_rules(
+        Mode::Ask,
+        &[
+            "bash(ls*)",
+            "bash(git status*)",
+            "bash(echo*)",
+            "bash(cat*)",
+            "bash(read*)",
+            "bash(printf*)",
+            "bash(export*)",
+            "bash(for*)",
+            "bash(xargs*)",
+            "bash(arch*)",
+            "bash(perl*)",
+            "bash(node*)",
+            "bash(bash*)",
+            "bash(python3*)",
+            "bash(compgen*)",
+            "bash(enable*)",
+            "bash(true*)",
+        ],
+        &[],
+    );
+    for cmd in [
+        "echo='a[$(touch pwn)]'; cat <<XEOF\n$((echo))\nXEOF\n",
+        "for PATH in ./evilbin; do ls; done",
+        "read PATH <<< /tmp/evil; ls",
+        "export LD_PRELOAD; ls",
+        "echo \"${x@P}\"",
+        "bash /dev/stdin <<< 'x'",
+        "python3 -m code <<< 'import os'",
+        "perl -I lib <<< 'x'",
+        "echo \"sh -c id\" | xargs env",
+        "arch -arm64 bash -c x",
+        "compgen -C x y",
+        "enable -f ./evil.so evil",
+    ] {
+        assert!(asks(allow.decide("bash", &exec("x"), Some(cmd))), "{cmd}");
+        assert!(
+            asks(p(Mode::Yolo).decide("bash", &exec("x"), Some(cmd))),
+            "{cmd}"
+        );
+    }
+}
+
+#[test]
+fn argv_word_symlinked_to_a_device_path_asks() {
+    let t = tempfile::tempdir().unwrap();
+    std::os::unix::fs::symlink("/dev/stdin", t.path().join("s.sh")).unwrap();
+    let y = Policy::new(
+        PolicyConfig {
+            mode: Mode::Yolo,
+            allow: vec![],
+            deny: vec![],
+        },
+        t.path().to_path_buf(),
+    )
+    .unwrap();
+    assert!(asks(y.decide(
+        "bash",
+        &exec("bash"),
+        Some("bash s.sh <<< x")
+    )));
+    assert_eq!(
+        y.decide("bash", &exec("ls"), Some("ls src")),
+        Decision::Allow
+    );
+}

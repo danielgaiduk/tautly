@@ -7,6 +7,8 @@
 
 use tree_sitter::{Node, Parser};
 
+use crate::runners::{base, reject_unanalyzable, runs_module};
+
 /// A single command invocation with its words unquoted. Variable expansions
 /// stay literal (`$X`). Wrappers such as `sudo` or `env` are not unwrapped.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -100,13 +102,11 @@ fn snippet(s: &str) -> String {
 const STRUCTURAL: &[&str] = &[
     "program",
     "list",
-    "pipeline",
     "subshell",
     "if_statement",
     "elif_clause",
     "else_clause",
     "while_statement",
-    "for_statement",
     "case_statement",
     "case_item",
     "do_group",
@@ -156,83 +156,8 @@ fn walk(
     }
     let depth = depth + 1;
     match node.kind() {
-        "command" => {
-            let mut assignments = Vec::new();
-            let mut argv = Vec::new();
-            let mut redirects = Vec::new();
-            let mut extra = Vec::new();
-            let mut rest = Vec::new();
-            let mut cur = node.walk();
-            for child in node.children(&mut cur) {
-                match child.kind() {
-                    "command_name" => argv.push(unquote(child, src)),
-                    "variable_assignment" => {
-                        assignments.push(text(child, src).to_string());
-                        rest.push(child);
-                    }
-                    "file_redirect" | "heredoc_redirect" | "herestring_redirect" => {
-                        collect_redirects(child, src, &mut redirects, &mut extra, depth)?
-                    }
-                    "comment" => {}
-                    _ if child.is_named() => {
-                        argv.push(unquote(child, src));
-                        rest.push(child);
-                    }
-                    _ => {}
-                }
-            }
-            if argv.is_empty() {
-                if redirects.iter().any(|r| r.write) {
-                    return Err(Unparseable("redirection without a command".into()));
-                }
-            } else {
-                reject_unanalyzable(&argv)?;
-                reject_dynamic_names(&argv)?;
-                out.push(SimpleCommand {
-                    assignments,
-                    argv,
-                    redirects,
-                });
-            }
-            for child in rest {
-                // A command's own assignments only reach its environment; the policy
-                // judges them, so only look inside for substitutions.
-                if child.kind() == "variable_assignment" {
-                    walk_children(child, src, out, depth)?;
-                } else {
-                    walk(child, src, out, depth)?;
-                }
-            }
-            out.append(&mut extra);
-            Ok(())
-        }
-        "declaration_command" | "unset_command" => {
-            let mut argv = Vec::new();
-            let mut cur = node.walk();
-            for child in node.children(&mut cur) {
-                if !child.is_named() || child.kind() == "variable_assignment" {
-                    argv.push(text(child, src).to_string());
-                } else {
-                    argv.push(unquote(child, src));
-                }
-            }
-            reject_dynamic_names(&argv)?;
-            out.push(SimpleCommand {
-                assignments: Vec::new(),
-                argv,
-                redirects: Vec::new(),
-            });
-            // Assignments here are argv words the policy judges; only look inside them.
-            let mut cur = node.walk();
-            for child in node.children(&mut cur) {
-                if child.kind() == "variable_assignment" {
-                    walk_children(child, src, out, depth)?;
-                } else {
-                    walk(child, src, out, depth)?;
-                }
-            }
-            Ok(())
-        }
+        "command" => walk_command(node, src, out, depth),
+        "declaration_command" | "unset_command" => walk_declaration(node, src, out, depth),
         "test_command" => {
             out.push(SimpleCommand {
                 assignments: Vec::new(),
@@ -241,31 +166,9 @@ fn walk(
             });
             walk_children(node, src, out, depth)
         }
-        "redirected_statement" | "function_definition" => {
-            let start = out.len();
-            let mut redirects = Vec::new();
-            let mut extra = Vec::new();
-            let mut cur = node.walk();
-            for child in node.children(&mut cur) {
-                match child.kind() {
-                    "file_redirect" | "heredoc_redirect" | "herestring_redirect" => {
-                        collect_redirects(child, src, &mut redirects, &mut extra, depth)?
-                    }
-                    _ => walk(child, src, out, depth)?,
-                }
-            }
-            if out.len() == start {
-                if redirects.iter().any(|r| r.write) {
-                    return Err(Unparseable("redirection without a command".into()));
-                }
-            } else {
-                for cmd in &mut out[start..] {
-                    cmd.redirects.extend(redirects.iter().cloned());
-                }
-            }
-            out.append(&mut extra);
-            Ok(())
-        }
+        // Every element after the first reads the previous one's output.
+        "pipeline" => walk_pipeline(node, src, out, depth),
+        "redirected_statement" | "function_definition" => walk_redirected(node, src, out, depth),
         // Redirects are only understood in the contexts above; anywhere else
         // they could hide a write, so refuse.
         "file_redirect" | "heredoc_redirect" | "herestring_redirect" => {
@@ -298,6 +201,13 @@ fn walk(
             let t = text(node, src);
             if let Some(inner) = t.strip_prefix("((") {
                 require_literal_arith(inner.strip_suffix("))").unwrap_or(inner))?;
+            }
+            walk_children(node, src, out, depth)
+        }
+        // `for NAME in ...` / `select NAME in ...` assign NAME.
+        "for_statement" => {
+            if let Some(var) = node.child_by_field_name("variable") {
+                reject_dangerous_name(text(var, src))?;
             }
             walk_children(node, src, out, depth)
         }
@@ -363,6 +273,157 @@ fn walk(
     }
 }
 
+fn walk_command(
+    node: Node,
+    src: &[u8],
+    out: &mut Vec<SimpleCommand>,
+    depth: usize,
+) -> Result<(), Unparseable> {
+    let mut assignments = Vec::new();
+    let mut argv = Vec::new();
+    let mut redirects = Vec::new();
+    let mut extra = Vec::new();
+    let mut rest = Vec::new();
+    let mut fed = false;
+    let mut cur = node.walk();
+    for child in node.children(&mut cur) {
+        fed |= feeds_stdin(child, src);
+        match child.kind() {
+            "command_name" => argv.push(unquote(child, src)),
+            "variable_assignment" => {
+                assignments.push(text(child, src).to_string());
+                rest.push(child);
+            }
+            "file_redirect" | "heredoc_redirect" | "herestring_redirect" => {
+                collect_redirects(child, src, &mut redirects, &mut extra, depth)?
+            }
+            "comment" => {}
+            _ if child.is_named() => {
+                argv.push(unquote(child, src));
+                rest.push(child);
+            }
+            _ => {}
+        }
+    }
+    if argv.is_empty() {
+        if redirects.iter().any(|r| r.write) {
+            return Err(Unparseable("redirection without a command".into()));
+        }
+    } else {
+        reject_unanalyzable(&argv)?;
+        reject_dynamic_names(&argv)?;
+        if fed && runs_module(&argv) {
+            return Err(fed_module(&argv));
+        }
+        out.push(SimpleCommand {
+            assignments,
+            argv,
+            redirects,
+        });
+    }
+    for child in rest {
+        // A command's own assignments only reach its environment; the policy
+        // judges them, so only look inside for substitutions.
+        if child.kind() == "variable_assignment" {
+            walk_children(child, src, out, depth)?;
+        } else {
+            walk(child, src, out, depth)?;
+        }
+    }
+    out.append(&mut extra);
+    Ok(())
+}
+
+fn walk_declaration(
+    node: Node,
+    src: &[u8],
+    out: &mut Vec<SimpleCommand>,
+    depth: usize,
+) -> Result<(), Unparseable> {
+    let mut argv = Vec::new();
+    let mut cur = node.walk();
+    for child in node.children(&mut cur) {
+        if !child.is_named() || child.kind() == "variable_assignment" {
+            argv.push(text(child, src).to_string());
+        } else {
+            argv.push(unquote(child, src));
+        }
+    }
+    reject_dynamic_names(&argv)?;
+    out.push(SimpleCommand {
+        assignments: Vec::new(),
+        argv,
+        redirects: Vec::new(),
+    });
+    // Assignments here are argv words the policy judges; only look inside them.
+    let mut cur = node.walk();
+    for child in node.children(&mut cur) {
+        if child.kind() == "variable_assignment" {
+            walk_children(child, src, out, depth)?;
+        } else {
+            walk(child, src, out, depth)?;
+        }
+    }
+    Ok(())
+}
+
+fn walk_pipeline(
+    node: Node,
+    src: &[u8],
+    out: &mut Vec<SimpleCommand>,
+    depth: usize,
+) -> Result<(), Unparseable> {
+    let mut cur = node.walk();
+    let mut first = true;
+    for child in node.children(&mut cur) {
+        let start = out.len();
+        walk(child, src, out, depth)?;
+        if child.is_named() {
+            if !first {
+                reject_fed_modules(&out[start..])?;
+            }
+            first = false;
+        }
+    }
+    Ok(())
+}
+
+fn walk_redirected(
+    node: Node,
+    src: &[u8],
+    out: &mut Vec<SimpleCommand>,
+    depth: usize,
+) -> Result<(), Unparseable> {
+    let start = out.len();
+    let mut redirects = Vec::new();
+    let mut extra = Vec::new();
+    let mut fed = false;
+    let mut cur = node.walk();
+    for child in node.children(&mut cur) {
+        fed |= feeds_stdin(child, src);
+        match child.kind() {
+            "file_redirect" | "heredoc_redirect" | "herestring_redirect" => {
+                collect_redirects(child, src, &mut redirects, &mut extra, depth)?
+            }
+            _ => walk(child, src, out, depth)?,
+        }
+    }
+    if fed {
+        reject_fed_modules(&out[start..])?;
+    }
+    if out.len() == start {
+        if redirects.iter().any(|r| r.write) {
+            return Err(Unparseable("redirection without a command".into()));
+        }
+    } else {
+        for cmd in &mut out[start..] {
+            cmd.redirects.extend(redirects.iter().cloned());
+        }
+    }
+    out.append(&mut extra);
+    Ok(())
+}
+
 fn walk_children(
     node: Node,
     src: &[u8],
@@ -397,31 +458,69 @@ fn collect_redirects(
             walk_children(node, src, extra, depth)
         }
         "heredoc_redirect" => {
-            // With an unquoted delimiter bash runs `...` in the body, but the grammar
-            // keeps it as plain text, so it cannot be analyzed.
+            // With an unquoted delimiter bash expands the body, and the grammar
+            // misreads parts of it (`$((x))` as a subshell, `...` as text), so any
+            // expansion there fails closed. Quoted delimiters keep the body literal.
             let quoted = node
                 .named_children(&mut node.walk())
                 .find(|c| c.kind() == "heredoc_start")
                 .is_some_and(|c| text(c, src).contains(['\'', '"', '\\']));
-            let body_has_backquote = node
+            let body_expands = node
                 .named_children(&mut node.walk())
-                .any(|c| c.kind() == "heredoc_body" && text(c, src).contains('`'));
-            if !quoted && body_has_backquote {
-                return Err(Unparseable(
-                    "backquote substitution in a heredoc body".into(),
-                ));
+                .any(|c| c.kind() == "heredoc_body" && text(c, src).contains(['`', '$']));
+            if !quoted && body_expands {
+                return Err(Unparseable("expansion in an unquoted heredoc body".into()));
             }
             for child in node.children(&mut cur) {
                 match child.kind() {
                     "file_redirect" | "heredoc_redirect" | "herestring_redirect" => {
                         collect_redirects(child, src, redirects, extra, depth)?
                     }
-                    _ => walk(child, src, extra, depth)?,
+                    _ => {
+                        // `cmd <<EOF | next`: `next` reads `cmd`'s output.
+                        let start = extra.len();
+                        walk(child, src, extra, depth)?;
+                        reject_fed_modules(&extra[start..])?;
+                    }
                 }
             }
             Ok(())
         }
         _ => walk_children(node, src, extra, depth),
+    }
+}
+
+/// Whether a redirect feeds the command's stdin: a heredoc, a herestring, or
+/// `<` / `<>` on descriptor 0.
+fn feeds_stdin(node: Node, src: &[u8]) -> bool {
+    match node.kind() {
+        "heredoc_redirect" | "herestring_redirect" => true,
+        "file_redirect" => {
+            let fd = node.child_by_field_name("descriptor").map(|d| text(d, src));
+            let mut cur = node.walk();
+            let op = node
+                .children(&mut cur)
+                .find(|c| !c.is_named())
+                .map(|c| text(c, src));
+            matches!(op, Some("<" | "<>")) && fd.is_none_or(|d| d == "0")
+        }
+        _ => false,
+    }
+}
+
+fn fed_module(argv: &[String]) -> Unparseable {
+    Unparseable(format!(
+        "`{}` runs a module whose stdin the command supplies",
+        argv.join(" ")
+    ))
+}
+
+/// Commands whose stdin is supplied by the command line must not run a module
+/// that may execute it (`echo 'code' | python3 -m code`).
+fn reject_fed_modules(cmds: &[SimpleCommand]) -> Result<(), Unparseable> {
+    match cmds.iter().find(|c| runs_module(&c.argv)) {
+        Some(c) => Err(fed_module(&c.argv)),
+        None => Ok(()),
     }
 }
 
@@ -556,6 +655,11 @@ fn check_expansion(t: &str) -> Result<(), Unparseable> {
             None => return Err(hidden(&format!("expansion `{}`", snippet(t)))),
         }
     }
+    if b.get(i) == Some(&b'@') {
+        // `${x@P}` expands prompt escapes (running `$(...)` in the value), and the
+        // other transformations are not worth telling apart.
+        return Err(hidden(&format!("transformation `{}`", snippet(t))));
+    }
     if b.get(i) == Some(&b':') && !matches!(b.get(i + 1), Some(b'-' | b'=' | b'?' | b'+')) {
         require_literal_arith(&inner[i + 1..])?;
     }
@@ -604,7 +708,28 @@ fn reject_dynamic_names(argv: &[String]) -> Result<(), Unparseable> {
             .collect(),
         _ => Vec::new(),
     };
-    names.into_iter().try_for_each(require_static_name)
+    for name in names {
+        require_static_name(name)?;
+        // Name operands assign the variable (`read PATH`, `export LD_PRELOAD`);
+        // `unset` and `test -v` only remove or inspect it.
+        if !matches!(cmd, "unset" | "[" | "test") {
+            reject_dangerous_name(name)?;
+        }
+    }
+    Ok(())
+}
+
+/// A variable assignment by name (for/select/read/export/...) to a variable that
+/// can make later commands run other code.
+fn reject_dangerous_name(name: &str) -> Result<(), Unparseable> {
+    let name = name.split('[').next().unwrap_or(name);
+    if is_dangerous_env(name) {
+        Err(Unparseable(format!(
+            "assignment to `{name}` changes how later commands run"
+        )))
+    } else {
+        Ok(())
+    }
 }
 
 /// Split getopt-style `args` into the values of options in `name_opts` (which
@@ -690,240 +815,6 @@ pub(crate) fn is_dangerous_env(name: &str) -> bool {
     let upper = name.to_ascii_uppercase();
     DANGEROUS_ENV.contains(&upper.as_str())
         || DANGEROUS_ENV_PREFIXES.iter().any(|p| upper.starts_with(p))
-}
-
-/// Commands that run the rest of their argv as another command. We look through
-/// them conservatively: any later word may be the inner command.
-const WRAPPERS: &[&str] = &[
-    "sudo",
-    "doas",
-    "env",
-    "command",
-    "builtin",
-    "exec",
-    "nohup",
-    "time",
-    "xargs",
-    "nice",
-    "timeout",
-    "setsid",
-    "find",
-    "stdbuf",
-    "ionice",
-    "flock",
-    "taskset",
-    "chrt",
-    "numactl",
-    "unbuffer",
-    "caffeinate",
-    "pkexec",
-    "runuser",
-    "strace",
-    "ltrace",
-    "busybox",
-    "nsenter",
-    "unshare",
-    "firejail",
-];
-
-/// Commands that run their arguments through a shell (`watch`, `su -c`, `script -c`)
-/// or start a shell that reads unseen input (`su`, `script`, `chroot` without a command).
-const SHELL_RUNNERS: &[&str] = &["watch", "su", "script", "chroot"];
-
-const SHELLS: &[&str] = &[
-    "bash", "sh", "zsh", "dash", "ksh", "ash", "mksh", "fish", "csh", "tcsh",
-];
-
-/// How an interpreter's command line names the code it runs.
-struct Interp {
-    shell: bool,
-    /// Short flags whose value is inline code.
-    inline: &'static str,
-    /// Long options whose value is inline code.
-    inline_long: &'static [&'static str],
-    /// Short flags that take a (non-code) value.
-    value_opts: &'static str,
-    /// Long options that take a separate (non-code) value.
-    long_value: &'static [&'static str],
-    /// Short flag whose value is a module to run (`python -m`), an analyzable operand.
-    module: Option<char>,
-    /// Words that only print information and exit.
-    info: &'static [&'static str],
-}
-
-fn interp(name: &str) -> Option<Interp> {
-    let versioned = |prefix: &str| {
-        name.strip_prefix(prefix)
-            .is_some_and(|v| v.chars().all(|c| c.is_ascii_digit() || c == '.'))
-    };
-    Some(if SHELLS.contains(&name) {
-        Interp {
-            shell: true,
-            inline: "c",
-            inline_long: &["--command"],
-            value_opts: "oO",
-            long_value: &["--rcfile", "--init-file"],
-            module: None,
-            info: &["--version", "--help"],
-        }
-    } else if versioned("python") || versioned("pypy") {
-        Interp {
-            shell: false,
-            inline: "c",
-            inline_long: &[],
-            value_opts: "WX",
-            long_value: &[],
-            module: Some('m'),
-            info: &["--version", "--help", "-V", "-h"],
-        }
-    } else if matches!(name, "node" | "nodejs") {
-        Interp {
-            shell: false,
-            inline: "ep",
-            inline_long: &["--eval", "--print"],
-            value_opts: "r",
-            long_value: &["--require", "--import", "--loader"],
-            module: None,
-            info: &["--version", "--help", "-v", "-h"],
-        }
-    } else if name == "perl" || versioned("perl") {
-        Interp {
-            shell: false,
-            inline: "eE",
-            inline_long: &[],
-            value_opts: "",
-            long_value: &[],
-            module: None,
-            info: &["--version", "--help", "-v", "-V", "-h"],
-        }
-    } else if name == "ruby" || versioned("ruby") {
-        Interp {
-            shell: false,
-            inline: "e",
-            inline_long: &[],
-            value_opts: "CIrE",
-            long_value: &[],
-            module: None,
-            info: &["--version", "--help", "-v", "-h"],
-        }
-    } else {
-        return None;
-    })
-}
-
-/// Why an interpreter invocation runs code we cannot see: inline code (`-c`,
-/// `-e`), or a script read from stdin (`-s`, `-`, or no script operand at all,
-/// which covers heredocs, herestrings, `<` redirects and pipes).
-fn interpreter_reason(a: &[String]) -> Option<&'static str> {
-    let spec = interp(base(&a[0]))?;
-    let inline = Some("runs inline code");
-    let stdin = Some("reads its script from stdin");
-    let mut it = a[1..].iter();
-    while let Some(w) = it.next() {
-        if spec.info.contains(&w.as_str()) {
-            return None;
-        }
-        if w == "-" {
-            return stdin;
-        }
-        if w == "--" {
-            return if it.next().is_some() { None } else { stdin };
-        }
-        if let Some(long) = w.strip_prefix("--") {
-            let (key, value) = match long.split_once('=') {
-                Some((k, _)) => (k, true),
-                None => (long, false),
-            };
-            let key = format!("--{key}");
-            if spec.inline_long.contains(&key.as_str()) {
-                return inline;
-            }
-            if spec.long_value.contains(&key.as_str()) && !value {
-                it.next();
-            }
-            continue;
-        }
-        let cluster = w
-            .strip_prefix('-')
-            .or_else(|| w.strip_prefix('+').filter(|_| spec.shell));
-        let Some(cluster) = cluster else {
-            return None; // the script operand
-        };
-        for (i, ch) in cluster.char_indices() {
-            if spec.inline.contains(ch) {
-                return inline;
-            }
-            if spec.shell && ch == 's' {
-                return stdin;
-            }
-            if spec.module == Some(ch) {
-                return None;
-            }
-            if spec.value_opts.contains(ch) {
-                if cluster[i + ch.len_utf8()..].is_empty() {
-                    it.next();
-                }
-                break;
-            }
-        }
-    }
-    stdin
-}
-
-fn base(s: &str) -> &str {
-    s.rsplit('/').next().unwrap_or(s)
-}
-
-/// Reject commands that execute code we cannot see, directly or through a
-/// wrapper (wrapper argv is kept as written; we only look through it).
-fn reject_unanalyzable(argv: &[String]) -> Result<(), Unparseable> {
-    if argv[0].contains('$') || argv[0].contains('`') {
-        return Err(Unparseable(format!("dynamic command name `{}`", argv[0])));
-    }
-    let single_dash =
-        |w: &String, flag: char| w.starts_with('-') && !w.starts_with("--") && w.contains(flag);
-    let bad = |a: &[String]| -> Option<&'static str> {
-        let name = base(&a[0]);
-        match name {
-            "eval" | "source" | "." | "trap" | "coproc" => Some("runs a string as code"),
-            _ if SHELL_RUNNERS.contains(&name) => Some("runs its arguments through a shell"),
-            "env"
-                if a[1..]
-                    .iter()
-                    .any(|w| w.starts_with("--split-string") || single_dash(w, 'S')) =>
-            {
-                Some("splits a string into a command")
-            }
-            "flock"
-                if a[1..]
-                    .iter()
-                    .any(|w| w.starts_with("--command") || single_dash(w, 'c')) =>
-            {
-                Some("runs its arguments through a shell")
-            }
-            _ => interpreter_reason(a),
-        }
-    };
-    let found = bad(argv).or_else(|| {
-        let name = base(&argv[0]);
-        // `command -v x` only looks `x` up.
-        let lookup = name == "command"
-            && argv[1..]
-                .iter()
-                .any(|w| single_dash(w, 'v') || single_dash(w, 'V'));
-        if !WRAPPERS.contains(&name) || lookup {
-            return None;
-        }
-        if argv[1..].iter().any(|w| w.contains(['$', '`'])) {
-            return Some("may run a dynamic command");
-        }
-        // Conservative: through a wrapper, any later word may be the inner command.
-        (1..argv.len()).find_map(|i| bad(&argv[i..]))
-    });
-    match found {
-        Some(why) => Err(Unparseable(format!("`{}` {why}", argv.join(" ")))),
-        None => Ok(()),
-    }
 }
 
 fn redirect_of(node: Node, src: &[u8]) -> Result<Option<Redirect>, Unparseable> {

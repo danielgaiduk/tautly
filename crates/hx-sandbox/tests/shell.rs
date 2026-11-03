@@ -457,6 +457,174 @@ fn backquotes_in_unquoted_heredoc_bodies_are_unparseable() {
     ] {
         assert!(parse_commands(s).is_ok(), "{s}");
     }
-    let c = parse_commands("cat <<EOF\n$(rm x)\nEOF\n").unwrap();
-    assert_eq!(argv0s(&c), ["cat", "rm"]);
+    // Round 2 ruling: any `$` in an unquoted body fails closed (see below).
+    assert!(parse_commands("cat <<EOF\n$(rm x)\nEOF\n").is_err());
+}
+
+// ---- checkpoint fix round 2 ----
+
+#[test]
+fn any_expansion_in_an_unquoted_heredoc_body_is_unparseable() {
+    for s in [
+        "echo='a[$(touch pwn)]'; cat <<XEOF\n$((echo))\nXEOF\n",
+        "cat <<XEOF\n$(( echo ))\nXEOF\n",
+        "cat <<XEOF\n$[echo]\nXEOF\n",
+        "cat <<XEOF\n$((1))\nXEOF\n",
+        "cat <<XEOF\n${a[$x]}\nXEOF\n",
+        "cat <<XEOF\n${x@P}\nXEOF\n",
+        "cat <<XEOF\nhome is $HOME\nXEOF\n",
+        "cat <<XEOF > out.txt\n$(id)\nXEOF\n",
+    ] {
+        assert!(parse_commands(s).is_err(), "{s}");
+    }
+    for s in [
+        "cat <<'XEOF'\n$((echo)) $(id) $HOME\nXEOF\n",
+        "cat <<\"XEOF\"\n$(id)\nXEOF\n",
+        "cat <<XEOF\nplain text only\nXEOF\n",
+    ] {
+        assert!(parse_commands(s).is_ok(), "{s}");
+    }
+}
+
+#[test]
+fn name_operands_assigning_dangerous_variables_are_unparseable() {
+    for s in [
+        "for PATH in ./evilbin; do ls; done",
+        "for HOME in /tmp/evil; do git status; done",
+        "select PATH in /tmp/evil; do ls; done",
+        "for PS4 in '$(touch x)'; do set -x; ls; done",
+        "read PATH <<< /tmp/evil; ls",
+        "read -r IFS <<< x; ls",
+        "read -a LD_LIBRARY_PATH < f",
+        "printf -v PATH %s /tmp/evil; ls",
+        "getopts a PATH; ls",
+        "mapfile -t PATH < f",
+        "readarray BASH_ENV < f",
+        "export LD_PRELOAD; ls",
+        "declare -x GIT_DIR",
+        "local PATH",
+        "readonly IFS",
+        "typeset -x PYTHONPATH",
+        "for XDG_CONFIG_HOME in /tmp; do git status; done",
+        "for SHELLOPTS in x; do :; done",
+        "for BASHOPTS in x; do :; done",
+    ] {
+        assert!(parse_commands(s).is_err(), "{s}");
+    }
+    for s in [
+        "for f in a b; do echo $f; done",
+        "read -r line < f",
+        "printf -v out %s x",
+        "export FOO",
+        "unset PATH_TMP",
+    ] {
+        assert!(parse_commands(s).is_ok(), "{s}");
+    }
+}
+
+#[test]
+fn transformation_operators_in_expansions_are_unparseable() {
+    for s in [
+        "echo \"${x@P}\"",
+        "echo ${x@P}",
+        "echo ${a[@]@Q}",
+        "echo ${x@E}",
+    ] {
+        assert!(parse_commands(s).is_err(), "{s}");
+    }
+    assert!(parse_commands("echo ${@} ${@:2} ${a[@]} ${#a[@]}").is_ok());
+}
+
+#[test]
+fn interpreter_device_paths_process_substitution_and_unknown_options_are_unparseable() {
+    for s in [
+        "bash /dev/stdin <<< 'x'",
+        "bash /dev/fd/0 <<< 'x'",
+        "bash /proc/self/fd/0",
+        "bash -O extglob -- /dev/stdin",
+        "sh -e /dev/stdin",
+        "env bash /dev/stdin",
+        "cat x | bash /dev/stdin",
+        "true | bash /dev/stdin",
+        "bash <(echo x)",
+        "python3 /dev/stdin <<XEOF\nimport os\nXEOF\n",
+        "python3 -X dev /dev/stdin",
+        "ruby /dev/stdin",
+        "perl /dev/stdin",
+        "node /dev/stdin",
+        "bash \"$script\"",
+        "perl -I lib <<< 'x'",
+        "node -C dev <<< 'x'",
+        "python3 -m code <<< 'import os'",
+        "python3 -m code < f",
+        "echo x | python3 -m code",
+        "python3 -Z x.py",
+        "bash -j x.sh",
+        "node --frobnicate x.js",
+        "timeout 5 python3 -m code <<< x",
+    ] {
+        assert!(parse_commands(s).is_err(), "{s}");
+    }
+    for s in [
+        "bash -o posix script.sh",
+        "bash -ex script.sh",
+        "bash --norc --noprofile script.sh",
+        "python3 -u -B -X dev x.py",
+        "python3 -m pytest -q",
+        "python3 -OO x.py",
+        "perl -Ilib -w x.pl",
+        "perl -I lib x.pl",
+        "node --inspect x.js",
+        "node -r ts-node/register x.ts",
+        "ruby -w x.rb",
+        "cat x | python3 script.py",
+        "python3 script.py < in.txt",
+    ] {
+        assert!(parse_commands(s).is_ok(), "{s}");
+    }
+}
+
+#[test]
+fn more_wrappers_and_xargs_into_runners_are_unparseable() {
+    for s in [
+        "arch -arm64 bash -c 'x'",
+        "xcrun bash -c x",
+        "sandbox-exec -p '(version 1)' sh -c x",
+        "systemd-run --user sh -c x",
+        "setpriv --reuid 1 sh -c x",
+        "prlimit --nofile=10 sh -c x",
+        "fakeroot sh -c x",
+        "doas sh -c x",
+        "arch $CMD",
+        "echo \"sh -c id\" | xargs env",
+        "echo x | xargs sudo",
+        "echo x | xargs -n1 bash",
+        "echo x | xargs python3",
+        "echo x | xargs nice",
+    ] {
+        assert!(parse_commands(s).is_err(), "{s}");
+    }
+    for s in [
+        "arch -arm64 cargo build",
+        "echo a | xargs rm",
+        "find src -name '*.o' | xargs rm -f",
+    ] {
+        assert!(parse_commands(s).is_ok(), "{s}");
+    }
+}
+
+#[test]
+fn builtins_that_load_or_run_code_are_unparseable() {
+    for s in [
+        "compgen -C 'touch x' x",
+        "compgen -F f x",
+        "compgen -A file -C x y",
+        "enable -f ./evil.so evil",
+        "bind -x '\"\\C-t\": touch x'",
+    ] {
+        assert!(parse_commands(s).is_err(), "{s}");
+    }
+    for s in ["compgen -A file", "enable -n echo", "bind -l"] {
+        assert!(parse_commands(s).is_ok(), "{s}");
+    }
 }
