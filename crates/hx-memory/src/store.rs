@@ -243,9 +243,21 @@ impl MemoryStore {
     /// error is available from [`staleness_error`](Self::staleness_error) until the next
     /// check.
     pub fn refresh_staleness(&mut self) -> usize {
+        let all: Vec<usize> = (0..self.entries.len()).collect();
+        self.recheck(&all);
+        self.entries.iter().filter(|e| e.stale).count()
+    }
+
+    /// Re-check the anchors of the entries at `which` (indices into `entries`).
+    fn recheck(&mut self, which: &[usize]) {
         let index = &self.index;
         let mut error = None;
-        for e in &mut self.entries {
+        for e in self
+            .entries
+            .iter_mut()
+            .enumerate()
+            .filter_map(|(i, e)| which.contains(&i).then_some(e))
+        {
             let mut stale = false;
             let mut unknown = false;
             for a in &e.anchors {
@@ -267,7 +279,6 @@ impl MemoryStore {
             }
         }
         self.staleness_error = error;
-        self.entries.iter().filter(|e| e.stale).count()
     }
 
     /// One line per entry (`- [kind] title`, plus ` [stale]`), oldest first, within
@@ -565,6 +576,40 @@ impl MemoryStore {
             }
         }
         hits
+    }
+
+    /// Like [`search`](Self::search), after re-checking the anchors of the entries it would
+    /// return (and only those: a check is an index query per anchor, so checking the whole
+    /// store would hold the shared index connection for up to 500 entries). Other entries
+    /// keep the flag of their last check, and [`staleness_error`](Self::staleness_error)
+    /// describes this check.
+    pub fn search_fresh(
+        &mut self,
+        query: &str,
+        k: usize,
+        cap_tokens: u32,
+        est: &dyn Fn(&str) -> u32,
+    ) -> Vec<Hit> {
+        let terms = search::query_terms(query);
+        if terms.is_empty() || k == 0 {
+            return Vec::new();
+        }
+        let returned: Vec<usize> = {
+            let episodes = self.episodes();
+            let docs: Vec<&Doc> = self
+                .docs
+                .iter()
+                .chain(episodes.iter().map(|e| &e.doc))
+                .collect();
+            search::rank(&docs, &terms)
+                .into_iter()
+                .take(k)
+                .map(|(i, _)| i)
+                .filter(|i| *i < self.entries.len())
+                .collect()
+        };
+        self.recheck(&returned);
+        self.search(query, k, cap_tokens, est)
     }
 
     /// Write the episode of `session_id` (replacing an earlier one); returns its path.

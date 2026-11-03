@@ -124,16 +124,21 @@ impl Tool for RecallTool {
             return ToolResult::error("memory is not available in this session");
         };
         // Index queries and the first read of the episode files block: keep them off the
-        // async threads. Staleness is re-checked so edits made this session show.
+        // async threads. `search_fresh` re-checks the staleness of the entries it returns
+        // (not of every entry) so edits made this session show.
         let output = tokio::task::spawn_blocking(move || {
             let mut store = memory.write().unwrap_or_else(|e| e.into_inner());
-            store.refresh_staleness();
-            let note = store.staleness_error().map(str::to_string);
             // Escaping can lengthen the text, so search again with less if the whole output
-            // would not fit.
+            // would not fit; only the first pass queries the index.
             let mut budget = RECALL_TEXT_TOKENS;
+            let mut first = true;
             loop {
-                let hits = store.search(&query, RECALL_TOP_K, budget, &est);
+                let hits = if std::mem::take(&mut first) {
+                    store.search_fresh(&query, RECALL_TOP_K, budget, &est)
+                } else {
+                    store.search(&query, RECALL_TOP_K, budget, &est)
+                };
+                let note = store.staleness_error().map(str::to_string);
                 let out = format_hits(&hits, note.as_deref());
                 let tokens = est(&out);
                 if tokens <= RECALL_MAX_TOKENS || budget == 0 {

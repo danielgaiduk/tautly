@@ -379,3 +379,31 @@ async fn recall_says_when_staleness_could_not_be_checked() {
     assert!(r.output.contains("could not be re-checked"), "{}", r.output);
     assert!(!r.output.contains("STALE"), "{}", r.output);
 }
+
+#[tokio::test]
+async fn recall_rechecks_only_the_anchors_of_its_hits() {
+    // CP3 M11: a check is an index query per anchor, made under the store lock.
+    let e = env(&[("lib.rs", "fn a(){1}")]).await;
+    add(&e, "alpha anchored fact", "The alpha function.", true);
+    add(
+        &e,
+        "gamma plain fact",
+        "The gamma module is documented.",
+        false,
+    );
+    let db = rusqlite::Connection::open(e.db.path().join("index.db")).unwrap();
+    db.execute_batch("ALTER TABLE files RENAME TO files_gone")
+        .unwrap();
+    // The hit has no anchors, so the broken index is never asked.
+    let r = run(&e, &RecallTool, json!({"query": "gamma"})).await;
+    assert!(!r.is_error, "{}", r.output);
+    assert!(r.output.contains("gamma plain fact"), "{}", r.output);
+    assert!(
+        !r.output.contains("could not be re-checked"),
+        "{}",
+        r.output
+    );
+    // A hit with an anchor is checked, and the failure is reported.
+    let r = run(&e, &RecallTool, json!({"query": "alpha"})).await;
+    assert!(r.output.contains("could not be re-checked"), "{}", r.output);
+}

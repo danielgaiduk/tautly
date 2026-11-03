@@ -1080,3 +1080,91 @@ async fn updating_by_id_without_anchors_keeps_and_rehashes_them() {
     assert_eq!(anchors.len(), 1);
     assert_eq!(anchors[0].symbol.as_deref(), Some("b"));
 }
+
+// ------------------------------------------------------------------ search_fresh (CP3 M11)
+
+/// Two entries on `alpha`/`beta` code, plus the code changed under both anchors.
+async fn two_stale_entries() -> (Env, String, String) {
+    let mut e = setup(&[("a.rs", "fn a(){1}"), ("b.rs", "fn b(){1}")]).await;
+    let mut da = draft_anchored("a.rs", Some("a"));
+    da.title = "alpha note".into();
+    da.body = "alpha explained".into();
+    let mut db = draft_anchored("b.rs", Some("b"));
+    db.title = "beta note".into();
+    db.body = "beta explained".into();
+    let ia = add(&mut e.store, da);
+    let ib = add(&mut e.store, db);
+    fs::write(e.project.path().join("a.rs"), "fn a(){2}").unwrap();
+    fs::write(e.project.path().join("b.rs"), "fn b(){2}").unwrap();
+    e.index.reindex_file(Path::new("a.rs")).await.unwrap();
+    e.index.reindex_file(Path::new("b.rs")).await.unwrap();
+    (e, ia, ib)
+}
+
+fn flag_of(m: &MemoryStore, id: &str) -> bool {
+    m.entries().iter().find(|e| e.id == id).unwrap().stale
+}
+
+#[tokio::test]
+async fn search_fresh_rechecks_only_the_returned_entries() {
+    let (mut e, ia, ib) = two_stale_entries().await;
+    let hits = e.store.search_fresh("alpha", 5, 2000, &est);
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].source, HitSource::Project(ia.clone()));
+    assert!(hits[0].stale, "the returned entry is checked");
+    assert!(flag_of(&e.store, &ia));
+    assert!(
+        !flag_of(&e.store, &ib),
+        "an entry that was not returned is not re-checked"
+    );
+    // A full check still sees both.
+    assert_eq!(e.store.refresh_staleness(), 2);
+}
+
+#[tokio::test]
+async fn search_fresh_checks_only_the_top_k() {
+    let (mut e, ia, ib) = two_stale_entries().await;
+    // Both match; only the best one (a shorter, denser alpha document) is returned.
+    let hits = e.store.search_fresh("note explained", 1, 2000, &est);
+    assert_eq!(hits.len(), 1);
+    let returned = match &hits[0].source {
+        HitSource::Project(id) => id.clone(),
+        other => panic!("{other:?}"),
+    };
+    let other = if returned == ia { &ib } else { &ia };
+    assert!(flag_of(&e.store, &returned));
+    assert!(!flag_of(&e.store, other));
+}
+
+#[tokio::test]
+async fn search_fresh_does_not_touch_the_index_for_unanchored_hits() {
+    let mut e = setup(&[("a.rs", "fn a(){1}")]).await;
+    let mut anchored = draft_anchored("a.rs", Some("a"));
+    anchored.title = "anchored one".into();
+    add(&mut e.store, anchored);
+    let mut plain = draft("plain gamma", MemoryKind::Fact, "gamma explained");
+    plain.anchors = vec![];
+    add(&mut e.store, plain);
+    // Break the index. A full check would report it; a search that returns only the
+    // unanchored entry never queries it.
+    let conn = rusqlite::Connection::open(e.db.path().join("index.db")).unwrap();
+    conn.execute_batch("ALTER TABLE files RENAME TO files_gone")
+        .unwrap();
+    let hits = e.store.search_fresh("gamma", 5, 2000, &est);
+    assert_eq!(hits.len(), 1);
+    assert_eq!(e.store.staleness_error(), None);
+    // The anchored entry's turn comes when it is returned.
+    e.store.search_fresh("anchored", 5, 2000, &est);
+    assert!(e.store.staleness_error().is_some());
+}
+
+#[tokio::test]
+async fn search_fresh_clears_a_flag_whose_code_was_restored() {
+    let (mut e, ia, _) = two_stale_entries().await;
+    assert!(e.store.search_fresh("alpha", 5, 2000, &est)[0].stale);
+    fs::write(e.project.path().join("a.rs"), "fn a(){1}").unwrap();
+    e.index.reindex_file(Path::new("a.rs")).await.unwrap();
+    let hits = e.store.search_fresh("alpha", 5, 2000, &est);
+    assert!(!hits[0].stale);
+    assert!(!flag_of(&e.store, &ia));
+}
