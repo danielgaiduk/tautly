@@ -2,7 +2,7 @@
 //!
 //! Project memory is one markdown file per entry in `<project>/.tautly/memory/<id>.md`
 //! (YAML frontmatter, shareable via git). Episodes are private session summaries in
-//! `<data_home>/memory/<project_hash>/episodes/<session-id>.md`. Every file is written
+//! `<data_home>/memory/<project_id>/episodes/<session-id>.md`. Every file is written
 //! atomically (temp file + rename) with mode 0600 in directories of mode 0700.
 
 mod consolidate;

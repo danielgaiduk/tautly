@@ -100,7 +100,7 @@ impl Tool for WriteTool {
         let shown = shown_path(sb, &full, &a.path);
         let diff = display_diff(&[(shown, pre_image.as_deref(), Some(a.content.as_bytes()))]).await;
         let mut r = ToolResult::ok(output);
-        r.applied_diff = Some(diff);
+        r.applied_diff = Some(Box::new(diff));
         r.effects.push(AppliedEffect::Edited {
             path: full,
             pre_image,

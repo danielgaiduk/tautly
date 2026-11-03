@@ -278,13 +278,13 @@ Structured record: task, plan steps with status, files read/edited with content 
     - The session-start `Checkpoint` record (7.11.11) carries the authoritative head, dirty state and tree.
     - A later `Labeled{label}` record renames the session (the last one wins).
   - **H5, prefix inputs:** `PrefixApplied{agents_md?, repo_map?, system_prompt_hash, tools_hash}` is written before the first request, and again before any request whose stable-prefix inputs changed (for example MCP tools joining, a model switch changing the edit format).
-    - `agents_md` and `repo_map` are blobs of the exact text sent.
+    - `agents_md` and `repo_map` are blobs of the raw text the context holds (none when absent): the content of the `<agents_md>` and `<repo_map>` blocks, without the tags the request wraps it in, so resume can restore it unchanged. `system_prompt_hash` is the blake3 of the system prompt block as sent, `tools_hash` that of the serialized tool list.
     - Resume, rewind and replay use the logged text and never regenerate it.
     - If the current binary's system prompt or tool schemas hash differently, resume warns that the cache will be cold.
   - **H6, richer `Request`:** `Request{hash, turn, step, model, blocks: {stable, pinned, history, tail}}`. `turn` is the user turn, `step` the absolute provider step, and `blocks` the blake3 of each block.
   - **H7, edits and undo are logged and reversible:**
-    - `Edit` and `PersistedEffect::Edited` carry `post_image_blob`, the written content (deduped).
-    - Undo appends `Undone{turn, files: [{path, from_blob?, to?}], backup_ref?}` after storing each file's current content (`from_blob`), so undone states can be restored.
+    - `Edit` and `PersistedEffect::Edited` carry `post_image_blob`, the written content (deduped). `Edit.step` is the provider step it happened in (map steps to user turns through the `Request` records).
+    - Undo appends `Undone{turn, files: [{path, from_blob?, from_mode?, to?, to_mode?}], backup_ref?}` after storing each file's current content (`from_blob`, with its mode), so undone states can be restored.
   - **H8, approval requests:** `ApprovalRequested{request_id, kind: tool|mcp_server|memory, call_id?, reason}` is logged before its event is emitted.
   - **H9, point-in-time rebuild:** `rebuild(reader, until)` cuts at any step boundary and synthesizes `cancelled` results for open calls. `Fork{at?, label?}` branches from any step.
   - **H10, project id:** sessions and blobs are keyed by `<project-id>` (above). The header's `root` names the worktree.

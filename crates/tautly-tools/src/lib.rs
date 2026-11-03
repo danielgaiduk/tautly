@@ -140,7 +140,8 @@ pub struct ToolResult {
     pub effects: Vec<AppliedEffect>,
     pub meta: ToolMeta,
     /// The diff a successful `edit` or `write` applied (spec 7.11.4).
-    pub applied_diff: Option<DiffPreview>,
+    /// Boxed to keep `ToolResult` small (it is the error type of many helpers).
+    pub applied_diff: Option<Box<DiffPreview>>,
 }
 
 impl ToolResult {

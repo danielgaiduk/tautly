@@ -468,7 +468,7 @@ async fn commit(p: Prepared, sb: &dyn Sandbox, cx: &ToolCx) -> ToolResult {
         output.push_str(&w);
     }
     let mut r = ToolResult::ok(output);
-    r.applied_diff = Some(diff);
+    r.applied_diff = Some(Box::new(diff));
     r.effects.push(AppliedEffect::Edited {
         path: file.full,
         pre_image: Some(file.original),
@@ -895,7 +895,7 @@ async fn commit_patch(
     lines.extend(warnings);
     let mut r = ToolResult::ok(lines.join("\n"));
     r.effects = effects;
-    r.applied_diff = Some(diff);
+    r.applied_diff = Some(Box::new(diff));
     r
 }
 

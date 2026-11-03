@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use tautly_session::{
-    BlobRef, Error, SCHEMA_VERSION, SessionReader, SessionWriter, list_in, paths,
+    BlobRef, Error, HeaderInit, SCHEMA_VERSION, SessionReader, SessionWriter, list_in, paths,
 };
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -33,13 +33,14 @@ impl Env {
         }
     }
     fn writer(&self) -> SessionWriter<Rec> {
-        SessionWriter::create_in(self.data.path(), self.project.path(), None).unwrap()
+        SessionWriter::create_in(self.data.path(), self.project.path(), HeaderInit::default())
+            .unwrap()
     }
     fn project_dir(&self) -> PathBuf {
         self.data
             .path()
             .join("sessions")
-            .join(paths::project_hash(self.project.path()))
+            .join(paths::project_id(self.project.path()))
     }
 }
 
@@ -285,7 +286,10 @@ fn fork_header_references_parent_offset() {
     let fork = SessionWriter::<Rec>::create_in(
         env.data.path(),
         env.project.path(),
-        Some((parent.session_id().to_string(), 1)),
+        HeaderInit {
+            parent: Some((parent.session_id().to_string(), 1)),
+            ..HeaderInit::default()
+        },
     )
     .unwrap();
     let r = SessionReader::<Rec>::open(fork.path()).unwrap();
@@ -346,7 +350,8 @@ fn two_writers_same_project_do_not_collide() {
         .map(|n| {
             let (data, project) = (data.clone(), project.clone());
             std::thread::spawn(move || {
-                let mut w = SessionWriter::<Rec>::create_in(&data, &project, None).unwrap();
+                let mut w = SessionWriter::<Rec>::create_in(&data, &project, HeaderInit::default())
+                    .unwrap();
                 for i in 0..50 {
                     w.append(&msg(&format!("w{n}-{i}"))).unwrap();
                 }
@@ -399,7 +404,7 @@ fn data_home_precedence_and_default_create_uses_it() {
 
     // The default constructors follow TAUTLY_HOME.
     let project = tempfile::tempdir().unwrap();
-    let w = SessionWriter::<Rec>::create(project.path(), None).unwrap();
+    let w = SessionWriter::<Rec>::create(project.path(), HeaderInit::default()).unwrap();
     assert!(w.path().starts_with(tautly.path().join("sessions")));
     assert_eq!(tautly_session::list(project.path()).unwrap().len(), 1);
     drop(w);

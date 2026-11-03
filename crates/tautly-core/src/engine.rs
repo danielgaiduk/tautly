@@ -25,7 +25,7 @@ use std::time::Duration;
 use tautly_context::Context;
 use tautly_provider::{Catalog, Provider, Retrying};
 use tautly_sandbox::{LocalSandbox, Policy, PolicyError, Sandbox, SandboxError};
-use tautly_session::SessionWriter;
+use tautly_session::{HeaderInit, SessionWriter};
 use tautly_tools::{ProcessGroups, ReadTracker, registry};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -182,7 +182,12 @@ impl EngineBuilder {
                 .map_err(EngineError::Provider)?,
         };
         let provider: Arc<dyn Provider> = Arc::new(Retrying::new(provider));
-        let writer = SessionWriter::<SessionRecord>::create_in(&data_home, &root, None)?;
+        let init = HeaderInit {
+            model: Some(config.model.as_str().to_string()),
+            config_hash: Some(config.hash()),
+            ..HeaderInit::default()
+        };
+        let writer = SessionWriter::<SessionRecord>::create_in(&data_home, &root, init)?;
         let session_id = writer.session_id().to_string();
         let session_path = writer.path().to_path_buf();
 
@@ -221,6 +226,8 @@ impl EngineBuilder {
             latest_compaction: None,
             pending_memory_index: None,
             untracked_paths: HashSet::new(),
+            user_turn: 0,
+            prefix_log: Default::default(),
             last_request_path: last_request_path(&session_path),
             index_error_reported: false,
             session_id: session_id.clone(),

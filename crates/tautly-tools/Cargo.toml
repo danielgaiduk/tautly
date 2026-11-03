@@ -11,6 +11,8 @@ tautly-sandbox = { path = "../tautly-sandbox" }
 tautly-provider = { path = "../tautly-provider" }
 tautly-index = { path = "../tautly-index" }
 tautly-memory = { path = "../tautly-memory" }
+# Only for `RelPath` in `PersistedEffect` (the session-log form of an effect).
+tautly-session = { path = "../tautly-session" }
 async-trait.workspace = true
 thiserror.workspace = true
 tokio.workspace = true

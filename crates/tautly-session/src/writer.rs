@@ -4,15 +4,18 @@ use std::marker::PhantomData;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 use serde::de::DeserializeOwned;
+use serde_json::value::RawValue;
 use ulid::Ulid;
 
 use crate::blobs::{BlobRef, BlobStore};
+use crate::git;
 use crate::paths;
 use crate::reader::SessionReader;
-use crate::record::{Header, LineRef, SCHEMA_VERSION};
+use crate::record::{GitState, Header, HeaderInit, LineRef, SCHEMA_VERSION};
 use crate::{Error, Result};
 
 /// Destination of the log bytes: a file in production, a fault-injecting
@@ -62,30 +65,27 @@ pub struct SessionWriter<R: Serialize> {
     header: Header,
     path: PathBuf,
     next_offset: u64,
+    /// The `t` of the last record written: `t` never goes backwards within a log.
+    last_t: u64,
     blobs: BlobStore,
     poisoned: AtomicBool,
     _record: PhantomData<fn(&R)>,
 }
 
 impl<R: Serialize> SessionWriter<R> {
-    /// Create a new session for the project at `root` under [`paths::data_home`].
-    /// `parent` marks a fork: (parent session id, parent record offset).
-    pub fn create(root: &Path, parent: Option<(String, u64)>) -> Result<Self> {
-        Self::create_in(&paths::data_home()?, root, parent)
+    /// Create a new session for the project at `root` under [`paths::data_home`], with
+    /// the header fields `init` decides (a fork's parent, label, origin, model, ...).
+    pub fn create(root: &Path, init: HeaderInit) -> Result<Self> {
+        Self::create_in(&paths::data_home()?, root, init)
     }
 
-    /// Like [`create`](Self::create) with an explicit data home.
-    pub fn create_in(data_home: &Path, root: &Path, parent: Option<(String, u64)>) -> Result<Self> {
-        let dir = paths::project_dir(data_home, root);
+    /// Like [`create`](Self::create) with an explicit data home. The log goes in the
+    /// directory of the root's [`project_id`](paths::project_id), shared by every
+    /// worktree of a repository. The git state is read from files (no git is run).
+    pub fn create_in(data_home: &Path, root: &Path, init: HeaderInit) -> Result<Self> {
+        let header = new_header(Ulid::new(), root, init);
+        let dir = paths::sessions_dir(data_home, &header.project);
         paths::create_private_dir_all(&dir)?;
-        let ulid = Ulid::new();
-        let header = Header {
-            schema_version: SCHEMA_VERSION,
-            session_id: ulid.to_string(),
-            created: ulid.datetime(),
-            root: paths::canonical_root(root),
-            parent,
-        };
         let path = dir.join(format!("{}.jsonl", header.session_id));
         let file = OpenOptions::new()
             .write(true)
@@ -93,7 +93,7 @@ impl<R: Serialize> SessionWriter<R> {
             .mode(0o600)
             .open(&path)?;
         lock_exclusive(&file, &path)?;
-        let mut w = Self::from_file(file, header, path, 0, BlobStore::new(&dir));
+        let mut w = Self::from_file(file, header, path, 0, 0, BlobStore::new(&dir));
         let line = encode(&LineRef::<R>::Header(&w.header))?;
         w.write_line(&line)?;
         w.checkpoint()?;
@@ -105,6 +105,7 @@ impl<R: Serialize> SessionWriter<R> {
         header: Header,
         path: PathBuf,
         next_offset: u64,
+        last_t: u64,
         blobs: BlobStore,
     ) -> Self {
         Self {
@@ -112,10 +113,44 @@ impl<R: Serialize> SessionWriter<R> {
             header,
             path,
             next_offset,
+            last_t,
             blobs,
             poisoned: AtomicBool::new(false),
             _record: PhantomData,
         }
+    }
+
+    /// The `t` to write for a record made at `t_ms`: never before the previous record's,
+    /// so `t` is non-decreasing within a log even when the clock steps back.
+    fn stamp(&mut self, t_ms: u64) -> u64 {
+        self.last_t = self.last_t.max(t_ms);
+        self.last_t
+    }
+
+    /// Copy the first `count` records of the log at `src` (a fork's parent) to the end of
+    /// this one, verbatim: each record's JSON is copied byte for byte (fields a newer
+    /// version added survive) and keeps its original `t`; offsets continue this log's.
+    /// Returns how many were copied (fewer when `src` has fewer). Buffered like
+    /// [`append`](Self::append).
+    pub fn copy_from(&mut self, src: &Path, count: u64) -> Result<u64> {
+        self.check_usable()?;
+        let reader = SessionReader::<Box<RawValue>>::open(src)?;
+        let mut copied = 0;
+        for entry in reader
+            .entries()
+            .take(usize::try_from(count).unwrap_or(usize::MAX))
+        {
+            let entry = entry?;
+            let line = encode(&LineRef::Record {
+                offset: self.next_offset,
+                t: self.stamp(entry.t_ms),
+                data: &entry.rec,
+            })?;
+            self.write_line(&line)?;
+            self.next_offset += 1;
+            copied += 1;
+        }
+        Ok(copied)
     }
 
     pub fn header(&self) -> &Header {
@@ -148,11 +183,17 @@ impl<R: Serialize> SessionWriter<R> {
         self.out.write_all(line).map_err(|e| self.poison(e))
     }
 
-    /// Buffer one record; returns its 0-based offset.
+    /// Buffer one record, stamped with the current time (clamped so `t` never goes back);
+    /// returns its 0-based offset.
     pub fn append(&mut self, rec: &R) -> Result<u64> {
         self.check_usable()?;
         let offset = self.next_offset;
-        let line = encode(&LineRef::Record { offset, data: rec })?;
+        let t = self.stamp(now_ms());
+        let line = encode(&LineRef::Record {
+            offset,
+            t,
+            data: rec,
+        })?;
         self.write_line(&line)?;
         self.next_offset += 1;
         Ok(offset)
@@ -186,9 +227,9 @@ impl<R: Serialize + DeserializeOwned> SessionWriter<R> {
         let file = OpenOptions::new().append(true).open(path)?;
         lock_exclusive(&file, path)?;
         let reader = SessionReader::<R>::open(path)?;
-        let mut count = 0;
-        for rec in reader.records() {
-            rec?;
+        let (mut count, mut last_t) = (0, 0);
+        for entry in reader.entries() {
+            last_t = last_t.max(entry?.t_ms);
             count += 1;
         }
         if let Some(tail_start) = reader.tail_start() {
@@ -201,9 +242,42 @@ impl<R: Serialize + DeserializeOwned> SessionWriter<R> {
             reader.header().clone(),
             path.to_path_buf(),
             count,
+            last_t,
             BlobStore::new(dir),
         ))
     }
+}
+
+/// The header of a new session `ulid` at `root`. The git directories are resolved once,
+/// for both the project id and the head.
+fn new_header(ulid: Ulid, root: &Path, init: HeaderInit) -> Header {
+    let dirs = git::dirs(root);
+    let git = dirs.as_ref().map(|d| GitState {
+        head: git::head(d),
+        dirty: None,
+    });
+    Header {
+        schema_version: SCHEMA_VERSION,
+        session_id: ulid.to_string(),
+        created: ulid.datetime(),
+        root: paths::canonical_root(root),
+        parent: init.parent,
+        project: paths::project_id_with(root, dirs.as_ref()),
+        label: init.label,
+        origin: init.origin,
+        git,
+        tautly_version: env!("CARGO_PKG_VERSION").to_string(),
+        model: init.model,
+        config_hash: init.config_hash,
+        tags: init.tags,
+    }
+}
+
+/// Unix milliseconds now (0 before 1970, which only a broken clock gives).
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
 }
 
 fn encode<R: Serialize>(line: &LineRef<'_, R>) -> Result<Vec<u8>> {
@@ -249,15 +323,10 @@ mod tests {
     fn writer(sink: Failing, blob_dir: &Path) -> SessionWriter<String> {
         SessionWriter {
             out: BufWriter::new(Box::new(sink)),
-            header: Header {
-                schema_version: SCHEMA_VERSION,
-                session_id: "X".into(),
-                created: std::time::SystemTime::now(),
-                root: PathBuf::from("/"),
-                parent: None,
-            },
+            header: new_header(Ulid::new(), Path::new("/"), HeaderInit::default()),
             path: PathBuf::from("/nonexistent"),
             next_offset: 0,
+            last_t: 0,
             blobs: BlobStore::new(blob_dir),
             poisoned: AtomicBool::new(false),
             _record: PhantomData,

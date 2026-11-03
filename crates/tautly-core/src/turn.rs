@@ -26,13 +26,14 @@ use tautly_provider::{
     CanonicalRequest, Content, Message, ProviderError, ProviderEvent, Quota, RawUsage, Role,
     StopReason, cost_usd,
 };
+use tautly_session::RelPath;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::approvals::Approvals;
 use crate::ledger::Row;
 use crate::protocol::{BudgetScope, Command, ErrorKind, Event, FinishReason, UsageRole};
-use crate::record::{SessionRecord, storable};
+use crate::record::SessionRecord;
 use crate::session::Session;
 
 /// A response that breaks off after content is sent again at most this many times.
@@ -291,6 +292,7 @@ impl Session {
         });
         self.apply_startup().await;
         self.evidence = self.evidence.fresh();
+        self.user_turn += 1;
         self.emit(Event::TurnStarted).await;
         self.budgets
             .lock()
@@ -350,7 +352,7 @@ impl Session {
                 return FinishReason::Budget;
             }
             let turn = self.context.next_turn();
-            self.log_request(&req).await;
+            self.log_request(&req, turn).await;
             let sent_at = Instant::now();
             let resp = match self.stream(req, u64::from(status.used), ctl).await {
                 Ok(r) => r,
@@ -583,11 +585,14 @@ impl Session {
         for p in &rec.forgotten_paths {
             self.reads.forget_path(p);
         }
-        let (paths, skipped): (Vec<_>, Vec<_>) = rec
-            .forgotten_paths
-            .iter()
-            .cloned()
-            .partition(|p| storable(p));
+        let mut paths = Vec::with_capacity(rec.forgotten_paths.len());
+        let mut skipped = Vec::new();
+        for p in &rec.forgotten_paths {
+            match RelPath::from_abs(self.root(), p) {
+                Some(rel) => paths.push(rel),
+                None => skipped.push(p.clone()),
+            }
+        }
         self.untracked(skipped).await;
         self.log(SessionRecord::GcApplied {
             elided: rec

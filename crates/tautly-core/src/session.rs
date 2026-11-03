@@ -9,8 +9,8 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, SystemTime};
 
 use tautly_context::pinned::{self, PinSource, Pinned};
-use tautly_context::{CompactionRecord, Context, agents_md};
-use tautly_provider::{CanonicalRequest, ModelId, ModelInfo, Provider, ToolSpec};
+use tautly_context::{CompactionRecord, Context, Turn, agents_md};
+use tautly_provider::{Block, CanonicalRequest, ModelId, ModelInfo, Provider, ToolSpec};
 use tautly_sandbox::{Policy, Sandbox, cleanup_spills};
 use tautly_session::{BlobRef, SessionWriter};
 use tautly_tools::{ProcessGroups, ReadTracker, Tool};
@@ -23,7 +23,7 @@ use crate::budget::Budgets;
 use crate::evidence::EvidenceTracker;
 use crate::ledger::CostLedger;
 use crate::protocol::{Command, ErrorKind, Event};
-use crate::record::SessionRecord;
+use crate::record::{BlockHashes, SessionRecord};
 use crate::workspace::Workspace;
 
 /// How long the first request waits for the repo map and the memory index (Task 38 note):
@@ -305,8 +305,12 @@ pub(crate) struct Session {
     /// The provider whose reasoning items the history holds; a request to another provider
     /// first strips them (they are provider-specific).
     pub history_provider: String,
-    /// Non-UTF-8 paths already reported as not tracked.
+    /// Paths already reported as not tracked (outside the root, or not valid UTF-8).
     pub untracked_paths: HashSet<PathBuf>,
+    /// User turns started in this session (1-based once the first message runs).
+    pub user_turn: u32,
+    /// The stable-prefix inputs last logged (`PrefixApplied`).
+    pub prefix_log: PrefixLog,
     /// Where [`Session::log_request`] keeps the latest request.
     pub last_request_path: PathBuf,
     pub index_error_reported: bool,
@@ -381,28 +385,68 @@ impl Session {
         self.with_log(|l| l.checkpoint()).await;
     }
 
-    /// Log a request by its hash only, and keep the request itself, unsynced, in the
+    /// Log the request of provider step `step` by its hash only (with the user turn, the
+    /// model and the hash of each block, H6), and keep the request itself, unsynced, in the
     /// session's last-request file (for `prompt show --full`): a blob per request would
-    /// make the log grow with the square of the session length.
-    pub async fn log_request(&self, req: &CanonicalRequest) {
-        let bytes = serde_json::to_vec(req).unwrap_or_default();
-        let hash = BlobRef::parse(blake3::hash(&bytes).to_hex().as_str())
-            .expect("a blake3 hex digest is a blob reference");
-        let path = self.last_request_path.clone();
+    /// make the log grow with the square of the session length. A `PrefixApplied` record
+    /// goes first when the stable-prefix inputs differ from the last one logged (H5); it
+    /// counts as logged only once the write succeeded.
+    ///
+    /// The serializing and hashing (the whole request and history, every step) run off the
+    /// async workers, on copies taken here.
+    pub async fn log_request(&mut self, req: &CanonicalRequest, step: u32) {
+        let req = req.clone();
+        let history = self.context.history.clone();
+        let pinned = pinned::render(&self.context.pinned);
+        let agents_md = self.context.agents_md.clone();
+        let repo_map = self.context.repo_map.clone();
+        let prefix_log = self.prefix_log.clone();
+        let (turn, path) = (self.user_turn, self.last_request_path.clone());
+        let logged = self
+            .with_log(move |l| {
+                let prefix = prefix_log.due(agents_md.as_deref(), repo_map.as_deref(), &req);
+                if let Some((rec, texts)) = &prefix {
+                    for t in texts {
+                        l.blob(t.as_bytes())?;
+                    }
+                    l.append(rec)?;
+                }
+                let bytes = serde_json::to_vec(&req).unwrap_or_default();
+                let rec = SessionRecord::Request {
+                    hash: blob_ref(&bytes),
+                    turn,
+                    step,
+                    model: req.model.clone(),
+                    blocks: block_hashes(&pinned, &history, &req),
+                };
+                write_private(&path, &bytes);
+                l.append(&rec)?;
+                Ok(prefix.map(|(rec, _)| rec))
+            })
+            .await;
+        if let Some(Some(rec)) = logged {
+            self.prefix_log.logged(rec);
+        }
+    }
+
+    /// Log a question to the user (an `ApprovalRequested` record) durably, before its
+    /// event is shown (H8). Waiting for the user follows, so the fsync costs nothing felt.
+    pub async fn log_approval(&self, rec: SessionRecord) {
         self.with_log(move |l| {
-            write_private(&path, &bytes);
-            l.append(&SessionRecord::Request { hash })
+            l.append(&rec)?;
+            l.checkpoint()
         })
         .await;
     }
 
-    /// Say once per path that a non-UTF-8 path is left out of the log.
+    /// Say once per path that a path a record cannot hold (outside the root, or not valid
+    /// UTF-8) is left out of the log.
     pub async fn untracked(&mut self, paths: Vec<PathBuf>) {
         for p in paths {
             if self.untracked_paths.insert(p.clone()) {
                 self.warn(format!(
-                    "non-UTF-8 path not tracked: {} (the change applies, but resume and undo \
-                     will not know about it)",
+                    "path not tracked: {} (outside the project root or not valid UTF-8; the \
+                     change applies, but resume and undo will not know about it)",
                     p.to_string_lossy()
                 ))
                 .await;
@@ -572,6 +616,77 @@ impl Session {
     }
 }
 
+/// The stable-prefix inputs last logged, to log `PrefixApplied` again only when they
+/// change (spec 6.5 H5). A record counts once [`logged`](Self::logged): one whose write
+/// failed is due again.
+#[derive(Clone, Default)]
+pub(crate) struct PrefixLog {
+    last: Option<SessionRecord>,
+}
+
+impl PrefixLog {
+    /// When the inputs of `req` (built with this AGENTS.md text and repo map) differ from
+    /// the last logged: the `PrefixApplied` record to log and the texts its blobs name.
+    pub fn due(
+        &self,
+        agents_md: Option<&str>,
+        repo_map: Option<&str>,
+        req: &CanonicalRequest,
+    ) -> Option<(SessionRecord, Vec<String>)> {
+        let system = match req.system.first() {
+            Some(Block::Text(t)) => t.as_str(),
+            _ => "",
+        };
+        let rec = SessionRecord::PrefixApplied {
+            agents_md: agents_md.map(|t| blob_ref(t.as_bytes())),
+            repo_map: repo_map.map(|t| blob_ref(t.as_bytes())),
+            system_prompt_hash: hex_hash(system.as_bytes()),
+            tools_hash: json_hash(&req.tools),
+        };
+        if self.last.as_ref() == Some(&rec) {
+            return None;
+        }
+        let texts = [agents_md, repo_map].into_iter().flatten();
+        Some((rec, texts.map(str::to_string).collect()))
+    }
+
+    /// `rec` (from [`due`](Self::due)) is in the log.
+    pub fn logged(&mut self, rec: SessionRecord) {
+        self.last = Some(rec);
+    }
+}
+
+/// The hash of each part of `req` (H6). `pinned` (the rendered pinned block) and
+/// `history` are the context's that `req` was assembled from: in the request the pinned
+/// block shares the first message.
+fn block_hashes(pinned: &Option<String>, history: &[Turn], req: &CanonicalRequest) -> BlockHashes {
+    let tail = req.messages.last().filter(|_| req.volatile_tail);
+    BlockHashes {
+        stable: json_hash(&(&req.system, &req.tools)),
+        pinned: json_hash(pinned),
+        history: json_hash(history),
+        tail: json_hash(&tail),
+    }
+}
+
+fn hex_hash(bytes: &[u8]) -> String {
+    blake3::hash(bytes).to_hex().to_string()
+}
+
+/// blake3 hex of the JSON serialization (streamed into the hasher): canonical for these
+/// types (structs and vectors in a fixed order, maps sorted).
+fn json_hash<T: serde::Serialize + ?Sized>(value: &T) -> String {
+    let mut hasher = blake3::Hasher::new();
+    let _ = serde_json::to_writer(&mut hasher, value);
+    hasher.finalize().to_hex().to_string()
+}
+
+/// The blob reference `bytes` would have: blake3 hex.
+fn blob_ref(bytes: &[u8]) -> BlobRef {
+    BlobRef::parse(blake3::hash(bytes).to_hex().as_str())
+        .expect("a blake3 hex digest is a blob reference")
+}
+
 /// Replace `path` with `bytes`, readable by the user only (requests hold the whole
 /// conversation). Best effort, not synced: it is a debugging aid, not the record.
 fn write_private(path: &Path, bytes: &[u8]) {
@@ -585,4 +700,85 @@ fn write_private(path: &Path, bytes: &[u8]) {
         .open(path)
         .and_then(|mut f| f.write_all(bytes));
     drop(written);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn request(system: &str, tool: &str) -> CanonicalRequest {
+        CanonicalRequest {
+            model: ModelId::from("mock/m"),
+            system: vec![Block::Text(system.into())],
+            tools: vec![ToolSpec {
+                name: tool.into(),
+                description: String::new(),
+                schema: serde_json::json!({}),
+            }],
+            messages: vec![],
+            max_output: 1,
+            reasoning: None,
+            cache_breakpoints: vec![],
+            volatile_tail: false,
+        }
+    }
+
+    /// What `log_request` does when the write succeeds: take the due record and mark it.
+    fn log_if_due(
+        log: &mut PrefixLog,
+        agents: Option<&str>,
+        map: Option<&str>,
+        req: &CanonicalRequest,
+    ) -> Option<SessionRecord> {
+        let (rec, _) = log.due(agents, map, req)?;
+        log.logged(rec.clone());
+        Some(rec)
+    }
+
+    #[test]
+    fn prefix_applied_is_due_only_when_an_input_changes() {
+        let mut log = PrefixLog::default();
+        let req = request("sys", "read");
+        let (first, texts) = log.due(Some("agents"), None, &req).expect("first");
+        assert_eq!(texts, ["agents"]);
+        let SessionRecord::PrefixApplied {
+            agents_md,
+            repo_map,
+            system_prompt_hash,
+            tools_hash,
+        } = &first
+        else {
+            panic!("{first:?}")
+        };
+        assert_eq!(agents_md.as_ref(), Some(&blob_ref(b"agents")));
+        assert_eq!(*repo_map, None);
+        assert_eq!(*system_prompt_hash, blake3::hash(b"sys").to_hex().as_str());
+        assert_eq!(tools_hash.len(), 64);
+        log.logged(first.clone());
+        assert!(log.due(Some("agents"), None, &req).is_none());
+        // Each input on its own makes it due again.
+        let sys2 = request("sys 2", "read");
+        assert!(log_if_due(&mut log, Some("agents"), None, &sys2).is_some());
+        assert!(log_if_due(&mut log, Some("other"), None, &req).is_some());
+        assert!(log_if_due(&mut log, Some("other"), Some("map"), &req).is_some());
+        let write = request("sys", "write");
+        assert!(log_if_due(&mut log, Some("other"), Some("map"), &write).is_some());
+        assert!(log_if_due(&mut log, Some("other"), Some("map"), &write).is_none());
+        // Back to the first inputs: logged again, identical to the first record.
+        assert_eq!(
+            log_if_due(&mut log, Some("agents"), None, &req),
+            Some(first)
+        );
+    }
+
+    #[test]
+    fn a_prefix_record_whose_write_failed_is_due_again() {
+        let mut log = PrefixLog::default();
+        let req = request("sys", "read");
+        // The write failed: `logged` was never called.
+        let (rec, _) = log.due(None, None, &req).unwrap();
+        assert_eq!(log.due(None, None, &req).map(|(r, _)| r), Some(rec.clone()));
+        log.logged(rec);
+        assert!(log.due(None, None, &req).is_none());
+    }
 }

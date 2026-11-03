@@ -59,7 +59,7 @@ pub const DEFAULT_TEST_COMMANDS: &[&str] = &[
 
 /// `[evidence]`: user and CLI layers only (a repository could otherwise label any command
 /// a passing test).
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EvidenceConfig {
     /// Patterns added to the defaults (permission-rule glob syntax, matched against each

@@ -38,11 +38,36 @@ pub fn data_home_from(get: impl Fn(&str) -> Option<OsString>) -> Result<PathBuf>
     }
 }
 
-/// Stable 16-hex-digit identifier of a project: blake3 of its canonical path
-/// (the path as given when it cannot be canonicalized).
+/// Stable 16-hex-digit identifier of a work tree: blake3 of its canonical path
+/// (the path as given when it cannot be canonicalized). Keys the code index, whose
+/// contents differ between worktrees; sessions use [`project_id`].
 pub fn project_hash(root: &Path) -> String {
-    let canonical = canonical_root(root);
-    let hash = blake3::hash(canonical.as_os_str().as_encoded_bytes());
+    path_hash(&canonical_root(root))
+}
+
+/// Stable 16-hex-digit identifier of a project (spec 6.5 H10): blake3 of the canonical git
+/// common directory when `root` is in a git work tree, so every worktree of a repository
+/// has the same id; else [`project_hash`] of the root. Keys session logs, blobs and
+/// memory episodes. Read from the git files; never runs git.
+///
+/// The git directory is the nearest ancestor's `.git`, as git finds it (without
+/// `GIT_CEILING_DIRECTORIES`): a directory that is not itself a repository but lies inside
+/// one (for example under a home directory kept in git) shares that repository's id.
+/// Listings span such directories; [`list_here`](crate::list_here) keeps one root's.
+pub fn project_id(root: &Path) -> String {
+    project_id_with(root, crate::git::dirs(root).as_ref())
+}
+
+/// [`project_id`] with the git directories already resolved.
+pub(crate) fn project_id_with(root: &Path, dirs: Option<&crate::git::GitDirs>) -> String {
+    match dirs {
+        Some(dirs) => path_hash(&dirs.common_dir),
+        None => project_hash(root),
+    }
+}
+
+fn path_hash(path: &Path) -> String {
+    let hash = blake3::hash(path.as_os_str().as_encoded_bytes());
     hash.to_hex()[..16].to_string()
 }
 
@@ -50,9 +75,14 @@ pub(crate) fn canonical_root(root: &Path) -> PathBuf {
     root.canonicalize().unwrap_or_else(|_| root.to_path_buf())
 }
 
-/// `<data_home>/sessions/<project_hash>`.
+/// `<data_home>/sessions/<project_id>`.
 pub(crate) fn project_dir(data_home: &Path, root: &Path) -> PathBuf {
-    data_home.join("sessions").join(project_hash(root))
+    sessions_dir(data_home, &project_id(root))
+}
+
+/// `<data_home>/sessions/<project>`.
+pub(crate) fn sessions_dir(data_home: &Path, project: &str) -> PathBuf {
+    data_home.join("sessions").join(project)
 }
 
 /// `create_dir_all` with mode 0700 for every directory it creates: logs and

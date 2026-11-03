@@ -2645,6 +2645,7 @@ dependencies = [
  "tautly-memory",
  "tautly-provider",
  "tautly-sandbox",
+ "tautly-session",
  "tempfile",
  "thiserror",
  "tokio",

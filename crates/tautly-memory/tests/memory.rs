@@ -535,7 +535,7 @@ fn search_includes_episodes_and_caps_at_2000_tokens() {
         e.data
             .path()
             .join("memory")
-            .join(tautly_session::paths::project_hash(e.project.path()))
+            .join(tautly_session::paths::project_id(e.project.path()))
             .join("episodes/sess-1.md")
     );
     assert_eq!(
@@ -987,7 +987,7 @@ async fn symlinked_episode_dirs_are_refused() {
     )
     .unwrap();
     let e = setup(&[]).await;
-    let hash = tautly_session::paths::project_hash(e.project.path());
+    let hash = tautly_session::paths::project_id(e.project.path());
     let project_dir = e.data.path().join("memory").join(&hash);
     fs::create_dir_all(&project_dir).unwrap();
     symlink(outside.path(), project_dir.join("episodes")).unwrap();

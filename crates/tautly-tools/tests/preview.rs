@@ -110,7 +110,7 @@ proptest! {
             assert_eq!(p.bases, vec![(e.full("f.txt"), Some(blake3::hash(content.as_bytes())))]);
             let r = e.run_approved(&EditTool, args, &p).await;
             assert!(!r.is_error, "{}", r.output);
-            assert_eq!(r.applied_diff.as_ref(), Some(&p.diff));
+            assert_eq!(r.applied_diff.as_deref(), Some(&p.diff));
             assert!(p.diff.unified.starts_with("--- a/f.txt\n+++ b/f.txt\n@@ "), "{}", p.diff.unified);
             Ok(())
         })?;
@@ -168,7 +168,7 @@ async fn preview_for_each_edit_format() {
         }
     );
     let r = e.run_approved(&EditTool, args, &p).await;
-    assert_eq!(r.applied_diff, Some(p.diff));
+    assert_eq!(r.applied_diff.as_deref(), Some(&p.diff));
 
     // patch: update, add and delete in one call, concatenated in patch order.
     let e = env(EditFormat::Patch);
@@ -205,7 +205,7 @@ async fn preview_for_each_edit_format() {
     assert!(e.dir.path().join("gone.txt").exists() && !e.dir.path().join("added.txt").exists());
     let r = e.run_approved(&EditTool, args, &p).await;
     assert!(!r.is_error, "{}", r.output);
-    assert_eq!(r.applied_diff, Some(p.diff));
+    assert_eq!(r.applied_diff.as_deref(), Some(&p.diff));
 
     // hashline.
     let e = env(EditFormat::Hashline);
@@ -226,7 +226,7 @@ async fn preview_for_each_edit_format() {
     );
     let r = e.run_approved(&EditTool, args, &p).await;
     assert!(!r.is_error, "{}", r.output);
-    assert_eq!(r.applied_diff, Some(p.diff));
+    assert_eq!(r.applied_diff.as_deref(), Some(&p.diff));
 }
 
 #[tokio::test]
@@ -297,7 +297,7 @@ async fn write_new_file_diff_uses_dev_null() {
     );
     let r = e.run_approved(&WriteTool, args, &p).await;
     assert!(!r.is_error, "{}", r.output);
-    assert_eq!(r.applied_diff, Some(p.diff));
+    assert_eq!(r.applied_diff.as_deref(), Some(&p.diff));
 
     // An unapproved write (auto-edit, yolo) reports its diff too.
     let r = WriteTool
@@ -307,7 +307,7 @@ async fn write_new_file_diff_uses_dev_null() {
             &e.cx,
         )
         .await;
-    let d = r.applied_diff.unwrap();
+    let d = *r.applied_diff.unwrap();
     assert!(
         d.unified
             .starts_with("--- a/docs/new.md\n+++ b/docs/new.md\n"),
@@ -461,7 +461,7 @@ async fn a_large_file_previews_the_diff_it_applies() {
     assert!(p.diff.unified.contains("-row line 50000\n+changed\n"));
     let r = e.run_approved(&EditTool, args, &p).await;
     assert!(!r.is_error, "{}", r.output);
-    assert_eq!(r.applied_diff, Some(p.diff));
+    assert_eq!(r.applied_diff.as_deref(), Some(&p.diff));
 }
 
 /// An approval covers the files the preview read. A symlink that now points elsewhere

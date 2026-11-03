@@ -25,6 +25,10 @@ pub enum MutationReason {
     Forced,
     /// The user asked for it.
     Manual,
+    /// A reason this version does not know (read back from a newer session log; never
+    /// decided here).
+    #[serde(other)]
+    Unknown,
 }
 
 /// When the last provider request went out and how much of it the cache holds.

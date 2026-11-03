@@ -139,7 +139,9 @@ fn earliest_pre_images(
             SessionRecord::TurnEnd { .. } => ended += 1,
             SessionRecord::Edit {
                 path, pre_image, ..
-            } if turn.is_none_or(|t| t == ended + 1) => edits.push((path, pre_image)),
+            } if turn.is_none_or(|t| t == ended + 1) => {
+                edits.push((PathBuf::from(path.as_str()), pre_image))
+            }
             _ => {}
         }
     }

@@ -1304,7 +1304,7 @@ async fn request_records_keep_only_hashes_and_blob_bytes_grow_linearly() {
         .home
         .path()
         .join("sessions")
-        .join(tautly_session::paths::project_hash(&fx.root()))
+        .join(tautly_session::paths::project_id(&fx.root()))
         .join("blobs");
     let before = dir_bytes(&blobs);
     assert_eq!(
@@ -1329,7 +1329,7 @@ async fn request_records_keep_only_hashes_and_blob_bytes_grow_linearly() {
     let hashes: Vec<_> = recs
         .iter()
         .filter_map(|r| match r {
-            SessionRecord::Request { hash } => Some(hash.clone()),
+            SessionRecord::Request { hash, .. } => Some(hash.clone()),
             _ => None,
         })
         .collect();

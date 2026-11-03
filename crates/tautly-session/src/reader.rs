@@ -8,7 +8,7 @@ use serde::de::DeserializeOwned;
 
 use crate::blobs::{BlobRef, BlobStore};
 use crate::paths;
-use crate::record::{Header, Parsed, SCHEMA_VERSION, parse_line};
+use crate::record::{Entry, Header, Origin, Parsed, SCHEMA_VERSION, parse_line};
 use crate::{Error, Result};
 
 /// Reads one session log.
@@ -42,7 +42,7 @@ impl<R: DeserializeOwned> SessionReader<R> {
             return Err(bad("header line is missing or incomplete"));
         }
         let header = match parse_line(&first) {
-            Ok(Parsed::Header(h)) => h,
+            Ok(Parsed::Header(h)) => *h,
             Ok(_) => return Err(bad("first line is not a header")),
             Err(e) => return Err(bad(&e.to_string())),
         };
@@ -82,6 +82,11 @@ impl<R: DeserializeOwned> SessionReader<R> {
     /// Stream `(offset, record)` pairs in log order. After the first error the
     /// iterator ends.
     pub fn records(&self) -> impl Iterator<Item = Result<(u64, R)>> + use<R> {
+        self.entries().map(|e| e.map(|e| (e.offset, e.rec)))
+    }
+
+    /// Like [`records`](Self::records), with each record's timestamp.
+    pub fn entries(&self) -> impl Iterator<Item = Result<Entry<R>>> + use<R> {
         Records::<R> {
             path: self.path.clone(),
             input: Some(Input::Pending(self.body_start)),
@@ -162,7 +167,7 @@ struct Records<R> {
 }
 
 impl<R: DeserializeOwned> Records<R> {
-    fn corrupt(&mut self, reason: String) -> Option<Result<(u64, R)>> {
+    fn corrupt(&mut self, reason: String) -> Option<Result<Entry<R>>> {
         self.input = None;
         Some(Err(Error::Corrupt {
             path: self.path.clone(),
@@ -173,7 +178,7 @@ impl<R: DeserializeOwned> Records<R> {
 }
 
 impl<R: DeserializeOwned> Iterator for Records<R> {
-    type Item = Result<(u64, R)>;
+    type Item = Result<Entry<R>>;
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
@@ -209,7 +214,7 @@ impl<R: DeserializeOwned> Iterator for Records<R> {
                 return self.corrupt("line has no trailing newline".into());
             }
             match parse_line(&buf) {
-                Ok(Parsed::Record { offset, data }) => {
+                Ok(Parsed::Record { offset, t_ms, data }) => {
                     if offset != self.next_offset {
                         let reason =
                             format!("expected offset {}, found {offset}", self.next_offset);
@@ -222,7 +227,11 @@ impl<R: DeserializeOwned> Iterator for Records<R> {
                         }
                     };
                     self.next_offset += 1;
-                    return Some(Ok((offset, data)));
+                    return Some(Ok(Entry {
+                        offset,
+                        t_ms,
+                        rec: data,
+                    }));
                 }
                 Ok(Parsed::Unknown) => continue,
                 Ok(Parsed::Header(_)) => return self.corrupt("unexpected second header".into()),
@@ -239,9 +248,17 @@ pub struct SessionSummary {
     pub created: SystemTime,
     pub path: PathBuf,
     pub last_modified: SystemTime,
+    /// The work tree the session ran in (the header's canonical root).
+    pub root: PathBuf,
+    /// The header's label; a later `Labeled` record (read by the engine) renames it.
+    pub label: Option<String>,
+    pub origin: Origin,
+    pub parent: Option<(String, u64)>,
 }
 
-/// Sessions of the project at `root` under [`paths::data_home`], newest first.
+/// Sessions of the project at `root` under [`paths::data_home`], newest first: those of
+/// every worktree of the repository, which share a [`project_id`](paths::project_id). To
+/// continue a session in this work tree, use [`list_here`], which keeps only this root's.
 pub fn list(root: &Path) -> Result<Vec<SessionSummary>> {
     list_in(&paths::data_home()?, root)
 }
@@ -273,8 +290,28 @@ pub fn list_in(data_home: &Path, root: &Path) -> Result<Vec<SessionSummary>> {
             created: header.created,
             path,
             last_modified,
+            root: header.root.clone(),
+            label: header.label.clone(),
+            origin: header.origin,
+            parent: header.parent.clone(),
         });
     }
     out.sort_by(|a, b| b.created.cmp(&a.created).then_with(|| b.id.cmp(&a.id)));
     Ok(out)
+}
+
+/// The sessions that ran in the work tree `root` itself, newest first: what "continue
+/// here" (`--continue`, the latest session) picks from. Another worktree's session must
+/// never be resumed here: its relative paths would resolve, and its undo write, in this
+/// tree.
+pub fn list_here(root: &Path) -> Result<Vec<SessionSummary>> {
+    list_here_in(&paths::data_home()?, root)
+}
+
+/// Like [`list_here`] with an explicit data home.
+pub fn list_here_in(data_home: &Path, root: &Path) -> Result<Vec<SessionSummary>> {
+    let here = paths::canonical_root(root);
+    let mut all = list_in(data_home, root)?;
+    all.retain(|s| s.root == here);
+    Ok(all)
 }
