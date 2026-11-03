@@ -148,17 +148,30 @@ async fn web_fetch_connection_failure_is_error_not_panic() {
 }
 
 #[test]
-fn web_fetch_effect_is_read_only_and_spec_is_strict() {
-    let (_d, _sb, _cx) = env();
-    assert_eq!(
-        WebFetchTool
-            .effect(&json!({"url": "https://a.test"}))
-            .unwrap(),
-        Effect::ReadOnly
-    );
+fn web_fetch_spec_is_strict() {
     assert!(WebFetchTool.effect(&json!({"nope": 1})).is_err());
     let spec = WebFetchTool.spec(&hx_provider::Capabilities::conservative());
     assert_eq!(spec.name, "web_fetch");
     assert_eq!(spec.schema["additionalProperties"], json!(false));
     assert_eq!(spec.schema["required"], json!(["url"]));
+}
+
+#[test]
+fn web_fetch_effect_names_the_host() {
+    let e = |url: &str| WebFetchTool.effect(&json!({ "url": url }));
+    assert_eq!(
+        e("https://Docs.Rust-Lang.org/std?q=1").unwrap(),
+        Effect::Network {
+            host: "docs.rust-lang.org".into()
+        }
+    );
+    assert_eq!(
+        e("http://127.0.0.1:8080/x").unwrap(),
+        Effect::Network {
+            host: "127.0.0.1".into()
+        }
+    );
+    for bad in ["file:///etc/passwd", "not a url", "", "ftp://a.test/"] {
+        assert!(e(bad).is_err(), "{bad}");
+    }
 }

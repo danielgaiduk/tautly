@@ -9,8 +9,16 @@ use url::Url;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Effect {
     ReadOnly,
-    Write { paths: Vec<PathBuf> },
-    Exec { argv: Vec<String> },
+    Write {
+        paths: Vec<PathBuf>,
+    },
+    Exec {
+        argv: Vec<String>,
+    },
+    /// Network egress to `host` (lowercase, no port).
+    Network {
+        host: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -121,8 +121,10 @@ impl Tool for WebFetchTool {
     }
 
     fn effect(&self, args: &Value) -> Result<Effect, ToolError> {
-        let _: Args = parse_args(args)?;
-        Ok(Effect::ReadOnly)
+        let a: Args = parse_args(args)?;
+        let url = parse_url(&a.url).map_err(ToolError::BadArgs)?;
+        let host = url.host_str().unwrap_or_default().to_string();
+        Ok(Effect::Network { host })
     }
 
     async fn run(&self, args: Value, sb: &dyn Sandbox, cx: &ToolCx) -> ToolResult {

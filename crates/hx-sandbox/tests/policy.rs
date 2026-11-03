@@ -807,3 +807,60 @@ fn round_five_probes_ask() {
         );
     }
 }
+
+// --- network egress (web_fetch) ---
+
+fn net(host: &str) -> Effect {
+    Effect::Network {
+        host: host.to_string(),
+    }
+}
+
+#[test]
+fn network_asks_in_ask_and_auto_edit_and_allows_in_yolo() {
+    for mode in [Mode::Ask, Mode::AutoEdit] {
+        assert!(asks(p(mode).decide("web_fetch", &net("example.com"), None)));
+    }
+    assert_eq!(
+        p(Mode::Yolo).decide("web_fetch", &net("example.com"), None),
+        Decision::Allow
+    );
+}
+
+#[test]
+fn network_allow_rule_matches_host_in_any_mode() {
+    for mode in [Mode::Ask, Mode::AutoEdit, Mode::Yolo] {
+        let pol = with_rules(mode, &["web_fetch(*.rust-lang.org)"], &[]);
+        assert_eq!(
+            pol.decide("web_fetch", &net("doc.rust-lang.org"), None),
+            Decision::Allow
+        );
+    }
+    let pol = with_rules(Mode::Ask, &["web_fetch(*.rust-lang.org)"], &[]);
+    assert!(asks(pol.decide("web_fetch", &net("evil.example"), None)));
+    // A rule for another tool never allows it.
+    let pol = with_rules(Mode::Ask, &["bash(*)"], &[]);
+    assert!(asks(pol.decide("web_fetch", &net("a.test"), None)));
+}
+
+#[test]
+fn network_deny_rule_beats_allow_and_yolo() {
+    for mode in [Mode::Ask, Mode::Yolo] {
+        let pol = with_rules(mode, &["web_fetch(*)"], &["web_fetch(*.evil.test)"]);
+        assert_eq!(
+            pol.decide("web_fetch", &net("x.evil.test"), None),
+            Decision::Deny {
+                rule: "web_fetch(*.evil.test)".into()
+            }
+        );
+        assert_eq!(
+            pol.decide("web_fetch", &net("good.test"), None),
+            Decision::Allow
+        );
+    }
+    let pol = with_rules(Mode::Yolo, &[], &["web_fetch"]);
+    assert!(matches!(
+        pol.decide("web_fetch", &net("a.test"), None),
+        Decision::Deny { .. }
+    ));
+}

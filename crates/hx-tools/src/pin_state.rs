@@ -37,7 +37,8 @@ pub struct StatePatch {
     pub decisions_add: Vec<String>,
     #[serde(default)]
     pub questions_add: Vec<String>,
-    /// Indices of open questions to mark resolved.
+    /// 0-based indices of open questions to mark resolved, in the order the state
+    /// summary lists them.
     #[serde(default)]
     pub questions_resolve: Vec<usize>,
 }
@@ -139,7 +140,7 @@ impl Tool for StateTool {
                     },
                     "decisions_add": {"type": "array", "items": {"type": "string"}, "description": "Decisions to record."},
                     "questions_add": {"type": "array", "items": {"type": "string"}, "description": "Open questions to record."},
-                    "questions_resolve": {"type": "array", "items": {"type": "integer", "minimum": 0}, "description": "Numbers of open questions to mark resolved, as the state summary lists them."}
+                    "questions_resolve": {"type": "array", "items": {"type": "integer", "minimum": 0}, "description": "0-based indices of open questions to mark resolved, in the order the state summary lists them."}
                 },
                 "additionalProperties": false
             }),

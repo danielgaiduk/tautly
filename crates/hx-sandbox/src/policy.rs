@@ -106,8 +106,13 @@ impl Rule {
 /// What a tool call touches, normalized for rule matching.
 enum Subjects {
     Commands(Vec<SimpleCommand>),
-    Unparseable { reason: String, raw: String },
+    Unparseable {
+        reason: String,
+        raw: String,
+    },
     Paths(Vec<PathSubject>),
+    /// The host a network call reaches.
+    Host(String),
     None,
 }
 
@@ -184,6 +189,7 @@ impl Policy {
     fn subjects(&self, effect: &Effect, raw_cmd: Option<&str>) -> Subjects {
         match effect {
             Effect::ReadOnly => Subjects::None,
+            Effect::Network { host } => Subjects::Host(host.clone()),
             Effect::Write { paths } => Subjects::Paths(
                 paths
                     .iter()
@@ -241,6 +247,7 @@ impl Policy {
                             .iter()
                             .any(|p| p.forms().any(|f| r.matches_str(tool, &f)))
                 }
+                Subjects::Host(h) => r.matches_str(tool, h),
             };
             if hit {
                 return deny(r);
@@ -256,7 +263,7 @@ impl Policy {
                 .find_map(|p| path_reason(&self.root, Path::new(""), &p.raw)),
             Subjects::Commands(cmds) => cmds.iter().find_map(|c| self.command_reason(c)),
             Subjects::Unparseable { reason, .. } => Some(format!("unparseable command: {reason}")),
-            Subjects::None => None,
+            Subjects::Host(_) | Subjects::None => None,
         }
     }
 
@@ -274,6 +281,7 @@ impl Policy {
                             && p.real.as_ref().is_none_or(|r| any(&path_str(r)))
                     })
             }
+            Subjects::Host(h) => any(h),
             Subjects::Unparseable { .. } | Subjects::None => false,
         }
     }
@@ -287,6 +295,9 @@ impl Policy {
             // Paths were already checked to be inside the workspace and unprotected.
             (Mode::AutoEdit, Effect::Write { .. }) => Decision::Allow,
             (_, Effect::Write { .. }) => ask("write requires approval"),
+            (_, Effect::Network { host }) => {
+                ask(&format!("network access to {host} requires approval"))
+            }
             _ => match subjects {
                 Subjects::Commands(cmds) if cmds.is_empty() => Decision::Allow,
                 _ => ask("command requires approval"),
