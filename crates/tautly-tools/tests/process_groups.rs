@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::json;
 use tautly_provider::EditFormat;
-use tautly_sandbox::LocalSandbox;
+use tautly_sandbox::{LocalSandbox, Sandbox};
 use tautly_tools::{BashTool, ProcessGroups, Tool, ToolCx, ToolResult, group_alive};
 use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;
@@ -137,4 +137,34 @@ async fn cancel_kills_the_command_without_waiting_out_the_grace() {
     // A command that dies on SIGTERM is not given the full 100 ms grace.
     assert!(took < Duration::from_millis(90), "{took:?}");
     assert!(e.groups.live().is_empty());
+}
+
+#[tokio::test]
+async fn a_settled_entry_whose_number_now_belongs_to_a_live_process_is_not_signalled() {
+    let e = env();
+    // An unrelated live process leading its own group, whose pid equals a stale entry: a
+    // settled group's leader was reaped, so a live pid with that number means reuse.
+    let mut other =
+        e.sb.spawn(tautly_sandbox::SpawnSpec {
+            argv: vec!["/bin/sh".into(), "-c".into(), "exec sleep 308".into()],
+            cwd: ".".into(),
+            env: vec![],
+            env_remove: vec![],
+            new_process_group: true,
+        })
+        .await
+        .unwrap();
+    let pid = other.id().unwrap();
+    e.groups.register(pid);
+    e.groups.settle(pid);
+    assert!(e.groups.live().is_empty(), "a reused number is not ours");
+    e.groups.register(pid);
+    e.groups.settle(pid);
+    e.groups.terminate_all(Duration::from_millis(100)).await;
+    e.groups.kill_all_now();
+    assert!(
+        other.try_wait().unwrap().is_none(),
+        "an unrelated process was signalled"
+    );
+    other.kill().await.unwrap();
 }
