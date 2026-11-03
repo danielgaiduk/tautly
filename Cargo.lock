@@ -614,9 +614,11 @@ checksum = "15cdd26707701c53297e2fa6afb323d55fbc1d0810c3aec078ae3ef0424c3c15"
 name = "hx-index"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "blake3",
  "futures",
  "hx-sandbox",
+ "ignore",
  "rayon",
  "rusqlite",
  "streaming-iterator",

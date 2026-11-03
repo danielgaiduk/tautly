@@ -509,3 +509,148 @@ fn index_is_send_and_sync() {
     fn check<T: Send + Sync>() {}
     check::<Index>();
 }
+
+// ------------------------------------------------------------ review round 1
+
+#[tokio::test]
+async fn reindex_file_skips_ignored_and_hidden_files() {
+    let (t, idx) = index_with(&[
+        (".gitignore", "ignored/\n*.gen.rs\n"),
+        ("src/keep.rs", "fn keep(){}"),
+        ("ignored/skip.rs", "fn a(){}"),
+        ("src/x.gen.rs", "fn b(){}"),
+        (".hidden/h.rs", "fn c(){}"),
+    ]);
+    idx.refresh().await.unwrap();
+    assert_eq!(idx.stats().files, 1);
+    for rel in ["ignored/skip.rs", "src/x.gen.rs", ".hidden/h.rs"] {
+        let p = t.path().join(rel);
+        std::fs::write(&p, "fn edited(){}\n").unwrap();
+        idx.reindex_file(Path::new(rel)).await.unwrap();
+        assert!(idx.outline(Path::new(rel)).unwrap().is_empty(), "{rel}");
+        assert_eq!(idx.stats().files, 1, "{rel}");
+    }
+    // A file that was indexed and becomes ignored is dropped by the next reindex.
+    std::fs::write(
+        t.path().join(".gitignore"),
+        "ignored/\n*.gen.rs\nsrc/keep.rs\n",
+    )
+    .unwrap();
+    idx.reindex_file(Path::new("src/keep.rs")).await.unwrap();
+    assert_eq!(idx.stats().files, 0);
+    // Admitted nested files are still indexed.
+    write_all(t.path(), &[("src/deep/x.rs", "fn deep(){}")]);
+    idx.reindex_file(Path::new("src/deep/x.rs")).await.unwrap();
+    assert_eq!(idx.find_symbol("deep", None).unwrap().len(), 1);
+}
+
+/// Delegates to a real sandbox but can be told to fail the directory walk.
+struct FlakySandbox {
+    inner: LocalSandbox,
+    fail_walk: std::sync::atomic::AtomicBool,
+}
+
+#[async_trait::async_trait]
+impl hx_sandbox::Sandbox for FlakySandbox {
+    fn root(&self) -> &Path {
+        self.inner.root()
+    }
+    fn resolve(&self, p: &Path) -> Result<PathBuf, hx_sandbox::SandboxError> {
+        self.inner.resolve(p)
+    }
+    async fn read(&self, p: &Path) -> Result<Vec<u8>, hx_sandbox::SandboxError> {
+        self.inner.read(p).await
+    }
+    async fn metadata(&self, p: &Path) -> Result<hx_sandbox::FileMeta, hx_sandbox::SandboxError> {
+        self.inner.metadata(p).await
+    }
+    async fn write_atomic(
+        &self,
+        p: &Path,
+        bytes: &[u8],
+        mode: Option<u32>,
+    ) -> Result<(), hx_sandbox::SandboxError> {
+        self.inner.write_atomic(p, bytes, mode).await
+    }
+    async fn remove_file(&self, p: &Path) -> Result<(), hx_sandbox::SandboxError> {
+        self.inner.remove_file(p).await
+    }
+    async fn spill(&self, bytes: &[u8]) -> Result<PathBuf, hx_sandbox::SandboxError> {
+        self.inner.spill(bytes).await
+    }
+    async fn spawn(
+        &self,
+        spec: hx_sandbox::SpawnSpec,
+    ) -> Result<hx_sandbox::Child, hx_sandbox::SandboxError> {
+        self.inner.spawn(spec).await
+    }
+    fn walker(&self, base: &Path) -> Result<ignore::WalkBuilder, hx_sandbox::SandboxError> {
+        if self.fail_walk.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(hx_sandbox::SandboxError::Denied("walk refused".into()));
+        }
+        self.inner.walker(base)
+    }
+    async fn http_get(
+        &self,
+        url: &hx_sandbox::Url,
+    ) -> Result<hx_sandbox::HttpResponse, hx_sandbox::SandboxError> {
+        self.inner.http_get(url).await
+    }
+}
+
+#[tokio::test]
+async fn background_refresh_failure_is_recorded_and_cleared_on_success() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let t = tempfile::tempdir().unwrap();
+    write_all(t.path(), &[("a.rs", "fn a(){}")]);
+    let sb = Arc::new(FlakySandbox {
+        inner: LocalSandbox::new(t.path().to_path_buf()).unwrap(),
+        fail_walk: std::sync::atomic::AtomicBool::new(true),
+    });
+    let idx = Arc::new(Index::open(&t.path().join(".index.db"), sb.clone()).unwrap());
+    assert_eq!(idx.last_error(), None);
+    idx.clone().spawn_background_refresh().await.unwrap();
+    assert!(!idx.is_ready());
+    let err = idx.last_error().expect("failure recorded");
+    assert!(err.contains("walk refused"), "{err}");
+    assert!(idx.refresh().await.is_err());
+
+    sb.fail_walk.store(false, SeqCst);
+    idx.clone().spawn_background_refresh().await.unwrap();
+    assert!(idx.is_ready());
+    assert_eq!(idx.last_error(), None);
+}
+
+fn db_with_version(dir: &Path, version: i64) -> PathBuf {
+    let db = dir.join("v.db");
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.execute_batch("CREATE TABLE schema_version (version INTEGER NOT NULL)")
+        .unwrap();
+    conn.execute("INSERT INTO schema_version VALUES (?1)", [version])
+        .unwrap();
+    db
+}
+
+#[test]
+fn newer_schema_is_refused() {
+    let t = tempfile::tempdir().unwrap();
+    let db = db_with_version(t.path(), 99);
+    let sb = Arc::new(LocalSandbox::new(t.path().to_path_buf()).unwrap());
+    let err = Index::open(&db, sb).err().expect("must refuse");
+    assert!(
+        matches!(err, hx_index::IndexError::SchemaTooNew { found: 99 }),
+        "{err:?}"
+    );
+}
+
+#[test]
+fn unsupported_old_schema_is_refused_explicitly() {
+    let t = tempfile::tempdir().unwrap();
+    let db = db_with_version(t.path(), 0);
+    let sb = Arc::new(LocalSandbox::new(t.path().to_path_buf()).unwrap());
+    let err = Index::open(&db, sb).err().expect("must refuse");
+    assert!(
+        matches!(err, hx_index::IndexError::SchemaTooOld { found: 0 }),
+        "{err:?}"
+    );
+}

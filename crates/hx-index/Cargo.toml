@@ -12,6 +12,7 @@ thiserror.workspace = true
 tokio.workspace = true
 futures.workspace = true
 blake3.workspace = true
+ignore.workspace = true
 rusqlite.workspace = true
 rayon.workspace = true
 streaming-iterator.workspace = true
@@ -26,7 +27,6 @@ tree-sitter-toml-ng.workspace = true
 tree-sitter-yaml.workspace = true
 
 [dev-dependencies]
+async-trait.workspace = true
 tempfile.workspace = true
 tokio.workspace = true
-rusqlite.workspace = true
-blake3.workspace = true

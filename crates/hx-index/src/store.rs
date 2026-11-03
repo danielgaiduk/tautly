@@ -91,6 +91,10 @@ pub enum IndexError {
     Sandbox(#[from] hx_sandbox::SandboxError),
     #[error("index database has schema version {found}, this build understands {SCHEMA_VERSION}")]
     SchemaTooNew { found: i64 },
+    #[error(
+        "index database has schema version {found}, older than the oldest supported ({SCHEMA_VERSION}); delete it to rebuild"
+    )]
+    SchemaTooOld { found: i64 },
     #[error("background task failed: {0}")]
     Task(String),
 }
@@ -119,6 +123,7 @@ pub(crate) struct Inner {
     conn: Mutex<Connection>,
     pub sb: Arc<dyn Sandbox>,
     ready: AtomicBool,
+    last_error: Mutex<Option<String>>,
 }
 
 /// Incremental symbol and reference index of the sandbox root, persisted in SQLite.
@@ -147,13 +152,14 @@ impl Index {
                 conn: Mutex::new(conn),
                 sb,
                 ready: AtomicBool::new(false),
+                last_error: Mutex::new(None),
             }),
         })
     }
 
     /// Run [`Index::refresh`] in the background; never blocks the caller. A failed
     /// refresh leaves the index not ready (callers fall back to on-demand lookups) and
-    /// the next call retries.
+    /// is recorded in [`Index::last_error`]; the next call retries.
     pub fn spawn_background_refresh(self: Arc<Self>) -> JoinHandle<()> {
         tokio::spawn(async move {
             let _ = self.refresh().await;
@@ -163,6 +169,15 @@ impl Index {
     /// True once a refresh has completed since this handle was opened.
     pub fn is_ready(&self) -> bool {
         self.inner.ready.load(Ordering::Acquire)
+    }
+
+    /// The error of the most recent refresh, if it failed.
+    pub fn last_error(&self) -> Option<String> {
+        self.inner
+            .last_error
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     /// Symbols of one file in source order. Empty for unknown files.
@@ -276,6 +291,28 @@ impl Inner {
 
     pub fn mark_ready(&self) {
         self.ready.store(true, Ordering::Release);
+    }
+
+    /// Record the outcome of a refresh: success clears the last error.
+    pub fn record_refresh<T>(&self, result: &Result<T, IndexError>) {
+        let mut slot = self
+            .last_error
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        *slot = result.as_ref().err().map(ToString::to_string);
+    }
+
+    /// Run database work on the blocking pool, so a long transaction holding the
+    /// connection mutex never parks an async worker.
+    pub async fn run<T, F>(self: &Arc<Self>, f: F) -> Result<T, IndexError>
+    where
+        T: Send + 'static,
+        F: FnOnce(&Inner) -> Result<T, IndexError> + Send + 'static,
+    {
+        let inner = Arc::clone(self);
+        tokio::task::spawn_blocking(move || f(&inner))
+            .await
+            .map_err(|e| IndexError::Task(e.to_string()))?
     }
 
     /// The database key for a path: root-relative, `/`-separated, no `.` components.
@@ -407,10 +444,31 @@ fn migrate(conn: &mut Connection) -> Result<(), IndexError> {
                 [SCHEMA_VERSION],
             )?;
         }
-        Some(SCHEMA_VERSION) => {}
-        Some(found) => return Err(IndexError::SchemaTooNew { found }),
+        Some(found) if found > SCHEMA_VERSION => return Err(IndexError::SchemaTooNew { found }),
+        Some(found) => upgrade(&tx, found)?,
     }
     tx.commit()?;
+    Ok(())
+}
+
+/// Migration scripts as `(from_version, sql)`; each upgrades `from_version` to
+/// `from_version + 1`. Empty while v1 is the only schema; a schema change appends a
+/// step here and bumps [`SCHEMA_VERSION`].
+const MIGRATIONS: &[(i64, &str)] = &[];
+
+/// Step an existing database from `from` up to [`SCHEMA_VERSION`].
+fn upgrade(tx: &rusqlite::Transaction, from: i64) -> Result<(), IndexError> {
+    let mut version = from;
+    while version < SCHEMA_VERSION {
+        let Some((_, sql)) = MIGRATIONS.iter().find(|(v, _)| *v == version) else {
+            return Err(IndexError::SchemaTooOld { found: from });
+        };
+        tx.execute_batch(sql)?;
+        version += 1;
+    }
+    if version != from {
+        tx.execute("UPDATE schema_version SET version = ?1", [version])?;
+    }
     Ok(())
 }
 
