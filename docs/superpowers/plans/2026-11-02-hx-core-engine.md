@@ -785,6 +785,8 @@ proptest! { #[test] fn apply_then_inverse_restores(text in "[a-z\\n]{1,200}", ..
 
 ### Task 25: Cancellation, budgets, ledger, signals
 
+**Task 24 review note (binding):** count the usage of a discarded (re-sent) provider attempt in the ledger and budgets, so cost is never under-reported. If Task 25 drops tool futures on a hard deadline, also drop the read baselines recorded at that step (add a per-turn forget to `ReadTracker`).
+
 **Task 23 review note (binding):** if the active model has no catalog price (`cost_usd = null`) while a `max_usd` budget is set, emit a `Warning` once and enforce only the token budgets for that model; never treat an unknown price as zero cost silently.
 
 **Checkpoint 2 amendments (binding):** The process-group registry also reaps per-call bash reader tasks/fds on return; spill cleanup (age/size cap) runs at engine start if Task 24 didn't add it.
