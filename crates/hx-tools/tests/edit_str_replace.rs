@@ -267,12 +267,12 @@ fn spec_follows_edit_format() {
         assert_eq!(s.name, "edit");
         assert_eq!(s.schema["type"], json!("object"));
         assert_eq!(s.schema["additionalProperties"], json!(false));
-        // Patch and Hashline schemas arrive in Task 12; until then they share this one.
-        assert_eq!(
-            s.schema["required"],
-            json!(["path", "old_text", "new_text"]),
-            "{fmt:?}"
-        );
+        let required = match fmt {
+            EditFormat::StrReplace => json!(["path", "old_text", "new_text"]),
+            EditFormat::Patch => json!(["patch"]),
+            EditFormat::Hashline => json!(["path", "ops"]),
+        };
+        assert_eq!(s.schema["required"], required, "{fmt:?}");
     }
 }
 

@@ -62,11 +62,22 @@ pub struct Located {
 
 /// Find the one place `old` refers to in `text` (LF line endings), trying stages 1-4.
 pub fn locate(text: &str, old: &str) -> Result<Located, MatchError> {
+    locate_with(text, old, false)
+}
+
+/// Like [`locate`], but the exact and normalized stages only accept matches that cover
+/// whole lines, so a block of lines (a patch hunk) can never match inside a longer line
+/// and the indentation stages still get their turn when the file indents more.
+pub fn locate_lines(text: &str, old: &str) -> Result<Located, MatchError> {
+    locate_with(text, old, true)
+}
+
+fn locate_with(text: &str, old: &str, whole_lines: bool) -> Result<Located, MatchError> {
     if old.is_empty() {
         return Err(no_match());
     }
     // Exact match first (spec 5.4 step 2).
-    if let Some(range) = unique(text, find_all(text, old), old.len())? {
+    if let Some(range) = unique(text, find_hits(text, old, whole_lines), old.len())? {
         return Ok(exact(range, RepairStage::Exact));
     }
     // Stage 1: normalize the model's text and retry.
@@ -75,7 +86,7 @@ pub fn locate(text: &str, old: &str) -> Result<Located, MatchError> {
         return Err(no_match());
     }
     if norm != old {
-        if let Some(range) = unique(text, find_all(text, &norm), norm.len())? {
+        if let Some(range) = unique(text, find_hits(text, &norm, whole_lines), norm.len())? {
             return Ok(exact(range, RepairStage::Normalized));
         }
     }
@@ -287,6 +298,19 @@ fn find_all(text: &str, pat: &str) -> Vec<usize> {
         let at = from + i;
         hits.push(at);
         from = at + text[at..].chars().next().map_or(1, char::len_utf8);
+    }
+    hits
+}
+
+/// [`find_all`], keeping only hits that start and end on line boundaries when asked.
+fn find_hits(text: &str, pat: &str, whole_lines: bool) -> Vec<usize> {
+    let mut hits = find_all(text, pat);
+    if whole_lines {
+        let bytes = text.as_bytes();
+        hits.retain(|&at| {
+            let end = at + pat.len();
+            (at == 0 || bytes[at - 1] == b'\n') && (end == bytes.len() || bytes[end - 1] == b'\n')
+        });
     }
     hits
 }

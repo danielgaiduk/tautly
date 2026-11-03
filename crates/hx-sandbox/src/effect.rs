@@ -60,6 +60,8 @@ pub trait Sandbox: Send + Sync {
         bytes: &[u8],
         mode: Option<u32>,
     ) -> Result<(), SandboxError>;
+    /// Delete the file at `p` (confined to the root). Errors if it does not exist.
+    async fn remove_file(&self, p: &Path) -> Result<(), SandboxError>;
     /// Persist `bytes` (e.g. over-long tool output) in a sandbox-managed scratch area and
     /// return its root-relative path, so the model can `read` it later. Content-addressed.
     async fn spill(&self, bytes: &[u8]) -> Result<PathBuf, SandboxError>;

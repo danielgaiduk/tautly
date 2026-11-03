@@ -152,6 +152,11 @@ impl Sandbox for LocalSandbox {
         .map_err(|e| SandboxError::Io(std::io::Error::other(e)))?
     }
 
+    async fn remove_file(&self, p: &Path) -> Result<(), SandboxError> {
+        let path = self.resolve(p)?;
+        Ok(tokio::fs::remove_file(path).await?)
+    }
+
     async fn spill(&self, bytes: &[u8]) -> Result<PathBuf, SandboxError> {
         let tmp = Path::new(".hx/tmp");
         let ignore = tmp.join(".gitignore");

@@ -25,3 +25,4 @@ similar.workspace = true
 tempfile.workspace = true
 tokio.workspace = true
 proptest.workspace = true
+ignore.workspace = true

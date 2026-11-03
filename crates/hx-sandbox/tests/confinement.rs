@@ -193,3 +193,34 @@ async fn spill_keeps_existing_gitignore() {
     let gi = std::fs::read_to_string(t.path().join(".hx/tmp/.gitignore")).unwrap();
     assert_eq!(gi, "custom\n");
 }
+
+#[tokio::test]
+async fn remove_file_deletes_and_errors_when_missing() {
+    let (t, sb) = sandbox();
+    sb.write_atomic(Path::new("d/gone.txt"), b"x", None)
+        .await
+        .unwrap();
+    sb.remove_file(Path::new("d/gone.txt")).await.unwrap();
+    assert!(!t.path().join("d/gone.txt").exists());
+    match sb.remove_file(Path::new("d/gone.txt")).await {
+        Err(SandboxError::Io(e)) => assert_eq!(e.kind(), std::io::ErrorKind::NotFound),
+        other => panic!("expected NotFound, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn remove_file_rejects_escape_and_symlink_outside() {
+    let (t, sb) = sandbox();
+    let outside = tempfile::tempdir().unwrap();
+    std::fs::write(outside.path().join("victim.txt"), b"keep").unwrap();
+    assert!(matches!(
+        sb.remove_file(Path::new("../victim.txt")).await,
+        Err(SandboxError::OutsideRoot(_))
+    ));
+    std::os::unix::fs::symlink(outside.path(), t.path().join("link")).unwrap();
+    assert!(matches!(
+        sb.remove_file(Path::new("link/victim.txt")).await,
+        Err(SandboxError::OutsideRoot(_))
+    ));
+    assert!(outside.path().join("victim.txt").exists());
+}

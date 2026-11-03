@@ -598,6 +598,7 @@ dependencies = [
  "globset",
  "hx-provider",
  "hx-sandbox",
+ "ignore",
  "libc",
  "proptest",
  "regex",
