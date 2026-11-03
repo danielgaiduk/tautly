@@ -135,6 +135,9 @@ pub enum SessionRecord {
     },
     /// The session is renamed; the last one wins over the header's label.
     Labeled { label: String },
+    /// The session switched to `model` (`Command::SetModel`, spec 7.11.5); requests from
+    /// here on go to it. The last one wins over the header's model.
+    ModelSet { model: ModelId },
     /// An engine bug (a panic in the turn task), with its message; a `TurnEnd{Error}`
     /// follows.
     EngineError { message: String },
@@ -206,6 +209,7 @@ const KNOWN_TYPES: &[&str] = &[
     "checkpoint",
     "checkpoint_skipped",
     "labeled",
+    "model_set",
     "engine_error",
     "turn_end",
 ];
@@ -241,6 +245,22 @@ pub fn session_label(
         }
     }
     Ok(label)
+}
+
+/// The model the session uses at the end of the log: the last `ModelSet` record's, else
+/// the header's model. Resume (Task 26) starts the rebuilt session on it; while replaying,
+/// a `ModelSet` to another provider strips the reasoning before it
+/// (`Context::strip_reasoning`), as the live switch did.
+pub fn session_model(
+    reader: &SessionReader<SessionRecord>,
+) -> tautly_session::Result<Option<ModelId>> {
+    let mut model = reader.header().model.clone().map(ModelId::from);
+    for rec in reader.records() {
+        if let (_, SessionRecord::ModelSet { model: m }) = rec? {
+            model = Some(m);
+        }
+    }
+    Ok(model)
 }
 
 #[cfg(test)]
@@ -466,6 +486,9 @@ mod tests {
             },
             SessionRecord::Labeled {
                 label: "try-a".into(),
+            },
+            SessionRecord::ModelSet {
+                model: ModelId::from("openai/gpt-5"),
             },
             SessionRecord::EngineError {
                 message: String::new(),

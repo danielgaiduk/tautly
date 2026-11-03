@@ -132,6 +132,11 @@ impl Context {
         if below_threshold && !forced {
             return None;
         }
+        // A forced cold epoch (a model switch) is not an expired cache: when the window
+        // forces the compaction, say so.
+        if forced && self.cold_epoch_forced {
+            return Some(MutationReason::Forced);
+        }
         schedule::decide(
             &self.clock,
             now,

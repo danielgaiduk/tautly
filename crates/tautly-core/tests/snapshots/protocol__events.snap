@@ -194,6 +194,11 @@ expression: events
     "truncated": false
   },
   {
+    "type": "model_changed",
+    "model": "compat:local/llama",
+    "provider": "compat:local"
+  },
+  {
     "type": "warning",
     "message": "non-UTF-8 path not tracked"
   }

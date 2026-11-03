@@ -13,9 +13,11 @@ mod dispatch;
 pub mod engine;
 pub mod evidence;
 pub mod ledger;
+mod model_switch;
 pub mod protocol;
 mod provider_setup;
 pub mod record;
+pub mod routing;
 mod session;
 pub mod signals;
 pub mod turn;
@@ -36,6 +38,7 @@ pub use protocol::{
     BudgetScope, Command, DiffFile, DiffStatus, EffectView, ErrorKind, Event, FinishReason,
     PROTOCOL_VERSION, ToolMetaView, UsageRole,
 };
+pub use provider_setup::{ProviderFactory, ProviderSetupError, provider_label};
 pub use record::SessionRecord;
 pub use signals::{Signal, SignalPolicy, SignalRouter, handle_signals, install_signal_handlers};
 pub use workspace::Workspace;

@@ -7,15 +7,18 @@
 //! arrives.
 //!
 //! `SetBudget` is applied at once, even mid-turn: the running turn sees the new limits at
-//! its next tool boundary (`budget.rs`). At shutdown, after the turn has ended, every
-//! process group the session's commands left behind is terminated.
+//! its next tool boundary (`budget.rs`). `SetModel` waits for the turn to end like other
+//! commands, so it applies at once when idle and otherwise before the next user turn
+//! (`model_switch.rs`). At shutdown, after the turn has ended, every process group the
+//! session's commands left behind is terminated.
 //!
-//! Seams for later tasks: resume and fork (Task 26) build the
-//! `Session` from a log instead of [`Session::init`]'s fresh state (`EngineBuilder::resume`
-//! is refused until then); side-model routing (Task 27) replaces the provider used by
-//! `Session::summarize`; memory proposals (Task 28) plug in at the `ContextOp::Remember`
-//! arm of `dispatch.rs` and fill `Session::pending_memory_index`, which the cache epoch
-//! already applies.
+//! Seams for later tasks: resume and fork (Task 26) build the `Session` from a log
+//! instead of [`Session::init`]'s fresh state (`EngineBuilder::resume` is refused until
+//! then); a resumed session starts on `record::session_model` and sets
+//! `Context::reasoning_provider` to that model's provider. Side-model routing (Task 27)
+//! replaces `routing::side_model_id` and the provider used by `Session::summarize`;
+//! memory proposals (Task 28) plug in at the `ContextOp::Remember` arm of `dispatch.rs`
+//! and fill `Session::pending_memory_index`, which the cache epoch already applies.
 
 use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -37,9 +40,11 @@ use crate::budget::{Budget, Budgets};
 use crate::config::{Config, LoadedConfig};
 use crate::evidence::{EvidenceTracker, TestMatcher};
 use crate::ledger::{CostLedger, LEDGER_FILE};
+use crate::model_switch::ModelSetup;
 use crate::protocol::{BudgetScope, Command, ErrorKind, Event, FinishReason};
-use crate::provider_setup::provider_for;
+use crate::provider_setup::{ProviderFactory, provider_for, provider_label};
 use crate::record::SessionRecord;
+use crate::routing;
 use crate::session::{EventSink, Log, LogFailure, Session};
 use crate::turn::TurnControl;
 use crate::workspace::Workspace;
@@ -85,6 +90,10 @@ pub struct EngineBuilder {
     /// Default: the adapter for `config.model`, with its key from the environment or the
     /// keychain. Always wrapped in `Retrying`.
     pub provider: Option<Arc<dyn Provider>>,
+    /// Builds the provider for the model a `SetModel` names (on the blocking pool; it may
+    /// read the keychain). Default: the adapter for that model's provider, with its key
+    /// from the environment or the keychain. Wrapped in `Retrying` like `provider`.
+    pub provider_factory: Option<ProviderFactory>,
     /// Default: a `LocalSandbox` on the root (or the workspace's sandbox).
     pub sandbox: Option<Arc<dyn Sandbox>>,
     /// A session id to resume (Task 26).
@@ -109,6 +118,7 @@ impl EngineBuilder {
             config,
             root: root.into(),
             provider: None,
+            provider_factory: None,
             sandbox: None,
             resume: None,
             workspace: None,
@@ -179,7 +189,7 @@ impl EngineBuilder {
         let provider = match self.provider {
             Some(p) => p,
             None => provider_for(&config, &config.model, Arc::clone(&catalog))
-                .map_err(EngineError::Provider)?,
+                .map_err(|e| EngineError::Provider(e.to_string()))?,
         };
         let provider: Arc<dyn Provider> = Arc::new(Retrying::new(provider));
         let init = HeaderInit {
@@ -197,8 +207,10 @@ impl EngineBuilder {
         let specs = tools.iter().map(|t| t.spec(&info.caps)).collect();
         let context = Context {
             root: Some(root.clone()),
+            reasoning_provider: Some(provider_label(&config.model)),
             ..Context::default()
         };
+        let side_model = routing::side_model_id(&config, &catalog);
         let budgets = Arc::new(Mutex::new(Budgets::new(
             &config.budget,
             info.price.is_some(),
@@ -215,7 +227,9 @@ impl EngineBuilder {
             sandbox,
             workspace,
             provider,
-            history_provider: config.model.provider().to_string(),
+            setup: ModelSetup::new(config.clone(), Arc::clone(&catalog), self.provider_factory),
+            side_model,
+            reasoning_retry: false,
             model: config.model.clone(),
             info,
             tools,
@@ -516,6 +530,7 @@ impl Actor {
         match cmd {
             Command::Pin { .. } | Command::Unpin { .. } => session.context_command(cmd).await,
             Command::Diff { turn } => session.diff(turn).await,
+            Command::SetModel { model } => session.set_model(model).await,
             other => {
                 let name = serde_json::to_value(&other)
                     .ok()

@@ -293,3 +293,78 @@ fn forced_compaction_at_90_percent_whatever_the_threshold() {
         assert!(!c.needs_compaction(&status(95_000), t, now, Some(TTL), Some(&p)));
     }
 }
+
+#[test]
+fn a_forced_cold_epoch_is_cold_until_the_next_request_and_forced_by_the_window() {
+    let now = Instant::now();
+    let t = Some(DEFAULT_THRESHOLD);
+    let p = price();
+    let mut c = big_history(11);
+    c.note_request(now - WARM, 80_000);
+    // Warm: over the threshold but below 90%, the cost model defers.
+    assert_eq!(
+        c.compaction_decision(&status(85_000), t, now, Some(TTL), Some(&p)),
+        None
+    );
+    c.force_cold_epoch();
+    assert_eq!(c.clock, CacheClock::default());
+    assert_eq!(
+        c.compaction_decision(&status(85_000), t, now, Some(TTL), Some(&p)),
+        Some(MutationReason::ColdCache)
+    );
+    // A window the context no longer fits: forced, not merely cold.
+    assert_eq!(
+        c.compaction_decision(&status(95_000), t, now, Some(TTL), Some(&p)),
+        Some(MutationReason::Forced)
+    );
+    // The next request ends it; a cold cache again reports cold.
+    c.note_request(now, 80_000);
+    assert!(!c.cold_epoch_forced);
+    assert_eq!(
+        c.compaction_decision(&status(95_000), t, now + TTL, Some(TTL), Some(&p)),
+        Some(MutationReason::ColdCache)
+    );
+}
+
+fn assistant(content: Vec<Content>) -> Message {
+    Message {
+        role: Role::Assistant,
+        content,
+    }
+}
+
+fn thought() -> Content {
+    Content::Reasoning {
+        text: "t".into(),
+        signature: Some("s".into()),
+    }
+}
+
+#[test]
+fn reasoning_is_stripped_unless_it_came_from_the_kept_provider() {
+    let mut c = Context {
+        history: vec![Turn {
+            messages: vec![
+                assistant(vec![Content::RedactedReasoning { data: "x".into() }]),
+                assistant(vec![thought(), Content::Text("hi".into())]),
+            ],
+        }],
+        reasoning_provider: Some("anthropic".into()),
+        ..Default::default()
+    };
+    let before = c.history.clone();
+    c.strip_reasoning(Some("anthropic"));
+    assert_eq!(c.history, before, "same provider: kept");
+
+    c.strip_reasoning(Some("openai"));
+    // Emptied assistant messages are dropped; the text stays.
+    let hi = [assistant(vec![Content::Text("hi".into())])];
+    assert_eq!(c.history[0].messages, hi);
+    assert_eq!(c.reasoning_provider.as_deref(), Some("openai"));
+
+    // None strips whatever the history holds, even its own provider's.
+    c.history[0].messages[0].content.insert(0, thought());
+    c.strip_reasoning(None);
+    assert_eq!(c.history[0].messages, hi);
+    assert_eq!(c.reasoning_provider, None);
+}
