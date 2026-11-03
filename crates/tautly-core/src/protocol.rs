@@ -489,6 +489,8 @@ mod memory_change_wire {
         created: u64,
         #[serde(default)]
         verified: Option<u64>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        tags: Vec<String>,
         body: String,
     }
 
@@ -501,6 +503,7 @@ mod memory_change_wire {
                 anchors: e.anchors.clone(),
                 created: unix_secs(e.created),
                 verified: e.verified.map(unix_secs),
+                tags: e.tags.clone(),
                 body: e.body.clone(),
             }),
             delete: change.delete.clone(),
@@ -518,6 +521,8 @@ mod memory_change_wire {
                 anchors: e.anchors,
                 created: from_unix_secs(e.created),
                 verified: e.verified.map(from_unix_secs),
+                tags: e.tags,
+                links: tautly_memory::parse_links(&e.body),
                 body: e.body,
                 stale: false,
             }),

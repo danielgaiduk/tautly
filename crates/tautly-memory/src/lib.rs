@@ -1,16 +1,21 @@
 //! Code-anchored project memory, episodic memory and `recall` search (spec 7.4).
 //!
-//! Project memory is one markdown file per entry in `<project>/.tautly/memory/<id>.md`
-//! (YAML frontmatter, shareable via git). Episodes are private session summaries in
+//! Project memory is one markdown file per entry in `<project>/.tautly/memory/`, named
+//! after its title (`<title-slug>.md`, `-2`, `-3`... on collision) and shareable via git.
+//! The directory opens as an Obsidian vault: the frontmatter is YAML properties (the
+//! stable `id` among them, so renaming a file breaks nothing), entries have `tags`, and
+//! bodies link each other with `[[title]]`, which `recall` follows one hop. Episodes are private session summaries in
 //! `<data_home>/memory/<project_id>/episodes/<session-id>.md`. Every file is written
 //! atomically (temp file + rename) with mode 0600 in directories of mode 0700.
 
 mod consolidate;
 mod entry;
 mod episodes;
+mod frontmatter;
 mod search;
 mod stale;
 mod store;
+mod vault;
 
 use std::path::PathBuf;
 
@@ -19,6 +24,7 @@ pub use entry::{
 };
 pub use search::{Hit, HitSource};
 pub use store::MemoryStore;
+pub use vault::parse_links;
 
 #[derive(Debug, thiserror::Error)]
 pub enum MemoryError {

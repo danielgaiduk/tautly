@@ -15,6 +15,7 @@ serde_json.workspace = true
 humantime.workspace = true
 rand.workspace = true
 libc.workspace = true
+serde-saphyr.workspace = true
 
 [dev-dependencies]
 tautly-sandbox = { path = "../tautly-sandbox" }

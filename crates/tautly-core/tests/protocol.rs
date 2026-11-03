@@ -25,6 +25,8 @@ fn memory_change() -> MemoryChange {
             created: UNIX_EPOCH + Duration::from_secs(1_700_000_000),
             verified: None,
             body: "cargo build --workspace".into(),
+            tags: vec![],
+            links: vec![],
             stale: false,
         }),
         delete: vec!["old-entry".into()],

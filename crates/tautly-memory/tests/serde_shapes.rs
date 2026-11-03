@@ -27,6 +27,8 @@ fn entry(stale: bool) -> MemoryEntry {
         created: UNIX_EPOCH + Duration::new(1_700_000_000, 5),
         verified: Some(UNIX_EPOCH + Duration::from_secs(1_700_000_100)),
         body: "cargo build --workspace".into(),
+        tags: vec![],
+        links: vec![],
         stale,
     }
 }

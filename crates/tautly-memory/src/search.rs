@@ -23,6 +23,8 @@ pub struct Hit {
     pub text: String,
     pub stale: bool,
     pub score: f32,
+    /// The project entry whose `[[link]]` brought this one in (one hop); None for a match.
+    pub linked_from: Option<String>,
 }
 
 /// Term frequencies of one document (title and body).

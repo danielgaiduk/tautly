@@ -1,4 +1,4 @@
-//! Entry types and the markdown file format.
+//! Entry types, ids and title rules. The file format is in `frontmatter.rs`.
 
 use std::path::{Component, Path, PathBuf};
 use std::time::SystemTime;
@@ -6,6 +6,7 @@ use std::time::SystemTime;
 use serde::{Deserialize, Serialize};
 
 use crate::MemoryError;
+use crate::frontmatter;
 
 /// Longest entry body, in tokens.
 pub const MAX_BODY_TOKENS: u32 = 300;
@@ -54,10 +55,17 @@ pub struct MemoryEntry {
     pub id: String,
     pub title: String,
     pub kind: MemoryKind,
+    /// Obsidian tags, without `#`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
     pub anchors: Vec<MemAnchor>,
     pub created: SystemTime,
     pub verified: Option<SystemTime>,
     pub body: String,
+    /// The `[[wikilink]]` targets of the body, as written (label and heading left out),
+    /// each once. Derived from the body, never stored apart from it.
+    #[serde(skip)]
+    pub links: Vec<String>,
     /// An anchor's code changed since the entry was written. Never stored in the file or in
     /// a serialized proposal; it reads back `false`.
     #[serde(skip)]
@@ -65,78 +73,15 @@ pub struct MemoryEntry {
 }
 
 impl MemoryEntry {
-    /// The file text: YAML frontmatter, then the body.
+    /// The file text: YAML frontmatter (Obsidian properties), then the body.
     pub fn to_markdown(&self) -> String {
-        // Every value is a JSON scalar or flow sequence, which is valid YAML, so quoting
-        // and escaping never need a YAML library.
-        let json = |v: &str| serde_json::to_string(v).unwrap_or_default();
-        let anchors: Vec<FileAnchor> = self
-            .anchors
-            .iter()
-            .map(|a| FileAnchor {
-                path: a.path.to_string_lossy().into_owned(),
-                symbol: a.symbol.clone(),
-                hash: a.hash.clone(),
-            })
-            .collect();
-        let mut out = String::from("---\n");
-        out.push_str(&format!("id: {}\n", json(&self.id)));
-        out.push_str(&format!("title: {}\n", json(&self.title)));
-        out.push_str(&format!("kind: {}\n", json(self.kind.as_str())));
-        out.push_str(&format!(
-            "anchors: {}\n",
-            serde_json::to_string(&anchors).unwrap_or_else(|_| "[]".into())
-        ));
-        out.push_str(&format!("created: {}\n", json(&format_time(self.created))));
-        if let Some(v) = self.verified {
-            out.push_str(&format!("verified: {}\n", json(&format_time(v))));
-        }
-        out.push_str("---\n");
-        out.push_str(&self.body);
-        out.push('\n');
-        out
+        frontmatter::render(self)
     }
 
-    /// Parse a file written by [`to_markdown`](Self::to_markdown) (or by hand).
+    /// Parse an entry file: the YAML frontmatter [`to_markdown`](Self::to_markdown)
+    /// writes, a hand-edited one, or the first version's `key: <JSON>` lines.
     pub fn from_markdown(text: &str) -> Result<Self, String> {
-        let rest = text
-            .strip_prefix("---\n")
-            .ok_or("missing `---` frontmatter")?;
-        let (front, body) = split_frontmatter(rest).ok_or("unterminated frontmatter")?;
-        let (mut id, mut title, mut kind, mut created) = (None, None, None, None);
-        let (mut verified, mut anchors) = (None, Vec::new());
-        for line in front.lines().filter(|l| !l.trim().is_empty()) {
-            let (key, value) = line
-                .split_once(':')
-                .ok_or_else(|| format!("bad frontmatter line `{line}`"))?;
-            match key.trim() {
-                "id" => id = Some(scalar(value)?),
-                "title" => title = Some(scalar(value)?),
-                "kind" => {
-                    let k = scalar(value)?;
-                    kind =
-                        Some(MemoryKind::parse(&k).ok_or_else(|| format!("unknown kind `{k}`"))?);
-                }
-                "created" => created = Some(parse_time(&scalar(value)?)?),
-                "verified" => verified = Some(parse_time(&scalar(value)?)?),
-                "anchors" => anchors = parse_anchors(value)?,
-                _ => {} // Unknown keys are kept out of the entry but not an error.
-            }
-        }
-        let id = id.ok_or("missing `id`")?;
-        if !valid_id(&id) {
-            return Err(format!("invalid id `{id}`"));
-        }
-        Ok(MemoryEntry {
-            id,
-            title: title.ok_or("missing `title`")?,
-            kind: kind.ok_or("missing `kind`")?,
-            anchors,
-            created: created.ok_or("missing `created`")?,
-            verified,
-            body: body.strip_suffix('\n').unwrap_or(body).to_string(),
-            stale: false,
-        })
+        frontmatter::parse(text)
     }
 }
 
@@ -147,6 +92,8 @@ pub struct MemoryDraft {
     pub id: Option<String>,
     pub title: String,
     pub kind: MemoryKind,
+    #[serde(default)]
+    pub tags: Vec<String>,
     pub anchors: Vec<(PathBuf, Option<String>)>,
     pub body: String,
 }
@@ -214,62 +161,6 @@ pub(crate) fn normalize_rel(path: &Path) -> Result<PathBuf, &'static str> {
         return Err("the path must be relative to the project root and stay inside it");
     }
     Ok(out)
-}
-
-#[derive(Serialize, Deserialize)]
-struct FileAnchor {
-    path: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    symbol: Option<String>,
-    hash: String,
-}
-
-fn format_time(t: SystemTime) -> String {
-    humantime::format_rfc3339_seconds(t).to_string()
-}
-
-fn parse_time(s: &str) -> Result<SystemTime, String> {
-    humantime::parse_rfc3339(s).map_err(|e| format!("bad timestamp `{s}`: {e}"))
-}
-
-/// The text before the closing `---` line, and the text after it.
-fn split_frontmatter(rest: &str) -> Option<(&str, &str)> {
-    let mut offset = 0;
-    for line in rest.split_inclusive('\n') {
-        if line.trim_end() == "---" {
-            return Some((&rest[..offset], &rest[offset + line.len()..]));
-        }
-        offset += line.len();
-    }
-    None
-}
-
-/// A YAML scalar: double-quoted (JSON escapes), single-quoted, or plain.
-fn scalar(raw: &str) -> Result<String, String> {
-    let raw = raw.trim();
-    if raw.starts_with('"') {
-        return serde_json::from_str(raw).map_err(|e| format!("bad string {raw}: {e}"));
-    }
-    if raw.len() >= 2 && raw.starts_with('\'') && raw.ends_with('\'') {
-        return Ok(raw[1..raw.len() - 1].replace("''", "'"));
-    }
-    Ok(raw.to_string())
-}
-
-fn parse_anchors(raw: &str) -> Result<Vec<MemAnchor>, String> {
-    let list: Vec<FileAnchor> =
-        serde_json::from_str(raw.trim()).map_err(|e| format!("bad anchors: {e}"))?;
-    list.into_iter()
-        .map(|a| {
-            let path = normalize_rel(Path::new(&a.path))
-                .map_err(|why| format!("bad anchor path `{}`: {why}", a.path))?;
-            Ok(MemAnchor {
-                path,
-                symbol: a.symbol,
-                hash: a.hash,
-            })
-        })
-        .collect()
 }
 
 pub(crate) fn check_id(id: &str) -> Result<(), MemoryError> {

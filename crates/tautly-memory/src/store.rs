@@ -1,5 +1,6 @@
 //! The memory store: loading, applying changes, the index block and search.
 
+use std::collections::HashMap;
 use std::fs;
 use std::io::{ErrorKind, Read, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
@@ -9,10 +10,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tautly_index::Index;
 
-use crate::entry::{check_id, normalize_rel, sanitize_title, valid_id, valid_session_id};
+use crate::entry::{check_id, normalize_rel, sanitize_title, valid_session_id};
 use crate::episodes::{self, Episode};
 use crate::search::{self, Doc, Hit, HitSource};
 use crate::stale;
+use crate::vault::{clean_tags, file_slug, is_entry_file, parse_links};
 use crate::{MAX_BODY_TOKENS, MemAnchor, MemoryChange, MemoryDraft, MemoryEntry, MemoryError};
 
 /// Entry files larger than this are not loaded.
@@ -27,6 +29,8 @@ const MAX_SCAN: usize = MAX_ENTRIES * 4;
 pub(crate) const MAX_ANCHORS: usize = 16;
 /// `skipped()` lists this many files at most; the rest are only counted.
 const MAX_SKIPS_LISTED: usize = 50;
+/// A recall adds at most this many entries linked from its hits.
+const MAX_LINKED_HITS: usize = 5;
 
 pub struct MemoryStore {
     pub(crate) index: Arc<Index>,
@@ -38,6 +42,9 @@ pub struct MemoryStore {
     pub(crate) entries: Vec<MemoryEntry>,
     /// Search statistics of `entries`, in the same order.
     pub(crate) docs: Vec<Doc>,
+    /// The file (in `dir`) each entry is stored in, by id: a file keeps its name (and a
+    /// renamed one its new name) across updates.
+    files: HashMap<String, String>,
     skipped: Vec<(PathBuf, String)>,
     skipped_total: usize,
     /// `.tautly` and `.tautly/memory`: checked not to be links before every read and write.
@@ -190,19 +197,20 @@ impl MemoryStore {
             .into_iter()
             .rev()
             .collect();
-        let (entries, skipped, skipped_total) = if verify_dirs(&dir_chain)? {
+        let loaded = if verify_dirs(&dir_chain)? {
             load_entries(&dir)?
         } else {
-            (vec![], vec![], 0)
+            Loaded::default()
         };
         let mut store = MemoryStore {
             index,
             dir,
             episodes_dir,
-            entries,
+            entries: loaded.entries,
             docs: Vec::new(),
-            skipped,
-            skipped_total,
+            files: loaded.files,
+            skipped: loaded.skipped,
+            skipped_total: loaded.skipped_total,
             dir_chain,
             data_home: data_home.to_path_buf(),
             episodes_chain,
@@ -216,6 +224,11 @@ impl MemoryStore {
 
     pub fn entries(&self) -> &[MemoryEntry] {
         &self.entries
+    }
+
+    /// The file (in `.tautly/memory`) entry `id` is stored in.
+    pub fn file_name(&self, id: &str) -> Option<&str> {
+        self.files.get(id).map(String::as_str)
     }
 
     /// Entry files that could not be loaded, with the reason.
@@ -361,6 +374,22 @@ impl MemoryStore {
         }
     }
 
+    /// A file name for a new entry titled `title`: `<slug>.md`, else `<slug>-2.md`,
+    /// `<slug>-3.md`... whichever no entry uses and no file has.
+    fn new_file_name(&self, title: &str) -> String {
+        let slug = file_slug(title);
+        (1..)
+            .map(|n| match n {
+                1 => format!("{slug}.md"),
+                n => format!("{slug}-{n}.md"),
+            })
+            .find(|name| {
+                !self.files.values().any(|f| f == name)
+                    && fs::symlink_metadata(self.dir.join(name)).is_err()
+            })
+            .expect("some suffix is free")
+    }
+
     /// Validate `d` and fill in the anchor hashes. Writes nothing. A draft naming an existing
     /// `id` updates that entry: it keeps its creation time and counts as verified now.
     pub fn draft_to_change(
@@ -453,6 +482,8 @@ impl MemoryStore {
             created: existing.map_or(when, |e| e.created),
             verified: existing.map(|_| when),
             body: body.to_string(),
+            tags: clean_tags(d.tags),
+            links: parse_links(body),
             stale: false,
         };
         Ok(MemoryChange {
@@ -485,21 +516,31 @@ impl MemoryStore {
             check_id(id)?;
         }
         if let Some(e) = &c.upsert {
-            write_private(&self.dir_chain, &format!("{}.md", e.id), &e.to_markdown())?;
+            let name = match self.files.get(&e.id) {
+                Some(name) => name.clone(),
+                None => self.new_file_name(&e.title),
+            };
+            write_private(&self.dir_chain, &name, &e.to_markdown())?;
+            self.files.insert(e.id.clone(), name);
+            let mut e = e.clone();
+            e.links = parse_links(&e.body);
             self.entries.retain(|x| x.id != e.id);
-            self.entries.push(e.clone());
+            self.entries.push(e);
         }
         let mut failure = None;
         for id in &c.delete {
-            let path = self.dir.join(format!("{id}.md"));
-            match fs::remove_file(&path) {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => {
-                    failure.get_or_insert(io_err(&path)(e));
-                    continue;
+            if let Some(name) = self.files.get(id) {
+                let path = self.dir.join(name);
+                match fs::remove_file(&path) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => {
+                        failure.get_or_insert(io_err(&path)(e));
+                        continue;
+                    }
                 }
             }
+            self.files.remove(id);
             self.entries.retain(|x| &x.id != id);
         }
         self.rebuild();
@@ -520,7 +561,8 @@ impl MemoryStore {
     }
 
     /// BM25 (k1 = 1.2, b = 0.75) over project entries and episodes: the best `k` that match,
-    /// with their texts cut so that titles and texts together fit `cap_tokens`.
+    /// then the entries their bodies `[[link]]` to (one hop, at most [`MAX_LINKED_HITS`]),
+    /// with texts cut so that titles and texts together fit `cap_tokens`.
     pub fn search(
         &self,
         query: &str,
@@ -528,6 +570,35 @@ impl MemoryStore {
         cap_tokens: u32,
         est: &dyn Fn(&str) -> u32,
     ) -> Vec<Hit> {
+        let picked = self.pick(query, k);
+        self.hits(&picked, cap_tokens, est)
+    }
+
+    /// Like [`search`](Self::search), after re-checking the anchors of the entries it would
+    /// return (and only those: a check is an index query per anchor, so checking the whole
+    /// store would hold the shared index connection for up to 500 entries). Other entries
+    /// keep the flag of their last check, and [`staleness_error`](Self::staleness_error)
+    /// describes this check.
+    pub fn search_fresh(
+        &mut self,
+        query: &str,
+        k: usize,
+        cap_tokens: u32,
+        est: &dyn Fn(&str) -> u32,
+    ) -> Vec<Hit> {
+        let picked = self.pick(query, k);
+        let returned: Vec<usize> = picked
+            .iter()
+            .map(|p| p.doc)
+            .filter(|i| *i < self.entries.len())
+            .collect();
+        self.recheck(&returned);
+        self.hits(&picked, cap_tokens, est)
+    }
+
+    /// The documents a search returns, in order: the ranked matches (indices into entries,
+    /// then episodes), then the entries linked from the matched entries.
+    fn pick(&self, query: &str, k: usize) -> Vec<Picked> {
         let terms = search::query_terms(query);
         if terms.is_empty() || k == 0 {
             return Vec::new();
@@ -538,10 +609,67 @@ impl MemoryStore {
             .iter()
             .chain(episodes.iter().map(|e| &e.doc))
             .collect();
+        let mut picked: Vec<Picked> = search::rank(&docs, &terms)
+            .into_iter()
+            .take(k)
+            .map(|(doc, score)| Picked {
+                doc,
+                score,
+                linked_from: None,
+            })
+            .collect();
+        let mut linked = Vec::new();
+        for p in &picked {
+            let Some(from) = self.entries.get(p.doc) else {
+                continue;
+            };
+            for target in &from.links {
+                let Some(to) = self.resolve_link(target) else {
+                    continue;
+                };
+                let seen = picked.iter().chain(&linked).any(|x: &Picked| x.doc == to);
+                if !seen && linked.len() < MAX_LINKED_HITS {
+                    linked.push(Picked {
+                        doc: to,
+                        score: 0.0,
+                        linked_from: Some(p.doc),
+                    });
+                }
+            }
+        }
+        picked.extend(linked);
+        picked
+    }
+
+    /// The entry a `[[target]]` names: by id, else by title, else by file name (any case).
+    fn resolve_link(&self, target: &str) -> Option<usize> {
+        let target = target.trim();
+        if let Some(i) = self.entries.iter().position(|e| e.id == target) {
+            return Some(i);
+        }
+        let lower = target.to_lowercase();
+        if let Some(i) = self
+            .entries
+            .iter()
+            .position(|e| e.title.to_lowercase() == lower)
+        {
+            return Some(i);
+        }
+        self.entries.iter().position(|e| {
+            self.files
+                .get(&e.id)
+                .and_then(|f| f.strip_suffix(".md"))
+                .is_some_and(|stem| stem.to_lowercase() == lower)
+        })
+    }
+
+    /// The hits of `picked`, in order, while they fit `cap_tokens`.
+    fn hits(&self, picked: &[Picked], cap_tokens: u32, est: &dyn Fn(&str) -> u32) -> Vec<Hit> {
+        let episodes = self.episodes();
         let mut hits = Vec::new();
         let mut left = cap_tokens;
-        for (i, score) in search::rank(&docs, &terms).into_iter().take(k) {
-            let (source, kind, title, text, stale) = match self.entries.get(i) {
+        for p in picked {
+            let (source, kind, title, text, stale) = match self.entries.get(p.doc) {
                 Some(e) => (
                     HitSource::Project(e.id.clone()),
                     Some(e.kind),
@@ -550,7 +678,7 @@ impl MemoryStore {
                     e.stale,
                 ),
                 None => {
-                    let ep = &episodes[i - self.entries.len()];
+                    let ep = &episodes[p.doc - self.entries.len()];
                     (
                         HitSource::Episode(ep.session_id.clone()),
                         None,
@@ -573,47 +701,14 @@ impl MemoryStore {
                 title,
                 text,
                 stale,
-                score,
+                score: p.score,
+                linked_from: p.linked_from.map(|i| self.entries[i].id.clone()),
             });
             if left == 0 {
                 break;
             }
         }
         hits
-    }
-
-    /// Like [`search`](Self::search), after re-checking the anchors of the entries it would
-    /// return (and only those: a check is an index query per anchor, so checking the whole
-    /// store would hold the shared index connection for up to 500 entries). Other entries
-    /// keep the flag of their last check, and [`staleness_error`](Self::staleness_error)
-    /// describes this check.
-    pub fn search_fresh(
-        &mut self,
-        query: &str,
-        k: usize,
-        cap_tokens: u32,
-        est: &dyn Fn(&str) -> u32,
-    ) -> Vec<Hit> {
-        let terms = search::query_terms(query);
-        if terms.is_empty() || k == 0 {
-            return Vec::new();
-        }
-        let returned: Vec<usize> = {
-            let episodes = self.episodes();
-            let docs: Vec<&Doc> = self
-                .docs
-                .iter()
-                .chain(episodes.iter().map(|e| &e.doc))
-                .collect();
-            search::rank(&docs, &terms)
-                .into_iter()
-                .take(k)
-                .map(|(i, _)| i)
-                .filter(|i| *i < self.entries.len())
-                .collect()
-        };
-        self.recheck(&returned);
-        self.search(query, k, cap_tokens, est)
     }
 
     /// Write the episode of `session_id` (replacing an earlier one); returns its path.
@@ -632,29 +727,50 @@ impl MemoryStore {
     }
 }
 
-/// What loading a directory found: the entries, the first skipped files with the reason,
-/// and how many were skipped in all.
-type Loaded = (Vec<MemoryEntry>, Vec<(PathBuf, String)>, usize);
+/// One document a search returns.
+struct Picked {
+    /// An index into entries, then episodes.
+    doc: usize,
+    score: f32,
+    /// The entry (index) whose link brought this one in.
+    linked_from: Option<usize>,
+}
+
+/// What loading a directory found: the entries and their file names, the first skipped
+/// files with the reason, and how many were skipped in all.
+#[derive(Default)]
+struct Loaded {
+    entries: Vec<MemoryEntry>,
+    files: HashMap<String, String>,
+    skipped: Vec<(PathBuf, String)>,
+    skipped_total: usize,
+}
 
 /// The entries in `dir` (checked not to be a link), within the load caps. A missing
-/// directory is empty.
+/// directory is empty. Files starting with a dot are not entries (Obsidian's, and the
+/// store's temporary files); a second file with an id already loaded is skipped.
 fn load_entries(dir: &Path) -> Result<Loaded, MemoryError> {
     let read = match fs::read_dir(dir) {
         Ok(r) => r,
-        Err(e) if e.kind() == ErrorKind::NotFound => return Ok((vec![], vec![], 0)),
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(Loaded::default()),
         Err(e) => return Err(io_err(dir)(e)),
     };
     let mut paths: Vec<PathBuf> = read
         .filter_map(Result::ok)
         .map(|e| e.path())
-        .filter(|p| p.extension().is_some_and(|x| x == "md"))
+        .filter(|p| {
+            p.extension().is_some_and(|x| x == "md")
+                && !p
+                    .file_name()
+                    .is_some_and(|n| n.as_encoded_bytes().starts_with(b"."))
+        })
         .take(MAX_SCAN + 1)
         .collect();
-    let (mut entries, mut skipped, mut total) = (Vec::new(), Vec::new(), 0usize);
+    let mut out = Loaded::default();
     let mut skip = |path: &Path, why: String| {
-        total += 1;
-        if skipped.len() < MAX_SKIPS_LISTED {
-            skipped.push((path.to_path_buf(), why));
+        out.skipped_total += 1;
+        if out.skipped.len() < MAX_SKIPS_LISTED {
+            out.skipped.push((path.to_path_buf(), why));
         }
     };
     if paths.len() > MAX_SCAN {
@@ -665,8 +781,17 @@ fn load_entries(dir: &Path) -> Result<Loaded, MemoryError> {
         );
     }
     paths.sort();
+    let (mut entries, mut files) = (Vec::new(), HashMap::new());
     let mut bytes = 0u64;
     for path in paths {
+        let Some(name) = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .filter(|n| is_entry_file(n))
+        else {
+            skip(&path, "the file name is not valid UTF-8".into());
+            continue;
+        };
         if entries.len() >= MAX_ENTRIES {
             skip(
                 &path,
@@ -679,14 +804,24 @@ fn load_entries(dir: &Path) -> Result<Loaded, MemoryError> {
                 &path,
                 format!("the total size of the entry files would exceed {MAX_TOTAL_BYTES} bytes"),
             ),
+            Ok((entry, _)) if files.contains_key(&entry.id) => skip(
+                &path,
+                format!(
+                    "the id `{}` is already used by {}",
+                    entry.id, files[&entry.id]
+                ),
+            ),
             Ok((entry, len)) => {
                 bytes += len;
+                files.insert(entry.id.clone(), name.to_string());
                 entries.push(entry);
             }
             Err(why) => skip(&path, why),
         }
     }
-    Ok((entries, skipped, total))
+    out.entries = entries;
+    out.files = files;
+    Ok(out)
 }
 
 /// One entry file and its size, enforcing the limits drafts obey: title cleaned and capped,
@@ -694,13 +829,6 @@ fn load_entries(dir: &Path) -> Result<Loaded, MemoryError> {
 fn load_entry(path: &Path) -> Result<(MemoryEntry, u64), String> {
     let text = read_nofollow(path, MAX_ENTRY_BYTES, false)?;
     let mut entry = MemoryEntry::from_markdown(&text)?;
-    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
-    if !valid_id(stem) || stem != entry.id {
-        return Err(format!(
-            "the id `{}` does not match the file name",
-            entry.id
-        ));
-    }
     let tokens = entry.body.len().div_ceil(4) as u32;
     if tokens > MAX_BODY_TOKENS {
         return Err(format!(

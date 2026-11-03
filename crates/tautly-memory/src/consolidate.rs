@@ -7,6 +7,7 @@ use serde_json::json;
 
 use crate::entry::{check_id, sanitize_title};
 use crate::stale;
+use crate::vault::{clean_tags, parse_links};
 use crate::{
     MAX_BODY_TOKENS, MemAnchor, MemoryChange, MemoryEntry, MemoryError, MemoryKind, MemoryStore,
 };
@@ -179,7 +180,9 @@ impl MemoryStore {
                             anchors,
                             created: sources[0].created,
                             verified: None,
+                            tags: clean_tags(sources.iter().flat_map(|e| e.tags.iter().cloned())),
                             body: body.to_string(),
+                            links: parse_links(body),
                             stale,
                         }),
                         delete: merge,

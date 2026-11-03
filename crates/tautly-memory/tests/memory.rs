@@ -59,6 +59,7 @@ fn draft(title: &str, kind: MemoryKind, body: &str) -> MemoryDraft {
         id: None,
         title: title.into(),
         kind,
+        tags: vec![],
         anchors: vec![],
         body: body.into(),
     }
@@ -91,6 +92,8 @@ fn entry(id: &str, title: &str, created: u64, verified: Option<u64>) -> MemoryEn
         created: secs(created),
         verified: verified.map(secs),
         body: "body".into(),
+        tags: vec![],
+        links: vec![],
         stale: false,
     }
 }
@@ -116,7 +119,7 @@ async fn entry_roundtrips_through_frontmatter_file() {
         .project
         .path()
         .join(".tautly/memory")
-        .join(format!("{id}.md"));
+        .join(e.store.file_name(&id).unwrap());
     let text = fs::read_to_string(&file).unwrap();
     assert!(text.starts_with("---\n"), "{text}");
     assert!(text.contains("\nkind: "), "{text}");
@@ -173,10 +176,10 @@ async fn open_skips_unreadable_entries_and_reports_them() {
     let id = add(&mut e.store, draft("Good", MemoryKind::Fact, "ok"));
     let dir = e.project.path().join(".tautly/memory");
     fs::write(dir.join("broken.md"), "garbage").unwrap();
-    // The id inside must match the file name.
+    // A second file with an id already loaded.
     fs::write(
         dir.join("other.md"),
-        fs::read_to_string(dir.join(format!("{id}.md"))).unwrap(),
+        fs::read_to_string(dir.join(e.store.file_name(&id).unwrap())).unwrap(),
     )
     .unwrap();
     fs::write(dir.join("notes.txt"), "ignored").unwrap();
