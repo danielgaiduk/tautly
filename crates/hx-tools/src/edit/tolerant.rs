@@ -160,8 +160,8 @@ fn locate_with(text: &str, old: &str, whole_lines: bool) -> Result<Located, Matc
 
 /// Stage 5: the symbol the first definition line of `old` names, located in `text` by
 /// parsing it (never a stale index). The symbol's lines are the range to replace when their
-/// source resembles `old` (ratio >= [`STRUCTURAL_SIMILARITY`], and so do their last lines)
-/// and exactly one same-named symbol does, provided `old` is exactly one symbol. `Ok(None)` when `old` is not exactly one definition
+/// source resembles `old` (ratio >= [`STRUCTURAL_SIMILARITY`], and the non-blank lines pair up one-to-one, each
+/// pair that alike) and exactly one same-named symbol does, provided `old` is exactly one symbol. `Ok(None)` when `old` is not exactly one definition
 /// or nothing resembles it.
 pub fn locate_structural(
     path: &Path,
@@ -198,6 +198,11 @@ pub fn locate_structural(
         return Ok(None);
     }
     let want_text = squash(&norm);
+    let want_lines: Vec<&str> = model_lines
+        .iter()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty())
+        .collect();
 
     let file = Lines::new(text);
     let hits: Vec<(usize, usize)> = hx_index::extract(lang, text)
@@ -208,10 +213,20 @@ pub fn locate_structural(
         .filter(|&(start, end)| end < file.len() && start <= end)
         .filter(|&(start, end)| {
             let source: Vec<&str> = (start..=end).map(|i| file.line(i)).collect();
-            // A truncated block can still parse as a shorter symbol (Python), so its last
-            // line must also resemble the symbol's real last line.
-            let last_line = source.last().copied().unwrap_or("").trim();
-            similarity(last_line, model_lines[last].trim()) >= STRUCTURAL_SIMILARITY
+            // A truncated block can still parse as a complete shorter symbol (Python), and a
+            // repeated line can fool an end check, so the blocks must line up one-to-one:
+            // same number of non-blank lines, each pair alike, so a typo repairs but any
+            // missing or extra line does not.
+            let theirs: Vec<&str> = source
+                .iter()
+                .map(|l| l.trim())
+                .filter(|l| !l.is_empty())
+                .collect();
+            theirs.len() == want_lines.len()
+                && theirs
+                    .iter()
+                    .zip(&want_lines)
+                    .all(|(a, b)| similarity(a, b) >= STRUCTURAL_SIMILARITY)
                 && similarity(&squash(&source.join("\n")), &want_text) >= STRUCTURAL_SIMILARITY
         })
         .collect();

@@ -18,8 +18,8 @@ async fn structural_fallback_replaces_symbol_body_when_similar() {
     let e = env();
     put(&e, "a.rs", STRUCTURAL_SRC.as_bytes()).await;
     read(&e, "a.rs").await;
-    // Two identifiers differ from the file, so stages 1-4 all fail.
-    let old = "fn compute(a: i32, b: i32) -> i32 {\n    let sum = a + b;\n    let twice = sum * 2;\n    twice - 1\n}";
+    // A misspelt identifier on two lines, so stages 1-4 all fail.
+    let old = "fn compute(a: i32, b: i32) -> i32 {\n    let sum = a + b;\n    let doubld = sum * 2;\n    doubld - 1\n}";
     let new = "fn compute(a: i32, b: i32) -> i32 {\n    (a + b) * 3\n}";
     let r = edit(&e, "a.rs", old, new).await;
     assert!(!r.is_error, "{}", r.output);
@@ -71,7 +71,7 @@ async fn structural_fallback_reverts_on_new_parse_error() {
     let e = env();
     put(&e, "a.rs", STRUCTURAL_SRC.as_bytes()).await;
     read(&e, "a.rs").await;
-    let old = "fn compute(a: i32, b: i32) -> i32 {\n    let sum = a + b;\n    let twice = sum * 2;\n    twice - 1\n}";
+    let old = "fn compute(a: i32, b: i32) -> i32 {\n    let sum = a + b;\n    let doubld = sum * 2;\n    doubld - 1\n}";
     // The replacement leaves its brace open.
     let new = "fn compute(a: i32, b: i32) -> i32 {\n    let sum = a + b;\n";
     let r = edit(&e, "a.rs", old, new).await;
@@ -138,6 +138,45 @@ async fn structural_fallback_repairs_exact_extent_python() {
         got,
         "def helper():\n    return 0\n\ndef compute_everything(a, b):\n    return a + b\n\ndef neighbour():\n    return 1\n"
     );
+}
+
+const PY_REPEAT: &str = "def compute_everything(first_value, second_value):\n    total_amount = first_value + second_value\n    scaled_amount = total_amount * 2\n    logged_amount = scaled_amount + 0\n    result = logged_amount\n    if result < 0:\n        return result\n    result = result + 1\n    return result\n\ndef neighbour():\n    return 1\n";
+
+#[tokio::test]
+async fn structural_fallback_rejects_truncation_at_a_repeated_line() {
+    let e = env();
+    put(&e, "a.py", PY_REPEAT.as_bytes()).await;
+    read(&e, "a.py").await;
+    // Cut after the inner `return result`, which equals the function's real last line once
+    // trimmed. It parses as a complete shorter function; the missing tail must not be lost.
+    let old = "def compute_everything(first_value, second_value):\n    total_amount = first_value + second_value\n    scaled_amount = total_amount * 2\n    logged_amount = scaled_amnt + 0\n    result = logged_amount\n    if result < 0:\n        return result";
+    let r = edit(
+        &e,
+        "a.py",
+        old,
+        "def compute_everything(a, b):\n    return a + b",
+    )
+    .await;
+    assert!(r.is_error, "{}", r.output);
+    assert!(r.output.contains("not found"), "{}", r.output);
+    assert_eq!(slurp(&e, "a.py").await, PY_REPEAT.as_bytes());
+}
+
+#[tokio::test]
+async fn structural_fallback_rejects_an_extra_line() {
+    let e = env();
+    put(&e, "a.py", PY_REPEAT.as_bytes()).await;
+    read(&e, "a.py").await;
+    let old = "def compute_everything(first_value, second_value):\n    total_amount = first_value + second_value\n    scaled_amount = total_amount * 2\n    print(scaled_amount)\n    logged_amount = scaled_amnt + 0\n    result = logged_amount\n    if result < 0:\n        return result\n    result = result + 1\n    return result";
+    let r = edit(
+        &e,
+        "a.py",
+        old,
+        "def compute_everything(a, b):\n    return a + b",
+    )
+    .await;
+    assert!(r.is_error, "{}", r.output);
+    assert_eq!(slurp(&e, "a.py").await, PY_REPEAT.as_bytes());
 }
 
 // ---------------------------------------------------------------- tool-level
