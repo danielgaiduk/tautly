@@ -17,7 +17,7 @@
 - Auth: API keys from env vars or OS keychain only. No subscription OAuth, ever.
 - Telemetry: off by default; nothing leaves the machine unless enabled.
 - Cold start < 50 ms; idle RSS < 30 MB; RSS within ±10% over 4-hour simulated session.
-- Dependencies point downward only: `hx-cli → {hx-tui, hx-rpc} → hx-core → {hx-provider, hx-tools, hx-context, hx-memory, hx-index, hx-session, hx-sandbox}`; `hx-tools → {hx-sandbox, hx-provider, hx-index, hx-memory}`; `hx-memory → {hx-index, hx-session}`; `hx-index → hx-sandbox`; `hx-context → hx-provider`.
+- Dependencies point downward only: `hx-cli → {hx-tui, hx-rpc} → hx-core → {hx-provider, hx-tools, hx-context, hx-memory, hx-index, hx-session, hx-sandbox}`; `hx-tools → {hx-sandbox, hx-provider, hx-index, hx-memory}`; `hx-memory → {hx-index, hx-session}`; `hx-index → hx-sandbox`; `hx-context → {hx-provider, hx-tools}`.
 - `hx-tools` must not call `std::fs::*`, `tokio::fs::*`, `std::process::Command`, `tokio::process::Command` directly (enforced by `clippy::disallowed_methods`/`disallowed_types`).
 - Errors: `thiserror` per crate; `anyhow` only in `hx-cli`. No `panic = "abort"`.
 - Paths: config `~/.config/hx/config.toml`, project `.hx/config.toml`, sessions `~/.local/share/hx/sessions/<project-hash>/<session-id>.jsonl` (+ `blobs/`), ledger `~/.local/share/hx/ledger.db`. Honor `XDG_CONFIG_HOME` / `XDG_DATA_HOME` and an `HX_HOME` override (used by tests).
@@ -573,6 +573,8 @@ proptest! { #[test] fn apply_then_inverse_restores(text in "[a-z\\n]{1,200}", ..
 - [ ] **Step 5: Commit** `git commit -m "feat(session): append-only JSONL store with blobs and fork"`
 
 ### Task 19: Context blocks, token accounting, pinned items, working state
+
+**Task 19 review amendment (binding):** the working state renders as a tail block after the last message (spec 6.1), not before history; the last-message cache breakpoint goes on the last history message, before the state tail. Pinned stays as the first user-role content after the stable prefix.
 
 **Checkpoint 2 amendments (binding):** Use the new effect shapes from the checkpoint-2 fix wave: `AppliedEffect::{Read{path,range,file_hash,shown}, Edited{path,pre_image,pre_mode,post_hash}, Deleted{path,pre_image,pre_mode}, Exec{may_write}}`; the files list is keyed by the resolved effect path (displayed root-relative); `Deleted` removes the file note's `edited` state and marks it deleted.
 

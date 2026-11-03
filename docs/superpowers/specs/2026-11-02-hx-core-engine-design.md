@@ -63,7 +63,7 @@ hx-cli        binary: arg parsing, selects TUI or headless mode
      ├─ hx-session    append-only session log, resume, fork, undo
      └─ hx-sandbox    Sandbox trait; this sub-project ships a passthrough-with-policy stub
 ```
-Dependencies only point downward (`hx-tools → hx-memory → {hx-index, hx-session}`, `hx-index → hx-sandbox`, `hx-tools → hx-sandbox`, `hx-context → hx-provider`). Each crate is independently testable.
+Dependencies only point downward (`hx-tools → hx-memory → {hx-index, hx-session}`, `hx-index → hx-sandbox`, `hx-tools → hx-sandbox`, `hx-context → {hx-provider, hx-tools}`). Each crate is independently testable.
 
 ### 2.2 Rules
 - **Single entry point:** `hx-core` exposes an `Engine` handle. Clients send `Command`s and receive a stream of `Event`s. TUI and RPC are both plain consumers, guaranteeing identical behavior.
@@ -134,7 +134,7 @@ Built-in TOML catalog (context window, prices per token class, capabilities). Us
 API keys from environment variables or the OS keychain (`keyring` crate). No subscription OAuth.
 
 ### 4.5 Cache stability
-`hx-context` keeps the request prefix byte-stable across turns: fixed tool ordering, no timestamps or volatile data in the system prompt, pinned/state blocks after the stable prefix. Cache hit ratio is reported in `Usage`.
+`hx-context` keeps the request prefix byte-stable across turns: fixed tool ordering, no timestamps or volatile data in the system prompt, pinned block after the stable prefix, working state as a tail block after the last message (6.1). Cache hit ratio is reported in `Usage`.
 
 ### 4.6 Cost, quota, budgets
 - `Usage` per provider response; cost computed from catalog prices. Aggregated per turn, session and day into a local SQLite ledger (`~/.local/share/hx/ledger.db`).
@@ -195,9 +195,10 @@ Requests are assembled in fixed order:
 ```
 [stable]   system prompt · tool schemas · AGENTS.md · memory index (7.4) · repo map (7.10)
 [pinned]   constraints and facts that survive compaction
-[state]    structured working state
 [history]  recent turns, verbatim
+[state]    structured working state — a tail block after the last message, rendered fresh for each request and never stored in history
 ```
+- Cache stability: the working state changes on almost every tool call (the files list follows effects), so it sits after history; the cached prefix (stable · pinned · history up to the last cache breakpoint) survives state changes. Pinned items change rarely and stay before history.
 - `ContextStatus{used, budget, breakdown}` is emitted every turn.
 - `hx prompt show` prints the system prompt; `hx prompt show --full` prints the exact last request.
 - System prompt target: < 2,000 tokens.
