@@ -361,7 +361,9 @@ impl Session {
         let (tx, mut rx) = mpsc::channel::<String>(OUTPUT_BUFFER);
         let events = self.events.clone();
         let call_id = call.id.clone();
-        let forward = tokio::spawn(async move {
+        // Aborted if this call is dropped (abandoned), so no output of it follows its
+        // `ToolFinished`.
+        let mut forward = AbortOnDrop(Some(tokio::spawn(async move {
             while let Some(text) = rx.recv().await {
                 events
                     .emit(Event::ToolOutputDelta {
@@ -370,7 +372,7 @@ impl Session {
                     })
                     .await;
             }
-        });
+        })));
         let mut cx = ToolCx::new(self.info.caps.edit_format, self.root().join(SPILL_DIR))
             .with_reads(Arc::clone(&self.reads))
             .with_cancel(ctl.cancel.child_token())
@@ -393,7 +395,9 @@ impl Session {
                 )
             });
         drop(cx);
-        let _ = forward.await;
+        if let Some(h) = forward.0.take() {
+            let _ = h.await;
+        }
         result
     }
 
@@ -469,6 +473,17 @@ impl Session {
             }
         }
         (content, event)
+    }
+}
+
+/// A task that is aborted when this is dropped before it was awaited.
+struct AbortOnDrop(Option<tokio::task::JoinHandle<()>>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        if let Some(h) = &self.0 {
+            h.abort();
+        }
     }
 }
 

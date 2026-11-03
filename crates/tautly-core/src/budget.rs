@@ -188,7 +188,8 @@ impl Budgets {
             let detail = self.detail(limit, usd, tokens);
             out.push(match state {
                 BudgetState::Exceeded => format!(
-                    "{name} budget exhausted ({detail}); stopping at the next tool boundary"
+                    "{name} budget exhausted ({detail}); no further requests will be sent, and tool \
+                     calls not yet started will not run"
                 ),
                 _ => {
                     let pct = (self.effective(limit).share(usd, tokens) * 100.0 + 1e-9).floor();
@@ -299,7 +300,10 @@ mod tests {
         assert_eq!(b.exceeded(), Some(BudgetScope::Turn));
         assert_eq!(
             b.news(),
-            ["turn budget exhausted (100 of 100 tokens); stopping at the next tool boundary"]
+            [
+                "turn budget exhausted (100 of 100 tokens); no further requests will be \
+                 sent, and tool calls not yet started will not run"
+            ]
         );
         // A new message starts the turn budget again; the session spend stays.
         b.start_turn();
