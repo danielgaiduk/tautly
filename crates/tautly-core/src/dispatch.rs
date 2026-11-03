@@ -4,7 +4,9 @@
 //! run at all) form one run whose calls execute concurrently; every write, command or
 //! network call is a run of its own, executed alone, in model order. Before a run starts,
 //! each of its calls passes, in model order, the loop breaker, the permission policy and,
-//! for `ask`, the user. After a run, its results are processed in model order: context
+//! for `ask`, the user, who is shown the call's preview diff (spec 7.11.4): a call whose
+//! preview fails is answered with that failure without asking, and an approved call runs
+//! only if its files still hash as the preview saw them. After a run, its results are processed in model order: context
 //! operations (`pin`, `state`) are applied before the result is final (a refused pin
 //! becomes an error result), the attempt ledger and the working state are updated, the
 //! result is logged with its effects and checkpointed, and only then is `ToolFinished`
@@ -34,7 +36,9 @@ use tautly_provider::Content;
 use tautly_sandbox::{Decision, Effect, SPILL_DIR};
 use tautly_session::BlobRef;
 use tautly_tools::AppliedEffect;
-use tautly_tools::{ContextOp, PersistedEffect, Tool, ToolCx, ToolResult, parse_context_op};
+use tautly_tools::{
+    ContextOp, PersistedEffect, Preview, Tool, ToolCx, ToolResult, parse_context_op,
+};
 use tokio::sync::mpsc;
 
 use crate::approvals::Verdict;
@@ -50,6 +54,9 @@ const OUTPUT_BUFFER: usize = 64;
 const ABANDON_AFTER: Duration = Duration::from_millis(150);
 /// How long a write may still run after a cancel before it is dropped.
 const WRITE_BOUND: Duration = Duration::from_secs(10);
+
+/// The file hashes an approved preview started from (`ToolCx::with_approved_bases`).
+type Bases = Vec<(PathBuf, Option<blake3::Hash>)>;
 
 /// One call, checked for what can be known before running it.
 struct Planned<'a> {
@@ -208,28 +215,27 @@ impl Session {
     async fn execute(&mut self, run: &[Planned<'_>], turn: u32, ctl: &TurnControl) -> Vec<Outcome> {
         let mut gated = Vec::with_capacity(run.len());
         for p in run {
-            gated.push(self.gate(p, ctl).await);
+            gated.push(self.gate(p, turn, ctl).await);
         }
-        let admitted: Vec<&Planned> = run
+        let admitted: Vec<(&Planned, Option<Bases>)> = run
             .iter()
-            .zip(&gated)
-            .filter(|(_, g)| g.is_none())
-            .map(|(p, _)| p)
+            .zip(gated.iter_mut())
+            .filter_map(|(p, g)| g.as_mut().ok().map(|bases| (p, bases.take())))
             .collect();
         let this = &*self;
-        let bounded = admitted.iter().map(|p| async move {
+        let bounded = admitted.iter().map(|(p, bases)| async move {
             let grace = match &p.runnable {
                 Some((_, Effect::Write { .. })) => WRITE_BOUND,
                 _ => ABANDON_AFTER,
             };
             tokio::select! {
-                r = this.invoke(p, turn, ctl) => Some(r),
+                r = this.invoke(p, bases.as_ref(), turn, ctl) => Some(r),
                 () = after_cancel(ctl, grace) => None,
             }
         });
         let ran: Vec<Option<ToolResult>> = join_all(bounded).await;
         let mut lost_writes = Vec::new();
-        for (p, r) in admitted.iter().zip(&ran) {
+        for ((p, _), r) in admitted.iter().zip(&ran) {
             if let (None, Some((_, Effect::Write { paths }))) = (r, &p.runnable) {
                 lost_writes.extend(paths.iter().cloned());
             }
@@ -240,9 +246,10 @@ impl Session {
         if !lost_writes.is_empty() {
             self.lost_writes(&lost_writes).await;
         }
-        let mut ran = admitted.iter().zip(ran);
+        let mut ran = admitted.iter().map(|(p, _)| p).zip(ran);
         gated
             .into_iter()
+            .map(Result::err)
             .map(|g| {
                 g.unwrap_or_else(|| match ran.next().expect("one result per admitted call") {
                     (_, Some(result)) => Outcome {
@@ -282,18 +289,26 @@ impl Session {
         .await;
     }
 
-    /// Whether the call may run: None if so, else how it ended without running.
-    async fn gate(&mut self, p: &Planned<'_>, ctl: &TurnControl) -> Option<Outcome> {
+    /// Whether the call may run: `Ok` if so, with the file bases its approved preview saw
+    /// (when it was asked and has a preview), else how it ended without running.
+    async fn gate(
+        &mut self,
+        p: &Planned<'_>,
+        turn: u32,
+        ctl: &TurnControl,
+    ) -> Result<Option<Bases>, Outcome> {
         if let Some(r) = &p.rejected {
-            return Some(Outcome::refused(r.clone()));
+            return Err(Outcome::refused(r.clone()));
         }
         if ctl.cancel.is_cancelled() {
-            return Some(Outcome::cancelled());
+            return Err(Outcome::cancelled());
         }
-        let (_, effect) = p.runnable.as_ref()?;
+        let Some((tool, effect)) = p.runnable.as_ref() else {
+            return Ok(None);
+        };
         let args = p.call.input();
         if let Some(by) = self.ledger.check(&p.call.name, &args) {
-            return Some(Outcome {
+            return Err(Outcome {
                 result: ToolResult::error(by.message()),
                 blocked: true,
                 ran: false,
@@ -302,24 +317,39 @@ impl Session {
         let raw_cmd = args.get("command").and_then(Value::as_str);
         let raw_cmd = raw_cmd.filter(|_| p.call.name == "bash");
         match self.policy.decide(&p.call.name, effect, raw_cmd) {
-            Decision::Allow => None,
-            Decision::Deny { rule } => Some(Outcome::refused(ToolResult::error(format!(
+            Decision::Allow => Ok(None),
+            Decision::Deny { rule } => Err(Outcome::refused(ToolResult::error(format!(
                 "denied by the permission rule `{rule}`; the call did not run"
             )))),
-            Decision::Ask { reason } => self.ask(p.call, &args, reason, ctl).await,
+            Decision::Ask { reason } => self.ask(p.call, tool, &args, reason, turn, ctl).await,
         }
     }
 
-    /// Ask the user (interactive) or deny (headless, spec 3.4).
+    /// Preview the call, then ask the user (interactive) or deny (headless, spec 3.4). A
+    /// call whose preview fails is answered with that failure without asking, since it
+    /// would change nothing (spec 7.11.4).
     async fn ask(
         &self,
         call: &Call,
+        tool: &Arc<dyn Tool>,
         args: &Value,
         reason: String,
+        turn: u32,
         ctl: &TurnControl,
-    ) -> Option<Outcome> {
+    ) -> Result<Option<Bases>, Outcome> {
+        let (diff, bases) = match self.preview(tool, args, turn, ctl).await? {
+            Some(Ok(preview)) => (Some(preview.diff), Some(preview.bases)),
+            Some(Err(result)) => {
+                return Err(Outcome {
+                    result,
+                    blocked: false,
+                    ran: true,
+                });
+            }
+            None => (None, None),
+        };
         let Some((request_id, rx)) = ctl.approvals.open() else {
-            return Some(Outcome::refused(ToolResult::error(format!(
+            return Err(Outcome::refused(ToolResult::error(format!(
                 "denied: this call needs approval ({reason}), and nobody can approve it in \
                  this session (headless); the user can allow it with --approve auto-edit or yolo"
             ))));
@@ -330,27 +360,72 @@ impl Session {
             tool: call.name.clone(),
             args: args.clone(),
             reason,
+            diff,
         })
         .await;
         let verdict = tokio::select! {
             v = rx => v.unwrap_or(Verdict::Denied { reason: None }),
             () = ctl.cancel.cancelled() => {
                 ctl.approvals.withdraw(&request_id);
-                return Some(Outcome::cancelled());
+                return Err(Outcome::cancelled());
             }
         };
         match verdict {
-            Verdict::Approved => None,
-            Verdict::Denied { reason } => Some(Outcome::refused(ToolResult::error(match reason {
+            Verdict::Approved => Ok(bases),
+            Verdict::Denied { reason } => Err(Outcome::refused(ToolResult::error(match reason {
                 Some(r) => format!("denied by user: {r}"),
                 None => "denied by user".to_string(),
             }))),
         }
     }
 
+    /// The call's [`Tool::preview`]. A panicking preview becomes an error result; a cancel
+    /// ends the call.
+    async fn preview(
+        &self,
+        tool: &Arc<dyn Tool>,
+        args: &Value,
+        turn: u32,
+        ctl: &TurnControl,
+    ) -> Result<Option<Result<Preview, ToolResult>>, Outcome> {
+        let cx = self.tool_cx(turn, ctl);
+        let preview =
+            AssertUnwindSafe(tool.preview(args, self.sandbox.as_ref(), &cx)).catch_unwind();
+        tokio::select! {
+            p = preview => Ok(p.unwrap_or_else(|_| {
+                Some(Err(ToolResult::error(
+                    "the tool's preview crashed (an engine bug); nothing was changed",
+                )))
+            })),
+            () = ctl.cancel.cancelled() => Err(Outcome::cancelled()),
+        }
+    }
+
+    /// The context a call of step `turn` runs (or is previewed) with.
+    fn tool_cx(&self, turn: u32, ctl: &TurnControl) -> ToolCx {
+        let mut cx = ToolCx::new(self.info.caps.edit_format, self.root().join(SPILL_DIR))
+            .with_reads(Arc::clone(&self.reads))
+            .with_cancel(ctl.cancel.child_token())
+            .with_turn(turn)
+            .with_process_groups(self.groups.clone());
+        if let Some(index) = self.workspace.index() {
+            cx = cx.with_index(index);
+        }
+        if let Some(memory) = self.workspace.memory() {
+            cx = cx.with_memory(memory);
+        }
+        cx
+    }
+
     /// Run one admitted call. Output lines are forwarded as `ToolOutputDelta` and all of
     /// them are out before this returns. A panicking tool becomes an error result.
-    async fn invoke(&self, p: &Planned<'_>, turn: u32, ctl: &TurnControl) -> ToolResult {
+    async fn invoke(
+        &self,
+        p: &Planned<'_>,
+        bases: Option<&Bases>,
+        turn: u32,
+        ctl: &TurnControl,
+    ) -> ToolResult {
         let (tool, _) = p.runnable.as_ref().expect("admitted calls are runnable");
         let call = p.call;
         self.emit(Event::ToolStarted {
@@ -371,17 +446,9 @@ impl Session {
                     .await;
             }
         });
-        let mut cx = ToolCx::new(self.info.caps.edit_format, self.root().join(SPILL_DIR))
-            .with_reads(Arc::clone(&self.reads))
-            .with_cancel(ctl.cancel.child_token())
-            .with_output_tx(tx)
-            .with_turn(turn)
-            .with_process_groups(self.groups.clone());
-        if let Some(index) = self.workspace.index() {
-            cx = cx.with_index(index);
-        }
-        if let Some(memory) = self.workspace.memory() {
-            cx = cx.with_memory(memory);
+        let mut cx = self.tool_cx(turn, ctl).with_output_tx(tx);
+        if let Some(bases) = bases {
+            cx = cx.with_approved_bases(bases.clone());
         }
         let run = tool.run(call.input(), self.sandbox.as_ref(), &cx);
         let result = AssertUnwindSafe(run)
@@ -447,6 +514,7 @@ impl Session {
             blocked,
             effects: result.effects.iter().map(EffectView::from).collect(),
             meta: (&result.meta).into(),
+            diff: result.applied_diff.clone(),
         };
         let content = Content::ToolResult {
             id: call.id.clone(),

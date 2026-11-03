@@ -11,6 +11,7 @@ mod index_tools;
 mod memory_tools;
 mod persist;
 mod pin_state;
+pub mod preview;
 mod procs;
 mod read;
 mod reread;
@@ -46,6 +47,7 @@ pub use pin_state::{
     ContextOp, MAX_PIN_BYTES, PinTool, PlanStep, StatePatch, StateTool, StepStatus,
     parse_context_op,
 };
+pub use preview::{DiffPreview, FileChange, Preview, unified_diff};
 pub use procs::{ProcessGroups, group_alive};
 pub use read::ReadTool;
 pub use web_fetch::WebFetchTool;
@@ -125,6 +127,8 @@ pub struct ToolResult {
     pub is_error: bool,
     pub effects: Vec<AppliedEffect>,
     pub meta: ToolMeta,
+    /// The diff a successful `edit` or `write` applied (spec 7.11.4).
+    pub applied_diff: Option<DiffPreview>,
 }
 
 impl ToolResult {
@@ -134,6 +138,7 @@ impl ToolResult {
             is_error: false,
             effects: Vec::new(),
             meta: ToolMeta::default(),
+            applied_diff: None,
         }
     }
 
@@ -445,6 +450,7 @@ pub struct ToolCx {
     memory: Option<Arc<RwLock<MemoryStore>>>,
     turn: u32,
     groups: ProcessGroups,
+    approved_bases: Option<Vec<(PathBuf, Option<blake3::Hash>)>>,
 }
 
 impl std::fmt::Debug for ToolCx {
@@ -471,6 +477,7 @@ impl ToolCx {
             memory: None,
             turn: 0,
             groups: ProcessGroups::default(),
+            approved_bases: None,
         }
     }
 
@@ -513,6 +520,13 @@ impl ToolCx {
         self
     }
 
+    /// The file hashes an approved [`Tool::preview`] started from: `run` then refuses with
+    /// `changed_after_approval` if any file no longer has its hash.
+    pub fn with_approved_bases(mut self, bases: Vec<(PathBuf, Option<blake3::Hash>)>) -> Self {
+        self.approved_bases = Some(bases);
+        self
+    }
+
     pub fn edit_format(&self) -> EditFormat {
         self.edit_format
     }
@@ -548,6 +562,10 @@ impl ToolCx {
     pub fn process_groups(&self) -> &ProcessGroups {
         &self.groups
     }
+
+    pub fn approved_bases(&self) -> Option<&[(PathBuf, Option<blake3::Hash>)]> {
+        self.approved_bases.as_deref()
+    }
 }
 
 #[async_trait]
@@ -558,6 +576,17 @@ pub trait Tool: Send + Sync {
     fn effect(&self, args: &Value) -> Result<Effect, ToolError>;
     /// Never panics on bad arguments: returns an error result instead.
     async fn run(&self, args: Value, sb: &dyn Sandbox, cx: &ToolCx) -> ToolResult;
+    /// What `run` would change, computed the same way (stale guard, matching) without
+    /// writing anything: None for tools that do not change files, `Err` with the result
+    /// `run` would return when the call would fail.
+    async fn preview(
+        &self,
+        _args: &Value,
+        _sb: &dyn Sandbox,
+        _cx: &ToolCx,
+    ) -> Option<Result<Preview, ToolResult>> {
+        None
+    }
 }
 
 /// The tools available for a model, in a fixed order.

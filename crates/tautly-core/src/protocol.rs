@@ -9,9 +9,9 @@
 //! Readers ignore fields they do not know (no wire type denies unknown fields), so adding
 //! a field is a minor-version change; every new field that is not an `Option` must carry
 //! `#[serde(default)]`. An event type, [`EffectView`] kind, [`ErrorKind`],
-//! [`FinishReason`] or [`UsageRole`] value a reader does not know reads as its `Unknown`
-//! variant instead of failing the message, so those can also grow in minor versions
-//! (match with a wildcard arm). New values of enums defined in other crates
+//! [`FinishReason`], [`UsageRole`] or [`DiffStatus`] value a reader does not know reads as
+//! its `Unknown` variant instead of failing the message, so those can also grow in minor
+//! versions (match with a wildcard arm). New values of enums defined in other crates
 //! ([`MutationReason`], `Shown`, `MemoryKind`) are a major-version change. An unknown
 //! [`Command`] is an error: the engine cannot ignore what it was asked to do.
 //! Timestamps are unix seconds (`u64`).
@@ -26,7 +26,7 @@ use serde_json::Value;
 use tautly_context::{Breakdown, ContextStatus, MutationReason};
 use tautly_memory::MemoryChange;
 use tautly_provider::Quota;
-use tautly_tools::{AppliedEffect, LineRange, Shown, ToolMeta};
+use tautly_tools::{AppliedEffect, DiffPreview, LineRange, Shown, ToolMeta};
 
 /// `(major, minor)` of this protocol.
 pub const PROTOCOL_VERSION: (u32, u32) = (1, 0);
@@ -176,6 +176,10 @@ pub enum Event {
         tool: String,
         args: Value,
         reason: String,
+        /// What the call would change (edits and writes); the approved diff is the applied
+        /// one, since `run` refuses if a file changed after this preview.
+        #[serde(default)]
+        diff: Option<DiffPreview>,
     },
     ToolStarted {
         call_id: String,
@@ -194,6 +198,9 @@ pub enum Event {
         blocked: bool,
         effects: Vec<EffectView>,
         meta: ToolMetaView,
+        /// The diff a successful edit or write applied.
+        #[serde(default)]
+        diff: Option<DiffPreview>,
     },
     Usage {
         role: UsageRole,
@@ -242,6 +249,15 @@ pub enum Event {
         retryable: bool,
         hint: Option<String>,
     },
+    /// The answer to [`Command::Diff`]: the net change per file that Tautly's tools made in
+    /// the session (`turn` None) or in user turn `turn`, with the concatenated diff (capped
+    /// at 2,000 lines).
+    SessionDiff {
+        turn: Option<u32>,
+        files: Vec<DiffFile>,
+        unified: String,
+        truncated: bool,
+    },
     /// Something the user should know that does not end the turn (a skipped non-UTF-8
     /// path, a malformed AGENTS.md section, memory entries that failed to load).
     Warning {
@@ -262,6 +278,26 @@ impl Event {
             warnings: status.warnings.clone(),
         }
     }
+}
+
+/// One file of an [`Event::SessionDiff`]: its root-relative path and line counts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiffFile {
+    pub path: String,
+    pub status: DiffStatus,
+    pub added: u32,
+    pub removed: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiffStatus {
+    Added,
+    Modified,
+    Deleted,
+    /// A status this version does not know.
+    #[serde(other)]
+    Unknown,
 }
 
 /// What a budget limit applies to.
@@ -310,6 +346,11 @@ pub enum Command {
     },
     ConsolidateMemory,
     Fork,
+    /// Answered with [`Event::SessionDiff`]: the whole session (None) or user turn `turn`
+    /// (1-based).
+    Diff {
+        turn: Option<u32>,
+    },
     Shutdown,
 }
 

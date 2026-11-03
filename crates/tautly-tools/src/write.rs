@@ -6,6 +6,7 @@ use serde_json::{Value, json};
 use tautly_provider::{Capabilities, ToolSpec};
 use tautly_sandbox::{Effect, Sandbox, SandboxError};
 
+use crate::preview::{Preview, check_approved, display_diff, shown_path};
 use crate::spec::{parse_args, tool_spec};
 use crate::{AppliedEffect, Tool, ToolCx, ToolError, ToolResult};
 
@@ -48,25 +49,16 @@ impl Tool for WriteTool {
     }
 
     async fn run(&self, args: Value, sb: &dyn Sandbox, cx: &ToolCx) -> ToolResult {
+        if let Err(r) = check_approved(sb, cx).await {
+            return r;
+        }
         let a: Args = match parse_args(&args) {
             Ok(a) => a,
             Err(e) => return ToolResult::error(e.to_string()),
         };
-        let full = match sb.resolve(Path::new(&a.path)) {
-            Ok(p) => p,
-            Err(e) => return ToolResult::error(e.to_string()),
-        };
-        let pre_image = match sb.read(&full).await {
-            Ok(b) => Some(b),
-            Err(SandboxError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => None,
-            Err(e) => return ToolResult::error(format!("{}: {e}", a.path)),
-        };
-        let pre_mode = match &pre_image {
-            Some(_) => match sb.metadata(&full).await {
-                Ok(m) => Some(m.mode & 0o7777),
-                Err(e) => return ToolResult::error(format!("{}: {e}", a.path)),
-            },
-            None => None,
+        let (full, pre_image, pre_mode) = match load(&a, sb).await {
+            Ok(loaded) => loaded,
+            Err(r) => return r,
         };
         // The commit point: a cancel seen before it changes nothing; after it, the write
         // is reported in full (the engine waits for it rather than abandon it).
@@ -102,7 +94,10 @@ impl Tool for WriteTool {
             output.push('\n');
             output.push_str(&note);
         }
+        let shown = shown_path(sb, &full, &a.path);
+        let diff = display_diff(&[(shown, pre_image.as_deref(), Some(a.content.as_bytes()))]).await;
         let mut r = ToolResult::ok(output);
+        r.applied_diff = Some(diff);
         r.effects.push(AppliedEffect::Edited {
             path: full,
             pre_image,
@@ -111,4 +106,51 @@ impl Tool for WriteTool {
         });
         r
     }
+
+    async fn preview(
+        &self,
+        args: &Value,
+        sb: &dyn Sandbox,
+        _cx: &ToolCx,
+    ) -> Option<Result<Preview, ToolResult>> {
+        let a: Args = match parse_args(args) {
+            Ok(a) => a,
+            Err(e) => return Some(Err(ToolResult::error(e.to_string()))),
+        };
+        let (full, pre_image, _) = match load(&a, sb).await {
+            Ok(loaded) => loaded,
+            Err(r) => return Some(Err(r)),
+        };
+        let shown = shown_path(sb, &full, &a.path);
+        let diff = display_diff(&[(shown, pre_image.as_deref(), Some(a.content.as_bytes()))]).await;
+        let base = pre_image.as_deref().map(blake3::hash);
+        Some(Ok(Preview {
+            diff,
+            bases: vec![(full, base)],
+        }))
+    }
+}
+
+/// The resolved path and the file as it is (pre-image and permission bits; None when it
+/// does not exist yet). Errors are ready to return.
+async fn load(
+    a: &Args,
+    sb: &dyn Sandbox,
+) -> Result<(PathBuf, Option<Vec<u8>>, Option<u32>), ToolResult> {
+    let full = sb
+        .resolve(Path::new(&a.path))
+        .map_err(|e| ToolResult::error(e.to_string()))?;
+    let pre_image = match sb.read(&full).await {
+        Ok(b) => Some(b),
+        Err(SandboxError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(ToolResult::error(format!("{}: {e}", a.path))),
+    };
+    let pre_mode = match &pre_image {
+        Some(_) => match sb.metadata(&full).await {
+            Ok(m) => Some(m.mode & 0o7777),
+            Err(e) => return Err(ToolResult::error(format!("{}: {e}", a.path))),
+        },
+        None => None,
+    };
+    Ok((full, pre_image, pre_mode))
 }

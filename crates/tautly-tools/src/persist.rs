@@ -77,6 +77,7 @@ pub(crate) const ERROR_KINDS: &[&str] = &[
     "invalid_ops",
     "invalid_patch",
     "invalid_memory",
+    "changed_after_approval",
 ];
 
 /// What a kind this version does not know is read back as.
