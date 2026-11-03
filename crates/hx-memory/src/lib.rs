@@ -28,6 +28,10 @@ pub enum MemoryError {
         #[source]
         source: std::io::Error,
     },
+    #[error("{} is a symlink or not a directory; hx will not read or write memory through it", .0.display())]
+    UnsafeDir(PathBuf),
+    #[error("code index error: {0}")]
+    Index(String),
     #[error("invalid id `{0}`: use lowercase letters, digits, `-` and `_` only")]
     BadId(String),
     #[error("no memory entry with id `{0}`")]

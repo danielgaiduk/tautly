@@ -17,6 +17,8 @@ pub enum HitSource {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Hit {
     pub source: HitSource,
+    /// The entry's kind; None for an episode.
+    pub kind: Option<crate::MemoryKind>,
     pub title: String,
     pub text: String,
     pub stale: bool,

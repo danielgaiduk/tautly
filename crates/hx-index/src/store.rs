@@ -331,15 +331,20 @@ impl Index {
 
     /// blake3 hex of the file content as last indexed.
     pub fn file_hash(&self, rel: &Path) -> Option<String> {
+        self.try_file_hash(rel).ok().flatten()
+    }
+
+    /// [`file_hash`](Self::file_hash) that reports a database error instead of folding it
+    /// into `None` (not indexed).
+    pub fn try_file_hash(&self, rel: &Path) -> Result<Option<String>, IndexError> {
         let key = self.inner.key(rel);
-        self.inner
+        Ok(self
+            .inner
             .conn()
             .query_row("SELECT hash FROM files WHERE path = ?1", [key], |r| {
                 r.get(0)
             })
-            .optional()
-            .ok()
-            .flatten()
+            .optional()?)
     }
 
     /// blake3 hex of the first definition (in source order) named `name` in the file,
@@ -352,8 +357,23 @@ impl Index {
         parent: Option<&str>,
         kind: Option<SymbolKind>,
     ) -> Option<String> {
+        self.try_symbol_hash_in(rel, name, parent, kind)
+            .ok()
+            .flatten()
+    }
+
+    /// [`symbol_hash_in`](Self::symbol_hash_in) that reports a database error instead of
+    /// folding it into `None` (no such definition).
+    pub fn try_symbol_hash_in(
+        &self,
+        rel: &Path,
+        name: &str,
+        parent: Option<&str>,
+        kind: Option<SymbolKind>,
+    ) -> Result<Option<String>, IndexError> {
         let key = self.inner.key(rel);
-        self.inner
+        Ok(self
+            .inner
             .conn()
             .query_row(
                 "SELECT hash FROM symbols WHERE file = ?1 AND name = ?2 \
@@ -362,9 +382,7 @@ impl Index {
                 params![key, name, parent, kind.map(SymbolKind::as_str)],
                 |r| r.get(0),
             )
-            .optional()
-            .ok()
-            .flatten()
+            .optional()?)
     }
 
     /// How many refreshes have completed on this handle.

@@ -14,8 +14,10 @@ serde.workspace = true
 serde_json.workspace = true
 humantime.workspace = true
 rand.workspace = true
+libc.workspace = true
 
 [dev-dependencies]
 hx-sandbox = { path = "../hx-sandbox" }
 tokio.workspace = true
 tempfile.workspace = true
+rusqlite.workspace = true

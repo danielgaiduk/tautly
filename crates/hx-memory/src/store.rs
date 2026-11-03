@@ -1,7 +1,7 @@
 //! The memory store: loading, applying changes, the index block and search.
 
 use std::fs;
-use std::io::{Read, Write};
+use std::io::{ErrorKind, Read, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -16,7 +16,17 @@ use crate::stale;
 use crate::{MAX_BODY_TOKENS, MemAnchor, MemoryChange, MemoryDraft, MemoryEntry, MemoryError};
 
 /// Entry files larger than this are not loaded.
-const MAX_ENTRY_BYTES: u64 = 64 * 1024;
+const MAX_ENTRY_BYTES: u64 = 16 * 1024;
+/// At most this many entries are loaded.
+const MAX_ENTRIES: usize = 500;
+/// The entry files loaded add up to at most this many bytes.
+const MAX_TOTAL_BYTES: u64 = 2 * 1024 * 1024;
+/// Directory listings are read only up to this many `.md` files.
+const MAX_SCAN: usize = MAX_ENTRIES * 4;
+/// Most anchors one entry may have.
+pub(crate) const MAX_ANCHORS: usize = 16;
+/// `skipped()` lists this many files at most; the rest are only counted.
+const MAX_SKIPS_LISTED: usize = 50;
 
 pub struct MemoryStore {
     pub(crate) index: Arc<Index>,
@@ -29,6 +39,13 @@ pub struct MemoryStore {
     /// Search statistics of `entries`, in the same order.
     pub(crate) docs: Vec<Doc>,
     skipped: Vec<(PathBuf, String)>,
+    skipped_total: usize,
+    /// `.hx` and `.hx/memory`: checked not to be links before every read and write.
+    dir_chain: Vec<PathBuf>,
+    /// The hx data home, and below it `memory`, the project's directory and `episodes`.
+    data_home: PathBuf,
+    episodes_chain: Vec<PathBuf>,
+    staleness_error: Option<String>,
     /// Loaded on the first search; dropped when an episode is written.
     episodes: Mutex<Option<Arc<Vec<Episode>>>>,
 }
@@ -40,14 +57,76 @@ fn io_err(path: &Path) -> impl FnOnce(std::io::Error) -> MemoryError + '_ {
     }
 }
 
-/// Create `file` in `dir` atomically (temp file + rename), mode 0600, creating `dir` with
-/// mode 0700 when missing.
-pub(crate) fn write_private(dir: &Path, file: &str, content: &str) -> Result<PathBuf, MemoryError> {
-    fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(dir)
-        .map_err(io_err(dir))?;
+/// Whether every directory of `chain` (each inside the previous) exists as a real
+/// directory: Ok(false) once one is missing, `UnsafeDir` for a symlink or a file. Memory is
+/// repo-controlled, so a link must never lead reads or writes out of the project.
+pub(crate) fn verify_dirs(chain: &[PathBuf]) -> Result<bool, MemoryError> {
+    for dir in chain {
+        match fs::symlink_metadata(dir) {
+            Ok(m) if m.is_dir() => {}
+            Ok(_) => return Err(MemoryError::UnsafeDir(dir.clone())),
+            Err(e) if e.kind() == ErrorKind::NotFound => return Ok(false),
+            Err(e) => return Err(io_err(dir)(e)),
+        }
+    }
+    Ok(true)
+}
+
+/// [`verify_dirs`], creating the missing directories with mode 0700.
+fn ensure_dirs(chain: &[PathBuf]) -> Result<(), MemoryError> {
+    for dir in chain {
+        if let Err(e) = fs::DirBuilder::new().mode(0o700).create(dir)
+            && e.kind() != ErrorKind::AlreadyExists
+        {
+            return Err(io_err(dir)(e));
+        }
+        // Whether we made it or it was there: it must be a real directory.
+        if !fs::symlink_metadata(dir).map_err(io_err(dir))?.is_dir() {
+            return Err(MemoryError::UnsafeDir(dir.clone()));
+        }
+    }
+    Ok(())
+}
+
+/// Read `path` (UTF-8) without following a symlink or blocking on a pipe. A file over `max`
+/// bytes is an error, or cut to `max` when `truncate`.
+pub(crate) fn read_nofollow(path: &Path, max: u64, truncate: bool) -> Result<String, String> {
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .map_err(|e| format!("cannot open (a symlink is refused): {e}"))?;
+    let meta = file.metadata().map_err(|e| e.to_string())?;
+    if !meta.is_file() {
+        return Err("not a regular file".into());
+    }
+    if meta.len() > max && !truncate {
+        return Err(format!("larger than {max} bytes"));
+    }
+    let mut bytes = Vec::new();
+    file.take(max)
+        .read_to_end(&mut bytes)
+        .map_err(|e| e.to_string())?;
+    match String::from_utf8(bytes) {
+        Ok(t) => Ok(t),
+        Err(e) if truncate => {
+            let valid = e.utf8_error().valid_up_to();
+            Ok(String::from_utf8_lossy(&e.as_bytes()[..valid]).into_owned())
+        }
+        Err(_) => Err("not UTF-8".into()),
+    }
+}
+
+/// Create `file` atomically (temp file in the same directory + rename), mode 0600, in the
+/// last directory of `chain`, creating the chain with mode 0700. The chain is checked for
+/// links first.
+pub(crate) fn write_private(
+    chain: &[PathBuf],
+    file: &str,
+    content: &str,
+) -> Result<PathBuf, MemoryError> {
+    ensure_dirs(chain)?;
+    let dir = chain.last().expect("a directory chain is never empty");
     let target = dir.join(file);
     let tmp = dir.join(format!(".{file}.{:08x}.tmp", rand::random::<u32>()));
     let written = fs::OpenOptions::new()
@@ -92,12 +171,26 @@ impl MemoryStore {
         data_home: &Path,
         index: Arc<Index>,
     ) -> Result<Self, MemoryError> {
-        let dir = project_root.join(".hx").join("memory");
+        let hx = project_root.join(".hx");
+        let dir = hx.join("memory");
+        let dir_chain = vec![hx, dir.clone()];
         let episodes_dir = data_home
             .join("memory")
             .join(hx_session::paths::project_hash(project_root))
             .join("episodes");
-        let (entries, skipped) = load_entries(&dir)?;
+        let episodes_chain: Vec<PathBuf> = episodes_dir
+            .ancestors()
+            .take(3)
+            .map(Path::to_path_buf)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        let (entries, skipped, skipped_total) = if verify_dirs(&dir_chain)? {
+            load_entries(&dir)?
+        } else {
+            (vec![], vec![], 0)
+        };
         let mut store = MemoryStore {
             index,
             dir,
@@ -105,6 +198,11 @@ impl MemoryStore {
             entries,
             docs: Vec::new(),
             skipped,
+            skipped_total,
+            dir_chain,
+            data_home: data_home.to_path_buf(),
+            episodes_chain,
+            staleness_error: None,
             episodes: Mutex::new(None),
         };
         store.rebuild();
@@ -121,6 +219,16 @@ impl MemoryStore {
         &self.skipped
     }
 
+    /// How many entry files were skipped when loading (`skipped` lists only the first few).
+    pub fn skipped_count(&self) -> usize {
+        self.skipped_total
+    }
+
+    /// The error from the last staleness check, if the index could not be queried.
+    pub fn staleness_error(&self) -> Option<&str> {
+        self.staleness_error.as_deref()
+    }
+
     fn rebuild(&mut self) {
         self.entries.sort_by(|a, b| sort_key(a).cmp(&sort_key(b)));
         self.docs = self
@@ -130,12 +238,35 @@ impl MemoryStore {
             .collect();
     }
 
-    /// Re-check every anchor against the index; returns how many entries are now stale.
+    /// Re-check every anchor against the index; returns how many entries are now stale. An
+    /// entry whose anchors cannot be checked because the index fails keeps its flag; the
+    /// error is available from [`staleness_error`](Self::staleness_error) until the next
+    /// check.
     pub fn refresh_staleness(&mut self) -> usize {
         let index = &self.index;
+        let mut error = None;
         for e in &mut self.entries {
-            e.stale = e.anchors.iter().any(|a| stale::is_stale(index, a));
+            let mut stale = false;
+            let mut unknown = false;
+            for a in &e.anchors {
+                match stale::is_stale(index, a) {
+                    Ok(true) => {
+                        stale = true;
+                        break;
+                    }
+                    Ok(false) => {}
+                    Err(err) => {
+                        error.get_or_insert_with(|| err.to_string());
+                        unknown = true;
+                        break;
+                    }
+                }
+            }
+            if !unknown {
+                e.stale = stale;
+            }
         }
+        self.staleness_error = error;
         self.entries.iter().filter(|e| e.stale).count()
     }
 
@@ -237,28 +368,6 @@ impl MemoryStore {
                 max: MAX_BODY_TOKENS,
             });
         }
-        let mut anchors = Vec::new();
-        for (path, symbol) in &d.anchors {
-            let shown = match symbol {
-                Some(s) => format!("{} (symbol `{s}`)", path.display()),
-                None => path.display().to_string(),
-            };
-            let bad = |reason: String| MemoryError::BadAnchor {
-                anchor: shown.clone(),
-                reason,
-            };
-            let rel = normalize_rel(path).map_err(|why| bad(why.into()))?;
-            let symbol = match symbol.as_deref().map(str::trim) {
-                Some("") => return Err(bad("the symbol name is empty".into())),
-                other => other.map(String::from),
-            };
-            let hash = stale::anchor_hash(&self.index, &rel, symbol.as_deref()).map_err(bad)?;
-            anchors.push(MemAnchor {
-                path: rel,
-                symbol,
-                hash,
-            });
-        }
         let existing = match &d.id {
             Some(id) => {
                 check_id(id)?;
@@ -271,6 +380,52 @@ impl MemoryStore {
             }
             None => None,
         };
+        // An update without anchors keeps the entry's own, hashed again against the code now.
+        let wanted: Vec<(PathBuf, Option<String>)> = match existing {
+            Some(e) if d.anchors.is_empty() => e
+                .anchors
+                .iter()
+                .map(|a| (a.path.clone(), a.symbol.clone()))
+                .collect(),
+            _ => d.anchors.clone(),
+        };
+        if wanted.len() > MAX_ANCHORS {
+            return Err(MemoryError::InvalidChange(format!(
+                "an entry has at most {MAX_ANCHORS} anchors"
+            )));
+        }
+        let mut anchors = Vec::new();
+        for (path, symbol) in &wanted {
+            let shown = match symbol {
+                Some(s) => format!("{} (symbol `{s}`)", path.display()),
+                None => path.display().to_string(),
+            };
+            let bad = |reason: String| MemoryError::BadAnchor {
+                anchor: shown.clone(),
+                reason,
+            };
+            let index_err = |e: hx_index::IndexError| MemoryError::Index(e.to_string());
+            let rel = normalize_rel(path).map_err(|why| bad(why.into()))?;
+            let symbol = match symbol.as_deref().map(str::trim) {
+                Some("") => return Err(bad("the symbol name is empty".into())),
+                other => other.map(String::from),
+            };
+            let hash =
+                match stale::probe(&self.index, &rel, symbol.as_deref()).map_err(index_err)? {
+                    stale::Probe::Hash(h) => h,
+                    stale::Probe::Gone(reason) => return Err(bad(reason)),
+                };
+            if let Some(sym) = &symbol
+                && let Some(why) = stale::ambiguity(&self.index, &rel, sym).map_err(index_err)?
+            {
+                return Err(bad(why));
+            }
+            anchors.push(MemAnchor {
+                path: rel,
+                symbol,
+                hash,
+            });
+        }
         let when = now();
         let entry = MemoryEntry {
             id: match existing {
@@ -295,6 +450,7 @@ impl MemoryStore {
     /// written first, so a failure there changes nothing; a failed delete is reported after
     /// the others were tried.
     pub fn apply(&mut self, c: &MemoryChange) -> Result<(), MemoryError> {
+        verify_dirs(&self.dir_chain)?;
         if let Some(e) = &c.upsert {
             check_id(&e.id)?;
             if let Some(a) = e.anchors.iter().find(|a| normalize_rel(&a.path).is_err()) {
@@ -314,7 +470,7 @@ impl MemoryStore {
             check_id(id)?;
         }
         if let Some(e) = &c.upsert {
-            write_private(&self.dir, &format!("{}.md", e.id), &e.to_markdown())?;
+            write_private(&self.dir_chain, &format!("{}.md", e.id), &e.to_markdown())?;
             self.entries.retain(|x| x.id != e.id);
             self.entries.push(e.clone());
         }
@@ -337,8 +493,15 @@ impl MemoryStore {
 
     fn episodes(&self) -> Arc<Vec<Episode>> {
         let mut slot = self.episodes.lock().unwrap_or_else(PoisonError::into_inner);
-        slot.get_or_insert_with(|| Arc::new(episodes::load_all(&self.episodes_dir)))
-            .clone()
+        slot.get_or_insert_with(|| {
+            // A linked episodes directory is treated as having no episodes.
+            let found = match verify_dirs(&self.episodes_chain) {
+                Ok(true) => episodes::load_all(&self.episodes_dir),
+                _ => Vec::new(),
+            };
+            Arc::new(found)
+        })
+        .clone()
     }
 
     /// BM25 (k1 = 1.2, b = 0.75) over project entries and episodes: the best `k` that match,
@@ -363,10 +526,11 @@ impl MemoryStore {
         let mut hits = Vec::new();
         let mut left = cap_tokens;
         for (i, score) in search::rank(&docs, &terms).into_iter().take(k) {
-            let (source, title, text, stale) = match self.entries.get(i) {
+            let (source, kind, title, text, stale) = match self.entries.get(i) {
                 Some(e) => (
                     HitSource::Project(e.id.clone()),
-                    e.title.clone(),
+                    Some(e.kind),
+                    sanitize_title(&e.title),
                     e.body.as_str(),
                     e.stale,
                 ),
@@ -374,6 +538,7 @@ impl MemoryStore {
                     let ep = &episodes[i - self.entries.len()];
                     (
                         HitSource::Episode(ep.session_id.clone()),
+                        None,
                         ep.title.clone(),
                         ep.text.as_str(),
                         false,
@@ -389,6 +554,7 @@ impl MemoryStore {
             left = room.saturating_sub(est(&text));
             hits.push(Hit {
                 source,
+                kind,
                 title,
                 text,
                 stale,
@@ -406,49 +572,79 @@ impl MemoryStore {
         if !valid_session_id(session_id) {
             return Err(MemoryError::BadId(session_id.to_string()));
         }
-        let path = write_private(&self.episodes_dir, &format!("{session_id}.md"), markdown)?;
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&self.data_home)
+            .map_err(io_err(&self.data_home))?;
+        let path = write_private(&self.episodes_chain, &format!("{session_id}.md"), markdown)?;
         *self.episodes.lock().unwrap_or_else(PoisonError::into_inner) = None;
         Ok(path)
     }
 }
 
-/// The entries in `dir` and the files that were skipped. A missing directory is empty.
-#[allow(clippy::type_complexity)]
-fn load_entries(dir: &Path) -> Result<(Vec<MemoryEntry>, Vec<(PathBuf, String)>), MemoryError> {
+/// What loading a directory found: the entries, the first skipped files with the reason,
+/// and how many were skipped in all.
+type Loaded = (Vec<MemoryEntry>, Vec<(PathBuf, String)>, usize);
+
+/// The entries in `dir` (checked not to be a link), within the load caps. A missing
+/// directory is empty.
+fn load_entries(dir: &Path) -> Result<Loaded, MemoryError> {
     let read = match fs::read_dir(dir) {
         Ok(r) => r,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((vec![], vec![])),
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok((vec![], vec![], 0)),
         Err(e) => return Err(io_err(dir)(e)),
     };
     let mut paths: Vec<PathBuf> = read
         .filter_map(Result::ok)
         .map(|e| e.path())
         .filter(|p| p.extension().is_some_and(|x| x == "md"))
+        .take(MAX_SCAN + 1)
         .collect();
+    let (mut entries, mut skipped, mut total) = (Vec::new(), Vec::new(), 0usize);
+    let mut skip = |path: &Path, why: String| {
+        total += 1;
+        if skipped.len() < MAX_SKIPS_LISTED {
+            skipped.push((path.to_path_buf(), why));
+        }
+    };
+    if paths.len() > MAX_SCAN {
+        paths.pop();
+        skip(
+            dir,
+            format!("more than {MAX_SCAN} entry files; the rest were not read"),
+        );
+    }
     paths.sort();
-    let (mut entries, mut skipped) = (Vec::new(), Vec::new());
+    let mut bytes = 0u64;
     for path in paths {
+        if entries.len() >= MAX_ENTRIES {
+            skip(
+                &path,
+                format!("more than {MAX_ENTRIES} entries; not loaded"),
+            );
+            continue;
+        }
         match load_entry(&path) {
-            Ok(e) => entries.push(e),
-            Err(why) => skipped.push((path, why)),
+            Ok((_, len)) if bytes + len > MAX_TOTAL_BYTES => skip(
+                &path,
+                format!("the total size of the entry files would exceed {MAX_TOTAL_BYTES} bytes"),
+            ),
+            Ok((entry, len)) => {
+                bytes += len;
+                entries.push(entry);
+            }
+            Err(why) => skip(&path, why),
         }
     }
-    Ok((entries, skipped))
+    Ok((entries, skipped, total))
 }
 
-fn load_entry(path: &Path) -> Result<MemoryEntry, String> {
-    let meta = fs::symlink_metadata(path).map_err(|e| e.to_string())?;
-    if !meta.is_file() {
-        return Err("not a regular file".into());
-    }
-    if meta.len() > MAX_ENTRY_BYTES {
-        return Err(format!("larger than {MAX_ENTRY_BYTES} bytes"));
-    }
-    let mut text = String::new();
-    fs::File::open(path)
-        .and_then(|mut f| f.read_to_string(&mut text))
-        .map_err(|e| e.to_string())?;
-    let entry = MemoryEntry::from_markdown(&text)?;
+/// One entry file and its size, enforcing the limits drafts obey: title cleaned and capped,
+/// body within the token limit, a bounded number of anchors.
+fn load_entry(path: &Path) -> Result<(MemoryEntry, u64), String> {
+    let text = read_nofollow(path, MAX_ENTRY_BYTES, false)?;
+    let mut entry = MemoryEntry::from_markdown(&text)?;
     let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
     if !valid_id(stem) || stem != entry.id {
         return Err(format!(
@@ -456,5 +652,18 @@ fn load_entry(path: &Path) -> Result<MemoryEntry, String> {
             entry.id
         ));
     }
-    Ok(entry)
+    let tokens = entry.body.len().div_ceil(4) as u32;
+    if tokens > MAX_BODY_TOKENS {
+        return Err(format!(
+            "the body is about {tokens} tokens; the limit is {MAX_BODY_TOKENS}"
+        ));
+    }
+    if entry.anchors.len() > MAX_ANCHORS {
+        return Err(format!("more than {MAX_ANCHORS} anchors"));
+    }
+    entry.title = sanitize_title(&entry.title);
+    if entry.title.is_empty() {
+        entry.title = "(untitled)".into();
+    }
+    Ok((entry, text.len() as u64))
 }

@@ -20,7 +20,7 @@ fn est(s: &str) -> u32 {
 struct Env {
     project: TempDir,
     data: TempDir,
-    _db: TempDir,
+    db: TempDir,
     index: Arc<Index>,
     store: MemoryStore,
 }
@@ -44,7 +44,7 @@ async fn env_with(files: &[(&str, &str)], refresh: bool) -> Env {
     Env {
         project,
         data,
-        _db: db,
+        db,
         index,
         store,
     }
@@ -739,4 +739,344 @@ fn parse_consolidation_rejects_overlapping_ops_and_long_bodies() {
         e.store.parse_consolidation(&long),
         Err(MemoryError::TooLong { .. })
     ));
+}
+
+// ---- fix round 1: hostile repositories, symlinks, staleness errors, anchors ----
+
+/// A hand-written entry file, as a teammate (or an attacker) could commit one.
+fn entry_file(id: &str, title: &str, body: &str) -> String {
+    format!(
+        "---\nid: {}\ntitle: {}\nkind: \"fact\"\nanchors: []\ncreated: \"2026-01-01T00:00:00Z\"\n---\n{body}\n",
+        serde_json_str(id),
+        serde_json_str(title)
+    )
+}
+
+fn serde_json_str(s: &str) -> String {
+    format!(
+        "\"{}\"",
+        s.replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('\n', "\\n")
+    )
+}
+
+fn write_entries(project: &Path, files: &[(String, String)]) {
+    let dir = project.join(".hx/memory");
+    fs::create_dir_all(&dir).unwrap();
+    for (name, text) in files {
+        fs::write(dir.join(name), text).unwrap();
+    }
+}
+
+fn reopen(e: &Env) -> MemoryStore {
+    MemoryStore::open_in(e.project.path(), e.data.path(), e.index.clone()).unwrap()
+}
+
+#[tokio::test]
+async fn loaded_entries_are_capped_and_sanitized_and_skips_are_reported() {
+    let e = setup(&[]).await;
+    write_entries(
+        e.project.path(),
+        &[
+            ("ok.md".into(), entry_file("ok", "fine", "body")),
+            (
+                "big.md".into(),
+                entry_file("big", "big", &"x".repeat(20_000)),
+            ),
+            (
+                "long.md".into(),
+                entry_file("long", "long", &"x".repeat(2_000)),
+            ),
+            (
+                "title.md".into(),
+                entry_file("title", &"t".repeat(1000), "b"),
+            ),
+            ("nl.md".into(), entry_file("nl", "a\nb<c>", "b")),
+        ],
+    );
+    let m = reopen(&e);
+    let mut ids: Vec<&str> = m.entries().iter().map(|x| x.id.as_str()).collect();
+    ids.sort();
+    assert_eq!(ids, ["nl", "ok", "title"]);
+    assert_eq!(m.skipped_count(), 2);
+    let why: String = m.skipped().iter().map(|(_, w)| w.as_str()).collect();
+    assert!(why.contains("16384") && why.contains("300"), "{why}");
+    let by = |id: &str| m.entries().iter().find(|x| x.id == id).unwrap();
+    assert_eq!(by("nl").title, "a b c");
+    assert!(by("title").title.chars().count() <= 120);
+}
+
+#[tokio::test]
+async fn entry_count_and_total_bytes_are_capped_with_a_report() {
+    let e = setup(&[]).await;
+    let files: Vec<(String, String)> = (0..520)
+        .map(|i| {
+            (
+                format!("e{i:03}.md"),
+                entry_file(&format!("e{i:03}"), "t", "b"),
+            )
+        })
+        .collect();
+    write_entries(e.project.path(), &files);
+    let m = reopen(&e);
+    assert_eq!(m.entries().len(), 500);
+    assert_eq!(m.skipped_count(), 20);
+    assert!(!m.skipped().is_empty() && m.skipped().len() <= 50);
+
+    // Few small files do not hit the aggregate cap, many big ones do.
+    let e = setup(&[]).await;
+    let long_path = "a".repeat(14_000);
+    let files: Vec<(String, String)> = (0..150)
+        .map(|i| {
+            let id = format!("f{i:03}");
+            let mut text = entry_file(&id, "t", "b");
+            text = text.replace(
+                "anchors: []",
+                &format!("anchors: [{{\"path\":\"{long_path}\",\"hash\":\"h\"}}]"),
+            );
+            (format!("{id}.md"), text)
+        })
+        .collect();
+    write_entries(e.project.path(), &files);
+    let m = reopen(&e);
+    assert!(
+        m.entries().len() < 150 && m.entries().len() > 100,
+        "{}",
+        m.entries().len()
+    );
+    assert_eq!(m.entries().len() + m.skipped_count(), 150);
+    assert!(
+        m.skipped().iter().any(|(_, w)| w.contains("total")),
+        "{:?}",
+        m.skipped()
+    );
+
+    // A flood of oversize files: counted, but only the first few are listed.
+    let e = setup(&[]).await;
+    let files: Vec<(String, String)> = (0..120)
+        .map(|i| {
+            (
+                format!("b{i:03}.md"),
+                entry_file(&format!("b{i:03}"), "t", &"x".repeat(17_000)),
+            )
+        })
+        .collect();
+    write_entries(e.project.path(), &files);
+    let m = reopen(&e);
+    assert!(m.entries().is_empty());
+    assert_eq!(m.skipped_count(), 120);
+    assert_eq!(m.skipped().len(), 50);
+}
+
+#[tokio::test]
+async fn consolidation_request_is_capped_and_says_what_was_left_out() {
+    let e = setup(&[]).await;
+    let body = "x".repeat(1_100);
+    let files: Vec<(String, String)> = (0..500)
+        .map(|i| {
+            let id = format!("e{i:03}");
+            let mut text = entry_file(&id, &format!("title {i:03}"), &body);
+            text = text.replace(
+                "created: \"2026-01-01T00:00:00Z\"",
+                &format!("created: \"2026-01-01T{:02}:{:02}:00Z\"", i / 60, i % 60),
+            );
+            if i == 0 {
+                text = text.replacen("\n---\n", "\nverified: \"2026-06-01T00:00:00Z\"\n---\n", 1);
+            }
+            (format!("{id}.md"), text)
+        })
+        .collect();
+    write_entries(e.project.path(), &files);
+    let m = reopen(&e);
+    assert_eq!(m.entries().len(), 500);
+    let req = m.consolidation_request();
+    assert!(req.len() <= 50_000 * 4 + 4_000, "{} bytes", req.len());
+    assert!(req.contains("left out"), "{}", &req[req.len() - 600..]);
+    assert!(
+        req.contains("\"id\": \"e000\""),
+        "the oldest entry is verified, so it stays"
+    );
+    assert!(
+        req.contains("\"id\": \"e499\""),
+        "the newest unverified stays"
+    );
+    assert!(
+        !req.contains("\"id\": \"e001\""),
+        "the oldest unverified goes first"
+    );
+
+    let small = setup(&[]).await;
+    write_entries(
+        small.project.path(),
+        &[("a.md".into(), entry_file("a", "A", "b"))],
+    );
+    assert!(!reopen(&small).consolidation_request().contains("left out"));
+}
+
+#[tokio::test]
+async fn symlinked_memory_dirs_are_refused() {
+    use std::os::unix::fs::symlink;
+    let outside = TempDir::new().unwrap();
+    let planted = entry_file("planted", "Planted", "from outside");
+    fs::write(outside.path().join("planted.md"), &planted).unwrap();
+
+    // `.hx/memory` is a link: open refuses, nothing is read.
+    let e = setup(&[]).await;
+    fs::create_dir_all(e.project.path().join(".hx")).unwrap();
+    symlink(outside.path(), e.project.path().join(".hx/memory")).unwrap();
+    let r = MemoryStore::open_in(e.project.path(), e.data.path(), e.index.clone());
+    assert!(matches!(r, Err(MemoryError::UnsafeDir(_))));
+
+    // `.hx` is a link.
+    let e = setup(&[]).await;
+    symlink(outside.path(), e.project.path().join(".hx")).unwrap();
+    let r = MemoryStore::open_in(e.project.path(), e.data.path(), e.index.clone());
+    assert!(matches!(r, Err(MemoryError::UnsafeDir(_))));
+
+    // The directory is swapped for a link after open: writes and deletes go nowhere.
+    let mut e = setup(&[]).await;
+    let id = add(&mut e.store, draft("Real", MemoryKind::Fact, "b"));
+    let real = e.project.path().join(".hx/memory");
+    fs::rename(&real, e.project.path().join(".hx/moved")).unwrap();
+    symlink(outside.path(), &real).unwrap();
+    let c = e
+        .store
+        .draft_to_change(draft("Second", MemoryKind::Fact, "b"), &est)
+        .unwrap();
+    assert!(matches!(e.store.apply(&c), Err(MemoryError::UnsafeDir(_))));
+    let del = MemoryChange {
+        upsert: None,
+        delete: vec!["planted".into(), id],
+    };
+    assert!(matches!(
+        e.store.apply(&del),
+        Err(MemoryError::UnsafeDir(_))
+    ));
+    let mut names: Vec<_> = fs::read_dir(outside.path())
+        .unwrap()
+        .map(|d| d.unwrap().file_name().into_string().unwrap())
+        .collect();
+    names.sort();
+    assert_eq!(names, ["planted.md"], "nothing written or removed outside");
+
+    // A symlinked file inside a real directory is skipped.
+    let e = setup(&[]).await;
+    fs::create_dir_all(e.project.path().join(".hx/memory")).unwrap();
+    symlink(
+        outside.path().join("planted.md"),
+        e.project.path().join(".hx/memory/planted.md"),
+    )
+    .unwrap();
+    let m = reopen(&e);
+    assert!(m.entries().is_empty());
+    assert_eq!(m.skipped_count(), 1);
+}
+
+#[tokio::test]
+async fn symlinked_episode_dirs_are_refused() {
+    use std::os::unix::fs::symlink;
+    let outside = TempDir::new().unwrap();
+    fs::write(
+        outside.path().join("evil.md"),
+        "# planted\nscheduler secrets",
+    )
+    .unwrap();
+    let e = setup(&[]).await;
+    let hash = hx_session::paths::project_hash(e.project.path());
+    let project_dir = e.data.path().join("memory").join(&hash);
+    fs::create_dir_all(&project_dir).unwrap();
+    symlink(outside.path(), project_dir.join("episodes")).unwrap();
+    assert!(matches!(
+        e.store.write_episode("s1", "text"),
+        Err(MemoryError::UnsafeDir(_))
+    ));
+    assert!(e.store.search("scheduler", 5, 2000, &est).is_empty());
+    assert!(!outside.path().join("s1.md").exists());
+}
+
+#[tokio::test]
+async fn index_errors_are_not_staleness() {
+    let mut e = setup(&[("lib.rs", "fn a(){1}\nfn b(){2}")]).await;
+    add(&mut e.store, draft_anchored("lib.rs", Some("a")));
+    add(&mut e.store, draft_anchored("lib.rs", Some("b")));
+    fs::write(e.project.path().join("lib.rs"), "fn a(){1}\nfn b(){9}").unwrap();
+    e.index.reindex_file(Path::new("lib.rs")).await.unwrap();
+    assert_eq!(e.store.refresh_staleness(), 1);
+    assert_eq!(e.store.staleness_error(), None);
+    let flags: Vec<bool> = e.store.entries().iter().map(|x| x.stale).collect();
+
+    // Break the index database from another connection.
+    let db = rusqlite::Connection::open(e.db.path().join("index.db")).unwrap();
+    db.execute_batch("ALTER TABLE files RENAME TO files_gone")
+        .unwrap();
+    assert_eq!(
+        e.store.refresh_staleness(),
+        1,
+        "flags are left as they were"
+    );
+    let after: Vec<bool> = e.store.entries().iter().map(|x| x.stale).collect();
+    assert_eq!(after, flags);
+    assert!(e.store.staleness_error().is_some());
+    assert!(
+        e.store
+            .draft_to_change(draft_anchored("lib.rs", Some("a")), &est)
+            .is_err()
+    );
+
+    db.execute_batch("ALTER TABLE files_gone RENAME TO files")
+        .unwrap();
+    e.store.refresh_staleness();
+    assert_eq!(e.store.staleness_error(), None);
+}
+
+#[tokio::test]
+async fn ambiguous_unqualified_symbol_is_rejected_with_candidates() {
+    let src = "struct A;\nstruct B;\nimpl A {\n    fn new() -> A { A }\n}\nimpl B {\n    fn new() -> B { B }\n}\nfn solo() {}\n";
+    let e = setup(&[("lib.rs", src)]).await;
+    let err = e
+        .store
+        .draft_to_change(draft_anchored("lib.rs", Some("new")), &est)
+        .unwrap_err();
+    let msg = err.to_string();
+    assert!(matches!(err, MemoryError::BadAnchor { .. }), "{msg}");
+    assert!(msg.contains("A::new") && msg.contains("B::new"), "{msg}");
+    assert!(
+        e.store
+            .draft_to_change(draft_anchored("lib.rs", Some("A::new")), &est)
+            .is_ok()
+    );
+    assert!(
+        e.store
+            .draft_to_change(draft_anchored("lib.rs", Some("solo")), &est)
+            .is_ok()
+    );
+}
+
+#[tokio::test]
+async fn updating_by_id_without_anchors_keeps_and_rehashes_them() {
+    let mut e = setup(&[("lib.rs", "fn a(){1}\nfn b(){2}")]).await;
+    let id = add(&mut e.store, draft_anchored("lib.rs", Some("a")));
+    let old = e.store.entries()[0].anchors[0].hash.clone();
+    fs::write(e.project.path().join("lib.rs"), "fn a(){7}\nfn b(){2}").unwrap();
+    e.index.reindex_file(Path::new("lib.rs")).await.unwrap();
+    assert_eq!(e.store.refresh_staleness(), 1);
+
+    let mut d = draft("Reworded", MemoryKind::Fact, "new text");
+    d.id = Some(id.clone());
+    let c = e.store.draft_to_change(d, &est).unwrap();
+    let kept = &c.upsert.as_ref().unwrap().anchors;
+    assert_eq!(kept.len(), 1);
+    assert_eq!(kept[0].symbol.as_deref(), Some("a"));
+    assert_ne!(kept[0].hash, old, "re-hashed against the code as it is now");
+    e.store.apply(&c).unwrap();
+    assert_eq!(e.store.refresh_staleness(), 0);
+
+    // Anchors given in the update replace the old ones.
+    let mut d = draft_anchored("lib.rs", Some("b"));
+    d.id = Some(id);
+    let c = e.store.draft_to_change(d, &est).unwrap();
+    let anchors = &c.upsert.unwrap().anchors;
+    assert_eq!(anchors.len(), 1);
+    assert_eq!(anchors[0].symbol.as_deref(), Some("b"));
 }

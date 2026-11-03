@@ -1,14 +1,16 @@
 //! Episodic memory: private per-session summaries, read lazily on the first search.
 
 use std::fs;
-use std::io::Read;
 use std::path::Path;
 
 use crate::entry::{sanitize_title, valid_session_id};
 use crate::search::{Doc, doc_of};
+use crate::store::read_nofollow;
 
 /// Episodes larger than this are read only up to it.
-const MAX_EPISODE_BYTES: u64 = 64 * 1024;
+const MAX_EPISODE_BYTES: u64 = 32 * 1024;
+/// Only the newest episodes (by session id, which sorts by time) are searched.
+const MAX_EPISODES: usize = 200;
 
 pub(crate) struct Episode {
     pub session_id: String,
@@ -17,26 +19,27 @@ pub(crate) struct Episode {
     pub doc: Doc,
 }
 
-/// Every readable episode in `dir`, by session id. A missing directory has none.
+/// The newest readable episodes in `dir` (already verified not to be a link), by session
+/// id. Symlinked files are skipped.
 pub(crate) fn load_all(dir: &Path) -> Vec<Episode> {
     let Ok(read) = fs::read_dir(dir) else {
         return Vec::new();
     };
-    let mut out: Vec<Episode> = read
+    let mut ids: Vec<String> = read
         .filter_map(Result::ok)
         .filter_map(|e| {
-            let path = e.path();
-            let id = path.file_name()?.to_str()?.strip_suffix(".md")?.to_string();
-            if !valid_session_id(&id) || !fs::symlink_metadata(&path).ok()?.is_file() {
-                return None;
-            }
-            let mut bytes = Vec::new();
-            fs::File::open(&path)
-                .ok()?
-                .take(MAX_EPISODE_BYTES)
-                .read_to_end(&mut bytes)
-                .ok()?;
-            let text = String::from_utf8_lossy(&bytes).into_owned();
+            let name = e.file_name().into_string().ok()?;
+            let id = name.strip_suffix(".md")?.to_string();
+            valid_session_id(&id).then_some(id)
+        })
+        .collect();
+    ids.sort();
+    let skip = ids.len().saturating_sub(MAX_EPISODES);
+    ids.drain(..skip);
+    ids.into_iter()
+        .filter_map(|id| {
+            let text =
+                read_nofollow(&dir.join(format!("{id}.md")), MAX_EPISODE_BYTES, true).ok()?;
             let heading = text
                 .lines()
                 .map(|l| sanitize_title(l.trim_start_matches('#')))
@@ -50,7 +53,5 @@ pub(crate) fn load_all(dir: &Path) -> Vec<Episode> {
                 doc,
             })
         })
-        .collect();
-    out.sort_by(|a, b| a.session_id.cmp(&b.session_id));
-    out
+        .collect()
 }
