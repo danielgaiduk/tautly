@@ -23,7 +23,7 @@
 //! restore them.
 
 use std::panic::AssertUnwindSafe;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -39,7 +39,7 @@ use tokio::sync::mpsc;
 
 use crate::approvals::Verdict;
 use crate::protocol::{BudgetScope, EffectView, Event};
-use crate::record::{SessionRecord, storable, utf8_effects};
+use crate::record::{ApprovalKind, SessionRecord};
 use crate::session::{Log, LogFailure, Session};
 use crate::turn::{Call, TurnControl};
 
@@ -324,6 +324,13 @@ impl Session {
                  this session (headless); the user can allow it with --approve auto-edit or yolo"
             ))));
         };
+        self.log_approval(SessionRecord::ApprovalRequested {
+            request_id: request_id.clone(),
+            kind: ApprovalKind::Tool,
+            call_id: Some(call.id.clone()),
+            reason: reason.clone(),
+        })
+        .await;
         self.emit(Event::ToolApprovalRequested {
             request_id: request_id.clone(),
             call_id: call.id.clone(),
@@ -454,8 +461,9 @@ impl Session {
             is_error: result.is_error,
         };
         let id = call.id.clone();
+        let root = self.root().to_path_buf();
         if let Some(skipped) = self
-            .with_log(move |log| persist_result(log, id, result, turn))
+            .with_log(move |log| persist_result(log, &root, id, result, turn))
             .await
         {
             self.untracked(skipped.untracked).await;
@@ -480,59 +488,97 @@ async fn after_cancel(ctl: &TurnControl, grace: Duration) {
 
 /// What [`persist_result`] left out of the log.
 struct Skipped {
-    /// Paths that are not valid UTF-8.
+    /// Paths a record cannot hold (outside the root, or not valid UTF-8).
     untracked: Vec<PathBuf>,
     /// Changed files whose pre-image reference is unusable: no `Edit` record, rather than
     /// one that says the file was created.
     bad_pre_images: Vec<PathBuf>,
 }
 
-/// Log a result with its effects (file contents as blobs, paths that are not valid UTF-8
-/// left out) and an `Edit` record per changed file. Buffered: the caller checkpoints.
-/// Blocking file I/O.
+/// The path an effect names.
+fn effect_path(effect: &AppliedEffect) -> Option<&Path> {
+    match effect {
+        AppliedEffect::Read { path, .. }
+        | AppliedEffect::Edited { path, .. }
+        | AppliedEffect::Deleted { path, .. } => Some(path),
+        AppliedEffect::Exec { .. } => None,
+    }
+}
+
+/// What an edit wrote, read back from disk: only when it still hashes to `post_hash`, so
+/// the blob is exactly the tool's output and never a later change by someone else.
+fn post_image(path: &Path, post_hash: &blake3::Hash) -> Option<Vec<u8>> {
+    let bytes = std::fs::read(path).ok()?;
+    (blake3::hash(&bytes) == *post_hash).then_some(bytes)
+}
+
+/// The `Edit` record of a changed file: None for reads and commands, `Some(None)` when its
+/// pre-image reference is unusable.
+fn edit_record(e: &PersistedEffect, turn: u32) -> Option<Option<SessionRecord>> {
+    let (path, pre, post) = match e {
+        PersistedEffect::Edited {
+            path,
+            pre_image_blob,
+            post_image_blob,
+            ..
+        } => (path, pre_image_blob.as_deref(), post_image_blob.as_deref()),
+        PersistedEffect::Deleted {
+            path,
+            pre_image_blob,
+            ..
+        } => (path, Some(pre_image_blob.as_str()), None),
+        PersistedEffect::Read { .. } | PersistedEffect::Exec { .. } => return None,
+    };
+    let Ok(pre_image) = pre.map(BlobRef::parse).transpose() else {
+        return Some(None);
+    };
+    Some(Some(SessionRecord::Edit {
+        path: path.clone(),
+        pre_image,
+        post_image_blob: post.and_then(|b| BlobRef::parse(b).ok()),
+        turn,
+    }))
+}
+
+/// Log a result with its effects (paths relative to `root`, file contents as blobs, paths a
+/// record cannot hold left out) and an `Edit` record per changed file, with the content
+/// it had before and after. Buffered: the caller checkpoints. Blocking file I/O.
 fn persist_result(
     log: &Log,
+    root: &Path,
     id: String,
     result: ToolResult,
     turn: u32,
 ) -> Result<Skipped, LogFailure> {
     let result_blob = log.blob(result.output.as_bytes())?;
-    let mut persisted = Vec::with_capacity(result.effects.len());
-    for e in &result.effects {
-        let mut put = |bytes: &[u8]| log.blob(bytes).map(|b| b.as_str().to_string());
-        persisted.push(PersistedEffect::from_applied(e, &mut put)?);
-    }
-    let (effects, untracked) = utf8_effects(persisted);
+    let mut effects = Vec::with_capacity(result.effects.len());
+    let mut untracked = Vec::new();
     let mut edits = Vec::new();
     let mut bad_pre_images = Vec::new();
-    for e in &effects {
-        let (path, pre) = match e {
+    for e in &result.effects {
+        let mut put = |bytes: &[u8]| log.blob(bytes).map(|b| b.as_str().to_string());
+        let Some(mut persisted) = PersistedEffect::from_applied(e, root, &mut put)? else {
+            untracked.extend(effect_path(e).map(Path::to_path_buf));
+            continue;
+        };
+        if let (
             PersistedEffect::Edited {
-                path,
-                pre_image_blob,
-                ..
-            } => (path, pre_image_blob.as_deref()),
-            PersistedEffect::Deleted {
-                path,
-                pre_image_blob,
-                ..
-            } => (path, Some(pre_image_blob.as_str())),
-            _ => continue,
-        };
-        debug_assert!(storable(path));
-        let pre_image = match pre.map(BlobRef::parse) {
-            None => None,
-            Some(Ok(b)) => Some(b),
-            Some(Err(_)) => {
-                bad_pre_images.push(path.clone());
-                continue;
-            }
-        };
-        edits.push(SessionRecord::Edit {
-            path: path.clone(),
-            pre_image,
-            turn,
-        });
+                post_image_blob, ..
+            },
+            AppliedEffect::Edited {
+                path, post_hash, ..
+            },
+        ) = (&mut persisted, e)
+            && let Some(bytes) = post_image(path, post_hash)
+        {
+            *post_image_blob = Some(log.blob(&bytes)?.as_str().to_string());
+        }
+        match edit_record(&persisted, turn) {
+            Some(Some(rec)) => edits.push(rec),
+            Some(None) => bad_pre_images.extend(effect_path(e).map(Path::to_path_buf)),
+            None => {}
+        }
+        effects.push(persisted);
     }
     log.append(&SessionRecord::ToolResult {
         id,

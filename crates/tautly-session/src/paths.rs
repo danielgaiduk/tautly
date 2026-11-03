@@ -38,11 +38,26 @@ pub fn data_home_from(get: impl Fn(&str) -> Option<OsString>) -> Result<PathBuf>
     }
 }
 
-/// Stable 16-hex-digit identifier of a project: blake3 of its canonical path
-/// (the path as given when it cannot be canonicalized).
+/// Stable 16-hex-digit identifier of a work tree: blake3 of its canonical path
+/// (the path as given when it cannot be canonicalized). Keys the code index, whose
+/// contents differ between worktrees; sessions use [`project_id`].
 pub fn project_hash(root: &Path) -> String {
-    let canonical = canonical_root(root);
-    let hash = blake3::hash(canonical.as_os_str().as_encoded_bytes());
+    path_hash(&canonical_root(root))
+}
+
+/// Stable 16-hex-digit identifier of a project (spec 6.5 H10): blake3 of the canonical git
+/// common directory when `root` is in a git work tree, so every worktree of a repository
+/// has the same id; else [`project_hash`] of the root. Keys session logs, blobs and
+/// memory episodes. Read from the git files; never runs git.
+pub fn project_id(root: &Path) -> String {
+    match crate::git::dirs(root) {
+        Some(dirs) => path_hash(&dirs.common_dir),
+        None => project_hash(root),
+    }
+}
+
+fn path_hash(path: &Path) -> String {
+    let hash = blake3::hash(path.as_os_str().as_encoded_bytes());
     hash.to_hex()[..16].to_string()
 }
 
@@ -50,9 +65,9 @@ pub(crate) fn canonical_root(root: &Path) -> PathBuf {
     root.canonicalize().unwrap_or_else(|_| root.to_path_buf())
 }
 
-/// `<data_home>/sessions/<project_hash>`.
+/// `<data_home>/sessions/<project_id>`.
 pub(crate) fn project_dir(data_home: &Path, root: &Path) -> PathBuf {
-    data_home.join("sessions").join(project_hash(root))
+    data_home.join("sessions").join(project_id(root))
 }
 
 /// `create_dir_all` with mode 0700 for every directory it creates: logs and

@@ -8,7 +8,7 @@ use serde::de::DeserializeOwned;
 
 use crate::blobs::{BlobRef, BlobStore};
 use crate::paths;
-use crate::record::{Header, Parsed, SCHEMA_VERSION, parse_line};
+use crate::record::{Entry, Header, Parsed, SCHEMA_VERSION, parse_line};
 use crate::{Error, Result};
 
 /// Reads one session log.
@@ -42,7 +42,7 @@ impl<R: DeserializeOwned> SessionReader<R> {
             return Err(bad("header line is missing or incomplete"));
         }
         let header = match parse_line(&first) {
-            Ok(Parsed::Header(h)) => h,
+            Ok(Parsed::Header(h)) => *h,
             Ok(_) => return Err(bad("first line is not a header")),
             Err(e) => return Err(bad(&e.to_string())),
         };
@@ -82,6 +82,11 @@ impl<R: DeserializeOwned> SessionReader<R> {
     /// Stream `(offset, record)` pairs in log order. After the first error the
     /// iterator ends.
     pub fn records(&self) -> impl Iterator<Item = Result<(u64, R)>> + use<R> {
+        self.entries().map(|e| e.map(|e| (e.offset, e.rec)))
+    }
+
+    /// Like [`records`](Self::records), with each record's timestamp.
+    pub fn entries(&self) -> impl Iterator<Item = Result<Entry<R>>> + use<R> {
         Records::<R> {
             path: self.path.clone(),
             input: Some(Input::Pending(self.body_start)),
@@ -162,7 +167,7 @@ struct Records<R> {
 }
 
 impl<R: DeserializeOwned> Records<R> {
-    fn corrupt(&mut self, reason: String) -> Option<Result<(u64, R)>> {
+    fn corrupt(&mut self, reason: String) -> Option<Result<Entry<R>>> {
         self.input = None;
         Some(Err(Error::Corrupt {
             path: self.path.clone(),
@@ -173,7 +178,7 @@ impl<R: DeserializeOwned> Records<R> {
 }
 
 impl<R: DeserializeOwned> Iterator for Records<R> {
-    type Item = Result<(u64, R)>;
+    type Item = Result<Entry<R>>;
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
@@ -209,7 +214,7 @@ impl<R: DeserializeOwned> Iterator for Records<R> {
                 return self.corrupt("line has no trailing newline".into());
             }
             match parse_line(&buf) {
-                Ok(Parsed::Record { offset, data }) => {
+                Ok(Parsed::Record { offset, t_ms, data }) => {
                     if offset != self.next_offset {
                         let reason =
                             format!("expected offset {}, found {offset}", self.next_offset);
@@ -222,7 +227,11 @@ impl<R: DeserializeOwned> Iterator for Records<R> {
                         }
                     };
                     self.next_offset += 1;
-                    return Some(Ok((offset, data)));
+                    return Some(Ok(Entry {
+                        offset,
+                        t_ms,
+                        rec: data,
+                    }));
                 }
                 Ok(Parsed::Unknown) => continue,
                 Ok(Parsed::Header(_)) => return self.corrupt("unexpected second header".into()),

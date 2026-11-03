@@ -32,7 +32,7 @@ pub struct MemoryStore {
     pub(crate) index: Arc<Index>,
     /// `<project>/.tautly/memory`.
     pub(crate) dir: PathBuf,
-    /// `<data_home>/memory/<project_hash>/episodes`.
+    /// `<data_home>/memory/<project_id>/episodes` (shared by all worktrees of a repository).
     pub(crate) episodes_dir: PathBuf,
     /// Oldest first (ties by id).
     pub(crate) entries: Vec<MemoryEntry>,
@@ -180,7 +180,7 @@ impl MemoryStore {
         let dir_chain = vec![tautly, dir.clone()];
         let episodes_dir = data_home
             .join("memory")
-            .join(tautly_session::paths::project_hash(project_root))
+            .join(tautly_session::paths::project_id(project_root))
             .join("episodes");
         let episodes_chain: Vec<PathBuf> = episodes_dir
             .ancestors()

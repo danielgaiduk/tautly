@@ -470,7 +470,7 @@ async fn a_write_cancelled_after_its_commit_is_awaited_and_its_edit_recorded() {
         .filter_map(|r| match r.unwrap().1 {
             SessionRecord::Edit {
                 path, pre_image, ..
-            } if path.ends_with("a.txt") => Some(pre_image),
+            } if path.as_str() == "a.txt" => Some(pre_image),
             _ => None,
         })
         .next()

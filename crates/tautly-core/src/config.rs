@@ -280,6 +280,16 @@ pub struct LoadedConfig {
 }
 
 impl Config {
+    /// blake3 hex of the effective configuration, for the session header (spec 6.5 H3):
+    /// equal for equal configurations. It hashes the `Debug` form, which is deterministic
+    /// because every map in `Config` is ordered (`BTreeMap`, `Vec`); it holds no secrets
+    /// (keys come from the environment or the keychain, never from configuration).
+    pub fn hash(&self) -> String {
+        blake3::hash(format!("{self:?}").as_bytes())
+            .to_hex()
+            .to_string()
+    }
+
     /// Defaults, then `<config home>/config.toml`, then `<root>/.tautly/config.toml`, then
     /// `cli`. A missing file is skipped. Without a usable (absolute) config home the user
     /// layer is skipped with a warning.

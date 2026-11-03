@@ -4,15 +4,17 @@ use std::marker::PhantomData;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use ulid::Ulid;
 
 use crate::blobs::{BlobRef, BlobStore};
+use crate::git;
 use crate::paths;
 use crate::reader::SessionReader;
-use crate::record::{Header, LineRef, SCHEMA_VERSION};
+use crate::record::{GitState, Header, HeaderInit, LineRef, SCHEMA_VERSION};
 use crate::{Error, Result};
 
 /// Destination of the log bytes: a file in production, a fault-injecting
@@ -68,24 +70,20 @@ pub struct SessionWriter<R: Serialize> {
 }
 
 impl<R: Serialize> SessionWriter<R> {
-    /// Create a new session for the project at `root` under [`paths::data_home`].
-    /// `parent` marks a fork: (parent session id, parent record offset).
-    pub fn create(root: &Path, parent: Option<(String, u64)>) -> Result<Self> {
-        Self::create_in(&paths::data_home()?, root, parent)
+    /// Create a new session for the project at `root` under [`paths::data_home`], with
+    /// the header fields `init` decides (a fork's parent, label, origin, model, ...).
+    pub fn create(root: &Path, init: HeaderInit) -> Result<Self> {
+        Self::create_in(&paths::data_home()?, root, init)
     }
 
-    /// Like [`create`](Self::create) with an explicit data home.
-    pub fn create_in(data_home: &Path, root: &Path, parent: Option<(String, u64)>) -> Result<Self> {
+    /// Like [`create`](Self::create) with an explicit data home. The log goes in the
+    /// directory of the root's [`project_id`](paths::project_id), shared by every
+    /// worktree of a repository. The git state is read from files (no git is run).
+    pub fn create_in(data_home: &Path, root: &Path, init: HeaderInit) -> Result<Self> {
         let dir = paths::project_dir(data_home, root);
         paths::create_private_dir_all(&dir)?;
         let ulid = Ulid::new();
-        let header = Header {
-            schema_version: SCHEMA_VERSION,
-            session_id: ulid.to_string(),
-            created: ulid.datetime(),
-            root: paths::canonical_root(root),
-            parent,
-        };
+        let header = new_header(ulid, root, init);
         let path = dir.join(format!("{}.jsonl", header.session_id));
         let file = OpenOptions::new()
             .write(true)
@@ -148,11 +146,15 @@ impl<R: Serialize> SessionWriter<R> {
         self.out.write_all(line).map_err(|e| self.poison(e))
     }
 
-    /// Buffer one record; returns its 0-based offset.
+    /// Buffer one record, stamped with the current time; returns its 0-based offset.
     pub fn append(&mut self, rec: &R) -> Result<u64> {
         self.check_usable()?;
         let offset = self.next_offset;
-        let line = encode(&LineRef::Record { offset, data: rec })?;
+        let line = encode(&LineRef::Record {
+            offset,
+            t: now_ms(),
+            data: rec,
+        })?;
         self.write_line(&line)?;
         self.next_offset += 1;
         Ok(offset)
@@ -206,6 +208,36 @@ impl<R: Serialize + DeserializeOwned> SessionWriter<R> {
     }
 }
 
+/// The header of a new session `ulid` at `root`.
+fn new_header(ulid: Ulid, root: &Path, init: HeaderInit) -> Header {
+    let git = git::dirs(root).map(|_| GitState {
+        head: git::git_head(root),
+        dirty: None,
+    });
+    Header {
+        schema_version: SCHEMA_VERSION,
+        session_id: ulid.to_string(),
+        created: ulid.datetime(),
+        root: paths::canonical_root(root),
+        parent: init.parent,
+        project: paths::project_id(root),
+        label: init.label,
+        origin: init.origin,
+        git,
+        tautly_version: env!("CARGO_PKG_VERSION").to_string(),
+        model: init.model,
+        config_hash: init.config_hash,
+        tags: init.tags,
+    }
+}
+
+/// Unix milliseconds now (0 before 1970, which only a broken clock gives).
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+}
+
 fn encode<R: Serialize>(line: &LineRef<'_, R>) -> Result<Vec<u8>> {
     let mut buf = serde_json::to_vec(line)?;
     buf.push(b'\n');
@@ -249,13 +281,7 @@ mod tests {
     fn writer(sink: Failing, blob_dir: &Path) -> SessionWriter<String> {
         SessionWriter {
             out: BufWriter::new(Box::new(sink)),
-            header: Header {
-                schema_version: SCHEMA_VERSION,
-                session_id: "X".into(),
-                created: std::time::SystemTime::now(),
-                root: PathBuf::from("/"),
-                parent: None,
-            },
+            header: new_header(Ulid::new(), Path::new("/"), HeaderInit::default()),
             path: PathBuf::from("/nonexistent"),
             next_offset: 0,
             blobs: BlobStore::new(blob_dir),
