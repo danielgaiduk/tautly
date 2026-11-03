@@ -78,7 +78,8 @@ impl Context {
         // last message, built fresh for each request. It is always its own user message: the
         // last cache breakpoint marks the final content block of its message, and appending
         // to a user message (tool results) would put the volatile state inside the cached
-        // prefix. Providers take consecutive user turns (Anthropic merges them).
+        // prefix. That leaves two user messages in a row; Anthropic merges them server-side
+        // and the Google and compat adapters merge same-role messages themselves.
         let cached_len = messages.len();
         if let Some(state) = &state_text {
             messages.push(Message {
