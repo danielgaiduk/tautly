@@ -4,7 +4,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use common::{BlockingSandbox, Fixture, eventually, paths, write_all};
+use common::{BlockingSandbox, Fixture, HookSandbox, eventually, paths, write_all};
 use hx_index::{Index, RefreshStats};
 use hx_sandbox::LocalSandbox;
 
@@ -885,20 +885,85 @@ async fn mark_stale_lasts_until_a_refresh_that_started_after_it_completes() {
     assert!(!idx.is_stale());
 }
 
+#[tokio::test]
+async fn a_refresh_that_started_before_the_mark_does_not_clear_it() {
+    let fx = sample();
+    let slot: Arc<std::sync::OnceLock<Arc<Index>>> = Arc::default();
+    let hook_slot = Arc::clone(&slot);
+    let sb = Arc::new(HookSandbox {
+        inner: LocalSandbox::new(fx.root.path().to_path_buf()).unwrap(),
+        // Runs after the refresh has started scanning.
+        on_walk: std::sync::Mutex::new(Some(Box::new(move || {
+            hook_slot.get().unwrap().mark_stale();
+        }))),
+    });
+    let idx = Arc::new(Index::open(&fx.root.path().join(".index.db"), sb).unwrap());
+    slot.set(Arc::clone(&idx)).ok();
+    idx.refresh().await.unwrap();
+    assert!(idx.is_stale(), "the mark came after this refresh began");
+    idx.refresh().await.unwrap();
+    assert!(!idx.is_stale());
+}
+
 #[tokio::test(flavor = "multi_thread")]
-async fn mark_stale_is_cleared_by_a_watcher_batch_that_sees_the_change() {
+async fn a_watcher_batch_alone_does_not_clear_staleness() {
     let fx = sample();
     let idx = Arc::new(fx.open());
     idx.refresh().await.unwrap();
     let _watch = idx.clone().start_watcher().unwrap();
     std::fs::write(fx.path("made_by_shell.rs"), "fn s() {}\n").unwrap();
     idx.mark_stale();
-    // The marks only clear once a batch that began after the mark has completed; the
-    // create event is delivered after it, so wait for the tree to know the file.
+    // The batch has run once the tree knows the file; give it time to (wrongly) clear.
     assert!(
-        eventually(WATCH_WAIT, || {
-            idx.tree().get(Path::new("made_by_shell.rs")).is_some() && !idx.is_stale()
-        })
+        eventually(WATCH_WAIT, || idx
+            .tree()
+            .get(Path::new("made_by_shell.rs"))
+            .is_some())
         .await
     );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(idx.is_stale());
+    idx.refresh().await.unwrap();
+    assert!(!idx.is_stale());
+}
+
+#[tokio::test]
+async fn background_refresh_clears_staleness_and_coalesces() {
+    let fx = sample();
+    let idx = Arc::new(fx.open());
+    idx.refresh().await.unwrap();
+    // Nothing stale: nothing to do, but the loop still ends cleanly.
+    idx.refresh_stale_in_background().unwrap().await.unwrap();
+
+    std::fs::write(fx.path("later.rs"), "fn later() {}\n").unwrap();
+    idx.mark_stale();
+    let first = idx.refresh_stale_in_background().expect("starts a loop");
+    // On this single-threaded runtime the loop has not run yet.
+    assert!(idx.refresh_stale_in_background().is_none(), "coalesced");
+    first.await.unwrap();
+    assert!(!idx.is_stale());
+    assert!(idx.tree().get(Path::new("later.rs")).is_some());
+    // A new loop can start once the previous one finished.
+    idx.mark_stale();
+    idx.refresh_stale_in_background().unwrap().await.unwrap();
+    assert!(!idx.is_stale());
+}
+
+#[tokio::test]
+async fn background_refresh_runs_again_for_a_mark_made_during_it() {
+    let fx = sample();
+    let slot: Arc<std::sync::OnceLock<Arc<Index>>> = Arc::default();
+    let hook_slot = Arc::clone(&slot);
+    let sb = Arc::new(HookSandbox {
+        inner: LocalSandbox::new(fx.root.path().to_path_buf()).unwrap(),
+        on_walk: std::sync::Mutex::new(None),
+    });
+    let idx = Arc::new(Index::open(&fx.root.path().join(".index.db"), sb.clone()).unwrap());
+    slot.set(Arc::clone(&idx)).ok();
+    idx.refresh().await.unwrap();
+    idx.mark_stale();
+    // The loop's first refresh is overtaken by a second mark.
+    *sb.on_walk.lock().unwrap() = Some(Box::new(move || hook_slot.get().unwrap().mark_stale()));
+    idx.refresh_stale_in_background().unwrap().await.unwrap();
+    assert!(!idx.is_stale(), "a second pass covered the second mark");
 }

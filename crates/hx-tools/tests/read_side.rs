@@ -631,3 +631,21 @@ async fn bash_marks_the_index_stale_so_files_it_creates_are_found() {
     let r = e.run(&GlobTool, json!({"pattern": "made.txt"})).await;
     assert_eq!(r.output, "made.txt");
 }
+
+#[tokio::test]
+async fn bash_starts_a_background_refresh_that_clears_staleness_even_for_a_no_op() {
+    let e = common::env(REPO, common::Built::Full).await;
+    let r = e.run(&BashTool, json!({"command": "true"})).await;
+    assert!(!r.is_error, "{}", r.output);
+    assert!(e.index.is_stale(), "marked when the command ended");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while e.index.is_stale() && std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(!e.index.is_stale(), "background refresh completed");
+    // Index-backed again.
+    e.sb.reset();
+    let r = e.run(&GlobTool, json!({"pattern": "*.md"})).await;
+    assert_eq!(e.sb.walks(), 0);
+    assert_eq!(r.output, "docs/readme.md");
+}

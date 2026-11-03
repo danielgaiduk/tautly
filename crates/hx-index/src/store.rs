@@ -156,8 +156,10 @@ pub(crate) struct Inner {
     trigrams_ready: AtomicBool,
     /// How many times [`Index::mark_stale`] was called.
     stale_marks: AtomicU64,
-    /// The highest mark count a completed refresh or watcher batch is known to cover.
+    /// The highest mark count a completed refresh is known to cover.
     covered_marks: AtomicU64,
+    /// A background refresh loop is running or about to.
+    bg_refresh: AtomicBool,
     /// The last scan met symlinks: a change under one path may alias another.
     has_links: AtomicBool,
     last_error: Mutex<Option<String>>,
@@ -196,6 +198,7 @@ impl Index {
                 trigrams_ready: AtomicBool::new(false),
                 stale_marks: AtomicU64::new(0),
                 covered_marks: AtomicU64::new(0),
+                bg_refresh: AtomicBool::new(false),
                 has_links: AtomicBool::new(false),
                 last_error: Mutex::new(None),
                 tree: RwLock::new(tree),
@@ -228,18 +231,49 @@ impl Index {
     }
 
     /// Record that files may have changed behind the index's back (a shell command ran).
-    /// Until a refresh, or a watcher batch, that started after this call has completed,
+    /// Until a full [`Index::refresh`] that started after this call completes successfully,
     /// [`Index::is_stale`] is true and callers should not trust the tree or the trigram
-    /// candidates for files that may have just appeared.
+    /// candidates for files that may have just appeared. The watcher does not clear it:
+    /// the OS may deliver the events of the change after any batch that began earlier.
     pub fn mark_stale(&self) {
         self.inner.stale_marks.fetch_add(1, Ordering::SeqCst);
     }
 
-    /// True between [`Index::mark_stale`] and the next completed refresh or watcher batch
-    /// that started after it.
+    /// True between [`Index::mark_stale`] and the next successful refresh that started
+    /// after it.
     pub fn is_stale(&self) -> bool {
         self.inner.stale_marks.load(Ordering::SeqCst)
             > self.inner.covered_marks.load(Ordering::SeqCst)
+    }
+
+    /// Refresh in the background until the index is no longer stale. Refreshes are
+    /// coalesced: if a loop is already running, this returns None and that loop does one
+    /// more pass when a mark arrived after its refresh started. A failed refresh stops the
+    /// loop (see [`Index::last_error`]); the next call retries. Also None outside a
+    /// Tokio runtime.
+    pub fn refresh_stale_in_background(self: &Arc<Self>) -> Option<JoinHandle<()>> {
+        let runtime = tokio::runtime::Handle::try_current().ok()?;
+        if self.inner.bg_refresh.swap(true, Ordering::AcqRel) {
+            return None;
+        }
+        let this = Arc::clone(self);
+        Some(runtime.spawn(async move {
+            loop {
+                let mut ok = true;
+                while this.is_stale() {
+                    if this.refresh().await.is_err() {
+                        ok = false;
+                        break;
+                    }
+                }
+                this.inner.bg_refresh.store(false, Ordering::Release);
+                // A mark that landed after the last check but before the flag cleared
+                // saw the flag set and started nothing: take the loop back.
+                if !ok || !this.is_stale() || this.inner.bg_refresh.swap(true, Ordering::AcqRel) {
+                    break;
+                }
+            }
+        }))
     }
 
     /// The error of the most recent refresh, if it failed.

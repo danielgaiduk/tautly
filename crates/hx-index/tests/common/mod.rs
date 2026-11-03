@@ -261,3 +261,55 @@ impl Sandbox for ProbeSandbox {
         self.inner.http_get(url).await
     }
 }
+
+/// Delegates to a real sandbox and runs a one-shot hook the first time a walker is asked
+/// for (the start of a refresh's scan), to let a test act in the middle of a refresh.
+pub struct HookSandbox {
+    pub inner: LocalSandbox,
+    pub on_walk: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
+}
+
+#[async_trait::async_trait]
+impl Sandbox for HookSandbox {
+    fn root(&self) -> &Path {
+        self.inner.root()
+    }
+    fn resolve(&self, p: &Path) -> Result<PathBuf, SandboxError> {
+        self.inner.resolve(p)
+    }
+    async fn read(&self, p: &Path) -> Result<Vec<u8>, SandboxError> {
+        self.inner.read(p).await
+    }
+    async fn metadata(&self, p: &Path) -> Result<FileMeta, SandboxError> {
+        self.inner.metadata(p).await
+    }
+    async fn write_atomic(
+        &self,
+        p: &Path,
+        bytes: &[u8],
+        mode: Option<u32>,
+    ) -> Result<(), SandboxError> {
+        self.inner.write_atomic(p, bytes, mode).await
+    }
+    async fn remove_file(&self, p: &Path) -> Result<(), SandboxError> {
+        self.inner.remove_file(p).await
+    }
+    async fn spill(&self, bytes: &[u8]) -> Result<PathBuf, SandboxError> {
+        self.inner.spill(bytes).await
+    }
+    async fn spawn(&self, spec: hx_sandbox::SpawnSpec) -> Result<hx_sandbox::Child, SandboxError> {
+        self.inner.spawn(spec).await
+    }
+    fn walker(&self, base: &Path) -> Result<ignore::WalkBuilder, SandboxError> {
+        if let Some(hook) = self.on_walk.lock().unwrap().take() {
+            hook();
+        }
+        self.inner.walker(base)
+    }
+    async fn http_get(
+        &self,
+        url: &hx_sandbox::Url,
+    ) -> Result<hx_sandbox::HttpResponse, SandboxError> {
+        self.inner.http_get(url).await
+    }
+}

@@ -155,13 +155,15 @@ impl Capture<'_> {
     }
 }
 
-/// Marks the code index stale when dropped.
+/// Marks the code index stale when dropped and starts a background refresh to catch it up.
 struct StaleOnDrop(Option<std::sync::Arc<hx_index::Index>>);
 
 impl Drop for StaleOnDrop {
     fn drop(&mut self) {
         if let Some(index) = &self.0 {
             index.mark_stale();
+            // Coalesced with any refresh already running; errors land in `last_error`.
+            drop(index.refresh_stale_in_background());
         }
     }
 }
