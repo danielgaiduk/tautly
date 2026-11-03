@@ -257,3 +257,37 @@ async fn arc_dyn_provider_can_be_wrapped_and_box_is_a_provider() {
     }
     assert_eq!(collect(stream_of(&boxed)).await, vec![Ok(done())]);
 }
+
+fn usage(input: u64) -> ProviderEvent {
+    ProviderEvent::Usage(RawUsage {
+        input,
+        output: 1,
+        cache_read: 0,
+        cache_write: 0,
+    })
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_usage_of_a_retried_attempt_is_passed_on_as_discarded() {
+    // The attempt reported its input usage (message_start), then failed before content.
+    let m = MockProvider::new(vec![
+        MockTurn::DropAfter(vec![usage(500)]),
+        MockTurn::Events(vec![usage(500), text("ok"), done()]),
+    ]);
+    let out = collect(Retrying::new(m.clone()).stream(req(), CancellationToken::new())).await;
+    let discarded = RawUsage {
+        input: 500,
+        output: 1,
+        cache_read: 0,
+        cache_write: 0,
+    };
+    assert_eq!(
+        out,
+        vec![
+            Ok(ProviderEvent::DiscardedUsage(discarded)),
+            Ok(usage(500)),
+            Ok(text("ok")),
+            Ok(done())
+        ]
+    );
+}

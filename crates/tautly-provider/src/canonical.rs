@@ -200,7 +200,12 @@ pub enum ProviderEvent {
         name: String,
         input_json: String,
     },
+    /// Usage so far of this response, cumulative: a later `Usage` replaces an earlier one
+    /// (Anthropic reports the input at the start and the total at the end).
     Usage(RawUsage),
+    /// Usage of an earlier attempt that [`crate::Retrying`] discarded and retried: billed,
+    /// but it describes no response. Add it to the cost; never calibrate with it.
+    DiscardedUsage(RawUsage),
     Quota(Quota),
     Done {
         stop: StopReason,

@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 use futures::StreamExt;
 use tautly_context::compact::DEFAULT_KEEP_RECENT;
 use tautly_context::schedule::{self, MutationReason};
-use tautly_context::{CompactError, ContextStatus, GcRecord, Turn};
+use tautly_context::{CompactError, ContextStatus, GcRecord, TokenEstimator, Turn};
 use tautly_provider::{
     CanonicalRequest, Content, Message, ProviderError, ProviderEvent, Quota, RawUsage, Role,
     StopReason, cost_usd,
@@ -71,6 +71,8 @@ struct Response {
     /// The events as logged: consecutive deltas merged.
     logged: Vec<ProviderEvent>,
     usage: Option<RawUsage>,
+    /// Usage of attempts the retry wrapper discarded.
+    discarded: Vec<RawUsage>,
     quota: Option<Quota>,
     stop: Option<StopReason>,
 }
@@ -126,6 +128,7 @@ impl Response {
                 self.calls.push(call);
             }
             ProviderEvent::Usage(u) => self.usage = Some(*u),
+            ProviderEvent::DiscardedUsage(u) => self.discarded.push(*u),
             ProviderEvent::Quota(q) => self.quota = Some(q.clone()),
             ProviderEvent::Done { stop } => self.stop = Some(stop.clone()),
         }
@@ -136,6 +139,24 @@ impl Response {
             }
             (_, ev) => self.logged.push(ev),
         }
+    }
+
+    /// What the response streamed so far is worth in output tokens (an estimate, for an
+    /// attempt that ended before the provider reported its usage).
+    fn streamed_tokens(&self, tokens: &TokenEstimator) -> u64 {
+        let mut text = String::new();
+        for c in &self.content {
+            match c {
+                Content::Text(t) | Content::Reasoning { text: t, .. } => text.push_str(t),
+                Content::RedactedReasoning { data } => text.push_str(data),
+                Content::ToolUse { name, input, .. } => {
+                    text.push_str(name);
+                    text.push_str(&input.to_string());
+                }
+                _ => {}
+            }
+        }
+        u64::from(tokens.estimate(&text))
     }
 
     /// A response cut off (output limit) right after a reasoning item keeps no dangling
@@ -162,6 +183,37 @@ fn parse_args(input_json: &str) -> Result<serde_json::Value, String> {
         Ok(_) => Err("the arguments must be a JSON object".into()),
         Err(e) => Err(format!("the arguments are not valid JSON ({e})")),
     }
+}
+
+/// The usage to count for an attempt that ended early (broke off, was cancelled): what the
+/// provider reported, with the output raised to what was streamed, or else an estimate of
+/// the request's input and the streamed output. True when any of it is estimated.
+fn partial_usage(reported: Option<RawUsage>, est_input: u64, est_output: u64) -> (RawUsage, bool) {
+    match reported {
+        Some(u) => (
+            RawUsage {
+                output: u.output.max(est_output),
+                ..u
+            },
+            est_output > u.output,
+        ),
+        None => (
+            RawUsage {
+                input: est_input,
+                output: est_output,
+                cache_read: 0,
+                cache_write: 0,
+            },
+            true,
+        ),
+    }
+}
+
+/// How the stream of one attempt ended.
+enum Ended {
+    Done,
+    Cancelled,
+    Failed(ProviderError),
 }
 
 /// Why streaming a response stopped without one.
@@ -291,7 +343,7 @@ impl Session {
             let turn = self.context.next_turn();
             self.log_request(&req).await;
             let sent_at = Instant::now();
-            let resp = match self.stream(req, ctl).await {
+            let resp = match self.stream(req, u64::from(status.used), ctl).await {
                 Ok(r) => r,
                 Err(StreamEnd::Cancelled) => return FinishReason::Cancelled,
                 Err(StreamEnd::Budget) => return FinishReason::Budget,
@@ -311,7 +363,8 @@ impl Session {
             self.context.note_request(sent_at, status.cached_prefix);
             if let Some(u) = resp.usage {
                 self.context.calibrate(&status, &u);
-                self.spend(UsageRole::Main, u, resp.quota.clone()).await;
+                self.spend(UsageRole::Main, u, resp.quota.clone(), false)
+                    .await;
             }
             self.emit(Event::context_status(&status)).await;
             steps += 1;
@@ -382,9 +435,14 @@ impl Session {
     /// used only once the response is complete. A response that breaks off with a
     /// transient error after content (the retry wrapper cannot hide that) is discarded and
     /// the request sent again, so a partial tool call never runs.
+    ///
+    /// Every attempt's usage counts (`est_input` is the request's estimated size): what the
+    /// retry wrapper discarded, and for an attempt that broke off or was cancelled, what it
+    /// reported or else an estimate.
     async fn stream(
         &mut self,
         req: CanonicalRequest,
+        est_input: u64,
         ctl: &TurnControl,
     ) -> Result<Response, StreamEnd> {
         let mut attempt = 0;
@@ -393,14 +451,14 @@ impl Session {
             let mut resp = Response::default();
             // Mirrors `Retrying`: usage and quota alone are not content.
             let mut content = false;
-            let broke = loop {
+            let ended = loop {
                 let item = tokio::select! {
                     biased;
-                    () = ctl.cancel.cancelled() => return Err(StreamEnd::Cancelled),
+                    () = ctl.cancel.cancelled() => break Ended::Cancelled,
                     item = s.next() => item,
                 };
                 match item {
-                    None => break None,
+                    None => break Ended::Done,
                     Some(Ok(ev)) => {
                         match &ev {
                             ProviderEvent::TextDelta(t) => {
@@ -411,20 +469,31 @@ impl Session {
                             }
                             _ => {}
                         }
-                        content |= !matches!(ev, ProviderEvent::Usage(_) | ProviderEvent::Quota(_));
+                        content |= !matches!(
+                            ev,
+                            ProviderEvent::Usage(_)
+                                | ProviderEvent::Quota(_)
+                                | ProviderEvent::DiscardedUsage(_)
+                        );
                         resp.push(ev);
                     }
-                    Some(Err(e)) => break Some(e),
+                    Some(Err(e)) => break Ended::Failed(e),
                 }
             };
-            let Some(e) = broke else {
-                return Ok(resp.finish());
+            for u in std::mem::take(&mut resp.discarded) {
+                self.spend(UsageRole::Main, u, None, false).await;
+            }
+            let e = match ended {
+                Ended::Done => return Ok(resp.finish()),
+                Ended::Cancelled => {
+                    self.spend_partial(UsageRole::Main, &resp, est_input).await;
+                    return Err(StreamEnd::Cancelled);
+                }
+                Ended::Failed(e) => e,
             };
             // What the provider billed for the broken attempt counts, so cost is never
             // under-reported.
-            if let Some(u) = resp.usage {
-                self.spend(UsageRole::Main, u, resp.quota.clone()).await;
-            }
+            self.spend_partial(UsageRole::Main, &resp, est_input).await;
             // Before any content, `Retrying` has already retried (spec 3.5): its error is
             // final. Only a response that broke off after content is sent again, and not
             // once the budget is used up.
@@ -600,42 +669,67 @@ impl Session {
         req: CanonicalRequest,
         ctl: &TurnControl,
     ) -> Result<String, StreamEnd> {
+        let est_input = u64::from(
+            self.context
+                .tokens
+                .estimate(&serde_json::to_string(&req).unwrap_or_default()),
+        );
         let mut s = self.provider.stream(req, ctl.cancel.child_token());
         let mut text = String::new();
         let mut usage = None;
-        let failed = loop {
+        let ended = loop {
             let item = tokio::select! {
                 biased;
-                () = ctl.cancel.cancelled() => return Err(StreamEnd::Cancelled),
+                () = ctl.cancel.cancelled() => break Ended::Cancelled,
                 item = s.next() => item,
             };
             match item {
-                None => break None,
+                None => break Ended::Done,
                 Some(Ok(ProviderEvent::TextDelta(t))) => text.push_str(&t),
                 Some(Ok(ProviderEvent::Usage(u))) => usage = Some(u),
+                Some(Ok(ProviderEvent::DiscardedUsage(u))) => {
+                    self.spend(UsageRole::Side, u, None, false).await;
+                }
                 Some(Ok(_)) => {}
-                Some(Err(e)) => break Some(e),
+                Some(Err(e)) => break Ended::Failed(e),
             }
         };
-        // A failed summary that was billed counts as well.
-        if let Some(u) = usage {
-            self.spend(UsageRole::Side, u, None).await;
+        if let (Ended::Done, Some(u)) = (&ended, usage) {
+            self.spend(UsageRole::Side, u, None, false).await;
+            return Ok(text.trim().to_string());
         }
-        match failed {
-            None => Ok(text.trim().to_string()),
-            Some(e) => Err(StreamEnd::Failed(e)),
+        // Failed or cancelled: what it reported, or an estimate, still counts.
+        let est_output = u64::from(self.context.tokens.estimate(&text));
+        let (u, estimated) = partial_usage(usage, est_input, est_output);
+        self.spend(UsageRole::Side, u, None, estimated).await;
+        match ended {
+            Ended::Done => Ok(text.trim().to_string()),
+            Ended::Cancelled => Err(StreamEnd::Cancelled),
+            Ended::Failed(e) => Err(StreamEnd::Failed(e)),
         }
+    }
+
+    /// Count an attempt that ended early (see [`partial_usage`]).
+    async fn spend_partial(&mut self, role: UsageRole, resp: &Response, est_input: u64) {
+        let est_output = resp.streamed_tokens(&self.context.tokens);
+        let (u, estimated) = partial_usage(resp.usage, est_input, est_output);
+        self.spend(role, u, resp.quota.clone(), estimated).await;
     }
 
     /// Account for one provider response: the ledger first, then `Usage`, then the budgets
     /// (whose 80% and exhausted warnings follow the `Usage` that caused them).
-    async fn spend(&mut self, role: UsageRole, u: RawUsage, quota: Option<Quota>) {
+    async fn spend(&mut self, role: UsageRole, u: RawUsage, quota: Option<Quota>, estimated: bool) {
         let cost = cost_usd(&u, self.info.price.as_ref());
         if let Some(ledger) = self.cost_ledger.clone() {
             let (session, model) = (self.session_id.clone(), self.model.clone());
-            let written =
-                tokio::task::spawn_blocking(move || ledger.record(&session, &model, &u, cost))
-                    .await;
+            let written = tokio::task::spawn_blocking(move || {
+                if estimated {
+                    ledger.record_estimated(&session, &model, &u, cost)
+                } else {
+                    ledger.record(&session, &model, &u, cost)
+                }
+            })
+            .await;
             match written {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => self.ledger_unavailable(e.to_string()).await,
@@ -650,6 +744,7 @@ impl Session {
             cache_write: u.cache_write,
             cost_usd: cost,
             quota,
+            estimated,
         })
         .await;
         self.budgets
@@ -755,6 +850,31 @@ mod tests {
             r.push(ev);
         }
         assert_eq!(reasoning(&r), [("ab".to_string(), Some("SIG".to_string()))]);
+    }
+
+    #[test]
+    fn an_early_end_counts_what_was_reported_or_an_estimate() {
+        let start = RawUsage {
+            input: 1000,
+            output: 1,
+            cache_read: 50,
+            cache_write: 0,
+        };
+        // Reported input kept; output raised to what was streamed.
+        assert_eq!(
+            partial_usage(Some(start), 9999, 40),
+            (
+                RawUsage {
+                    output: 40,
+                    ..start
+                },
+                true
+            )
+        );
+        assert_eq!(partial_usage(Some(start), 9999, 0), (start, false));
+        // Nothing reported: the request's estimated input.
+        let (u, estimated) = partial_usage(None, 3000, 7);
+        assert_eq!((u.input, u.output, estimated), (3000, 7, true));
     }
 
     #[test]

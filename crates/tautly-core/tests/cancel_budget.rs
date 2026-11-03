@@ -864,6 +864,93 @@ async fn usage_of_a_discarded_attempt_counts_in_ledger_and_budget() {
     assert_eq!((t.requests, t.tokens()), (2, 330));
 }
 
+/// What an Anthropic stream reports at `message_start`: the input, and one output token.
+fn start_usage(input: u64) -> ProviderEvent {
+    ProviderEvent::Usage(tokens(input, 1))
+}
+
+fn usage_events(events: &[Event]) -> Vec<(u64, u64, bool)> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            Event::Usage {
+                tokens_in,
+                tokens_out,
+                estimated,
+                ..
+            } => Some((*tokens_in, *tokens_out, *estimated)),
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn usage_of_a_stream_broken_mid_way_is_estimated_and_counted() {
+    let fx = Fx::new();
+    let partial = "partial answer ".repeat(40);
+    let mock = MockProvider::new(vec![
+        // Shaped like a real Anthropic stream: usage at message_start, text, then a break.
+        MockTurn::DropAfter(vec![start_usage(1000), ProviderEvent::TextDelta(partial)]),
+        MockTurn::Events(vec![
+            start_usage(1000),
+            ProviderEvent::TextDelta("full".into()),
+            ProviderEvent::Usage(tokens(1000, 20)),
+            ProviderEvent::Done {
+                stop: StopReason::EndTurn,
+            },
+        ]),
+    ]);
+    let mut run = start(fx.builder(config(true), &mock));
+    let events = run.turn_with("go").await;
+    assert_eq!(finish_reason(&events), FinishReason::Completed);
+    let u = usage_events(&events);
+    assert_eq!(u.len(), 2, "{events:?}");
+    // The broken attempt: its reported input, and the output its streamed text is worth.
+    assert_eq!(u[0].0, 1000);
+    assert!(u[0].1 > 20, "{u:?}");
+    assert!(u[0].2, "the broken attempt is marked estimated");
+    assert_eq!(u[1], (1000, 20, false));
+    let t = fx.ledger().totals(UNIX_EPOCH).unwrap();
+    assert_eq!((t.requests, t.estimated), (2, 1));
+    assert_eq!(t.input, 2000);
+}
+
+#[tokio::test]
+async fn a_cancelled_request_counts_its_estimated_input() {
+    let fx = Fx::new();
+    let mock = MockProvider::new(vec![MockTurn::Stall]);
+    let mut run = start(fx.builder(config(true), &mock));
+    run.say("go").await;
+    run.until(|e| matches!(e, Event::TurnStarted)).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    run.send(Command::Cancel).await;
+    let events = run.turn().await;
+    assert_eq!(finish_reason(&events), FinishReason::Cancelled);
+    let u = usage_events(&events);
+    assert_eq!(u.len(), 1, "{events:?}");
+    assert!(u[0].0 > 0 && u[0].2, "{u:?}");
+    let t = fx.ledger().totals(UNIX_EPOCH).unwrap();
+    assert_eq!((t.requests, t.estimated), (1, 1));
+}
+
+#[tokio::test]
+async fn usage_of_an_attempt_the_retry_wrapper_discarded_is_counted() {
+    let fx = Fx::new();
+    let mock = MockProvider::new(vec![
+        // Input reported, then a transient failure before any content: retried inside.
+        MockTurn::DropAfter(vec![start_usage(700)]),
+        text_step("ok", tokens(300, 5)),
+    ]);
+    let mut run = start(fx.builder(config(true), &mock));
+    let events = run.turn_with("go").await;
+    assert_eq!(finish_reason(&events), FinishReason::Completed);
+    assert_eq!(mock.requests().len(), 2);
+    let t = fx.ledger().totals(UNIX_EPOCH).unwrap();
+    assert_eq!((t.requests, t.input, t.estimated), (2, 1000, 0));
+    // The calibrated context status comes from the completed response only.
+    assert_eq!(usage_events(&events).last(), Some(&(300, 5, false)));
+}
+
 #[tokio::test]
 async fn an_unopenable_ledger_is_reported_once_and_the_session_runs() {
     let fx = Fx::new();

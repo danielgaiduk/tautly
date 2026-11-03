@@ -205,6 +205,10 @@ pub enum Event {
         cost_usd: Option<f64>,
         #[serde(default, with = "quota_wire")]
         quota: Option<Quota>,
+        /// Some of the numbers are the engine's estimate: the response broke off or was
+        /// cancelled before the provider said what it billed. Sent only when true.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        estimated: bool,
     },
     /// Emitted every turn.
     ContextStatus {

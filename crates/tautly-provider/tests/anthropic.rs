@@ -208,8 +208,9 @@ async fn sends_expected_request_and_parses_text() {
         .mount(&server)
         .await;
     let evs: Vec<_> = run(&server).await.into_iter().map(Result::unwrap).collect();
-    assert_eq!(evs[0], ProviderEvent::TextDelta("Hello".into()));
-    assert_eq!(evs[1], ProviderEvent::TextDelta(", world".into()));
+    // evs[0] is the message_start usage.
+    assert_eq!(evs[1], ProviderEvent::TextDelta("Hello".into()));
+    assert_eq!(evs[2], ProviderEvent::TextDelta(", world".into()));
     assert_eq!(
         evs.last().unwrap(),
         &ProviderEvent::Done {
@@ -225,6 +226,12 @@ async fn parses_parallel_tool_use_fixture() {
     assert_eq!(
         evs,
         vec![
+            ProviderEvent::Usage(RawUsage {
+                input: 50,
+                output: 1,
+                cache_read: 0,
+                cache_write: 0
+            }),
             ProviderEvent::TextDelta("Checking.".into()),
             ProviderEvent::ToolCall {
                 id: "toolu_01".into(),
@@ -261,6 +268,12 @@ async fn parses_thinking_fixture() {
     assert_eq!(
         evs,
         vec![
+            ProviderEvent::Usage(RawUsage {
+                input: 10,
+                output: 1,
+                cache_read: 0,
+                cache_write: 0
+            }),
             ProviderEvent::ReasoningDelta("Let me think".into()),
             ProviderEvent::ReasoningDelta(" about this.".into()),
             ProviderEvent::ReasoningSignature("EqQBCgIYAhIM".into()),
@@ -288,6 +301,37 @@ async fn parses_usage_with_cache_tokens() {
         cache_read: 200,
         cache_write: 100
     })));
+}
+
+#[tokio::test]
+async fn message_start_usage_is_reported_before_content() {
+    // So a stream that breaks mid-way still says what its input cost.
+    let server = serve(sse(fixture("text.sse"))).await;
+    let evs: Vec<_> = run(&server).await.into_iter().map(Result::unwrap).collect();
+    assert_eq!(
+        evs[0],
+        ProviderEvent::Usage(RawUsage {
+            input: 25,
+            output: 1,
+            cache_read: 200,
+            cache_write: 100
+        })
+    );
+    // The total at the end replaces it.
+    let usages: Vec<_> = evs
+        .iter()
+        .filter(|e| matches!(e, ProviderEvent::Usage(_)))
+        .collect();
+    assert_eq!(usages.len(), 2);
+    assert_eq!(
+        usages[1],
+        &ProviderEvent::Usage(RawUsage {
+            input: 25,
+            output: 15,
+            cache_read: 200,
+            cache_write: 100
+        })
+    );
 }
 
 #[tokio::test]
@@ -520,10 +564,10 @@ async fn redacted_thinking_block_is_surfaced() {
     let server = serve(sse(body)).await;
     let evs: Vec<_> = run(&server).await.into_iter().map(Result::unwrap).collect();
     assert_eq!(
-        evs[0],
+        evs[1],
         ProviderEvent::RedactedReasoning("EmwKAhgBEgy3va3pzix".into())
     );
-    assert_eq!(evs[1], ProviderEvent::TextDelta("ok".into()));
+    assert_eq!(evs[2], ProviderEvent::TextDelta("ok".into()));
 }
 
 #[test]

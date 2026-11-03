@@ -306,7 +306,12 @@ impl StreamState {
         let index = v["index"].as_u64().unwrap_or(0);
         let mut out = Vec::new();
         match v["type"].as_str().unwrap_or_default() {
-            "message_start" => merge_usage(&mut self.usage, &v["message"]["usage"]),
+            // Reported at once (cumulative; the total at the end replaces it), so a stream
+            // that breaks off still says what its input cost.
+            "message_start" => {
+                merge_usage(&mut self.usage, &v["message"]["usage"]);
+                out.push(ProviderEvent::Usage(self.usage));
+            }
             "content_block_start" => {
                 let b = &v["content_block"];
                 if b["type"] == "redacted_thinking" {

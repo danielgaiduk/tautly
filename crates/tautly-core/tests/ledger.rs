@@ -75,6 +75,7 @@ fn totals_count_unpriced_rows_apart_and_filter_by_time() {
             cache_write: 50,
             usd: 0.25,
             unpriced: 1,
+            estimated: 0,
         }
     );
     assert_eq!(all.tokens(), 1170);
@@ -97,4 +98,43 @@ fn opening_a_path_that_is_not_a_database_fails() {
     )
     .unwrap();
     assert!(Ledger::open(&path).is_err());
+}
+
+#[test]
+fn estimated_rows_are_counted_apart() {
+    let dir = tempfile::tempdir().unwrap();
+    let ledger = Ledger::open(&dir.path().join("ledger.sqlite")).unwrap();
+    let model = ModelId::from("mock/test");
+    ledger
+        .record_estimated("s1", &model, &usage(900, 40, 0, 0), Some(0.01))
+        .unwrap();
+    ledger
+        .record("s1", &model, &usage(100, 10, 0, 0), Some(0.002))
+        .unwrap();
+    let t = ledger.totals(UNIX_EPOCH).unwrap();
+    assert_eq!((t.requests, t.estimated, t.tokens()), (2, 1, 1050));
+}
+
+#[test]
+fn a_version_1_ledger_gains_the_estimated_column_and_keeps_its_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("ledger.sqlite");
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE usage (id INTEGER PRIMARY KEY, at_ms INTEGER NOT NULL, \
+             session TEXT NOT NULL, model TEXT NOT NULL, input INTEGER NOT NULL, \
+             output INTEGER NOT NULL, cache_read INTEGER NOT NULL, \
+             cache_write INTEGER NOT NULL, cost_usd REAL); \
+             INSERT INTO usage VALUES (1, 1, 's', 'm', 10, 2, 0, 0, 0.5); \
+             PRAGMA user_version = 1;",
+        )
+        .unwrap();
+    }
+    let ledger = Ledger::open(&path).unwrap();
+    ledger
+        .record_estimated("s", &ModelId::from("m"), &usage(5, 1, 0, 0), None)
+        .unwrap();
+    let t = ledger.totals(UNIX_EPOCH).unwrap();
+    assert_eq!((t.requests, t.estimated, t.input), (2, 1, 15));
 }

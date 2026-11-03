@@ -104,6 +104,7 @@ fn every_event() -> Vec<Event> {
                 remaining_tokens: None,
                 reset_at: Some(UNIX_EPOCH + Duration::from_secs(1_700_000_060)),
             }),
+            estimated: false,
         },
         Event::ContextStatus {
             used: 5000,
