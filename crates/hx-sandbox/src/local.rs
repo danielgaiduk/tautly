@@ -1,6 +1,8 @@
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
 use tokio::process::{Child, Command};
@@ -8,6 +10,7 @@ use url::Url;
 
 use crate::effect::{FileMeta, HttpResponse, Sandbox, SandboxError, SpawnSpec};
 use crate::protected::{self, is_protected};
+use crate::spill::SPILL_DIR;
 
 const MAX_BODY: usize = 10 * 1024 * 1024;
 
@@ -16,6 +19,8 @@ const MAX_BODY: usize = 10 * 1024 * 1024;
 pub struct LocalSandbox {
     root: PathBuf,
     client: reqwest::Client,
+    /// `.hx/tmp` (with its `.gitignore`) and the spill directory are known to exist.
+    spill_ready: Arc<AtomicBool>,
 }
 
 impl LocalSandbox {
@@ -28,6 +33,7 @@ impl LocalSandbox {
         Ok(Self {
             root: root.canonicalize()?,
             client,
+            spill_ready: Arc::new(AtomicBool::new(false)),
         })
     }
 }
@@ -50,6 +56,21 @@ fn normalize(p: &Path) -> Option<PathBuf> {
 }
 
 impl LocalSandbox {
+    /// Create `.hx/tmp` with a `.gitignore` of `*` (unless one exists) and the spill
+    /// directory. Done once, and again only if the directory disappears.
+    async fn prepare_spill_dir(&self) -> Result<(), SandboxError> {
+        let ignore = Path::new(".hx/tmp/.gitignore");
+        if !tokio::fs::try_exists(self.resolve(ignore)?).await? {
+            self.write_atomic(ignore, b"*", None).await?;
+        }
+        let dir = Path::new(SPILL_DIR);
+        let path = self.resolve(dir)?;
+        self.guard_protected_target(dir, &path)?;
+        tokio::fs::create_dir_all(path).await?;
+        self.spill_ready.store(true, Ordering::Release);
+        Ok(())
+    }
+
     /// Refuse to modify a protected path (`.git/`, `.hx/`, ...) reached through a
     /// symlink: a repository can commit `NOTES.md -> .git/config` or `.hx/tmp ->
     /// ../.git/hooks`. Naming the protected path itself is the permission
@@ -86,42 +107,42 @@ impl Sandbox for LocalSandbox {
 
     fn resolve(&self, p: &Path) -> Result<PathBuf, SandboxError> {
         let outside = || SandboxError::OutsideRoot(p.to_path_buf());
-        let joined = self.root.join(p); // absolute `p` replaces root
-        // Walk components, canonicalizing the existing prefix as we go (so `..` after a
-        // symlink is resolved against the real directory); the non-existent tail is
-        // appended lexically.
-        let mut existing = PathBuf::new();
-        let mut tail: Vec<std::ffi::OsString> = Vec::new();
-        let mut exists = true;
-        for c in joined.components() {
-            if !exists {
-                match c {
-                    Component::ParentDir => {
-                        if tail.pop().is_none() {
-                            return Err(outside());
-                        }
-                    }
-                    Component::CurDir => {}
-                    other => tail.push(other.as_os_str().to_owned()),
-                }
-                continue;
+        // A relative `p` starts at the root, which is canonical already and is never
+        // canonicalized again; an absolute `p` replaces it.
+        let (base, rest) = if p.is_absolute() {
+            (PathBuf::from("/"), p.strip_prefix("/").unwrap_or(p))
+        } else {
+            (self.root.clone(), p)
+        };
+        let parts: Vec<Component> = rest.components().collect();
+        // Canonicalize the longest prefix that exists, in one call (the kernel resolves
+        // `..` after a symlink against the real directory); the missing tail is appended
+        // lexically below.
+        let mut keep = parts.len();
+        let existing = loop {
+            if keep == 0 {
+                break base.clone();
             }
-            existing.push(c.as_os_str());
-            if matches!(c, Component::RootDir | Component::Prefix(_)) {
-                continue;
-            }
-            match existing.canonicalize() {
-                Ok(canon) => existing = canon,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    exists = false;
-                    existing.pop();
-                    tail.push(c.as_os_str().to_owned());
-                }
+            let mut prefix = base.clone();
+            prefix.extend(parts[..keep].iter().map(|c| c.as_os_str()));
+            match prefix.canonicalize() {
+                Ok(canon) => break canon,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => keep -= 1,
                 Err(e) => return Err(e.into()),
             }
-        }
+        };
         let mut result = existing;
-        result.extend(tail);
+        for c in &parts[keep..] {
+            match c {
+                Component::ParentDir => {
+                    if !result.pop() {
+                        return Err(outside());
+                    }
+                }
+                Component::CurDir => {}
+                other => result.push(other.as_os_str()),
+            }
+        }
         let result = normalize(&result).ok_or_else(outside)?;
         if result.starts_with(&self.root) {
             Ok(result)
@@ -190,15 +211,41 @@ impl Sandbox for LocalSandbox {
         Ok(tokio::fs::remove_file(path).await?)
     }
 
+    /// A cache write: skipped when the content-addressed file is already there with the
+    /// right length, and never fsynced (a lost spill only costs a full re-read). The rename
+    /// still keeps readers from seeing a partial file.
     async fn spill(&self, bytes: &[u8]) -> Result<PathBuf, SandboxError> {
-        let tmp = Path::new(".hx/tmp");
-        let ignore = tmp.join(".gitignore");
-        if !tokio::fs::try_exists(self.resolve(&ignore)?).await? {
-            self.write_atomic(&ignore, b"*", None).await?;
-        }
         let hash = blake3::hash(bytes).to_hex();
-        let rel = tmp.join("spill").join(format!("{}.txt", &hash[..16]));
-        self.write_atomic(&rel, bytes, None).await?;
+        let rel = Path::new(SPILL_DIR).join(format!("{}.txt", &hash[..16]));
+        let path = self.resolve(&rel)?;
+        self.guard_protected_target(&rel, &path)?;
+        let len = bytes.len() as u64;
+        if tokio::fs::metadata(&path)
+            .await
+            .is_ok_and(|m| m.is_file() && m.len() == len)
+        {
+            return Ok(rel);
+        }
+        if !self.spill_ready.load(Ordering::Acquire)
+            || !tokio::fs::try_exists(path.parent().unwrap_or(&self.root)).await?
+        {
+            self.prepare_spill_dir().await?;
+        }
+        let bytes = bytes.to_vec();
+        tokio::task::spawn_blocking(move || -> Result<(), SandboxError> {
+            use std::io::Write;
+            let parent = path
+                .parent()
+                .ok_or_else(|| SandboxError::Denied("path has no parent".into()))?;
+            let mut tmp = tempfile::Builder::new()
+                .permissions(std::fs::Permissions::from_mode(0o666))
+                .tempfile_in(parent)?;
+            tmp.write_all(&bytes)?;
+            tmp.persist(&path).map_err(|e| SandboxError::Io(e.error))?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| SandboxError::Io(std::io::Error::other(e)))??;
         Ok(rel)
     }
 

@@ -308,3 +308,35 @@ async fn symlink_between_protected_paths_is_denied_too() {
         .await
         .unwrap();
 }
+
+/// `resolve` canonicalizes once, not once per path component (checkpoint 2, I6): on a
+/// deep path it costs about what one `canonicalize` does, never a multiple per level.
+#[tokio::test]
+async fn resolve_of_a_deep_path_costs_about_one_canonicalize() {
+    let (t, sb) = sandbox();
+    let rel: std::path::PathBuf = (0..30).map(|i| format!("d{i}")).collect();
+    std::fs::create_dir_all(t.path().join(&rel)).unwrap();
+    std::fs::write(t.path().join(&rel).join("f.txt"), b"x").unwrap();
+    let file = rel.join("f.txt");
+    let abs = t.path().join(&file);
+    let rounds = 300;
+    let time = |f: &dyn Fn()| {
+        let start = std::time::Instant::now();
+        for _ in 0..rounds {
+            f();
+        }
+        start.elapsed()
+    };
+    // Warm the caches, then compare.
+    sb.resolve(&file).unwrap();
+    let one = time(&|| {
+        abs.canonicalize().unwrap();
+    });
+    let resolve = time(&|| {
+        sb.resolve(&file).unwrap();
+    });
+    assert!(
+        resolve < one * 4,
+        "resolve {resolve:?} vs canonicalize {one:?} for {rounds} rounds"
+    );
+}
