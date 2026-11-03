@@ -19,29 +19,33 @@ const MAX_LINKS: usize = 40;
 /// A missing component is the one place this is lenient: the kernel fails
 /// `missing/../x` with ENOENT, but a tool may create `missing` first, so the walk
 /// treats the pair as cancelling. Once a `..` pops back onto a component that exists,
-/// the walk is back on the filesystem and continues to follow whatever links come
-/// next. A path whose only `..` are over names that exist is a single `canonicalize`.
+/// the walk is back on the filesystem and keeps following whatever links come next.
+///
+/// Cost: a path that exists is a single `canonicalize` (which also yields the on-disk
+/// spelling). Otherwise the walk goes one name at a time, one `lstat` per name (plus
+/// one `readlink` per link) and a final `canonicalize` of the part that exists;
+/// `..` over a name that exists is a pop of the symlink-free path walked so far, never
+/// a re-scan, so the work is linear in the length of `target` however many `..` it has.
 ///
 /// Errors other than "missing" (a file used as a directory, no permission) are returned
 /// as they are, unless the path has by then left `root`: what exists outside the
-/// workspace is not revealed, the result is `Resolved::Outside` instead.
+/// workspace is not revealed, the result is `Resolved::Outside` instead. Likewise a
+/// symlink loop reached outside the root.
 pub(crate) fn walk(root: &Path, target: &Path) -> std::io::Result<Resolved> {
-    let mut cur = if target.is_absolute() {
-        PathBuf::from("/")
+    let (mut cur, full) = if target.is_absolute() {
+        (PathBuf::from("/"), target.to_path_buf())
     } else {
-        root.to_path_buf()
+        (root.to_path_buf(), root.join(target))
     };
+    if let Ok(canon) = full.canonicalize() {
+        return Ok(classify(root, canon, &[]));
+    }
+    // `cur` stays a real directory path with no symlink in it (its case may be the
+    // one the caller typed; the canonicalize at the end puts on-disk spelling back).
     let mut queue: VecDeque<OsString> = components_of(target).collect();
-    // Names below `cur` that do not exist; `cur` itself is canonical and exists.
+    // Names below `cur` that do not exist.
     let mut missing: Vec<OsString> = Vec::new();
     let mut links = 0;
-    let finish = |cur: PathBuf, missing: Vec<OsString>| {
-        let full = cur.join(missing.iter().collect::<PathBuf>());
-        match full.strip_prefix(root) {
-            Ok(rel) => Resolved::Inside(rel.to_path_buf()),
-            Err(_) => Resolved::Outside(full),
-        }
-    };
     let io_or_outside = |e: std::io::Error, cur: &Path| {
         if cur.starts_with(root) {
             Err(e)
@@ -49,47 +53,16 @@ pub(crate) fn walk(root: &Path, target: &Path) -> std::io::Result<Resolved> {
             Ok(Resolved::Outside(cur.to_path_buf()))
         }
     };
-    loop {
+    while let Some(name) = queue.pop_front() {
         if !missing.is_empty() {
-            match queue.pop_front() {
-                None => return Ok(finish(cur, missing)),
-                Some(name) if name == ".." => {
-                    missing.pop();
-                }
-                Some(name) => missing.push(name),
+            if name == ".." {
+                missing.pop();
+            } else {
+                missing.push(name);
             }
             continue;
         }
-        if queue.is_empty() {
-            return Ok(finish(cur, missing));
-        }
-        // The longest run of the remaining names that exists, in one call.
-        let mut advanced = false;
-        for keep in (1..=queue.len()).rev() {
-            let mut prefix = cur.clone();
-            prefix.extend(queue.iter().take(keep));
-            match prefix.canonicalize() {
-                Ok(canon) => {
-                    cur = canon;
-                    queue.drain(..keep);
-                    advanced = true;
-                    break;
-                }
-                Err(e) if is_loop(&e) => return Ok(Resolved::Loop),
-                // Missing, a dangling link, or an unusable prefix: try a shorter one.
-                Err(_) => {}
-            }
-        }
-        if advanced {
-            continue;
-        }
-        // Nothing more resolves, so the next name is missing, a dangling link, or not
-        // reachable (its parent is a file).
-        let Some(name) = queue.pop_front() else {
-            return Ok(finish(cur, missing));
-        };
         if name == ".." {
-            // Only after a file used as a directory (`f/..`); stay lexical.
             cur.pop();
             continue;
         }
@@ -98,38 +71,47 @@ pub(crate) fn walk(root: &Path, target: &Path) -> std::io::Result<Resolved> {
             Ok(m) if m.file_type().is_symlink() => {
                 links += 1;
                 if links > MAX_LINKS {
-                    return Ok(Resolved::Loop);
+                    return Ok(if cur.starts_with(root) {
+                        Resolved::Loop
+                    } else {
+                        Resolved::Outside(cur)
+                    });
                 }
-                let dest = std::fs::read_link(&next)?;
+                let dest = match std::fs::read_link(&next) {
+                    Ok(d) => d,
+                    Err(e) => return io_or_outside(e, &cur),
+                };
                 if dest.is_absolute() {
                     cur = PathBuf::from("/");
                 }
-                for part in components_of(&dest).collect::<Vec<_>>().into_iter().rev() {
+                for part in components_of(&dest).rev() {
                     queue.push_front(part);
                 }
             }
-            Ok(_) => missing.push(name),
+            Ok(_) => cur = next,
             Err(e) if e.kind() == ErrorKind::NotFound => missing.push(name),
             Err(e) => return io_or_outside(e, &cur),
         }
     }
+    if let Ok(canon) = cur.canonicalize() {
+        cur = canon;
+    }
+    Ok(classify(root, cur, &missing))
+}
+
+fn classify(root: &Path, existing: PathBuf, missing: &[OsString]) -> Resolved {
+    let full = existing.join(missing.iter().collect::<PathBuf>());
+    match full.strip_prefix(root) {
+        Ok(rel) => Resolved::Inside(rel.to_path_buf()),
+        Err(_) => Resolved::Outside(full),
+    }
 }
 
 /// The names of `p` to walk: `..` and normal names; `.` and the root are implied.
-fn components_of(p: &Path) -> impl Iterator<Item = OsString> + '_ {
+fn components_of(p: &Path) -> impl DoubleEndedIterator<Item = OsString> + '_ {
     p.components().filter_map(|c| match c {
         Component::ParentDir => Some(OsString::from("..")),
         Component::Normal(s) => Some(s.to_owned()),
         _ => None,
     })
-}
-
-/// errno ELOOP (`ErrorKind::FilesystemLoop` is not stable yet).
-#[cfg(target_os = "macos")]
-pub(crate) const ELOOP: i32 = 62;
-#[cfg(not(target_os = "macos"))]
-pub(crate) const ELOOP: i32 = 40;
-
-fn is_loop(e: &std::io::Error) -> bool {
-    e.raw_os_error() == Some(ELOOP)
 }

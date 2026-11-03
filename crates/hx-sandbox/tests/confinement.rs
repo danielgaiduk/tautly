@@ -585,3 +585,155 @@ async fn resolve_outside_the_root_never_reveals_what_exists() {
         Err(SandboxError::Io(_))
     ));
 }
+
+// --- fix round 2: linear walk, remove_file acts on the link, minors ---
+
+/// Run `f` on a thread and fail if it takes longer than `limit` (so a quadratic
+/// resolver fails fast instead of hanging the suite).
+fn within<T: Send + 'static>(
+    limit: std::time::Duration,
+    f: impl FnOnce() -> T + Send + 'static,
+) -> T {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(f());
+    });
+    rx.recv_timeout(limit)
+        .unwrap_or_else(|_| panic!("did not finish within {limit:?}"))
+}
+
+#[tokio::test]
+async fn repeated_dotdot_over_missing_names_resolves_in_linear_time() {
+    let (t, sb) = sandbox();
+    std::fs::write(t.path().join("f.txt"), "x").unwrap();
+    let root = sb.root().to_path_buf();
+    let path = format!("{}f.txt", "m/../".repeat(3000));
+    let limit = std::time::Duration::from_secs(2);
+    let (sb2, p2) = (sb.clone(), path.clone());
+    let got = within(limit, move || sb2.resolve(Path::new(&p2)));
+    assert_eq!(got.unwrap(), root.join("f.txt"));
+    // The policy walks the same path twice per decision, before any prompt.
+    let policy = policy_for(&root, &["write"]);
+    let eff = write_effect(Path::new(&path));
+    let decision = within(limit, move || policy.decide("write", &eff, None));
+    assert_eq!(decision, hx_sandbox::Decision::Allow);
+    // Growing the input tenfold must not grow the cost by more than a small factor.
+    let long = format!("{}f.txt", "m/../".repeat(30000));
+    let start = std::time::Instant::now();
+    let r = within(limit, move || sb.resolve(Path::new(&long)));
+    assert_eq!(r.unwrap(), root.join("f.txt"));
+    assert!(start.elapsed() < limit);
+}
+
+#[tokio::test]
+async fn new_file_paths_cost_a_small_multiple_of_one_canonicalize() {
+    let (t, sb) = sandbox();
+    let dir: std::path::PathBuf = (0..5).map(|i| format!("d{i}")).collect();
+    std::fs::create_dir_all(t.path().join(&dir)).unwrap();
+    let existing = t.path().join(&dir);
+    let new_file = dir.join("a/b/new.rs");
+    let rounds = 300;
+    let time = |f: &dyn Fn()| {
+        let start = std::time::Instant::now();
+        for _ in 0..rounds {
+            f();
+        }
+        start.elapsed()
+    };
+    sb.resolve(&new_file).unwrap();
+    let one = time(&|| {
+        existing.canonicalize().unwrap();
+    });
+    let resolve = time(&|| {
+        sb.resolve(&new_file).unwrap();
+    });
+    assert!(
+        resolve < one * 10,
+        "resolve {resolve:?} vs canonicalize {one:?} for {rounds} rounds"
+    );
+}
+
+#[tokio::test]
+async fn remove_file_removes_a_dangling_link_itself() {
+    let (t, sb) = sandbox();
+    let outside = tempfile::tempdir().unwrap();
+    std::fs::write(outside.path().join("victim.txt"), b"keep").unwrap();
+    std::os::unix::fs::symlink("no/such/target", t.path().join("dangling")).unwrap();
+    std::os::unix::fs::symlink(outside.path().join("nope"), t.path().join("dangling_out")).unwrap();
+    std::os::unix::fs::symlink(
+        outside.path().join("victim.txt"),
+        t.path().join("to_victim"),
+    )
+    .unwrap();
+    for name in ["dangling", "dangling_out", "to_victim"] {
+        sb.remove_file(Path::new(name)).await.unwrap();
+        assert!(
+            std::fs::symlink_metadata(t.path().join(name)).is_err(),
+            "{name} still there"
+        );
+    }
+    // A link to a file outside the root is only unlinked, never followed.
+    assert_eq!(
+        std::fs::read(outside.path().join("victim.txt")).unwrap(),
+        b"keep"
+    );
+    // Missing names stay an error, and the parent is still confined.
+    assert!(matches!(
+        sb.remove_file(Path::new("dangling")).await,
+        Err(SandboxError::Io(_))
+    ));
+    assert!(matches!(
+        sb.remove_file(Path::new("missing/../../x")).await,
+        Err(SandboxError::OutsideRoot(_))
+    ));
+}
+
+#[tokio::test]
+async fn remove_file_still_refuses_links_into_protected_paths() {
+    let (t, sb) = protected_repo();
+    // A link into .git stays undeletable (as before), and its target is untouched.
+    let r = sb.remove_file(Path::new("NOTES.md")).await;
+    assert!(matches!(r, Err(SandboxError::Denied(_))), "{r:?}");
+    assert!(std::fs::symlink_metadata(t.path().join("NOTES.md")).is_ok());
+    assert_eq!(
+        std::fs::read_to_string(t.path().join(".git/config")).unwrap(),
+        "[core]\n"
+    );
+    // Through a directory link into .git the parent itself is protected.
+    std::fs::write(t.path().join(".git/hooks/pre-commit"), "#!/bin/sh\n").unwrap();
+    let r = sb.remove_file(Path::new("docs/hooks/pre-commit")).await;
+    assert!(matches!(r, Err(SandboxError::Denied(_))), "{r:?}");
+    assert!(t.path().join(".git/hooks/pre-commit").exists());
+}
+
+#[tokio::test]
+async fn symlink_loop_outside_the_root_is_outside_not_eloop() {
+    let (_t, outside, sb) = dotdot_repo();
+    std::os::unix::fs::symlink("b", outside.path().join("a")).unwrap();
+    std::os::unix::fs::symlink("a", outside.path().join("b")).unwrap();
+    for p in ["link_out/a/x", "link_out/a", "missing/../link_out/b/x"] {
+        let r = sb.resolve(Path::new(p));
+        assert!(matches!(r, Err(SandboxError::OutsideRoot(_))), "{p}: {r:?}");
+    }
+}
+
+#[tokio::test]
+async fn case_only_difference_is_not_called_a_symlink() {
+    let (t, sb) = protected_repo();
+    let root = sb.root().to_path_buf();
+    let policy = policy_for(&root, &["write"]);
+    let hx_sandbox::Decision::Ask { reason } =
+        policy.decide("write", &write_effect(Path::new(".GIT/config")), None)
+    else {
+        panic!("expected ask");
+    };
+    assert!(!reason.contains("symlink"), "{reason}");
+    // A real link is still named.
+    let hx_sandbox::Decision::Ask { reason } =
+        policy.decide("write", &write_effect(Path::new("NOTES.md")), None)
+    else {
+        panic!("expected ask");
+    };
+    assert!(reason.contains(".git/config"), "{reason}");
+    drop(t);
+}

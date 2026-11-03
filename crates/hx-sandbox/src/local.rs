@@ -1,5 +1,5 @@
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -98,7 +98,7 @@ impl Sandbox for LocalSandbox {
             Resolved::Inside(rel) => Ok(self.root.join(rel)),
             Resolved::Outside(_) => Err(SandboxError::OutsideRoot(p.to_path_buf())),
             Resolved::Loop => Err(SandboxError::Io(std::io::Error::from_raw_os_error(
-                walk::ELOOP,
+                libc::ELOOP,
             ))),
         }
     }
@@ -157,9 +157,25 @@ impl Sandbox for LocalSandbox {
         .map_err(|e| SandboxError::Io(std::io::Error::other(e)))?
     }
 
+    /// Unlinks `p` itself, as `unlink` does: a final symlink (dangling, or pointing
+    /// outside the root or into a protected path) is removed, never followed, so the
+    /// file it names is untouched. The parent directory is resolved through the walker,
+    /// so the root and the protected-path guard are checked on parent plus final name.
     async fn remove_file(&self, p: &Path) -> Result<(), SandboxError> {
-        let path = self.resolve(p)?;
+        let name = match p.components().next_back() {
+            Some(Component::Normal(name)) => name.to_owned(),
+            _ => return Err(SandboxError::Denied("path has no file name".into())),
+        };
+        let parent = self.resolve(p.parent().unwrap_or(Path::new("")))?;
+        let path = parent.join(name);
         self.guard_protected_target(p, &path)?;
+        // A link whose destination is a protected path is still refused, as before:
+        // unlinking it is harmless to the target, but callers (and the patch tool's
+        // tests) rely on a link into `.git/` not being deletable. A destination that is
+        // outside the root, dangling or looping is not refused: only the link goes.
+        if let Ok(real) = self.resolve(p) {
+            self.guard_protected_target(p, &real)?;
+        }
         Ok(tokio::fs::remove_file(path).await?)
     }
 

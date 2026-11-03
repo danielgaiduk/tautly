@@ -682,6 +682,7 @@ dependencies = [
  "blake3",
  "globset",
  "ignore",
+ "libc",
  "reqwest",
  "serde",
  "serde_json",

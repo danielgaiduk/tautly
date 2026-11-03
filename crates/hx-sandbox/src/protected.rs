@@ -67,7 +67,7 @@ pub(crate) fn path_reason(root: &Path, cwd: &Path, target: &str) -> Option<Strin
     if is_protected(&rel) {
         // Name the real target too, so an approval prompt cannot hide it.
         return Some(match resolved {
-            Some(Resolved::Inside(real)) if real != rel => format!(
+            Some(Resolved::Inside(real)) if !same_path(&real, &rel) => format!(
                 "protected path: {} (symlink to {})",
                 rel.display(),
                 real.display()
@@ -84,6 +84,12 @@ pub(crate) fn path_reason(root: &Path, cwd: &Path, target: &str) -> Option<Strin
         )),
         Resolved::Loop => Some(format!("too many levels of symlinks: {target}")),
     }
+}
+
+/// Whether two root-relative paths are the same file name for name; the case of a
+/// spelling alone (`.GIT` for `.git`) is not a symlink.
+fn same_path(a: &Path, b: &Path) -> bool {
+    a.to_string_lossy().to_lowercase() == b.to_string_lossy().to_lowercase()
 }
 
 /// `target` as seen from working directory `cwd` (lexical; root-relative or
