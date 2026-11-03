@@ -1,0 +1,630 @@
+//! One user message: the step loop (spec 3.1). A step is one provider request and the
+//! tool calls of its response; it is also one context `Turn` (checkpoint 3), numbered by
+//! `Context::next_turn()` read before the step's turn is pushed. `max_turns` counts steps;
+//! `TurnStarted`/`TurnFinished` bracket the whole message.
+//!
+//! Every step starts with the cache epoch (spec 7.7): collection and threshold compaction
+//! are decided together and applied together, with the session pins and a pending memory
+//! index riding on the same epoch, so the cached prefix breaks at most once.
+
+use std::time::{Duration, Instant};
+
+use futures::StreamExt;
+use tautly_context::compact::DEFAULT_KEEP_RECENT;
+use tautly_context::schedule::{self, MutationReason};
+use tautly_context::{CompactError, ContextStatus, GcRecord, Turn};
+use tautly_provider::{
+    CanonicalRequest, Content, Message, ProviderError, ProviderEvent, Quota, RawUsage, Role,
+    StopReason, cost_usd,
+};
+use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
+
+use crate::approvals::Approvals;
+use crate::protocol::{Command, ErrorKind, Event, FinishReason, UsageRole};
+use crate::record::{SessionRecord, storable};
+use crate::session::Session;
+
+/// A response that breaks off after content is sent again at most this many times.
+const MAX_REISSUES: u32 = 4;
+
+/// What a turn task gets from the actor.
+pub(crate) struct TurnControl {
+    pub cancel: CancellationToken,
+    /// `Pin`/`Unpin` sent while the turn runs, applied at the next step start.
+    pub inbox: mpsc::UnboundedReceiver<Command>,
+    pub approvals: Approvals,
+}
+
+/// A tool call of a completed response.
+#[derive(Debug, Clone)]
+pub(crate) struct Call {
+    pub id: String,
+    pub name: String,
+    /// The parsed arguments (a JSON object), or why they are unusable.
+    pub args: Result<serde_json::Value, String>,
+}
+
+impl Call {
+    /// The arguments as the history holds them: an empty object when unusable.
+    pub fn input(&self) -> serde_json::Value {
+        self.args
+            .clone()
+            .unwrap_or_else(|_| serde_json::Value::Object(Default::default()))
+    }
+}
+
+/// A completed provider response.
+#[derive(Debug, Default)]
+struct Response {
+    content: Vec<Content>,
+    calls: Vec<Call>,
+    /// The events as logged: consecutive deltas merged.
+    logged: Vec<ProviderEvent>,
+    usage: Option<RawUsage>,
+    quota: Option<Quota>,
+    stop: Option<StopReason>,
+}
+
+impl Response {
+    fn push(&mut self, ev: ProviderEvent) {
+        match &ev {
+            ProviderEvent::TextDelta(t) => match self.content.last_mut() {
+                Some(Content::Text(s)) => s.push_str(t),
+                _ => self.content.push(Content::Text(t.clone())),
+            },
+            ProviderEvent::ReasoningDelta(t) => match self.content.last_mut() {
+                Some(Content::Reasoning {
+                    text,
+                    signature: None,
+                }) => text.push_str(t),
+                _ => self.content.push(Content::Reasoning {
+                    text: t.clone(),
+                    signature: None,
+                }),
+            },
+            ProviderEvent::ReasoningSignature(sig) => {
+                if let Some(Content::Reasoning { signature, .. }) = self
+                    .content
+                    .iter_mut()
+                    .rev()
+                    .find(|c| matches!(c, Content::Reasoning { .. }))
+                {
+                    *signature = Some(sig.clone());
+                }
+            }
+            ProviderEvent::RedactedReasoning(data) => self
+                .content
+                .push(Content::RedactedReasoning { data: data.clone() }),
+            ProviderEvent::ToolCall {
+                id,
+                name,
+                input_json,
+            } => {
+                let call = Call {
+                    id: id.clone(),
+                    name: name.clone(),
+                    args: parse_args(input_json),
+                };
+                self.content.push(Content::ToolUse {
+                    id: id.clone(),
+                    name: name.clone(),
+                    input: call.input(),
+                });
+                self.calls.push(call);
+            }
+            ProviderEvent::Usage(u) => self.usage = Some(*u),
+            ProviderEvent::Quota(q) => self.quota = Some(q.clone()),
+            ProviderEvent::Done { stop } => self.stop = Some(stop.clone()),
+        }
+        match (self.logged.last_mut(), ev) {
+            (Some(ProviderEvent::TextDelta(a)), ProviderEvent::TextDelta(b))
+            | (Some(ProviderEvent::ReasoningDelta(a)), ProviderEvent::ReasoningDelta(b)) => {
+                a.push_str(&b)
+            }
+            (_, ev) => self.logged.push(ev),
+        }
+    }
+
+    /// A response cut off (output limit) right after a reasoning item keeps no dangling
+    /// reasoning: providers reject a reasoning item that leads nowhere.
+    fn finish(mut self) -> Self {
+        if self.stop == Some(StopReason::MaxTokens)
+            && matches!(
+                self.content.last(),
+                Some(Content::Reasoning { .. } | Content::RedactedReasoning { .. })
+            )
+        {
+            self.content.pop();
+        }
+        self
+    }
+}
+
+fn parse_args(input_json: &str) -> Result<serde_json::Value, String> {
+    if input_json.trim().is_empty() {
+        return Ok(serde_json::Value::Object(Default::default()));
+    }
+    match serde_json::from_str::<serde_json::Value>(input_json) {
+        Ok(v @ serde_json::Value::Object(_)) => Ok(v),
+        Ok(_) => Err("the arguments must be a JSON object".into()),
+        Err(e) => Err(format!("the arguments are not valid JSON ({e})")),
+    }
+}
+
+/// Why streaming a response stopped without one.
+enum StreamEnd {
+    Cancelled,
+    Failed(ProviderError),
+}
+
+/// Remove reasoning items from every turn: they belong to the provider that produced them.
+pub fn strip_reasoning(history: &mut [Turn]) {
+    for turn in history {
+        for m in &mut turn.messages {
+            m.content.retain(|c| {
+                !matches!(
+                    c,
+                    Content::Reasoning { .. } | Content::RedactedReasoning { .. }
+                )
+            });
+        }
+        turn.messages
+            .retain(|m| !(m.role == Role::Assistant && m.content.is_empty()));
+    }
+}
+
+fn error_event(e: &ProviderError) -> Event {
+    let (kind, hint) = match e {
+        ProviderError::Transient { .. } => (
+            ErrorKind::ProviderTransient,
+            Some("the provider is unavailable or rate-limited; try again shortly".to_string()),
+        ),
+        ProviderError::Auth(_) => (
+            ErrorKind::ProviderFatal,
+            Some("check the API key for this provider".to_string()),
+        ),
+        ProviderError::InvalidRequest(_) => (ErrorKind::ProviderFatal, None),
+        ProviderError::ContextOverflow(_) => (
+            ErrorKind::ContextOverflow,
+            Some("the context is too large for the model; compact it".to_string()),
+        ),
+        ProviderError::Other(_) => (ErrorKind::ProviderFatal, None),
+    };
+    Event::Error {
+        kind,
+        message: e.to_string(),
+        retryable: e.is_transient(),
+        hint,
+    }
+}
+
+impl Session {
+    /// Run one user message to its end.
+    pub async fn run_turn(&mut self, text: String, ctl: &mut TurnControl) {
+        self.apply_startup().await;
+        self.emit(Event::TurnStarted).await;
+        self.context.history.push(Turn {
+            messages: vec![Message {
+                role: Role::User,
+                content: vec![Content::Text(text)],
+            }],
+        });
+        let reason = self.steps(ctl).await;
+        self.log(SessionRecord::TurnEnd { reason }).await;
+        self.checkpoint().await;
+        self.emit(Event::TurnFinished { reason }).await;
+    }
+
+    async fn steps(&mut self, ctl: &mut TurnControl) -> FinishReason {
+        let mut steps = 0u32;
+        loop {
+            if ctl.cancel.is_cancelled() {
+                return FinishReason::Cancelled;
+            }
+            if steps >= self.max_turns {
+                return FinishReason::MaxTurns;
+            }
+            while let Ok(cmd) = ctl.inbox.try_recv() {
+                self.context_command(cmd).await;
+            }
+            self.check_index().await;
+            if self.model.provider() != self.history_provider {
+                strip_reasoning(&mut self.context.history);
+                self.history_provider = self.model.provider().to_string();
+            }
+            let (req, status) = self.epoch(ctl).await;
+            if ctl.cancel.is_cancelled() {
+                return FinishReason::Cancelled;
+            }
+            let turn = self.context.next_turn();
+            if let Some(hash) = self
+                .blob(&serde_json::to_vec(&req).unwrap_or_default())
+                .await
+            {
+                self.log(SessionRecord::Request { hash }).await;
+            }
+            let sent_at = Instant::now();
+            let resp = match self.stream(req, ctl).await {
+                Ok(r) => r,
+                Err(StreamEnd::Cancelled) => return FinishReason::Cancelled,
+                Err(StreamEnd::Failed(e)) => {
+                    self.emit(error_event(&e)).await;
+                    return FinishReason::Error;
+                }
+            };
+            self.context.note_request(sent_at, status.cached_prefix);
+            if let Some(u) = resp.usage {
+                self.context.calibrate(&status, &u);
+                self.emit(Event::Usage {
+                    role: UsageRole::Main,
+                    tokens_in: u.input,
+                    tokens_out: u.output,
+                    cache_read: u.cache_read,
+                    cache_write: u.cache_write,
+                    cost_usd: cost_usd(&u, self.info.price.as_ref()),
+                    quota: resp.quota.clone(),
+                })
+                .await;
+            }
+            self.emit(Event::context_status(&status)).await;
+            for ev in &resp.logged {
+                self.log(SessionRecord::Provider(ev.clone())).await;
+            }
+            steps += 1;
+            let assistant = Message {
+                role: Role::Assistant,
+                content: resp.content,
+            };
+            if resp.calls.is_empty() {
+                if !assistant.content.is_empty() {
+                    self.context.history.push(Turn {
+                        messages: vec![assistant],
+                    });
+                }
+                self.checkpoint().await;
+                return FinishReason::Completed;
+            }
+            for c in &resp.calls {
+                self.log(SessionRecord::ToolCall {
+                    id: c.id.clone(),
+                    name: c.name.clone(),
+                    args: c.input(),
+                })
+                .await;
+            }
+            self.checkpoint().await;
+            for c in &resp.calls {
+                self.emit(Event::ToolCallProposed {
+                    call_id: c.id.clone(),
+                    tool: c.name.clone(),
+                    args: c.input(),
+                })
+                .await;
+            }
+            let results = self.run_calls(&resp.calls, turn, ctl).await;
+            self.context.history.push(Turn {
+                messages: vec![
+                    assistant,
+                    Message {
+                        role: Role::User,
+                        content: results,
+                    },
+                ],
+            });
+            self.checkpoint().await;
+        }
+    }
+
+    /// Report a failed index refresh once.
+    async fn check_index(&mut self) {
+        if self.index_error_reported {
+            return;
+        }
+        if let Some(e) = self.workspace.index().and_then(|i| i.last_error()) {
+            self.index_error_reported = true;
+            self.warn(format!("code index refresh failed: {e}")).await;
+        }
+    }
+
+    fn assemble(&self) -> (CanonicalRequest, ContextStatus) {
+        self.context
+            .assemble(&self.info.caps, &self.specs, &self.model)
+    }
+
+    /// Stream one response. Text and reasoning are shown as they arrive; tool calls are
+    /// used only once the response is complete. A response that breaks off with a
+    /// transient error after content (the retry wrapper cannot hide that) is discarded and
+    /// the request sent again, so a partial tool call never runs.
+    async fn stream(
+        &mut self,
+        req: CanonicalRequest,
+        ctl: &TurnControl,
+    ) -> Result<Response, StreamEnd> {
+        let mut attempt = 0;
+        loop {
+            let mut s = self.provider.stream(req.clone(), ctl.cancel.child_token());
+            let mut resp = Response::default();
+            let broke = loop {
+                let item = tokio::select! {
+                    biased;
+                    () = ctl.cancel.cancelled() => return Err(StreamEnd::Cancelled),
+                    item = s.next() => item,
+                };
+                match item {
+                    None => break None,
+                    Some(Ok(ev)) => {
+                        match &ev {
+                            ProviderEvent::TextDelta(t) => {
+                                self.emit(Event::TextDelta { text: t.clone() }).await
+                            }
+                            ProviderEvent::ReasoningDelta(t) => {
+                                self.emit(Event::ReasoningDelta { text: t.clone() }).await
+                            }
+                            _ => {}
+                        }
+                        resp.push(ev);
+                    }
+                    Some(Err(e)) => break Some(e),
+                }
+            };
+            match broke {
+                None => return Ok(resp.finish()),
+                Some(e) if e.is_transient() && attempt < MAX_REISSUES => {
+                    attempt += 1;
+                    self.warn(format!(
+                        "the response broke off ({e}); discarding it and sending the request again"
+                    ))
+                    .await;
+                }
+                Some(e) => return Err(StreamEnd::Failed(e)),
+            }
+        }
+    }
+
+    /// The cache epoch at a step start; returns the request to send.
+    async fn epoch(&mut self, ctl: &TurnControl) -> (CanonicalRequest, ContextStatus) {
+        let (req, status) = self.assemble();
+        let now = Instant::now();
+        let ttl = self
+            .info
+            .cache_ttl_s
+            .map(|s| Duration::from_secs(u64::from(s)));
+        let price = self.info.price;
+        let window = self.info.caps.context_window;
+        let gc = self
+            .context
+            .gc_decision(now, ttl, price.as_ref(), status.used, window);
+        let compaction = self.context.compaction_decision(
+            &status,
+            self.compaction_threshold,
+            now,
+            ttl,
+            price.as_ref(),
+        );
+        let cold = schedule::decide(
+            &self.context.clock,
+            now,
+            ttl,
+            0,
+            price.as_ref(),
+            status.used,
+            window,
+        ) == Some(MutationReason::ColdCache);
+
+        let mut applied = false;
+        if let Some(rec) = self.context.collect(gc.or(compaction)) {
+            self.collected(rec).await;
+            applied = true;
+        }
+        if let Some(reason) = compaction {
+            applied |= self.compact(reason, ctl).await;
+        }
+        if !applied && !cold {
+            return (req, status);
+        }
+        let mut changed = applied;
+        if let Some(text) = self.pending_memory_index.take() {
+            self.context.memory_index = Some(text.clone()).filter(|t| !t.trim().is_empty());
+            self.log(SessionRecord::MemoryIndexApplied { text }).await;
+            changed = true;
+        }
+        if self.context.fold_session_pins() {
+            self.log(SessionRecord::PinsFolded).await;
+            changed = true;
+        }
+        if changed {
+            self.assemble()
+        } else {
+            (req, status)
+        }
+    }
+
+    /// Log and announce a collection, and forget the read baselines it took away.
+    async fn collected(&mut self, rec: GcRecord) {
+        for p in &rec.forgotten_paths {
+            self.reads.forget_path(p);
+        }
+        let (paths, skipped): (Vec<_>, Vec<_>) = rec
+            .forgotten_paths
+            .iter()
+            .cloned()
+            .partition(|p| storable(p));
+        self.untracked(skipped).await;
+        self.log(SessionRecord::GcApplied {
+            elided: rec
+                .elided
+                .iter()
+                .map(|e| (e.call_id.clone(), e.by_turn))
+                .collect(),
+            reason: rec.reason,
+            tokens_freed: rec.tokens_freed,
+            forgotten_paths: paths,
+        })
+        .await;
+        self.emit(Event::ContextCollected {
+            elided_results: rec.elided.len() as u32,
+            tokens_freed: rec.tokens_freed,
+            reason: rec.reason,
+        })
+        .await;
+    }
+
+    /// Threshold compaction (spec 6.4): announced first, summarized by the model, and if
+    /// that fails (or the summary is not smaller) the oldest turns are dropped without a
+    /// summary; never retried in a loop. True when the history changed.
+    async fn compact(&mut self, reason: MutationReason, ctl: &TurnControl) -> bool {
+        let (req, removed) =
+            self.context
+                .compaction_request(&self.model, &self.info.caps, DEFAULT_KEEP_RECENT);
+        if removed == 0 {
+            return false;
+        }
+        let (_, mut status) = self.assemble();
+        status.warnings.push(format!(
+            "compacting: summarizing the {removed} oldest turns"
+        ));
+        self.emit(Event::context_status(&status)).await;
+        let summary = match self.summarize(req, ctl).await {
+            Ok(s) => Some(s),
+            Err(StreamEnd::Cancelled) => return false,
+            Err(StreamEnd::Failed(e)) => {
+                self.warn(format!(
+                    "the compaction summary failed ({e}); dropping the oldest turns without one"
+                ))
+                .await;
+                None
+            }
+        };
+        let rec = match summary.map(|s| self.context.apply_compaction(removed, s)) {
+            Some(Ok(rec)) => Ok(rec),
+            Some(Err(CompactError::SummaryTooLong { .. })) | None => {
+                self.context.apply_compaction(removed, String::new())
+            }
+            Some(Err(e)) => Err(e),
+        };
+        let Ok(rec) = rec else {
+            return false;
+        };
+        self.reads.forget_shown_at(rec.last_removed_turn);
+        for p in &rec.forgotten_paths {
+            self.reads.forget_path(p);
+        }
+        let mut blobs = Vec::with_capacity(rec.removed_turns.len());
+        for t in &rec.removed_turns {
+            match self.blob(&serde_json::to_vec(t).unwrap_or_default()).await {
+                Some(b) => blobs.push(b),
+                None => break,
+            }
+        }
+        if blobs.len() == rec.removed_turns.len() {
+            self.log(SessionRecord::Compaction {
+                removed: blobs,
+                summary: rec.summary.clone(),
+            })
+            .await;
+        }
+        self.emit(Event::Compacted {
+            removed_turns: rec.removed_turns.len() as u32,
+            summary: rec.summary.clone(),
+            reason,
+        })
+        .await;
+        self.latest_compaction = Some(rec);
+        true
+    }
+
+    /// Run a summary request and collect its text. (Task 27 sends it to the side model.)
+    async fn summarize(
+        &mut self,
+        req: CanonicalRequest,
+        ctl: &TurnControl,
+    ) -> Result<String, StreamEnd> {
+        let mut s = self.provider.stream(req, ctl.cancel.child_token());
+        let mut text = String::new();
+        let mut usage = None;
+        loop {
+            let item = tokio::select! {
+                biased;
+                () = ctl.cancel.cancelled() => return Err(StreamEnd::Cancelled),
+                item = s.next() => item,
+            };
+            match item {
+                None => break,
+                Some(Ok(ProviderEvent::TextDelta(t))) => text.push_str(&t),
+                Some(Ok(ProviderEvent::Usage(u))) => usage = Some(u),
+                Some(Ok(_)) => {}
+                Some(Err(e)) => return Err(StreamEnd::Failed(e)),
+            }
+        }
+        if let Some(u) = usage {
+            self.emit(Event::Usage {
+                role: UsageRole::Side,
+                tokens_in: u.input,
+                tokens_out: u.output,
+                cache_read: u.cache_read,
+                cache_write: u.cache_write,
+                cost_usd: cost_usd(&u, self.info.price.as_ref()),
+                quota: None,
+            })
+            .await;
+        }
+        Ok(text.trim().to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn deltas_merge_and_a_trailing_reasoning_item_is_dropped_when_cut_off() {
+        let mut r = Response::default();
+        for ev in [
+            ProviderEvent::TextDelta("a".into()),
+            ProviderEvent::TextDelta("b".into()),
+            ProviderEvent::ReasoningDelta("think".into()),
+            ProviderEvent::Done {
+                stop: StopReason::MaxTokens,
+            },
+        ] {
+            r.push(ev);
+        }
+        assert_eq!(r.logged.len(), 3);
+        let r = r.finish();
+        assert_eq!(r.content, vec![Content::Text("ab".into())]);
+    }
+
+    #[test]
+    fn arguments_must_be_a_json_object() {
+        assert!(parse_args("").unwrap().is_object());
+        assert!(parse_args("[1]").is_err());
+        assert!(parse_args("{x").is_err());
+        assert!(parse_args(r#"{"a":1}"#).is_ok());
+    }
+
+    #[test]
+    fn stripping_reasoning_drops_emptied_assistant_messages() {
+        let mut h = vec![Turn {
+            messages: vec![
+                Message {
+                    role: Role::Assistant,
+                    content: vec![Content::RedactedReasoning { data: "x".into() }],
+                },
+                Message {
+                    role: Role::Assistant,
+                    content: vec![
+                        Content::Reasoning {
+                            text: "t".into(),
+                            signature: Some("s".into()),
+                        },
+                        Content::Text("hi".into()),
+                    ],
+                },
+            ],
+        }];
+        strip_reasoning(&mut h);
+        assert_eq!(h[0].messages.len(), 1);
+        assert_eq!(h[0].messages[0].content, vec![Content::Text("hi".into())]);
+    }
+}
