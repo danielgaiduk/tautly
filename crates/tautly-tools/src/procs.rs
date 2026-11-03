@@ -18,35 +18,23 @@
 //! puts each background job in its own group), daemonizers (`daemonize`,
 //! `start-stop-daemon`, `tmux new -d`, `screen -dm`, `docker run -d`), and every child if
 //! tautly itself is killed with SIGKILL. The permission policy asks before `setsid` and
-//! job control; on Linux the engine also makes itself a child subreaper, so orphans that
-//! left their group are adopted and ended at shutdown. The rest waits for the OS-level
-//! sandbox.
+//! job control; the rest waits for the OS-level sandbox. Adopting such orphans (a Linux
+//! child subreaper) is post-v1: it needs positive identification of what was adopted (a
+//! process-wide record of every pid we spawned, taken under the reaper's lock, plus an
+//! adoption signature), or it steals exit statuses from children it does not own.
 //!
 //! **Zombies** count as members (`killpg(pgid, 0)` succeeds for them). Normally the
 //! runtime reaps our own children and init reaps orphans at once; where nothing reaps
 //! orphans (tautly as PID 1 in a container without an init) a dead group stays "alive":
 //! cancel then waits its full grace and `terminate_all` its whole `grace`, but nothing is
-//! signalled wrongly. On Linux the engine reaps the orphans it adopts as subreaper.
+//! signalled wrongly.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 /// How often [`ProcessGroups::terminate_all`] looks whether the groups are gone.
 const POLL: Duration = Duration::from_millis(5);
-
-/// Leaders of the commands running now, across every registry in the process: our own
-/// children, which an orphan reaper must leave to the runtime.
-static RUNNING: Mutex<BTreeSet<u32>> = Mutex::new(BTreeSet::new());
-
-fn running() -> std::sync::MutexGuard<'static, BTreeSet<u32>> {
-    RUNNING.lock().unwrap_or_else(|e| e.into_inner())
-}
-
-/// The pids of the commands running now in this process (their group leaders).
-pub fn running_leaders() -> Vec<u32> {
-    running().iter().copied().collect()
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum State {
@@ -68,13 +56,11 @@ impl ProcessGroups {
         let mut live = self.lock();
         live.retain(|&g, &mut st| still_ours(g, st));
         live.insert(pgid, State::Running);
-        running().insert(pgid);
     }
 
     /// The command that led `pgid` has returned and its leader was reaped; what is left in
     /// the group are background children. Released if none are.
     pub fn settle(&self, pgid: u32) {
-        running().remove(&pgid);
         let mut live = self.lock();
         if live.contains_key(&pgid) && still_ours(pgid, State::Settled) {
             live.insert(pgid, State::Settled);
@@ -85,7 +71,6 @@ impl ProcessGroups {
 
     /// Stop tracking `pgid`.
     pub fn release(&self, pgid: u32) {
-        running().remove(&pgid);
         self.lock().remove(&pgid);
     }
 
@@ -120,7 +105,6 @@ impl ProcessGroups {
         let mut live = self.lock();
         for (g, _) in &groups {
             live.remove(g);
-            running().remove(g);
         }
         groups.len()
     }
@@ -133,7 +117,6 @@ impl ProcessGroups {
             if still_ours(g, st) {
                 killpg(g, libc::SIGKILL);
             }
-            running().remove(&g);
         }
         live.clear();
     }

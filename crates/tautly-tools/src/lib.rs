@@ -46,7 +46,7 @@ pub use pin_state::{
     ContextOp, MAX_PIN_BYTES, PinTool, PlanStep, StatePatch, StateTool, StepStatus,
     parse_context_op,
 };
-pub use procs::{ProcessGroups, group_alive, running_leaders};
+pub use procs::{ProcessGroups, group_alive};
 pub use read::ReadTool;
 pub use web_fetch::WebFetchTool;
 pub use write::WriteTool;

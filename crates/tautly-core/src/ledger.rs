@@ -15,7 +15,8 @@ pub const LEDGER_FILE: &str = "ledger.sqlite";
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// `PRAGMA user_version` of the schema below. Changes are additive only (new columns with
-/// defaults), so an older build can still write a newer file's rows it knows about.
+/// defaults); a build still refuses a file whose version is newer than it knows
+/// ([`LedgerError::Newer`]), so it never writes rows a newer schema might misread.
 const SCHEMA_VERSION: i64 = 2;
 
 const SCHEMA: &str = "
