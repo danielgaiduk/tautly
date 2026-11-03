@@ -67,6 +67,10 @@ impl<R: DeserializeOwned> SessionReader<R> {
         self.tail_start.is_some()
     }
 
+    pub(crate) fn tail_start(&self) -> Option<u64> {
+        self.tail_start
+    }
+
     /// Stream `(offset, record)` pairs in log order. After the first error the
     /// iterator ends.
     pub fn records(&self) -> impl Iterator<Item = Result<(u64, R)>> + use<R> {

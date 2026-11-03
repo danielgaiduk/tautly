@@ -390,12 +390,12 @@ fn data_home_precedence_and_default_create_uses_it() {
     set("XDG_DATA_HOME", Some(xdg.path()));
     assert_eq!(paths::data_home(), xdg.path().join("hx"));
     set("HX_HOME", Some(hx.path()));
-    assert_eq!(paths::data_home(), hx.path().join("hx"));
+    assert_eq!(paths::data_home(), hx.path());
 
     // The default constructors follow HX_HOME.
     let project = tempfile::tempdir().unwrap();
     let w = SessionWriter::<Rec>::create(project.path(), None).unwrap();
-    assert!(w.path().starts_with(hx.path().join("hx").join("sessions")));
+    assert!(w.path().starts_with(hx.path().join("sessions")));
     assert_eq!(hx_session::list(project.path()).unwrap().len(), 1);
     drop(w);
 
@@ -415,4 +415,102 @@ fn project_hash_is_16_hex_stable_and_path_specific() {
     assert_ne!(h, paths::project_hash(b.path()));
     // Canonicalized: a non-normalized spelling hashes the same.
     assert_eq!(h, paths::project_hash(&a.path().join(".")));
+}
+
+#[test]
+fn reopen_truncates_torn_tail_and_continues_offsets() {
+    let env = Env::new();
+    let mut w = env.writer();
+    w.append(&msg("a")).unwrap();
+    w.append(&msg("b")).unwrap();
+    w.checkpoint().unwrap();
+    let path = w.path().to_path_buf();
+    let id = w.session_id().to_string();
+    drop(w);
+    let mut f = OpenOptions::new().append(true).open(&path).unwrap();
+    f.write_all(br#"{"type":"record","offset":2,"data":{"kind":"msg","te"#)
+        .unwrap();
+    drop(f);
+    assert!(SessionReader::<Rec>::open(&path).unwrap().truncated_tail());
+
+    let mut w = SessionWriter::<Rec>::reopen(&path).unwrap();
+    assert_eq!(w.session_id(), id);
+    assert_eq!(w.path(), path);
+    assert_eq!(w.append(&msg("c")).unwrap(), 2);
+    w.checkpoint().unwrap();
+    drop(w);
+
+    let (got, truncated) = read_all(&path);
+    assert!(!truncated);
+    assert_eq!(got, vec![(0, msg("a")), (1, msg("b")), (2, msg("c"))]);
+}
+
+#[test]
+fn reopen_removes_unparseable_final_line_with_newline() {
+    let env = Env::new();
+    let mut w = env.writer();
+    w.append(&msg("a")).unwrap();
+    w.checkpoint().unwrap();
+    let path = w.path().to_path_buf();
+    drop(w);
+    let mut f = OpenOptions::new().append(true).open(&path).unwrap();
+    f.write_all(b"{\"type\":\"rec\n").unwrap();
+    drop(f);
+
+    let mut w = SessionWriter::<Rec>::reopen(&path).unwrap();
+    assert_eq!(w.append(&msg("b")).unwrap(), 1);
+    drop(w);
+    let (got, truncated) = read_all(&path);
+    assert!(!truncated);
+    assert_eq!(got, vec![(0, msg("a")), (1, msg("b"))]);
+}
+
+#[test]
+fn reopen_clean_log_is_a_noop_that_continues() {
+    let env = Env::new();
+    let mut w = env.writer();
+    w.append(&msg("a")).unwrap();
+    w.checkpoint().unwrap();
+    let path = w.path().to_path_buf();
+    drop(w);
+    let before = fs::read(&path).unwrap();
+    let mut w = SessionWriter::<Rec>::reopen(&path).unwrap();
+    assert_eq!(fs::read(&path).unwrap(), before);
+    assert_eq!(w.append(&msg("b")).unwrap(), 1);
+}
+
+#[test]
+fn reopen_corrupt_middle_is_an_error_and_leaves_file_untouched() {
+    let env = Env::new();
+    let mut w = env.writer();
+    w.append(&msg("a")).unwrap();
+    w.checkpoint().unwrap();
+    let path = w.path().to_path_buf();
+    drop(w);
+    let mut f = OpenOptions::new().append(true).open(&path).unwrap();
+    f.write_all(b"garbage\n").unwrap();
+    f.write_all(br#"{"type":"record","offset":2,"data":{"kind":"msg","text":"c"}}"#)
+        .unwrap();
+    f.write_all(b"\n").unwrap();
+    drop(f);
+    let before = fs::read(&path).unwrap();
+
+    assert!(matches!(
+        SessionWriter::<Rec>::reopen(&path),
+        Err(Error::Corrupt { .. })
+    ));
+    assert_eq!(fs::read(&path).unwrap(), before);
+}
+
+#[test]
+fn reopen_rejects_missing_header() {
+    let env = Env::new();
+    let w = env.writer();
+    let path = w.path().to_path_buf();
+    drop(w);
+    fs::write(&path, b"").unwrap();
+    assert!(matches!(
+        SessionWriter::<Rec>::reopen(&path),
+        Err(Error::BadHeader { .. })
+    ));
 }

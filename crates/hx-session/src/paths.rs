@@ -2,15 +2,16 @@
 
 use std::path::{Path, PathBuf};
 
-/// The hx data directory: `HX_HOME`, else `XDG_DATA_HOME`, else
-/// `~/.local/share`, with `/hx` appended in every case. Empty variables are
-/// ignored.
+/// The hx data directory: `HX_HOME` used as-is, else `$XDG_DATA_HOME/hx`,
+/// else `~/.local/share/hx`. Empty variables are ignored.
 pub fn data_home() -> PathBuf {
-    let base = non_empty_env("HX_HOME")
-        .or_else(|| non_empty_env("XDG_DATA_HOME"))
+    if let Some(home) = non_empty_env("HX_HOME") {
+        return home;
+    }
+    non_empty_env("XDG_DATA_HOME")
         .or_else(|| non_empty_env("HOME").map(|h| h.join(".local").join("share")))
-        .unwrap_or_else(|| PathBuf::from(".local/share"));
-    base.join("hx")
+        .unwrap_or_else(|| PathBuf::from(".local/share"))
+        .join("hx")
 }
 
 fn non_empty_env(name: &str) -> Option<PathBuf> {

@@ -4,11 +4,13 @@ use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 
 use serde::Serialize;
+use serde::de::IgnoredAny;
 use ulid::Ulid;
 
 use crate::Result;
 use crate::blobs::{BlobRef, BlobStore};
 use crate::paths;
+use crate::reader::SessionReader;
 use crate::record::{Header, LineRef, SCHEMA_VERSION};
 
 /// Appends records to one session log.
@@ -61,6 +63,37 @@ impl<R: Serialize> SessionWriter<R> {
         w.out.write_all(&line)?;
         w.checkpoint()?;
         Ok(w)
+    }
+
+    /// Reopen an existing session log for appending (resume). Validates the
+    /// header, scans the records, truncates a torn final line, and continues
+    /// offsets after the last good record. A malformed line anywhere else is
+    /// `Error::Corrupt`; history is never truncated.
+    pub fn reopen(path: &Path) -> Result<Self> {
+        // Validates the header and locates a torn tail; the scan rejects a
+        // corrupt middle before anything is modified.
+        let reader = SessionReader::<IgnoredAny>::open(path)?;
+        let mut count = 0;
+        for rec in reader.records() {
+            rec?;
+            count += 1;
+        }
+        let header = reader.header().clone();
+        if let Some(tail_start) = reader.tail_start() {
+            let f = OpenOptions::new().write(true).open(path)?;
+            f.set_len(tail_start)?;
+            f.sync_data()?;
+        }
+        let file = OpenOptions::new().append(true).open(path)?;
+        let dir = path.parent().unwrap_or(Path::new("."));
+        Ok(Self {
+            out: BufWriter::new(file),
+            header,
+            path: path.to_path_buf(),
+            next_offset: count,
+            blobs: BlobStore::new(dir),
+            _record: PhantomData,
+        })
     }
 
     pub fn header(&self) -> &Header {
