@@ -123,7 +123,7 @@ trait Provider: Send + Sync {
 | Adapter | Wire API | Provider-specific handling |
 |---|---|---|
 | `anthropic` | Messages API | `cache_control` breakpoints on system, tools, rolling conversation prefix; extended thinking budget; fine-grained tool streaming |
-| `openai` | Responses API | reasoning effort; `previous_response_id` reuse when beneficial; automatic prefix caching |
+| `openai` | Responses API | reasoning effort; stateless requests (`store: false`) with reasoning carried across steps as encrypted reasoning items (`include: ["reasoning.encrypted_content"]`); automatic prefix caching |
 | `google` | Gemini API | thinking budget; implicit/explicit context caching |
 | `openai-compat` | Chat Completions | base URL configurable (OpenRouter, Ollama, vLLM, LM Studio, Groq, …); conservative default capabilities |
 
@@ -198,6 +198,7 @@ Requests are assembled in fixed order:
 [history]  recent turns, verbatim
 [state]    structured working state — a tail block after the last message, rendered fresh for each request and never stored in history
 ```
+- Adapters whose wire API requires alternating roles merge consecutive same-role messages (e.g. tool results followed by the state tail).
 - Cache stability: the working state changes on almost every tool call (the files list follows effects), so it sits after history; the cached prefix (stable · pinned · history up to the last cache breakpoint) survives state changes. Pinned items change rarely and stay before history.
 - `ContextStatus{used, budget, breakdown}` is emitted every turn.
 - `hx prompt show` prints the system prompt; `hx prompt show --full` prints the exact last request.

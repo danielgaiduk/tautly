@@ -599,7 +599,7 @@ proptest! { #[test] fn apply_then_inverse_restores(text in "[a-z\\n]{1,200}", ..
 - [ ] **Step 1: Write the failing tests**
 
 ```rust
-#[test] fn block_order_is_system_tools_agents_memory_pinned_state_history() { /* inspect request.system blocks order and that pinned/state appear after stable prefix */ }
+#[test] fn block_order_is_system_tools_agents_memory_pinned_history_state() { /* stable system blocks, then pinned as first user content, history, and the state tail last */ }
 #[test] fn stable_prefix_is_byte_identical_across_turns() {
     let mut c = ctx(); let (a, _) = c.assemble(&caps(), &tools(), &m()); c.history.push(turn("hi")); c.apply_op(ContextOp::Pin("x".into()));
     let (b, _) = c.assemble(&caps(), &tools(), &m());
@@ -615,7 +615,7 @@ proptest! { #[test] fn apply_then_inverse_restores(text in "[a-z\\n]{1,200}", ..
 ```
 
 - [ ] **Step 2: Run** `cargo test -p hx-context --test assemble` — Expected: FAIL.
-- [ ] **Step 3: Implement.** Pinned and state render as tagged text blocks (`<pinned>…</pinned>`, `<working_state>…</working_state>`) placed as the first user-role content after the system prefix, so the system prefix stays stable. Write `system.md` (role, tool-use rules, safety rules); it contains no per-model or per-turn text. Edit-format guidance lives in the `edit` tool's description, which already varies by `caps.edit_format`.
+- [ ] **Step 3: Implement.** Pinned and state render as tagged text blocks (`<pinned>…</pinned>`, `<working_state>…</working_state>`); pinned is the first user-role content after the system prefix, the state is a tail message after the last history message (spec 6.1), so the cached prefix stays stable. Write `system.md` (role, tool-use rules, safety rules); it contains no per-model or per-turn text. Edit-format guidance lives in the `edit` tool's description, which already varies by `caps.edit_format`.
 - [ ] **Step 4: Run** — Expected: PASS.
 - [ ] **Step 5: Commit** `git commit -m "feat(context): block assembly, token accounting, pinned, working state"`
 
@@ -723,6 +723,8 @@ proptest! { #[test] fn apply_then_inverse_restores(text in "[a-z\\n]{1,200}", ..
 
 ### Task 24: Engine turn loop and approvals
 
+**Task 19 review note (binding):** every step ends in the plain-text state tail, so providers see each step as a fresh user turn; confirm with the mock provider that reasoning continuity holds (Anthropic thinking signatures, OpenAI encrypted reasoning items) across tool steps. The engine passes a canonicalized root (same canonicalization as the sandbox) into `Context.root` and merges `agents_md::load` pins into `Context.pinned` exactly once.
+
 **Checkpoint 2 amendments (binding):** Ordering: partition calls into maximal runs; consecutive ReadOnly calls run concurrently; every Write/Exec/Network call is a barrier executed alone in model order; ContextOps (pin/state/remember) apply in model order after each run. Index: open it on a blocking task AFTER the first event (ToolCx gets `index: None` until ready), start the watcher (`Index::start_watcher`) and keep the `WatchHandle` in the actor; if the watcher fails or stops (`watching()` false) tools treat the index as stale. Emit `last_error()` once as a status warning. On Cancel, forget every read baseline committed by results that are not appended (use effects' `shown`). Write-generation bumps on `Edited | Deleted | Exec`. Resume replays ToolCall records through `parse_context_op` (ContextOp has no serde). Run spill cleanup at engine start.
 
 **Files:**
@@ -814,6 +816,8 @@ proptest! { #[test] fn apply_then_inverse_restores(text in "[a-z\\n]{1,200}", ..
 - [ ] **Step 5: Commit** `git commit -m "feat(core): side-model routing for compaction, memory and web_fetch"`
 
 ### Task 28: Memory in the engine
+
+**Task 19 review note (binding):** the memory index lives in the cached system prefix, so `[stale]` flags and index content change only at session start or inside a cache epoch chosen by the scheduler (spec 7.7), never mid-turn.
 
 **Checkpoint 2 amendments (binding):** Refresh memory staleness after bash only once the index is fresh (`!is_stale()`); use `wait_ready(timeout)`.
 
