@@ -37,9 +37,16 @@ An open-source, provider-neutral agentic coding harness that becomes the go-to t
 | 4 | Extensions (MCP, hooks, skills, ACP bridge) | Tools-only MCP client (7.11.10) and ACP bridge (7.11.9); hooks, skills and MCP resources/prompts/sampling: no |
 | 5 | Eval & benchmark program | `tautly eval` runner, starter set and the public benchmark kit (9.3) |
 
-**Scope change (user-approved 2026-11-03):** v1 gains receipts and a savings meter, zero-config first run with `doctor`/`auth add` and installers, diffs in approvals and results, mid-session model switch, `CLAUDE.md` fallback, an evidence footer, the daily-driver REPL, the ACP bridge, a tools-only MCP client and git checkpoints before bash (all in 7.11). OpenTelemetry export is removed from v1 (4.6).
+**Scope change (user-approved 2026-11-03):** v1 gains receipts and a savings meter, zero-config first run with `doctor`/`auth add` and installers, diffs in approvals and results, mid-session model switch, `CLAUDE.md` fallback, an evidence footer, the daily-driver REPL, the ACP bridge, a tools-only MCP client and git checkpoints before bash (all in 7.11). OpenTelemetry export is removed from v1 (4.6). A second approved change (2026-11-03) adds the time-travel core: session-format hooks, rewind as fork, the session tree, fork at a step in an isolated worktree, playback, compare and bisect (6.5, 7.12).
 
-**Roadmap after v1:** (1) a minimal OS sandbox for `Exec` (sub-project 2: Seatbelt on macOS, bubblewrap on Linux; writes confined to the root and temp, network on/off) comes directly after v1, before Trust; (2) Trust; then the remaining sub-projects. The public launch ships the reproducible benchmark (9.3). OpenTelemetry export is post-v1.
+**Roadmap after v1:**
+1. A minimal OS sandbox for `Exec` (sub-project 2: Seatbelt on macOS, bubblewrap on Linux; writes confined to the root and temp, network on/off).
+2. Trust.
+3. Time travel (7.12.8).
+4. Resilience & safety.
+5. Economics.
+
+Then the remaining sub-projects. The public launch ships the reproducible benchmark (9.3). OpenTelemetry export is post-v1.
 
 Post-v1, out of scope for all of the above: multi-agent orchestration, deterministic replay, team policy-as-code, plugin marketplaces.
 
@@ -51,6 +58,8 @@ Post-v1, out of scope for all of the above: multi-agent orchestration, determini
 - Usable as a daily driver on a real repository with each of the four adapters, via `tautly -p`, the REPL (7.11.8) and an ACP client (Zed).
 - First run with only a provider key in the environment (or a running Ollama) and no config file reaches a first answer without setup; `tautly doctor` exits 0 on a healthy machine (7.11.2).
 - Every turn ends with a receipt whose savings are labelled estimates (7.11.1); `/undo` in a git repository also reverts files changed by `bash` (7.11.11).
+- `--resume` reproduces the exact request prefix even when `AGENTS.md` or the repo map changed on disk since (6.5).
+- Rewind and branch switching never overwrite a file the user changed without explicit consent, and the abandoned branch stays intact (7.12).
 
 ## 2. Architecture
 
@@ -110,14 +119,14 @@ Every step is appended to the session log before its effects are surfaced, so an
 
 ### 3.2 Events (engine → client)
 Typed, serde-serializable, versioned:
-`TurnStarted`, `TextDelta`, `ReasoningDelta`, `ToolCallProposed`, `ToolApprovalRequested{request_id, call_id, tool, args, reason, diff?}`, `ToolStarted`, `ToolOutputDelta`, `ToolFinished{…, blocked, diff?}`, `Usage{role, tokens_in, tokens_out, cache_read, cache_write, cost_usd, quota?}` (`role` ∈ `main | side`), `ContextStatus{used, budget, breakdown, warnings}`, `Compacted{removed_turns, summary, reason}`, `ContextCollected{elided_results, tokens_freed, reason}`, `MemoryProposed{proposal_id, change}` (`change` = an entry to upsert and/or entry ids to delete), `SessionChanged{session_id}`, `TurnReceipt{…}` (7.11.1), `ModelChanged{model, provider}` (7.11.5), `SessionDiff{turn?, files, unified, truncated}` (7.11.4), `Undone{turn, restored, deleted, dry_run, backup_ref?, note?}` (7.11.11), `McpServerApprovalRequested{request_id, server, source, launch}`, `McpServerStatus{server, state, tools, message?}` (7.11.10), `TurnFinished{reason, evidence?}` (7.11.7), `Error{kind, message, retryable, hint}`, `Warning{message}`.
+`TurnStarted`, `TextDelta`, `ReasoningDelta`, `ToolCallProposed`, `ToolApprovalRequested{request_id, call_id, tool, args, reason, diff?}`, `ToolStarted`, `ToolOutputDelta`, `ToolFinished{…, blocked, diff?}`, `Usage{role, tokens_in, tokens_out, cache_read, cache_write, cost_usd, quota?}` (`role` ∈ `main | side`), `ContextStatus{used, budget, breakdown, warnings}`, `Compacted{removed_turns, summary, reason}`, `ContextCollected{elided_results, tokens_freed, reason}`, `MemoryProposed{proposal_id, change}` (`change` = an entry to upsert and/or entry ids to delete), `SessionChanged{session_id}`, `TurnReceipt{…}` (7.11.1), `ModelChanged{model, provider}` (7.11.5), `SessionDiff{turn?, files, unified, truncated}` (7.11.4), `Undone{turn, restored, deleted, dry_run, backup_ref?, note?}` (7.11.11), `McpServerApprovalRequested{request_id, server, source, launch}`, `McpServerStatus{server, state, tools, message?}` (7.11.10), `TurnFinished{reason, evidence?}` (7.11.7), `Rewound{at, branch, report}`, `Switched{branch, report}`, `Replayed{offset, t_ms, event}`, `ReplayFinished{session_id, events, cancelled}`, `UserMessage{text}` (7.12), `Error{kind, message, retryable, hint}`, `Warning{message}`.
 
 `TurnFinished.reason` ∈ `completed | cancelled | budget | max_turns | timeout | error`. At the end of a turn `TurnReceipt` comes right before `TurnFinished`, for every reason.
 
 `diff` is a `DiffPreview{unified, lines, truncated}` (7.11.4). New fields are optional or defaulted, so readers built for the first list keep working (3.4).
 
 ### 3.3 Commands (client → engine)
-`SendMessage`, `Approve{request_id, session_rule?}`, `Deny{request_id, reason?}`, `Cancel`, `SetBudget`, `Compact`, `Uncompact`, `Pin`, `Unpin`, `ApproveMemory{proposal_id}`, `RejectMemory{proposal_id}`, `ConsolidateMemory`, `Fork`, `SetModel{model}` (7.11.5), `Diff{turn?}` (7.11.4), `Undo{turn?, dry_run}` (7.11.11), `Shutdown`.
+`SendMessage`, `Approve{request_id, session_rule?}`, `Deny{request_id, reason?}`, `Cancel`, `SetBudget`, `Compact`, `Uncompact`, `Pin`, `Unpin`, `ApproveMemory{proposal_id}`, `RejectMemory{proposal_id}`, `ConsolidateMemory`, `Fork{at?, label?}`, `SetModel{model}` (7.11.5), `Diff{turn?}` (7.11.4), `Undo{turn?, dry_run}` (7.11.11), `Rewind{at, label?, dry_run, overwrite}`, `Switch{session_id, dry_run, overwrite}`, `Label{label}`, `Replay{session_id?, speed, from_step?}` (7.12), `Shutdown`.
 
 `Approve`/`Deny` answer both tool-call approvals and MCP server approvals; request ids are unique across both. `session_rule` (7.11.8) only applies to tool calls.
 
@@ -128,7 +137,9 @@ Typed, serde-serializable, versioned:
 - In headless mode `ask` resolves to `deny` unless `--approve <mode>` is given (`auto-edit` or `yolo`), memory proposals are rejected unless `--approve-memory` is given, and repository-declared MCP servers that the user has not approved are not started unless `--approve-mcp` is given (7.11.10). Headless never blocks on input.
 - **ACP:** `tautly acp` speaks the Agent Client Protocol to editors (7.11.9). It is an engine client like this server, not a layer on top of it.
 - **Interactive clients (apps, IDE extensions):** `initialize` params carry `client: {interactive: bool, name, version}`. With `interactive: true`, `ask` emits `ToolApprovalRequested{request_id, …}` and waits for `approve`/`deny` with that `request_id`; memory proposals wait for `approve_memory`/`reject_memory`. Pending requests are denied when the client disconnects or sends `shutdown`, so nothing hangs. Without `interactive`, the headless rules above apply unchanged.
-- **Several sessions per process:** `session/new {root, resume?, fork?}` returns a `session_id`; `session/list` and `session/close` manage them. Every session-scoped method takes `session_id`, and every `event` notification carries it. Sessions on the same root share one code index, file watcher and memory store (opened once, reference-counted); each session has its own context, read tracker, budget and session log. The single-session form (no `session/new`, `session_id` optional) remains valid for scripts and `tautly -p`.
+- **Several sessions per process:** `session/new {root, resume?, fork?}` returns a `session_id`; `session/list` and `session/close` manage them.
+  - `fork` is `{session_id, at?, label?, worktree?, model?}`; with `worktree: true` the fork runs in an isolated git worktree (7.12.4).
+  - `session/tree {root}` returns the session tree (7.12.3). Every session-scoped method takes `session_id`, and every `event` notification carries it. Sessions on the same root share one code index, file watcher and memory store (opened once, reference-counted); each session has its own context, read tracker, budget and session log. The single-session form (no `session/new`, `session_id` optional) remains valid for scripts and `tautly -p`.
 
 ### 3.5 Stream reliability
 - Provider errors are classified retryable (429, 5xx, network) or fatal.
@@ -167,7 +178,7 @@ API keys from environment variables or the OS keychain (`keyring` crate). No sub
 `tautly-context` keeps the request prefix byte-stable across turns: fixed tool ordering, no timestamps or volatile data in the system prompt, pinned block after the stable prefix, working state as a tail block after the last message (6.1). Cache hit ratio is reported in `Usage`.
 
 ### 4.6 Cost, quota, budgets
-- `Usage` per provider response; cost computed from catalog prices. Aggregated per turn, session and day into a local SQLite ledger (`~/.local/share/tautly/ledger.db`).
+- `Usage` per provider response; cost computed from catalog prices. Aggregated per turn, session and day into a local SQLite ledger (`~/.local/share/tautly/ledger.sqlite`).
 - Quota: rate-limit response headers (Anthropic, OpenAI) parsed into `Usage.quota{remaining_requests, remaining_tokens, reset_at}` when present.
 - `SetBudget{scope: turn|session, max_usd?, max_tokens?}`. At 80%: warning event. At 100%: the engine finishes the in-flight tool call, then ends with `TurnFinished{reason: budget}`.
 - Telemetry: OpenTelemetry export is removed from v1 (user-approved 2026-11-03) and is post-v1. Nothing leaves the machine except provider, `web_fetch` and MCP requests. The `[telemetry]` table stays reserved (2.4).
@@ -253,11 +264,31 @@ Structured record: task, plan steps with status, files read/edited with content 
 - Compaction summaries are generated by the side model (7.5).
 
 ### 6.5 Session store
-- Append-only JSONL per session: `~/.local/share/tautly/sessions/<project-hash>/<session-id>.jsonl`. Large blobs (file contents, tool outputs) stored content-addressed in a sibling `blobs/` directory and referenced by hash.
+- Append-only JSONL per session: `~/.local/share/tautly/sessions/<project-id>/<session-id>.jsonl`. Large blobs (file contents, tool outputs) stored content-addressed in a sibling `blobs/` directory and referenced by hash.
+- `<project-id>` is the blake3 of the canonical git common directory when the root is in a git work tree, else of the canonical root. All worktrees of one repository therefore share session listings and blobs. The code index stays keyed by root, because worktree contents differ.
 - Records: commands, canonical requests, provider events, tool calls/results, edit pre-images, compactions, model switches (`ModelSet`), checkpoints (`Checkpoint`, `CheckpointSkipped`) and per-turn savings (7.11).
 - Durability: fsync at turn and tool boundaries. On start, a session ending mid-turn is detected and resumable from the last complete step.
 - Operations: `tautly --continue`, `tautly --resume <id>`, `/fork` (new log referencing parent at an event offset), `tautly sessions list|show|export|delete` (`delete` also removes the session's checkpoint refs, 7.11.11).
 - Format documented and versioned (`schema_version` in the header record).
+- **Time-travel hooks** (user-approved 2026-11-03, schema 1, before release). Each one captures data that can never be recovered later:
+  - **H1, timestamp:** every record line carries `"t": <unix ms>` in its envelope.
+  - **H2, root-relative paths:** paths in records are relative to the header's `root`. On read they are re-confined under the current root: absolute paths, `..` and NUL are refused. Events keep showing paths as before.
+  - **H3, header fields:** `project`, `label?`, `origin` (`user | fork | rewind | what_if | eval | import`), `git?: {head?, dirty?}`, `tautly_version`, `model?`, `config_hash?` (blake3 of the effective config), `tags`.
+    - `git.head` is read from the `.git` files without spawning git, so start-up stays fast. `dirty` is unknown in the header.
+    - The session-start `Checkpoint` record (7.11.11) carries the authoritative head, dirty state and tree.
+    - A later `Labeled{label}` record renames the session (the last one wins).
+  - **H5, prefix inputs:** `PrefixApplied{agents_md?, repo_map?, system_prompt_hash, tools_hash}` is written before the first request, and again before any request whose stable-prefix inputs changed (for example MCP tools joining, a model switch changing the edit format).
+    - `agents_md` and `repo_map` are blobs of the exact text sent.
+    - Resume, rewind and replay use the logged text and never regenerate it.
+    - If the current binary's system prompt or tool schemas hash differently, resume warns that the cache will be cold.
+  - **H6, richer `Request`:** `Request{hash, turn, step, model, blocks: {stable, pinned, history, tail}}`. `turn` is the user turn, `step` the absolute provider step, and `blocks` the blake3 of each block.
+  - **H7, edits and undo are logged and reversible:**
+    - `Edit` and `PersistedEffect::Edited` carry `post_image_blob`, the written content (deduped).
+    - Undo appends `Undone{turn, files: [{path, from_blob?, to?}], backup_ref?}` after storing each file's current content (`from_blob`), so undone states can be restored.
+  - **H8, approval requests:** `ApprovalRequested{request_id, kind: tool|mcp_server|memory, call_id?, reason}` is logged before its event is emitted.
+  - **H9, point-in-time rebuild:** `rebuild(reader, until)` cuts at any step boundary and synthesizes `cancelled` results for open calls. `Fork{at?, label?}` branches from any step.
+  - **H10, project id:** sessions and blobs are keyed by `<project-id>` (above). The header's `root` names the worktree.
+  - **Checkpoint record:** `Checkpoint{n, commit, tree, head?, dirty, turn, step}`, plus `CheckpointSkipped{reason, turn, step}`. The single checkpoint mechanism is the git one of 7.11.11.
 
 ## 7. Token efficiency and memory
 
@@ -295,7 +326,7 @@ Structured record: task, plan steps with status, files read/edited with content 
 ### 7.5 Side-model routing
 - Config `[routing] side_model = "<model id>"`. Default: the catalog model with `tier = "small"` from the main model's provider; if none, the main model.
 - Used for: compaction summaries, episodes, memory consolidation, and `web_fetch` with a `question` (returns the answer, ≤ 1,000 tokens, plus the source URL).
-- Side-model usage is reported with `Usage.role = side` and counted in budgets and the ledger.
+- Side-model usage is reported with `Usage.role = side` and counted in budgets and the ledger. It is priced with the side model's catalog price and recorded under the side model's id.
 
 ### 7.7 Cache-aware scheduling
 - The catalog gains `cache_ttl_s: Option<u32>` per model (default 300 for `explicit`/`automatic` cache styles, `None` for `none`).
@@ -348,7 +379,7 @@ This section covers what a user sees in the first ten minutes and in every turn.
   - `cache_read_tokens` = the turn's `cache_read`. `cache_usd = cache_read × (input_price − cache_read_price) − cache_write × (cache_write_price − input_price)`, which can be negative.
   - `total_usd` = the four token estimates priced at the main model's input price, except `context_gc` at the cache-read price (elided tokens would mostly have been cached), plus `cache_usd`. It is `None` without catalog prices.
 - Tools report their part of the estimate in `ToolMeta.saved: Option<Saved{kind, bytes}>`. The engine adds them up and records them in the session log.
-- Every receipt is stored in the ledger (4.6) in a `receipts` table: session, project hash, root, user turn, main model, time, plus every field above.
+- Every receipt is stored in the ledger (4.6) in a `receipts` table: session, project id (6.5), root, user turn, main model, time, plus every field above.
 - `tautly stats [--since 7d|30d|all] [--by day|model|project] [--json]` (default `--since 30d --by day`). Tokens and cost come from the ledger's usage rows; savings, wall time and turn counts come from receipt rows. `--by project` joins usage rows to the project through their session.
 - `tautly receipt [--last | --session ID] [--markdown]` summarises one session: the most recent session of the current project by default (`--last` says so explicitly), or `ID`. It shows turns, tool calls, wall time, tokens, cache hit ratio, cost, the savings estimates and the last turn's evidence (7.11.7). `--markdown` prints a pasteable table. A receipt never contains paths, prompts, code or the project name.
 
@@ -532,7 +563,13 @@ At each directory level where `AGENTS.md` is read (root and ancestors, 6.1), a d
 - **Out of v1:** resources, prompts, sampling, elicitation, OAuth and roots (sub-project 4). `tautly mcp list` shows servers, source, approval state and tool count.
 
 #### 7.11.11 Git checkpoints and undo
-- **When:** before every `bash` call, which is `Exec{may_write: true}`, and before every stdio MCP call, in a git work tree with `[checkpoints] enabled`.
+- **When:** in a git work tree with `[checkpoints] enabled`:
+  - at session start;
+  - before every `bash` call (which is `Exec{may_write: true}`) and every stdio MCP call;
+  - at every `TurnEnd`;
+  - before a rewind or branch switch (7.12).
+
+  With a checkpoint before every command and at every turn end, the files of any step boundary can be rebuilt exactly (7.12.1). This is the only checkpoint mechanism: time travel and undo both use these refs. A shadow repository was considered and rejected, because forks in worktrees need the commits in the user's repository.
 - **How:** the engine snapshots the work tree with git plumbing, through `Sandbox::spawn`:
   1. `GIT_INDEX_FILE=<temp file>`, then `git read-tree HEAD` (empty tree when unborn).
   2. `git add -A` (includes untracked files and respects ignore rules).
@@ -546,7 +583,9 @@ At each directory level where `AGENTS.md` is read (root and ancestors, 6.1), a d
   - the snapshot takes longer than `timeout_ms` (3,000; git is killed);
   - untracked files exceed `max_untracked_mb` (200) or `max_untracked_files` (20,000), checked with `git ls-files --others --exclude-standard` first.
 
-  The session log records `Checkpoint{n, commit, turn, step}`.
+  The session log records `Checkpoint{n, commit, tree, head?, dirty, turn, step}` (6.5).
+- **Forks:** a fork (7.12) creates its own refs `refs/tautly/checkpoints/<child>/<n>` for every parent checkpoint it copies. Deleting or pruning one session therefore never breaks another.
+- **Visibility:** the refs appear in `git log --all`. To hide them, use `git log --exclude='refs/tautly/*' --all` (`--exclude` must come before `--all`); this is documented.
 - **Undo:**
   - `Command::Undo{turn?, dry_run}` reverts user turn `turn` (default: the last). It walks that turn's records in reverse:
     - an `Edit` restores its pre-image (5.4);
@@ -558,7 +597,125 @@ At each directory level where `AGENTS.md` is read (root and ancestors, 6.1), a d
   - `tautly undo [--turn N]` uses the same path, with the same user-turn numbering.
 - **Pruning:**
   - At engine start, checkpoint refs older than `keep_days` (14) are deleted with `git update-ref -d`. `git gc` is never run.
-  - `tautly sessions delete <id>` removes the session log, its blobs and its checkpoint refs.
+  - `tautly sessions delete <id>` removes the session log and its checkpoint refs, plus its worktree when it is a worktree fork (7.12.4). Blobs are shared across the project's sessions and are kept; blob garbage collection is post-v1.
+
+### 7.12 Time travel (v1 core; user-approved 2026-11-03)
+Every operation here creates a new branch or a new view. None truncates a log, and none overwrites a file the user changed without explicit consent. Rationale: the 2026-11-03 research notes. Untrustworthy file rewind is the most-voiced complaint about other tools, and forks elsewhere share one mutable working tree.
+
+#### 7.12.1 Step addresses and file states
+- **Step addresses.** Steps are numbered by the absolute 1-based provider step (the context turn counter, 7.2). "At step N" means steps 1..N are kept and the next step is N+1. `at = 0` means before the first step. CLIs and the REPL show step numbers next to user turns (`tautly sessions show`, `/tree`).
+- **`state_at(session, N)`, the files at a step boundary:**
+  1. Take the earliest `Checkpoint` record after step N.
+  2. Restore its tree.
+  3. Revert, in reverse order, every `Edit` (to its pre-image) and every `Undone` (to its `from_blob`) between step N and that checkpoint.
+
+  This is exact, because a checkpoint precedes every command (7.11.11).
+- **Partial states.** These cases give a *partial* state, reported with a note, and only tool edits are reverted:
+  - no later checkpoint exists (a crash mid-turn, or outside git);
+  - a command between the boundary and that checkpoint had its checkpoint skipped.
+- **`expected_tip(session)`** is the files as the agent left them: the latest checkpoint plus later tool-edit post-images. A file whose disk hash differs from `expected_tip` was changed by someone else: a **human edit**.
+- **Working-tree lease.** Engines hold a shared `flock` on `<data home>/locks/<root-hash>.lock`. Rewind and switch need it exclusive. They are refused while another live session, in this process or another, uses the same working tree.
+
+#### 7.12.2 Rewind as fork
+- `Command::Rewind{at, label?, dry_run, overwrite}` (REPL `/rewind <step>`):
+  1. Take a checkpoint of the current tree and append it to the current session, so its tip stays restorable.
+  2. Create a branch: a new session with `origin: rewind`, `parent: (current, offset of step at)`, the records up to that step copied verbatim, and child checkpoint refs.
+  3. Materialize `state_at(at)` in place.
+  4. Continue on the branch (`SessionChanged`). The old branch's log is never modified apart from that tip checkpoint.
+- **Materializing** changes only the paths where the target state differs from `expected_tip`.
+  - A path that would change and has a human edit, including a human-added file that would be deleted, is a **conflict**.
+  - When conflicts remain that are not listed in `overwrite`, nothing is written and no branch is created (`applied: false`).
+  - Human edits to paths the rewind does not touch are left alone.
+  - Before any write, a backup snapshot is taken (`undo-<n>` ref, 7.11.11).
+- **The answer is `Rewound{at, branch, report}`**, where `report` is `{restored, deleted, conflicts, dry_run, applied, backup_ref?, note?}`. The REPL first sends a dry run and shows what would be restored, deleted and in conflict. It asks y/n, and on conflicts asks separately before sending `overwrite` with the paths.
+- **Conversation:** the branch's context is `rebuild(reader, at)` (H9). Requests after a rewind start from that exact prefix.
+- **Outside git:** only tool edits are restored, and `note` says command effects were not.
+
+#### 7.12.3 Session tree and switching
+- **Branches are first-class.** Each session's header gives its parent `(session, step)`, `label` and `origin`. `Fork{at?, label?}` (REPL `/fork [label]`) creates a conversation-only branch at step `at` (default: the tip) without touching files. `Label{label}` (`/label <name>`) renames the current branch.
+- **`session/tree {root}`** (RPC), `tautly sessions tree` and `/tree` list the project's sessions (H10) as a tree. Each node is `{session_id, parent?, label?, origin, created, steps, last_prompt, cost_usd?, live, current}`. The REPL prints one indented line per branch: `* <label or id8>  step N · <origin> · $cost · <last prompt, 40 chars>`, with `*` marking the current branch.
+- **`Command::Switch{session_id, dry_run, overwrite}`** (`/switch <label|id|n>`) materializes the target branch's tip (`expected_tip(target)`) in place, with the same conflict rules and backup as rewind. It then continues that session (`Switched{branch, report}`, `SessionChanged`). Switching back and forth restores each tip exactly.
+
+#### 7.12.4 Fork at a step into an isolated worktree
+- **Command:** `tautly fork <session> --at N [--model M] [--prompt TEXT] [--label L] [--dir PATH] [--approve auto-edit|yolo] [--budget-usd N] [--output json|text]`.
+- **Worktree:** it creates `git worktree add --detach <dir> <commit>` at `state_at(N)`'s checkpoint and applies the tool-edit reverts there. Git runs with hooks disabled. `<dir>` defaults to `<data home>/worktrees/<project-id>/<session-id>`.
+- **Session:** a new session (`origin: what_if`, parent `(session, step N)`, `root` = the worktree) holding the records up to step N. Root-relative paths make them valid there. It shares blobs with its parent (H10). `--model` applies `SetModel` before the first message.
+- **Running:**
+  - Without `--prompt` it prints the worktree path, the session id and the resume command.
+  - With `--prompt` it runs one-shot in the worktree under the headless rules (3.4).
+  - The original working tree and its index are never touched.
+- **Logged approvals are never consent:** every call in a fork is decided by the current policy afresh.
+- **Requirements and cleanup:** outside git the command is refused. `session/new{fork:{…, worktree: true}}` does the same over RPC. `tautly sessions delete` removes a clean fork worktree and refuses a dirty one without `--force`.
+
+#### 7.12.5 Playback
+- `tautly replay <session> [--speed X] [--from-step N] [--output text|json]` and `Command::Replay{session_id?, speed, from_step?}` (idle only) re-emit the logged stream. Each item is `Replayed{offset, t_ms, event}`, and the stream ends with `ReplayFinished{session_id, events, cancelled}`.
+- **Record-to-event mapping:**
+
+  | Record | Event |
+  |---|---|
+  | `SendMessage` | `UserMessage{text}` + `TurnStarted` |
+  | provider text and reasoning | `TextDelta` / `ReasoningDelta` (redacted reasoning skipped) |
+  | `ToolCall` | `ToolCallProposed` |
+  | `ApprovalRequested` | `ToolApprovalRequested` (no `diff`) |
+  | `ToolResult` | `ToolFinished` (output from its blob) |
+  | provider usage | `Usage` |
+  | `Compaction` | `Compacted` |
+  | `GcApplied` | `ContextCollected` |
+  | `MemoryProposal` | `MemoryProposed` |
+  | `ModelSet` | `ModelChanged` |
+  | `TurnEnd` | `TurnFinished` |
+
+- **Pacing:** each gap is `Δt / speed`, capped at 2 s; `speed = 0` is instant.
+- **Read-only:** no provider request, no tool execution, no file access beyond the log and its blobs. It works without an API key. Replayed approval request ids cannot be answered. `Cancel` stops a replay.
+
+#### 7.12.6 Compare
+- `tautly compare <a> <b> [<c>…] [--json]` takes 2–5 sessions. When the sessions share a fork point, figures count from it; otherwise they cover whole sessions.
+- **One column per session:**
+  - label;
+  - models used;
+  - user turns and steps;
+  - tokens (input, output, cache read) and cost (ledger by session, which includes discarded attempts, falling back to logged usage);
+  - wall time: the sum of `SendMessage → TurnEnd` timestamps;
+  - tool calls, blocked calls and edit failures;
+  - last test evidence (7.11.7);
+  - files touched;
+  - diff stat (`+a -r`, the net change since the fork point).
+- A files table shows `only <a> | only <b> | both`.
+
+#### 7.12.7 Bisect
+- **Command:** `tautly bisect <session> --test "<cmd>" [--good N] [--bad M] [--timeout S] [--yes] [--json]`. Defaults: good = 0, bad = the tip, timeout 600 s per run.
+- **Candidates:** the step boundaries whose state is exact (7.12.1). Partial ones are skipped.
+- **Pre-pass:** logged runs of the identical normalized command, with their exit codes and write generations, narrow the range before anything runs.
+- **Runs:**
+  - Each run materializes `state_at(k)` in one temporary worktree under `<data home>/worktrees/<project-id>/bisect-<id>`. Ignored files such as build caches are kept between runs.
+  - The command runs through the sandbox with the `bash` tool's process-group and timeout handling. Exit 0 is good, 125 skip, any other code bad, and a timeout skip.
+  - The endpoints are verified first (good must pass and bad must fail), else exit 2.
+- **Safety:** before running, it prints the command and the maximum number of runs and asks, unless `--yes` is given. A deny rule matching the command refuses. The worktree is removed at the end, also on error, and the user's working tree is never touched.
+- **Result:** the first failing step, its user turn, its tool calls (`tool: target`) and ≤ 300 characters of the step's assistant text.
+
+#### 7.12.8 Post-v1: the Time travel sub-project (after Trust)
+- **Race / best-of-N:** `tautly race -n K [--models a,b,…] --verify "<cmd>"`.
+  - Runs K forks in worktrees, mixing providers, with one hard budget for the whole fan-out.
+  - Selection is by the verify command; ties go to the smaller diff, then fewer tokens.
+  - Losers are cancelled early once a candidate passes.
+  - Results are ranked by cost per pass.
+- **Cassettes:** deterministic replay of a session.
+  - A `ReplayProvider` serves each step's logged response and checks the regenerated request hash (H6). A divergence is located with the block hashes.
+  - Tool results are served by call id; `web_fetch` is always served from the recording.
+  - In live-tools mode, logged approvals are not consent: the policy is re-checked, and runs happen only in a worktree.
+  - Real sessions become `eval --replay` regression cases.
+- **Cherry-pick and path-level merge:** `tautly merge <fork> [--paths …] [--steps N..M]` applies a fork's changes three-way, logged with provenance. Conflicts surface as normal approvals.
+- **Redacted export/import:**
+  - **Bundle:** one JSONL file: the session log plus `{"type":"blob",…}` lines. Old readers skip unknown line types, so a bundle is still a valid log.
+  - **HTML:** a self-contained HTML export.
+  - **PR trailer:** an optional `Tautly-Session: <id>` trailer, compatible with Agent Trace attribution.
+  - **Safety rules:**
+    - Redact secrets in tool output (environment dumps, `.env` reads, key patterns).
+    - Replace home, user and host names.
+    - Offer a hashes-only mode for proprietary code.
+    - Strip `RedactedReasoning` and reasoning signatures.
+    - Mark request hashes unverifiable after redaction.
+  - **Imports:** read-only, `origin: import`, paths re-confined. Undo or rewind is never applied against the local tree.
 
 ## 8. Error handling
 
@@ -604,4 +761,4 @@ At each directory level where `AGENTS.md` is read (root and ancestors, 6.1), a d
 - CI only lints the scripts and runs the report generator on a committed fixture. Live runs are manual, and their raw logs are published with the results.
 
 ## 10. Out of scope (this sub-project)
-Real OS sandbox enforcement (first after v1, 1.5); full TUI; OpenTelemetry export; semantic (type-aware) references; embedding-based memory search; learned skills; speculative prefetch; pre-run cost estimates; MCP resources, prompts, sampling and OAuth; hooks; skills; multi-agent/subagents; LSP diagnostics; deterministic replay; Windows; team policy; plugin marketplace.
+Real OS sandbox enforcement (first after v1, 1.5); full TUI; OpenTelemetry export; semantic (type-aware) references; embedding-based memory search; learned skills; speculative prefetch; pre-run cost estimates; MCP resources, prompts, sampling and OAuth; race/best-of-N, cassettes, cherry-pick/merge and session export/import (post-v1 Time travel, 7.12.8); hooks; skills; multi-agent/subagents; LSP diagnostics; deterministic replay; Windows; team policy; plugin marketplace.

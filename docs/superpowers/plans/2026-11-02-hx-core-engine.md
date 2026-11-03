@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Build sub-project 1 of `tautly`: a Rust, library-first agent engine with four provider adapters, a sandbox-gated tool set with model-adaptive edits, a code index, output filters, structured context with diff re-reads, context GC and state-preserving compaction, code-anchored memory, cheap side-model routing, an append-only session store, a JSON-RPC headless mode, a daily-driver line REPL, an ACP bridge, a tools-only MCP client, git checkpoints with undo, turn receipts, zero-config first run with `doctor`, installers, CI performance gates, an eval runner and a public benchmark kit.
+**Goal:** Build sub-project 1 of `tautly`: a Rust, library-first agent engine with four provider adapters, a sandbox-gated tool set with model-adaptive edits, a code index, output filters, structured context with diff re-reads, context GC and state-preserving compaction, code-anchored memory, cheap side-model routing, an append-only session store, a JSON-RPC headless mode, a daily-driver line REPL, an ACP bridge, a tools-only MCP client, git checkpoints with undo, turn receipts, zero-config first run with `doctor`, installers, CI performance gates, an eval runner and a public benchmark kit, and the time-travel core (session-format hooks, rewind as fork, session tree, worktree forks, playback, compare, bisect).
 
 **Architecture:** Cargo workspace of single-purpose crates with downward-only dependencies. `tautly-core::Engine` accepts `Command`s and emits a bounded stream of `Event`s; the REPL, the JSON-RPC server and the ACP bridge are thin consumers. All file and process access from tools goes through `tautly-sandbox::Sandbox`.
 
@@ -20,11 +20,12 @@
 - Dependencies point downward only: `tautly-cli → {tautly-tui, tautly-rpc, tautly-acp} → tautly-core → {tautly-provider, tautly-tools, tautly-context, tautly-memory, tautly-index, tautly-session, tautly-sandbox, tautly-mcp}`; `tautly-mcp → {tautly-tools, tautly-sandbox}`; `tautly-tools → {tautly-sandbox, tautly-provider, tautly-index, tautly-memory}`; `tautly-memory → {tautly-index, tautly-session}`; `tautly-index → tautly-sandbox`; `tautly-context → {tautly-provider, tautly-tools, tautly-index, tautly-sandbox}`.
 - `tautly-tools` must not call `std::fs::*`, `tokio::fs::*`, `std::process::Command`, `tokio::process::Command` directly (enforced by `clippy::disallowed_methods`/`disallowed_types`).
 - Errors: `thiserror` per crate; `anyhow` only in `tautly-cli`. No `panic = "abort"`.
-- Paths: config `~/.config/tautly/config.toml`, project `.tautly/config.toml`, sessions `~/.local/share/tautly/sessions/<project-hash>/<session-id>.jsonl` (+ `blobs/`), ledger `~/.local/share/tautly/ledger.db` (+ `receipts` table), REPL history `~/.local/share/tautly/repl_history`, MCP approvals `~/.local/share/tautly/mcp-approvals.json`, checkpoint refs `refs/tautly/checkpoints/<session>/<n>` in the user's repository. Honor `XDG_CONFIG_HOME` / `XDG_DATA_HOME` and an `TAUTLY_HOME` override (used by tests).
+- Paths: config `~/.config/tautly/config.toml`, project `.tautly/config.toml`, sessions `~/.local/share/tautly/sessions/<project-id>/<session-id>.jsonl` (+ `blobs/`; `<project-id>` = blake3 of the git common dir, else of the root, Task 48), ledger `~/.local/share/tautly/ledger.sqlite` (+ `receipts` table), worktree forks and bisect worktrees `~/.local/share/tautly/worktrees/<project-id>/<id>`, working-tree leases `~/.local/share/tautly/locks/<root-hash>.lock`, REPL history `~/.local/share/tautly/repl_history`, MCP approvals `~/.local/share/tautly/mcp-approvals.json`, checkpoint refs `refs/tautly/checkpoints/<session>/<n>` in the user's repository. Honor `XDG_CONFIG_HOME` / `XDG_DATA_HOME` and an `TAUTLY_HOME` override (used by tests).
 - Fixed values: bash timeout 120 s; tool output cap 30 KB (head + tail); max 5 retry attempts; compaction threshold 80%; budget warning 80%; system prompt < 2,000 tokens; pinned warning at 10% of window; cancel kills children within 200 ms.
 - Token-efficiency values: diff re-read when < 50% of lines changed; context GC threshold max(2,000 tokens, 5% of window), only at step start (before each provider request); output filters apply above 2 KB, ≤ 20 detail lines per item; memory index ≤ 500 tokens; cache scheduler: default cache TTL 300 s, warm-cache benefit multiplier 5, forced mutation at ≥ 90% of window, threshold compaction deferrable from 80% to 90%; loop breaker: failed-attempts list 10 entries / ≤ 300 tokens, previous-result excerpt 5 lines; tolerant edits: anchor interior similarity ≥ 0.9, structural similarity ≥ 0.8, nearest-window ≤ 20 lines; memory entry body ≤ 300 tokens; `recall` top 5, ≤ 2,000 tokens; `web_fetch` question answers ≤ 1,000 tokens; index build of 10,000 files < 10 s, single-file reindex < 50 ms; token regression gate 10%.
 - Workspace engine: watcher debounce 50 ms; trigram literal minimum 3 bytes; `find` default limit 20 (max 50); batched read ≤ 10 targets; repo map ≤ 400 tokens; selective trigram grep on 100,000 files < 50 ms; tree glob < 5 ms.
 - v1 scope additions (user-approved 2026-11-03, spec 7.11): savings estimate 4 bytes/token; diff preview cap 200 lines / 16 KB, session diff cap 2,000 lines; Ollama probe 300 ms; `doctor` network timeout 3 s; MCP startup wait 5,000 ms, call timeout 120 s, ≤ 50 tools per server, description ≤ 1 KB, input schema ≤ 8 KB, tool name ≤ 64 chars; checkpoint timeout 3,000 ms, untracked limits 200 MB / 20,000 files, refs kept 14 days; REPL history 1,000 entries, double Ctrl+C window 2 s; ACP tool output ≤ 8 KB, ACP diff content ≤ 256 KB per side.
+- Time travel (spec 7.12): steps are absolute 1-based provider steps ("at N" keeps steps 1..N); replay gaps capped at 2 s; compare takes 2–5 sessions; bisect run timeout 600 s, exit 0 good / 125 skip / other bad; record timestamps are unix ms.
 - Protocol: new `Event`/`Command` variants and fields are additions (optional or `#[serde(default)]`); `PROTOCOL_VERSION` stays `(1, 0)` because nothing has been released yet.
 - Exit codes for `tautly -p`: 0 completed, 1 error, 2 budget/max_turns/timeout, 130 cancelled.
 
@@ -33,11 +34,13 @@
 Tasks run in this order (numbers are identities, not sequence):
 
 1. Tasks 1–25 and 36–38 are done (36–37 ran right after Task 15, 38 right after Task 19).
-2. **Engine:** 26 → 27 → 28 → **checkpoint 4** (whole-branch review, as before).
+2. **Engine:** 48 (session-format hooks) → 26 → 27 → 28 → **checkpoint 4** (whole-branch review, as before).
 3. **Engine-side v1 additions:** 42 (diffs) → 43 (SetModel) → 44 (CLAUDE.md fallback, evidence footer) → 47 (git checkpoints, undo).
-4. **Clients and CLI:** 29 → 31 → 39 (receipts, stats) → 40 (zero-config, doctor, auth add) → 45 (MCP client) → 30 (daily-driver REPL) → 46 (ACP bridge) → 41 (release, installers) → **checkpoint 5** (whole-branch review of Tasks 29–31 and 39–47).
-5. **Gates and acceptance:** 33 → 34 → 35.
-6. **Final whole-branch v1 review** on Fable (`claude-fable-5-1`, user request 2026-11-03).
+4. **Clients and CLI:** 29 → 31 → 39 (receipts, stats) → 40 (zero-config, doctor, auth add) → 45 (MCP client) → 30 (daily-driver REPL) → 46 (ACP bridge).
+5. **Time travel:** 49 (rewind as fork, session tree, switch) → 50 (worktree fork at step N) → 51 (playback) → 52 (compare) → 53 (bisect).
+6. **Release:** 41 (release, installers) → **checkpoint 5** (whole-branch review of Tasks 29–31 and 39–53).
+7. **Gates and acceptance:** 33 → 34 → 35.
+8. **Final whole-branch v1 review** on Fable (`claude-fable-5-1`, user request 2026-11-03).
 
 Task 32 is removed from v1 and is not executed.
 
@@ -67,6 +70,16 @@ Task 32 is removed from v1 and is not executed.
 
    Test in Task 30.
 10. **First-run detection sending keys to the wrong host:** expect keys only from env or keychain, sent only to their provider's configured host (in a header), and never read from repository files. Test in Task 40.
+11. **Rewind or switch clobbering human edits:**
+    - Expect every path whose disk content differs from the agent's recorded tip to be reported as a conflict.
+    - Nothing is written unless that path is in `overwrite`.
+    - A backup ref is taken before any write.
+    - The abandoned branch's log stays unmodified (except its tip checkpoint) and stays switchable.
+
+    Test in Task 49.
+12. **Two sessions writing one working tree during rewind or switch:** expect the exclusive lease to refuse. Test in Task 49.
+13. **Replays and forks treating logged approvals as consent:** expect replay to make no provider or tool calls, and forks to re-decide every call by the current policy. Test in Tasks 50 and 51.
+14. **Record paths escaping the root:** expect root-relative record paths with `..`, absolute paths or NUL to be refused on read, and records copied into a worktree fork to resolve under the new root only. Test in Task 48.
 
 ---
 
@@ -98,6 +111,8 @@ crates/
   tautly-mcp/src/{lib.rs, config.rs, client.rs, tool.rs, names.rs, approvals.rs}
   tautly-acp/src/{lib.rs, bridge.rs, map.rs, permission.rs}
   tautly-core/src/{receipt.rs, detect.rs, diff.rs, evidence.rs, checkpoint.rs}   (v1 additions)
+  tautly-core/src/{timetravel.rs, lease.rs, tree.rs, worktree.rs, replay.rs, compare.rs, bisect.rs}   (time travel)
+  tautly-cli/src/cmd/{fork.rs, replay.rs, compare.rs, bisect.rs}
   tautly-cli/src/{main.rs, cmd/{prompt.rs, sessions.rs, models.rs, undo.rs, eval.rs, stats.rs, receipt.rs, auth.rs, doctor.rs, mcp.rs}}
 dist-workspace.toml, .github/workflows/release.yml   cargo-dist release
 benchmarks/{terminal-bench,tokens}/, docs/benchmark.md   public benchmark kit
@@ -844,6 +859,20 @@ proptest! { #[test] fn apply_then_inverse_restores(text in "[a-z\\n]{1,200}", ..
 
 ### Task 26: Resume, fork, undo, compaction wiring
 
+**Time-travel note (binding, user-approved 2026-11-03; spec 6.5 H5/H7/H9, 7.12):** Task 48 runs first.
+- **Point-in-time rebuild:**
+  - `rebuild` takes `until: Option<u32>` (step), `fn resume::rebuild(reader: &SessionReader<SessionRecord>, until: Option<u32>) -> Result<Rebuilt, ResumeError>`. It cuts only at step boundaries and gives open calls synthetic `cancelled` results.
+  - `Command::Fork { at: Option<u32>, label: Option<String> }` creates a conversation-only branch at any step: records up to step `at` copied verbatim, header `origin: fork`, `parent: (id, offset of step at's end)`, `label`. Files are not touched.
+- **Logged prefix inputs:** resume uses the last `PrefixApplied` `agents_md`/`repo_map` blobs, never fresh disk content. A differing `system_prompt_hash`/`tools_hash` emits a `Warning` (the cache will be cold).
+  - `resume_rebuilds_context_identically` must also pass after `AGENTS.md` and the repo map changed on disk.
+  - Add `rebuild_until_step_matches_live_prefix_at_that_step` and `fork_at_step_copies_records_and_sets_parent_label_origin`.
+- **Undo is logged (H7):** undo blobs each file's current content first and appends `SessionRecord::Undone { turn, files: Vec<UndoneFile>, backup_ref: None }`. `rebuild` replays it. Add `undo_appends_undone_record_with_from_and_to_blobs`.
+
+**Task 25 review note (binding):**
+- **Budget spend on rebuild:** session spend comes from the ledger's session column, `Ledger::session_totals(session_id) -> Result<Totals>` (add it), which includes discarded attempts. Without the ledger, it falls back to summing logged `Provider(Usage)` records, with a `Warning`.
+- **Budgets:** logged `SetBudget` commands are replayed in order. Forks and rewinds start a new session id with zero spend.
+- **Tests:** `resume_restores_budget_spend_and_set_budget`.
+
 **Checkpoint 2 amendments (binding):** Fork gives the child a fresh ReadTracker; undo uses `Edited.pre_image/pre_mode` and `Deleted` (restore file + mode).
 
 **Checkpoint 3 amendments (binding):** `rebuild` replays the `ToolResult` records' `effects`/`meta` through `push_tool_result` and `apply_effects`, and the `GcApplied`/`MemoryIndexApplied` records (Task 24), so the files list, `Context.results`, GC elisions and the memory index text are exactly as before. GC originals and `CompactionRecord` contents are read back from session blobs (each `ToolResult`'s result blob by call id for `restore_gc`; only references and the latest compaction record stay in memory), which `Uncompact` and `restore_gc` use. Use `Context::reapply_gc(&[(call_id, by_turn)])` (added at checkpoint 3 in tautly-context; `GcRecord.elided` entries carry `by_turn`, so Task 24 builds `GcApplied.elided` straight from the record) and pass `forgotten_paths` to the rebuilt ReadTracker, used by `rebuild`. A `PinsFolded` record (written by Task 24 whenever `fold_session_pins()` returns true) makes `rebuild` fold at that position, so the prefix after resume is identical. Fork copies the parent's records verbatim (no re-serialization, so fields a newer version added survive).
@@ -862,6 +891,8 @@ proptest! { #[test] fn apply_then_inverse_restores(text in "[a-z\\n]{1,200}", ..
 - [ ] **Step 5: Commit** `git commit -m "feat(core): resume, fork, undo, compaction wiring"`
 
 ### Task 27: Side-model routing
+
+**Task 25 review note (binding):** side usage is priced with the side model's catalog price and recorded in the ledger under the side model's id, never the main model's. An unpriced side model gives `cost_usd = None`, and the Task 25 warn-and-enforce-tokens rule applies. Test: `side_usage_priced_and_recorded_with_side_model_id`.
 
 **Files:**
 - Create: `crates/tautly-core/src/routing.rs`; modify `crates/tautly-provider/src/{lib.rs,catalog.rs}` (add `trait SideModel` and `tier`), `crates/tautly-provider/catalog/models.toml`, `crates/tautly-tools/src/web_fetch.rs`, `crates/tautly-core/src/{engine.rs,turn.rs}`
@@ -1324,7 +1355,7 @@ Tasks 39–47 follow the order in **Execution Order**. Each task's new `Event`/`
 - [ ] **Step 4: Run** — Expected: PASS.
 - [ ] **Step 5: Commit** `git commit -m "feat(cli): zero-config provider detection, auth add, doctor"`
 
-### Task 41: Release and installers with cargo-dist (execute after Task 46)
+### Task 41: Release and installers with cargo-dist (execute after Task 53)
 
 **Files:**
 - Create: `dist-workspace.toml`, `.github/workflows/release.yml` (generated by `dist generate`, committed), `scripts/check-dist-plan.sh`
@@ -1414,6 +1445,8 @@ Tasks 39–47 follow the order in **Execution Order**. Each task's new `Event`/`
 - [ ] **Step 5: Commit** `git commit -m "feat(core,tools): diff previews in approvals and results, session diff"`
 
 ### Task 43: Mid-session model switch (execute after Task 42)
+
+**Task 25 review note (binding):** a switch refreshes the priced/unpriced state of the session's budget enforcement. Switching to an unpriced model while `max_usd` is set re-emits the one-time `Warning` for that model, and enforces token budgets only. Switching back to a priced model restores USD enforcement, with spend so far unchanged. Test: `switch_to_unpriced_model_rewarns_and_back_restores_usd_budget`.
 
 **Task 19 re-review note applies (binding):** on a switch to another provider, strip `Reasoning`/`RedactedReasoning` produced by a different provider before the next request.
 
@@ -1652,6 +1685,16 @@ Tasks 39–47 follow the order in **Execution Order**. Each task's new `Event`/`
 
 ### Task 47: Git checkpoints before bash and `/undo` (execute after Task 44)
 
+**Time-travel amendment (binding, user-approved 2026-11-03; spec 7.11.11, 7.12):** these git checkpoints are the only checkpoint mechanism; time travel (Tasks 49–53) uses them. A shadow repository was rejected, because worktree forks need the commits in the user's repository.
+- **Records:** use the `SessionRecord::Checkpoint { n, commit, tree, head, dirty, turn, step }` and `CheckpointSkipped` types defined in Task 48.
+- **When:** take checkpoints at session start (off the startup path, after the first event), before every Exec and stdio MCP call, at every `TurnEnd`, and on request (`Checkpointer::snapshot_now`, used before rewind/switch).
+- **Forks:** add `async fn Checkpointer::adopt(&self, child_session: &str, commits: &[(u32, String)]) -> Result<(), CheckpointError>`. A fork creates its own refs for every checkpoint record it copies.
+- **Undo:** writes the H7 `Undone` record (Task 26).
+- **Deletion:** `tautly sessions delete` keeps blobs (shared per project).
+- **Tests:**
+  - `checkpoints_at_session_start_and_turn_end`;
+  - `adopted_refs_survive_parent_delete`.
+
 **Files:**
 - Create: `crates/tautly-core/src/checkpoint.rs`
 - Modify:
@@ -1675,7 +1718,7 @@ Tasks 39–47 follow the order in **Execution Order**. Each task's new `Event`/`
     - `async fn backup(&mut self) -> Result<CheckpointRef, Skip>` (`undo-<n>` ref)
   - `struct CheckpointRef { n: u32, commit: String, refname: String }`, `enum Skip { NoGit, Timeout, TooManyUntracked { files: u64, bytes: u64 }, Git(String) }`, `struct RestorePlan { restored: Vec<PathBuf>, deleted: Vec<PathBuf> }`.
   - `async fn checkpoint::prune(sb: &dyn Sandbox, root: &Path, keep_days: u32) -> Result<u32, CheckpointError>` (engine start) and `async fn checkpoint::delete_session_refs(sb: &dyn Sandbox, root: &Path, session: &str) -> Result<u32, CheckpointError>`.
-  - Session records: `SessionRecord::Checkpoint { n: u32, commit: String, turn: u32, step: u32 }` and `SessionRecord::CheckpointSkipped { reason: String, turn: u32, step: u32 }`. A skip also emits a `Warning` `checkpoint skipped: <reason>`.
+  - Session records `SessionRecord::Checkpoint { n, commit, tree, head, dirty, turn, step }` and `SessionRecord::CheckpointSkipped { reason, turn, step }` (types from Task 48). A skip also emits a `Warning` `checkpoint skipped: <reason>`.
   - Wire additions:
     - `Command::Undo { turn: Option<u32>, dry_run: bool }`
     - `Event::Undone { turn: u32, restored: Vec<String>, deleted: Vec<String>, dry_run: bool, backup_ref: Option<String>, note: Option<String> }`
@@ -1683,7 +1726,7 @@ Tasks 39–47 follow the order in **Execution Order**. Each task's new `Event`/`
     - It walks the turn's `Edit` and `Checkpoint` records in reverse, taking a backup snapshot first.
     - `note` = `"ignored files and submodules are not restored"` when the turn ran commands in git, or `"command side effects not undone (not a git repository)"` outside git.
     - `tautly undo [--turn N]` and `/undo` use it.
-  - `tautly sessions delete <id>` removes the log, its blobs and its refs.
+  - `tautly sessions delete <id>` removes the log and its refs; blobs are shared and kept.
 
 - [ ] **Step 1: Write the failing tests** (temporary git repos):
   - Snapshots:
@@ -1704,7 +1747,7 @@ Tasks 39–47 follow the order in **Execution Order**. Each task's new `Event`/`
     - `undo_default_is_last_user_turn_and_cli_uses_same_numbering`.
   - Pruning and deletion:
     - `refs_older_than_keep_days_pruned_at_engine_start` (`GIT_COMMITTER_DATE` in the past);
-    - `sessions_delete_removes_log_blobs_and_refs`.
+    - `sessions_delete_removes_log_and_refs_keeps_shared_blobs`.
 - [ ] **Step 2: Run** `cargo test -p tautly-core --test checkpoint && cargo test -p tautly-cli --test cli` — Expected: FAIL.
 - [ ] **Step 3: Implement.**
   - Snapshot: `read-tree HEAD` (or `read-tree --empty`), `add -A`, `write-tree`, `commit-tree -p <prev|HEAD>`, `update-ref`.
@@ -1713,3 +1756,267 @@ Tasks 39–47 follow the order in **Execution Order**. Each task's new `Event`/`
   - The checkpoint runs inside the `Exec` barrier (Checkpoint 2 ordering), before the call starts. Its time is counted in the call's duration.
 - [ ] **Step 4: Run** — Expected: PASS.
 - [ ] **Step 5: Commit** `git commit -m "feat(core): git checkpoints before bash and user-turn undo"`
+
+---
+
+## Time travel core (user-approved 2026-11-03; spec 6.5 hooks, 7.12)
+
+Task 48 runs before Task 26. Tasks 49–53 run after Task 46 and before checkpoint 5 (see **Execution Order**). All of them use the single checkpoint mechanism of Task 47, the `state_at` and `expected_tip` rules of spec 7.12.1, and the rule that logged approvals are never consent.
+
+### Task 48: Session-format hooks H1–H10 (execute before Task 26)
+
+**Files:**
+- Modify:
+  - `crates/tautly-session/src/{record.rs,writer.rs,reader.rs,paths.rs,lib.rs}`.
+  - `crates/tautly-core/src/{record.rs,session.rs,turn.rs,engine.rs,approvals.rs,dispatch.rs}`.
+  - `crates/tautly-memory/src/episodes.rs` (project id), `crates/tautly-core/src/ledger.rs` (project column = project id).
+- Test: `crates/tautly-session/tests/hooks.rs`, `crates/tautly-core/tests/session_hooks.rs`
+
+**Interfaces:**
+- Consumes: `SessionWriter`, `SessionReader`, `Header` (Task 18); `SessionRecord`, `PersistedEffect` (Task 24); `Context` blocks (Task 19); `agents_md`, `repo_map` (Tasks 19, 38).
+- Produces:
+  - **H1 timestamp.** The envelope is `{"type":"record","offset":n,"t":<unix ms>,"data":…}`. `SessionReader::entries(&self) -> impl Iterator<Item = Result<Entry<R>>>`, with `struct Entry<R> { offset: u64, t_ms: u64, rec: R }`. `records()` stays. A missing `t` reads as 0.
+  - **H3 header.**
+    - `Header` gains (all `#[serde(default)]`): `project: String`, `label: Option<String>`, `origin: Origin`, `git: Option<GitState>`, `tautly_version: String`, `model: Option<String>`, `config_hash: Option<String>`, `tags: Vec<String>`.
+    - `enum Origin { User, Fork, Rewind, WhatIf, Eval, Import, #[serde(other)] Unknown }` (default `User`); `struct GitState { head: Option<String>, dirty: Option<bool> }`.
+    - `struct HeaderInit { parent: Option<(String, u64)>, label: Option<String>, origin: Origin, model: Option<String>, config_hash: Option<String>, tags: Vec<String> }`, taken by `SessionWriter::create_in(data_home, root, init)`.
+    - `fn git_head(root: &Path) -> Option<String>` reads `.git`, `HEAD`, loose refs and `packed-refs` (worktree `gitdir:` files included) without spawning git.
+  - **H10 project id.** `fn project_id(root: &Path) -> String` = blake3 hex of the canonical git common dir (resolved from `.git` / `gitdir:` / `commondir` files), else of the canonical root. It is used for session dirs, blobs, episodes and the ledger project column. `project_hash(root)` stays for the index only.
+  - **H2 root-relative paths.** `#[derive(Serialize, Deserialize)] struct RelPath(String)` with:
+    - `fn from_abs(root: &Path, p: &Path) -> Option<RelPath>`;
+    - `fn resolve(&self, root: &Path) -> Result<PathBuf, ConfineError>`, which refuses absolute paths, `..` components, NUL and empty paths.
+
+    It is used in `PersistedEffect`, `Edit`, `GcApplied.forgotten_paths` and `Undone`. Non-UTF-8 paths keep the existing skip-with-warning rule.
+  - **H5.** `SessionRecord::PrefixApplied { agents_md: Option<BlobRef>, repo_map: Option<BlobRef>, system_prompt_hash: String, tools_hash: String }`. Written before the first `Request` and before any `Request` whose inputs differ from the last `PrefixApplied`.
+  - **H6.** `SessionRecord::Request { hash: BlobRef, turn: u32, step: u32, model: ModelId, blocks: BlockHashes }`, with `struct BlockHashes { stable: String, pinned: String, history: String, tail: String }` (blake3 hex of each block's canonical serialization).
+  - **H7.**
+    - `post_image_blob: Option<BlobRef>` is added to `PersistedEffect::Edited` and to `SessionRecord::Edit { path: RelPath, pre_image: Option<BlobRef>, post_image_blob: Option<BlobRef>, turn: u32 }`.
+    - `SessionRecord::Undone { turn: u32, files: Vec<UndoneFile>, backup_ref: Option<String> }`, with `struct UndoneFile { path: RelPath, from_blob: Option<BlobRef>, to: Option<BlobRef> }`. The type lands here; Task 26 writes it.
+  - **H8.** `SessionRecord::ApprovalRequested { request_id: String, kind: ApprovalKind, call_id: Option<String>, reason: String }`, with `enum ApprovalKind { Tool, McpServer, Memory }`. It is appended before the matching event is emitted.
+  - **Checkpoint record types** (written by Task 47): `SessionRecord::Checkpoint { n: u32, commit: String, tree: String, head: Option<String>, dirty: bool, turn: u32, step: u32 }` and `SessionRecord::CheckpointSkipped { reason: String, turn: u32, step: u32 }`.
+  - **Labels.** `SessionRecord::Labeled { label: String }`.
+
+- [ ] **Step 1: Write the failing tests.**
+  - Session:
+    - `every_record_line_has_unix_ms_timestamp`;
+    - `line_without_t_reads_as_zero`;
+    - `header_carries_project_label_origin_git_version_model_config_hash_tags`;
+    - `old_header_without_new_fields_reads_with_defaults`;
+    - `relpath_rejects_absolute_dotdot_nul_and_empty`;
+    - `relpath_written_under_one_root_resolves_under_another`;
+    - `worktree_sessions_share_project_id_and_blob_dir` (`git worktree add`);
+    - `non_git_project_id_is_root_hash`;
+    - `git_head_read_from_files_for_branch_detached_packed_refs_and_worktree` (no `git` on `PATH` during the test).
+  - Core:
+    - `prefix_applied_logged_before_first_request_with_agents_md_and_repo_map_blobs`;
+    - `prefix_applied_relogged_only_when_inputs_change`;
+    - `request_record_has_turn_step_model_and_block_hashes`: `stable` is identical across requests while the prefix is unchanged;
+    - `edit_records_carry_post_image_equal_to_disk`;
+    - `approval_request_logged_with_call_id_before_event`;
+    - `persisted_paths_are_root_relative`;
+    - `config_hash_stable_for_identical_config`;
+    - `labeled_record_renames_session`.
+- [ ] **Step 2: Run** `cargo test -p tautly-session --test hooks && cargo test -p tautly-core --test session_hooks` — Expected: FAIL.
+- [ ] **Step 3: Implement.** Post-image blobs are written on the same blocking path as other blobs; they dedupe with the next pre-image. Keep `SCHEMA_VERSION = 1`, since schema 1 is unreleased. Update every existing test that builds a `Header` or reads absolute record paths.
+- [ ] **Step 4: Run** `cargo test --workspace` — Expected: PASS.
+- [ ] **Step 5: Commit** `git commit -m "feat(session): time-travel hooks — timestamps, relative paths, header, prefix inputs, post-images"`
+
+### Task 49: Rewind as fork, session tree, switching (execute after Task 46)
+
+**Files:**
+- Create: `crates/tautly-core/src/{timetravel.rs,lease.rs,tree.rs}`
+- Modify:
+  - `crates/tautly-core/src/{protocol.rs,engine.rs,resume.rs,checkpoint.rs}`.
+  - `crates/tautly-rpc/src/server.rs`: `session/tree`, and the `rewind`, `switch`, `label` methods.
+  - `crates/tautly-tui/src/slash.rs`: `/rewind`, `/tree`, `/switch`, `/label`.
+  - `crates/tautly-cli/src/cmd/sessions.rs`: `sessions tree`.
+- Test: `crates/tautly-core/tests/timetravel.rs`, `crates/tautly-rpc/tests/server.rs` (extend), `crates/tautly-tui/tests/repl.rs` (extend)
+
+**Interfaces:**
+- Consumes: `rebuild(reader, until)` and `Fork{at, label}` (Task 26); `Checkpointer::{snapshot_now, restore, backup, adopt}` (Task 47); Task 48 records.
+- Produces:
+  - `struct FileState { base: Option<String /* checkpoint commit */>, overlay: Vec<(RelPath, Option<BlobRef>)>, partial: Option<String> }`.
+  - `fn timetravel::state_at(reader: &SessionReader<SessionRecord>, at: u32) -> Result<FileState, TtError>`. It takes the earliest checkpoint after step `at`, then reverse-applies `Edit` pre-images and `Undone.from_blob` between the boundary and that checkpoint. With no such checkpoint, or a skipped one, it is `partial`.
+  - `fn timetravel::expected_tip(reader: &SessionReader<SessionRecord>) -> Result<FileState, TtError>`.
+  - `async fn timetravel::materialize(sb: &dyn Sandbox, cp: Option<&mut Checkpointer>, target: &FileState, expected: &FileState, overwrite: &[RelPath], dry_run: bool) -> Result<MaterializeReport, TtError>`. It changes only paths where the target differs from `expected`. A path that would change and whose disk content ≠ `expected` is a conflict, which aborts unless listed in `overwrite`. It takes a backup before any write.
+  - `#[derive(Serialize, Deserialize)] struct MaterializeReport { restored: Vec<String>, deleted: Vec<String>, conflicts: Vec<String>, dry_run: bool, applied: bool, backup_ref: Option<String>, note: Option<String> }`.
+  - `struct Lease` with `fn shared(data_home: &Path, root: &Path) -> io::Result<Lease>` (held by every engine) and `fn try_exclusive(&self) -> Result<ExclusiveGuard, LeaseError>` (`flock`; it also fails while another live session in this process shares the `Workspace`).
+  - Wire additions:
+    - `Command::Rewind { at: u32, label: Option<String>, dry_run: bool, #[serde(default)] overwrite: Vec<String> }` → `Event::Rewound { at: u32, branch: String, report: MaterializeReport }`, then `SessionChanged` when applied.
+    - `Command::Switch { session_id: String, dry_run: bool, #[serde(default)] overwrite: Vec<String> }` → `Event::Switched { branch: String, report: MaterializeReport }`, then `SessionChanged`.
+    - `Command::Label { label: String }` appends `Labeled`.
+  - `struct TreeNode { session_id: String, parent: Option<(String, u32)>, label: Option<String>, origin: Origin, created: u64, steps: u32, last_prompt: String, cost_usd: Option<f64>, live: bool, current: bool }` and `fn tree::build(data_home: &Path, project: &str, current: Option<&str>) -> Result<Vec<TreeNode>, TtError>`. RPC `session/tree {root}` returns `{nodes}`.
+  - REPL:
+    - `/rewind N`: dry run, show restored/deleted/conflicts, `y` applies. With conflicts it asks `overwrite N files you changed? (backup kept)`, then sends `overwrite`.
+    - `/tree` prints `* <label|id8>  step N · <origin> · $cost · <last prompt 40 chars>`, indented per depth.
+    - `/switch <label|id|n>` and `/label <name>`.
+  - CLI: `tautly sessions tree`.
+
+- [ ] **Step 1: Write the failing tests.**
+  - File states:
+    - `state_at_uses_earliest_checkpoint_after_and_reverts_tool_edits`;
+    - `state_at_with_skipped_checkpoint_is_partial`.
+  - Rewind:
+    - `rewind_creates_branch_and_leaves_old_log_unmodified_except_tip_checkpoint`;
+    - `rewind_restores_tool_and_bash_changes`;
+    - `rewind_conflict_on_human_edit_writes_nothing_and_creates_no_branch`;
+    - `rewind_overwrite_list_applies_with_backup_ref`;
+    - `human_edit_outside_changed_paths_left_alone`;
+    - `human_added_file_not_deleted_without_overwrite`;
+    - `context_after_rewind_equals_rebuild_until`;
+    - `non_git_rewind_restores_tool_edits_and_notes_commands`.
+  - Switch and lease:
+    - `switch_back_and_forth_restores_each_tip_exactly`;
+    - `rewind_and_switch_refused_while_lease_shared_elsewhere` (a second engine on the same root);
+    - `fork_children_own_checkpoint_refs`: delete the parent and the child still materializes.
+  - Tree, labels and clients:
+    - `label_command_renames_branch`;
+    - `tree_lists_parent_step_label_origin_live_current`;
+    - `rpc_session_tree_and_rewind_methods`;
+    - `repl_rewind_dry_run_then_apply_and_tree_switch_label`.
+- [ ] **Step 2: Run** `cargo test -p tautly-core --test timetravel && cargo test -p tautly-rpc && cargo test -p tautly-tui` — Expected: FAIL.
+- [ ] **Step 3: Implement.** Order within a rewind:
+  1. Exclusive lease.
+  2. Tip checkpoint of the current session.
+  3. Compute target and expected.
+  4. Dry-run report. When it is not a dry run and there are no unlisted conflicts: backup, materialize, create the branch log (Task 26 fork, with origin `rewind`), adopt checkpoint refs, rebuild the context, `SessionChanged`.
+
+  A failure after materializing restores from the backup.
+- [ ] **Step 4: Run** — Expected: PASS.
+- [ ] **Step 5: Commit** `git commit -m "feat(core): rewind as fork, session tree and branch switching"`
+
+### Task 50: Fork at step N into an isolated worktree (execute after Task 49)
+
+**Files:**
+- Create: `crates/tautly-core/src/worktree.rs`, `crates/tautly-cli/src/cmd/fork.rs`
+- Modify: `crates/tautly-rpc/src/server.rs` (`session/new {fork: {session_id, at, label, worktree, model}}`), `crates/tautly-cli/src/cmd/sessions.rs` (delete removes the fork worktree)
+- Test: `crates/tautly-core/tests/worktree_fork.rs`, `crates/tautly-cli/tests/fork.rs`
+
+**Interfaces:**
+- Consumes: `state_at` (Task 49); `Fork` copy and `adopt` (Tasks 26, 47); `SetModel` (Task 43); headless rules (Task 29).
+- Produces:
+  - `async fn worktree::create(sb: &dyn Sandbox, repo_root: &Path, state: &FileState, dir: &Path) -> Result<PathBuf, WtError>`: `git -c core.hooksPath=/dev/null worktree add --detach <dir> <base>`, then writes the overlay. A non-git root or a missing base gives `WtError::NotGit` or `WtError::Partial`.
+  - `fn fork_into(reader: &SessionReader<SessionRecord>, at: u32, new_root: &Path, label: Option<String>, origin: Origin, model: Option<ModelId>) -> Result<String /* session id */, WtError>`: records up to step `at` copied verbatim, header `root` = `new_root`, same `project` id.
+  - CLI: `tautly fork <session> --at N [--model M] [--prompt TEXT] [--label L] [--dir PATH] [--approve auto-edit|yolo] [--budget-usd N] [--output json|text]`.
+    - The default dir is `<data home>/worktrees/<project-id>/<session-id>`.
+    - Without `--prompt` it prints `worktree: <path>  session: <id>  resume: cd <path> && tautly --resume <id>`.
+    - With `--prompt` it runs `run_oneshot` in the worktree under the headless rules and exits with the same codes as `tautly -p`.
+  - `tautly sessions delete <fork>` runs `git worktree remove` on a clean worktree. A dirty one is refused unless `--force`.
+
+- [ ] **Step 1: Write the failing tests:**
+  - `fork_at_n_creates_worktree_with_state_at_n_and_original_tree_and_index_untouched`;
+  - `fork_session_has_parent_origin_what_if_and_records_up_to_n`;
+  - `fork_shares_blob_dir_with_parent`;
+  - `model_override_applied_before_first_message`;
+  - `prompt_runs_headless_in_worktree_only`;
+  - `logged_approvals_are_not_consent`: the parent approved `bash x`, and in the fork without `--approve` the same call is denied;
+  - `worktree_hooks_not_run`;
+  - `non_git_root_refuses`;
+  - `partial_state_refused_with_note`;
+  - `sessions_delete_removes_clean_worktree_refuses_dirty_without_force`;
+  - `rpc_session_new_fork_worktree`.
+- [ ] **Step 2: Run** `cargo test -p tautly-core --test worktree_fork && cargo test -p tautly-cli --test fork` — Expected: FAIL.
+- [ ] **Step 3: Implement.** The new worktree builds its own index in the background (index keyed by root). The fork never inherits session rules or pending approvals.
+- [ ] **Step 4: Run** — Expected: PASS.
+- [ ] **Step 5: Commit** `git commit -m "feat(core,cli): fork at a step into an isolated git worktree"`
+
+### Task 51: Playback (execute after Task 50)
+
+**Files:**
+- Create: `crates/tautly-core/src/replay.rs`, `crates/tautly-cli/src/cmd/replay.rs`
+- Modify: `crates/tautly-core/src/{protocol.rs,engine.rs}`, `crates/tautly-tui/src/render.rs` (render `Replayed` and `UserMessage`), `crates/tautly-rpc/src/server.rs` (`replay` method)
+- Test: `crates/tautly-core/tests/replay.rs`, `crates/tautly-cli/tests/replay.rs`
+
+**Interfaces:**
+- Consumes: `SessionReader::entries` (Task 48); the record set of Tasks 24, 28, 43, 48.
+- Produces:
+  - `fn replay::events(reader: &SessionReader<SessionRecord>, from_step: Option<u32>) -> impl Iterator<Item = (u64 /* offset */, u64 /* t_ms */, Event)>`, using the mapping in spec 7.12.5.
+  - Wire additions:
+    - `Command::Replay { session_id: Option<String>, speed: f32, from_step: Option<u32> }` (idle only, else `Error{kind: Internal, message: "replay needs an idle session"}`).
+    - `Event::Replayed { offset: u64, t_ms: u64, event: Box<Event> }`, `Event::ReplayFinished { session_id: String, events: u32, cancelled: bool }`.
+    - `Event::UserMessage { text: String }` (emitted only inside `Replayed`).
+  - Pacing: sleep `min((t_i − t_{i−1}) / speed, 2 s)`; `speed == 0.0` means none. `Cancel` stops playback.
+  - CLI: `tautly replay <session> [--speed X (default 1)] [--from-step N] [--output text|json]`. Text output uses the REPL renderer; json prints inner events as NDJSON. No provider is built and no key is needed.
+
+- [ ] **Step 1: Write the failing tests:**
+  - `replay_reemits_logged_stream_in_order`: golden check against the live stream of a scripted mock session, modulo merged deltas and approval `diff`;
+  - `replay_makes_no_provider_requests_or_spawns` (`MockProvider.requests()` is empty; the sandbox spawn counter is 0);
+  - `replay_paces_by_timestamps_scaled_and_capped_at_2s` (`tokio::time::pause`);
+  - `speed_zero_is_instant`;
+  - `from_step_skips_earlier_steps`;
+  - `cancel_stops_with_finished_cancelled`;
+  - `replay_during_turn_errors`;
+  - `replayed_request_ids_not_answerable`;
+  - `cli_replay_without_api_key`.
+- [ ] **Step 2: Run** `cargo test -p tautly-core --test replay && cargo test -p tautly-cli --test replay` — Expected: FAIL.
+- [ ] **Step 3: Implement.**
+- [ ] **Step 4: Run** — Expected: PASS.
+- [ ] **Step 5: Commit** `git commit -m "feat(core,cli): session playback"`
+
+### Task 52: Compare (execute after Task 51)
+
+**Files:**
+- Create: `crates/tautly-core/src/compare.rs`, `crates/tautly-cli/src/cmd/compare.rs`
+- Test: `crates/tautly-core/tests/compare.rs`, `crates/tautly-cli/tests/compare.rs` (insta golden)
+
+**Interfaces:**
+- Consumes: `Ledger::session_totals` (Task 26 note); `TestEvidence` (Task 44); `session_diff` (Task 42); header parents (Task 48).
+- Produces:
+  - `struct BranchSummary { session_id: String, label: Option<String>, models: Vec<ModelId>, user_turns: u32, steps: u32, tokens_in: u64, tokens_out: u64, cache_read: u64, cost_usd: Option<f64>, wall_ms: u64, tool_calls: u32, blocked: u32, edit_failures: u32, evidence: Option<TestEvidence>, files: BTreeSet<String>, added: u32, removed: u32 }`.
+  - `fn compare::fork_point(a: &Header, b: &Header, data_home: &Path) -> Option<(String, u32)>` (walks parent chains).
+  - `fn compare::summarize(reader: &SessionReader<SessionRecord>, ledger: Option<&Ledger>, from_step: Option<u32>) -> Result<BranchSummary, CompareError>`.
+    - Wall time = Σ(`TurnEnd.t` − `SendMessage.t`).
+    - Cost comes from the ledger by session, falling back to logged usage.
+    - Diff stat = the net change since `from_step`.
+  - CLI: `tautly compare <a> <b> [<c>…] [--json]`, with 2–5 sessions (more is an error), one column per session plus a files table `only <x> | both`.
+
+- [ ] **Step 1: Write the failing tests:**
+  - `compare_two_branches_from_common_fork_point_golden`;
+  - `figures_count_from_fork_point_not_shared_prefix`;
+  - `files_overlap_sets`;
+  - `evidence_row_shows_last_test_and_stale`;
+  - `cost_from_ledger_includes_discarded_attempts_else_logged_usage`;
+  - `unrelated_sessions_compared_whole`;
+  - `more_than_five_sessions_rejected`;
+  - `json_shape`.
+- [ ] **Step 2: Run** `cargo test -p tautly-core --test compare && cargo test -p tautly-cli --test compare` — Expected: FAIL.
+- [ ] **Step 3: Implement.**
+- [ ] **Step 4: Run** — Expected: PASS.
+- [ ] **Step 5: Commit** `git commit -m "feat(cli): compare sessions and branches"`
+
+### Task 53: Session bisect (execute after Task 52)
+
+**Files:**
+- Create: `crates/tautly-core/src/bisect.rs`, `crates/tautly-cli/src/cmd/bisect.rs`
+- Test: `crates/tautly-core/tests/bisect.rs`, `crates/tautly-cli/tests/bisect.rs`
+
+**Interfaces:**
+- Consumes: `state_at`, `worktree::create` (Tasks 49, 50); the bash process-group and timeout handling (Tasks 10, 25); the policy deny rules (Task 3).
+- Produces:
+  - `struct BisectPlan { session: String, test: String, good: u32, bad: u32, candidates: Vec<u32> }`, built by `fn bisect::plan(reader: &SessionReader<SessionRecord>, test: &str, good: Option<u32>, bad: Option<u32>) -> Result<BisectPlan, BisectError>`. Candidates are exact step boundaries only.
+  - `fn bisect::prepass(reader: &SessionReader<SessionRecord>, test: &str) -> Option<(u32, u32)>`, from logged runs of the identical normalized command with their exit codes and write generations.
+  - `enum Verdict { Good, Bad, Skip }` (exit 0, any other code, exit 125 or a timeout).
+  - `#[async_trait] trait TestRunner { async fn run(&self, dir: &Path, cmd: &str, timeout: Duration) -> Verdict; }`.
+  - `async fn bisect::run(plan: &BisectPlan, sb: &dyn Sandbox, runner: &dyn TestRunner, timeout: Duration) -> Result<BisectOutcome, BisectError>`.
+    - It reuses one worktree `<data home>/worktrees/<project-id>/bisect-<ulid>`, moved with `git checkout --detach` plus the overlay.
+    - Ignored files are kept between runs.
+    - The endpoints are verified first.
+    - The worktree is removed at the end, also on error.
+  - `struct BisectOutcome { first_bad: Option<u32>, turn: Option<u32>, calls: Vec<String /* tool: target */>, text_excerpt: String /* ≤ 300 chars */, runs: u32, skipped: Vec<u32> }`.
+  - CLI: `tautly bisect <session> --test "<cmd>" [--good N] [--bad M] [--timeout 600] [--yes] [--json]`. It asks before running (it shows the command and the maximum number of runs), unless `--yes` is given. A deny rule on the command refuses. An endpoint mismatch exits 2.
+
+- [ ] **Step 1: Write the failing tests:**
+  - `bisect_finds_first_failing_step` (an edit at step 3 breaks `./check.sh`);
+  - `bisect_covers_bash_side_effects` (the bug comes from `sed -i` at step 5);
+  - `partial_boundaries_skipped`;
+  - `exit_125_and_timeout_skip`;
+  - `endpoint_mismatch_exits_2`;
+  - `prepass_narrows_range_with_fewer_runs`;
+  - `runs_in_temp_worktree_original_untouched`;
+  - `asks_unless_yes`;
+  - `deny_rule_refuses`;
+  - `worktree_removed_on_success_and_error`.
+- [ ] **Step 2: Run** `cargo test -p tautly-core --test bisect && cargo test -p tautly-cli --test bisect` — Expected: FAIL.
+- [ ] **Step 3: Implement.**
+- [ ] **Step 4: Run** — Expected: PASS.
+- [ ] **Step 5: Commit** `git commit -m "feat(cli): session bisect over checkpoints"`
