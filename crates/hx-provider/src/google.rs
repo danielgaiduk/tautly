@@ -157,6 +157,8 @@ pub fn to_wire(req: &CanonicalRequest) -> Value {
                 }
                 // Thought text is not sent back, only its signature.
                 Content::Reasoning { signature: sig, .. } => signature = sig.as_deref(),
+                // Anthropic-only opaque reasoning; meaningless to Gemini.
+                Content::RedactedReasoning { .. } => {}
             }
         }
         // Function responses must directly follow the calls they answer, so they go first.

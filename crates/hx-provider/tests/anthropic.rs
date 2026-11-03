@@ -495,3 +495,61 @@ fn assistant_image_content_is_skipped() {
         json!([{"type":"text","text":"ok"}])
     );
 }
+
+// ---- checkpoint fix: redacted thinking round-trip ----
+#[tokio::test]
+async fn redacted_thinking_block_is_surfaced() {
+    let events = [
+        json!({"type":"message_start","message":{"usage":{"input_tokens":5,"output_tokens":0}}}),
+        json!({"type":"content_block_start","index":0,"content_block":{"type":"redacted_thinking","data":"EmwKAhgBEgy3va3pzix"}}),
+        json!({"type":"content_block_stop","index":0}),
+        json!({"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}),
+        json!({"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"ok"}}),
+        json!({"type":"content_block_stop","index":1}),
+        json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":3}}),
+        json!({"type":"message_stop"}),
+    ];
+    let body: String = events
+        .iter()
+        .map(|e| format!("event: {}\ndata: {e}\n\n", e["type"].as_str().unwrap()))
+        .collect();
+    let server = serve(sse(body)).await;
+    let evs: Vec<_> = run(&server).await.into_iter().map(Result::unwrap).collect();
+    assert_eq!(
+        evs[0],
+        ProviderEvent::RedactedReasoning("EmwKAhgBEgy3va3pzix".into())
+    );
+    assert_eq!(evs[1], ProviderEvent::TextDelta("ok".into()));
+}
+
+#[test]
+fn redacted_reasoning_is_echoed_verbatim() {
+    let mut req = base_req();
+    req.messages = vec![
+        Message {
+            role: Role::User,
+            content: vec![Content::Text("q".into())],
+        },
+        Message {
+            role: Role::Assistant,
+            content: vec![
+                Content::RedactedReasoning {
+                    data: "opaque==".into(),
+                },
+                Content::Text("a".into()),
+            ],
+        },
+    ];
+    let w = to_wire(&req);
+    assert_eq!(
+        w["messages"][1]["content"][0],
+        json!({"type": "redacted_thinking", "data": "opaque=="})
+    );
+    let c = Content::RedactedReasoning { data: "x".into() };
+    let s = serde_json::to_string(&c).unwrap();
+    assert_eq!(s, r#"{"redacted_reasoning":{"data":"x"}}"#);
+    assert_eq!(serde_json::from_str::<Content>(&s).unwrap(), c);
+    let e = ProviderEvent::RedactedReasoning("x".into());
+    let s = serde_json::to_string(&e).unwrap();
+    assert_eq!(serde_json::from_str::<ProviderEvent>(&s).unwrap(), e);
+}

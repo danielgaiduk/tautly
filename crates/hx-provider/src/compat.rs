@@ -80,6 +80,7 @@ fn messages(req: &CanonicalRequest) -> Vec<Value> {
                     })),
                     Content::ToolResult { .. }
                     | Content::Reasoning { .. }
+                    | Content::RedactedReasoning { .. }
                     | Content::Image { .. } => {}
                 }
             }

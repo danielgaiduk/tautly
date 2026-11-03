@@ -105,6 +105,7 @@ fn input_items(messages: &[Message]) -> Vec<Value> {
                     }
                     Content::ToolResult { .. }
                     | Content::Reasoning { .. }
+                    | Content::RedactedReasoning { .. }
                     | Content::Image { .. } => {}
                 }
             }

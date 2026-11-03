@@ -93,6 +93,7 @@ fn content_to_wire(c: &Content) -> Option<Value> {
         Content::Reasoning {
             signature: None, ..
         } => return None,
+        Content::RedactedReasoning { data } => json!({"type": "redacted_thinking", "data": data}),
     })
 }
 
@@ -308,7 +309,12 @@ impl StreamState {
             "message_start" => merge_usage(&mut self.usage, &v["message"]["usage"]),
             "content_block_start" => {
                 let b = &v["content_block"];
-                if b["type"] == "tool_use" {
+                if b["type"] == "redacted_thinking" {
+                    // Encrypted reasoning arrives whole; it must be sent back unchanged.
+                    out.push(ProviderEvent::RedactedReasoning(
+                        b["data"].as_str().unwrap_or_default().into(),
+                    ));
+                } else if b["type"] == "tool_use" {
                     let s = |k: &str| b[k].as_str().unwrap_or_default().to_string();
                     self.tools.insert(
                         index,

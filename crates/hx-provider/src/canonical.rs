@@ -122,6 +122,11 @@ pub enum Content {
         text: String,
         signature: Option<String>,
     },
+    /// Reasoning the provider returned encrypted (Anthropic `redacted_thinking`). Opaque:
+    /// sent back verbatim to the provider that produced it, dropped by every other adapter.
+    RedactedReasoning {
+        data: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -181,6 +186,9 @@ pub enum ProviderEvent {
     ReasoningDelta(String),
     /// Signature of the thinking block just streamed; send it back with the reasoning text.
     ReasoningSignature(String),
+    /// An encrypted reasoning block (opaque data); keep it as
+    /// [`Content::RedactedReasoning`] and send it back unchanged.
+    RedactedReasoning(String),
     ToolCall {
         id: String,
         name: String,
