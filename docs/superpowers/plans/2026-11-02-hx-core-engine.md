@@ -825,6 +825,8 @@ proptest! { #[test] fn apply_then_inverse_restores(text in "[a-z\\n]{1,200}", ..
 
 ### Task 28: Memory in the engine
 
+**Task 22 note (binding):** call `MemoryStore::refresh_staleness()` once the index is ready and before building the memory index block; route `ContextOp::Remember` to the approval flow only when the `remember` result is not an error.
+
 **Task 19 review note (binding):** the memory index lives in the cached system prefix, so `[stale]` flags and index content change only at session start or inside a cache epoch chosen by the scheduler (spec 7.7), never mid-turn.
 
 **Checkpoint 2 amendments (binding):** Refresh memory staleness after bash only once the index is fresh (`!is_stale()`); use `wait_ready(timeout)`.
