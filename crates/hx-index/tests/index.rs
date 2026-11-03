@@ -699,3 +699,50 @@ async fn refs_in_filters_by_path_prefix_in_sql() {
     assert_eq!(paths(Some("."), 10).len(), 5);
     assert!(paths(Some("nope"), 10).is_empty());
 }
+
+fn index_names(db: &Path) -> Vec<String> {
+    let conn = rusqlite::Connection::open(db).unwrap();
+    let mut stmt = conn
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name IN ('symbols_name', 'refs_name_file_line') ORDER BY name")
+        .unwrap();
+    stmt.query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap()
+}
+
+#[tokio::test]
+async fn a_bulk_first_build_leaves_the_name_indexes_in_place() {
+    let t = tempfile::tempdir().unwrap();
+    let dbs = tempfile::tempdir().unwrap();
+    for i in 0..2100 {
+        let dir = t.path().join(format!("d{}", i % 20));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(format!("f{i}.rs")),
+            format!("fn f{i}() {{ shared_callee(); }}\n"),
+        )
+        .unwrap();
+    }
+    let db = dbs.path().join("i.db");
+    let idx = open_at(t.path(), &db);
+    assert_eq!(idx.refresh().await.unwrap().parsed, 2100);
+    assert_eq!(index_names(&db), ["refs_name_file_line", "symbols_name"]);
+    assert_eq!(idx.find_symbol("f2099", None).unwrap().len(), 1);
+    assert_eq!(idx.refs("shared_callee", 5000).unwrap().len(), 2100);
+}
+
+#[test]
+fn name_indexes_dropped_by_an_interrupted_build_come_back_on_open() {
+    let t = tempfile::tempdir().unwrap();
+    let dbs = tempfile::tempdir().unwrap();
+    let db = dbs.path().join("i.db");
+    drop(open_at(t.path(), &db));
+    rusqlite::Connection::open(&db)
+        .unwrap()
+        .execute_batch("DROP INDEX symbols_name; DROP INDEX refs_name_file_line;")
+        .unwrap();
+    assert!(index_names(&db).is_empty());
+    drop(open_at(t.path(), &db));
+    assert_eq!(index_names(&db), ["refs_name_file_line", "symbols_name"]);
+}

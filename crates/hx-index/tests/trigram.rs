@@ -20,6 +20,7 @@ async fn ready(files: &[(&str, &str)]) -> (Fixture, Index) {
     let fx = Fixture::new(files);
     let idx = fx.open();
     idx.refresh().await.unwrap();
+    idx.build_trigrams().await.unwrap();
     (fx, idx)
 }
 
@@ -112,11 +113,88 @@ async fn not_ready_index_falls_back_to_full_scan() {
     let fx = Fixture::new(&[("a.rs", "foo bar\n")]);
     let idx = fx.open();
     assert_eq!(idx.grep_candidates("foo bar"), Candidates::FullScan);
+    assert!(!idx.is_ready() && !idx.trigrams_ready());
     idx.refresh().await.unwrap();
+    // Symbols are ready, postings are not: still a full scan.
+    assert!(idx.is_ready() && !idx.trigrams_ready());
+    assert_eq!(idx.grep_candidates("foo bar"), Candidates::FullScan);
+    idx.build_trigrams().await.unwrap();
+    assert!(idx.trigrams_ready());
     assert_eq!(files(idx.grep_candidates("foo bar")), ["a.rs"]);
-    // A new handle on a populated database is not ready until it has refreshed.
+    // A new handle on a populated database is not ready until it has refreshed and
+    // confirmed its postings.
     let again = fx.open();
     assert_eq!(again.grep_candidates("foo bar"), Candidates::FullScan);
+    again.refresh().await.unwrap();
+    assert_eq!(again.grep_candidates("foo bar"), Candidates::FullScan);
+    assert_eq!(
+        again.build_trigrams().await.unwrap(),
+        0,
+        "nothing was pending"
+    );
+    assert_eq!(files(again.grep_candidates("foo bar")), ["a.rs"]);
+}
+
+#[tokio::test]
+async fn refresh_leaves_postings_pending_and_pending_files_stay_candidates() {
+    let fx = Fixture::new(&[("a.rs", "fn alpha() {}\n"), ("b.rs", "fn beta() {}\n")]);
+    let idx = fx.open();
+    idx.refresh().await.unwrap();
+    assert_eq!(
+        trigram_count(&fx.db(), "a.rs"),
+        0,
+        "phase 1 writes no postings"
+    );
+    assert_eq!(idx.build_trigrams().await.unwrap(), 2);
+    assert!(trigram_count(&fx.db(), "a.rs") > 0);
+    assert_eq!(files(idx.grep_candidates("alpha")), ["a.rs"]);
+
+    // A refresh that re-reads a changed file drops its postings and marks it pending;
+    // until phase 2 runs the index cannot vouch for it, so it stays a candidate.
+    std::fs::write(fx.path("a.rs"), "fn gamma() {}\n").unwrap();
+    set_future_mtime(&fx.path("a.rs"));
+    idx.refresh().await.unwrap();
+    assert_eq!(trigram_count(&fx.db(), "a.rs"), 0);
+    assert_eq!(files(idx.grep_candidates("gamma")), ["a.rs"]);
+    assert_eq!(files(idx.grep_candidates("beta")), ["a.rs", "b.rs"]);
+    assert_eq!(idx.build_trigrams().await.unwrap(), 1);
+    assert_eq!(files(idx.grep_candidates("gamma")), ["a.rs"]);
+    assert_eq!(files(idx.grep_candidates("beta")), ["b.rs"]);
+}
+
+fn set_future_mtime(path: &Path) {
+    let f = std::fs::File::options().write(true).open(path).unwrap();
+    f.set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(5))
+        .unwrap();
+}
+
+#[tokio::test]
+async fn background_refresh_runs_both_phases() {
+    let fx = Fixture::new(&[("a.rs", "fn alpha() {}\n")]);
+    let idx = Arc::new(fx.open());
+    idx.clone().spawn_background_refresh().await.unwrap();
+    assert!(idx.is_ready() && idx.trigrams_ready());
+    assert_eq!(files(idx.grep_candidates("alpha")), ["a.rs"]);
+}
+
+#[tokio::test]
+async fn postings_survive_vacuum() {
+    let (fx, idx) = ready(&[
+        ("a.rs", "fn first_one() {}\n"),
+        ("b.rs", "fn second_one() {}\n"),
+        ("c.rs", "fn third_one() {}\n"),
+    ])
+    .await;
+    std::fs::remove_file(fx.path("a.rs")).unwrap();
+    idx.reindex_file(Path::new("a.rs")).await.unwrap();
+    // VACUUM may renumber implicit rowids; postings must not depend on them.
+    rusqlite::Connection::open(fx.db())
+        .unwrap()
+        .execute_batch("VACUUM")
+        .unwrap();
+    assert_eq!(files(idx.grep_candidates("second_one")), ["b.rs"]);
+    assert_eq!(files(idx.grep_candidates("third_one")), ["c.rs"]);
+    assert!(files(idx.grep_candidates("first_one")).is_empty());
 }
 
 #[tokio::test]
@@ -136,13 +214,14 @@ async fn trigram_rows_follow_edits_deletes_and_refresh() {
     write_all(fx.root.path(), &[("c.txt", "delta text\n")]);
     std::fs::remove_file(fx.path("a.rs")).unwrap();
     idx.refresh().await.unwrap();
+    idx.build_trigrams().await.unwrap();
     assert_eq!(files(idx.grep_candidates("delta")), ["c.txt"]);
     assert!(files(idx.grep_candidates("gamma")).is_empty());
     // No orphaned postings are left behind by the deletes.
     let conn = rusqlite::Connection::open(fx.db()).unwrap();
     let orphans: i64 = conn
         .query_row(
-            "SELECT COUNT(*) FROM trigrams WHERE file_id NOT IN (SELECT rowid FROM files)",
+            "SELECT COUNT(*) FROM trigrams WHERE file_id NOT IN (SELECT id FROM files)",
             [],
             |r| r.get(0),
         )
@@ -153,7 +232,7 @@ async fn trigram_rows_follow_edits_deletes_and_refresh() {
 fn trigram_count(db: &Path, rel: &str) -> i64 {
     let conn = rusqlite::Connection::open(db).unwrap();
     conn.query_row(
-        "SELECT COUNT(*) FROM trigrams WHERE file_id = (SELECT rowid FROM files WHERE path = ?1)",
+        "SELECT COUNT(*) FROM trigrams WHERE file_id = (SELECT id FROM files WHERE path = ?1)",
         [rel],
         |r| r.get(0),
     )
@@ -171,6 +250,7 @@ async fn binary_and_oversize_files_have_no_trigrams() {
     .unwrap();
     let idx = fx.open();
     idx.refresh().await.unwrap();
+    idx.build_trigrams().await.unwrap();
     assert!(trigram_count(&fx.db(), "ok.txt") > 0);
     assert_eq!(trigram_count(&fx.db(), "bin.dat"), 0);
     assert_eq!(trigram_count(&fx.db(), "big.txt"), 0);
@@ -227,8 +307,8 @@ async fn v1_database_migrates_and_is_fully_reparsed() {
 
     let sb = Arc::new(LocalSandbox::new(root.path().to_path_buf()).unwrap());
     let idx = Index::open(&db, sb).unwrap();
-    // The v1 tree is available straight away.
-    assert_eq!(idx.tree().len(), 2);
+    // v1 contents are derived data and are discarded by the migration.
+    assert_eq!(idx.tree().len(), 0);
 
     let conn = rusqlite::Connection::open(&db).unwrap();
     let version: i64 = conn
@@ -252,6 +332,7 @@ async fn v1_database_migrates_and_is_fully_reparsed() {
         stats.parsed, 2,
         "every file is reparsed after the migration"
     );
+    idx.build_trigrams().await.unwrap();
     assert_eq!(files(idx.grep_candidates("needle_fn")), ["a.rs"]);
     assert_eq!(idx.find_symbol("needle_fn", None).unwrap().len(), 1);
 
@@ -264,6 +345,7 @@ async fn v1_database_migrates_and_is_fully_reparsed() {
 async fn changed_extractor_version_forces_a_full_reparse() {
     let (fx, idx) = ready(&[("a.rs", "fn a() {}\n"), ("b.rs", "fn b() {}\n")]).await;
     assert_eq!(idx.refresh().await.unwrap().parsed, 0);
+    assert_eq!(idx.build_trigrams().await.unwrap(), 0);
     drop(idx);
     let conn = rusqlite::Connection::open(fx.db()).unwrap();
     let n = conn
@@ -277,6 +359,8 @@ async fn changed_extractor_version_forces_a_full_reparse() {
     let idx = fx.open();
     assert_eq!(idx.refresh().await.unwrap().parsed, 2);
     assert_eq!(idx.refresh().await.unwrap().parsed, 0);
+    // Every file is pending again, so phase 2 rebuilds all postings.
+    assert_eq!(idx.build_trigrams().await.unwrap(), 2);
 }
 
 // ----------------------------------------------------------------- proptest
@@ -345,6 +429,7 @@ proptest! {
         }
         let idx = open_at(root.path(), &db_dir.path().join("i.db"));
         rt.block_on(idx.refresh()).unwrap();
+        rt.block_on(idx.build_trigrams()).unwrap();
         for pat in &patterns {
             let re = regex::Regex::new(pat).unwrap();
             // The full scan is the oracle.
@@ -364,65 +449,5 @@ proptest! {
                 }
             }
         }
-    }
-}
-
-/// Scale smoke test, run with `cargo test -p hx-index --release -- --ignored --nocapture`.
-#[tokio::test(flavor = "multi_thread")]
-#[ignore = "scale measurement"]
-async fn scale_10k_files_build_and_selective_search() {
-    let files: usize = std::env::var("HX_SCALE_FILES")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(10_000);
-    let root = tempfile::tempdir().unwrap();
-    let db_dir = tempfile::tempdir().unwrap();
-    let mut seed = 0x2545_f491_4f6c_dd1du64;
-    let mut next = move || {
-        seed ^= seed << 13;
-        seed ^= seed >> 7;
-        seed ^= seed << 17;
-        seed
-    };
-    let vocab: Vec<String> = (0..3000)
-        .map(|i| format!("w{:x}_{}", next() % 100_000, i % 97))
-        .collect();
-    for i in 0..files {
-        let dir = root.path().join(format!("d{}/e{}", i % 50, i % 7));
-        std::fs::create_dir_all(&dir).unwrap();
-        let mut body = String::new();
-        for _ in 0..120 {
-            let w = &vocab[(next() % vocab.len() as u64) as usize];
-            body.push_str(&format!("fn {w}() {{ call_{w}(); }}\n"));
-        }
-        if i == files / 2 {
-            body.push_str("// the_one_needle_marker\n");
-        }
-        std::fs::write(dir.join(format!("f{i}.rs")), body).unwrap();
-    }
-    let idx = open_at(root.path(), &db_dir.path().join("i.db"));
-    let t = std::time::Instant::now();
-    idx.refresh().await.unwrap();
-    println!("refresh of {files} files: {:?}", t.elapsed());
-    let t = std::time::Instant::now();
-    let found = idx.grep_candidates("the_one_needle_marker");
-    println!(
-        "selective search: {:?} -> {}",
-        t.elapsed(),
-        files_len(&found)
-    );
-    let t = std::time::Instant::now();
-    let found = idx.grep_candidates("fn w1");
-    println!("common search: {:?} -> {}", t.elapsed(), files_len(&found));
-    let t = std::time::Instant::now();
-    let tree = idx.tree();
-    let n = tree.glob("d3/**/*.rs", Path::new(".")).len();
-    println!("glob: {:?} -> {n}", t.elapsed());
-}
-
-fn files_len(c: &Candidates) -> usize {
-    match c {
-        Candidates::Files(v) => v.len(),
-        Candidates::FullScan => usize::MAX,
     }
 }

@@ -49,14 +49,15 @@ impl Slot {
 #[derive(Default)]
 pub(crate) struct TreeData {
     files: BTreeMap<String, Slot>,
-    /// Files the trigram index cannot vouch for (over the size cap, not UTF-8).
+    /// Files the trigram index cannot vouch for: over the size cap, not UTF-8, or postings
+    /// not built yet.
     opaque: BTreeSet<String>,
 }
 
 impl TreeData {
-    pub fn insert(&mut self, key: String, size: i64, mtime: i64, hash: &str, text: bool) {
+    pub fn insert(&mut self, key: String, size: i64, mtime: i64, hash: &str, indexed: bool) {
         let hash = blake3::Hash::from_hex(hash).ok().map(|h| *h.as_bytes());
-        if text {
+        if indexed {
             self.opaque.remove(&key);
         } else {
             self.opaque.insert(key.clone());
@@ -77,6 +78,11 @@ impl TreeData {
             slot.size = size.max(0) as u64;
             slot.mtime = mtime;
         }
+    }
+
+    /// The file's postings were stored.
+    pub fn set_indexed(&mut self, key: &str) {
+        self.opaque.remove(key);
     }
 
     pub fn remove(&mut self, key: &str) {

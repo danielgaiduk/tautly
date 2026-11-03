@@ -117,3 +117,33 @@ impl Sandbox for BlockingSandbox {
         self.inner.http_get(url).await
     }
 }
+
+/// Writes `files` synthetic Rust files of `fns` functions each (about 45 bytes per
+/// function) under `root`, spread over 350 directories; file `files / 2` also contains
+/// the line `// the_one_needle_marker`. Deterministic. Shared by the scale test and
+/// benchmarks.
+pub fn synthetic_corpus(root: &Path, files: usize, fns: usize) {
+    let mut seed = 0x2545_f491_4f6c_dd1du64;
+    let mut next = move || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed
+    };
+    let vocab: Vec<String> = (0..3000)
+        .map(|i| format!("w{:x}_{}", next() % 100_000, i % 97))
+        .collect();
+    for i in 0..files {
+        let dir = root.join(format!("d{}/e{}", i % 50, i % 7));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut body = String::new();
+        for _ in 0..fns {
+            let w = &vocab[(next() % vocab.len() as u64) as usize];
+            body.push_str(&format!("fn {w}() {{ call_{w}(); }}\n"));
+        }
+        if i == files / 2 {
+            body.push_str("// the_one_needle_marker\n");
+        }
+        std::fs::write(dir.join(format!("f{i}.rs")), body).unwrap();
+    }
+}

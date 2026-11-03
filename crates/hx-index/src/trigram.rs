@@ -37,12 +37,13 @@ impl Index {
     ///
     /// Patterns are Rust-regex syntax; put case-insensitivity in the pattern
     /// (`(?i)`). Every file with a match is in the result, but not every file in the
-    /// result matches. Files the index cannot vouch for (over 1 MB, not UTF-8) are
-    /// always included. A pattern with no literal of at least 3 bytes, a syntax error,
-    /// an index that has not finished refreshing, and any database error all yield
+    /// result matches. Files the index cannot vouch for (over 1 MB, not UTF-8, postings
+    /// not built yet) are always included. A pattern with no literal of at least 3
+    /// bytes, a syntax error, an index whose [`Index::refresh`] or
+    /// [`Index::build_trigrams`] has not completed, and any database error all yield
     /// [`Candidates::FullScan`].
     pub fn grep_candidates(&self, pattern: &str) -> Candidates {
-        if !self.is_ready() {
+        if !self.is_ready() || !self.trigrams_ready() {
             return Candidates::FullScan;
         }
         let Some(plan) = plan(pattern) else {
@@ -102,7 +103,7 @@ fn lookup(conn: &Connection, plan: &Plan) -> Result<Vec<String>, IndexError> {
             break;
         }
     }
-    let mut path = conn.prepare_cached("SELECT path FROM files WHERE rowid = ?1")?;
+    let mut path = conn.prepare_cached("SELECT path FROM files WHERE id = ?1")?;
     let mut out = Vec::new();
     for id in ids.unwrap_or_default() {
         if let Ok(p) = path.query_row([id], |r| r.get::<_, String>(0)) {

@@ -37,7 +37,8 @@ impl Index {
     /// changed path is brought in line with the disk ([`Index::reindex_file`] for
     /// files, a walk for directories, row removal for paths that are gone or not
     /// admitted); a change to an ignore file triggers a full [`Index::refresh`], and
-    /// so does an overflow or error from the OS watcher. Must be called inside a Tokio
+    /// so does an overflow or error from the OS watcher, and so does any change while the
+    /// workspace contains symlinks (the OS reports the target's path, not its aliases). Must be called inside a Tokio
     /// runtime, which the watcher thread borrows for the index's async work.
     pub fn start_watcher(self: Arc<Self>) -> Result<WatchHandle, IndexError> {
         let runtime = Handle::try_current()
@@ -129,8 +130,15 @@ fn run(
             // event or the next refresh.
             let _ = runtime.block_on(index.reindex_path(rel));
         }
-        if batch.refresh && !stop.load(Ordering::Acquire) {
-            let _ = runtime.block_on(index.refresh());
+        // With symlinks in the tree one change can alias several paths, and a changed
+        // ignore file changes which files are admitted: reconcile with a full refresh.
+        let resync = batch.refresh || (index.inner.has_links() && !batch.paths.is_empty());
+        if resync && !stop.load(Ordering::Acquire) {
+            runtime.block_on(async {
+                if index.refresh().await.is_ok() {
+                    let _ = index.build_trigrams().await;
+                }
+            });
         }
     }
 }

@@ -11,7 +11,9 @@ use rayon::prelude::*;
 
 use crate::extract::extract;
 use crate::lang::Lang;
-use crate::store::{Index, IndexError, Inner, ParsedFile, RefreshStats};
+use crate::store::{
+    Index, IndexError, Inner, ParsedFile, RefreshStats, TRI_DONE, TRI_NONE, TRI_PENDING,
+};
 use crate::trigram::trigrams;
 
 /// Files larger than this are tracked by size and mtime only (never read).
@@ -20,6 +22,9 @@ const MAX_FILE_BYTES: u64 = 1024 * 1024;
 const BATCH_FILES: usize = 500;
 /// Bytes of source held in memory per batch.
 const MAX_BATCH_BYTES: u64 = 16 * 1024 * 1024;
+/// A refresh of an index that is not ready yet, with at least this many files to
+/// (re)write, drops the name indexes for the duration and rebuilds them at the end.
+const BULK_REBUILD_FILES: usize = 2000;
 /// Concurrent sandbox reads.
 const IO_CONCURRENCY: usize = 64;
 /// Longest stored reference context, in characters.
@@ -50,11 +55,83 @@ impl Index {
     /// `is_ready` as it was.
     pub async fn refresh(&self) -> Result<RefreshStats, IndexError> {
         self.inner.run(|i| i.set_bulk_cache(true)).await?;
-        let result = self.refresh_inner().await;
+        let mut result = self.refresh_inner().await;
+        // A bulk build may have dropped the name indexes; they must be back whatever
+        // happened (a no-op otherwise).
+        if let Err(e) = self.inner.run(|i| i.ensure_name_indexes()).await {
+            result = result.and(Err(e));
+        }
         // Best effort: failing to shrink the cache must not hide the refresh's result.
         let _ = self.inner.run(|i| i.set_bulk_cache(false)).await;
         self.inner.record_refresh(&result);
         result
+    }
+
+    /// Phase 2 of building the index: read every text file whose trigram postings are
+    /// missing (all of them after a first [`Index::refresh`] or an extractor-version
+    /// change; the changed files after a later one) and store them. Extraction runs on
+    /// the rayon pool and the next batch is read while the previous one is written.
+    /// Returns how many files got postings; afterwards [`Index::trigrams_ready`] is
+    /// true and [`Index::grep_candidates`] narrows searches. Files edited since the
+    /// refresh are skipped (they stay candidates until the next refresh re-reads them).
+    /// Edits made through [`Index::reindex_file`] never wait for this phase.
+    pub async fn build_trigrams(&self) -> Result<u32, IndexError> {
+        self.inner.run(|i| i.set_bulk_cache(true)).await?;
+        let result = self.build_trigrams_inner().await;
+        let _ = self.inner.run(|i| i.set_bulk_cache(false)).await;
+        if result.is_ok() {
+            self.inner.mark_trigrams_ready();
+        }
+        result
+    }
+
+    async fn build_trigrams_inner(&self) -> Result<u32, IndexError> {
+        let inner = &self.inner;
+        let pending = inner.run(|i| i.pending_trigram_files()).await?;
+        let sizes: Vec<u64> = pending.iter().map(|p| p.size as u64).collect();
+        let mut pending = pending.into_iter();
+        let mut pos = 0;
+        let mut write: Option<Write<Vec<String>>> = None;
+        let mut done = 0u32;
+        while pos < sizes.len() {
+            let n = batch_end(&sizes[pos..], BATCH_FILES, MAX_BATCH_BYTES);
+            pos += n;
+            let batch: Vec<_> = pending.by_ref().take(n).collect();
+            let candidates = batch
+                .iter()
+                .map(|p| Candidate {
+                    key: p.key.clone(),
+                    lang: None,
+                    mtime: 0,
+                    size: p.size,
+                })
+                .collect();
+            let read = read_all(inner, candidates).await;
+            let expect: HashMap<String, (i64, String)> =
+                batch.into_iter().map(|p| (p.key, (p.id, p.hash))).collect();
+            let items = tokio::task::spawn_blocking(move || {
+                read.into_par_iter()
+                    .filter_map(|(c, bytes)| {
+                        let (id, hash) = expect.get(&c.key)?;
+                        // Only content that is still what the row describes.
+                        if blake3::hash(&bytes).to_hex().as_str() != hash.as_str() {
+                            return None;
+                        }
+                        Some((*id, c.key, hash.clone(), trigrams(&bytes)))
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .await
+            .map_err(|e| IndexError::Task(e.to_string()))?;
+            if let Some(prev) = write.take() {
+                done += prev.finish().await?.len() as u32;
+            }
+            write = Some(Write::start(inner, move |i| i.apply_trigrams(&items)));
+        }
+        if let Some(prev) = write.take() {
+            done += prev.finish().await?.len() as u32;
+        }
+        Ok(done)
     }
 
     async fn refresh_inner(&self) -> Result<RefreshStats, IndexError> {
@@ -86,6 +163,9 @@ impl Index {
                     .is_none_or(|k| (k.mtime, k.size) != (c.mtime, c.size))
         });
         stats.unchanged = fresh.len() as u32;
+        if !self.is_ready() && stale.len() >= BULK_REBUILD_FILES {
+            inner.run(|i| i.drop_name_indexes()).await?;
+        }
 
         // Files over the cap are never read, so they cost no batch budget.
         let sizes: Vec<u64> = stale
@@ -100,6 +180,7 @@ impl Index {
             .collect();
         let mut stale = stale.into_iter();
         let mut pos = 0;
+        let mut write: Option<Write<()>> = None;
         while pos < sizes.len() {
             let n = batch_end(&sizes[pos..], BATCH_FILES, MAX_BATCH_BYTES);
             pos += n;
@@ -113,7 +194,7 @@ impl Index {
             let outcomes = tokio::task::spawn_blocking(move || {
                 read.into_par_iter()
                     .zip(hashes)
-                    .map(|((c, bytes), old)| process(c, &bytes, old.as_deref()))
+                    .map(|((c, bytes), old)| process(c, &bytes, old.as_deref(), false))
                     .collect::<Vec<_>>()
             })
             .await
@@ -123,7 +204,16 @@ impl Index {
             parsed.extend(big.into_iter().map(oversize_file));
             stats.parsed += parsed.len() as u32;
             stats.unchanged += touched.len() as u32;
-            inner.run(move |i| i.apply(&parsed, &touched, &[])).await?;
+            // Write this batch while the next one is read and parsed.
+            if let Some(prev) = write.take() {
+                prev.finish().await?;
+            }
+            write = Some(Write::start(inner, move |i| {
+                i.apply(&parsed, &touched, &[])
+            }));
+        }
+        if let Some(prev) = write.take() {
+            prev.finish().await?;
         }
         if force {
             inner.run(|i| i.record_extractor_version()).await?;
@@ -164,9 +254,10 @@ impl Index {
             .run(move |i| i.known_file(&key))
             .await?
             .map(|k| k.hash);
-        let outcome = tokio::task::spawn_blocking(move || process(cand, &bytes, old.as_deref()))
-            .await
-            .map_err(|e| IndexError::Task(e.to_string()))?;
+        let outcome =
+            tokio::task::spawn_blocking(move || process(cand, &bytes, old.as_deref(), true))
+                .await
+                .map_err(|e| IndexError::Task(e.to_string()))?;
         let (parsed, touched) = split(vec![outcome]);
         inner.run(move |i| i.apply(&parsed, &touched, &[])).await
     }
@@ -249,11 +340,29 @@ fn oversize_file(c: Candidate) -> ParsedFile {
         mtime: c.mtime,
         size: c.size,
         lang: c.lang,
-        text: false,
+        tri_state: TRI_NONE,
         symbols: Vec::new(),
         refs: Vec::new(),
         lines: Vec::new(),
         trigrams: Vec::new(),
+    }
+}
+
+/// A database write running in the background, so the next batch can be read and parsed
+/// meanwhile.
+struct Write<T>(tokio::task::JoinHandle<Result<T, IndexError>>);
+
+impl<T: Send + 'static> Write<T> {
+    fn start(
+        inner: &Arc<Inner>,
+        f: impl FnOnce(&Inner) -> Result<T, IndexError> + Send + 'static,
+    ) -> Write<T> {
+        let inner = Arc::clone(inner);
+        Write(tokio::spawn(async move { inner.run(f).await }))
+    }
+
+    async fn finish(self) -> Result<T, IndexError> {
+        self.0.await.map_err(|e| IndexError::Task(e.to_string()))?
     }
 }
 
@@ -275,7 +384,10 @@ fn candidate(key: String, meta: &FileMeta) -> Candidate {
 /// exist. It is the sandbox's own walker, so the sandbox's entry filter stays in force.
 fn walker_at(sb: &dyn Sandbox, dir: &str) -> Result<ignore::WalkBuilder, IndexError> {
     let mut builder = sb.walker(Path::new(if dir.is_empty() { "." } else { dir }))?;
-    builder.require_git(false);
+    // Same link handling as the grep and glob tools, so the tree and the trigram index
+    // are never a subset of what they see. Links leaving the root are dropped by the
+    // sandbox's own entry filter; the walker detects link cycles.
+    builder.require_git(false).follow_links(true);
     Ok(builder)
 }
 
@@ -355,9 +467,11 @@ async fn files_under(inner: &Inner, dir: &str) -> Result<Vec<String>, IndexError
 async fn scan(inner: &Inner) -> Result<Vec<Candidate>, IndexError> {
     let builder = walker_at(inner.sb.as_ref(), "")?;
     let root = inner.sb.root().to_path_buf();
-    let paths = tokio::task::spawn_blocking(move || {
+    let (paths, links) = tokio::task::spawn_blocking(move || {
         let mut out = Vec::new();
+        let mut links = false;
         for entry in builder.build().flatten() {
+            links |= entry.path_is_symlink();
             if !entry.file_type().is_some_and(|t| t.is_file()) {
                 continue;
             }
@@ -366,10 +480,11 @@ async fn scan(inner: &Inner) -> Result<Vec<Candidate>, IndexError> {
             };
             out.push(rel.to_path_buf());
         }
-        out
+        (out, links)
     })
     .await
     .map_err(|e| IndexError::Task(e.to_string()))?;
+    inner.set_has_links(links);
 
     let sb = &inner.sb;
     let stats: Vec<Option<Candidate>> = stream::iter(paths)
@@ -410,9 +525,11 @@ fn split(outcomes: Vec<Outcome>) -> Split {
     out
 }
 
-/// Hash, decode and (when the content changed) parse and trigram one file. Content that
-/// is over the cap (it grew since the stat) or not UTF-8 is recorded by hash only.
-fn process(c: Candidate, bytes: &[u8], old_hash: Option<&str>) -> Outcome {
+/// Hash, decode and (when the content changed) parse one file; with `with_trigrams` its
+/// postings are computed too, otherwise the file is left pending for
+/// [`Index::build_trigrams`]. Content that is over the cap (it grew since the stat) or
+/// not UTF-8 is recorded by hash only.
+fn process(c: Candidate, bytes: &[u8], old_hash: Option<&str>, with_trigrams: bool) -> Outcome {
     let hash = blake3::hash(bytes).to_hex().to_string();
     if old_hash == Some(hash.as_str()) {
         return Outcome::Touch(c.key, c.mtime, c.size);
@@ -452,11 +569,15 @@ fn process(c: Candidate, bytes: &[u8], old_hash: Option<&str>) -> Outcome {
         mtime: c.mtime,
         size: c.size,
         lang: c.lang,
-        text: true,
+        tri_state: if with_trigrams { TRI_DONE } else { TRI_PENDING },
         symbols,
         refs: extracted.refs,
         lines,
-        trigrams: trigrams(bytes),
+        trigrams: if with_trigrams {
+            trigrams(bytes)
+        } else {
+            Vec::new()
+        },
     }))
 }
 

@@ -429,3 +429,64 @@ async fn single_file_admission_agrees_with_the_full_walk() {
     assert!(walked.iter().any(|p| p == Path::new("keep.log")));
     assert!(!walked.iter().any(|p| p == Path::new("src/gen/out.rs")));
 }
+
+#[tokio::test]
+async fn files_reachable_through_in_root_symlinks_are_indexed_like_the_tools_see_them() {
+    let fx = Fixture::new(&[
+        ("real/x.rs", "fn via_link() { unique_link_token(); }\n"),
+        ("plain.rs", "fn plain() {}\n"),
+    ]);
+    let outside = tempfile::tempdir().unwrap();
+    write_all(
+        outside.path(),
+        &[("secret.rs", "fn unique_link_token() {}\n")],
+    );
+    // A linked directory, a linked file, a cycle, and links leaving the root.
+    std::os::unix::fs::symlink("real", fx.path("alias")).unwrap();
+    std::os::unix::fs::symlink("real/x.rs", fx.path("link.rs")).unwrap();
+    std::os::unix::fs::symlink(".", fx.path("real/loop")).unwrap();
+    std::os::unix::fs::symlink(outside.path(), fx.path("escape")).unwrap();
+    std::os::unix::fs::symlink(outside.path().join("secret.rs"), fx.path("out.rs")).unwrap();
+    std::os::unix::fs::symlink("missing.rs", fx.path("dangling.rs")).unwrap();
+    let idx = fx.open();
+    idx.refresh().await.unwrap();
+
+    let tree = idx.tree();
+    let walked = tree.glob("**/*", Path::new("."));
+    let all = paths(&walked);
+    for want in ["alias/x.rs", "link.rs", "real/x.rs", "plain.rs"] {
+        assert!(all.contains(&want), "{want} missing from {all:?}");
+    }
+    for never in ["escape/secret.rs", "out.rs", "dangling.rs"] {
+        assert!(!all.contains(&never), "{never} must stay outside the tree");
+    }
+    assert_eq!(
+        tree.get(Path::new("alias/x.rs")).unwrap().hash,
+        tree.get(Path::new("real/x.rs")).unwrap().hash
+    );
+    idx.build_trigrams().await.unwrap();
+    match idx.grep_candidates("unique_link_token") {
+        hx_index::Candidates::Files(f) => {
+            let f = paths(&f);
+            assert!(f.contains(&"alias/x.rs") && f.contains(&"link.rs"), "{f:?}");
+            assert!(
+                !f.iter().any(|p| p.contains("secret") || *p == "out.rs"),
+                "{f:?}"
+            );
+        }
+        hx_index::Candidates::FullScan => panic!("expected candidates"),
+    }
+
+    // A single-file reindex through the link agrees with the walk.
+    std::fs::write(
+        fx.path("real/x.rs"),
+        "fn via_link() { changed_token_xyz(); }\n",
+    )
+    .unwrap();
+    idx.reindex_file(Path::new("alias/x.rs")).await.unwrap();
+    assert_ne!(
+        tree.get(Path::new("alias/x.rs")).unwrap().hash,
+        tree.get(Path::new("link.rs")).unwrap().hash
+    );
+    assert!(tree.get(Path::new("alias/x.rs")).is_some());
+}

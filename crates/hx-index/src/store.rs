@@ -23,6 +23,14 @@ const OLDEST_MIGRATABLE: i64 = 1;
 /// database reparses every file instead of trusting content hashes.
 const EXTRACTOR_VERSION: &str = "2";
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+/// `files.trigram_state`: the trigram index cannot vouch for this file (binary, over the
+/// size cap).
+pub(crate) const TRI_NONE: u8 = 0;
+/// The file's postings are in `trigrams` and match its stored hash.
+pub(crate) const TRI_DONE: u8 = 1;
+/// UTF-8 text whose postings have not been built (yet): found by a refresh, picked up by
+/// [`Index::build_trigrams`].
+pub(crate) const TRI_PENDING: u8 = 2;
 /// SQLite's default page cache, and the one used while refreshing, in KiB.
 const DEFAULT_CACHE_KIB: i64 = 2000;
 const BULK_CACHE_KIB: i64 = 64 * 1024;
@@ -129,12 +137,13 @@ pub(crate) struct ParsedFile {
     pub size: i64,
     /// None for extensions without a grammar.
     pub lang: Option<Lang>,
-    /// UTF-8 text within the size cap: has trigrams (possibly none, if tiny).
-    pub text: bool,
+    /// One of the `TRI_*` states.
+    pub tri_state: u8,
     pub symbols: Vec<SymbolRow>,
     pub refs: Vec<(u32, String)>,
     pub lines: Vec<(u32, String)>,
-    /// Distinct trigrams of the content (see [`crate::trigram::trigrams`]).
+    /// Distinct trigrams of the content (see [`crate::trigram::trigrams`]); only for
+    /// `TRI_DONE` files.
     pub trigrams: Vec<u32>,
 }
 
@@ -142,6 +151,9 @@ pub(crate) struct Inner {
     conn: Mutex<Connection>,
     pub sb: Arc<dyn Sandbox>,
     ready: AtomicBool,
+    trigrams_ready: AtomicBool,
+    /// The last scan met symlinks: a change under one path may alias another.
+    has_links: AtomicBool,
     last_error: Mutex<Option<String>>,
     tree: SharedTree,
 }
@@ -167,30 +179,44 @@ impl Index {
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.pragma_update_and_check(None, "journal_mode", "WAL", |_| Ok(()))?;
         migrate(&mut conn)?;
+        // A bulk refresh that was interrupted may have left these dropped.
+        ensure_name_indexes(&conn)?;
         let tree = load_tree(&conn)?;
         Ok(Index {
             inner: Arc::new(Inner {
                 conn: Mutex::new(conn),
                 sb,
                 ready: AtomicBool::new(false),
+                trigrams_ready: AtomicBool::new(false),
+                has_links: AtomicBool::new(false),
                 last_error: Mutex::new(None),
                 tree: RwLock::new(tree),
             }),
         })
     }
 
-    /// Run [`Index::refresh`] in the background; never blocks the caller. A failed
-    /// refresh leaves the index not ready (callers fall back to on-demand lookups) and
-    /// is recorded in [`Index::last_error`]; the next call retries.
+    /// Run [`Index::refresh`] and then [`Index::build_trigrams`] in the background;
+    /// never blocks the caller. A failed refresh leaves the index not ready (callers
+    /// fall back to on-demand lookups) and is recorded in [`Index::last_error`]; the
+    /// next call retries.
     pub fn spawn_background_refresh(self: Arc<Self>) -> JoinHandle<()> {
         tokio::spawn(async move {
-            let _ = self.refresh().await;
+            if self.refresh().await.is_ok() {
+                let _ = self.build_trigrams().await;
+            }
         })
     }
 
-    /// True once a refresh has completed since this handle was opened.
+    /// True once a refresh has completed since this handle was opened: symbols,
+    /// references and the workspace tree are current.
     pub fn is_ready(&self) -> bool {
         self.inner.ready.load(Ordering::Acquire)
+    }
+
+    /// True once [`Index::build_trigrams`] has completed since this handle was opened;
+    /// until then [`Index::grep_candidates`] answers [`crate::Candidates::FullScan`].
+    pub fn trigrams_ready(&self) -> bool {
+        self.inner.trigrams_ready.load(Ordering::Acquire)
     }
 
     /// The error of the most recent refresh, if it failed.
@@ -379,14 +405,42 @@ impl Inner {
             -DEFAULT_CACHE_KIB
         };
         conn.pragma_update(None, "cache_size", kib)?;
+        // Let the WAL grow during a bulk build instead of checkpointing every 4 MB.
+        conn.pragma_update(None, "wal_autocheckpoint", if on { 16384 } else { 1000 })?;
         if !on {
             conn.execute_batch("PRAGMA shrink_memory")?;
         }
         Ok(())
     }
 
+    /// Drop the two name indexes before a bulk build: with them in place every inserted
+    /// symbol and reference is a random b-tree insert, which is half the build time;
+    /// [`ensure_name_indexes`] rebuilds them sorted afterwards.
+    pub fn drop_name_indexes(&self) -> Result<(), IndexError> {
+        self.conn().execute_batch(
+            "DROP INDEX IF EXISTS symbols_name; DROP INDEX IF EXISTS refs_name_file_line;",
+        )?;
+        Ok(())
+    }
+
+    pub fn ensure_name_indexes(&self) -> Result<(), IndexError> {
+        ensure_name_indexes(&self.conn())
+    }
+
     pub fn mark_ready(&self) {
         self.ready.store(true, Ordering::Release);
+    }
+
+    pub fn mark_trigrams_ready(&self) {
+        self.trigrams_ready.store(true, Ordering::Release);
+    }
+
+    pub fn set_has_links(&self, v: bool) {
+        self.has_links.store(v, Ordering::Release);
+    }
+
+    pub fn has_links(&self) -> bool {
+        self.has_links.load(Ordering::Acquire)
     }
 
     /// Record the outcome of a refresh: success clears the last error.
@@ -479,7 +533,7 @@ impl Inner {
         {
             // Postings carry no foreign key (they point at a rowid), so they go first.
             let mut delete_tris = tx.prepare_cached(
-                "DELETE FROM trigrams WHERE file_id = (SELECT rowid FROM files WHERE path = ?1)",
+                "DELETE FROM trigrams WHERE file_id = (SELECT id FROM files WHERE path = ?1)",
             )?;
             let mut delete = tx.prepare_cached("DELETE FROM files WHERE path = ?1")?;
             for path in removed {
@@ -492,7 +546,7 @@ impl Inner {
                 touch.execute(params![path, mtime, size])?;
             }
             let mut insert_file = tx.prepare_cached(
-                "INSERT INTO files (path, hash, mtime, size, lang, text) \
+                "INSERT INTO files (path, hash, mtime, size, lang, trigram_state) \
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             )?;
             let mut insert_symbol = tx.prepare_cached(
@@ -516,7 +570,7 @@ impl Inner {
                     f.mtime,
                     f.size,
                     f.lang.map_or("other", Lang::as_str),
-                    f.text
+                    f.tri_state
                 ])?;
                 let file_id = tx.last_insert_rowid();
                 for s in &f.symbols {
@@ -555,10 +609,87 @@ impl Inner {
             tree.touch(path, *size, *mtime);
         }
         for f in parsed {
-            tree.insert(f.path.clone(), f.size, f.mtime, &f.hash, f.text);
+            tree.insert(
+                f.path.clone(),
+                f.size,
+                f.mtime,
+                &f.hash,
+                f.tri_state == TRI_DONE,
+            );
         }
         Ok(())
     }
+}
+
+/// A file whose postings are waiting to be built.
+pub(crate) struct PendingFile {
+    pub id: i64,
+    pub key: String,
+    pub size: i64,
+    pub hash: String,
+}
+
+impl Inner {
+    pub fn pending_trigram_files(&self) -> Result<Vec<PendingFile>, IndexError> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare_cached(&format!(
+            "SELECT id, path, size, hash FROM files WHERE trigram_state = {TRI_PENDING} ORDER BY id"
+        ))?;
+        let rows = stmt.query_map([], |r| {
+            Ok(PendingFile {
+                id: r.get(0)?,
+                key: r.get(1)?,
+                size: r.get(2)?,
+                hash: r.get(3)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Store postings for pending files, one transaction. A file is only marked done if
+    /// it is still the pending row with the hash the postings were computed from (a
+    /// concurrent reindex replaces the row); returns the paths that were.
+    pub fn apply_trigrams(
+        &self,
+        items: &[(i64, String, String, Vec<u32>)],
+    ) -> Result<Vec<String>, IndexError> {
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut done = Vec::new();
+        {
+            let mut mark = tx.prepare_cached(&format!(
+                "UPDATE files SET trigram_state = {TRI_DONE} \
+                 WHERE id = ?1 AND hash = ?2 AND trigram_state = {TRI_PENDING}"
+            ))?;
+            let mut postings: Vec<u64> = Vec::new();
+            for (id, path, hash, tris) in items {
+                if mark.execute(params![id, hash])? == 1 {
+                    postings.extend(tris.iter().map(|t| pack_posting(*t, *id)));
+                    done.push(path.clone());
+                }
+            }
+            postings.sort_unstable();
+            let mut insert =
+                tx.prepare_cached("INSERT INTO trigrams (tri, file_id) VALUES (?1, ?2)")?;
+            for p in postings {
+                insert.execute(params![p >> POSTING_ID_BITS, p & POSTING_ID_MASK])?;
+            }
+        }
+        tx.commit()?;
+        let mut tree = self.tree.write().unwrap_or_else(PoisonError::into_inner);
+        for path in &done {
+            tree.set_indexed(path);
+        }
+        Ok(done)
+    }
+}
+
+fn ensure_name_indexes(conn: &Connection) -> Result<(), IndexError> {
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS symbols_name ON symbols(name); \
+         CREATE INDEX IF NOT EXISTS refs_name_file_line ON refs(name, file, line);",
+    )?;
+    Ok(())
 }
 
 const POSTING_ID_BITS: u32 = 40;
@@ -572,19 +703,19 @@ fn pack_posting(tri: u32, file_id: i64) -> u64 {
 /// The tree as the database remembers it.
 fn load_tree(conn: &Connection) -> Result<TreeData, IndexError> {
     let mut tree = TreeData::default();
-    let mut stmt = conn.prepare("SELECT path, size, mtime, hash, text FROM files")?;
+    let mut stmt = conn.prepare("SELECT path, size, mtime, hash, trigram_state FROM files")?;
     let rows = stmt.query_map([], |r| {
         Ok((
             r.get::<_, String>(0)?,
             r.get::<_, i64>(1)?,
             r.get::<_, i64>(2)?,
             r.get::<_, String>(3)?,
-            r.get::<_, bool>(4)?,
+            r.get::<_, u8>(4)?,
         ))
     })?;
     for row in rows {
-        let (path, size, mtime, hash, text) = row?;
-        tree.insert(path, size, mtime, &hash, text);
+        let (path, size, mtime, hash, state) = row?;
+        tree.insert(path, size, mtime, &hash, state == TRI_DONE);
     }
     Ok(tree)
 }
@@ -614,10 +745,55 @@ fn migrate(conn: &mut Connection) -> Result<(), IndexError> {
 /// [`SCHEMA_VERSION`].
 const MIGRATIONS: &[(i64, &str)] = &[(1, MIGRATE_V1_TO_V2)];
 
-/// Trigram postings (`file_id` is the `files` rowid; the second index serves deleting
-/// one file's postings), the `meta` key/value table, a `text` flag on files (set when
-/// the trigram index covers the file), and a covering index for reference lookups.
+/// The v2 schema. Everything in a v1 database is derived from the sources, and the
+/// extractor-version change would reparse every file anyway, so the migration drops the
+/// v1 tables and creates v2 ones rather than rebuilding `files` in place.
+///
+/// What v2 adds: `files.id`, an explicit `INTEGER PRIMARY KEY` that trigram postings
+/// point at (an implicit rowid would not survive `VACUUM`); `files.trigram_state` (see
+/// the `TRI_*` constants); `trigrams` (the `trigrams_file` index serves deleting one
+/// file's postings); `meta`; and a covering index for reference lookups.
 const MIGRATE_V1_TO_V2: &str = "
+DROP TABLE ref_lines;
+DROP TABLE refs;
+DROP TABLE symbols;
+DROP TABLE files;
+CREATE TABLE files (
+    id            INTEGER PRIMARY KEY,
+    path          TEXT NOT NULL UNIQUE,
+    hash          TEXT NOT NULL,
+    mtime         INTEGER NOT NULL,
+    size          INTEGER NOT NULL,
+    lang          TEXT NOT NULL,
+    trigram_state INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX files_pending ON files(id) WHERE trigram_state = 2;
+CREATE TABLE symbols (
+    id         INTEGER PRIMARY KEY,
+    file       TEXT NOT NULL REFERENCES files(path) ON DELETE CASCADE,
+    name       TEXT NOT NULL,
+    kind       TEXT NOT NULL,
+    parent     TEXT,
+    start_line INTEGER NOT NULL,
+    end_line   INTEGER NOT NULL,
+    signature  TEXT NOT NULL,
+    hash       TEXT NOT NULL
+);
+CREATE INDEX symbols_file ON symbols(file);
+CREATE INDEX symbols_name ON symbols(name);
+CREATE TABLE refs (
+    file TEXT NOT NULL REFERENCES files(path) ON DELETE CASCADE,
+    line INTEGER NOT NULL,
+    name TEXT NOT NULL
+);
+CREATE INDEX refs_file ON refs(file);
+CREATE INDEX refs_name_file_line ON refs(name, file, line);
+CREATE TABLE ref_lines (
+    file TEXT NOT NULL REFERENCES files(path) ON DELETE CASCADE,
+    line INTEGER NOT NULL,
+    text TEXT NOT NULL,
+    PRIMARY KEY (file, line)
+) WITHOUT ROWID;
 CREATE TABLE trigrams (
     tri     INTEGER NOT NULL,
     file_id INTEGER NOT NULL,
@@ -625,9 +801,6 @@ CREATE TABLE trigrams (
 ) WITHOUT ROWID;
 CREATE INDEX trigrams_file ON trigrams(file_id);
 CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT) WITHOUT ROWID;
-ALTER TABLE files ADD COLUMN text INTEGER NOT NULL DEFAULT 0;
-DROP INDEX refs_name;
-CREATE INDEX refs_name_file_line ON refs(name, file, line);
 ";
 
 /// Step an existing database from `from` up to [`SCHEMA_VERSION`].
