@@ -841,6 +841,8 @@ proptest! { #[test] fn apply_then_inverse_restores(text in "[a-z\\n]{1,200}", ..
 
 ### Task 28: Memory in the engine
 
+**Obsidian-compatibility amendment (binding, user-approved 2026-11-03; spec 7.4):** this task also changes tautly-memory: real YAML frontmatter readable as Obsidian properties (pick a maintained YAML crate allowed by the global constraints; reading stays tolerant of the old `key: <JSON>` form), `tags: Vec<String>` on entries and drafts, readable file names `<title-slug>.md` with numeric collision suffixes (id stays in frontmatter; existing `<slug>-<hex>.md` files keep loading), `[[title]]`/`[[title|label]]` links parsed from bodies into `MemoryEntry.links`, `recall` adding directly linked entries within the 2,000-token cap, and memory caps/sanitizing unchanged. Tests: `vault_files_parse_as_obsidian_properties` (golden frontmatter), `wikilinks_are_followed_one_hop_by_recall`, `renamed_file_keeps_links_by_id`, `old_format_still_loads`.
+
 **Task 24 re-review note (binding):** emit `MemoryProposed` through the turn's bound event sink (which waits on a full channel), never the actor's best-effort sink, so an interactive client never misses a proposal.
 
 **Task 22 note (binding):** call `MemoryStore::refresh_staleness()` once the index is ready and before building the first memory index block (the engine awaits it for ~300 ms before the first `assemble`; on timeout the slot stays empty for the session); route `ContextOp::Remember` to the approval flow only when the `remember` result is not an error. Surface `MemoryStore::skipped_count()` and `staleness_error()` to the user (status line or warning event) at session start.
