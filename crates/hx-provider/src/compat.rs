@@ -15,7 +15,7 @@ use tokio_util::sync::CancellationToken;
 use url::Url;
 
 use crate::sse::try_events;
-use crate::util::{openai_quota_from_headers, retry_after, transient};
+use crate::util::{merge_same_role, openai_quota_from_headers, retry_after, transient};
 use crate::{
     Block, CanonicalRequest, Catalog, Content, Provider, ProviderError, ProviderEvent, RawUsage,
     Role, StopReason,
@@ -66,7 +66,7 @@ fn messages(req: &CanonicalRequest) -> Vec<Value> {
     if !system.is_empty() {
         out.push(json!({"role": "system", "content": system}));
     }
-    for m in &req.messages {
+    for m in &merge_same_role(&req.messages) {
         if m.role == Role::Assistant {
             let mut text = String::new();
             let mut calls = Vec::new();

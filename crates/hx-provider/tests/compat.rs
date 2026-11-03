@@ -541,3 +541,53 @@ async fn new_indexless_tool_call_after_finish_does_not_panic() {
         ]
     );
 }
+
+#[test]
+fn consecutive_user_messages_merge_into_one() {
+    let req = req_of(vec![
+        msg(Role::User, vec![text("prompt")]),
+        msg(Role::User, vec![text("state")]),
+    ]);
+    let w = to_wire(&req);
+    let users: Vec<&Value> = w["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|m| m["role"] == "user")
+        .collect();
+    assert_eq!(users.len(), 1);
+    assert_eq!(users[0]["content"], "prompt\n\nstate");
+}
+
+#[test]
+fn tool_result_then_state_tail_is_tool_message_then_one_user_message() {
+    let req = req_of(vec![
+        msg(Role::User, vec![text("q")]),
+        msg(
+            Role::Assistant,
+            vec![Content::ToolUse {
+                id: "c1".into(),
+                name: "read_file".into(),
+                input: json!({}),
+            }],
+        ),
+        msg(
+            Role::User,
+            vec![Content::ToolResult {
+                id: "c1".into(),
+                output: "body".into(),
+                is_error: false,
+            }],
+        ),
+        msg(Role::User, vec![text("state")]),
+    ]);
+    let w = to_wire(&req);
+    let roles: Vec<&str> = w["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["role"].as_str().unwrap())
+        .collect();
+    assert_eq!(roles, ["system", "user", "assistant", "tool", "user"]);
+    assert_eq!(w["messages"][4]["content"], "state");
+}

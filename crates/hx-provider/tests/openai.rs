@@ -99,11 +99,11 @@ fn ok(r: Vec<Result<ProviderEvent, ProviderError>>) -> Vec<ProviderEvent> {
 
 #[test]
 fn reasoning_effort_maps() {
-    let w = to_wire(&req_reasoning(Reasoning::Effort(Effort::High)), None);
+    let w = to_wire(&req_reasoning(Reasoning::Effort(Effort::High)));
     assert_eq!(w["reasoning"]["effort"], "high");
-    let w = to_wire(&req_reasoning(Reasoning::Effort(Effort::Low)), None);
+    let w = to_wire(&req_reasoning(Reasoning::Effort(Effort::Low)));
     assert_eq!(w["reasoning"]["effort"], "low");
-    assert!(to_wire(&base_req(), None).get("reasoning").is_none());
+    assert!(to_wire(&base_req()).get("reasoning").is_none());
 }
 
 #[test]
@@ -115,7 +115,7 @@ fn reasoning_budget_maps_to_effort_buckets() {
         (8_192, "medium"),
         (8_193, "high"),
     ] {
-        let w = to_wire(&req_reasoning(Reasoning::Budget(budget)), None);
+        let w = to_wire(&req_reasoning(Reasoning::Budget(budget)));
         assert_eq!(w["reasoning"]["effort"], want, "budget {budget}");
     }
 }
@@ -151,10 +151,11 @@ fn wire_basics_and_item_mapping() {
             ],
         ),
     ]);
-    let w = to_wire(&req, None);
+    let w = to_wire(&req);
     assert_eq!(w["model"], "gpt-5");
     assert_eq!(w["stream"], true);
-    assert_eq!(w["store"], true);
+    assert_eq!(w["store"], false);
+    assert_eq!(w["include"], json!(["reasoning.encrypted_content"]));
     assert_eq!(w["max_output_tokens"], 8_000);
     assert_eq!(w["instructions"], "You are hx.\n\nBe brief.");
     assert!(w.get("previous_response_id").is_none());
@@ -174,17 +175,6 @@ fn wire_basics_and_item_mapping() {
     );
 }
 
-#[test]
-fn previous_response_id_used_only_when_prefix_unchanged() {
-    // Pure wire: given only the new messages, only those are sent, plus the id.
-    let new_only = req_of(vec![msg(Role::User, vec![text("next")])]);
-    let w = to_wire(&new_only, Some("resp_1"));
-    assert_eq!(w["previous_response_id"], "resp_1");
-    assert_eq!(w["input"].as_array().unwrap().len(), 1);
-    assert_eq!(w["input"][0]["content"][0]["text"], "next");
-    assert_eq!(w["store"], true);
-}
-
 async fn bodies(server: &MockServer) -> Vec<Value> {
     server
         .received_requests()
@@ -193,48 +183,6 @@ async fn bodies(server: &MockServer) -> Vec<Value> {
         .iter()
         .map(|r| serde_json::from_slice(&r.body).unwrap())
         .collect()
-}
-
-#[tokio::test]
-async fn provider_reuses_response_id_only_when_prefix_unchanged() {
-    let server = serve(sse(fixture("text.sse"))).await;
-    let p = provider(&server);
-    let go = |req: CanonicalRequest| {
-        let p = p.clone();
-        async move {
-            p.stream(req, CancellationToken::new())
-                .collect::<Vec<_>>()
-                .await
-        }
-    };
-    let first = req_of(vec![msg(Role::User, vec![text("q")])]);
-    go(first).await;
-
-    // The fixture answered "Hello"; the follow-up extends the same history.
-    let second = req_of(vec![
-        msg(Role::User, vec![text("q")]),
-        msg(Role::Assistant, vec![text("Hello")]),
-        msg(Role::User, vec![text("next")]),
-    ]);
-    go(second).await;
-
-    // Same shape, but the first message was edited: the prefix no longer matches.
-    let third = req_of(vec![
-        msg(Role::User, vec![text("EDITED")]),
-        msg(Role::Assistant, vec![text("Hello")]),
-        msg(Role::User, vec![text("again")]),
-    ]);
-    go(third).await;
-
-    let b = bodies(&server).await;
-    assert_eq!(b.len(), 3);
-    assert!(b[0].get("previous_response_id").is_none());
-    assert_eq!(b[0]["input"].as_array().unwrap().len(), 1);
-    assert_eq!(b[1]["previous_response_id"], "resp_1");
-    assert_eq!(b[1]["input"].as_array().unwrap().len(), 1);
-    assert_eq!(b[1]["input"][0]["content"][0]["text"], "next");
-    assert!(b[2].get("previous_response_id").is_none());
-    assert_eq!(b[2]["input"].as_array().unwrap().len(), 3);
 }
 
 #[tokio::test]
@@ -521,48 +469,6 @@ async fn system_images_are_rejected_without_sending_a_request() {
     assert!(server.received_requests().await.unwrap().is_empty());
 }
 
-#[tokio::test]
-async fn expired_previous_response_falls_back_to_full_history() {
-    let server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/v1/responses"))
-        .and(body_partial_json(json!({"previous_response_id": "resp_1"})))
-        .respond_with(ResponseTemplate::new(400).set_body_string(
-            r#"{"error":{"message":"Previous response not found","code":"previous_response_not_found"}}"#,
-        ))
-        .with_priority(1)
-        .mount(&server)
-        .await;
-    Mock::given(method("POST"))
-        .and(path("/v1/responses"))
-        .respond_with(sse(fixture("text.sse")))
-        .with_priority(5)
-        .mount(&server)
-        .await;
-    let p = provider(&server);
-    let first = req_of(vec![msg(Role::User, vec![text("q")])]);
-    p.stream(first, CancellationToken::new())
-        .collect::<Vec<_>>()
-        .await;
-    let second = req_of(vec![
-        msg(Role::User, vec![text("q")]),
-        msg(Role::Assistant, vec![text("Hello")]),
-        msg(Role::User, vec![text("next")]),
-    ]);
-    let evs = ok(p.stream(second, CancellationToken::new()).collect().await);
-    assert_eq!(
-        evs.last(),
-        Some(&ProviderEvent::Done {
-            stop: StopReason::EndTurn
-        })
-    );
-    let b = bodies(&server).await;
-    assert_eq!(b.len(), 3);
-    assert_eq!(b[1]["previous_response_id"], "resp_1");
-    assert!(b[2].get("previous_response_id").is_none());
-    assert_eq!(b[2]["input"].as_array().unwrap().len(), 3);
-}
-
 #[test]
 fn user_image_content_becomes_input_image_data_url() {
     let req = req_of(vec![msg(
@@ -575,7 +481,7 @@ fn user_image_content_becomes_input_image_data_url() {
             },
         ],
     )]);
-    let w = to_wire(&req, None);
+    let w = to_wire(&req);
     assert_eq!(
         w["input"],
         json!([{"role":"user","content":[
@@ -583,4 +489,104 @@ fn user_image_content_becomes_input_image_data_url() {
             {"type":"input_image","image_url":"data:image/png;base64,AQID"},
         ]}])
     );
+}
+
+#[tokio::test]
+async fn encrypted_reasoning_item_round_trips_into_the_next_request() {
+    let server = serve(sse(fixture("reasoning_encrypted.sse"))).await;
+    let evs = ok(run(&server).await);
+    // The summary still streams for display; the item itself arrives as opaque reasoning.
+    assert_eq!(
+        evs[0],
+        ProviderEvent::ReasoningDelta("Need the file.".into())
+    );
+    let data = evs
+        .iter()
+        .find_map(|e| match e {
+            ProviderEvent::RedactedReasoning(d) => Some(d.clone()),
+            _ => None,
+        })
+        .expect("a reasoning item event");
+    let pos = |pred: &dyn Fn(&ProviderEvent) -> bool| evs.iter().position(pred).unwrap();
+    assert!(
+        pos(&|e| matches!(e, ProviderEvent::RedactedReasoning(_)))
+            < pos(&|e| matches!(e, ProviderEvent::ToolCall { .. }))
+    );
+
+    // The engine stores what it received, in order, and sends it back.
+    let next = req_of(vec![
+        msg(Role::User, vec![text("q")]),
+        msg(
+            Role::Assistant,
+            vec![
+                Content::RedactedReasoning { data },
+                Content::ToolUse {
+                    id: "call_9".into(),
+                    name: "read_file".into(),
+                    input: json!({"path": "a.rs"}),
+                },
+            ],
+        ),
+        msg(
+            Role::User,
+            vec![Content::ToolResult {
+                id: "call_9".into(),
+                output: "body".into(),
+                is_error: false,
+            }],
+        ),
+    ]);
+    let w = to_wire(&next);
+    assert_eq!(
+        w["input"],
+        json!([
+            {"role":"user","content":[{"type":"input_text","text":"q"}]},
+            {"type":"reasoning","id":"rs_9","encrypted_content":"ENC==",
+             "summary":[{"type":"summary_text","text":"Need the file."}]},
+            {"type":"function_call","call_id":"call_9","name":"read_file","arguments":"{\"path\":\"a.rs\"}"},
+            {"type":"function_call_output","call_id":"call_9","output":"body"},
+        ])
+    );
+}
+
+#[test]
+fn foreign_redacted_reasoning_is_not_sent_to_openai() {
+    let req = req_of(vec![
+        msg(Role::User, vec![text("q")]),
+        msg(
+            Role::Assistant,
+            vec![
+                Content::RedactedReasoning {
+                    data: "anthropic-opaque".into(),
+                },
+                text("a"),
+            ],
+        ),
+    ]);
+    let w = to_wire(&req);
+    assert_eq!(w["input"].as_array().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn requests_are_stateless_and_never_reference_a_previous_response() {
+    let server = serve(sse(fixture("text.sse"))).await;
+    let p = provider(&server);
+    for turn in 0..3 {
+        let mut messages = vec![msg(Role::User, vec![text("q")])];
+        for i in 0..turn {
+            messages.push(msg(Role::Assistant, vec![text("Hello")]));
+            messages.push(msg(Role::User, vec![text(&format!("n{i}"))]));
+        }
+        p.stream(req_of(messages), CancellationToken::new())
+            .collect::<Vec<_>>()
+            .await;
+    }
+    let b = bodies(&server).await;
+    assert_eq!(b.len(), 3);
+    for (i, body) in b.iter().enumerate() {
+        assert!(body.get("previous_response_id").is_none(), "{body}");
+        assert_eq!(body["store"], false);
+        assert_eq!(body["include"], json!(["reasoning.encrypted_content"]));
+        assert_eq!(body["input"].as_array().unwrap().len(), 1 + 2 * i);
+    }
 }

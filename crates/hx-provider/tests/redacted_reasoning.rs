@@ -31,7 +31,7 @@ fn req(model: &str) -> CanonicalRequest {
 #[test]
 fn non_anthropic_adapters_drop_redacted_reasoning() {
     let bodies = [
-        openai::to_wire(&req("openai/gpt-5"), None),
+        openai::to_wire(&req("openai/gpt-5")),
         google::to_wire(&req("google/gemini-2.5-pro")),
         compat::to_wire(&req("compat:x/m")),
     ];

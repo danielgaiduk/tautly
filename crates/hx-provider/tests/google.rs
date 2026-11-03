@@ -568,3 +568,70 @@ async fn thought_signature_emits_event_before_its_part() {
         ]
     );
 }
+
+fn tool_result(id: &str, out: &str) -> Content {
+    Content::ToolResult {
+        id: id.into(),
+        output: out.into(),
+        is_error: false,
+    }
+}
+
+#[test]
+fn consecutive_same_role_messages_merge_into_one_turn() {
+    // History ending in tool results followed by the working-state tail.
+    let req = req_of(vec![
+        msg(Role::User, vec![text("q")]),
+        msg(
+            Role::Assistant,
+            vec![Content::ToolUse {
+                id: "c1".into(),
+                name: "read_file".into(),
+                input: json!({"path": "a"}),
+            }],
+        ),
+        msg(Role::User, vec![tool_result("c1", "body")]),
+        msg(Role::User, vec![text("<working_state>s</working_state>")]),
+    ]);
+    let w = to_wire(&req);
+    let contents = w["contents"].as_array().unwrap();
+    assert_eq!(contents.len(), 3, "{contents:?}");
+    assert_eq!(contents[2]["role"], "user");
+    let parts = contents[2]["parts"].as_array().unwrap();
+    assert_eq!(parts.len(), 2);
+    assert!(parts[0].get("functionResponse").is_some());
+    assert_eq!(parts[1]["text"], "<working_state>s</working_state>");
+
+    // First request of a turn: prompt followed by the state tail.
+    let req = req_of(vec![
+        msg(Role::User, vec![text("prompt")]),
+        msg(Role::User, vec![text("state")]),
+    ]);
+    let w = to_wire(&req);
+    let contents = w["contents"].as_array().unwrap();
+    assert_eq!(contents.len(), 1);
+    assert_eq!(
+        contents[0]["parts"],
+        json!([{"text": "prompt"}, {"text": "state"}])
+    );
+}
+
+#[test]
+fn merge_keeps_function_responses_first_when_text_precedes_them() {
+    let req = req_of(vec![
+        msg(
+            Role::Assistant,
+            vec![Content::ToolUse {
+                id: "c1".into(),
+                name: "read_file".into(),
+                input: json!({}),
+            }],
+        ),
+        msg(Role::User, vec![text("early")]),
+        msg(Role::User, vec![tool_result("c1", "body")]),
+    ]);
+    let w = to_wire(&req);
+    let parts = &w["contents"][1]["parts"];
+    assert!(parts[0].get("functionResponse").is_some(), "{parts}");
+    assert_eq!(parts[1]["text"], "early");
+}

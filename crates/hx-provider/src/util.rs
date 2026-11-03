@@ -4,7 +4,7 @@ use std::time::{Duration, SystemTime};
 
 use reqwest::header::HeaderMap;
 
-use crate::{ProviderError, Quota};
+use crate::{Message, ProviderError, Quota};
 
 pub(crate) fn header_u64(h: &HeaderMap, name: &str) -> Option<u64> {
     h.get(name)?.to_str().ok()?.trim().parse().ok()
@@ -13,6 +13,20 @@ pub(crate) fn header_u64(h: &HeaderMap, name: &str) -> Option<u64> {
 /// The `retry-after` header in seconds, if present.
 pub(crate) fn retry_after(h: &HeaderMap) -> Option<Duration> {
     header_u64(h, "retry-after").map(Duration::from_secs)
+}
+
+/// Consecutive messages with the same role joined into one (content concatenated in order).
+/// The engine's working-state tail is a separate user message after tool results or the
+/// prompt; APIs and chat templates that need alternating roles get a single turn instead.
+pub(crate) fn merge_same_role(messages: &[Message]) -> Vec<Message> {
+    let mut out: Vec<Message> = Vec::with_capacity(messages.len());
+    for m in messages {
+        match out.last_mut() {
+            Some(last) if last.role == m.role => last.content.extend(m.content.iter().cloned()),
+            _ => out.push(m.clone()),
+        }
+    }
+    out
 }
 
 pub(crate) fn transient(msg: impl Into<String>) -> ProviderError {

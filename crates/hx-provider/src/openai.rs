@@ -1,13 +1,16 @@
 //! OpenAI Responses API adapter.
 //!
-//! Requests are sent with `store: true` so that a later request can continue from the stored
-//! response via `previous_response_id` and send only the items added since. The provider
-//! remembers the last response id together with a hash of the input items that response
-//! covers (everything we sent plus the assistant output it produced); reuse happens only when
-//! the next request starts with exactly those items.
+//! Requests are stateless: `store: false`, the full input is sent every time, and
+//! `include: ["reasoning.encrypted_content"]` makes reasoning items come back encrypted so
+//! they can be replayed. Each reasoning output item (`id`, `encrypted_content`, `summary`)
+//! is surfaced as a [`ProviderEvent::RedactedReasoning`] whose data is that item as JSON,
+//! stored as [`Content::RedactedReasoning`], and sent back as a `reasoning` input item in
+//! its original position. `previous_response_id` is never used: the engine's per-request
+//! working-state tail means a stored response could not be continued anyway, and nothing
+//! stays on OpenAI's side. Automatic prefix caching still applies to the repeated prefix.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use base64::{Engine, engine::general_purpose::STANDARD};
@@ -24,16 +27,12 @@ use crate::{
     ProviderEvent, RawUsage, Reasoning, Role, StopReason,
 };
 
-/// Last completed response: id, blake3 of the serialized input items it covers, item count.
-type LastResponse = Option<(String, [u8; 32], usize)>;
-
 #[derive(Clone)]
 pub struct OpenAiProvider {
     client: reqwest::Client,
     api_key: String,
     base_url: Url,
     catalog: Arc<Catalog>,
-    last: Arc<Mutex<LastResponse>>,
 }
 
 impl OpenAiProvider {
@@ -47,7 +46,6 @@ impl OpenAiProvider {
             api_key,
             base_url,
             catalog,
-            last: Arc::default(),
         }
     }
 
@@ -83,8 +81,15 @@ fn tool_call_item(id: &str, name: &str, input: &Value) -> Value {
     json!({"type": "function_call", "call_id": id, "name": name, "arguments": input.to_string()})
 }
 
-/// Convert canonical messages into Responses `input` items. Reasoning content is dropped: the
-/// API has no signature equivalent to send it back with.
+/// The `reasoning` input item stored in `data` (see the module doc), if it is one. Opaque
+/// reasoning from other providers is not.
+fn reasoning_item(data: &str) -> Option<Value> {
+    let v: Value = serde_json::from_str(data).ok()?;
+    (v["type"] == "reasoning" && v["encrypted_content"].is_string()).then_some(v)
+}
+
+/// Convert canonical messages into Responses `input` items. Plain reasoning text is dropped
+/// (it is only a summary); opaque reasoning items are replayed in place.
 fn input_items(messages: &[Message]) -> Vec<Value> {
     let mut items = Vec::new();
     for m in messages {
@@ -103,9 +108,14 @@ fn input_items(messages: &[Message]) -> Vec<Value> {
                         flush(&mut text, &mut items);
                         items.push(tool_call_item(id, name, input));
                     }
+                    Content::RedactedReasoning { data } => {
+                        if let Some(item) = reasoning_item(data) {
+                            flush(&mut text, &mut items);
+                            items.push(item);
+                        }
+                    }
                     Content::ToolResult { .. }
                     | Content::Reasoning { .. }
-                    | Content::RedactedReasoning { .. }
                     | Content::Image { .. } => {}
                 }
             }
@@ -144,12 +154,7 @@ fn input_items(messages: &[Message]) -> Vec<Value> {
     items
 }
 
-fn hash_items(items: &[Value]) -> [u8; 32] {
-    let bytes = serde_json::to_vec(items).expect("JSON values serialize");
-    *blake3::hash(&bytes).as_bytes()
-}
-
-fn build_body(req: &CanonicalRequest, input: &[Value], prev: Option<&str>) -> Value {
+fn build_body(req: &CanonicalRequest, input: &[Value]) -> Value {
     let instructions = req
         .system
         .iter()
@@ -162,8 +167,8 @@ fn build_body(req: &CanonicalRequest, input: &[Value], prev: Option<&str>) -> Va
     let mut body = json!({
         "model": req.model.model(),
         "stream": true,
-        // Required for the response to be usable as `previous_response_id` later.
-        "store": true,
+        "store": false,
+        "include": ["reasoning.encrypted_content"],
         "max_output_tokens": req.max_output,
         "input": input,
     });
@@ -186,16 +191,12 @@ fn build_body(req: &CanonicalRequest, input: &[Value], prev: Option<&str>) -> Va
         }
         None => {}
     }
-    if let Some(id) = prev {
-        body["previous_response_id"] = id.into();
-    }
     body
 }
 
-/// Build the Responses API request body from all of `req.messages`. With `prev`, the caller
-/// is continuing a stored response and must pass a request holding only the new messages.
-pub fn to_wire(req: &CanonicalRequest, prev: Option<&str>) -> Value {
-    build_body(req, &input_items(&req.messages), prev)
+/// Build the Responses API request body from all of `req.messages`.
+pub fn to_wire(req: &CanonicalRequest) -> Value {
+    build_body(req, &input_items(&req.messages))
 }
 
 fn error_parts(body: &str) -> (Option<String>, String) {
@@ -252,18 +253,9 @@ struct Call {
 /// Per-response state machine turning Responses SSE payloads into canonical events.
 #[derive(Default)]
 struct StreamState {
-    response_id: Option<String>,
     calls: HashMap<u64, Call>,
     emitted: HashSet<u64>,
-    text: String,
-    /// Assistant output so far, in canonical form (used to extend the reuse hash).
-    output: Vec<Content>,
     has_calls: bool,
-}
-
-struct Finished {
-    response_id: Option<String>,
-    output_items: Vec<Value>,
 }
 
 fn s(v: &Value, k: &str) -> String {
@@ -271,30 +263,16 @@ fn s(v: &Value, k: &str) -> String {
 }
 
 impl StreamState {
-    fn flush_text(&mut self) {
-        if !self.text.is_empty() {
-            self.output
-                .push(Content::Text(std::mem::take(&mut self.text)));
-        }
-    }
-
     fn emit_call(&mut self, index: u64, call: Call, out: &mut Vec<ProviderEvent>) {
         if !self.emitted.insert(index) {
             return;
         }
-        self.flush_text();
         self.has_calls = true;
         let input_json = if call.args.trim().is_empty() {
             "{}".to_string()
         } else {
             call.args
         };
-        let input = serde_json::from_str(&input_json).unwrap_or(Value::Null);
-        self.output.push(Content::ToolUse {
-            id: call.id.clone(),
-            name: call.name.clone(),
-            input,
-        });
         out.push(ProviderEvent::ToolCall {
             id: call.id,
             name: call.name,
@@ -302,8 +280,7 @@ impl StreamState {
         });
     }
 
-    fn finish(&mut self, resp: &Value) -> (Vec<ProviderEvent>, Option<Finished>) {
-        self.flush_text();
+    fn finish(&mut self, resp: &Value) -> Vec<ProviderEvent> {
         let u = &resp["usage"];
         let total_in = u["input_tokens"].as_u64().unwrap_or(0);
         let cached = u["input_tokens_details"]["cached_tokens"]
@@ -325,30 +302,16 @@ impl StreamState {
         } else {
             StopReason::EndTurn
         };
-        let output_items = input_items(&[Message {
-            role: Role::Assistant,
-            content: std::mem::take(&mut self.output),
-        }]);
-        (
-            vec![ProviderEvent::Usage(usage), ProviderEvent::Done { stop }],
-            Some(Finished {
-                response_id: self.response_id.take(),
-                output_items,
-            }),
-        )
+        vec![ProviderEvent::Usage(usage), ProviderEvent::Done { stop }]
     }
 
     /// Returns the events for one SSE payload; `Some` means the response ended.
-    fn handle(
-        &mut self,
-        data: &str,
-    ) -> Result<(Vec<ProviderEvent>, Option<Finished>), ProviderError> {
+    fn handle(&mut self, data: &str) -> Result<(Vec<ProviderEvent>, bool), ProviderError> {
         let v: Value = serde_json::from_str(data)
             .map_err(|e| ProviderError::Other(format!("invalid SSE payload: {e}")))?;
         let index = v["output_index"].as_u64().unwrap_or(0);
         let mut out = Vec::new();
         match v["type"].as_str().unwrap_or_default() {
-            "response.created" => self.response_id = v["response"]["id"].as_str().map(String::from),
             "response.output_item.added" => {
                 let item = &v["item"];
                 if item["type"] == "function_call" {
@@ -363,9 +326,7 @@ impl StreamState {
                 }
             }
             "response.output_text.delta" => {
-                let d = s(&v, "delta");
-                self.text.push_str(&d);
-                out.push(ProviderEvent::TextDelta(d));
+                out.push(ProviderEvent::TextDelta(s(&v, "delta")));
             }
             "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => {
                 out.push(ProviderEvent::ReasoningDelta(s(&v, "delta")))
@@ -403,11 +364,21 @@ impl StreamState {
                         };
                         self.emit_call(index, call, &mut out);
                     }
-                    "message" => self.flush_text(),
+                    "reasoning" if item["encrypted_content"].is_string() => {
+                        let replay = json!({
+                            "type": "reasoning",
+                            "id": item["id"],
+                            "encrypted_content": item["encrypted_content"],
+                            "summary": item.get("summary").cloned().unwrap_or_else(|| json!([])),
+                        });
+                        out.push(ProviderEvent::RedactedReasoning(replay.to_string()));
+                    }
                     _ => {}
                 }
             }
-            "response.completed" | "response.incomplete" => return Ok(self.finish(&v["response"])),
+            "response.completed" | "response.incomplete" => {
+                return Ok((self.finish(&v["response"]), true));
+            }
             "response.failed" => {
                 let e = &v["response"]["error"];
                 return Err(map_stream_error(
@@ -429,7 +400,7 @@ impl StreamState {
             // Unknown and bookkeeping events carry nothing the canonical stream models.
             _ => {}
         }
-        Ok((out, None))
+        Ok((out, false))
     }
 }
 
@@ -456,24 +427,10 @@ impl Provider for OpenAiProvider {
             }));
         }
         let this = self.clone();
-        let items = input_items(&req.messages);
+        let body = to_wire(&req);
 
         Box::pin(async_stream::stream! {
-            // Continue the stored response only when this request starts with exactly the
-            // items it covers.
-            let reusable = this
-                .last
-                .lock()
-                .expect("last-response lock")
-                .clone()
-                .filter(|(_, hash, n)| *n <= items.len() && hash_items(&items[..*n]) == *hash);
-            let mut reuse = reusable.map(|(id, _, n)| (id, n));
-
-            let resp = loop {
-                let body = match &reuse {
-                    Some((id, n)) => build_body(&req, &items[*n..], Some(id)),
-                    None => build_body(&req, &items, None),
-                };
+            let resp = {
                 let builder = this
                     .client
                     .post(this.endpoint())
@@ -492,19 +449,13 @@ impl Provider for OpenAiProvider {
                     }
                 };
                 let status = resp.status();
-                if status.is_success() {
-                    break resp;
+                if !status.is_success() {
+                    let retry_after = retry_after(resp.headers());
+                    let text = resp.text().await.unwrap_or_default();
+                    yield Err(map_http_error(status.as_u16(), retry_after, &text));
+                    return;
                 }
-                let retry_after = retry_after(resp.headers());
-                let text = resp.text().await.unwrap_or_default();
-                if reuse.is_some() && text.contains("previous_response_not_found") {
-                    // The stored response expired or was deleted: resend the full history.
-                    *this.last.lock().expect("last-response lock") = None;
-                    reuse = None;
-                    continue;
-                }
-                yield Err(map_http_error(status.as_u16(), retry_after, &text));
-                return;
+                resp
             };
             if let Some(q) = openai_quota_from_headers(resp.headers()) {
                 yield Ok(ProviderEvent::Quota(q));
@@ -533,13 +484,7 @@ impl Provider for OpenAiProvider {
                         for e in out {
                             yield Ok(e);
                         }
-                        if let Some(f) = finished {
-                            if let Some(id) = f.response_id {
-                                let mut covered = items.clone();
-                                covered.extend(f.output_items);
-                                *this.last.lock().expect("last-response lock") =
-                                    Some((id, hash_items(&covered), covered.len()));
-                            }
+                        if finished {
                             return;
                         }
                     }

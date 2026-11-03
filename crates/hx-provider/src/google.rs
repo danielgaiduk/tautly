@@ -18,7 +18,7 @@ use tokio_util::sync::CancellationToken;
 use url::Url;
 
 use crate::sse::try_events;
-use crate::util::{retry_after, transient};
+use crate::util::{merge_same_role, retry_after, transient};
 use crate::{
     Block, CanonicalRequest, Catalog, Content, Effort, Provider, ProviderError, ProviderEvent,
     RawUsage, Reasoning, Role, StopReason,
@@ -120,7 +120,7 @@ pub fn to_wire(req: &CanonicalRequest) -> Value {
     // most recent call.
     let mut names: HashMap<&str, &str> = HashMap::new();
     let mut contents: Vec<Value> = Vec::new();
-    for m in &req.messages {
+    for m in &merge_same_role(&req.messages) {
         let mut responses = Vec::new();
         let mut parts = Vec::new();
         // Signature of the reasoning block just seen; it belongs to the next text/call part.
