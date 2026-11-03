@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use tautly_index::{Index, WatchHandle};
-use tautly_memory::MemoryStore;
+use tautly_memory::{MemoryStore, sanitize_title};
 use tautly_sandbox::Sandbox;
 use tokio::sync::watch;
 
@@ -102,10 +102,17 @@ impl Workspace {
                 match opened {
                     Ok(Ok(store)) => {
                         let skipped = store.skipped_count();
-                        if skipped > 0 {
+                        if let (true, Some((path, _))) = (skipped > 0, store.skipped().first()) {
+                            // The file's name only: its text and the reason (which may
+                            // quote it) are the repository's, and the path is local.
+                            // (`sanitize_title` also clips it to 120 characters.)
+                            let name = path
+                                .file_name()
+                                .map(|n| sanitize_title(&n.to_string_lossy()))
+                                .unwrap_or_default();
                             warnings.push(format!(
-                                "{skipped} memory entr{} could not be loaded",
-                                if skipped == 1 { "y" } else { "ies" }
+                                "{skipped} memory entr{} could not be loaded (first: {name})",
+                                if skipped == 1 { "y" } else { "ies" },
                             ));
                         }
                         Some(Arc::new(RwLock::new(store)))

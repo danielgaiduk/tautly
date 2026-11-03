@@ -7,6 +7,7 @@ use serde_json::json;
 
 use crate::entry::{check_id, sanitize_title};
 use crate::stale;
+use crate::vault::{clean_tags, parse_links};
 use crate::{
     MAX_BODY_TOKENS, MemAnchor, MemoryChange, MemoryEntry, MemoryError, MemoryKind, MemoryStore,
 };
@@ -46,6 +47,14 @@ impl MemoryStore {
     /// [`MAX_PROMPT_TOKENS`] of entries, verified and newer ones first; the prompt says how
     /// many were left out.
     pub fn consolidation_request(&self) -> String {
+        self.consolidation_request_within(MAX_PROMPT_TOKENS)
+    }
+
+    /// [`consolidation_request`](Self::consolidation_request) with at most `max_tokens`
+    /// (and never more than [`MAX_PROMPT_TOKENS`]) of entries: for a side model with a
+    /// smaller window.
+    pub fn consolidation_request_within(&self, max_tokens: u32) -> String {
+        let max_bytes = max_tokens.min(MAX_PROMPT_TOKENS) as usize * 4;
         let mut order: Vec<usize> = (0..self.entries.len()).collect();
         order.sort_by(|&a, &b| {
             let (x, y) = (&self.entries[a], &self.entries[b]);
@@ -68,7 +77,7 @@ impl MemoryStore {
             });
             // Pretty printing indents each line; 24 bytes covers it.
             let size = serde_json::to_string_pretty(&value).map_or(0, |t| t.len()) + 24;
-            if used + size > MAX_PROMPT_TOKENS as usize * 4 {
+            if used + size > max_bytes {
                 continue;
             }
             used += size;
@@ -179,7 +188,9 @@ impl MemoryStore {
                             anchors,
                             created: sources[0].created,
                             verified: None,
+                            tags: clean_tags(sources.iter().flat_map(|e| e.tags.iter().cloned())),
                             body: body.to_string(),
+                            links: parse_links(body),
                             stale,
                         }),
                         delete: merge,

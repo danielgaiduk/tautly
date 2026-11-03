@@ -66,6 +66,8 @@ struct RememberArgs {
     kind: MemoryKind,
     body: String,
     #[serde(default)]
+    tags: Vec<String>,
+    #[serde(default)]
     anchors: Vec<AnchorArg>,
 }
 
@@ -83,6 +85,7 @@ pub(crate) fn parse_remember(args: &Value) -> Result<MemoryDraft, ToolError> {
         id: a.id,
         title: a.title,
         kind: a.kind,
+        tags: a.tags,
         anchors: a.anchors.into_iter().map(|x| (x.path, x.symbol)).collect(),
         body: a.body,
     })
@@ -98,8 +101,9 @@ impl Tool for RecallTool {
         tool_spec(
             "recall",
             "Search the project's memory (saved conventions, facts, gotchas, commands) and \
-             notes from earlier sessions. Returns the best 5 matches. A match marked STALE \
-             is about code that has changed since it was written: check it before relying on it.",
+             notes from earlier sessions. Returns the best 5 matches, then the entries they \
+             link to with [[title]]. A match marked STALE is about code that has changed \
+             since it was written: check it before relying on it.",
             json!({
                 "type": "object",
                 "properties": {
@@ -211,7 +215,10 @@ fn format_hits(hits: &[Hit], staleness_note: Option<&str>) -> String {
         let head = match (&h.source, h.kind) {
             (HitSource::Project(id), kind) => {
                 let kind = kind.map_or("note", |k| k.as_str());
-                format!("[{kind}] {title} (id: {id})")
+                match &h.linked_from {
+                    Some(from) => format!("[{kind}] {title} (id: {id}), linked from {from}"),
+                    None => format!("[{kind}] {title} (id: {id})"),
+                }
             }
             (HitSource::Episode(session), _) => {
                 format!("{title} (earlier session {session})")
@@ -244,13 +251,20 @@ impl Tool for RememberTool {
              Use it when the user corrects you or states a convention, or when you learn a \
              lasting fact, gotcha or command. Keep the body short (under 300 tokens) and \
              anchor it to the code it is about, so it can be flagged when that code changes. \
-             Pass `id` to update an existing entry; its anchors are kept unless you give new ones.",
+             Link related entries with [[their title]] in the body (saved as \
+             [[file-name|title]], which Obsidian resolves). Pass `id` to update an \
+             existing entry; its anchors are kept unless you give new ones.",
             json!({
                 "type": "object",
                 "properties": {
                     "title": {"type": "string", "description": "One-line summary."},
                     "kind": {"type": "string", "enum": ["convention", "fact", "gotcha", "command"]},
                     "body": {"type": "string", "description": "The note, under 300 tokens."},
+                    "tags": {
+                        "type": "array",
+                        "description": "Short topic tags, such as `build` or `testing`.",
+                        "items": {"type": "string"}
+                    },
                     "anchors": {
                         "type": "array",
                         "description": "Code the note is about.",

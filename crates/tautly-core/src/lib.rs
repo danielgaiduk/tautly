@@ -14,6 +14,7 @@ pub mod engine;
 pub mod evidence;
 pub mod ledger;
 pub mod mcp;
+mod memory;
 mod model_switch;
 pub mod protocol;
 mod provider_setup;
@@ -39,7 +40,7 @@ pub use ledger::{Ledger, LedgerError, Totals};
 pub use mcp::{Approval, McpPlan, NoPreExec, PlannedServer, PreExecHook, plan_servers};
 pub use protocol::{
     BudgetScope, Command, DiffFile, DiffStatus, EffectView, ErrorKind, Event, FinishReason,
-    McpState, PROTOCOL_VERSION, ToolMetaView, UsageRole,
+    MAX_REPLACED_SHOWN, McpState, PROTOCOL_VERSION, ToolMetaView, UsageRole,
 };
 pub use provider_setup::{ProviderFactory, ProviderSetupError, provider_label};
 pub use record::SessionRecord;

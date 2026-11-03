@@ -74,6 +74,7 @@ fn add(e: &Env, title: &str, body: &str, anchored: bool) -> String {
         id: None,
         title: title.into(),
         kind: MemoryKind::Fact,
+        tags: vec![],
         anchors,
         body: body.into(),
     };
@@ -103,6 +104,7 @@ async fn remember_tool_emits_context_op_and_writes_nothing() {
         id: None,
         title: "Use pnpm".into(),
         kind: MemoryKind::Convention,
+        tags: vec![],
         anchors: vec![
             (PathBuf::from("lib.rs"), Some("a".into())),
             (PathBuf::from("lib.rs"), None),
@@ -408,4 +410,37 @@ async fn recall_rechecks_only_the_anchors_of_its_hits() {
     // A hit with an anchor is checked, and the failure is reported.
     let r = run(&e, &RecallTool, json!({"query": "alpha"})).await;
     assert!(r.output.contains("could not be re-checked"), "{}", r.output);
+}
+
+#[tokio::test]
+async fn recall_shows_linked_entries_and_remember_takes_tags() {
+    let e = env(&[("lib.rs", "fn a(){1}")]).await;
+    let cache = add(&e, "Build cache", "Artifacts live in target/.", false);
+    let hit = add(
+        &e,
+        "Release checklist",
+        "Zebra step. See [[Build cache]].",
+        false,
+    );
+    let r = run(&e, &RecallTool, json!({"query": "zebra"})).await;
+    assert!(!r.is_error, "{}", r.output);
+    let lines = hit_lines(&r.output);
+    assert_eq!(lines.len(), 2, "{}", r.output);
+    assert!(lines[0].contains(&format!("(id: {hit})")), "{}", r.output);
+    assert!(
+        lines[1].contains(&format!("(id: {cache}), linked from {hit}")),
+        "{}",
+        r.output
+    );
+    assert!(r.output.contains("Artifacts live"), "{}", r.output);
+
+    let args = json!({
+        "title": "Use pnpm", "kind": "convention", "body": "pnpm only.",
+        "tags": ["build", "#js"]
+    });
+    assert!(!remember(&e, args.clone()).await.is_error);
+    match parse_context_op("remember", &args) {
+        Some(ContextOp::Remember(d)) => assert_eq!(d.tags, ["build", "#js"]),
+        other => panic!("{other:?}"),
+    }
 }

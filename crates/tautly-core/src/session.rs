@@ -23,6 +23,7 @@ use crate::budget::Budgets;
 use crate::evidence::EvidenceTracker;
 use crate::ledger::CostLedger;
 use crate::mcp::{McpSession, PreExecHook};
+use crate::memory::MemoryState;
 use crate::model_switch::ModelSetup;
 use crate::protocol::{Command, ErrorKind, Event};
 use crate::record::{BlockHashes, LoggedPin, SessionRecord};
@@ -32,8 +33,6 @@ use crate::workspace::Workspace;
 /// How long the first request waits for the repo map and the memory index (Task 38 note):
 /// past this the slots stay empty for the session, so the stable prefix never changes.
 const STARTUP_WAIT: Duration = Duration::from_millis(300);
-/// Tokens of the memory index block (spec 7.4).
-const MEMORY_INDEX_TOKENS: u32 = 500;
 /// Spill files older than this are removed at engine start.
 const SPILL_MAX_AGE: Duration = Duration::from_secs(7 * 24 * 3600);
 /// The spill store is cut back to this size at engine start.
@@ -275,11 +274,14 @@ impl LogFailure {
 }
 
 /// The stable-prefix parts that need the code index: built in the background at session
-/// start and taken by the first request if ready within [`STARTUP_WAIT`].
+/// start and taken by the first request if ready within [`STARTUP_WAIT`]. The memory index
+/// is rendered when it is taken, from a store whose staleness was checked once the index
+/// was ready.
 #[derive(Default)]
 pub(crate) struct Prefix {
     pub repo_map: Option<String>,
-    pub memory_index: Option<String>,
+    /// The memory store is open and its staleness checked.
+    pub memory_live: bool,
 }
 
 /// The background start-up work of one session; dropping it stops the work.
@@ -320,8 +322,10 @@ pub(crate) struct Session {
     /// The latest compaction, for `Uncompact` (Task 26); older ones live only in the log.
     pub latest_compaction: Option<CompactionRecord>,
     /// A memory index text waiting for the next cache epoch (spec 7.4/7.7). Set by the
-    /// memory flows (Task 28); applied, and logged as `MemoryIndexApplied`, at an epoch.
+    /// memory flows (`memory.rs`); applied, and logged as `MemoryIndexApplied`, at an epoch.
     pub pending_memory_index: Option<String>,
+    /// Proposals, staleness and episodes (`memory.rs`).
+    pub memory: MemoryState,
     /// Configuration, catalog and provider factory for `SetModel` (`model_switch.rs`).
     pub setup: ModelSetup,
     /// Set by a switch within one provider: the next request, if refused for its
@@ -580,31 +584,25 @@ impl Session {
             .await
             .ok()
             .flatten();
-            let memory = match opened.memory.clone() {
+            // Staleness is checked once the index is ready, before the first index block.
+            let checked = match opened.memory.clone() {
                 Some(store) => tokio::task::spawn_blocking(move || {
                     let mut store = store.write().unwrap_or_else(PoisonError::into_inner);
                     store.refresh_staleness();
-                    let error = store.staleness_error().map(str::to_string);
-                    let (text, _over) =
-                        store.index_block(MEMORY_INDEX_TOKENS, &|s| tokens.estimate(s));
-                    (text, error)
+                    store.staleness_error().map(str::to_string)
                 })
                 .await
                 .ok(),
                 None => None,
             };
-            let mut memory_index = None;
-            if let Some((text, error)) = memory {
-                if let Some(e) = error {
-                    events
-                        .warn(format!("memory staleness could not be checked: {e}"))
-                        .await;
-                }
-                memory_index = Some(text).filter(|t| !t.trim().is_empty());
+            if let Some(Some(e)) = &checked {
+                events
+                    .warn(format!("memory staleness could not be checked: {e}"))
+                    .await;
             }
             let _ = tx.send(Prefix {
                 repo_map: map,
-                memory_index,
+                memory_live: checked.is_some(),
             });
         });
         Startup {
@@ -622,9 +620,12 @@ impl Session {
         match tokio::time::timeout(STARTUP_WAIT, rx).await {
             Ok(Ok(prefix)) => {
                 self.context.repo_map = prefix.repo_map;
-                if let Some(text) = prefix.memory_index {
-                    self.context.memory_index = Some(text.clone());
-                    self.log(SessionRecord::MemoryIndexApplied { text }).await;
+                if prefix.memory_live {
+                    self.memory.live = true;
+                    if let Some(text) = self.first_memory_index().await {
+                        self.context.memory_index = Some(text.clone());
+                        self.log(SessionRecord::MemoryIndexApplied { text }).await;
+                    }
                 }
             }
             _ => {
@@ -656,11 +657,17 @@ impl Session {
         }
     }
 
-    /// A command that changes the context, applied between steps.
+    /// A command that changes the context or memory, applied between steps.
     pub async fn context_command(&mut self, cmd: Command) {
         match cmd {
             Command::Pin { text } => self.user_pin(text).await,
             Command::Unpin { text } => self.unpin(&text).await,
+            Command::ApproveMemory { proposal_id } => {
+                self.memory_decision(&proposal_id, true).await
+            }
+            Command::RejectMemory { proposal_id } => {
+                self.memory_decision(&proposal_id, false).await
+            }
             _ => {}
         }
     }

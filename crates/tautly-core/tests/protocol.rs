@@ -25,6 +25,8 @@ fn memory_change() -> MemoryChange {
             created: UNIX_EPOCH + Duration::from_secs(1_700_000_000),
             verified: None,
             body: "cargo build --workspace".into(),
+            tags: vec![],
+            links: vec![],
             stale: false,
         }),
         delete: vec!["old-entry".into()],
@@ -136,6 +138,18 @@ fn every_event() -> Vec<Event> {
         Event::MemoryProposed {
             proposal_id: "prop_1".into(),
             change: memory_change(),
+            replaces: vec![MemoryEntry {
+                id: "old-entry".into(),
+                title: "Building".into(),
+                kind: MemoryKind::Command,
+                anchors: vec![],
+                created: UNIX_EPOCH + Duration::from_secs(1_690_000_000),
+                verified: Some(UNIX_EPOCH + Duration::from_secs(1_695_000_000)),
+                body: "make all".into(),
+                tags: vec!["build".into()],
+                links: vec![],
+                stale: false,
+            }],
         },
         Event::SessionChanged {
             session_id: "01J0SESSION".into(),
@@ -726,10 +740,16 @@ fn timestamps_are_unix_seconds_on_the_wire() {
     let v = serde_json::to_value(Event::MemoryProposed {
         proposal_id: "p".into(),
         change,
+        replaces: vec![],
     })
     .unwrap();
     assert_eq!(v["change"]["upsert"]["created"], 1_700_000_000_u64);
     assert_eq!(v["change"]["upsert"]["verified"], 1_700_000_100_u64);
+    // Nothing replaced: no `replaces`, and an event without it reads back as none.
+    assert!(v.get("replaces").is_none(), "{v}");
+    let back: Event = serde_json::from_value(v).unwrap();
+    assert!(matches!(back, Event::MemoryProposed { replaces, .. } if replaces.is_empty()));
+    assert_eq!(proposed["replaces"][0]["created"], 1_690_000_000_u64);
     // A client that omits optional timestamps is understood.
     let e: Event = serde_json::from_value(json!({
         "type": "usage", "role": "main", "tokens_in": 1, "tokens_out": 1,

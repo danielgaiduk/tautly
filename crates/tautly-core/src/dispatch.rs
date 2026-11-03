@@ -166,9 +166,9 @@ impl Session {
             };
             let mut finished = Vec::with_capacity(run.len());
             for (p, o) in run.iter().zip(outcomes) {
-                let (content, event) = self.finish(p.call, o, turn).await;
+                let (content, events) = self.finish(p.call, o, turn).await;
                 results.push(content);
-                finished.push(event);
+                finished.extend(events);
             }
             // One durability point per run, before any of its results is shown.
             self.checkpoint().await;
@@ -286,6 +286,7 @@ impl Session {
         }
         self.ledger
             .note_effects(&[AppliedEffect::Exec { may_write: true }]);
+        self.memory.refresh_due = true;
         self.evidence.on_lost_write();
         let list: Vec<String> = paths.iter().map(|p| p.display().to_string()).collect();
         self.warn(format!(
@@ -527,18 +528,23 @@ impl Session {
     }
 
     /// Settle one call's outcome in model order: its result for the history and its
-    /// `ToolFinished`, to be shown once the run is checkpointed.
-    async fn finish(&mut self, call: &Call, outcome: Outcome, turn: u32) -> (Content, Event) {
+    /// `ToolFinished` (then a `remember` call's `MemoryProposed`), to be shown once the run
+    /// is checkpointed.
+    async fn finish(&mut self, call: &Call, outcome: Outcome, turn: u32) -> (Content, Vec<Event>) {
         let Outcome {
             mut result,
             blocked,
             ran,
         } = outcome;
         let args = call.input();
+        let mut memory_events = Vec::new();
         if ran && !result.is_error {
             match parse_context_op(&call.name, &args) {
-                // Task 28: a `remember` proposal goes to the user (`MemoryProposed`) here.
-                Some(ContextOp::Remember(_)) | None => {}
+                // Only a `remember` whose result is not an error is proposed.
+                Some(ContextOp::Remember(draft)) => {
+                    memory_events = self.remember_call(draft, &mut result).await;
+                }
+                None => {}
                 Some(op) => {
                     if let Err(e) = self.context.apply_op(op) {
                         result.output = format!("not applied: {e}");
@@ -549,6 +555,7 @@ impl Session {
         }
         if ran {
             self.ledger.note_effects(&result.effects);
+            self.note_memory_effects(&result.effects);
             let raw_cmd = args.get("command").and_then(Value::as_str);
             self.evidence.on_tool(
                 turn,
@@ -607,7 +614,9 @@ impl Session {
                 .await;
             }
         }
-        (content, event)
+        let mut events = vec![event];
+        events.extend(memory_events);
+        (content, events)
     }
 }
 
