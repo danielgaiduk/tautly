@@ -152,6 +152,18 @@ impl Sandbox for LocalSandbox {
         .map_err(|e| SandboxError::Io(std::io::Error::other(e)))?
     }
 
+    async fn spill(&self, bytes: &[u8]) -> Result<PathBuf, SandboxError> {
+        let tmp = Path::new(".hx/tmp");
+        let ignore = tmp.join(".gitignore");
+        if !tokio::fs::try_exists(self.resolve(&ignore)?).await? {
+            self.write_atomic(&ignore, b"*", None).await?;
+        }
+        let hash = blake3::hash(bytes).to_hex();
+        let rel = tmp.join("spill").join(format!("{}.txt", &hash[..16]));
+        self.write_atomic(&rel, bytes, None).await?;
+        Ok(rel)
+    }
+
     async fn spawn(&self, spec: SpawnSpec) -> Result<Child, SandboxError> {
         let (prog, args) = spec
             .argv

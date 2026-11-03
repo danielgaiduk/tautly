@@ -165,3 +165,31 @@ async fn walker_with_follow_links_does_not_leave_root() {
     );
     assert!(names.iter().all(|p| p.starts_with(&root)));
 }
+
+#[tokio::test]
+async fn spill_is_content_addressed_relative_and_gitignored() {
+    let (t, sb) = sandbox();
+    let rel = sb.spill(b"hello spill").await.unwrap();
+    assert!(rel.is_relative(), "{rel:?}");
+    let hash = blake3::hash(b"hello spill").to_hex();
+    assert_eq!(
+        rel,
+        Path::new(".hx/tmp/spill").join(format!("{}.txt", &hash[..16]))
+    );
+    assert_eq!(sb.read(&rel).await.unwrap(), b"hello spill");
+    let gi = std::fs::read_to_string(t.path().join(".hx/tmp/.gitignore")).unwrap();
+    assert_eq!(gi, "*");
+    // Same content -> same path; different content -> different path.
+    assert_eq!(sb.spill(b"hello spill").await.unwrap(), rel);
+    assert_ne!(sb.spill(b"other").await.unwrap(), rel);
+}
+
+#[tokio::test]
+async fn spill_keeps_existing_gitignore() {
+    let (t, sb) = sandbox();
+    std::fs::create_dir_all(t.path().join(".hx/tmp")).unwrap();
+    std::fs::write(t.path().join(".hx/tmp/.gitignore"), "custom\n").unwrap();
+    sb.spill(b"x").await.unwrap();
+    let gi = std::fs::read_to_string(t.path().join(".hx/tmp/.gitignore")).unwrap();
+    assert_eq!(gi, "custom\n");
+}

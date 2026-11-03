@@ -60,6 +60,9 @@ pub trait Sandbox: Send + Sync {
         bytes: &[u8],
         mode: Option<u32>,
     ) -> Result<(), SandboxError>;
+    /// Persist `bytes` (e.g. over-long tool output) in a sandbox-managed scratch area and
+    /// return its root-relative path, so the model can `read` it later. Content-addressed.
+    async fn spill(&self, bytes: &[u8]) -> Result<PathBuf, SandboxError>;
     async fn spawn(&self, spec: SpawnSpec) -> Result<Child, SandboxError>;
     fn walker(&self, base: &Path) -> Result<ignore::WalkBuilder, SandboxError>;
     async fn http_get(&self, url: &Url) -> Result<HttpResponse, SandboxError>;

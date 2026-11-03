@@ -1,5 +1,6 @@
 //! The `Tool` trait, shared tool context, and the built-in read-side tools.
 
+mod bash;
 mod cap;
 mod glob;
 mod grep;
@@ -19,6 +20,7 @@ use serde_json::Value;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
+pub use bash::{BashTool, cap_output};
 pub use cap::cap_text;
 pub use glob::GlobTool;
 pub use grep::GrepTool;
@@ -160,5 +162,6 @@ pub fn registry(_caps: &Capabilities) -> Vec<Arc<dyn Tool>> {
         Arc::new(WriteTool),
         Arc::new(GrepTool),
         Arc::new(GlobTool),
+        Arc::new(BashTool),
     ]
 }

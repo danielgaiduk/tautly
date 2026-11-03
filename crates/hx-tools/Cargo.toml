@@ -18,6 +18,7 @@ serde_json.workspace = true
 blake3.workspace = true
 globset.workspace = true
 regex.workspace = true
+libc.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
