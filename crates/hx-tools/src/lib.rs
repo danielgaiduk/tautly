@@ -3,6 +3,7 @@
 mod bash;
 mod cap;
 pub mod edit;
+pub mod filters;
 mod find;
 mod glob;
 mod grep;

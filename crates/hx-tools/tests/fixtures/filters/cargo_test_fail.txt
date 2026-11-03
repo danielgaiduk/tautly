@@ -1,0 +1,62 @@
+   Compiling hx-core v0.1.0 (/home/dev/hx/crates/hx-core)
+warning: unused variable: `idx`
+  --> crates/hx-core/src/ledger.rs:42:9
+   |
+42 |     let idx = 3;
+   |         ^^^ help: if this is intentional, prefix it with an underscore: `_idx`
+   |
+   = note: `#[warn(unused_variables)]` on by default
+
+warning: `hx-core` (lib test) generated 1 warning (run `cargo fix --lib -p hx-core --tests` to apply 1 suggestion)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 3.84s
+     Running unittests src/lib.rs (target/debug/deps/hx_core-5f2c1a9d0e7b4c36)
+
+running 12 tests
+test budget::tests::allows_under_budget ... ok
+test budget::tests::rejects_over_budget ... FAILED
+test budget::tests::warns_at_eighty_percent ... ok
+test ledger::tests::appends_row ... ok
+test ledger::tests::reads_back_rows ... ok
+test ledger::tests::sums_by_model ... FAILED
+test ledger::tests::rejects_negative_cost ... ok
+test session::tests::round_trips_header ... ok
+test session::tests::skips_torn_tail ... ok
+test session::tests::truncates_on_rewind ... ok
+test session::tests::writes_blob_once ... ok
+test session::tests::resumes_after_compaction ... ok
+
+failures:
+
+---- budget::tests::rejects_over_budget stdout ----
+
+thread 'budget::tests::rejects_over_budget' panicked at crates/hx-core/src/budget.rs:88:9:
+assertion `left == right` failed: spending past the limit must fail
+  left: Ok(())
+ right: Err(OverBudget { limit: 500, spent: 612 })
+stack backtrace:
+   0: rust_begin_unwind
+             at /rustc/1b2c3d4e5f6071829304a5b6c7d8e9f001122334/library/std/src/panicking.rs:692:5
+   1: core::panicking::panic_fmt
+             at /rustc/1b2c3d4e5f6071829304a5b6c7d8e9f001122334/library/core/src/panicking.rs:75:14
+   2: core::panicking::assert_failed_inner
+             at /rustc/1b2c3d4e5f6071829304a5b6c7d8e9f001122334/library/core/src/panicking.rs:408:17
+   3: hx_core::budget::tests::rejects_over_budget
+             at ./src/budget.rs:88:9
+   4: hx_core::budget::tests::rejects_over_budget::{{closure}}
+             at ./src/budget.rs:80:34
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+---- ledger::tests::sums_by_model stdout ----
+
+thread 'ledger::tests::sums_by_model' panicked at crates/hx-core/src/ledger.rs:121:14:
+called `Result::unwrap()` on an `Err` value: Sqlite(SqliteFailure(Error { code: ConstraintViolation, extended_code: 1555 }, Some("UNIQUE constraint failed: rows.id")))
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    budget::tests::rejects_over_budget
+    ledger::tests::sums_by_model
+
+test result: FAILED. 10 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+
+error: test failed, to rerun pass `-p hx-core --lib`

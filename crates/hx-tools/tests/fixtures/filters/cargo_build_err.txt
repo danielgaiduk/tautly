@@ -1,0 +1,53 @@
+   Compiling hx-sandbox v0.1.0 (/home/dev/hx/crates/hx-sandbox)
+   Compiling hx-tools v0.1.0 (/home/dev/hx/crates/hx-tools)
+error[E0308]: mismatched types
+   --> crates/hx-tools/src/bash.rs:212:34
+    |
+212 |         let (text, spilled) = cap_output(&full, OUTPUT_CAP, sb);
+    |                                -------- ^^^^^^^^^^^^^^^^^^^^^^^ expected `(String, Option<PathBuf>)`, found future
+    |                                |
+    |                                arguments to this function are incorrect
+    |
+note: function defined here
+   --> crates/hx-tools/src/bash.rs:70:14
+    |
+70  | pub async fn cap_output(full: &str, cap: usize, sb: &dyn Sandbox) -> (String, Option<PathBuf>) {
+    |              ^^^^^^^^^^
+help: consider `await`ing on the `Future`
+    |
+212 |         let (text, spilled) = cap_output(&full, OUTPUT_CAP, sb).await;
+    |                                                                ++++++
+
+error[E0425]: cannot find value `trailer` in this scope
+   --> crates/hx-tools/src/bash.rs:224:25
+    |
+224 |         text.push_str(&trailer);
+    |                         ^^^^^^^ not found in this scope
+    |
+help: a local variable with a similar name exists
+    |
+224 |         text.push_str(&trailers);
+    |                         ~~~~~~~~
+
+error[E0599]: no method named `spill_all` found for reference `&dyn Sandbox` in the current scope
+   --> crates/hx-tools/src/bash.rs:231:20
+    |
+231 |         let path = sb.spill_all(full.as_bytes()).await;
+    |                       ^^^^^^^^^ method not found in `&dyn Sandbox`
+    |
+    = help: items from traits can only be used if the trait is implemented and in scope
+    = note: the following trait defines an item `spill_all`, perhaps you need to implement it:
+            candidate #1: `SpillAll`
+
+warning: unused import: `std::path::Path`
+ --> crates/hx-tools/src/bash.rs:1:5
+  |
+1 | use std::path::Path;
+  |     ^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` on by default
+
+Some errors have detailed explanations: E0308, E0425, E0599.
+For more information about an error, try `rustc --explain E0308`.
+warning: `hx-tools` (lib) generated 1 warning
+error: could not compile `hx-tools` (lib) due to 3 previous errors; 1 warning emitted

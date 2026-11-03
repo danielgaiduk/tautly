@@ -13,11 +13,15 @@ use tokio::task::JoinSet;
 use tokio::time::Instant;
 
 use crate::cap::{OUTPUT_CAP, cap_text};
+use crate::filters;
 use crate::spec::{parse_args, tool_spec};
 use crate::{Tool, ToolCx, ToolError, ToolResult};
 
 const DEFAULT_TIMEOUT_S: u64 = 120;
 const MAX_TIMEOUT_S: u64 = 600;
+/// Output at or below this size is returned as is (up to the cap); above it, a
+/// recognized tool's output is summarized.
+const FILTER_THRESHOLD: usize = 2 * 1024;
 /// Grace between SIGTERM and SIGKILL.
 const TERM_GRACE: Duration = Duration::from_millis(100);
 /// Absolute cap on how long to keep reading pipes after the shell exits (background children may hold them).
@@ -49,8 +53,7 @@ pub struct BashTool;
 struct Args {
     command: String,
     timeout_s: Option<u64>,
-    /// Reserved for the output-filter task; accepted and ignored for now.
-    #[allow(dead_code)]
+    /// Skip output filtering.
     raw: Option<bool>,
 }
 
@@ -74,6 +77,19 @@ pub async fn cap_output(full: &str, cap: usize, sb: &dyn Sandbox) -> (String, Op
         return (text, None);
     }
     (text, sb.spill(full.as_bytes()).await.ok())
+}
+
+/// The filtered summary of `full` when `command` ends in a recognized tool and its
+/// output is large enough and parseable. The complete output is spilled and named in
+/// the summary; `None` when any of that does not hold (including a failed spill).
+async fn filtered_output(command: &str, full: &str, sb: &dyn Sandbox) -> Option<String> {
+    if full.len() <= FILTER_THRESHOLD {
+        return None;
+    }
+    let cmds = parse_commands(command).ok()?;
+    let summary = filters::apply(filters::detect(&cmds)?, full)?;
+    let spill = sb.spill(full.as_bytes()).await.ok()?;
+    Some(cap_text(&summary.render(&spill), OUTPUT_CAP).0)
 }
 
 enum Outcome {
@@ -216,7 +232,7 @@ impl Tool for BashTool {
         };
         let timeout_s = a.timeout_s.unwrap_or(DEFAULT_TIMEOUT_S);
         let spec = SpawnSpec {
-            argv: vec!["/bin/sh".into(), "-c".into(), a.command],
+            argv: vec!["/bin/sh".into(), "-c".into(), a.command.clone()],
             cwd: Path::new(".").to_path_buf(),
             // Overrides only: the sandbox spawn inherits the rest of the environment.
             env: vec![
@@ -322,7 +338,16 @@ impl Tool for BashTool {
             Ok(s) => s,
             Err(e) => String::from_utf8_lossy(e.as_bytes()).into_owned(),
         };
-        let (mut text, spilled) = cap_output(&full, OUTPUT_CAP, sb).await;
+        let filtered = if a.raw == Some(true) {
+            None
+        } else {
+            filtered_output(&a.command, &full, sb).await
+        };
+        // A summary already names the spilled file; otherwise the cap spills when it cuts.
+        let (mut text, spilled) = match filtered {
+            Some(summary) => (summary, None),
+            None => cap_output(&full, OUTPUT_CAP, sb).await,
+        };
         if !text.is_empty() && !text.ends_with('\n') {
             text.push('\n');
         }

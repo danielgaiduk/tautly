@@ -1,0 +1,93 @@
+ FAIL  src/parse.test.ts
+  parse
+    ✓ parses a simple token (3 ms)
+    ✕ handles empty input (4 ms)
+    ✕ rejects bad token (2 ms)
+    ✓ keeps position info (1 ms)
+    ✕ reports line numbers (2 ms)
+
+  ● parse › handles empty input
+
+    expect(received).toEqual(expected) // deep equality
+
+    Expected: []
+    Received: undefined
+
+      10 |
+      11 |   it('handles empty input', () => {
+    > 12 |     expect(parse('')).toEqual([]);
+         |                        ^
+      13 |   });
+      14 |
+      15 |   it('rejects bad token', () => {
+
+      at Object.<anonymous> (src/parse.test.ts:12:24)
+
+  ● parse › rejects bad token
+
+    expect(received).toThrow(expected)
+
+    Expected substring: "unexpected token"
+    Received message:   "Unexpected token '%' at 1:1"
+
+      15 |   it('rejects bad token', () => {
+      16 |     expect(() => parse('%')).toThrow('unexpected token');
+         |                                ^
+      17 |   });
+      18 | });
+
+      at Object.<anonymous> (src/parse.test.ts:16:32)
+          at Object.toThrow (node_modules/expect/build/toThrowMatchers.js:74:11)
+
+  ● parse › reports line numbers
+
+    expect(received).toMatchObject(expected)
+
+    - Expected  - 3
+    + Received  + 3
+
+      Object {
+    -   "column": 5,
+    -   "line": 2,
+    -   "offset": 14,
+    +   "column": 1,
+    +   "line": 1,
+    +   "offset": 0,
+      }
+
+      21 |   it('reports line numbers', () => {
+      22 |     const tok = parse('a\n  b').tokens[1];
+    > 23 |     expect(tok.pos).toMatchObject({ line: 2, column: 5, offset: 14 });
+         |                     ^
+      24 |   });
+
+      at Object.<anonymous> (src/parse.test.ts:23:21)
+
+ FAIL  src/reader.test.ts
+  ● Test suite failed to run
+
+    Cannot find module './header' from 'src/reader.ts'
+
+    Require stack:
+      src/reader.ts
+      src/reader.test.ts
+
+       7 | import fs from 'node:fs';
+       8 | import path from 'node:path';
+    >  9 | import { Header } from './header';
+         | ^
+      10 |
+      11 | export class Reader {
+      12 |   constructor(private readonly file: string) {}
+
+      at Resolver._throwModNotFoundError (node_modules/jest-resolve/build/resolver.js:427:11)
+      at Object.<anonymous> (src/reader.ts:9:1)
+
+ PASS  src/lex.test.ts
+ PASS  src/util/strings.test.ts
+
+Test Suites: 2 failed, 2 passed, 4 total
+Tests:       3 failed, 1 skipped, 14 passed, 18 total
+Snapshots:   0 total
+Time:        2.114 s
+Ran all test suites.

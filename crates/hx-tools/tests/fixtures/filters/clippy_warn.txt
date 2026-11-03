@@ -1,0 +1,61 @@
+    Checking hx-index v0.1.0 (/home/dev/hx/crates/hx-index)
+    Checking hx-tools v0.1.0 (/home/dev/hx/crates/hx-tools)
+warning: unneeded `return` statement
+   --> crates/hx-tools/src/find.rs:57:9
+    |
+57  |         return matches;
+    |         ^^^^^^^^^^^^^^ help: remove `return`: `matches`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#needless_return
+    = note: `#[warn(clippy::needless_return)]` on by default
+
+warning: redundant clone
+   --> crates/hx-tools/src/grep.rs:131:38
+    |
+131 |         let pattern = self.pattern.clone();
+    |                                   ^^^^^^^^ help: remove this
+    |
+note: this value is dropped without further use
+   --> crates/hx-tools/src/grep.rs:131:27
+    |
+131 |         let pattern = self.pattern.clone();
+    |                       ^^^^^^^^^^^^
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#redundant_clone
+    = note: `#[warn(clippy::redundant_clone)]` on by default
+
+warning: this `if` has identical blocks
+   --> crates/hx-tools/src/glob.rs:88:21
+    |
+88  |       let kind = if is_dir {
+    |  _____________________^
+89  | |         Kind::Entry
+90  | |     } else {
+91  | |         Kind::Entry
+92  | |     };
+    | |_____^
+    |
+note: same as this
+   --> crates/hx-tools/src/glob.rs:90:12
+    |
+90  |       } else {
+    |  ____________^
+91  | |         Kind::Entry
+92  | |     };
+    | |_____^
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#if_same_then_else
+    = note: `#[warn(clippy::if_same_then_else)]` on by default
+
+warning: manual implementation of `Option::map`
+   --> crates/hx-tools/src/read.rs:204:13
+    |
+204 | /             match self.cached(path) {
+205 | |                 Some(c) => Some(c.len()),
+206 | |                 None => None,
+207 | |             }
+    | |_____________^ help: try: `self.cached(path).map(|c| c.len())`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#manual_map
+    = note: `#[warn(clippy::manual_map)]` on by default
+
+warning: `hx-tools` (lib) generated 4 warnings (run `cargo clippy --fix --lib -p hx-tools` to apply 1 suggestion)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 5.12s

@@ -1,0 +1,108 @@
+//! `go test` (verbose or not): `--- FAIL: Name` lines, the indented log lines that
+//! belong to each test, compile errors and panics.
+
+use std::collections::HashMap;
+
+use super::{Item, Summary, location};
+
+pub(super) fn parse(output: &str) -> Option<Summary> {
+    let mut logs: HashMap<String, Vec<String>> = HashMap::new();
+    let mut failed_names: Vec<String> = Vec::new();
+    let mut passed: u32 = 0;
+    let mut package_lines = 0;
+    let mut build_errors: Vec<Item> = Vec::new();
+    let mut panic_item: Option<Item> = None;
+    let mut panic_detail: Vec<String> = Vec::new();
+    // The test whose log lines are being read; `None` outside of tests.
+    let mut current: Option<String> = None;
+    let mut in_panic = false;
+
+    for line in output.lines() {
+        if let Some(c) = re!(r"^\s*=== (?:RUN|NAME|CONT|PAUSE)\s+(\S+)").captures(line) {
+            current = Some(c[1].to_string());
+            in_panic = false;
+        } else if let Some(c) = re!(r"^\s*--- (FAIL|PASS|SKIP): (\S+) \(").captures(line) {
+            match &c[1] {
+                "FAIL" if !failed_names.iter().any(|n| n == &c[2]) => {
+                    failed_names.push(c[2].to_string());
+                }
+                "PASS" => passed += 1,
+                _ => {}
+            }
+            current = Some(c[2].to_string());
+            in_panic = false;
+        } else if let Some(c) = re!(r"^panic: (.*?)(?: \[recovered\])?$").captures(line) {
+            if panic_item.is_none() {
+                panic_item = Some(Item::new("panic", None, &c[1], Vec::<String>::new()));
+            }
+            current = None;
+            in_panic = true;
+        } else if let Some(c) = re!(r"^(\S+\.go):(\d+):(\d+): (.*)$").captures(line) {
+            build_errors.push(Item::new(
+                "build",
+                Some(location(&c[1], &c[2], Some(&c[3]))),
+                &c[4],
+                Vec::<String>::new(),
+            ));
+            current = None;
+        } else if re!(r"^(?:FAIL|PASS|ok)\b").is_match(line) || line.starts_with("exit status") {
+            package_lines += 1;
+            current = None;
+            in_panic = false;
+        } else if line.starts_with([' ', '\t']) && !line.trim().is_empty() {
+            if in_panic {
+                panic_detail.push(line.trim_start().to_string());
+            } else if let Some(t) = &current {
+                logs.entry(t.clone())
+                    .or_default()
+                    .push(line.trim_start().to_string());
+            }
+        } else if in_panic {
+            panic_detail.push(line.to_string());
+        } else {
+            current = None;
+        }
+    }
+
+    // A parent whose subtests failed has nothing to say beyond them.
+    let is_parent = |name: &str| {
+        let prefix = format!("{name}/");
+        !logs.contains_key(name) && failed_names.iter().any(|n| n.starts_with(&prefix))
+    };
+    let mut items: Vec<Item> = failed_names
+        .iter()
+        .filter(|n| !is_parent(n))
+        .map(|name| failure_item(name, logs.get(name).map_or(&[][..], Vec::as_slice)))
+        .collect();
+    let failed = items.len() as u32;
+    let mut errors = build_errors.len() as u32;
+    items.extend(build_errors);
+    if let Some(mut p) = panic_item {
+        p.detail = Item::new("", None, "", panic_detail).detail;
+        errors += 1;
+        items.push(p);
+    }
+
+    if items.is_empty() && package_lines == 0 {
+        return None;
+    }
+    Some(Summary {
+        tool: "go test",
+        passed: (passed > 0).then_some(passed),
+        failed,
+        errors,
+        warnings: 0,
+        items,
+    })
+}
+
+/// The first log line `file_test.go:14: message` gives the location and message.
+fn failure_item(name: &str, log: &[String]) -> Item {
+    match log.split_first() {
+        Some((first, rest)) => match re!(r"^(\S+\.go):(\d+): (.*)$").captures(first) {
+            Some(c) => Item::new(name, Some(location(&c[1], &c[2], None)), &c[3], rest),
+            None => Item::new(name, None, first, rest),
+        },
+        None => Item::new(name, None, "", Vec::<String>::new()),
+    }
+}

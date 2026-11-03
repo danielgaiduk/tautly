@@ -1,0 +1,48 @@
+..F....F..F..                                                            [100%]
+=================================== FAILURES ===================================
+______________________________ test_token_limit ________________________________
+
+    def test_token_limit():
+        text = "word " * 5000
+>       assert count_tokens(text) <= 4096
+E       assert 5000 <= 4096
+E        +  where 5000 = count_tokens('word word word word word word word word word word ...')
+
+tests/test_tokens.py:18: AssertionError
+___________________ test_split_respects_boundaries[3-expected1] ___________________
+
+n = 3, expected = ['abc', 'def', 'g']
+
+    @pytest.mark.parametrize("n,expected", [(2, ["ab", "cd", "e"]), (3, ["abc", "def", "g"])])
+    def test_split_respects_boundaries(n, expected):
+        chunks = split("abcdefg", n)
+>       assert chunks == expected
+E       AssertionError: assert ['abc', 'defg'] == ['abc', 'def', 'g']
+E         At index 1 diff: 'defg' != 'def'
+E         Right contains one more item: 'g'
+E         Use -v to get more diff
+
+tests/test_tokens.py:31: AssertionError
+____________________________ test_summary_report _______________________________
+
+stats = Stats(total=120, cached=18, saved=4096, rate=0.15)
+
+    def test_summary_report(stats):
+        report = render_report(stats)
+>       assert report.splitlines() == [
+            "total: 120",
+            "cached: 18 (15.0%)",
+            "saved: 4.0 KiB",
+        ]
+E       AssertionError: assert ['total: 120', 'cached: 18', 'saved: 4096'] == ['total: 120', 'cached: 18 (15.0%)', 'saved: 4.0 KiB']
+E         At index 1 diff: 'cached: 18' != 'cached: 18 (15.0%)'
+E         Full diff:
+E         - ['total: 120', 'cached: 18 (15.0%)', 'saved: 4.0 KiB']
+E         + ['total: 120', 'cached: 18', 'saved: 4096']
+
+tests/test_report.py:44: AssertionError
+=========================== short test summary info ============================
+FAILED tests/test_tokens.py::test_token_limit - assert 5000 <= 4096
+FAILED tests/test_tokens.py::test_split_respects_boundaries[3-expected1] - AssertionError: assert ['abc', 'defg'] == ['abc', 'def', 'g']
+FAILED tests/test_report.py::test_summary_report - AssertionError: assert ['total: 120', 'cached: 18', 'saved: 4096'] == ['total: 120', 'cached: 18 (15.0%)', 'saved: 4.0 KiB']
+3 failed, 10 passed in 0.19s

@@ -1,0 +1,52 @@
+============================= test session starts ==============================
+platform linux -- Python 3.12.3, pytest-8.3.2, pluggy-1.5.0
+rootdir: /home/dev/proj
+configfile: pyproject.toml
+plugins: cov-5.0.0, anyio-4.4.0
+collected 14 items
+
+tests/test_parse.py ....F..                                              [ 50%]
+tests/test_io.py ..F...E                                                 [100%]
+
+==================================== ERRORS ====================================
+_______________________ ERROR at setup of test_writes_file _____________________
+
+tmp_dir = <function tmp_dir at 0x7f3a1c2b9e40>
+
+    @pytest.fixture
+    def writer(tmp_dir):
+>       return Writer(tmp_dir / "out.txt", mode="x")
+E       TypeError: Writer.__init__() got an unexpected keyword argument 'mode'
+
+tests/conftest.py:21: TypeError
+=================================== FAILURES ===================================
+______________________________ test_parse_empty ________________________________
+
+    def test_parse_empty():
+>       assert parse("") == []
+E       AssertionError: assert None == []
+E        +  where None = parse('')
+
+tests/test_parse.py:12: AssertionError
+_________________________ TestReader.test_reads_header _________________________
+
+self = <tests.test_io.TestReader object at 0x7f3a1c0d2ad0>
+
+    def test_reads_header(self):
+        r = Reader(FIXTURE)
+>       assert r.header()["name"] == "alpha"
+               ^^^^^^^^^^^^^^^^^^
+E       KeyError: 'name'
+
+tests/test_io.py:33: KeyError
+=============================== warnings summary ===============================
+tests/test_parse.py::test_parse_unicode
+  /home/dev/proj/src/parse.py:57: DeprecationWarning: ast.Str is deprecated and will be removed in Python 3.14
+    return ast.Str(s)
+
+-- Docs: https://docs.pytest.org/en/stable/how-to-capture-warnings.html
+=========================== short test summary info ============================
+FAILED tests/test_parse.py::test_parse_empty - AssertionError: assert None == []
+FAILED tests/test_io.py::TestReader::test_reads_header - KeyError: 'name'
+ERROR tests/test_io.py::test_writes_file - TypeError: Writer.__init__() got an unexpected keyword argument 'mode'
+============== 2 failed, 11 passed, 1 warning, 1 error in 0.42s ================

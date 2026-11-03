@@ -1,0 +1,33 @@
+
+/home/dev/proj/src/parse.ts
+   12:5   error    'idx' is assigned a value but never used                         @typescript-eslint/no-unused-vars
+   30:10  warning  Unexpected console statement                                     no-console
+   44:21  error    Unexpected any. Specify a different type                         @typescript-eslint/no-explicit-any
+   51:7   error    'tokens' is never reassigned. Use 'const' instead                prefer-const
+   72:1   warning  Missing return type on function                                  @typescript-eslint/explicit-function-return-type
+
+/home/dev/proj/src/lex/tokens.ts
+    4:1   error    Unexpected var, use let or const instead                         no-var
+   19:3   warning  Missing return type on function                                  @typescript-eslint/explicit-function-return-type
+   23:10  error    Expected '===' and instead saw '=='                              eqeqeq
+   41:5   warning  Unexpected console statement                                     no-console
+
+/home/dev/proj/src/util/strings.ts
+    1:1   error    Parsing error: Unexpected token }
+
+/home/dev/proj/src/reader.ts
+    9:8   error    'Header' is defined but never used                               @typescript-eslint/no-unused-vars
+   33:14  error    Unnecessary escape character: \-                                 no-useless-escape
+   58:3   warning  Unexpected console statement                                     no-console
+
+/home/dev/proj/src/cli/commands/run-with-long-options-and-subcommands.ts
+    3:1   error    'yargs' is defined but never used                                @typescript-eslint/no-unused-vars
+   18:9   error    Unexpected lexical declaration in case block                     no-case-declarations
+   27:14  warning  Unexpected console statement                                     no-console
+   35:3   error    Expected a `break` statement before `case`                       no-fallthrough
+   49:1   error    Expected indentation of 2 spaces but found 4                     indent
+   52:20  warning  Missing return type on function                                  @typescript-eslint/explicit-function-return-type
+
+✖ 19 problems (12 errors, 7 warnings)
+  3 errors and 0 warnings potentially fixable with the `--fix` option.
+

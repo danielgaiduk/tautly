@@ -1,0 +1,58 @@
+=== RUN   TestParseEmpty
+    parse_test.go:14: ParseEmpty() = <nil>, want []string{}
+--- FAIL: TestParseEmpty (0.00s)
+=== RUN   TestParseTokens
+--- PASS: TestParseTokens (0.00s)
+=== RUN   TestReader
+=== RUN   TestReader/header
+    reader_test.go:31: header name = "", want "alpha"
+    reader_test.go:32: header version = 0, want 2
+=== RUN   TestReader/body
+=== RUN   TestReader/trailer
+--- FAIL: TestReader (0.00s)
+    --- FAIL: TestReader/header (0.00s)
+    --- PASS: TestReader/body (0.00s)
+    --- PASS: TestReader/trailer (0.00s)
+=== RUN   TestLexer
+--- PASS: TestLexer (0.00s)
+=== RUN   TestSplitBoundaries
+--- PASS: TestSplitBoundaries (0.00s)
+=== RUN   TestWriterFlush
+    writer_test.go:57: unexpected flush error: write /tmp/TestWriterFlush123/out.txt: file already closed
+    writer_test.go:61: buffer not drained: got 128 bytes pending, want 0
+    writer_test.go:62: pending data: "alpha\nbeta\ngamma\ndelta\nepsilon\nzeta\neta\ntheta\n"
+--- FAIL: TestWriterFlush (0.01s)
+=== RUN   TestRoundTripLarge
+--- PASS: TestRoundTripLarge (0.12s)
+=== RUN   TestRoundTripSmall
+--- PASS: TestRoundTripSmall (0.00s)
+=== RUN   TestEscapeQuotes
+--- PASS: TestEscapeQuotes (0.00s)
+=== RUN   TestIndexRebuild
+=== RUN   TestIndexRebuild/empty_tree
+=== RUN   TestIndexRebuild/single_file
+    index_test.go:88: rebuild returned 0 entries for single_file, want 1
+    index_test.go:89: root hash = 0000000000000000, want 5f2c1a9d0e7b4c36
+=== RUN   TestIndexRebuild/nested_dirs
+    index_test.go:97: entry[3].Path = "src/lib", want "src/lib/mod.go"
+--- FAIL: TestIndexRebuild (0.02s)
+    --- PASS: TestIndexRebuild/empty_tree (0.00s)
+    --- FAIL: TestIndexRebuild/single_file (0.00s)
+    --- FAIL: TestIndexRebuild/nested_dirs (0.01s)
+=== RUN   TestEscapeBackslash
+--- PASS: TestEscapeBackslash (0.00s)
+=== RUN   TestEscapeUnicode
+--- PASS: TestEscapeUnicode (0.00s)
+=== RUN   TestEscapeNewline
+--- PASS: TestEscapeNewline (0.00s)
+=== RUN   TestEscapeTab
+--- PASS: TestEscapeTab (0.00s)
+FAIL
+FAIL	example.com/proj/parse	0.006s
+=== RUN   TestCountTokens
+--- PASS: TestCountTokens (0.00s)
+=== RUN   TestCountTokensUnicode
+--- PASS: TestCountTokensUnicode (0.00s)
+PASS
+ok  	example.com/proj/tokens	0.003s
+FAIL

@@ -1,0 +1,81 @@
+
+ RUN  v2.1.8 /home/dev/proj
+
+ ❯ src/parse.test.ts (5 tests | 3 failed) 9ms
+   ✓ parse > parses a simple token 2ms
+   × parse > handles empty input 3ms
+     → expected undefined to deeply equal []
+   × parse > rejects bad token 2ms
+     → expected [Function] to throw error including 'unexpected token' but got 'Unexpected token '%' at 1:1'
+   ✓ parse > keeps position info 1ms
+   × parse > reports line numbers 3ms
+     → expected { line: 1, column: 1, offset: +0 } to match object { line: 2, column: 5, offset: 14 }
+ ✓ src/lex.test.ts (6 tests) 4ms
+ ✓ src/util/strings.test.ts (3 tests) 2ms
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯ Failed Tests 3 ⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯
+
+ FAIL  src/parse.test.ts > parse > handles empty input
+AssertionError: expected undefined to deeply equal []
+
+- Expected:
+[]
+
++ Received:
+undefined
+
+ ❯ src/parse.test.ts:12:24
+     10|
+     11|   it('handles empty input', () => {
+     12|     expect(parse('')).toEqual([]);
+       |                        ^
+     13|   });
+     14|
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/3]⎯
+
+ FAIL  src/parse.test.ts > parse > rejects bad token
+AssertionError: expected [Function] to throw error including 'unexpected token' but got 'Unexpected token '%' at 1:1'
+
+Expected: "unexpected token"
+Received: "Unexpected token '%' at 1:1"
+
+ ❯ src/parse.test.ts:16:32
+     14|
+     15|   it('rejects bad token', () => {
+     16|     expect(() => parse('%')).toThrow('unexpected token');
+       |                                ^
+     17|   });
+     18| });
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[2/3]⎯
+
+ FAIL  src/parse.test.ts > parse > reports line numbers
+AssertionError: expected { line: 1, column: 1, offset: +0 } to match object { line: 2, column: 5, offset: 14 }
+
+- Expected
++ Received
+
+  {
+-   "column": 5,
+-   "line": 2,
+-   "offset": 14,
++   "column": 1,
++   "line": 1,
++   "offset": 0,
+  }
+
+ ❯ src/parse.test.ts:23:21
+     21|   it('reports line numbers', () => {
+     22|     const tok = parse('a\n  b').tokens[1];
+     23|     expect(tok.pos).toMatchObject({ line: 2, column: 5, offset: 14 });
+       |                     ^
+     24|   });
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[3/3]⎯
+
+ Test Files  1 failed | 2 passed (3)
+      Tests  3 failed | 10 passed (13)
+   Start at  10:12:01
+   Duration  412ms (transform 31ms, setup 0ms, collect 58ms, tests 15ms, environment 0ms, prepare 120ms)
+
