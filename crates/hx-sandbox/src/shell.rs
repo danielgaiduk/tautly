@@ -312,6 +312,17 @@ fn walk_command(
     let mut cur = node.walk();
     for child in node.children(&mut cur) {
         fed |= feeds_stdin(child, src);
+        // bash joins `c\<newline>d` into one word; the grammar splits it.
+        let after = &src[child.end_byte()..];
+        if child.is_named()
+            && after.starts_with(b"\\\n")
+            && after.get(2).is_some_and(|c| !c.is_ascii_whitespace())
+        {
+            return Err(Unparseable(format!(
+                "line continuation inside the word `{}`",
+                snippet(text(child, src))
+            )));
+        }
         match child.kind() {
             "command_name" => argv.push(unquote(child, src)),
             "variable_assignment" => {
@@ -453,6 +464,10 @@ fn walk_redirected(
         }
     }
     cx.loops -= usize::from(function);
+    // Commands after a redefinition of `cd`, `set`, ... mean something else.
+    if function && let Some(name) = node.child_by_field_name("name") {
+        cx.define_function(text(name, src));
+    }
     if fed {
         reject_fed_modules(&out[start..])?;
     }
@@ -755,6 +770,17 @@ fn check_expansion(t: &str) -> Result<(), Unparseable> {
             None => return Err(hidden(&format!("expansion `{}`", snippet(t)))),
         }
     }
+    let name = &inner[..i];
+    let name = name.strip_prefix('#').unwrap_or(name);
+    let assigns = match b.get(i) {
+        Some(b'=' | b'?') => true,
+        Some(b':') => matches!(b.get(i + 1), Some(b'=' | b'?')),
+        _ => false,
+    };
+    if assigns {
+        // `${CDPATH:=.git}` assigns (and `?` tests) like `CDPATH=.git` would.
+        reject_dangerous_name(name)?;
+    }
     if b.get(i) == Some(&b'@') {
         // `${x@P}` expands prompt escapes (running `$(...)` in the value), and the
         // other transformations are not worth telling apart.
@@ -910,7 +936,7 @@ fn numeric_format(f: &str) -> bool {
             }
         }
         // Length modifiers (`%ld`, `%hhu`, `%zx`, ...).
-        while b.get(i).is_some_and(|c| b"hjlLqtz".contains(c)) {
+        while b.get(i).is_some_and(|c| b"hjlLqtzZI".contains(c)) {
             i += 1;
         }
         if star || matches!(b.get(i), Some(b'd' | b'i' | b'o' | b'u' | b'x' | b'X')) {

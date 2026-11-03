@@ -855,3 +855,88 @@ fn printf_length_modifiers_and_time_conversions_are_numeric() {
         assert!(parse_commands(s).is_ok(), "{s}");
     }
 }
+
+// ---- checkpoint fix round 5 ----
+
+#[test]
+fn builtin_double_dash_is_unwrapped() {
+    for s in [
+        "builtin -- cd sub && cat x",
+        "builtin builtin cd sub && cat x",
+        "command builtin -- cd sub && cat x",
+    ] {
+        let c = parse_commands(s).unwrap_or_else(|e| panic!("{s}: {e}"));
+        let cat = c.iter().find(|c| c.argv[0] == "cat").unwrap();
+        assert_eq!(cwds(cat), ["sub"], "{s}");
+    }
+    for s in [
+        "builtin -- cd .g*/hooks; echo x",
+        "builtin -- read PATH; ls",
+        "builtin -- shift \"$x\"",
+    ] {
+        assert!(parse_commands(s).is_err(), "{s}");
+    }
+}
+
+#[test]
+fn assigning_expansions_of_dangerous_names_are_unparseable() {
+    for s in [
+        "echo ${CDPATH:=.git}; cd hooks && echo pwn > pre-commit",
+        "echo ${CDPATH=.git}",
+        "echo \"${PATH:=/tmp/evil}\" > /dev/null; ls",
+        "cat ${IFS:=x}/config",
+        "echo ${LD_PRELOAD?x}",
+        "echo ${GIT_DIR:?x}",
+    ] {
+        assert!(parse_commands(s).is_err(), "{s}");
+    }
+    assert!(parse_commands("echo ${FOO:=x} ${PATH:-x} ${HOME:+y} ${CDPATH} ${#PATH}").is_ok());
+}
+
+#[test]
+fn line_continuation_inside_a_word_is_unparseable() {
+    for s in [
+        "c\\\nd .git && echo pwn > hooks/pre-commit",
+        "ec\\\nho x",
+        "cat .g\\\nit/config",
+    ] {
+        assert!(parse_commands(s).is_err(), "{s:?}");
+    }
+    for s in ["cargo test \\\n  --all", "echo a \\\nb", "echo \"a\\\nb\""] {
+        assert!(parse_commands(s).is_ok(), "{s:?}");
+    }
+}
+
+#[test]
+fn redefining_sensitive_commands_makes_later_commands_unparseable() {
+    for s in [
+        "cd() { true; }; cd sub/x && echo pwn > ../../pwned",
+        "function cd { true; }; cd sub/x",
+        "builtin() { true; }; builtin cd sub/x",
+        "command() { true; }; ls",
+        "set() { :; }; ls",
+        "printf() { :; }; ls",
+        "[() { :; }; ls",
+        "enable -n cd; cd sub/x && echo pwn > ../../pwned",
+        "enable -n test; ls",
+        "alias cd=true\ncd sub/x && echo pwn > ../../pwned",
+        "alias ls=x eval=y; ls",
+    ] {
+        assert!(parse_commands(s).is_err(), "{s:?}");
+    }
+    for s in [
+        "f() { ls; }; f",
+        "alias ll='ls -l'; ls",
+        "enable -n kill; ls",
+        "cd() { true; }",
+    ] {
+        assert!(parse_commands(s).is_ok(), "{s:?}");
+    }
+}
+
+#[test]
+fn printf_nonstandard_length_modifiers_are_numeric() {
+    for s in ["printf '%Zd' \"$x\"", "printf '%Id' \"$x\""] {
+        assert!(parse_commands(s).is_err(), "{s}");
+    }
+}

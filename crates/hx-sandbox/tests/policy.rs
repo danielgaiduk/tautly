@@ -775,3 +775,35 @@ fn round_four_cd_bypasses_ask() {
         );
     }
 }
+
+// --- checkpoint fix round 5 ---
+#[test]
+fn round_five_probes_ask() {
+    let pol = with_rules(
+        Mode::Ask,
+        &[
+            "bash(cd*)",
+            "bash(echo*)",
+            "bash(cat*)",
+            "bash(builtin*)",
+            "bash(enable*)",
+            "bash(alias*)",
+        ],
+        &[],
+    );
+    for cmd in [
+        "builtin -- cd .git && echo pwn > hooks/pre-commit",
+        "builtin -- cd sub && cat ../.git/config",
+        "echo ${CDPATH:=.git}; cd hooks && echo pwn > pre-commit",
+        "c\\\nd .git && echo pwn > hooks/pre-commit",
+        "cd() { true; }; cd sub/x && echo pwn > ../../pwned",
+        "enable -n cd; cd sub/x && echo pwn > ../../pwned",
+        "alias cd=true\ncd sub/x && echo pwn > ../../pwned",
+    ] {
+        assert!(asks(pol.decide("bash", &exec("cd"), Some(cmd))), "{cmd:?}");
+        assert!(
+            asks(p(Mode::Yolo).decide("bash", &exec("cd"), Some(cmd))),
+            "{cmd:?}"
+        );
+    }
+}

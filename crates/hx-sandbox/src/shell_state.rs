@@ -95,6 +95,13 @@ impl Cwd {
         self.lost = s.lost;
     }
 
+    /// A function named `name` was defined.
+    pub(crate) fn define_function(&mut self, name: &str) {
+        if is_sensitive_command(name) {
+            self.lose(format!("a function redefines `{name}`"));
+        }
+    }
+
     fn lose(&mut self, why: String) {
         self.lost.get_or_insert(why);
     }
@@ -152,6 +159,16 @@ impl Cwd {
             "shopt" if shopt_changes_options(&argv[1..]) => {
                 self.lose(format!("`{}` changes shell options", argv.join(" ")));
             }
+            "alias" | "enable" => {
+                let redefined = argv[1..]
+                    .iter()
+                    .filter(|a| !a.starts_with('-'))
+                    .map(|a| a.split_once('=').map_or(a.as_str(), |(n, _)| n))
+                    .find(|n| is_sensitive_command(n));
+                if let Some(n) = redefined {
+                    self.lose(format!("`{}` redefines `{n}`", argv.join(" ")));
+                }
+            }
             _ => {}
         }
     }
@@ -178,7 +195,7 @@ impl Cwd {
     }
 }
 
-/// The command that actually runs behind `builtin`, `command` (`-p`, `--`) and
+/// The command that actually runs behind `builtin` (`--`), `command` (`-p`, `--`) and
 /// `time` (`-p`) prefixes. `command -v`/`-V` only look a name up, so they are
 /// returned as is.
 pub(crate) fn unwrap_prefixes(argv: &[String]) -> &[String] {
@@ -206,7 +223,7 @@ pub(crate) fn unwrap_prefixes(argv: &[String]) -> &[String] {
             Some(i)
         };
         let next = match base(first) {
-            "builtin" => Some(1),
+            "builtin" => skip_opts(a, ""),
             "command" => skip_opts(a, "p"),
             "time" => skip_opts(a, "p"),
             _ => return a,
@@ -295,4 +312,15 @@ fn is_allowed_leading_set(argv: &[String]) -> bool {
 fn shopt_changes_options(args: &[String]) -> bool {
     args.iter()
         .any(|a| a.starts_with('-') && !a.starts_with("--") && a.contains(['s', 'u']))
+}
+
+/// Commands whose meaning the analysis relies on. Redefining one (function,
+/// `alias`, `enable -n`) makes every later command unanalyzable.
+fn is_sensitive_command(name: &str) -> bool {
+    const SENSITIVE: &[&str] = &[
+        "cd", "pushd", "popd", "dirs", "builtin", "command", "set", "shopt", "eval", "source", ".",
+        "exec", "test", "[", "printf", "read", "export", "declare", "typeset", "local", "readonly",
+        "unset", "time", "alias", "unalias", "enable", "trap",
+    ];
+    SENSITIVE.contains(&name)
 }
