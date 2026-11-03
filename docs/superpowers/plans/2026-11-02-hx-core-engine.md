@@ -2,11 +2,11 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Build sub-project 1 of `tautly`: a Rust, library-first agent engine with four provider adapters, a sandbox-gated tool set with model-adaptive edits, a code index, output filters, structured context with diff re-reads, context GC and state-preserving compaction, code-anchored memory, cheap side-model routing, an append-only session store, a JSON-RPC headless mode, a line-mode interactive stub, CI performance gates and an eval runner.
+**Goal:** Build sub-project 1 of `tautly`: a Rust, library-first agent engine with four provider adapters, a sandbox-gated tool set with model-adaptive edits, a code index, output filters, structured context with diff re-reads, context GC and state-preserving compaction, code-anchored memory, cheap side-model routing, an append-only session store, a JSON-RPC headless mode, a daily-driver line REPL, an ACP bridge, a tools-only MCP client, git checkpoints with undo, turn receipts, zero-config first run with `doctor`, installers, CI performance gates, an eval runner and a public benchmark kit.
 
-**Architecture:** Cargo workspace of single-purpose crates with downward-only dependencies. `tautly-core::Engine` accepts `Command`s and emits a bounded stream of `Event`s; the REPL stub and the JSON-RPC server are both thin consumers. All file and process access from tools goes through `tautly-sandbox::Sandbox`.
+**Architecture:** Cargo workspace of single-purpose crates with downward-only dependencies. `tautly-core::Engine` accepts `Command`s and emits a bounded stream of `Event`s; the REPL, the JSON-RPC server and the ACP bridge are thin consumers. All file and process access from tools goes through `tautly-sandbox::Sandbox`.
 
-**Tech Stack:** Rust (edition 2024, MSRV 1.85), tokio, tokio-util (`CancellationToken`), futures, serde/serde_json, toml, thiserror/anyhow, reqwest (rustls, `stream`), eventsource-stream, blake3, tempfile, ignore + grep-searcher + grep-regex, globset, rayon, similar (diffs), serde_yaml (frontmatter), ulid, wiremock, assert_cmd, memory-stats, tree-sitter (+ rust, typescript, javascript, python, go, json, toml, yaml, bash grammars), htmd, rusqlite (`bundled`), keyring, clap, nix, tracing, opentelemetry + opentelemetry-otlp, proptest, insta.
+**Tech Stack:** Rust (edition 2024, MSRV 1.85), tokio, tokio-util (`CancellationToken`), futures, serde/serde_json, toml, thiserror/anyhow, reqwest (rustls, `stream`), eventsource-stream, blake3, tempfile, ignore + grep-searcher + grep-regex, globset, rayon, similar (diffs), serde_yaml (frontmatter), ulid, wiremock, assert_cmd, memory-stats, tree-sitter (+ rust, typescript, javascript, python, go, json, toml, yaml, bash grammars), htmd, rusqlite (`bundled`), keyring, clap, nix, tracing, proptest, insta; for the v1 scope additions: reedline (REPL), rpassword (hidden key input), toml_edit (writing user config), rmcp 3.8 (MCP client), agent-client-protocol 1.15 (ACP), cargo-dist (release tooling, not a crate dependency). opentelemetry is no longer used in v1 (Task 32 removed).
 
 **Spec:** `docs/superpowers/specs/2026-11-02-hx-core-engine-design.md`
 
@@ -15,17 +15,31 @@
 - License: Apache-2.0 (every crate's `Cargo.toml` sets `license = "Apache-2.0"`).
 - Platforms: macOS and Linux only; `cfg(windows)` builds are not required in this sub-project.
 - Auth: API keys from env vars or OS keychain only. No subscription OAuth, ever.
-- Telemetry: off by default; nothing leaves the machine unless enabled.
+- Telemetry: none in v1 (OpenTelemetry export removed, Task 32). The `[telemetry]` table is reserved: parsed, ignored, `Warning` when `enabled = true` (Task 40). Nothing leaves the machine except provider, `web_fetch`, MCP and `doctor` network checks.
 - Cold start < 50 ms; idle RSS < 30 MB; RSS within ±10% over 4-hour simulated session.
-- Dependencies point downward only: `tautly-cli → {tautly-tui, tautly-rpc} → tautly-core → {tautly-provider, tautly-tools, tautly-context, tautly-memory, tautly-index, tautly-session, tautly-sandbox}`; `tautly-tools → {tautly-sandbox, tautly-provider, tautly-index, tautly-memory}`; `tautly-memory → {tautly-index, tautly-session}`; `tautly-index → tautly-sandbox`; `tautly-context → {tautly-provider, tautly-tools, tautly-index, tautly-sandbox}`.
+- Dependencies point downward only: `tautly-cli → {tautly-tui, tautly-rpc, tautly-acp} → tautly-core → {tautly-provider, tautly-tools, tautly-context, tautly-memory, tautly-index, tautly-session, tautly-sandbox, tautly-mcp}`; `tautly-mcp → {tautly-tools, tautly-sandbox}`; `tautly-tools → {tautly-sandbox, tautly-provider, tautly-index, tautly-memory}`; `tautly-memory → {tautly-index, tautly-session}`; `tautly-index → tautly-sandbox`; `tautly-context → {tautly-provider, tautly-tools, tautly-index, tautly-sandbox}`.
 - `tautly-tools` must not call `std::fs::*`, `tokio::fs::*`, `std::process::Command`, `tokio::process::Command` directly (enforced by `clippy::disallowed_methods`/`disallowed_types`).
 - Errors: `thiserror` per crate; `anyhow` only in `tautly-cli`. No `panic = "abort"`.
-- Paths: config `~/.config/tautly/config.toml`, project `.tautly/config.toml`, sessions `~/.local/share/tautly/sessions/<project-hash>/<session-id>.jsonl` (+ `blobs/`), ledger `~/.local/share/tautly/ledger.db`. Honor `XDG_CONFIG_HOME` / `XDG_DATA_HOME` and an `TAUTLY_HOME` override (used by tests).
+- Paths: config `~/.config/tautly/config.toml`, project `.tautly/config.toml`, sessions `~/.local/share/tautly/sessions/<project-hash>/<session-id>.jsonl` (+ `blobs/`), ledger `~/.local/share/tautly/ledger.db` (+ `receipts` table), REPL history `~/.local/share/tautly/repl_history`, MCP approvals `~/.local/share/tautly/mcp-approvals.json`, checkpoint refs `refs/tautly/checkpoints/<session>/<n>` in the user's repository. Honor `XDG_CONFIG_HOME` / `XDG_DATA_HOME` and an `TAUTLY_HOME` override (used by tests).
 - Fixed values: bash timeout 120 s; tool output cap 30 KB (head + tail); max 5 retry attempts; compaction threshold 80%; budget warning 80%; system prompt < 2,000 tokens; pinned warning at 10% of window; cancel kills children within 200 ms.
 - Token-efficiency values: diff re-read when < 50% of lines changed; context GC threshold max(2,000 tokens, 5% of window), only at step start (before each provider request); output filters apply above 2 KB, ≤ 20 detail lines per item; memory index ≤ 500 tokens; cache scheduler: default cache TTL 300 s, warm-cache benefit multiplier 5, forced mutation at ≥ 90% of window, threshold compaction deferrable from 80% to 90%; loop breaker: failed-attempts list 10 entries / ≤ 300 tokens, previous-result excerpt 5 lines; tolerant edits: anchor interior similarity ≥ 0.9, structural similarity ≥ 0.8, nearest-window ≤ 20 lines; memory entry body ≤ 300 tokens; `recall` top 5, ≤ 2,000 tokens; `web_fetch` question answers ≤ 1,000 tokens; index build of 10,000 files < 10 s, single-file reindex < 50 ms; token regression gate 10%.
 - Workspace engine: watcher debounce 50 ms; trigram literal minimum 3 bytes; `find` default limit 20 (max 50); batched read ≤ 10 targets; repo map ≤ 400 tokens; selective trigram grep on 100,000 files < 50 ms; tree glob < 5 ms.
-- Execution order note: Tasks 36–37 run right after Task 15; Task 38 runs right after Task 19.
+- v1 scope additions (user-approved 2026-11-03, spec 7.11): savings estimate 4 bytes/token; diff preview cap 200 lines / 16 KB, session diff cap 2,000 lines; Ollama probe 300 ms; `doctor` network timeout 3 s; MCP startup wait 5,000 ms, call timeout 120 s, ≤ 50 tools per server, description ≤ 1 KB, input schema ≤ 8 KB, tool name ≤ 64 chars; checkpoint timeout 3,000 ms, untracked limits 200 MB / 20,000 files, refs kept 14 days; REPL history 1,000 entries, double Ctrl+C window 2 s; ACP tool output ≤ 8 KB, ACP diff content ≤ 256 KB per side.
+- Protocol: new `Event`/`Command` variants and fields are additions (optional or `#[serde(default)]`); `PROTOCOL_VERSION` stays `(1, 0)` because nothing has been released yet.
 - Exit codes for `tautly -p`: 0 completed, 1 error, 2 budget/max_turns/timeout, 130 cancelled.
+
+## Execution Order
+
+Tasks run in this order (numbers are identities, not sequence):
+
+1. Tasks 1–25 and 36–38 are done (36–37 ran right after Task 15, 38 right after Task 19).
+2. **Engine:** 26 → 27 → 28 → **checkpoint 4** (whole-branch review, as before).
+3. **Engine-side v1 additions:** 42 (diffs) → 43 (SetModel) → 44 (CLAUDE.md fallback, evidence footer) → 47 (git checkpoints, undo).
+4. **Clients and CLI:** 29 → 31 → 39 (receipts, stats) → 40 (zero-config, doctor, auth add) → 45 (MCP client) → 30 (daily-driver REPL) → 46 (ACP bridge) → 41 (release, installers) → **checkpoint 5** (whole-branch review of Tasks 29–31 and 39–47).
+5. **Gates and acceptance:** 33 → 34 → 35.
+6. **Final whole-branch v1 review** on Fable (`claude-fable-5-1`, user request 2026-11-03).
+
+Task 32 is removed from v1 and is not executed.
 
 ## Review Focus
 
@@ -34,6 +48,25 @@
 3. **Two `tautly` processes on the same project** (concurrent sessions, shared ledger) — expect both to work: separate session files, SQLite in WAL mode with busy timeout. Test in Task 18 and Task 25.
 4. **Terminal closed / SIGTERM / SIGHUP mid-turn** — expect child process groups killed and the session left resumable. Test in Task 25.
 5. **Symlink tricks and loops** inside the workspace (link pointing outside root, cyclic links during `glob`/`grep`) — expect confinement errors and no hang. Test in Task 1 and Task 9.
+6. **Repository-declared MCP servers** (project `[mcp.servers]`, repo `.mcp.json`):
+   - Expect none to start without a recorded approval keyed by root + launch hash, and any change to the command to ask again.
+   - Headless never starts one without `--approve-mcp`.
+   - No server process sees a provider API key.
+
+   Test in Task 45.
+7. **Checkpoints touching user git state:**
+   - Expect the user's index, HEAD, branches, stash and ignored files to be byte-identical before and after a checkpoint and after an undo; only objects and `refs/tautly/` change.
+   - Git runs with fsmonitor and hooks disabled.
+   - A slow or huge tree is skipped, not hung.
+
+   Test in Task 47.
+8. **Approved diff ≠ applied diff:** expect a file changed between approval and execution to fail as stale, and the diff a user approves to be exactly what is written. Test in Task 42.
+9. **Session "always" rules widening permissions:**
+   - Expect a session rule to never persist (not even across resume) and to never override a deny rule or a protected path.
+   - A rule that does not match the pending call is refused.
+
+   Test in Task 30.
+10. **First-run detection sending keys to the wrong host:** expect keys only from env or keychain, sent only to their provider's configured host (in a header), and never read from repository files. Test in Task 40.
 
 ---
 
@@ -61,8 +94,13 @@ crates/
   tautly-core/src/{lib.rs, protocol.rs, config.rs, auth.rs, engine.rs, turn.rs, approvals.rs, budget.rs, ledger.rs,
                resume.rs, routing.rs, memory.rs, telemetry.rs}
   tautly-rpc/src/{lib.rs, jsonrpc.rs, server.rs, oneshot.rs}
-  tautly-tui/src/{lib.rs, repl.rs, render.rs}
-  tautly-cli/src/{main.rs, cmd/{prompt.rs, sessions.rs, models.rs, undo.rs, eval.rs}}
+  tautly-tui/src/{lib.rs, repl.rs, render.rs, input.rs, approve.rs, slash.rs}
+  tautly-mcp/src/{lib.rs, config.rs, client.rs, tool.rs, names.rs, approvals.rs}
+  tautly-acp/src/{lib.rs, bridge.rs, map.rs, permission.rs}
+  tautly-core/src/{receipt.rs, detect.rs, diff.rs, evidence.rs, checkpoint.rs}   (v1 additions)
+  tautly-cli/src/{main.rs, cmd/{prompt.rs, sessions.rs, models.rs, undo.rs, eval.rs, stats.rs, receipt.rs, auth.rs, doctor.rs, mcp.rs}}
+dist-workspace.toml, .github/workflows/release.yml   cargo-dist release
+benchmarks/{terminal-bench,tokens}/, docs/benchmark.md   public benchmark kit
 evals/starter/<task-id>/{task.toml, setup.sh, verify.sh}
 evals/replay/<task-id>.json      scripted mock sessions for the token regression gate
 evals/baseline.json              committed tokens-per-solved-task baseline
@@ -869,6 +907,12 @@ proptest! { #[test] fn apply_then_inverse_restores(text in "[a-z\\n]{1,200}", ..
 
 **Task 23 note (binding):** protocol enums have `Unknown` catch-all variants for forward compatibility; match them with a wildcard arm, and map `FinishReason::Unknown` to exit code 1.
 
+**v1 scope note (binding, user-approved 2026-11-03; spec 3.3, 7.11):**
+- Tasks 42, 43 and 47 run before this task, so the method list also includes `set_model`, `diff` and `undo`.
+- `approve`'s optional `session_rule` param is added by Task 30, together with its engine handling.
+- `methods_map_to_commands` covers them.
+- `--approve-mcp` is added by Task 45; first-run detection and its stderr line by Task 40.
+
 **Client-protocol amendment (binding, user-approved 2026-11-03; spec 3.4):** `initialize` accepts `client: {interactive, name, version}`; interactive clients get `ToolApprovalRequested{request_id}` / `MemoryProposed` answered by `approve`/`deny`/`approve_memory`/`reject_memory` with ids, and pending requests resolve to deny on disconnect or `shutdown`. Add `session/new {root, resume?, fork?}`, `session/list`, `session/close`; session-scoped methods take `session_id`; `event` notifications carry `session_id`. Sessions on one root share a `Workspace` hub (index, watcher, memory store; `Arc`, opened once, closed with the last session). Tests: `interactive_ask_waits_for_client_approval`, `pending_approval_denied_on_disconnect`, `two_sessions_share_one_index_and_route_events_by_session_id`, `single_session_form_still_works`.
 
 **Files:**
@@ -885,24 +929,86 @@ proptest! { #[test] fn apply_then_inverse_restores(text in "[a-z\\n]{1,200}", ..
 - [ ] **Step 4: Run** — Expected: PASS.
 - [ ] **Step 5: Commit** `git commit -m "feat(rpc): JSON-RPC server and tautly -p one-shot mode"`
 
-### Task 30: Interactive REPL stub
+### Task 30: Daily-driver REPL (rewritten, user-approved 2026-11-03; spec 7.11.8; execute after Task 45)
 
 **Checkpoint 3 note (binding):** the sandbox root is the git top level when the start directory is inside a git work tree (else the start directory); the REPL and `tautly -p` build the engine with that root, and an ancestor `AGENTS.md` above it follows spec 6.1's confinement rule (its link target must stay inside the directory holding it).
 
+**Scope note (binding):** this replaces the earlier y/n stub. It consumes events added by Tasks 39 (`TurnReceipt`), 42 (`diff`, `SessionDiff`), 43 (`ModelChanged`), 44 (`TurnFinished.evidence`), 45 (`McpServerApprovalRequested`, `McpServerStatus`) and 47 (`Undone`), all of which run first. The engine half of "allow for this session" (session rules) is built here, because the REPL is its first user; Task 46 reuses it for ACP `allow_always`. Ctrl+C semantics come from Task 25 (first cancels the turn and kills child groups within 200 ms). The full-screen TUI stays sub-project 3.
+
 **Files:**
-- Create: `crates/tautly-tui/src/{lib.rs,repl.rs,render.rs}`; modify `crates/tautly-cli/src/main.rs` (no `-p` and stdin is a TTY → REPL)
-- Test: `crates/tautly-tui/tests/repl.rs`
+- Create: `crates/tautly-tui/src/{lib.rs,repl.rs,render.rs,input.rs,approve.rs,slash.rs}`
+- Modify:
+  - `crates/tautly-cli/src/main.rs`: no `-p`, no `--rpc`, no `acp` subcommand and stdin is a TTY → REPL.
+  - `crates/tautly-core/src/{protocol.rs,approvals.rs,engine.rs}` and `crates/tautly-sandbox/src/policy.rs`: session rules.
+  - `crates/tautly-rpc/src/server.rs`: `approve` passes an optional `session_rule` param.
+- Test: `crates/tautly-tui/tests/repl.rs`, `crates/tautly-core/tests/session_rules.rs`, `crates/tautly-rpc/tests/server.rs` (`approve_with_session_rule`)
 
 **Interfaces:**
-- Produces: `async fn run_repl(engine: Engine, events: mpsc::Receiver<Event>, input: impl AsyncBufRead, out: impl AsyncWrite) -> Result<()>`; `fn render::event(e: &Event) -> Option<String>`.
+- Consumes:
+  - `Engine`, `Event`, `Command` with the variants above.
+  - `EngineBuilder.resume`.
+  - `tautly sessions list` data (Task 31: `fn sessions::list(project: &Path, limit: usize) -> Vec<SessionSummary>`).
+  - `Ledger::session_receipts` (Task 39).
+- Produces:
+  - `Command::Approve { request_id: String, #[serde(default)] session_rule: Option<String> }`
+  - `fn Policy::add_session_allow(&mut self, rule: &str) -> Result<(), PolicyError>`. Session rules are checked with the config allow rules, after deny rules, protected paths and unparseable commands. They are held in memory only.
+  - `fn Policy::rule_matches(rule: &str, tool: &str, effect: &Effect, raw_cmd: Option<&str>) -> Result<bool, PolicyError>`.
+  - `fn approve::exact_rule(tool: &str, args: &Value) -> Option<String>`:
+    - `edit(<path>)`, `write(<path>)`
+    - `bash(<whitespace-collapsed command, glob metacharacters escaped>)`
+    - `web_fetch(<host>)`
+    - `mcp__<server>__<tool>`
+  - `#[async_trait] trait LineSource { async fn read_line(&mut self, prompt: &str) -> Result<Line, ReplError>; }` with `enum Line { Text(String), CtrlC, CtrlD }`. `ReedlineSource` (history file `<data home>/repl_history`, 1,000 entries, multi-line via Alt+Enter and bracketed paste) and `ScriptedSource` (tests).
+  - `struct ReplOptions { color: bool /* TTY && NO_COLOR unset */, footer: bool /* [receipts] footer */, history: Option<PathBuf> }`.
+  - `type EngineFactory = Box<dyn Fn(Option<String> /* resume */) -> Result<(Engine, mpsc::Receiver<Event>), EngineError> + Send + Sync>`.
+  - `async fn run_repl(factory: EngineFactory, input: impl LineSource, out: impl AsyncWrite + Unpin, signals: impl Stream<Item = ()> /* SIGINT */, opts: ReplOptions) -> Result<(), ReplError>`.
+  - `fn render::event(e: &Event, st: &mut RenderState, opts: &ReplOptions) -> Option<String>`.
+  - `fn slash::parse(line: &str) -> Option<Slash>`, `enum Slash { Model(Option<String>), Cost, Diff(Option<u32>), Undo(Option<u32>), Resume(Option<String>), Compact, Pin(String), Unpin(String), Fork, MemoryConsolidate, Help, Unknown(String) }`.
 
-- [ ] **Step 1: Write the failing tests** (scripted stdin, captured stdout): `prints_streamed_text`; `approval_prompt_y_approves_n_denies`; `shows_context_and_cost_after_each_turn` (line matching `ctx \d+/\d+ tok · \$\d+\.\d{4}`); `slash_commands_map` (`/pin x` → `Pin`, `/compact`, `/fork`, `/undo`, `/memory consolidate` → `ConsolidateMemory`); `memory_proposal_shows_entry_and_y_approves_n_rejects`; `context_collected_prints_tokens_freed`; `ctrl_c_once_cancels_twice_exits` (simulate via injected signal stream); `unknown_slash_command_prints_help`.
-- [ ] **Step 2: Run** `cargo test -p tautly-tui` — Expected: FAIL.
-- [ ] **Step 3: Implement.** Plain line output, no alternate screen.
+- [ ] **Step 1: Write the failing tests.**
+  - REPL tests (scripted input, captured output):
+    - `prints_streamed_text`;
+    - `reasoning_shows_one_thinking_line_per_step`;
+    - `tool_row_format`: `ok bash cargo test -p x 2.1s · exit 0`; target truncated to 60 columns; statuses `ok|err|denied|blocked|cancelled`; `+a -r` for edits; filter saving note;
+    - `coloured_diff_only_with_color_option`: ANSI codes present with `color: true`, absent otherwise;
+    - `footer_after_each_turn`, matching `turn \d+ · \d+ steps · [\d.]+s · ctx \d+/\d+ tok · cache \d+% · \$\d+\.\d{4} \(session \$\d+\.\d{4}\) · saved ~\S+ tok \(est\.\)`;
+    - `footer_hidden_when_option_off`;
+    - `evidence_line_fresh_stale_and_none`: `last test: cargo test · exit 0 · fresh`, `stale (2 edits since)`, and `no test run this turn` when the turn edited without testing;
+    - `approval_prompt_shows_diff_and_y_approves_n_denies`;
+    - `approval_a_sends_exact_session_rule`: `Approve{session_rule: Some("bash(cargo test -p x)")}`;
+    - `approval_a_with_pattern_sends_user_rule`: `a bash(cargo test*)`;
+    - `slash_commands_map`:
+      - `/model x` → `SetModel`; `/diff 2` → `Diff{turn: Some(2)}`; `/diff` → `Diff{turn: None}`;
+      - `/undo` → `Undo{turn: None, dry_run: true}`, then `y` → `Undo{turn: None, dry_run: false}`, while `n` sends nothing;
+      - `/compact`, `/pin a`, `/unpin a`, `/fork`, `/memory consolidate` → their commands;
+    - `model_without_arg_lists_current_and_models_with_keys`;
+    - `cost_prints_turn_and_session_receipt`;
+    - `resume_without_arg_lists_last_10_sessions_and_with_arg_rebuilds_engine`: the factory is called with `Some(id)`;
+    - `memory_proposal_and_mcp_server_approval_use_y_n`;
+    - `ctrl_c_once_cancels_twice_within_2s_exits`: the injected signal stream; a third Ctrl+C after 2 s cancels again instead of exiting;
+    - `ctrl_c_at_prompt_clears_line_ctrl_d_exits`;
+    - `history_written_without_approval_answers`;
+    - `unknown_slash_command_prints_help`.
+  - Core `session_rules` tests:
+    - `session_rule_allows_matching_call`: the second identical `bash` call emits no `ToolApprovalRequested`;
+    - `session_rule_not_persisted_and_gone_after_resume`;
+    - `deny_rule_beats_session_rule`;
+    - `protected_path_still_asks_with_session_rule`: `edit(Cargo.toml)` asks again;
+    - `non_matching_session_rule_approves_once_and_warns`.
+- [ ] **Step 2: Run** `cargo test -p tautly-tui && cargo test -p tautly-core --test session_rules` — Expected: FAIL.
+- [ ] **Step 3: Implement.**
+  - Plain line output, no alternate screen.
+  - Rendering is a pure function of events plus `RenderState` (tests never need a terminal).
+  - The engine validates `session_rule` with `Policy::rule_matches` against the pending call before `add_session_allow`.
+  - `/resume` drops the current engine (`Shutdown`) before building the new one.
 - [ ] **Step 4: Run** — Expected: PASS.
-- [ ] **Step 5: Commit** `git commit -m "feat(tui): line-mode interactive REPL stub"`
+- [ ] **Step 5: Commit** `git commit -m "feat(tui): daily-driver line REPL with session rules"`
 
 ### Task 31: CLI utility commands
+
+**v1 scope note (binding, user-approved 2026-11-03):**
+- Expose `fn sessions::list(project: &Path, limit: usize) -> Vec<SessionSummary>`, with `struct SessionSummary { id: String, started: SystemTime, first_prompt: String /* first line, ≤ 60 chars */, cost_usd: Option<f64> }`, for the REPL's `/resume` (Task 30).
+- `tautly undo` switches to user-turn numbering and gains checkpoint restores in Task 47; `tautly sessions delete` is added there too.
 
 **Files:**
 - Create: `crates/tautly-cli/src/cmd/{prompt.rs,sessions.rs,models.rs,undo.rs}`
@@ -917,7 +1023,10 @@ proptest! { #[test] fn apply_then_inverse_restores(text in "[a-z\\n]{1,200}", ..
 - [ ] **Step 4: Run** — Expected: PASS.
 - [ ] **Step 5: Commit** `git commit -m "feat(cli): prompt, sessions, models, undo commands"`
 
-### Task 32: Opt-in OpenTelemetry export
+### Task 32: Opt-in OpenTelemetry export — Removed from v1 (user-approved 2026-11-03) — post-v1
+
+**Do not execute in v1.** The text below is kept for the post-v1 roadmap. In v1, the `[telemetry]` table stays reserved: it is parsed and ignored, and `enabled = true` produces a `Warning` (Task 40). No `otel` feature or opentelemetry dependency is added.
+
 
 **Files:**
 - Create: `crates/tautly-core/src/telemetry.rs`
@@ -935,6 +1044,11 @@ proptest! { #[test] fn apply_then_inverse_restores(text in "[a-z\\n]{1,200}", ..
 ### Task 33: Performance gates in CI
 
 **Checkpoint 2 amendments (binding):** Add an RSS gate for a 100k-file tree (index open + tree) and a gate that a no-op post-bash freshness check with a live watcher is cookie-based (< 50 ms), not a full refresh.
+
+**v1 scope note (binding, user-approved 2026-11-03):**
+- Cold-start gates run with `--mock-script`, which skips provider detection (Task 40), so they measure the same path as before.
+- Add the Task 47 checkpoint timings to the `perf` job: a clean 10,000-file repo < 300 ms and an unchanged-tree reuse < 5 ms, median of 20. These are recorded, and gated once stable.
+- Report the per-step latency added by checkpoints in the job summary.
 
 **Files:**
 - Create: `benches/perf/startup.sh`, `benches/perf/soak.rs`, `benches/perf/big_output.rs` (as `[[test]]` targets in a `perf` crate or `tautly-cli` with `#[ignore]` run explicitly), modify `.github/workflows/ci.yml` (job `perf`, release build, both OSes)
@@ -960,6 +1074,16 @@ proptest! { #[test] fn apply_then_inverse_restores(text in "[a-z\\n]{1,200}", ..
 
 ### Task 34: `tautly eval` runner and starter task set
 
+**Benchmark kit amendment (binding, user-approved 2026-11-03; spec 9.3):**
+- `tautly eval` gains `--trials N` (default 1). Results keep one entry per task and trial, and `summary` gains `trials` and the per-metric `mean`/`stdev` across trials.
+- `tautly eval report <results.json>... [--markdown]` prints the comparison table: model, pass rate, tokens per solved task, cache hit ratio, cost.
+- Add `benchmarks/tokens/run.sh` (fixed models and trials, writes raw JSON under `benchmarks/tokens/results/<date>/`) and a committed fixture `benchmarks/tokens/fixtures/sample.json`.
+- Tests:
+  - `trials_aggregate_mean_and_stdev`;
+  - `report_markdown_golden` (insta, run on the fixture);
+  - the CI `perf` job runs `tautly eval report benchmarks/tokens/fixtures/sample.json --markdown`.
+- No live run in CI.
+
 **Files:**
 - Create: `crates/tautly-cli/src/cmd/eval.rs`, `evals/starter/<id>/{task.toml,setup.sh,verify.sh}` × 50, `evals/README.md` (task format)
 - Test: `crates/tautly-cli/tests/eval.rs`
@@ -974,6 +1098,17 @@ proptest! { #[test] fn apply_then_inverse_restores(text in "[a-z\\n]{1,200}", ..
 - [ ] **Step 5: Commit** `git commit -m "feat(eval): tautly eval runner and 50-task starter set"`
 
 ### Task 35: Live smoke suite and daily-driver acceptance
+
+**Benchmark kit and acceptance amendment (binding, user-approved 2026-11-03; spec 9.3, 7.11):**
+- **Terminal-Bench adapter.** Add `benchmarks/terminal-bench/`:
+  - an installed-agent adapter for the Terminal-Bench 2.0 harness (harness version pinned in its README). It installs the release binary in the task container and runs `tautly -p "<instruction>" --approve yolo --output json`, keeping the event stream for token counts;
+  - `run.sh` for N trials (default 5) with a fixed model.
+- **Docs and CI.** Add `docs/benchmark.md`: methodology, reproduce commands, known failures, how to compare harnesses on the same model. CI runs `shellcheck` on the kit's scripts only; there is no live run in CI.
+- **Acceptance (Step 3) also records:**
+  - a zero-config first run on a clean account (no config file, only an env key): first answer, then `tautly doctor` exit 0;
+  - one task driven from Zed through `tautly acp`;
+  - `/undo` reverting a `bash` change in a git repo;
+  - one real MCP server (stdio) used through a tool call.
 
 **Files:**
 - Create: `crates/tautly-cli/tests/live_smoke.rs` (`#[ignore]`, requires keys), `.github/workflows/nightly.yml`
@@ -1040,3 +1175,541 @@ proptest! { #[test] fn apply_then_inverse_restores(text in "[a-z\\n]{1,200}", ..
 - [ ] **Step 3: Implement.** Section order: languages, directories, entry points, key symbols; truncate the last sections first to fit the budget.
 - [ ] **Step 4: Run** — Expected: PASS.
 - [ ] **Step 5: Commit** `git commit -m "feat(context): repo map in the stable prompt prefix"`
+
+---
+
+## v1 scope additions (user-approved 2026-11-03; spec 7.11)
+
+Tasks 39–47 follow the order in **Execution Order**. Each task's new `Event`/`Command` variants and fields are additions: `Option` fields, or `#[serde(default)]` on the rest. Each adds one insta snapshot per new variant to `event_json_shape_is_stable` (Task 23 test).
+
+### Task 39: Turn receipts, savings meter, `tautly stats`, `tautly receipt` (execute after Task 31)
+
+**Files:**
+- Create: `crates/tautly-core/src/receipt.rs`, `crates/tautly-cli/src/cmd/{stats.rs,receipt.rs}`
+- Modify:
+  - `crates/tautly-tools/src/{lib.rs,read.rs,bash.rs,index_tools.rs}`: `ToolMeta.saved`.
+  - `crates/tautly-core/src/{protocol.rs,ledger.rs,turn.rs,record.rs,config.rs}`.
+- Test: `crates/tautly-tools/tests/savings.rs`, `crates/tautly-core/tests/receipt.rs`, `crates/tautly-cli/tests/stats.rs`
+
+**Interfaces:**
+- Consumes:
+  - `Usage`/`RawUsage` and `Price` (Task 4).
+  - `Ledger` (Task 25).
+  - `GcRecord.tokens_freed` (Task 21).
+  - `TurnFinished.evidence` (Task 44).
+- Produces:
+  - `enum SaveKind { Index, DiffRead, Filter }`, `struct Saved { kind: SaveKind, bytes: u64 }`, `ToolMeta.saved: Option<Saved>` (persisted with the `ToolResult` record).
+  - Where tools report savings:
+    - `read`: re-read answered `unchanged` or with a diff → `DiffRead`, the full range bytes (≤ 30 KB) minus the returned bytes. A `{symbol}` target → `Index`, file bytes (≤ 30 KB) minus returned bytes.
+    - `outline`/`symbol` → `Index`, the same.
+    - Filtered `bash` → `Filter`, `min(raw, 30 KB)` minus returned, floored at 0.
+    - `refs`, `find`: `None`.
+  - `struct Savings { index: u64, diff_reads: u64, context_gc: u64, filters: u64, cache_read_tokens: u64, cache_usd: Option<f64>, total_usd: Option<f64> }`. Token fields = bytes / 4.
+  - `Event::TurnReceipt { turn: u32, model: ModelId, tokens_in: u64, tokens_out: u64, cache_read: u64, cache_write: u64, side_tokens: u64, cost_usd: Option<f64>, wall_ms: u64, cache_hit_ratio: Option<f64>, steps: u32, tool_calls: u32, saved: Savings }`. It is emitted right before `TurnFinished` for every reason.
+  - `struct ReceiptBuilder` with:
+    - `fn new(turn: u32, model: ModelId, started: Instant) -> Self`
+    - `fn usage(&mut self, role: UsageRole, raw: &RawUsage, cost: Option<f64>)`
+    - `fn request(&mut self, elided_tokens_out_of_context: u64)`: called once per provider request with the GC-elided tokens still out of context.
+    - `fn tool(&mut self, meta: &ToolMeta)`
+    - `fn finish(self, price: Option<&Price>, now: Instant) -> Event`
+  - `fn Ledger::record_receipt(&self, session: &str, project: &str, root: &Path, receipt: &Event) -> Result<()>`. Table `receipts(session, project, root, turn, model, at, tokens_in, tokens_out, cache_read, cache_write, side_tokens, cost_usd, wall_ms, steps, tool_calls, saved_index, saved_diff_reads, saved_context_gc, saved_filters, cache_usd, total_usd)`; WAL as before.
+  - `fn Ledger::stats(&self, since: Option<SystemTime>, by: GroupBy) -> Result<Vec<StatsRow>>`, with `enum GroupBy { Day, Model, Project }` and `struct StatsRow { key: String, turns: u64, tokens: u64, cost_usd: Option<f64>, saved_tokens: u64, saved_usd: Option<f64>, wall_ms: u64, cache_hit_ratio: Option<f64> }`. Tokens and cost come from usage rows; savings, wall time and turns from receipt rows; `Project` joins usage to receipts by session.
+  - `fn Ledger::session_receipts(&self, session: &str) -> Result<Vec<StoredReceipt>>`.
+  - `struct ReceiptsConfig { footer: bool /* true */ }`, `Config.receipts` (user and CLI only; the project layer drops it with a warning). The REPL footer (Task 30) reads it.
+  - CLI:
+    - `tautly stats [--since 7d|30d|all] [--by day|model|project] [--json]` (default `30d`, `day`).
+    - `tautly receipt [--last | --session ID] [--markdown]`: default and `--last` = the most recent session of the current project.
+
+- [ ] **Step 1: Write the failing tests.**
+  - Tools:
+    - `diff_reread_reports_full_minus_returned_bytes`: an 8,000-byte file read twice; the second gives `Saved{DiffRead, 8000 - returned}`;
+    - `filtered_cargo_output_reports_capped_raw_minus_returned`: 100 KB raw gives `30720 - returned`;
+    - `capped_but_unfiltered_output_reports_nothing`;
+    - `outline_and_symbol_report_index_saving`;
+    - `batched_symbol_target_reports_index_saving`;
+    - `refs_and_find_report_none`.
+  - Core:
+    - `receipt_precedes_turn_finished_for_every_reason`: completed, cancelled, budget, max_turns;
+    - `receipt_sums_main_and_side_and_reports_side_tokens`;
+    - `cache_hit_ratio_formula`: `cache_read 800, tokens_in 200` → `0.8`; both 0 → `None`;
+    - `context_gc_saving_counts_elided_tokens_per_later_request`: GC frees 3,000 tokens before request 2 of 3 → `context_gc == 6000`;
+    - `cache_usd_formula_can_be_negative`: a cold write-heavy turn gives `< 0`;
+    - `total_usd_prices_gc_at_cache_read_and_is_none_without_prices`;
+    - `wall_ms_spans_turn_started_to_finished`;
+    - `receipt_row_written_to_ledger`;
+    - `project_layer_cannot_set_receipts`.
+  - CLI:
+    - `stats_groups_by_day_model_project` (seeded ledger);
+    - `stats_json_shape` (insta);
+    - `receipt_markdown_labels_estimates_and_has_no_paths_prompts_or_project`: the output contains `est.`, and contains neither the root path, the prompt text nor the project name;
+    - `receipt_session_id_and_last`.
+- [ ] **Step 2: Run** `cargo test -p tautly-tools --test savings && cargo test -p tautly-core --test receipt && cargo test -p tautly-cli --test stats` — Expected: FAIL.
+- [ ] **Step 3: Implement.** Savings are bytes / 4 everywhere: deterministic, and labelled as estimates. A receipt is a projection of logged records, so resume rebuilds nothing extra.
+- [ ] **Step 4: Run** — Expected: PASS.
+- [ ] **Step 5: Commit** `git commit -m "feat(core,cli): turn receipts, savings estimates, stats and receipt commands"`
+
+### Task 40: Zero-config first run, `tautly auth add`, `tautly doctor` (execute after Task 39)
+
+**Files:**
+- Create: `crates/tautly-core/src/detect.rs`, `crates/tautly-cli/src/cmd/{auth.rs,doctor.rs}`
+- Modify:
+  - `crates/tautly-core/src/auth.rs`: `SecretStore::set`.
+  - `crates/tautly-core/src/config.rs`: `providers.auto_detect`, `LoadedConfig.model_explicit`, built-in compat entries, telemetry warning.
+  - `crates/tautly-core/src/provider_setup.rs`, `crates/tautly-provider/catalog/models.toml` (OpenRouter and Ollama entries), `crates/tautly-cli/src/main.rs`.
+- Test: `crates/tautly-core/tests/detect.rs`, `crates/tautly-cli/tests/{first_run.rs,auth.rs,doctor.rs}`
+
+**Interfaces:**
+- Consumes:
+  - `api_key_with`, `SecretStore`, `KeyLookup` (Task 23).
+  - `Catalog`, `Tier` (Tasks 4, 27).
+  - `restrict_project_layer` (Task 23).
+- Produces:
+  - `trait SecretStore { fn get(..) -> ..; fn set(&self, service: &str, account: &str, secret: &str) -> Result<(), AuthError>; }`; `KeyringStore` implements both.
+  - `ProvidersConfig.auto_detect: bool` (default `true`); user and CLI only, so the project layer drops it with a warning like every `providers` key.
+  - `LoadedConfig.model_explicit: bool`: true when any layer or flag set `model`.
+  - `fn Config::effective_compat(&self) -> Vec<CompatEntry>` adds built-in `openrouter` (`https://openrouter.ai/api/v1`, key env `OPENROUTER_API_KEY`) and `ollama` (`http://localhost:11434/v1`, no key) unless the user defines those names.
+  - `trait OllamaProbe { fn installed_models(&self, timeout: Duration) -> Option<Vec<String>>; }`; `HttpOllamaProbe` (`GET /api/tags`, 300 ms).
+  - `enum KeySource { Env(String), Keychain(String), Ollama }`, `struct Detected { model: ModelId, provider: String, source: KeySource, warning: Option<String> }`.
+  - `fn detect::detect(env: &dyn Fn(&str) -> Option<OsString>, store: &dyn SecretStore, probe: &dyn OllamaProbe, catalog: &Catalog) -> Result<Option<Detected>, AuthError>`. Order (spec 7.11.2):
+    1. env `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`;
+    2. keychain `anthropic`, `openai`, `google`;
+    3. OpenRouter env, then keychain `compat:openrouter`;
+    4. Ollama probe.
+  - `fn detect::default_model(provider: &str, catalog: &Catalog) -> Option<ModelId>`: priced, `tier != Small`, window ≥ 128,000, lowest input price, then output price, then id.
+  - `fn detect::ollama_model(installed: &[String], catalog: &Catalog) -> (ModelId, Option<String>)`.
+  - The CLI runs detection only when `!model_explicit && auto_detect && mock_script.is_none()`, off the async threads. It prints `using <model> (from <source>) · /model to switch · tautly doctor to check` to stderr. With nothing found it exits 1 with a hint naming the env variables, `tautly auth add <provider>` and Ollama.
+  - Telemetry: `[telemetry] enabled = true` → `LoadedConfig.warnings` gains `[telemetry] OpenTelemetry export is post-v1; ignored`.
+  - `tautly auth add <anthropic|openai|google|openrouter|compat:NAME>`:
+    - TTY: hidden prompt (`rpassword`). Otherwise one stdin line.
+    - Trims; rejects blank; `set`, then `get` to verify; prints `stored key for <provider> in the <keychain name>`. Never echoes the key.
+    - No keychain: exit 1 with an env-variable hint.
+    - Tests use a file-backed `SecretStore` selected by `TAUTLY_TEST_SECRET_STORE=<path>`, honoured only with the `mock` cargo feature.
+  - `tautly doctor [--json] [--offline]`, with `enum Level { Ok, Warn, Fail, Info }`, `struct Check { name: &'static str, level: Level, detail: String }`, `fn doctor::run(cx: &DoctorCx) -> Vec<Check>`.
+    - Checks: `config, model, keys, keychain, network, data home, sandbox, git, index` (`mcp` is added by Task 45). Their levels follow spec 7.11.2.
+    - Network: `GET` the model-list endpoint per provider with a key, 3 s timeout, key in a header (`x-api-key` / `Authorization: Bearer` / `x-goog-api-key`), never in the URL.
+    - Exit 1 if any `Fail`.
+
+- [ ] **Step 1: Write the failing tests.**
+  - Detection:
+    - `detect_order_env_then_keychain_then_openrouter_then_ollama` (table-driven, fake env/store/probe);
+    - `default_model_is_cheapest_non_small_with_128k_window` (fixture catalog: anthropic large/larger/small picks the cheapest large; tie broken by output price, then id);
+    - `ollama_prefers_catalog_model_else_alphabetical_with_warning`;
+    - `ollama_without_models_is_not_detected`;
+    - `ollama_probe_times_out_within_400ms` (wiremock delay 1 s);
+    - `explicit_model_skips_detection` (probe and store never called);
+    - `auto_detect_false_skips_detection`;
+    - `project_layer_cannot_set_auto_detect`;
+    - `builtin_compat_entries_unless_user_defines_them`;
+    - `telemetry_enabled_warns_and_is_ignored`.
+  - First run:
+    - `mock_script_skips_detection`;
+    - `no_provider_found_exits_1_with_hint`: stderr contains `tautly auth add`;
+    - `startup_line_on_stderr_not_stdout`: `-p --output json` stdout is valid NDJSON and stderr starts with `using `;
+    - `configured_model_without_key_fails_with_same_hint`.
+  - Auth:
+    - `auth_add_reads_stdin_and_writes_store`;
+    - `auth_add_rejects_blank`;
+    - `auth_add_never_prints_key`;
+    - `auth_add_unknown_provider_errors`.
+  - Doctor:
+    - `doctor_healthy_exits_0`: wiremock provider endpoints return 200, plus env key, temp data home and git repo;
+    - `doctor_rejected_key_fails_exit_1` (401);
+    - `doctor_offline_skips_network`;
+    - `doctor_sends_key_in_header_not_url`: wiremock asserts the header and an empty query;
+    - `doctor_never_prints_key_values`;
+    - `doctor_missing_git_is_warn_not_fail` (`PATH` without git);
+    - `doctor_json_shape` (insta).
+- [ ] **Step 2: Run** `cargo test -p tautly-core --test detect && cargo test -p tautly-cli --test first_run --test auth --test doctor` — Expected: FAIL.
+- [ ] **Step 3: Implement.** Detection reads env first, so the keychain is touched only when no env key exists and the probe runs only as the last resort. Catalog: add the OpenRouter ids of the three native main-tier models at OpenRouter list prices, and common Ollama models (unpriced, conservative capabilities).
+- [ ] **Step 4: Run** — Expected: PASS.
+- [ ] **Step 5: Commit** `git commit -m "feat(cli): zero-config provider detection, auth add, doctor"`
+
+### Task 41: Release and installers with cargo-dist (execute after Task 46)
+
+**Files:**
+- Create: `dist-workspace.toml`, `.github/workflows/release.yml` (generated by `dist generate`, committed), `scripts/check-dist-plan.sh`
+- Modify:
+  - `Cargo.toml`: workspace `repository`/`homepage`, `[profile.dist]` inheriting `release`.
+  - `crates/tautly-cli/Cargo.toml`: `[package.metadata.binstall]`; keyring features `apple-native`, `async-secret-service`, `tokio`, `crypto-rust`, so Linux links without libdbus.
+  - `.github/workflows/ci.yml`: jobs `dist-plan`, `musl-static`.
+  - README install section.
+- Test: `scripts/check-dist-plan.sh`, CI job `musl-static`
+
+**Interfaces:**
+- Produces:
+  - Release artifacts for `aarch64-apple-darwin`, `x86_64-apple-darwin`, `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`.
+  - Packaging: `tautly-<target>.tar.xz` with `.sha256`, `tautly-installer.sh`, and a Homebrew formula published to the tap named in `dist-workspace.toml` (`tap = "<owner>/homebrew-tap"`; the owner is filled in from the repository URL).
+  - Triggered by `v*` tags only.
+  - Runners: `aarch64-unknown-linux-musl` builds on `ubuntu-24.04-arm`; `x86_64-unknown-linux-musl` on `ubuntu-latest` with `musl-tools` (`[dist.dependencies.apt]`); both macOS targets on `macos-14`.
+  - Pin `cargo-dist-version`.
+
+- [ ] **Step 1: Write the failing checks.**
+  - `scripts/check-dist-plan.sh` runs `dist plan --output-format=json`. It asserts:
+    - exactly the four targets;
+    - installers `shell` and `homebrew`;
+    - `sha256` checksums;
+    - the binstall `pkg-url` template matches the planned artifact names.
+  - CI job `musl-static`: `cargo build --release --target x86_64-unknown-linux-musl -p tautly-cli`, then `file target/x86_64-unknown-linux-musl/release/tautly | grep -q 'statically linked'`, then `./tautly --version`.
+- [ ] **Step 2: Run** `bash scripts/check-dist-plan.sh` — Expected: FAIL (no dist config).
+- [ ] **Step 3: Implement.** Run `dist init` with the values above and `dist generate`, commit the workflow, add the binstall metadata and switch the keyring features. If the musl build cannot link the keyring backend, fall back to `-gnu` Linux targets, record that in `dist-workspace.toml` comments and the release notes, and update the check.
+- [ ] **Step 4: Run** `bash scripts/check-dist-plan.sh && dist build --artifacts=local` (host target) and run `tautly --version` from the produced archive — Expected: PASS. Publishing needs the tap repository and a `HOMEBREW_TAP_TOKEN` secret, which the user creates. The first release tag is pushed by the user, not by CI.
+- [ ] **Step 5: Commit** `git commit -m "build: cargo-dist releases, installers and static Linux builds"`
+
+### Task 42: Diffs in approvals and results, `Command::Diff` (execute after checkpoint 4)
+
+**Files:**
+- Create: `crates/tautly-tools/src/preview.rs`, `crates/tautly-core/src/diff.rs`
+- Modify:
+  - `crates/tautly-tools/src/{lib.rs,write.rs,edit/mod.rs,edit/str_replace.rs,edit/patch.rs,edit/hashline.rs}`.
+  - `crates/tautly-core/src/{protocol.rs,approvals.rs,turn.rs,engine.rs}`.
+- Test: `crates/tautly-tools/tests/preview.rs`, `crates/tautly-core/tests/diff.rs`
+
+**Interfaces:**
+- Consumes:
+  - The edit pipeline and tolerant applier (Tasks 11, 12, 7.9).
+  - `AppliedEffect::Edited.pre_image` (Task 26 undo data).
+  - The `SessionReader` (Task 18).
+- Produces:
+  - `#[derive(Serialize, Deserialize)] struct DiffPreview { unified: String, lines: u32, truncated: bool }`.
+  - `fn unified_diff(files: &[(PathBuf /* root-relative */, Option<&[u8]>, Option<&[u8]>)], max_lines: u32, max_bytes: usize) -> DiffPreview`:
+    - 3 context lines; `/dev/null` for created or deleted files; `Binary file <path> differs` for non-UTF-8 content;
+    - beyond the cap, it ends with `… N more lines (diff truncated)`.
+    - Approval and result caps are 200 lines / 16 KB.
+  - `struct Preview { diff: DiffPreview, bases: Vec<(PathBuf, Option<blake3::Hash>)> }`.
+  - `Tool::preview(&self, args: &Value, sb: &dyn Sandbox, cx: &ToolCx) -> Option<Result<Preview, ToolResult>>` (async, default `None`). `edit` (all formats) and `write` implement it with the same stale guard and matching as `run`, and never write.
+  - `ToolCx.approved_bases: Option<Vec<(PathBuf, Option<blake3::Hash>)>>`. When set, `run` fails with error kind `changed_after_approval` (text `stale: file changed after approval`) if a base hash differs.
+  - `ToolResult.applied_diff: Option<DiffPreview>`.
+  - Wire additions:
+    - `Event::ToolApprovalRequested { .., #[serde(default)] diff: Option<DiffPreview> }`
+    - `Event::ToolFinished { .., #[serde(default)] diff: Option<DiffPreview> }`
+    - `Command::Diff { turn: Option<u32> }`
+    - `Event::SessionDiff { turn: Option<u32>, files: Vec<DiffFile>, unified: String, truncated: bool }`
+    - `struct DiffFile { path: String, status: DiffStatus, added: u32, removed: u32 }`, `enum DiffStatus { Added, Modified, Deleted, #[serde(other)] Unknown }`
+  - `fn diff::session_diff(reader: &SessionReader<SessionRecord>, sb: &dyn Sandbox, turn: Option<u32>, max_lines: u32 /* 2000 */) -> Result<Event, DiffError>`. Turn = user turn (the n-th `SendMessage` record).
+  - Engine flow when the decision is `Ask`:
+    1. Call `preview`. On `Err(result)`, finish the call with that result and do not ask.
+    2. Otherwise attach the diff to `ToolApprovalRequested` and pass `bases` as `approved_bases` to `run`.
+
+- [ ] **Step 1: Write the failing tests.**
+  - Tools:
+    - `preview_equals_applied_diff` (proptest over random `str_replace` edits: `preview.diff == result.applied_diff`);
+    - `preview_writes_nothing` (bytes and mtime unchanged);
+    - `preview_for_each_edit_format`;
+    - `write_new_file_diff_uses_dev_null`;
+    - `diff_capped_at_200_lines_with_marker`: 250 changed lines → `lines == 250+`, `truncated`, ends with `… N more lines (diff truncated)`;
+    - `diff_capped_at_16kb`;
+    - `binary_content_shows_binary_differs`.
+  - Core:
+    - `approval_carries_diff_preview`: Ask mode edit → `diff` contains `--- a/src/lib.rs`;
+    - `failing_preview_answers_without_asking`: no match → `ToolFinished{is_error}` and no `ToolApprovalRequested`;
+    - `file_changed_after_approval_fails_stale`: an external write between the request and `Approve` → error kind `changed_after_approval`, and the file keeps the external content;
+    - `tool_finished_carries_applied_diff_in_every_mode` (ask, auto-edit, yolo);
+    - `session_diff_net_change_per_file`: editing a file twice across turns gives one diff from the first pre-image; a file created and then deleted is absent;
+    - `session_diff_turn_scope_uses_user_turns`;
+    - `session_diff_capped_at_2000_lines`;
+    - `old_json_without_diff_fields_parses`.
+- [ ] **Step 2: Run** `cargo test -p tautly-tools --test preview && cargo test -p tautly-core --test diff` — Expected: FAIL.
+- [ ] **Step 3: Implement.** Use `similar` (already in the stack) for hunks. The preview is computed on the blocking pool for files larger than 1 MB.
+- [ ] **Step 4: Run** — Expected: PASS.
+- [ ] **Step 5: Commit** `git commit -m "feat(core,tools): diff previews in approvals and results, session diff"`
+
+### Task 43: Mid-session model switch (execute after Task 42)
+
+**Task 19 re-review note applies (binding):** on a switch to another provider, strip `Reasoning`/`RedactedReasoning` produced by a different provider before the next request.
+
+**Files:**
+- Modify: `crates/tautly-core/src/{protocol.rs,engine.rs,turn.rs,record.rs,routing.rs,provider_setup.rs,resume.rs}`, `crates/tautly-context/src/{lib.rs,assemble.rs}` (force a cold epoch)
+- Test: `crates/tautly-core/tests/set_model.rs`
+
+**Interfaces:**
+- Consumes:
+  - `provider_for` (Task 23).
+  - `routing::side_model_id` (Task 27).
+  - The cache scheduler (Task 21/7.7).
+  - The `Budget` rules (Task 25).
+- Produces:
+  - `Command::SetModel { model: ModelId }`
+  - `Event::ModelChanged { model: ModelId, provider: String }`, with `provider` ∈ `anthropic|openai|google|compat:<name>`.
+  - `SessionRecord::ModelSet { model: ModelId }`, replayed by `rebuild`.
+  - `fn Context::force_cold_epoch(&mut self)`: the next step start decides `ColdCache`.
+  - `fn Context::strip_reasoning(&mut self, keep_provider: Option<&str>)`.
+  - Engine behaviour:
+    - `SetModel` applies immediately when idle, else at the next user-turn start.
+    - On apply it recomputes capabilities, budget window, edit format (config override wins) and the side model (`routing.side_model` wins).
+    - An unknown model or missing key → `Error{kind: ProviderFatal, retryable: false, hint: Some("… tautly auth add <provider>")}` and no change.
+    - A `400`/invalid-request error whose message names `thinking`, `reasoning` or `signature`, on the first request after a same-provider switch, strips reasoning and retries once.
+
+- [ ] **Step 1: Write the failing tests:**
+  - `set_model_idle_applies_immediately_and_emits_model_changed`;
+  - `set_model_during_turn_applies_at_next_user_turn`: the remaining steps of the turn use the old model; the next turn's first request uses the new one;
+  - `unknown_model_or_missing_key_errors_and_keeps_model`;
+  - `edit_format_follows_new_model_unless_configured`;
+  - `side_model_recomputed_unless_routing_set`;
+  - `first_request_after_switch_is_cold_epoch`: pending GC is applied and session pins are folded on that request;
+  - `smaller_window_forces_compaction_at_next_step`: 150k used, switch to a 128k model → `Compacted{reason: Forced}` before the request;
+  - `foreign_reasoning_stripped_same_provider_kept`;
+  - `reasoning_rejection_strips_and_retries_once`: the mock's second failure surfaces as `Error`;
+  - `model_set_survives_resume`;
+  - `budget_carries_over_and_unpriced_model_warns`.
+- [ ] **Step 2: Run** `cargo test -p tautly-core --test set_model` — Expected: FAIL.
+- [ ] **Step 3: Implement.** The provider is rebuilt via `provider_for` on the blocking pool; keychain reads never run on the executor.
+- [ ] **Step 4: Run** — Expected: PASS.
+- [ ] **Step 5: Commit** `git commit -m "feat(core): mid-session model switch"`
+
+### Task 44: `CLAUDE.md` fallback and evidence footer (execute after Task 43)
+
+**Files:**
+- Create: `crates/tautly-core/src/evidence.rs`
+- Modify:
+  - `crates/tautly-context/src/agents_md.rs`.
+  - `crates/tautly-tools/src/{lib.rs,filters/mod.rs}`: `ToolMeta.counts`.
+  - `crates/tautly-core/src/{protocol.rs,config.rs,turn.rs}`.
+- Test: `crates/tautly-context/tests/agents_md.rs` (extend), `crates/tautly-core/tests/evidence.rs`
+
+**Interfaces:**
+- Consumes:
+  - `agents_md::load` (Task 19, CP3 rounds).
+  - `parse_commands` (Task 2).
+  - The write generation (Task 24).
+  - Output filter counts (Task 16).
+- Produces:
+  - `agents_md::load` keeps its signature. Per directory level it reads `AGENTS.md`, else `CLAUDE.md`, through the same resolver, confinement, ownership/mode checks and shared caps (32 KB per file / 64 KB total), and auto-pins `Constraints`/`Rules` sections from either. `AgentsMd.sources: Vec<(PathBuf, InstructionFile)>`, `enum InstructionFile { AgentsMd, ClaudeMd }`. The block header names the file used. `@path` lines are kept as text.
+  - `struct TestCounts { passed: u32, failed: u32 }`, `ToolMeta.counts: Option<TestCounts>` (set by filters that parse counts).
+  - `struct EvidenceConfig { test_commands: Vec<String>, replace_defaults: bool }`, `Config.evidence` (user and CLI only; the project layer drops it with a warning).
+  - `const DEFAULT_TEST_COMMANDS: &[&str]` = the spec 7.11.7 list.
+  - `struct TestMatcher` with `fn new(cfg: &EvidenceConfig) -> Result<Self, PolicyError>` and `fn is_test(&self, raw_cmd: &str) -> bool`: any parsed component matches.
+  - `struct TestEvidence { command: String /* ≤ 200 chars */, exit_code: Option<i32>, passed: Option<u32>, failed: Option<u32>, step: u32, write_gen: u64, stale: bool, edits_since: u32, execs_since: u32 }`.
+  - `Event::TurnFinished { reason: FinishReason, #[serde(default)] evidence: Option<TestEvidence> }`.
+  - `struct EvidenceTracker` with `fn on_tool(&mut self, step: u32, raw_cmd: Option<&str>, result: &ToolResult, write_gen: u64)` and `fn finish(self) -> Option<TestEvidence>`. `stale` = a later `Edited|Deleted` effect, or a later `Exec{may_write: true}` that is not itself a test run.
+
+- [ ] **Step 1: Write the failing tests.**
+  - Context:
+    - `claude_md_used_when_no_agents_md`;
+    - `agents_md_wins_when_both_exist`;
+    - `claude_md_obeys_caps_confinement_and_ownership`: an outside symlink is refused, a group-writable ancestor is refused, and a 40 KB file is truncated with the marker;
+    - `claude_md_rules_section_auto_pinned`;
+    - `claude_md_at_imports_kept_as_text`;
+    - `block_header_names_file_used`.
+  - Core:
+    - `default_patterns_detect_common_test_commands`. Table: `cargo test -p x`, `cd a && pytest -q`, `npm run test -- --watch=false`, `go test ./...` are tests; `cargo build` and `echo pytest` are not;
+    - `evidence_reports_last_test_run_with_counts`;
+    - `edit_after_test_marks_stale_with_counts`;
+    - `test_after_test_is_fresh`;
+    - `non_test_exec_after_test_marks_stale`;
+    - `no_test_run_gives_none`;
+    - `project_layer_cannot_set_evidence`: project `[evidence] test_commands = ["true"]` is ignored with a warning;
+    - `user_patterns_add_and_replace_defaults`;
+    - `old_turn_finished_json_without_evidence_parses`.
+- [ ] **Step 2: Run** `cargo test -p tautly-context --test agents_md && cargo test -p tautly-core --test evidence` — Expected: FAIL.
+- [ ] **Step 3: Implement.**
+- [ ] **Step 4: Run** — Expected: PASS.
+- [ ] **Step 5: Commit** `git commit -m "feat(context,core): CLAUDE.md fallback and test evidence on TurnFinished"`
+
+### Task 45: Tools-only MCP client (execute after Task 40)
+
+**Files:**
+- Create: `crates/tautly-mcp/{Cargo.toml,src/{lib.rs,config.rs,client.rs,tool.rs,names.rs,approvals.rs}}`, `crates/tautly-mcp/tests/fixtures/echo_server.rs` (`[[bin]]` test fixture built on `rmcp` server APIs: stdio and streamable HTTP, plus a legacy-handshake mode), `crates/tautly-cli/src/cmd/mcp.rs`
+- Modify:
+  - `crates/tautly-core/src/config.rs`: `[mcp]` user-only except `servers` in the project layer.
+  - `crates/tautly-core/src/{engine.rs,turn.rs,protocol.rs}`.
+  - `crates/tautly-sandbox/src/policy.rs`: rule tool names may be globs when they start with `mcp__`.
+  - `crates/tautly-tools/src/lib.rs`: `registry` takes extra tools.
+  - `crates/tautly-rpc/src/oneshot.rs`, `crates/tautly-cli/src/main.rs` (`--approve-mcp`), `crates/tautly-cli/src/cmd/doctor.rs` (`mcp` check).
+- Test: `crates/tautly-mcp/tests/{client.rs,names.rs,approvals.rs}`, `crates/tautly-core/tests/mcp.rs`, `crates/tautly-cli/tests/mcp.rs`
+
+**Interfaces:**
+- Consumes:
+  - `Sandbox::spawn` (Task 1).
+  - `Tool`, `cap_text`/spill (Tasks 9, 10).
+  - The policy (Task 3).
+  - Approvals by `request_id` (Task 24).
+  - `Checkpointer::snapshot` (Task 47), before stdio MCP calls.
+  - The `rmcp` 3.8 client: stdio over the spawned child's `(stdout, stdin)` pair, plus streamable HTTP.
+- Produces:
+  - `struct McpConfig { enabled: bool, timeout_s: u64 /* 120 */, startup_timeout_ms: u64 /* 5000 */, max_tools: usize /* 50 */, import_mcp_json: bool /* true */, servers: BTreeMap<String, ServerSpec> }`.
+  - `enum ServerSpec { Stdio { command: String, args: Vec<String>, env: BTreeMap<String, String>, cwd: Option<PathBuf> }, Http { url: Url, headers: BTreeMap<String, String> } }`; `enum ServerSource { User, Project, McpJson, Client }`.
+  - `fn approvals::key(root: &Path, name: &str, spec: &ServerSpec) -> String`: blake3 hex of canonical root, name, transport, argv or URL, and env/header names (not values).
+  - `struct ApprovalStore` with `fn open(path: &Path) -> Self`, `fn is_approved(&self, key: &str) -> bool`, `fn approve(&mut self, key: &str, root: &Path, name: &str) -> io::Result<()>` (atomic write, mode 0600).
+  - `struct McpHub` with:
+    - `async fn start(servers: Vec<(String, ServerSpec, ServerSource)>, sb: Arc<dyn Sandbox>, cfg: &McpConfig, strip_env: &[String]) -> McpHub`
+    - `fn ready_tools(&self) -> Vec<Arc<dyn Tool>>`
+    - `fn status(&self) -> Vec<ServerStatus>`
+    - `async fn shutdown(&self)` (kills stdio process groups)
+  - `fn names::tool_name(server: &str, tool: &str) -> String`: `[A-Za-z0-9_-]` kept, others become `_`; over 64 chars → 57 chars + `_` + 6 hex of blake3; collisions resolved by that suffix.
+  - `struct McpTool: Tool`. `effect` = `Exec{argv: [command, args..]}` (stdio) or `Network{host}` (HTTP). Descriptions are truncated to 1 KB. An input schema > 8 KB skips the tool with a `Warning`. Results map text, `structuredContent` (JSON text), images (when capable) and resource links (text), then `cap_text` 30 KB with spill. Timeout `timeout_s`.
+  - Wire additions:
+    - `Event::McpServerApprovalRequested { request_id: String, server: String, source: String, launch: String }`, answered by `Approve`/`Deny` with that `request_id`.
+    - `Event::McpServerStatus { server: String, state: McpState, tools: u32, message: Option<String> }`, `enum McpState { Starting, Ready, Failed, Skipped, AwaitingApproval, #[serde(other)] Unknown }`.
+  - `EngineBuilder` gains `approve_mcp: bool` and `client_mcp: Vec<(String, ServerSpec)>` (ACP, trusted).
+  - Engine behaviour:
+    - The first request waits ≤ `startup_timeout_ms` for starting servers.
+    - Servers ready later, and `tools/list_changed`, apply at the next user-turn start only.
+    - Stdio server env = parent env minus provider key variables (all default names plus every configured `api_key_env`) plus `env`.
+    - A stdio MCP call takes a checkpoint first (Task 47).
+  - CLI: `tautly mcp list`, `tautly mcp import [--from PATH]` (Claude-style `mcpServers` JSON, default `~/.claude.json`, else `./.mcp.json`; written to the user config with `toml_edit`, comments preserved), and `--approve-mcp` (this run only, never persisted).
+
+- [ ] **Step 1: Write the failing tests.**
+  - Names:
+    - `names_sanitized_and_capped_at_64_with_hash`;
+    - `collisions_get_distinct_names`.
+  - Client:
+    - `stdio_server_lists_and_calls_tools`;
+    - `http_server_lists_and_calls_tools`;
+    - `legacy_initialize_handshake_server_supported`;
+    - `server_env_has_no_provider_keys`: with `ANTHROPIC_API_KEY` and a configured `api_key_env` set in the parent, the fixture's `env` tool reports neither;
+    - `call_timeout_respected` (`timeout_s = 1`, slow tool → error result);
+    - `oversized_schema_tool_skipped_with_warning`;
+    - `at_most_50_tools_per_server`;
+    - `description_truncated_to_1kb`;
+    - `result_mapping_text_structured_image_link`;
+    - `result_capped_at_30kb_with_spill`;
+    - `stdio_server_killed_on_shutdown` (no fixture process remains).
+  - Approvals:
+    - `repo_server_not_spawned_without_approval`: interactive → `McpServerApprovalRequested` and status `AwaitingApproval`, and no process exists before `Approve`;
+    - `approval_remembered_by_root_and_launch_hash`;
+    - `changed_command_asks_again`;
+    - `headless_repo_server_skipped_without_flag_started_with_approve_mcp_and_not_persisted`;
+    - `user_server_shadows_repo_server_with_warning`;
+    - `project_layer_mcp_keys_other_than_servers_dropped`;
+    - `deny_lasts_for_the_session`;
+    - `mcp_json_ignored_when_import_mcp_json_false`.
+  - Core:
+    - `mcp_tools_sorted_by_name_in_request`;
+    - `mcp_call_asks_in_ask_and_auto_edit_allowed_in_yolo`;
+    - `mcp_rule_by_name_glob_allows` (`allow = ["mcp__echo__*"]`);
+    - `first_request_waits_up_to_startup_timeout`;
+    - `late_server_joins_at_next_user_turn_once`: request 1 lacks its tools; the first request of turn 2 has them; later requests are prefix-identical;
+    - `list_changed_applies_at_next_user_turn`;
+    - `checkpoint_taken_before_stdio_mcp_call`;
+    - `identical_failed_mcp_call_blocked`.
+  - CLI:
+    - `mcp_import_from_claude_json_preserves_comments`;
+    - `mcp_list_shows_state_source_approval_and_tools`;
+    - `doctor_reports_pending_repo_mcp_approval_as_warn`.
+- [ ] **Step 2: Run** `cargo test -p tautly-mcp && cargo test -p tautly-core --test mcp && cargo test -p tautly-cli --test mcp` — Expected: FAIL.
+- [ ] **Step 3: Implement.** HTTP uses `rmcp`'s streamable-HTTP client (reqwest, rustls); its host is checked as `Network{host}` per call. Resources, prompts, sampling, elicitation, roots and OAuth are not implemented; requests for them are refused per the MCP spec.
+- [ ] **Step 4: Run** — Expected: PASS.
+- [ ] **Step 5: Commit** `git commit -m "feat(mcp): tools-only MCP client with repository server approval"`
+
+### Task 46: ACP bridge `tautly acp` (execute after Task 30)
+
+**Files:**
+- Create: `crates/tautly-acp/{Cargo.toml,src/{lib.rs,bridge.rs,map.rs,permission.rs}}`
+- Modify: `crates/tautly-cli/src/main.rs` (`acp` subcommand)
+- Test: `crates/tautly-acp/tests/{bridge.rs,map.rs}`. They drive the bridge over an in-memory duplex with the `agent-client-protocol` crate's client side, against `MockProvider`.
+
+**Interfaces:**
+- Consumes:
+  - `EngineBuilder` (+ `workspace`, `resume`, `client_mcp`, `interactive: true`).
+  - `Workspace` sharing (Task 29 amendment).
+  - Session rules (Task 30).
+  - `DiffPreview` and pre-images (Task 42).
+  - `SetModel` (Task 43).
+  - `McpServerApprovalRequested` (Task 45).
+  - `TurnReceipt`/evidence (Tasks 39, 44).
+  - `agent-client-protocol` 1.15 (schema v1.29.1, wire `protocolVersion` 1).
+- Produces:
+  - `const ACP_PROTOCOL_VERSION: u16 = 1`.
+  - `type AcpEngineFactory = Arc<dyn Fn(PathBuf /* root */, Option<String> /* resume */, Vec<(String, ServerSpec)>) -> Result<(Engine, mpsc::Receiver<Event>), EngineError> + Send + Sync>`.
+  - `async fn serve(factory: AcpEngineFactory, input: impl AsyncRead + Unpin, output: impl AsyncWrite + Unpin) -> Result<(), AcpError>`.
+  - `fn map::tool_kind(tool: &str) -> ToolKind`, per the spec 7.11.9 table.
+  - `fn map::stop_reason(r: FinishReason) -> Option<StopReason>` (`Error` → `None` = JSON-RPC error).
+  - `fn map::diff_content(path: &Path, old: Option<&str>, new: &str) -> Option<ToolCallContent>` (`None` when either side > 256 KB).
+  - `fn map::tool_title(tool: &str, args: &Value) -> String` (`<tool>: <target>`).
+  - Handled methods: `initialize` (agent capabilities `loadSession: true`, prompt `embeddedContext: true`, `image` per default model; `authMethods: []`), `session/new`, `session/load`, `session/prompt`, `session/cancel`, `session/set_config_option` (`configId: "model"`).
+  - Outbound: `session/update` (`agent_message_chunk`, `agent_thought_chunk`, `tool_call`, `tool_call_update`, `usage_update`, `available_commands_update`, `notice` when the client advertises `session.notices`) and `session/request_permission`.
+
+- [ ] **Step 1: Write the failing tests.**
+  - Initialize and sessions:
+    - `initialize_returns_protocol_1_and_load_session`;
+    - `higher_client_version_gets_1`;
+    - `session_new_uses_git_top_level_of_cwd`;
+    - `missing_key_fails_session_new_with_hint`;
+    - `two_sessions_share_one_workspace`;
+    - `client_mcp_servers_trusted_without_approval`;
+    - `session_load_replays_messages_and_tool_calls`.
+  - Prompts and streaming:
+    - `prompt_streams_agent_message_chunks_and_ends_end_turn`;
+    - `reasoning_maps_to_thought_chunks`;
+    - `tool_call_lifecycle_pending_in_progress_completed_with_kind_title_locations`;
+    - `edit_result_carries_diff_content_old_new`;
+    - `oversized_file_falls_back_to_unified_text`;
+    - `usage_update_has_used_size_and_usd_cost`;
+    - `slash_prompt_compact_maps_to_command`.
+  - Permissions:
+    - `ask_maps_to_request_permission_with_preview_diff`;
+    - `allow_always_adds_session_rule`: the second identical call is not asked;
+    - `reject_or_cancelled_outcome_denies`;
+    - `memory_proposal_and_mcp_approval_use_request_permission`.
+  - Cancel, stop reasons, model:
+    - `cancel_answers_pending_permission_and_returns_cancelled`;
+    - `stop_reason_mapping`: `max_turns` → `max_turn_requests`; budget → `end_turn` plus a notice when supported; error → JSON-RPC error;
+    - `set_config_option_model_sends_set_model_and_returns_options`.
+- [ ] **Step 2: Run** `cargo test -p tautly-acp` — Expected: FAIL.
+- [ ] **Step 3: Implement.** Client `fs/*` and `terminal/*` are not used. The bridge never writes to stdout except protocol frames; logs go to stderr.
+- [ ] **Step 4: Run** — Expected: PASS. Then a manual Zed check (`agent_servers` entry running `tautly acp`), recorded in Task 35's acceptance.
+- [ ] **Step 5: Commit** `git commit -m "feat(acp): Agent Client Protocol bridge"`
+
+### Task 47: Git checkpoints before bash and `/undo` (execute after Task 44)
+
+**Files:**
+- Create: `crates/tautly-core/src/checkpoint.rs`
+- Modify:
+  - `crates/tautly-core/src/{resume.rs,protocol.rs,engine.rs,turn.rs,record.rs}`.
+  - `crates/tautly-core/src/config.rs`: `[checkpoints]`, user and CLI only.
+  - `crates/tautly-cli/src/cmd/{undo.rs,sessions.rs}`.
+- Test: `crates/tautly-core/tests/checkpoint.rs`, `crates/tautly-cli/tests/cli.rs` (extend)
+
+**Interfaces:**
+- Consumes:
+  - `Sandbox::spawn` (Task 1).
+  - `undo` (Task 26) and pre-images.
+  - The write generation and watcher state (Tasks 24, 36).
+  - The session records (Task 24).
+- Produces:
+  - `struct CheckpointConfig { enabled: bool /* true */, keep_days: u32 /* 14 */, timeout_ms: u64 /* 3000 */, max_untracked_mb: u64 /* 200 */, max_untracked_files: u64 /* 20000 */ }`, `Config.checkpoints`.
+  - `struct Checkpointer`:
+    - `fn new(sb: Arc<dyn Sandbox>, root: PathBuf, session: String, cfg: CheckpointConfig) -> Option<Checkpointer>` (`None` when not a git work tree, git is missing, or the tree is bare).
+    - `async fn snapshot(&mut self, write_gen: u64, watcher_changed: bool) -> Result<CheckpointRef, Skip>`. Every git call has `GIT_INDEX_FILE=<temp>`, `-c core.fsmonitor=false -c core.hooksPath=/dev/null` and a `timeout_ms` deadline. An unchanged tree reuses the previous checkpoint.
+    - `async fn restore(&self, commit: &str, dry_run: bool) -> Result<RestorePlan, CheckpointError>`
+    - `async fn backup(&mut self) -> Result<CheckpointRef, Skip>` (`undo-<n>` ref)
+  - `struct CheckpointRef { n: u32, commit: String, refname: String }`, `enum Skip { NoGit, Timeout, TooManyUntracked { files: u64, bytes: u64 }, Git(String) }`, `struct RestorePlan { restored: Vec<PathBuf>, deleted: Vec<PathBuf> }`.
+  - `async fn checkpoint::prune(sb: &dyn Sandbox, root: &Path, keep_days: u32) -> Result<u32, CheckpointError>` (engine start) and `async fn checkpoint::delete_session_refs(sb: &dyn Sandbox, root: &Path, session: &str) -> Result<u32, CheckpointError>`.
+  - Session records: `SessionRecord::Checkpoint { n: u32, commit: String, turn: u32, step: u32 }` and `SessionRecord::CheckpointSkipped { reason: String, turn: u32, step: u32 }`. A skip also emits a `Warning` `checkpoint skipped: <reason>`.
+  - Wire additions:
+    - `Command::Undo { turn: Option<u32>, dry_run: bool }`
+    - `Event::Undone { turn: u32, restored: Vec<String>, deleted: Vec<String>, dry_run: bool, backup_ref: Option<String>, note: Option<String> }`
+  - `undo` changes to user-turn units: `fn undo(reader: &SessionReader<SessionRecord>, sandbox: &dyn Sandbox, cp: Option<&mut Checkpointer>, turn: Option<u32>, dry_run: bool) -> Result<UndoReport, UndoError>`.
+    - It walks the turn's `Edit` and `Checkpoint` records in reverse, taking a backup snapshot first.
+    - `note` = `"ignored files and submodules are not restored"` when the turn ran commands in git, or `"command side effects not undone (not a git repository)"` outside git.
+    - `tautly undo [--turn N]` and `/undo` use it.
+  - `tautly sessions delete <id>` removes the log, its blobs and its refs.
+
+- [ ] **Step 1: Write the failing tests** (temporary git repos):
+  - Snapshots:
+    - `checkpoint_leaves_index_head_stash_and_branches_untouched`: with a staged change and a stash entry, `.git/index` bytes, `rev-parse HEAD`, `stash list` and `for-each-ref refs/heads` are identical afterwards;
+    - `checkpoint_includes_untracked_and_excludes_ignored`;
+    - `unborn_head_repo_checkpoints`;
+    - `hooks_and_fsmonitor_never_run`: a repo `core.fsmonitor` script and `.git/hooks/*` scripts would touch a marker, and the marker is absent;
+    - `unchanged_tree_reuses_previous_checkpoint`;
+    - `timeout_skips_with_warning`: a `PATH` shim makes `git` sleep;
+    - `untracked_limits_skip_with_warning`;
+    - `project_layer_cannot_disable_checkpoints`.
+  - Undo:
+    - `non_git_dir_has_no_checkpointer_and_undo_notes_it`;
+    - `undo_reverts_bash_side_effects`: after `sed -i` on a tracked file and `touch new.txt`, undo restores the file and deletes `new.txt`, and the ignored `target/x` is untouched;
+    - `undo_combines_preimages_and_checkpoints_in_reverse`: edit A, then bash changes A and B, then edit B; undo returns both to the turn start;
+    - `undo_dry_run_changes_nothing_and_lists_paths`;
+    - `undo_takes_backup_ref_first`: a concurrent user change can be recovered from `backup_ref`;
+    - `undo_default_is_last_user_turn_and_cli_uses_same_numbering`.
+  - Pruning and deletion:
+    - `refs_older_than_keep_days_pruned_at_engine_start` (`GIT_COMMITTER_DATE` in the past);
+    - `sessions_delete_removes_log_blobs_and_refs`.
+- [ ] **Step 2: Run** `cargo test -p tautly-core --test checkpoint && cargo test -p tautly-cli --test cli` — Expected: FAIL.
+- [ ] **Step 3: Implement.**
+  - Snapshot: `read-tree HEAD` (or `read-tree --empty`), `add -A`, `write-tree`, `commit-tree -p <prev|HEAD>`, `update-ref`.
+  - Restore: `checkout <commit> -- <paths>` under the temp index; added paths are deleted through the sandbox.
+  - The untracked pre-check is `ls-files --others --exclude-standard -z` with sizes from `metadata`.
+  - The checkpoint runs inside the `Exec` barrier (Checkpoint 2 ordering), before the call starts. Its time is counted in the call's duration.
+- [ ] **Step 4: Run** — Expected: PASS.
+- [ ] **Step 5: Commit** `git commit -m "feat(core): git checkpoints before bash and user-turn undo"`

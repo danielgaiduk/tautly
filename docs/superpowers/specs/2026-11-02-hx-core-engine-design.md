@@ -14,14 +14,14 @@ An open-source, provider-neutral agentic coding harness that becomes the go-to t
 |---|---|
 | Model | Open-source product, permissive license (Apache-2.0) |
 | Wedge | Performance + reliability |
-| v1 surfaces | Interactive TUI + headless/JSON mode on one engine |
+| v1 surfaces | Daily-driver line REPL, headless/JSON-RPC mode and an ACP bridge for editors, all on one engine (7.11); the full-screen TUI is sub-project 3 |
 | Providers | Native Anthropic, OpenAI, Google adapters + generic OpenAI-compatible |
 | Team | Solo developer + coding agents |
 | Language / shape | Rust, library-first engine, thin clients in-process |
 
 ### 1.3 Assumptions
 - Platforms: macOS and Linux in v1; Windows (WSL first) after.
-- Distribution: single static binary.
+- Distribution: single static binary, released with cargo-dist (Homebrew tap, `curl | sh` installer, `cargo binstall`, GitHub release binaries; 7.11.3).
 - No vendor subscription OAuth reuse — API keys only (avoids ToS/blocking risk seen in 2026).
 
 ### 1.4 Why this can win (from market research, Nov 2026)
@@ -32,10 +32,14 @@ An open-source, provider-neutral agentic coding harness that becomes the go-to t
 | # | Sub-project | Covered here? |
 |---|---|---|
 | 1 | Core engine (loop, providers, tools, context, sessions, protocol) | **Yes** |
-| 2 | Sandbox + permission enforcement (Seatbelt, Landlock/bubblewrap) | Interface + stub only |
-| 3 | TUI client (ratatui, synchronized output) | Stub only |
-| 4 | Extensions (MCP, hooks, skills, ACP bridge) | No (protocol designed to support) |
-| 5 | Eval & benchmark program | `tautly eval` runner + starter set only |
+| 2 | Sandbox + permission enforcement (Seatbelt, Landlock/bubblewrap) | Interface + stub only; git checkpoints make bash side effects undoable (7.11.11) |
+| 3 | TUI client (ratatui, synchronized output) | Daily-driver line REPL only (7.11.8) |
+| 4 | Extensions (MCP, hooks, skills, ACP bridge) | Tools-only MCP client (7.11.10) and ACP bridge (7.11.9); hooks, skills and MCP resources/prompts/sampling: no |
+| 5 | Eval & benchmark program | `tautly eval` runner, starter set and the public benchmark kit (9.3) |
+
+**Scope change (user-approved 2026-11-03):** v1 gains receipts and a savings meter, zero-config first run with `doctor`/`auth add` and installers, diffs in approvals and results, mid-session model switch, `CLAUDE.md` fallback, an evidence footer, the daily-driver REPL, the ACP bridge, a tools-only MCP client and git checkpoints before bash (all in 7.11). OpenTelemetry export is removed from v1 (4.6).
+
+**Roadmap after v1:** (1) a minimal OS sandbox for `Exec` (sub-project 2: Seatbelt on macOS, bubblewrap on Linux; writes confined to the root and temp, network on/off) comes directly after v1, before Trust; (2) Trust; then the remaining sub-projects. The public launch ships the reproducible benchmark (9.3). OpenTelemetry export is post-v1.
 
 Post-v1, out of scope for all of the above: multi-agent orchestration, deterministic replay, team policy-as-code, plugin marketplaces.
 
@@ -44,16 +48,20 @@ Post-v1, out of scope for all of the above: multi-agent orchestration, determini
 - All four test layers green; performance gates in CI pass.
 - Cache hit ratio, blocked repeat attempts and edit repairs per stage are reported by `tautly eval`.
 - Tokens per solved task on the eval starter set is measured, published, and protected by a CI regression gate (9.1).
-- Usable as a daily driver on a real repository with each of the four adapters, via `tautly -p` and the interactive stub (2.3).
+- Usable as a daily driver on a real repository with each of the four adapters, via `tautly -p`, the REPL (7.11.8) and an ACP client (Zed).
+- First run with only a provider key in the environment (or a running Ollama) and no config file reaches a first answer without setup; `tautly doctor` exits 0 on a healthy machine (7.11.2).
+- Every turn ends with a receipt whose savings are labelled estimates (7.11.1); `/undo` in a git repository also reverts files changed by `bash` (7.11.11).
 
 ## 2. Architecture
 
 ### 2.1 Crate layout (Cargo workspace)
 ```
-tautly-cli        binary: arg parsing, selects TUI or headless mode
- ├─ tautly-tui    ratatui client (stub in this sub-project)
- ├─ tautly-rpc    JSON-RPC 2.0 over stdio (headless; later ACP bridge)
+tautly-cli        binary: arg parsing, selects REPL, headless or ACP mode; doctor, auth, stats
+ ├─ tautly-tui    line-mode daily-driver REPL (7.11.8); ratatui client in sub-project 3
+ ├─ tautly-rpc    JSON-RPC 2.0 over stdio (headless)
+ ├─ tautly-acp    Agent Client Protocol bridge over stdio (7.11.9)
  └─ tautly-core   the engine — no terminal I/O, no global state
+     ├─ tautly-mcp        tools-only MCP client (7.11.10)
      ├─ tautly-provider   Provider trait + anthropic / openai / google / openai-compat
      ├─ tautly-tools      Tool trait + read, write, edit, bash, grep, glob, outline, symbol, refs,
      │                web_fetch, recall, remember, pin, state; output filters
@@ -63,18 +71,31 @@ tautly-cli        binary: arg parsing, selects TUI or headless mode
      ├─ tautly-session    append-only session log, resume, fork, undo
      └─ tautly-sandbox    Sandbox trait; this sub-project ships a passthrough-with-policy stub
 ```
-Dependencies only point downward (`tautly-tools → tautly-memory → {tautly-index, tautly-session}`, `tautly-index → tautly-sandbox`, `tautly-tools → tautly-sandbox`, `tautly-context → {tautly-provider, tautly-tools, tautly-index, tautly-sandbox}`). Each crate is independently testable.
+Dependencies only point downward (`tautly-acp → tautly-core`, `tautly-core → tautly-mcp → {tautly-tools, tautly-sandbox}`, `tautly-tools → tautly-memory → {tautly-index, tautly-session}`, `tautly-index → tautly-sandbox`, `tautly-tools → tautly-sandbox`, `tautly-context → {tautly-provider, tautly-tools, tautly-index, tautly-sandbox}`). Each crate is independently testable.
 
 ### 2.2 Rules
 - **Single entry point:** `tautly-core` exposes an `Engine` handle. Clients send `Command`s and receive a stream of `Event`s. TUI and RPC are both plain consumers, guaranteeing identical behavior.
 - **Async:** Tokio. Each turn runs in its own task scope with a `CancellationToken`; cancellation propagates to provider streams and child processes.
 - **Sandbox chokepoint:** tools receive `&dyn Sandbox` and have no direct access to `std::fs` or `std::process`. Enforced by crate visibility and a CI lint (`clippy::disallowed_methods` for `std::fs::*`, `std::process::Command` in `tautly-tools`).
 - **Bounded by construction:** fixed-capacity channels between engine and clients; tool output capped with disk spill; session history streamed to disk; only the active context plus an index held in memory.
-- **Config:** layered TOML — user (`~/.config/tautly/config.toml`) → project (`.tautly/config.toml`) → CLI flags. The project layer is repository content and therefore untrusted: it may not set `providers` (base URLs, key variables), `telemetry`, `approve_memory`, `catalog_overrides` or `routing`, and in `permissions` it can only tighten (add `ask`/`deny` rules or lower the mode), never loosen. Ignored keys produce a `Warning` event naming the key. `AGENTS.md` in the repository root and ancestors is loaded as context.
+- **Config:** layered TOML — user (`~/.config/tautly/config.toml`) → project (`.tautly/config.toml`) → CLI flags. The project layer is repository content and therefore untrusted: it may not set `providers` (base URLs, key variables), `telemetry`, `approve_memory`, `catalog_overrides` or `routing`, and in `permissions` it can only tighten (add `ask`/`deny` rules or lower the mode), never loosen. Ignored keys produce a `Warning` event naming the key. `AGENTS.md` in the repository root and ancestors is loaded as context (`CLAUDE.md` where a directory has no `AGENTS.md`, 7.11.6). Keys added by the v1 scope change are listed in 2.4.
 
 ### 2.3 Stubs shipped in this sub-project
-- **`tautly-tui` stub:** a line-mode interactive REPL (no full-screen UI). Prints streamed text and tool activity, prompts y/n for approvals, shows `ContextStatus` and session cost after each turn, supports `/pin`, `/compact`, `/fork`, `/undo`. Replaced by the ratatui client in sub-project 3.
+- **`tautly-tui`:** the line-mode daily-driver REPL (7.11.8), not full-screen. The ratatui client of sub-project 3 replaces it later.
 - **`tautly-sandbox` stub:** applies the permission policy (5.5) and enforces workspace-root path confinement (canonicalized paths, symlinks resolved) in-process; spawns processes directly. No OS-level isolation — that is sub-project 2.
+
+### 2.4 Configuration added by the v1 scope change
+| Key | Default | Layers |
+|---|---|---|
+| `providers.auto_detect` | `true` | user, CLI. Provider detection when no layer names a model (7.11.2) |
+| `[mcp]` `enabled`, `timeout_s`, `startup_timeout_ms`, `max_tools`, `import_mcp_json` | `true`, 120, 5000, 50, `true` | user, CLI |
+| `[mcp.servers.<name>]` `{command, args, env, cwd}` or `{url, headers}` | none | user: trusted. Project layer: `servers` only; each such server is repository-declared and needs approval (7.11.10). A repository `.mcp.json` counts as the project layer |
+| `[evidence]` `test_commands`, `replace_defaults` | built-in list, `false` | user, CLI. A repository could otherwise label any command a passing test (7.11.7) |
+| `[receipts]` `footer` | `true` | user, CLI |
+| `[checkpoints]` `enabled`, `keep_days`, `timeout_ms`, `max_untracked_mb`, `max_untracked_files` | `true`, 14, 3000, 200, 20000 | user, CLI. Turning checkpoints off removes an undo safety net, so a repository cannot (7.11.11) |
+| `[telemetry]` | `enabled = false` | Reserved: parsed and ignored. `enabled = true` produces a `Warning` that export is post-v1 (4.6) |
+
+Any of these keys in the project layer, apart from `mcp.servers`, is dropped with a `Warning` (2.2).
 
 ## 3. Agent loop and protocol
 
@@ -89,19 +110,24 @@ Every step is appended to the session log before its effects are surfaced, so an
 
 ### 3.2 Events (engine → client)
 Typed, serde-serializable, versioned:
-`TurnStarted`, `TextDelta`, `ReasoningDelta`, `ToolCallProposed`, `ToolApprovalRequested`, `ToolStarted`, `ToolOutputDelta`, `ToolFinished{…, blocked}`, `Usage{role, tokens_in, tokens_out, cache_read, cache_write, cost_usd, quota?}` (`role` ∈ `main | side`), `ContextStatus{used, budget, breakdown}`, `Compacted{removed_turns, summary, reason}`, `ContextCollected{elided_results, tokens_freed, reason}`, `MemoryProposed{proposal_id, change}` (`change` = an entry to upsert and/or entry ids to delete), `SessionChanged{session_id}`, `TurnFinished{reason}`, `Error{kind, message, retryable, hint}`.
+`TurnStarted`, `TextDelta`, `ReasoningDelta`, `ToolCallProposed`, `ToolApprovalRequested{request_id, call_id, tool, args, reason, diff?}`, `ToolStarted`, `ToolOutputDelta`, `ToolFinished{…, blocked, diff?}`, `Usage{role, tokens_in, tokens_out, cache_read, cache_write, cost_usd, quota?}` (`role` ∈ `main | side`), `ContextStatus{used, budget, breakdown, warnings}`, `Compacted{removed_turns, summary, reason}`, `ContextCollected{elided_results, tokens_freed, reason}`, `MemoryProposed{proposal_id, change}` (`change` = an entry to upsert and/or entry ids to delete), `SessionChanged{session_id}`, `TurnReceipt{…}` (7.11.1), `ModelChanged{model, provider}` (7.11.5), `SessionDiff{turn?, files, unified, truncated}` (7.11.4), `Undone{turn, restored, deleted, dry_run, backup_ref?, note?}` (7.11.11), `McpServerApprovalRequested{request_id, server, source, launch}`, `McpServerStatus{server, state, tools, message?}` (7.11.10), `TurnFinished{reason, evidence?}` (7.11.7), `Error{kind, message, retryable, hint}`, `Warning{message}`.
 
-`TurnFinished.reason` ∈ `completed | cancelled | budget | max_turns | timeout | error`.
+`TurnFinished.reason` ∈ `completed | cancelled | budget | max_turns | timeout | error`. At the end of a turn `TurnReceipt` comes right before `TurnFinished`, for every reason.
+
+`diff` is a `DiffPreview{unified, lines, truncated}` (7.11.4). New fields are optional or defaulted, so readers built for the first list keep working (3.4).
 
 ### 3.3 Commands (client → engine)
-`SendMessage`, `Approve`, `Deny`, `Cancel`, `SetBudget`, `Compact`, `Uncompact`, `Pin`, `Unpin`, `ApproveMemory{proposal_id}`, `RejectMemory{proposal_id}`, `ConsolidateMemory`, `Fork`, `Shutdown`.
+`SendMessage`, `Approve{request_id, session_rule?}`, `Deny{request_id, reason?}`, `Cancel`, `SetBudget`, `Compact`, `Uncompact`, `Pin`, `Unpin`, `ApproveMemory{proposal_id}`, `RejectMemory{proposal_id}`, `ConsolidateMemory`, `Fork`, `SetModel{model}` (7.11.5), `Diff{turn?}` (7.11.4), `Undo{turn?, dry_run}` (7.11.11), `Shutdown`.
+
+`Approve`/`Deny` answer both tool-call approvals and MCP server approvals; request ids are unique across both. `session_rule` (7.11.8) only applies to tool calls.
 
 ### 3.4 Headless protocol (`tautly-rpc`)
 - JSON-RPC 2.0, newline-delimited JSON over stdio. Commands are methods; events are notifications.
 - `initialize` handshake negotiates protocol version. Event and field additions are minor-version and backwards compatible; any removal or semantic change is a major-version bump.
 - One-shot mode: `tautly -p "<prompt>" --output json|text` sends one message, streams events to stdout, exits with a code mapped from `TurnFinished.reason` (0 completed, 1 error, 2 budget/max_turns/timeout, 130 cancelled).
-- In headless mode `ask` resolves to `deny` unless `--approve <mode>` is given (`auto-edit` or `yolo`), and memory proposals are rejected unless `--approve-memory` is given. Headless never blocks on input.
-- **Interactive clients (apps, IDE extensions, the ACP bridge):** `initialize` params carry `client: {interactive: bool, name, version}`. With `interactive: true`, `ask` emits `ToolApprovalRequested{request_id, …}` and waits for `approve`/`deny` with that `request_id`; memory proposals wait for `approve_memory`/`reject_memory`. Pending requests are denied when the client disconnects or sends `shutdown`, so nothing hangs. Without `interactive`, the headless rules above apply unchanged.
+- In headless mode `ask` resolves to `deny` unless `--approve <mode>` is given (`auto-edit` or `yolo`), memory proposals are rejected unless `--approve-memory` is given, and repository-declared MCP servers that the user has not approved are not started unless `--approve-mcp` is given (7.11.10). Headless never blocks on input.
+- **ACP:** `tautly acp` speaks the Agent Client Protocol to editors (7.11.9). It is an engine client like this server, not a layer on top of it.
+- **Interactive clients (apps, IDE extensions):** `initialize` params carry `client: {interactive: bool, name, version}`. With `interactive: true`, `ask` emits `ToolApprovalRequested{request_id, …}` and waits for `approve`/`deny` with that `request_id`; memory proposals wait for `approve_memory`/`reject_memory`. Pending requests are denied when the client disconnects or sends `shutdown`, so nothing hangs. Without `interactive`, the headless rules above apply unchanged.
 - **Several sessions per process:** `session/new {root, resume?, fork?}` returns a `session_id`; `session/list` and `session/close` manage them. Every session-scoped method takes `session_id`, and every `event` notification carries it. Sessions on the same root share one code index, file watcher and memory store (opened once, reference-counted); each session has its own context, read tracker, budget and session log. The single-session form (no `session/new`, `session_id` optional) remains valid for scripts and `tautly -p`.
 
 ### 3.5 Stream reliability
@@ -135,7 +161,7 @@ Adapters may place the volatile tail (6.1) inside the last tool result's content
 Built-in TOML catalog (context window, prices per token class, capabilities). User overrides in config. `tautly models update` refreshes from a models.dev-format source. Unknown models get conservative defaults and `cost_usd = null`.
 
 ### 4.4 Auth
-API keys from environment variables or the OS keychain (`keyring` crate). No subscription OAuth.
+API keys from environment variables or the OS keychain (`keyring` crate). No subscription OAuth. `tautly auth add <provider>` writes the keychain; provider detection when no model is configured is in 7.11.2.
 
 ### 4.5 Cache stability
 `tautly-context` keeps the request prefix byte-stable across turns: fixed tool ordering, no timestamps or volatile data in the system prompt, pinned block after the stable prefix, working state as a tail block after the last message (6.1). Cache hit ratio is reported in `Usage`.
@@ -144,7 +170,7 @@ API keys from environment variables or the OS keychain (`keyring` crate). No sub
 - `Usage` per provider response; cost computed from catalog prices. Aggregated per turn, session and day into a local SQLite ledger (`~/.local/share/tautly/ledger.db`).
 - Quota: rate-limit response headers (Anthropic, OpenAI) parsed into `Usage.quota{remaining_requests, remaining_tokens, reset_at}` when present.
 - `SetBudget{scope: turn|session, max_usd?, max_tokens?}`. At 80%: warning event. At 100%: the engine finishes the in-flight tool call, then ends with `TurnFinished{reason: budget}`.
-- Telemetry: optional OpenTelemetry export using GenAI semantic conventions. Off by default; nothing leaves the machine unless enabled.
+- Telemetry: OpenTelemetry export is removed from v1 (user-approved 2026-11-03) and is post-v1. Nothing leaves the machine except provider, `web_fetch` and MCP requests. The `[telemetry]` table stays reserved (2.4).
 
 ## 5. Tools and edits
 
@@ -183,12 +209,13 @@ trait Tool: Send + Sync {
 2. **Matching** — exact match first; whitespace-normalized fallback only when it yields exactly one match. Zero or multiple matches fail with candidate locations.
 3. **Atomic write** — temp file in same directory → fsync → rename. Preserve line endings, encoding, trailing newline, file mode.
 4. **Syntax check** — tree-sitter parse for supported languages (initially Rust, TypeScript/JavaScript, Python, Go, JSON, TOML, YAML). A newly introduced parse error is reported in the tool result; the edit stays applied.
-5. **Undo** — pre-image recorded in the session log; `tautly undo [--turn N]` reverts.
+5. **Undo** — pre-image recorded in the session log; `tautly undo [--turn N]` reverts. In a git work tree, checkpoints taken before `bash` extend undo to command side effects (7.11.11).
 
 ### 5.5 Permission policy
 Rules are evaluated in `tautly-core`; OS-level enforcement is sub-project 2.
 - Modes: `ask` (default), `auto-edit` (workspace file writes allowed; exec still asks), `yolo`.
-- TOML rules, e.g. `[permissions] allow = ["bash(cargo test*)"]  deny = ["bash(rm -rf*)"]`. Deny beats allow.
+- TOML rules, e.g. `[permissions] allow = ["bash(cargo test*)"]  deny = ["bash(rm -rf*)"]`. Deny beats allow. MCP tools are matched by name, without parentheses: `mcp__github__create_issue`, `mcp__github__*` (7.11.10).
+- Session rules: an approval answered "allow for this session" adds an in-memory allow rule (7.11.8). It is never persisted, not even across resume. Deny rules and protected paths still win over it.
 - **Protected paths always ask, in every mode:** `.git/`, `.tautly/`, git hook paths, `.github/workflows/`, `.vscode/`, `.idea/`, `.envrc`, `Makefile`, `package.json`, `Cargo.toml` `build.rs`, shell rc files. Defends against "agent writes a file a trusted host tool later executes."
 - **Command parsing:** shell input is parsed (pipes, `&&`, `||`, `;`, subshells, command substitution) into individual commands; every component must pass the rules. Unparseable input resolves to `ask`. No name-based "safe command" shortcuts.
 
@@ -227,9 +254,9 @@ Structured record: task, plan steps with status, files read/edited with content 
 
 ### 6.5 Session store
 - Append-only JSONL per session: `~/.local/share/tautly/sessions/<project-hash>/<session-id>.jsonl`. Large blobs (file contents, tool outputs) stored content-addressed in a sibling `blobs/` directory and referenced by hash.
-- Records: commands, canonical requests, provider events, tool calls/results, edit pre-images, compactions.
+- Records: commands, canonical requests, provider events, tool calls/results, edit pre-images, compactions, model switches (`ModelSet`), checkpoints (`Checkpoint`, `CheckpointSkipped`) and per-turn savings (7.11).
 - Durability: fsync at turn and tool boundaries. On start, a session ending mid-turn is detected and resumable from the last complete step.
-- Operations: `tautly --continue`, `tautly --resume <id>`, `/fork` (new log referencing parent at an event offset), `tautly sessions list|show|export`.
+- Operations: `tautly --continue`, `tautly --resume <id>`, `/fork` (new log referencing parent at an event offset), `tautly sessions list|show|export|delete` (`delete` also removes the session's checkpoint refs, 7.11.11).
 - Format documented and versioned (`schema_version` in the header record).
 
 ## 7. Token efficiency and memory
@@ -308,6 +335,231 @@ Structured record: task, plan steps with status, files read/edited with content 
 ### 7.6 Measurement
 - `tautly eval` reports tokens per solved task (total input + output tokens across main and side roles, divided by solved tasks) and cache hit ratio (`cache_read / (input + cache_read)`).
 
+### 7.11 Daily-driver experience and adoption (user-approved 2026-11-03)
+This section covers what a user sees in the first ten minutes and in every turn. Rationale: the research notes of 2026-11-03 (opaque cost is the top reason users switch tools; undo and diffs build trust; MCP, ACP and `CLAUDE.md` are expected at launch).
+
+#### 7.11.1 Turn receipts and the savings meter
+- At the end of every turn the engine emits `TurnReceipt{turn, model, tokens_in, tokens_out, cache_read, cache_write, side_tokens, cost_usd?, wall_ms, cache_hit_ratio?, steps, tool_calls, saved}`. `turn` is the 1-based user-turn number. Token fields sum the main and side roles; `side_tokens` is the side share (input + output). `cache_hit_ratio = cache_read / (tokens_in + cache_read)`, and it is `None` when both are 0. `wall_ms` runs from `TurnStarted` to `TurnFinished`.
+- `saved` is `Savings{index, diff_reads, context_gc, filters, cache_read_tokens, cache_usd?, total_usd?}`. Every number is a counterfactual **estimate** against a plain harness that has the same 30 KB output cap and no Tautly mechanism. Clients must label them "est.". Tokens are bytes / 4.
+  - `index`: for each `outline`, `symbol` and symbol `read` target, the bytes of the whole file(s) the answer came from (each capped at 30 KB) minus the bytes returned. `refs`, `find` and the repo map are not estimated (0): they have no reliable counterfactual.
+  - `diff_reads`: for each re-read answered `unchanged` or with a diff (7.2), the bytes a full read of that range would have returned (capped at 30 KB) minus the bytes returned.
+  - `context_gc`: for each provider request in the turn, the tokens elided by GC (7.2) that are still out of the context at that request, summed over those requests.
+  - `filters`: for each filtered `bash` result (7.3), `min(raw bytes, 30 KB)` minus the bytes returned. Floored at 0.
+  - `cache_read_tokens` = the turn's `cache_read`. `cache_usd = cache_read × (input_price − cache_read_price) − cache_write × (cache_write_price − input_price)`, which can be negative.
+  - `total_usd` = the four token estimates priced at the main model's input price, except `context_gc` at the cache-read price (elided tokens would mostly have been cached), plus `cache_usd`. It is `None` without catalog prices.
+- Tools report their part of the estimate in `ToolMeta.saved: Option<Saved{kind, bytes}>`. The engine adds them up and records them in the session log.
+- Every receipt is stored in the ledger (4.6) in a `receipts` table: session, project hash, root, user turn, main model, time, plus every field above.
+- `tautly stats [--since 7d|30d|all] [--by day|model|project] [--json]` (default `--since 30d --by day`). Tokens and cost come from the ledger's usage rows; savings, wall time and turn counts come from receipt rows. `--by project` joins usage rows to the project through their session.
+- `tautly receipt [--last | --session ID] [--markdown]` summarises one session: the most recent session of the current project by default (`--last` says so explicitly), or `ID`. It shows turns, tool calls, wall time, tokens, cache hit ratio, cost, the savings estimates and the last turn's evidence (7.11.7). `--markdown` prints a pasteable table. A receipt never contains paths, prompts, code or the project name.
+
+#### 7.11.2 Zero-config first run, `auth add`, `doctor`
+- **Provider detection** runs only when no layer or flag names a model, `providers.auto_detect` is on and no `--mock-script` is given. The first match wins:
+  1. Environment variables, in order `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`.
+  2. Keychain entries, same order (service `tautly`, accounts `anthropic`, `openai`, `google`).
+  3. An OpenRouter key: `OPENROUTER_API_KEY`, then keychain account `compat:openrouter`.
+  4. A local Ollama: `GET http://localhost:11434/api/tags` with a 300 ms timeout.
+
+  Built-in compat entries `openrouter` (`https://openrouter.ai/api/v1`) and `ollama` (`http://localhost:11434/v1`) exist unless the user config defines entries with those names.
+- **Default model per provider:** among the provider's priced catalog models whose `tier` is not `small` and whose context window is ≥ 128,000, take the lowest input price (ties: lower output price, then id). The built-in catalog carries OpenRouter entries for the three native providers' main-tier models, at OpenRouter prices. Ollama: the first installed model that has a `compat:ollama/…` catalog entry, in catalog order; otherwise the alphabetically first installed model, with conservative capabilities and a `Warning`. Ollama with no installed models counts as not detected.
+- The CLI prints one line to stderr: `using <model> (from <source>) · /model to switch · tautly doctor to check`. Nothing detected: exit 1 with a hint naming the variables, `tautly auth add <provider>` and Ollama. A configured model whose provider has no key fails the same way, with the same hint.
+- **`tautly auth add <provider>`**, where provider ∈ `anthropic | openai | google | openrouter | compat:<name>`. With a TTY it prompts with hidden input; otherwise it reads one line from stdin. It trims the value, refuses a blank one, writes keychain service `tautly` with account = provider, reads it back to verify, and never prints the key. With no keychain available it exits 1 with a hint to use the environment variable.
+- **`tautly doctor [--json] [--offline]`** prints one line per check: `ok | warn | fail | info  <check>: <detail>`.
+  - `config`: loads; its warnings are warn.
+  - `model`: resolved model and its source; none is fail.
+  - `keys`: per provider, env / keychain / none, never the value.
+  - `keychain`: available, or the reason it is not (warn).
+  - `network`: for each provider with a key, `GET` its model-list endpoint (no tokens spent; key in a header, never in the URL) with a 3 s timeout. 2xx is ok; 401/403 is fail "key rejected"; timeout or other errors are fail for the active model's provider and warn otherwise. Skipped with `--offline`.
+  - `data home`: absolute and writable, else fail.
+  - `sandbox`: root resolution, plus an info line "no OS isolation in v1".
+  - `git`: binary and version; missing is warn (checkpoints off).
+  - `index`: present, ready or building, file count.
+  - `mcp`: per server, state; a pending repository approval is warn.
+
+  Exit code 1 if any check fails, else 0.
+
+#### 7.11.3 Release and installers
+- cargo-dist builds and publishes GitHub releases on `v*` tags for `aarch64-apple-darwin`, `x86_64-apple-darwin`, `x86_64-unknown-linux-musl` and `aarch64-unknown-linux-musl`. Linux binaries are static (musl). Each release has sha256 checksums, a `curl | sh` installer, a Homebrew formula pushed to the project's tap, and binaries laid out so `cargo binstall tautly` finds them.
+- The Linux keychain backend must link statically: `keyring` with the pure-Rust Secret Service backend (zbus). If that cannot link on musl, the Linux targets fall back to `-gnu` and the decision is recorded in the release notes.
+- macOS code signing and notarisation are post-v1. Neither curl nor Homebrew sets the quarantine flag.
+
+#### 7.11.4 Diffs in approvals, results and `/diff`
+- `Tool` gains a read-only `preview`, implemented by `edit` (every edit format, `patch` included) and `write`. It runs the same pipeline as `run`, including the stale guard and tolerant matching (7.9), without writing, and returns the unified diff it would apply plus the base content hash of each file.
+- When the policy says `ask`, the engine calls `preview` first:
+  - Success: `ToolApprovalRequested.diff` carries the diff.
+  - Error: the call is answered with that error without asking, since nothing would be written.
+  - After approval, `run` refuses with `stale: file changed after approval` if a file's hash differs from the preview base. So the approved diff is the applied diff.
+- `ToolFinished.diff` carries the diff actually applied (from pre-image and written content) for every successful `edit`, `write` and `patch`, whether or not it was asked.
+- `DiffPreview{unified, lines, truncated}`:
+  - Format: unified with 3 context lines, `--- a/<path>` / `+++ b/<path>` relative to the root (`/dev/null` for created or deleted files); several files are concatenated.
+  - `lines` = lines in the full diff.
+  - Cap: 200 lines and 16 KB. Beyond the cap the text ends with `… N more lines (diff truncated)` and `truncated: true`.
+  - Non-UTF-8 content shows `Binary file <path> differs`.
+- `Command::Diff{turn?}` answers with `SessionDiff{turn?, files, unified, truncated}`. `None` = the whole session; `n` = user turn `n`. It shows the net change per file that Tautly's tools edited, created or deleted in that scope: the earliest pre-image in scope against the current disk content. `files` = `[{path, status: added|modified|deleted, added, removed}]`. Cap: 2,000 lines, with the same marker. Changes made by commands are not included (see 7.11.11 for undo).
+
+#### 7.11.5 Mid-session model switch
+- `Command::SetModel{model}` takes effect at once when idle; during a turn it is queued for the start of the next user turn. An unknown model, or a provider without a key, gives `Error{kind: provider_fatal, hint}`, and the model is unchanged. On success the engine logs a `ModelSet{model}` session record (resume uses it) and emits `ModelChanged{model, provider}`. `provider` ∈ `anthropic | openai | google | compat:<name>`.
+- Recomputed for the new model:
+  - capabilities and the context budget;
+  - the edit format: the new model's default unless config overrides it (prompt caches are per model, so the schema change costs nothing extra);
+  - the side model: the new provider's small tier unless `routing.side_model` is set.
+- Budgets carry over. An unpriced model with `max_usd` set warns and enforces token budgets only (Task 25 rule).
+- Cache: the first request after a switch is treated as a cold-cache epoch (7.7): pending GC, compaction, pin folds and the memory index apply then, at no extra cost. If context use exceeds 90% of the new window, forced compaction runs at that step start.
+- Reasoning:
+  - `Reasoning`/`RedactedReasoning` items from a different provider are stripped before the next request.
+  - Same-provider switches keep them. If the provider then rejects the request as invalid and the error names thinking, reasoning or signature, the engine strips the reasoning and retries once.
+
+#### 7.11.6 `CLAUDE.md` fallback
+At each directory level where `AGENTS.md` is read (root and ancestors, 6.1), a directory without `AGENTS.md` contributes its `CLAUDE.md`, if present. It gets the same resolver, confinement, ownership and mode checks, the same caps (32 KB per file, 64 KB total, shared with AGENTS.md) and the same auto-pinning of `Constraints`/`Rules` sections. Where both files exist, only `AGENTS.md` is read. The block header names the file used. `@path` import lines are kept as text, never followed.
+
+#### 7.11.7 Evidence footer
+- A `bash` call is a **test run** when any component of its parsed command (5.5 parser) matches a test pattern. The patterns use the permission-rule glob syntax. Defaults:
+  - `cargo test*`, `cargo nextest run*`
+  - `npm test*`, `npm run test*`, `pnpm test*`, `pnpm run test*`, `yarn test*`, `bun test*`
+  - `pytest*`, `python -m pytest*`, `python3 -m pytest*`, `uv run pytest*`
+  - `go test*`, `jest*`, `npx jest*`, `vitest*`, `npx vitest*`
+  - `make test*`, `mvn test*`, `gradle test*`, `./gradlew test*`
+  - `rspec*`, `bundle exec rspec*`, `mix test*`, `dotnet test*`, `ctest*`
+
+  `[evidence] test_commands` adds patterns, and `replace_defaults = true` replaces the defaults. Trusted layers only (2.4).
+- `TurnFinished.evidence` is a `TestEvidence` for the last test run of the turn, or `None` when the turn ran none. Fields:
+  - `command` (whitespace collapsed, ≤ 200 chars);
+  - `exit_code`;
+  - `passed`/`failed` from the output filter's counts, when parsed;
+  - `step`;
+  - `write_gen`: the write generation (7.8) right after the run;
+  - `stale`, `edits_since`, `execs_since`.
+
+  `stale` is true when a later step of the turn applied an `Edited`/`Deleted` effect or a later `Exec{may_write: true}` that was not itself a test run. The counts say which. The REPL renders `last test: <command> · exit <code> · fresh|stale (N edits since)`. When the turn edited files without a test run, it renders `no test run this turn`. No model claims are parsed (that is Trust).
+
+#### 7.11.8 Daily-driver REPL (`tautly-tui`)
+- **Input:** line editing and persistent history (`reedline`; `<data home>/repl_history`, 1,000 entries; approvals and secrets are never stored). Alt+Enter or bracketed paste gives multi-line input. With no TTY or `NO_COLOR` set: plain text, no colour.
+- **Output:**
+  - Assistant text streams as it arrives. Reasoning shows as one dim `thinking…` line per step.
+  - Each tool call is one compact row: `<status> <tool> <target> <duration>[ · <note>]`.
+    - `status` ∈ `ok | err | denied | blocked | cancelled`.
+    - `target`: path, command or pattern, truncated to 60 columns.
+    - `note`: exit code, `+a -r` diff stat, or filter saving.
+  - Diffs are coloured (green additions, red removals, dim context).
+  - After each turn a footer: `turn N · S steps · 12.4s · ctx <used>/<budget> tok · cache 86% · $0.0712 (session $0.4120) · saved ~41k tok (est.)`, then the evidence line (7.11.7). `[receipts] footer = false` hides it.
+- **Approvals:**
+  - The prompt shows tool, target and the diff preview, then `allow? [y]es [n]o [a]lways this session (<rule>)`.
+  - `y` approves once; `n` denies.
+  - `a` approves and sends `session_rule` with the exact-target rule:
+    - `edit(<path>)`, `write(<path>)`
+    - `bash(<command>)`, whitespace-collapsed, with glob metacharacters escaped
+    - `web_fetch(<host>)`
+    - `mcp__<server>__<tool>`
+  - `a <rule>` sends the user's own pattern instead. The engine accepts a session rule only if it matches the pending call; otherwise it approves once and warns.
+  - Session rules last until the process exits. They are never persisted, and deny rules and protected paths still win (5.5).
+  - Memory proposals and MCP server approvals use `y`/`n`.
+- **Slash commands:**
+  - `/model [id]`: no id lists the current model and the models whose provider has a key.
+  - `/cost`: turn and session receipt.
+  - `/diff [N]`.
+  - `/undo [N]`: shows the dry run, asks y/n, then undoes (7.11.11).
+  - `/resume [n|id]`: no argument lists the project's last 10 sessions (id, age, first prompt line, cost); the REPL rebuilds the engine with `resume`.
+  - `/compact`, `/pin <text>`, `/unpin <text>`, `/fork`, `/memory consolidate`, `/help`.
+  - Unknown commands print the help.
+- **Keys:**
+  - Ctrl+C during a turn cancels it (8). A second Ctrl+C within 2 s exits.
+  - At the prompt, Ctrl+C clears the line and Ctrl+D on an empty line exits.
+
+#### 7.11.9 ACP bridge (`tautly acp`)
+- Speaks the Agent Client Protocol over stdio: wire `protocolVersion` 1, schema v1.29.1 (agentclientprotocol.com; `agent-client-protocol` crate 1.15.1, checked 2026-11-03). It drives `Engine`s directly, like the RPC server, and shares one `Workspace` per root (3.4). `initialize` advertises `loadSession: true`, embedded-context prompts, and images when the default model takes them. `authMethods` is empty: keys come from env or keychain, and a missing key fails `session/new` with the 7.11.2 hint.
+- **Sessions and prompts:**
+
+  | ACP | Engine |
+  |---|---|
+  | `session/new {cwd, mcpServers}` | Engine at the git top level of `cwd`. Client-supplied MCP servers count as user-trusted: they come from the user's editor config |
+  | `session/load` | `resume`, replaying user and agent messages and final tool calls as `session/update` |
+  | `session/prompt` | `SendMessage`. Text blocks are joined; resource blocks are inlined as fenced text with their URI; images pass when the model takes them |
+  | `session/prompt` starting with `/compact`, `/undo`, `/diff`, `/cost` or `/pin` | The matching command. These are advertised via `available_commands_update` |
+  | `session/set_config_option {configId: "model"}` | `SetModel`. The `model` option (category `model`) lists models with keys |
+
+- **Stop reasons:** `completed` → `end_turn`, `max_turns` → `max_turn_requests`, `cancelled` → `cancelled`. `budget` and `timeout` → `end_turn` preceded by a notice. `error` → a JSON-RPC error.
+- **Streaming:**
+  - `TextDelta` → `agent_message_chunk`. `ReasoningDelta` → `agent_thought_chunk`.
+  - `ToolCallProposed` → `tool_call` (`pending`). `kind`:
+    - `read`: `read`, `outline`, `symbol`
+    - `search`: `grep`, `glob`, `find`, `refs`, `recall`
+    - `edit`: `edit`, `write`
+    - `execute`: `bash`
+    - `fetch`: `web_fetch`
+    - `think`: `pin`, `state`, `remember`
+    - `other`: MCP tools
+
+    The title is `<tool>: <target>`; `locations` come from path arguments.
+  - `ToolStarted` → `tool_call_update` `in_progress`.
+  - `ToolFinished` → `completed`/`failed`, with text content (≤ 8 KB) and a `diff` content `{path, oldText, newText}` per edited file when both texts are ≤ 256 KB (else the unified `DiffPreview` as text).
+  - `Usage`/`ContextStatus` → `usage_update {used, size, cost{amount, currency: "USD"}}`.
+  - `TurnReceipt` and evidence → a `notice` when the client supports `session.notices`.
+- **Permissions** go through `session/request_permission`:
+  - `ToolApprovalRequested` → options `allow_once`, `allow_always` (= the exact-target `session_rule`, 7.11.8) and `reject_once`; the preview goes in as `diff` content.
+  - `McpServerApprovalRequested` and `MemoryProposed` → `allow_once`/`reject_once`.
+  - Outcome `cancelled` → `Deny`.
+- `session/cancel` → `Cancel`. The bridge answers outstanding permission requests as denied and responds to the prompt with `cancelled`.
+- Client `fs/*` and `terminal/*` methods are not used in v1. Tautly reads the disk through its sandbox, so unsaved editor buffers are not seen.
+
+#### 7.11.10 MCP client, tools only (`tautly-mcp`)
+- **Implementation:**
+  - Built on the official Rust SDK `rmcp` (3.8, checked 2026-11-03). It speaks MCP revision 2026-07-28 (stateless, `server/discover`) and falls back to the `initialize` handshake of 2025-11-25 and 2025-06-18 servers.
+  - Transports: stdio, and streamable HTTP. The deprecated HTTP+SSE transport is not supported.
+  - stdio servers are spawned through `Sandbox::spawn` in their own process group and killed at shutdown (8).
+  - Their environment is the user's, minus every provider key variable (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`, `OPENROUTER_API_KEY` and any configured `api_key_env`), plus the server's `env`.
+  - HTTP `headers` values may use `${VAR}`, expanded from the environment, in user config only.
+- **Sources:**
+  - User config `[mcp.servers.<name>]` (trusted).
+  - `tautly mcp import [--from PATH]`: reads a Claude-style JSON (`mcpServers: {name: {command, args, env} | {type: "http", url, headers}}`; default `~/.claude.json`, else `./.mcp.json`) and writes the entries into the user config with comments preserved.
+  - Repository-declared servers: the project layer's `[mcp.servers]`, and the repository root `.mcp.json` when `mcp.import_mcp_json` is on.
+- **Repository-declared servers are untrusted.** Each needs a one-time user approval, remembered in `<data home>/mcp-approvals.json` under `blake3(canonical root, name, transport, argv or URL, env and header names)`. Any change asks again.
+  - Interactive: `McpServerApprovalRequested{request_id, server, source, launch}` is answered by `Approve`/`Deny`. Denials last for the session.
+  - Headless: not started unless `--approve-mcp`, which approves for that run only and persists nothing.
+  - A user-config server with the same name wins over a repository one, with a `Warning`.
+- **Start-up:**
+  - Servers start in the background at session start.
+  - The first request waits up to `startup_timeout_ms` (5,000) for them. A server ready later joins at the start of the next user turn: one announced cache break.
+  - `notifications/tools/list_changed` also applies only at the next user-turn start.
+  - `McpServerStatus{server, state, tools, message?}` reports `state` ∈ `starting | ready | failed | skipped | awaiting_approval`.
+- **Tools:**
+  - Named `mcp__<server>__<tool>`. Characters outside `[A-Za-z0-9_-]` become `_`. Names longer than 64 are cut to 57 characters plus `_` and 6 hex characters of their blake3.
+  - Sorted with the other tools by name (Checkpoint 3 rule: wire order is the name sort), so the prefix stays byte-stable.
+  - At most `max_tools` (50) per server. Descriptions are truncated to 1 KB; a tool whose input schema exceeds 8 KB is skipped with a `Warning`.
+- **Calls:**
+  - Effect: `Exec{argv}` (stdio) or `Network{host}` (HTTP). The policy default is `ask`; `auto-edit` still asks; `yolo` allows. Rules match by name (5.5).
+  - Timeout `timeout_s` (120).
+  - Results: text content concatenated; `structuredContent` as JSON text when there is no text; images for capable models; resource links as text. The 30 KB head+tail cap with spill applies (5.2); command output filters do not.
+  - The loop breaker (7.8) applies.
+- **Out of v1:** resources, prompts, sampling, elicitation, OAuth and roots (sub-project 4). `tautly mcp list` shows servers, source, approval state and tool count.
+
+#### 7.11.11 Git checkpoints and undo
+- **When:** before every `bash` call, which is `Exec{may_write: true}`, and before every stdio MCP call, in a git work tree with `[checkpoints] enabled`.
+- **How:** the engine snapshots the work tree with git plumbing, through `Sandbox::spawn`:
+  1. `GIT_INDEX_FILE=<temp file>`, then `git read-tree HEAD` (empty tree when unborn).
+  2. `git add -A` (includes untracked files and respects ignore rules).
+  3. `git write-tree`, then `git commit-tree -p <previous checkpoint or HEAD>`.
+  4. `git update-ref refs/tautly/checkpoints/<session>/<n> <commit>`.
+
+  Every git call runs with `-c core.fsmonitor=false -c core.hooksPath=/dev/null`. The user's index, HEAD, branches, stash and ignored files are never read or written. Only objects and `refs/tautly/` change.
+- **Dedup:** if no file changed since the previous checkpoint (write generation unchanged and the watcher saw no change), the previous checkpoint is reused.
+- **Bounds:** the checkpoint is skipped with a `Warning` (`checkpoint skipped: <reason>`; the session records `CheckpointSkipped`) when:
+  - git is missing, or the tree is bare;
+  - the snapshot takes longer than `timeout_ms` (3,000; git is killed);
+  - untracked files exceed `max_untracked_mb` (200) or `max_untracked_files` (20,000), checked with `git ls-files --others --exclude-standard` first.
+
+  The session log records `Checkpoint{n, commit, turn, step}`.
+- **Undo:**
+  - `Command::Undo{turn?, dry_run}` reverts user turn `turn` (default: the last). It walks that turn's records in reverse:
+    - an `Edit` restores its pre-image (5.4);
+    - a `Checkpoint` restores the work tree to that snapshot: changed and deleted files come back from the checkpoint via the temp index; files added since, untracked and not ignored, are deleted.
+  - Before writing, it takes a backup snapshot `refs/tautly/checkpoints/<session>/undo-<n>`, so the undo itself can be reversed with git.
+  - It answers with `Undone{turn, restored, deleted, dry_run, backup_ref?, note?}`. `dry_run` changes nothing.
+  - Ignored files (e.g. `node_modules/`, `target/`) and submodule contents are never touched; `note` says so when the turn ran commands.
+  - Outside git, only tool pre-images are restored, and `note` says command side effects were not undone.
+  - `tautly undo [--turn N]` uses the same path, with the same user-turn numbering.
+- **Pruning:**
+  - At engine start, checkpoint refs older than `keep_days` (14) are deleted with `git update-ref -d`. `git gc` is never run.
+  - `tautly sessions delete <id>` removes the session log, its blobs and its checkpoint refs.
+
 ## 8. Error handling
 
 | Class | Behavior |
@@ -343,7 +595,13 @@ Structured record: task, plan steps with status, files read/edited with content 
 ### 9.2 Eval runner (interface for sub-project 5)
 - `tautly eval --tasks <dir> --model <id> [--edit-format <fmt>]` runs tasks headlessly in temporary git worktrees and reports pass rate, cost, tokens, tokens per solved task, cache hit ratio, and edit-failure rate as JSON.
 - Ships with a starter set of ~50 small repository tasks (each: setup script, prompt, verification command).
-- Terminal-Bench adapter and the published benchmark program are sub-project 5.
+- The full benchmark program (leaderboard, third-party submissions) is sub-project 5. v1 ships the kit in 9.3.
+
+### 9.3 Public benchmark kit (launch deliverable)
+- `benchmarks/terminal-bench/`: an adapter that runs Tautly as an installed agent in the Terminal-Bench 2.0 harness (harness version pinned in the kit's README), plus a script for N trials per task (default 5) with a fixed model and `--approve yolo` inside the harness container.
+- `benchmarks/tokens/`: runs `tautly eval` on the starter set with fixed models and trials and writes raw per-task JSON plus a generated markdown table: pass rate, tokens per solved task, cache hit ratio and cost, per model.
+- `docs/benchmark.md`: methodology, exact commands to reproduce, known failures, and how to compare against other harnesses on the same model.
+- CI only lints the scripts and runs the report generator on a committed fixture. Live runs are manual, and their raw logs are published with the results.
 
 ## 10. Out of scope (this sub-project)
-Real OS sandbox enforcement; full TUI; semantic (type-aware) references; embedding-based memory search; learned skills; speculative prefetch; pre-run cost estimates; MCP, hooks, skills, ACP; multi-agent/subagents; LSP diagnostics; deterministic replay; Windows; team policy; plugin marketplace.
+Real OS sandbox enforcement (first after v1, 1.5); full TUI; OpenTelemetry export; semantic (type-aware) references; embedding-based memory search; learned skills; speculative prefetch; pre-run cost estimates; MCP resources, prompts, sampling and OAuth; hooks; skills; multi-agent/subagents; LSP diagnostics; deterministic replay; Windows; team policy; plugin marketplace.
