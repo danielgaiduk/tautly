@@ -138,6 +138,12 @@ pub enum SessionRecord {
     /// The session switched to `model` (`Command::SetModel`, spec 7.11.5); requests from
     /// here on go to it. The last one wins over the header's model.
     ModelSet { model: ModelId },
+    /// Every reasoning item (`Reasoning`, `RedactedReasoning`) was removed from the history
+    /// here: the first request after a switch within one provider was refused for the
+    /// reasoning carried over from the previous model, and is sent again without it. A
+    /// rebuild must apply it at this position (`Context::strip_reasoning(None)`), or the
+    /// resumed session sends the refused reasoning again.
+    ReasoningStripped,
     /// An engine bug (a panic in the turn task), with its message; a `TurnEnd{Error}`
     /// follows.
     EngineError { message: String },
@@ -210,6 +216,7 @@ const KNOWN_TYPES: &[&str] = &[
     "checkpoint_skipped",
     "labeled",
     "model_set",
+    "reasoning_stripped",
     "engine_error",
     "turn_end",
 ];
@@ -250,7 +257,8 @@ pub fn session_label(
 /// The model the session uses at the end of the log: the last `ModelSet` record's, else
 /// the header's model. Resume (Task 26) starts the rebuilt session on it; while replaying,
 /// a `ModelSet` to another provider strips the reasoning before it
-/// (`Context::strip_reasoning`), as the live switch did.
+/// (`Context::strip_reasoning(Some(provider))`), and a `ReasoningStripped` strips all of it
+/// (`Context::strip_reasoning(None)`), each at its position, as the live session did.
 pub fn session_model(
     reader: &SessionReader<SessionRecord>,
 ) -> tautly_session::Result<Option<ModelId>> {
@@ -490,6 +498,7 @@ mod tests {
             SessionRecord::ModelSet {
                 model: ModelId::from("openai/gpt-5"),
             },
+            SessionRecord::ReasoningStripped,
             SessionRecord::EngineError {
                 message: String::new(),
             },

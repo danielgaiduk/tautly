@@ -110,6 +110,13 @@ impl Context {
     /// does a threshold that is not a positive number; with any positive threshold the
     /// context at 90% of the window is compacted regardless of its value. The engine applies the result together
     /// with any collection decided at the same turn start.
+    ///
+    /// The reason reported: a cold cache takes precedence, so a compaction at 90% after the
+    /// cache TTL expired says [`MutationReason::ColdCache`] (as does a collection in the
+    /// same epoch, which [`gc_decision`](Self::gc_decision) labels). The one exception is a
+    /// forced cold epoch ([`force_cold_epoch`](Self::force_cold_epoch), a model switch) at
+    /// 90% of the new window: nothing expired there, the window forced it, so it says
+    /// [`MutationReason::Forced`]. Below 90% a forced cold epoch says `ColdCache`.
     pub fn compaction_decision(
         &self,
         status: &ContextStatus,
@@ -133,7 +140,7 @@ impl Context {
             return None;
         }
         // A forced cold epoch (a model switch) is not an expired cache: when the window
-        // forces the compaction, say so.
+        // forces the compaction, say so (see the doc comment for the precedence).
         if forced && self.cold_epoch_forced {
             return Some(MutationReason::Forced);
         }

@@ -23,8 +23,8 @@ use tautly_context::compact::DEFAULT_KEEP_RECENT;
 use tautly_context::schedule::{self, MutationReason};
 use tautly_context::{CompactError, ContextStatus, GcRecord, TokenEstimator, Turn};
 use tautly_provider::{
-    CanonicalRequest, Content, Message, ProviderError, ProviderEvent, Quota, RawUsage, Role,
-    StopReason, cost_usd,
+    CanonicalRequest, Content, Message, ModelId, Price, ProviderError, ProviderEvent, Quota,
+    RawUsage, Role, StopReason, cost_usd,
 };
 use tautly_session::RelPath;
 use tokio::sync::mpsc;
@@ -350,6 +350,8 @@ impl Session {
                 // refuse the old one's reasoning. Strip it and send the step once more.
                 Err(StreamEnd::Failed(e)) if retry_without_reasoning && rejects_reasoning(&e) => {
                     self.context.strip_reasoning(None);
+                    // Logged, so a rebuild strips at the same point (`record.rs`).
+                    self.log(SessionRecord::ReasoningStripped).await;
                     self.warn(format!(
                         "the new model refused the reasoning carried over from the previous \
                          one ({e}); sending the request again without it"
@@ -615,11 +617,16 @@ impl Session {
     /// Threshold compaction (spec 6.4): announced first, summarized by the model, and if
     /// that fails (or the summary is not smaller) the oldest turns are dropped without a
     /// summary; never retried in a loop. True when the history changed.
+    ///
+    /// The summary goes to the side model when the main provider serves it (spec 7.5): it
+    /// is sized with that model's window and output cap, priced with its catalog price and
+    /// recorded under its id.
     async fn compact(&mut self, reason: MutationReason, ctl: &TurnControl) -> bool {
         let model = routing::summary_model(&self.model, &self.side_model);
+        let side = self.setup.catalog.get(&model);
         let (req, removed) =
             self.context
-                .compaction_request(&model, &self.info.caps, DEFAULT_KEEP_RECENT);
+                .compaction_request(&model, &side.caps, DEFAULT_KEEP_RECENT);
         if removed == 0 {
             return false;
         }
@@ -628,7 +635,7 @@ impl Session {
             "compacting: summarizing the {removed} oldest turns"
         ));
         self.emit(Event::context_status(&status)).await;
-        let summary = match self.summarize(req, ctl).await {
+        let summary = match self.summarize(req, side.price, ctl).await {
             Ok(s) => Some(s),
             Err(StreamEnd::Cancelled | StreamEnd::Budget) => return false,
             Err(StreamEnd::Failed(e)) => {
@@ -677,12 +684,15 @@ impl Session {
         true
     }
 
-    /// Run a summary request and collect its text. (Task 27 sends it to the side model.)
+    /// Run a summary request and collect its text; its usage is priced with `price` and
+    /// recorded under the request's model. (Task 27 sends it to the side model's provider.)
     async fn summarize(
         &mut self,
         req: CanonicalRequest,
+        price: Option<Price>,
         ctl: &TurnControl,
     ) -> Result<String, StreamEnd> {
+        let model = req.model.clone();
         let est_input = u64::from(
             self.context
                 .tokens
@@ -702,20 +712,23 @@ impl Session {
                 Some(Ok(ProviderEvent::TextDelta(t))) => text.push_str(&t),
                 Some(Ok(ProviderEvent::Usage(u))) => usage = Some(u),
                 Some(Ok(ProviderEvent::DiscardedUsage(u))) => {
-                    self.spend(UsageRole::Side, u, None, false).await;
+                    self.spend_as(UsageRole::Side, &model, price, u, None, false)
+                        .await;
                 }
                 Some(Ok(_)) => {}
                 Some(Err(e)) => break Ended::Failed(e),
             }
         };
         if let (Ended::Done, Some(u)) = (&ended, usage) {
-            self.spend(UsageRole::Side, u, None, false).await;
+            self.spend_as(UsageRole::Side, &model, price, u, None, false)
+                .await;
             return Ok(text.trim().to_string());
         }
         // Failed or cancelled: what it reported, or an estimate, still counts.
         let est_output = u64::from(self.context.tokens.estimate(&text));
         let (u, estimated) = partial_usage(usage, est_input, est_output);
-        self.spend(UsageRole::Side, u, None, estimated).await;
+        self.spend_as(UsageRole::Side, &model, price, u, None, estimated)
+            .await;
         match ended {
             Ended::Done => Ok(text.trim().to_string()),
             Ended::Cancelled => Err(StreamEnd::Cancelled),
@@ -733,11 +746,26 @@ impl Session {
     /// Account for one provider response: queue its ledger row, emit `Usage`, then count it
     /// against the budgets (whose 80% and exhausted warnings follow the `Usage`).
     async fn spend(&mut self, role: UsageRole, u: RawUsage, quota: Option<Quota>, estimated: bool) {
-        let cost = cost_usd(&u, self.info.price.as_ref());
+        let model = self.model.clone();
+        self.spend_as(role, &model, self.info.price, u, quota, estimated)
+            .await;
+    }
+
+    /// [`spend`](Self::spend) for a response of `model` (a side model), priced with `price`.
+    async fn spend_as(
+        &mut self,
+        role: UsageRole,
+        model: &ModelId,
+        price: Option<Price>,
+        u: RawUsage,
+        quota: Option<Quota>,
+        estimated: bool,
+    ) {
+        let cost = cost_usd(&u, price.as_ref());
         // Queued for the background writer: never waits (not even on the cancel path).
         let row = Row {
             session: self.session_id.clone(),
-            model: self.model.clone(),
+            model: model.clone(),
             usage: u,
             cost,
             estimated,

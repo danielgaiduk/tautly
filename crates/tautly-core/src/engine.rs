@@ -4,19 +4,22 @@
 //! While a turn runs, the actor still answers `Approve`/`Deny` (by request id), `Cancel`
 //! and `Shutdown`; `Pin`/`Unpin` reach the turn at its next step start; everything else
 //! (further messages included) waits for the turn to end. Every command is logged as it
-//! arrives.
+//! arrives (one that arrives while a `SetModel` builds its provider, once the build ends).
 //!
 //! `SetBudget` is applied at once, even mid-turn: the running turn sees the new limits at
 //! its next tool boundary (`budget.rs`). `SetModel` waits for the turn to end like other
 //! commands, so it applies at once when idle and otherwise before the next user turn
-//! (`model_switch.rs`). At shutdown, after the turn has ended, every process group the
-//! session's commands left behind is terminated.
+//! (`model_switch.rs`); while its provider is built the actor keeps taking commands, and a
+//! `Shutdown` abandons the switch. At shutdown, after the turn has ended, every process
+//! group the session's commands left behind is terminated.
 //!
 //! Seams for later tasks: resume and fork (Task 26) build the `Session` from a log
 //! instead of [`Session::init`]'s fresh state (`EngineBuilder::resume` is refused until
 //! then); a resumed session starts on `record::session_model` and sets
-//! `Context::reasoning_provider` to that model's provider. Side-model routing (Task 27)
-//! replaces `routing::side_model_id` and the provider used by `Session::summarize`;
+//! `Context::reasoning_provider` to that model's provider, and its rebuild applies the
+//! `ModelSet` and `ReasoningStripped` records at their positions (`record.rs`). Side-model
+//! routing (Task 27) replaces `routing::side_model_id` and the provider used by
+//! `Session::summarize` (keeping the side model's caps, price and ledger id there);
 //! memory proposals (Task 28) plug in at the `ContextOp::Remember` arm of `dispatch.rs`
 //! and fill `Session::pending_memory_index`, which the cache epoch already applies.
 
@@ -357,6 +360,22 @@ struct Actor {
     groups: ProcessGroups,
 }
 
+/// Collect the commands that arrive into `early` until a `Shutdown` (or the client going
+/// away, which means the same) is among them. Cancel-safe: a received command is stored
+/// before the next await, so dropping this future loses none. The caller handles `early`
+/// (logging each) afterwards, so their `Command` records follow what the interrupted
+/// command logged.
+async fn until_shutdown(commands: &mut mpsc::Receiver<Command>, early: &mut Vec<Command>) {
+    loop {
+        let cmd = commands.recv().await.unwrap_or(Command::Shutdown);
+        let stop = cmd == Command::Shutdown;
+        early.push(cmd);
+        if stop {
+            return;
+        }
+    }
+}
+
 /// The actor's task dropped without a shutdown (the runtime went away): no process group
 /// may outlive the session. After a normal shutdown the registry is already empty.
 impl Drop for Actor {
@@ -398,7 +417,22 @@ impl Actor {
                             None => self.lost(),
                         }
                     } else if let Some(s) = state.as_mut() {
-                        self.idle_command(s, cmd).await;
+                        if let Command::SetModel { model } = cmd {
+                            // The provider build may wait on a keychain prompt: keep taking
+                            // commands meanwhile, and let a `Shutdown` abandon the switch.
+                            let mut early = Vec::new();
+                            s.set_model(model, until_shutdown(&mut commands, &mut early))
+                                .await;
+                            for cmd in early {
+                                self.received(cmd, false, None, &mut queue, &mut stopping)
+                                    .await;
+                            }
+                            if stopping {
+                                break;
+                            }
+                        } else {
+                            self.idle_command(s, cmd).await;
+                        }
                     } else {
                         self.lost();
                     }
@@ -410,41 +444,9 @@ impl Actor {
             tokio::select! {
                 cmd = commands.recv(), if !stopping => {
                     let cmd = cmd.unwrap_or(Command::Shutdown);
-                    self.with_log({
-                        let rec = SessionRecord::Command(cmd.clone());
-                        move |l| l.append(&rec)
-                    })
-                    .await;
                     let lost = state.is_none() && running.is_none();
-                    match cmd {
-                        Command::Shutdown => {
-                            stopping = true;
-                            self.approvals.deny_all("the session is shutting down");
-                            self.shutdown.cancel();
-                        }
-                        // After a crashed turn every command gets the same answer.
-                        _ if lost => self.lost(),
-                        Command::Approve { request_id } => {
-                            self.resolve(&request_id, Verdict::Approved);
-                        }
-                        Command::Deny { request_id, reason } => {
-                            self.resolve(&request_id, Verdict::Denied { reason });
-                        }
-                        Command::Cancel => {
-                            if let Some(r) = &running {
-                                r.cancel.cancel();
-                            }
-                        }
-                        Command::SetBudget { scope, max_usd, max_tokens } => {
-                            self.set_budget(scope, max_usd, max_tokens);
-                        }
-                        cmd @ (Command::Pin { .. } | Command::Unpin { .. }) if running.is_some() => {
-                            if let Some(r) = &running {
-                                let _ = r.inbox.send(cmd);
-                            }
-                        }
-                        other => queue.push_back(other),
-                    }
+                    self.received(cmd, lost, running.as_ref(), &mut queue, &mut stopping)
+                        .await;
                 }
                 joined = async { (&mut running.as_mut().expect("guarded").handle).await }, if running.is_some() => {
                     running = None;
@@ -465,6 +467,56 @@ impl Actor {
         // with background children, such as dev servers.
         self.groups.terminate_all(GROUP_GRACE).await;
         self.with_log(|l| l.checkpoint()).await;
+    }
+
+    /// A command from the channel: logged, then handled at once (shutdown, approvals,
+    /// cancel, budgets, pins for the running turn) or queued for when no turn runs.
+    async fn received(
+        &self,
+        cmd: Command,
+        lost: bool,
+        running: Option<&Running>,
+        queue: &mut VecDeque<Command>,
+        stopping: &mut bool,
+    ) {
+        self.with_log({
+            let rec = SessionRecord::Command(cmd.clone());
+            move |l| l.append(&rec)
+        })
+        .await;
+        match cmd {
+            Command::Shutdown => {
+                *stopping = true;
+                self.approvals.deny_all("the session is shutting down");
+                self.shutdown.cancel();
+            }
+            // After a crashed turn every command gets the same answer.
+            _ if lost => self.lost(),
+            Command::Approve { request_id } => {
+                self.resolve(&request_id, Verdict::Approved);
+            }
+            Command::Deny { request_id, reason } => {
+                self.resolve(&request_id, Verdict::Denied { reason });
+            }
+            Command::Cancel => {
+                if let Some(r) = running {
+                    r.cancel.cancel();
+                }
+            }
+            Command::SetBudget {
+                scope,
+                max_usd,
+                max_tokens,
+            } => {
+                self.set_budget(scope, max_usd, max_tokens);
+            }
+            cmd @ (Command::Pin { .. } | Command::Unpin { .. }) if running.is_some() => {
+                if let Some(r) = running {
+                    let _ = r.inbox.send(cmd);
+                }
+            }
+            other => queue.push_back(other),
+        }
     }
 
     /// `SetBudget`: replace one scope's limits. Clients are trusted (the project layer's
@@ -530,7 +582,6 @@ impl Actor {
         match cmd {
             Command::Pin { .. } | Command::Unpin { .. } => session.context_command(cmd).await,
             Command::Diff { turn } => session.diff(turn).await,
-            Command::SetModel { model } => session.set_model(model).await,
             other => {
                 let name = serde_json::to_value(&other)
                     .ok()

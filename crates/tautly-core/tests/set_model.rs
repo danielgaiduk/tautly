@@ -9,7 +9,7 @@ use serde_json::{Value, json};
 use tautly_core::record::session_model;
 use tautly_core::{
     Command, Config, Engine, EngineBuilder, ErrorKind, Event, FinishReason, MutationReason,
-    ProviderFactory, ProviderSetupError, RoutingConfig, SessionRecord, provider_label,
+    ProviderFactory, ProviderSetupError, RoutingConfig, SessionRecord, UsageRole, provider_label,
 };
 use tautly_provider::{
     CanonicalRequest, Catalog, Content, MockProvider, MockTurn, ModelId, Provider, ProviderError,
@@ -47,7 +47,10 @@ edit_format = "{edit_format}"
 fn test_catalog() -> Catalog {
     let toml = [
         entry("anthropic/a1", 200_000, "str_replace", Some(3.0)),
-        entry("anthropic/a2", 200_000, "str_replace", Some(3.0)),
+        entry("anthropic/a2", 32_000, "str_replace", Some(3.0)),
+        // A side model of Anthropic's: a short summary cap and a high price.
+        entry("anthropic/side", 200_000, "str_replace", Some(1000.0))
+            .replace("max_output = 4000", "max_output = 1000"),
         entry("openai/o1", 200_000, "patch", Some(3.0)),
         entry("openai/small", 128_000, "patch", Some(3.0)),
         entry("openai/tiny", 32_000, "patch", Some(3.0)),
@@ -394,7 +397,6 @@ async fn unknown_model_or_missing_key_errors_and_keeps_model() {
 
     for (model, hint_has) in [
         ("acme/x", "<provider>/<model>"),
-        ("anthropic/not-in-the-catalog", "catalog"),
         ("compat:nowhere/llama", "[[providers.compat]]"),
         ("openai/o1", "tautly auth add openai"),
     ] {
@@ -480,7 +482,14 @@ async fn fill_for_compaction(run: &mut Run) {
 
 #[tokio::test]
 async fn side_model_recomputed_unless_routing_set() {
-    for (routing, side) in [(None, "openai/tiny"), (Some("openai/mini"), "openai/mini")] {
+    // (switch to, routing.side_model, the model the summary names). Without routing the
+    // side model follows the main one: a stale `anthropic/a1` would still be served by
+    // Anthropic after the switch to `anthropic/a2`, so only a recompute names a2.
+    for (to, routing, side) in [
+        ("openai/tiny", None, "openai/tiny"),
+        ("anthropic/a2", None, "anthropic/a2"),
+        ("openai/tiny", Some("openai/mini"), "openai/mini"),
+    ] {
         let fx = Fx::new();
         let mut script = vec![reply("one"), reply("two"), reply("three")];
         script.push(reply("SUMMARY-TEXT"));
@@ -494,7 +503,7 @@ async fn side_model_recomputed_unless_routing_set() {
         };
         let mut run = start(fx.builder(cfg, &mock));
         fill_for_compaction(&mut run).await;
-        run.set_model("openai/tiny").await;
+        run.set_model(to).await;
         let events = run.turn_with("four").await;
         assert_eq!(
             finish_reason(&events),
@@ -506,8 +515,86 @@ async fn side_model_recomputed_unless_routing_set() {
             .into_iter()
             .find(is_summary)
             .expect("no summary request");
-        assert_eq!(summary.model, m(side), "routing {routing:?}");
+        assert_eq!(summary.model, m(side), "to {to}, routing {routing:?}");
     }
+}
+
+/// The rows of the cost ledger as (model, cost), once a row for `model` is there (rows
+/// are written in the background).
+async fn ledger_rows_with(fx: &Fx, model: &str) -> Vec<(String, Option<f64>)> {
+    let path = fx.home.path().join("ledger.sqlite");
+    tokio::time::timeout(WAIT, async {
+        loop {
+            if let Ok(conn) = rusqlite::Connection::open(&path)
+                && let Ok(mut stmt) = conn.prepare("SELECT model, cost_usd FROM usage")
+            {
+                let rows: Vec<(String, Option<f64>)> = stmt
+                    .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                    .unwrap()
+                    .map(Result::unwrap)
+                    .collect();
+                if rows.iter().any(|(m, _)| m == model) {
+                    return rows;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("no ledger row for {model}"))
+}
+
+#[tokio::test]
+async fn a_side_model_summary_is_sized_priced_and_recorded_as_the_side_model() {
+    let fx = Fx::new();
+    let mock = MockProvider::new(vec![
+        reply("one"),
+        reply("two"),
+        reply("three"),
+        // anthropic/side: 1000 USD per million tokens, so 100 tokens cost 0.1.
+        billed("SUMMARY-TEXT", 100),
+        reply("done"),
+    ]);
+    let cfg = Config {
+        routing: RoutingConfig {
+            side_model: Some(m("anthropic/side")),
+        },
+        ..config("anthropic/a1")
+    };
+    let mut run = start(fx.builder(cfg, &mock));
+    fill_for_compaction(&mut run).await;
+    // anthropic/a2 has a 32k window: the next step compacts.
+    run.set_model("anthropic/a2").await;
+    let events = run.turn_with("four").await;
+    assert_eq!(
+        finish_reason(&events),
+        FinishReason::Completed,
+        "{events:?}"
+    );
+    let summary = mock
+        .requests()
+        .into_iter()
+        .find(is_summary)
+        .expect("no summary request");
+    assert_eq!(summary.model, m("anthropic/side"));
+    // Sized with the side model's output cap (1000), not the main model's (4000).
+    assert_eq!(summary.max_output, 1000);
+    // Priced with the side model's price, not a2's (3 USD per million tokens).
+    let side_cost = events.iter().find_map(|e| match e {
+        Event::Usage {
+            role: UsageRole::Side,
+            cost_usd,
+            ..
+        } => Some(*cost_usd),
+        _ => None,
+    });
+    let cost = side_cost.flatten().expect("no priced side usage");
+    assert!((cost - 0.1).abs() < 1e-9, "{cost}");
+    // And recorded under the side model's id.
+    let rows = ledger_rows_with(&fx, "anthropic/side").await;
+    let side_rows: Vec<_> = rows.iter().filter(|(m, _)| m == "anthropic/side").collect();
+    assert_eq!(side_rows.len(), 1, "{rows:?}");
+    assert!((side_rows[0].1.unwrap() - 0.1).abs() < 1e-9, "{rows:?}");
 }
 
 #[tokio::test]
@@ -693,6 +780,98 @@ async fn reasoning_rejection_strips_and_retries_once() {
         errors[0],
         Event::Error { kind: ErrorKind::ProviderFatal, message, .. } if message.contains("signature")
     ));
+    // The strip is in the log, between the refused request and its retry, so a rebuild
+    // removes the reasoning at the same point.
+    let recs = records(&run.engine);
+    let requests: Vec<usize> = recs
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| matches!(r, SessionRecord::Request { .. }))
+        .map(|(i, _)| i)
+        .collect();
+    let stripped: Vec<usize> = recs
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| matches!(r, SessionRecord::ReasoningStripped))
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(stripped.len(), 1, "{recs:?}");
+    assert!(
+        requests[1] < stripped[0] && stripped[0] < requests[2],
+        "{recs:?}"
+    );
+}
+
+fn rejected_reasoning() -> MockTurn {
+    MockTurn::Error(ProviderError::InvalidRequest(
+        "messages.1.content.0: invalid `signature` in `thinking` block".into(),
+    ))
+}
+
+#[tokio::test]
+async fn reasoning_rejection_retry_that_succeeds_completes_without_reasoning() {
+    let fx = Fx::new();
+    let mock = MockProvider::new(vec![
+        signed_thought("THINK-1", "SIG-1", "answer one"),
+        rejected_reasoning(),
+        reply("two"),
+        reply("three"),
+    ]);
+    let mut run = start(fx.builder(config("anthropic/a1"), &mock));
+    run.turn_with("one").await;
+    run.set_model("anthropic/a2").await;
+    let t2 = run.turn_with("two").await;
+    assert_eq!(finish_reason(&t2), FinishReason::Completed, "{t2:?}");
+    assert!(
+        !t2.iter().any(|e| matches!(e, Event::Error { .. })),
+        "{t2:?}"
+    );
+    let t3 = run.turn_with("three").await;
+    assert_eq!(finish_reason(&t3), FinishReason::Completed, "{t3:?}");
+
+    let reqs = mock.requests();
+    assert_eq!(reqs.len(), 4);
+    assert_eq!(reasoning_items(&reqs[1]).len(), 1);
+    // The retry and everything after it go without the reasoning; the answer stays.
+    assert_eq!(reasoning_items(&reqs[2]), []);
+    assert_eq!(reasoning_items(&reqs[3]), []);
+    assert!(
+        serde_json::to_string(&reqs[3].messages)
+            .unwrap()
+            .contains("answer one")
+    );
+    let stripped = records(&run.engine)
+        .iter()
+        .filter(|r| matches!(r, SessionRecord::ReasoningStripped))
+        .count();
+    assert_eq!(stripped, 1);
+}
+
+#[tokio::test]
+async fn a_cross_provider_switch_does_not_arm_the_reasoning_retry() {
+    let fx = Fx::new();
+    let mock = MockProvider::new(vec![
+        signed_thought("THINK-1", "SIG-1", "answer one"),
+        rejected_reasoning(),
+        reply("never sent"),
+    ]);
+    let mut run = start(fx.builder(config("anthropic/a1"), &mock));
+    run.turn_with("one").await;
+    // Another provider: the reasoning is stripped before the request, so a refusal that
+    // names it is not about carried-over reasoning and is not retried.
+    run.set_model("openai/o1").await;
+    let events = run.turn_with("two").await;
+    assert_eq!(finish_reason(&events), FinishReason::Error, "{events:?}");
+    assert_eq!(mock.requests().len(), 2, "no retry");
+    assert!(
+        !warnings(&events).iter().any(|w| w.contains("refused")),
+        "{events:?}"
+    );
+    assert!(
+        !records(&run.engine)
+            .iter()
+            .any(|r| matches!(r, SessionRecord::ReasoningStripped))
+    );
 }
 
 #[tokio::test]
@@ -814,5 +993,131 @@ async fn switch_to_unpriced_model_rewarns_and_back_restores_usd_budget() {
             .iter()
             .any(|w| w.contains("openai/free") && w.contains("no known price")),
         "{again:?}"
+    );
+}
+
+#[tokio::test]
+async fn an_uncatalogued_model_switches_with_conservative_defaults_and_a_warning() {
+    let fx = Fx::new();
+    let mock = MockProvider::new(vec![reply("one")]);
+    let mut run = start(fx.builder(config("anthropic/a1"), &mock));
+    let answer = run.set_model("anthropic/not-in-the-catalog").await;
+    assert!(
+        matches!(
+            answer.last(),
+            Some(Event::ModelChanged { model, .. }) if *model == m("anthropic/not-in-the-catalog")
+        ),
+        "{answer:?}"
+    );
+    assert!(
+        warnings(&answer)
+            .iter()
+            .any(|w| w.contains("anthropic/not-in-the-catalog")
+                && w.contains("conservative defaults")
+                && w.contains("catalog_overrides")),
+        "{answer:?}"
+    );
+    let events = run.turn_with("hi").await;
+    assert_eq!(finish_reason(&events), FinishReason::Completed);
+    let req = &mock.requests()[0];
+    assert_eq!(req.model, m("anthropic/not-in-the-catalog"));
+    // The conservative defaults: a 32k window, hashline edits.
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, Event::ContextStatus { budget: 32_000, .. }))
+    );
+    assert!(
+        records(&run.engine).iter().any(
+            |r| matches!(r, SessionRecord::ModelSet { model } if *model == m("anthropic/not-in-the-catalog"))
+        )
+    );
+}
+
+/// The `used` of the first `ContextStatus` of a turn.
+fn used(events: &[Event]) -> u32 {
+    events
+        .iter()
+        .find_map(|e| match e {
+            Event::ContextStatus { used, .. } => Some(*used),
+            _ => None,
+        })
+        .expect("no ContextStatus")
+}
+
+#[tokio::test]
+async fn the_estimator_calibration_resets_when_the_provider_changes() {
+    let fx = Fx::new();
+    // A billed count far above the estimate drives the learned ratio to its 2.0 limit.
+    let mock = MockProvider::new(vec![billed("one", 1_000_000), reply("two"), reply("three")]);
+    let mut run = start(fx.builder(config("anthropic/a1"), &mock));
+    run.turn_with("one").await;
+    // Same provider: the ratio carries on.
+    run.set_model("anthropic/a2").await;
+    let kept = used(&run.turn_with("two").await);
+    // Another provider (another tokenizer): it starts again at 1.0, about half the
+    // estimate of the same context.
+    run.set_model("openai/o1").await;
+    let reset = used(&run.turn_with("three").await);
+    assert!(reset * 3 < kept * 2, "kept {kept}, reset {reset}");
+}
+
+#[tokio::test]
+async fn shutdown_does_not_wait_for_a_slow_provider_build() {
+    use std::sync::Mutex;
+    let fx = Fx::new();
+    let mock = MockProvider::new(vec![]);
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let (entered_tx, release_rx) = (Mutex::new(entered_tx), Mutex::new(release_rx));
+    let built = mock.clone();
+    // Stands for a keychain prompt nobody answers.
+    let slow: ProviderFactory = Arc::new(move |_: &ModelId| {
+        let _ = entered_tx.lock().unwrap().send(());
+        let _ = release_rx.lock().unwrap().recv();
+        Ok(Arc::new(built.clone()) as Arc<dyn Provider>)
+    });
+    let mut run = start(EngineBuilder {
+        provider_factory: Some(slow),
+        ..fx.builder(config("anthropic/a1"), &mock)
+    });
+    run.send(Command::SetModel {
+        model: m("openai/o1"),
+    })
+    .await;
+    tokio::task::spawn_blocking(move || entered_rx.recv_timeout(WAIT))
+        .await
+        .unwrap()
+        .expect("the factory never ran");
+    run.send(Command::Shutdown).await;
+    let mut rest = Vec::new();
+    let closed = tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(ev) = run.events.recv().await {
+            rest.push(ev);
+        }
+    })
+    .await;
+    // Let the abandoned build finish before the runtime goes away.
+    let _ = release_tx.send(());
+    assert!(
+        closed.is_ok(),
+        "shutdown waited for the provider build: {rest:?}"
+    );
+    assert!(
+        !rest.iter().any(|e| matches!(e, Event::ModelChanged { .. })),
+        "{rest:?}"
+    );
+    assert!(
+        rest.iter().any(|e| matches!(
+            e,
+            Event::Error { kind: ErrorKind::ProviderFatal, message, .. }
+                if message.contains("openai/o1") && message.contains("shutting down")
+        )),
+        "{rest:?}"
+    );
+    assert!(
+        !records(&run.engine)
+            .iter()
+            .any(|r| matches!(r, SessionRecord::ModelSet { .. }))
     );
 }

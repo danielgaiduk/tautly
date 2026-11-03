@@ -4,18 +4,25 @@
 //! during a turn it waits in the command queue until the turn ends, so the turn's
 //! remaining steps keep the old model and the next user turn starts on the new one.
 //!
-//! A switch first checks the model (a built-in provider's model must be in the catalog, a
-//! compat model needs its `[[providers.compat]]` entry), then builds its provider on the
-//! blocking pool (the key lookup may read the keychain). Any failure is an
-//! `Error{provider_fatal}` with a hint, and nothing changes. On success it recomputes the
-//! capabilities and context window, the tools (whose `edit` schema follows the new
-//! model's edit format; a `catalog_overrides` entry for the model wins), the side model
-//! (`routing.side_model` wins) and whether USD budgets apply; strips reasoning another
-//! provider produced; makes the next step start a cold-cache epoch; logs `ModelSet` and
-//! emits `ModelChanged`.
+//! A switch first checks the model's provider (a built-in one, or a compat model with its
+//! `[[providers.compat]]` entry), then builds its provider on the blocking pool (the key
+//! lookup may read the keychain). The build is raced against shutdown: a `Shutdown` (or
+//! the client going away) while a keychain prompt is open abandons the switch, so the
+//! session never waits on the prompt to stop. Any failure is an `Error{provider_fatal}`
+//! with a hint, and nothing changes. A built-in provider's model that the catalog does not
+//! list is used with conservative defaults and a `Warning`, as at start-up (spec 4.3).
+//!
+//! On success it recomputes the capabilities and context window, the tools (whose `edit`
+//! schema follows the new model's edit format; a `catalog_overrides` entry for the model
+//! wins), the side model (`routing.side_model` wins) and whether USD budgets apply; on a
+//! change of provider it strips the reasoning the old one produced and restarts the token
+//! estimator's calibration (another tokenizer); makes the next step start a cold-cache
+//! epoch; logs `ModelSet` and emits `ModelChanged`.
 
+use std::future::Future;
 use std::sync::{Arc, PoisonError};
 
+use tautly_context::TokenEstimator;
 use tautly_provider::{Catalog, ModelId, Provider, ProviderError, Retrying};
 use tautly_tools::registry;
 
@@ -52,11 +59,6 @@ impl ModelSetup {
     /// Why `model` cannot be used, before any key lookup.
     fn check(&self, model: &ModelId) -> Result<(), ProviderSetupError> {
         match model.provider() {
-            "anthropic" | "openai" | "google" if !self.catalog.contains(model) => {
-                Err(ProviderSetupError::UnknownModel {
-                    model: model.clone(),
-                })
-            }
             "anthropic" | "openai" | "google" => Ok(()),
             "compat" => {
                 let label = provider_label(model);
@@ -92,8 +94,10 @@ pub(crate) fn rejects_reasoning(e: &ProviderError) -> bool {
 }
 
 impl Session {
-    /// `Command::SetModel`; see the module docs.
-    pub async fn set_model(&mut self, model: ModelId) {
+    /// `Command::SetModel`; see the module docs. `stop` resolves when the session is shutting
+    /// down: if that happens before the provider is built, the switch is abandoned (the
+    /// build finishes on the blocking pool and is dropped).
+    pub async fn set_model(&mut self, model: ModelId, stop: impl Future<Output = ()>) {
         if model == self.model {
             self.emit(Event::ModelChanged {
                 provider: provider_label(&model),
@@ -102,9 +106,24 @@ impl Session {
             .await;
             return;
         }
-        let provider = match self.build_provider(&model).await {
-            Ok(p) => p,
-            Err(e) => {
+        let built = tokio::select! {
+            biased;
+            built = self.build_provider(&model) => Some(built),
+            () = stop => None,
+        };
+        let provider = match built {
+            Some(Ok(p)) => p,
+            None => {
+                self.emit(Event::Error {
+                    kind: ErrorKind::ProviderFatal,
+                    message: format!("cannot switch to {model}: the session is shutting down"),
+                    retryable: false,
+                    hint: None,
+                })
+                .await;
+                return;
+            }
+            Some(Err(e)) => {
                 self.emit(Event::Error {
                     kind: ErrorKind::ProviderFatal,
                     message: format!("cannot switch to {model}: {e}"),
@@ -118,6 +137,15 @@ impl Session {
         let label = provider_label(&model);
         let same_provider = label == provider_label(&self.model);
         let info = self.setup.catalog.get(&model);
+        if model.provider() != "compat" && !self.setup.catalog.contains(&model) {
+            self.warn(format!(
+                "{model} is not in the model catalog: using conservative defaults (a {} token \
+                 window, no known price); describe it under \
+                 [catalog_overrides.models.\"{model}\"]",
+                info.caps.context_window
+            ))
+            .await;
+        }
         self.provider = Arc::new(Retrying::new(provider));
         self.tools = registry(&info.caps);
         self.specs = self.tools.iter().map(|t| t.spec(&info.caps)).collect();
@@ -130,6 +158,10 @@ impl Session {
         self.setup.config.model = model.clone();
         self.side_model = routing::side_model_id(&self.setup.config, &self.setup.catalog);
         self.context.strip_reasoning(Some(&label));
+        if !same_provider {
+            // The learned ratio is the old provider's tokenizer's.
+            self.context.tokens = TokenEstimator::default();
+        }
         // Kept reasoning may still be refused by the new model: the first request may
         // strip it and try again once.
         self.reasoning_retry = same_provider;

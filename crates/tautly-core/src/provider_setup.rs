@@ -30,9 +30,6 @@ pub enum ProviderSetupError {
     UnknownProvider { provider: String, model: ModelId },
     #[error("no [[providers.compat]] entry named `{name}` for model {model}")]
     NoCompatEntry { name: String, model: ModelId },
-    /// A model of a built-in provider that the catalog (with its overrides) does not list.
-    #[error("unknown model {model}: it is not in the model catalog")]
-    UnknownModel { model: ModelId },
     /// `provider` is `anthropic`, `openai`, `google` or `compat:<name>`; `how` says where
     /// the key is looked for, `note` why the keychain was not asked (if it was not).
     #[error(
@@ -61,10 +58,6 @@ impl ProviderSetupError {
             ProviderSetupError::NoCompatEntry { name, .. } => {
                 format!("add a [[providers.compat]] entry named `{name}` to the configuration")
             }
-            ProviderSetupError::UnknownModel { model } => format!(
-                "pick a model from the catalog, or describe this one under \
-                 [catalog_overrides.models.\"{model}\"]"
-            ),
             ProviderSetupError::MissingKey { provider, .. } => format!(
                 "store a key with `tautly auth add {provider}`, or set its environment variable"
             ),
