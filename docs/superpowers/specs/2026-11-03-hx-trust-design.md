@@ -1,4 +1,4 @@
-# hx — Trust: "done means proven" (Sub-project after v1)
+# Tautly — Trust: "done means proven" (Sub-project after v1)
 
 - **Date:** 2026-11-03
 - **Status:** DRAFT — not approved. Priority approved; design open for review. Decisions needing the user are collected in §6.
@@ -8,7 +8,7 @@
 ## 1. Intent
 
 ### 1.1 Goal
-When `hx` says a turn is done, it shows the proof. Today "done" means "the model stopped calling tools". After this sub-project, every turn that changed code ends with a status (`proven | unproven | failed | not_applicable`) backed by evidence that hx itself recorded: what ran, what changed, what was observed. The status costs **zero model tokens when the work is already correct**.
+When Tautly says a turn is done, it shows the proof. Today "done" means "the model stopped calling tools". After this sub-project, every turn that changed code ends with a status (`proven | unproven | failed | not_applicable`) backed by evidence that Tautly itself recorded: what ran, what changed, what was observed. The status costs **zero model tokens when the work is already correct**.
 
 ### 1.2 Design principle: one ledger, many readers
 The five requested features are five readers and writers of one data structure: the **evidence ledger** (3.1), an append-only, hash-chained record of the session's writes, executions and observations. Everything else is a projection of it:
@@ -27,9 +27,9 @@ These meet in one place, the **done gate** (3.2): obligations in, evidence out, 
 ### 1.3 Who benefits
 - Interactive users: no more "all tests pass" that was never true; failures caught before they read the summary.
 - Headless/CI users: a machine-checkable status, an opt-in exit code and a portable receipt for review.
-- The program itself: `hx eval` gains an honest false-done metric, and Economics (learned skills, budget autopilot) gets a success label it can trust.
+- The program itself: `tautly eval` gains an honest false-done metric, and Economics (learned skills, budget autopilot) gets a success label it can trust.
 
-### 1.4 Success criteria (all measured by `hx eval`, A/B with `--trust on|off`)
+### 1.4 Success criteria (all measured by `tautly eval`, A/B with `--trust on|off`)
 | Metric | Definition | Target |
 |---|---|---|
 | False-done rate | runs ending `completed` that fail the task's hidden verification command (v1 §9.2) | ≥ 40% relative reduction vs off, same model and edit format |
@@ -41,17 +41,17 @@ These meet in one place, the **done gate** (3.2): obligations in, evidence out, 
 | Latency overhead | added wall time per gated turn (p50) / selection compute (p95, 10k files) / ledger append per tool call | ≤ 20 s / < 100 ms / < 1 ms |
 | Claim false alarms | `contradicted` verdicts on runs that pass hidden verification | ≤ 5% |
 | Labeller precision | `Success` labels whose run passes hidden verification | ≥ 90% |
-| Receipt integrity | eval runs whose receipt passes `hx receipt verify`; single-byte mutations detected | 100% / 100% (proptest) |
+| Receipt integrity | eval runs whose receipt passes `tautly receipt verify`; single-byte mutations detected | 100% / 100% (proptest) |
 
 v1 performance gates (v1 §9.1: cold start, idle RSS, 4-hour RSS) must still pass with Trust on.
 
 ## 2. Architecture
 
 ### 2.1 Crate layout
-One new crate, no new top-level concepts in `hx-core` beyond a gate call:
+One new crate, no new top-level concepts in `tautly-core` beyond a gate call:
 ```
-hx-core ── turn loop calls trust::Gate at the would-finish point; feeds Ledger from the executor
- └─ hx-trust   NEW
+tautly-core ── turn loop calls trust::Gate at the would-finish point; feeds Ledger from the executor
+ └─ tautly-trust   NEW
      ├─ ledger     Evidence, Ledger, hash chain, freshness, change sets          (3.1)
      ├─ gate       obligations, discharge, status, fix-round feedback            (3.2)
      ├─ verify     LangRules, test selection, runner, flake retry                (3.3)
@@ -60,29 +60,29 @@ hx-core ── turn loop calls trust::Gate at the would-finish point; feeds Ledg
      ├─ audit      claim extraction, verdicts; receipt export/verify             (3.6)
      └─ outcome    success labeller                                              (3.7)
 ```
-Dependencies (downward only, extending v1 §2.1): `hx-core → hx-trust → {hx-tools, hx-index, hx-session, hx-sandbox}`. `hx-trust` never depends on `hx-core`, `hx-rpc` or a provider. The labeller's output type `SegmentOutcome` is defined in **`hx-session`** (data only), so Economics reads it from the session log without depending on `hx-trust`.
+Dependencies (downward only, extending v1 §2.1): `tautly-core → tautly-trust → {tautly-tools, tautly-index, tautly-session, tautly-sandbox}`. `tautly-trust` never depends on `tautly-core`, `tautly-rpc` or a provider. The labeller's output type `SegmentOutcome` is defined in **`tautly-session`** (data only), so Economics reads it from the session log without depending on `tautly-trust`.
 
 ### 2.2 Plug-in points in v1
 | v1 component | Change (all additive) |
 |---|---|
 | Turn loop (v1 §3.1) | New step 5a: when the model ends without tool calls, run the gate; on actionable failure inject one engine message and continue (counts as a turn) |
 | Executor (v1 §3.1 step 4) | After every tool call: `Ledger::record`. Around `Write` effects: snapshot index symbols of the file before, diff after. After every `Exec`: workspace stat walk (3.1) |
-| `hx-session` (v1 §6.5) | New record types `evidence`, `gate`, `contract`, `segment_outcome`; `schema_version` minor bump; old readers skip unknown types |
-| `hx-index` (v1 §7.1) | `IndexQuery` trait exposed read-only: `symbols_in(path)`, `refs(name)`, `package_of(path)` |
-| `hx-tools` filters (v1 §7.3) | Expose the structured parse that already exists internally: `filters::parse(cmd, output) -> Option<Parsed{class, counts, failures}>`. Text rendering unchanged |
-| `hx-tools` | Two tools, registered only when enabled: `verify` (Exec) and `propose_contract` (ReadOnly) |
-| `hx-rpc` / events (v1 §3.2) | New events/commands in 2.3; `TurnFinished` gains optional `trust` field; `reason` values unchanged |
+| `tautly-session` (v1 §6.5) | New record types `evidence`, `gate`, `contract`, `segment_outcome`; `schema_version` minor bump; old readers skip unknown types |
+| `tautly-index` (v1 §7.1) | `IndexQuery` trait exposed read-only: `symbols_in(path)`, `refs(name)`, `package_of(path)` |
+| `tautly-tools` filters (v1 §7.3) | Expose the structured parse that already exists internally: `filters::parse(cmd, output) -> Option<Parsed{class, counts, failures}>`. Text rendering unchanged |
+| `tautly-tools` | Two tools, registered only when enabled: `verify` (Exec) and `propose_contract` (ReadOnly) |
+| `tautly-rpc` / events (v1 §3.2) | New events/commands in 2.3; `TurnFinished` gains optional `trust` field; `reason` values unchanged |
 
 ### 2.3 Protocol additions (minor version)
 - **Events:** `GateStarted{round, checks:[{kind, label, reason}]}` · `GateFinished{round, status, obligations:[{kind, label, discharge, evidence?}], duration_ms}` · `ClaimsAudited{turn, claims:[{text, kind, verdict, evidence?}]}` · `ContractProposed{proposal_id, contract, rationale}` · `SegmentLabelled{segment, label, weight, final}`.
 - Gate command output streams through existing `ToolStarted/ToolOutputDelta/ToolFinished` with synthetic tool name `verify` or `contract`, so clients need no new rendering path.
 - `TurnFinished` gains `trust: Option<{status, rounds, receipt_root}>`. `reason` stays `completed`: adding a reason value would break strict clients.
 - **Commands:** `Verify` (run the gate now; results shown, nothing injected into the conversation) · `SetTrust{verify?, audit?}` · `SetContract{checks, scope}` · `ClearContract` · `ApproveContract{proposal_id}` · `RejectContract{proposal_id}` · `ExportReceipt{turns, format}`.
-- **Headless:** JSON output includes `trust` and `claims`. Exit codes unchanged by default; `hx -p --require-proven` maps `completed` with status `unproven|failed` to **exit 3** (open question Q3).
+- **Headless:** JSON output includes `trust` and `claims`. Exit codes unchanged by default; `tautly -p --require-proven` maps `completed` with status `unproven|failed` to **exit 3** (open question Q3).
 
 ## 3. Components
 
-### 3.1 Evidence ledger (`hx-trust::ledger`)
+### 3.1 Evidence ledger (`tautly-trust::ledger`)
 Single source of truth for "what actually happened". Built only from engine-observed effects, never from model text.
 ```rust
 pub struct Gen(pub u64);          // workspace write generation (v1 §7.8 counter, now also bumped by Exec side effects)
@@ -116,9 +116,9 @@ Rules:
 - **Exec side effects are detected, not assumed.** After every `Exec`, a stat walk (mtime + size, `.gitignore`-aware, the same walk as the v1 §7.1 incremental scan) finds changed files; each becomes a `Write{via: Exec}` with symbol diffs (≤ 20 files reindexed synchronously; beyond that, one `bulk` write and package-level selection). If the walk exceeds 200 ms, the workspace is treated as changed (conservative) and the event says so.
 - **Freshness:** `Exec` evidence is fresh iff no `Write` with a later `Gen` touches a path inside its `Scope` (package roots covered by the command; workspace root when unknown). Writes to `*.md` never stale evidence. Stale evidence is kept and reported as stale, never deleted.
 - **Zero tests is not a pass.** An `Exec` of class `Test` with `counts.passed + counts.failed == 0` (filter matched nothing, all skipped) has outcome `Failed` for proof purposes, whatever its exit code.
-- **Hash chain:** `chain_0 = blake3("hx.ledger/1" ‖ session_id ‖ git_head)`, `chain_i = blake3(chain_{i-1} ‖ jcs(entry_i without chain))` using RFC 8785 canonical JSON. Tamper-evident, not tamper-proof (no signing; Q4).
+- **Hash chain:** `chain_0 = blake3("tautly.ledger/1" ‖ session_id ‖ git_head)`, `chain_i = blake3(chain_{i-1} ‖ jcs(entry_i without chain))` using RFC 8785 canonical JSON. Tamper-evident, not tamper-proof (no signing; Q4).
 
-### 3.2 Done gate (`hx-trust::gate`)
+### 3.2 Done gate (`tautly-trust::gate`)
 Runs at the would-finish point (v1 §3.1 step 5a) and on the `Verify` command. Never runs on turns with no writes, no active contracts and no checkable claims (status `not_applicable`).
 ```rust
 pub enum Obligation { Tests(Selection), Contract(ContractId), Ripple(RippleSite), Claim(Claim) }
@@ -137,12 +137,12 @@ Algorithm:
 3. **Run** the rest sequentially in the sandbox: grouped test commands, then contract checks. If a test command fails to compile, contract checks are marked `Open(Skipped)` for this round. Every run is recorded as `Source::Gate{round}` evidence.
 4. **Re-evaluate** ripple sites and claims against the updated ledger.
 5. **Status:** `Failed` if any obligation is `Failed` or a claim is contradicted; else `Unproven` if any is `Open` or `Stale`; else `Proven`.
-6. **Feedback:** if the status is actionable (failing tests or contracts, contradicted or stale claims, unresolved ripple sites) and `round < max_rounds` and budget allows, one engine message is injected (`[hx gate] round 1: 2 tests failed …`) built from filtered failures (v1 §7.3), capped at `max_feedback_tokens`; the loop continues. Non-actionable opens (denied, runner missing, no tests) are reported, never fed back more than once per session.
+6. **Feedback:** if the status is actionable (failing tests or contracts, contradicted or stale claims, unresolved ripple sites) and `round < max_rounds` and budget allows, one engine message is injected (`[Tautly gate] round 1: 2 tests failed …`) built from filtered failures (v1 §7.3), capped at `max_feedback_tokens`; the loop continues. Non-actionable opens (denied, runner missing, no tests) are reported, never fed back more than once per session.
 7. A **passing gate injects nothing** into the conversation: the model's final message stands and the status goes to the client only. This is what makes token overhead zero on correct work.
 
 Early stop: if round N fails with the same failure signatures as round N−1, stop (no progress). Rounds count toward `max_turns` and cost budgets; gate wall time counts toward the turn's wall-time cap (v1 §4.6). If the remaining budget cannot cover the estimated run (last run duration of the same commands, else `round_timeout`), the obligation is `Open(SkippedBudget)`. The gate never pushes a turn past a budget.
 
-### 3.3 Verify loop and impact-scoped selection (`hx-trust::verify`)
+### 3.3 Verify loop and impact-scoped selection (`tautly-trust::verify`)
 Taken from the verify-loop draft (A.2–A.7) with the ledger replacing its ad hoc ChangeSet. Trigger is the gate (turn end, not per edit batch, so multi-file changes are not tested half-done), plus the model-callable `verify` tool for TDD-style mid-turn runs.
 ```rust
 pub struct ChangeSet { pub files: Vec<PathBuf>, pub symbols: Vec<SymbolChange>, pub bulk: bool }
@@ -166,10 +166,10 @@ impl Verifier {
 - **Flaky tests:** failed tests rerun alone `retry_failed` times; pass-on-rerun = flaky, listed, not fed back, does not fail the gate (counts as `Proven` with a `flaky` note on the evidence).
 - **Pre-existing failures** (ledger payoff, no extra runs): a failing test that already failed in ledger evidence *before the session's first write* is labelled `preexisting`, reported but not fed back and not counted as `Failed`. Without such evidence, a failure whose file and referenced symbols do not overlap the change set is labelled `possibly_preexisting` in feedback. Worktree baselines are deferred (§5).
 - **Index not ready:** steps 3–4 degrade to steps 1–2 plus package targets; `Selection.degraded` says why.
-- **Permissions:** every command is an `Exec` checked by the normal policy and command parser (v1 §5.5); no implicit allow. Templates from project config are repo-controlled and get no extra trust. Headless `ask` → deny → `Open(Denied)` = unproven, not failed. `hx trust allow` writes user-config allow rules for the detected runner commands on request.
-- **Shadow mode (eval only):** `hx eval --trust-shadow` also runs the full suite after each gate round to compute selection recall and precision.
+- **Permissions:** every command is an `Exec` checked by the normal policy and command parser (v1 §5.5); no implicit allow. Templates from project config are repo-controlled and get no extra trust. Headless `ask` → deny → `Open(Denied)` = unproven, not failed. `tautly trust allow` writes user-config allow rules for the detected runner commands on request.
+- **Shadow mode (eval only):** `tautly eval --trust-shadow` also runs the full suite after each gate round to compute selection recall and precision.
 
-### 3.4 Done contracts (`hx-trust::contract`)
+### 3.4 Done contracts (`tautly-trust::contract`)
 Explicit acceptance checks the turn must pass to be `proven`, in addition to impacted tests.
 ```rust
 pub struct Contract { pub id: ContractId, pub check: Check, pub origin: Origin, pub scope: ContractScope }
@@ -177,11 +177,11 @@ pub enum Check { Command { argv: String, expect_exit: i32 }, Test { target: Test
 pub enum Origin { User, ProjectConfig, Model { proposal_id: ProposalId } }   // Model only after ApproveContract
 pub enum ContractScope { NextTurn, Session }
 ```
-- **Sources:** `hx -p --done "<cmd>"` / `/done <cmd>` / `SetContract` (user, default `NextTurn`); `[trust] done = [...]` in config (a project's standing definition of done, `Session` scope; project-config commands need an allow rule like any repo-controlled template); `propose_contract` tool, which the model may call at the start of a task to turn acceptance criteria in the prompt into checks → `ContractProposed` → binding only after `ApproveContract`. Headless rejects proposals unless `--approve-contracts` (mirrors v1 §3.4). Q5 decides which sources ship.
+- **Sources:** `tautly -p --done "<cmd>"` / `/done <cmd>` / `SetContract` (user, default `NextTurn`); `[trust] done = [...]` in config (a project's standing definition of done, `Session` scope; project-config commands need an allow rule like any repo-controlled template); `propose_contract` tool, which the model may call at the start of a task to turn acceptance criteria in the prompt into checks → `ContractProposed` → binding only after `ApproveContract`. Headless rejects proposals unless `--approve-contracts` (mirrors v1 §3.4). Q5 decides which sources ship.
 - **`Test` checks** require the named test to *exist and run* (≥ 1 matching test executed) and pass; this is how "add a test for X" becomes enforceable.
 - **Anti-gaming:** the model cannot modify or clear contracts (only user commands can). Any `Write` to a test file that proving evidence depends on is flagged on the obligation and in the receipt (`proof depends on test files edited this session: tests/cfg.rs@turn 6`). Contract commands are recorded verbatim in the receipt so a reviewer sees exactly what "done" meant.
 
-### 3.5 Ripple check (`hx-trust::ripple`)
+### 3.5 Ripple check (`tautly-trust::ripple`)
 Index-based, no LSP. Catches "changed a signature, forgot a call site".
 ```rust
 pub struct RippleSite { pub symbol: SymbolKey, pub old_sig: String, pub new_sig: Option<String> /* None = removed/renamed */,
@@ -192,7 +192,7 @@ pub fn ripple(changes: &[SymbolChange], idx: &dyn IndexQuery, ledger: &Ledger, c
 - **At edit time:** the executor appends a short note to the edit's tool result (≤ 10 sites, ≤ 200 tokens): `ripple: signature of parse_cfg changed; 4 call sites not updated yet: src/a.rs:12, …`. This guides the next edits instead of waiting for a failure.
 - **Discharge** (at the gate): the site's file was written after `since` touching the site's line range; or the line no longer references the name; or, for compiled/typechecked languages (Rust, Go, TS with `tsc`), a fresh passing `Build`/`Typecheck`/`Test` evidence covers the site's package, because the compiler is the proof. Remaining sites are `Open(Unverified)`: fed back once, then reported; ripple alone never makes a turn `Failed` (refs are name-based and over-match).
 
-### 3.6 Claim auditor and receipts (`hx-trust::audit`)
+### 3.6 Claim auditor and receipts (`tautly-trust::audit`)
 **Claims.** Deterministic, English-only pattern library over the final message, with a negation/hedge window ("not yet", "should", "I couldn't") and optional scope (crate/package/path). Unknown phrasing yields no claim; no side-model extraction in this cut.
 ```rust
 pub enum ClaimKind { TestsPass { scope: Option<String> }, BuildOk, LintClean, TypecheckOk,
@@ -204,9 +204,9 @@ pub fn audit(claims: &[Claim], ledger: &Ledger) -> Vec<(Claim, Verdict)>;
 ```
 Matching: `TestsPass{scope}` needs a fresh `Test` evidence covering scope with `failed == 0` and > 0 tests; `BuildOk`/`LintClean`/`TypecheckOk` the same for their class; `NoOtherRefs{s}` needs an `Observe` (`refs`/`grep`) of `s` after the last write touching a definition of `s`; `Edited{p}` needs a `Write` of `p` this segment; `CommandRan{prog}` an `Exec` of that program. Because the gate runs checks *before* auditing (3.2 step 4), a claim like "tests pass" is usually verified by the gate's own run. Modes: `feedback` (contradicted/stale claims enter the gate's fix round), `annotate` (reported only), `off`. Rendering: `[contradicted] "build succeeds" — cargo build at turn 11 exited 101`.
 
-**Receipts.** `hx receipt [--session id] [--turns a..b] [--format json|md] [--git-note]` exports a ledger slice. JSON is canonical (RFC 8785); no file contents or command outputs, only hashes:
+**Receipts.** `tautly receipt [--session id] [--turns a..b] [--format json|md] [--git-note]` exports a ledger slice. JSON is canonical (RFC 8785); no file contents or command outputs, only hashes:
 ```json
-{ "schema": "hx.receipt/1", "hx_version": "0.4.0", "session_id": "01JC…", "turns": [3, 7],
+{ "schema": "tautly.receipt/1", "tautly_version": "0.4.0", "session_id": "01JC…", "turns": [3, 7],
   "base": { "git_head": "9f2c1e0", "dirty": false }, "prev_chain": "b3:41aa…",
   "models": [{ "role": "main", "id": "anthropic/…" }, { "role": "side", "id": "…" }],
   "entries": [
@@ -222,18 +222,18 @@ Matching: `TestsPass{scope}` needs a fresh `Test` evidence covering scope with `
   "status": "proven", "usage": { "tokens_in": 48210, "tokens_out": 3104, "cost_usd": 0.21 },
   "root": "b3:e81f…", "signature": null }
 ```
-`hx receipt verify <file> [--at <rev>] [--rerun]`: recomputes the chain from `prev_chain` (first bad `seq` reported), compares the last `post` hash per path with the tree (or `<rev>`), and with `--rerun` re-executes `source: gate`/contract `exec` entries through the normal policy and compares outcomes. `--git-note` writes the JSON to `refs/notes/hx` on HEAD. Exit codes: 0 valid, 4 chain broken, 5 tree mismatch, 6 rerun mismatch. `argv` is included verbatim; receipts stay local unless the user exports them (secret redaction belongs to the later secret-firewall work).
+`tautly receipt verify <file> [--at <rev>] [--rerun]`: recomputes the chain from `prev_chain` (first bad `seq` reported), compares the last `post` hash per path with the tree (or `<rev>`), and with `--rerun` re-executes `source: gate`/contract `exec` entries through the normal policy and compares outcomes. `--git-note` writes the JSON to `refs/notes/tautly` on HEAD. Exit codes: 0 valid, 4 chain broken, 5 tree mismatch, 6 rerun mismatch. `argv` is included verbatim; receipts stay local unless the user exports them (secret redaction belongs to the later secret-firewall work).
 
-### 3.7 Success labeller (`hx-trust::outcome`, type in `hx-session`)
+### 3.7 Success labeller (`tautly-trust::outcome`, type in `tautly-session`)
 Produces the per-task-segment label Economics consumes (learned skills §1.4, autopilot §2.2 of the drafts). A segment runs from one user message to the next.
 ```rust
-// hx-session (data only)
+// tautly-session (data only)
 pub struct SegmentOutcome { pub segment: SegmentId, pub label: OutcomeLabel, pub weight: f32,
                             pub signals: OutcomeSignals, pub final_: bool }
 pub enum OutcomeLabel { Success, Failure, Unknown }
 pub struct OutcomeSignals { pub finish: FinishReason, pub trust: Option<TrustStatus>, pub undone: bool,
                             pub corrected: bool, pub edits_survived: bool, pub cost_usd: Option<f64>, pub tokens: u64 }
-// hx-trust
+// tautly-trust
 pub fn label(seg: &SegmentView, ledger: &Ledger, final_: bool) -> SegmentOutcome;
 ```
 - **Failure:** finish ≠ `completed`; or trust `Failed`; or the segment's turns were undone (v1 §5.4); or corrected (the next segment's first 2 turns contain a `remember` proposal, a `Deny`, or writes restoring a segment file's `pre` hash); or segment edits did not survive to session end.
@@ -256,7 +256,7 @@ propose_contracts = true # registers propose_contract tool    (Q5)
 [trust.lang.rust]   command = "cargo test -p {package} {filter} -- --quiet"   # overrides built-ins
 [trust.lang.python] command = "pytest -q {files}"
 ```
-When `verify != "off"`, one static line (≤ 60 tokens) joins the system prompt: hx runs impacted tests when you finish, so do not run the full suite yourself (Q9). It is in the stable prefix, so it is cached (v1 §4.5).
+When `verify != "off"`, one static line (≤ 60 tokens) joins the system prompt: Tautly runs impacted tests when you finish, so do not run the full suite yourself (Q9). It is in the stable prefix, so it is cached (v1 §4.5).
 
 ## 4. Error handling and testing
 
@@ -282,7 +282,7 @@ When `verify != "off"`, one static line (≤ 60 tokens) joins the system prompt:
 2. **Fixture repos:** one per language (Rust workspace, Python package, TS with vitest, Go module) with a known call graph and golden selections (changed file → expected targets with reasons), plus a monorepo fixture for escalation.
 3. **Engine (`MockProvider` scripts):** edit → gate fails → fix → proven; fresh evidence reused (no command spawned, checked with a recording sandbox); max_rounds exhaustion and no-progress stop; flaky runner (fails once); preexisting failure; headless denial → unproven; budget skip; cancel mid-gate (no orphan processes); signature change → ripple note → site fixed; contradicted claim → feedback; contract proposed/approved/rejected; model edits a contract test file → flagged; Exec that modifies files (`sed -i`) stales prior evidence; crash and resume mid-gate.
 4. **Protocol:** golden JSON for new events, `TurnFinished.trust`, exit code 3 under `--require-proven`, receipt schema.
-5. **`hx eval` additions:** `--trust on|off` A/B, `--trust-shadow` (full-suite recall), and per-run reports of status, rounds, gate wall time and tokens, selection recall/precision, claim verdict mix, labeller agreement with hidden verification, receipt verify result. The starter set gains ~10 tasks built to tempt false "done" (a second failing test elsewhere, a signature change with distant callers, a requested test that must exist).
+5. **`tautly eval` additions:** `--trust on|off` A/B, `--trust-shadow` (full-suite recall), and per-run reports of status, rounds, gate wall time and tokens, selection recall/precision, claim verdict mix, labeller agreement with hidden verification, receipt verify result. The starter set gains ~10 tasks built to tempt false "done" (a second failing test elsewhere, a signature change with distant callers, a requested test that must exist).
 6. **CI gates (merge-blocking):** selection recall ≥ 90% on fixture replay; zero added tokens on round-1-pass turns (deterministic mock replay); receipt mutation detection; ledger append < 1 ms and post-Exec stat walk p95 < 50 ms on the generated 10k-file repo; all v1 §9.1 gates with Trust on.
 
 ## 5. Out of scope / deferred
@@ -299,7 +299,7 @@ Each has a recommended default; the draft is written as if the defaults are acce
 7. **Exec side-effect detection:** *Recommend:* stat walk after every `Exec` (correct, ~tens of ms). Alternative: treat every non-test `Exec` as a write (zero cost, but many needless stale verdicts).
 8. **Should passing turns run tests the model already ran?** *Recommend:* no, reuse fresh evidence (3.2 step 2). Saves time but trusts the model's chosen command scope as long as it covers the selection.
 9. **System-prompt line telling the model not to run the full suite?** *Recommend:* yes; it should cut redundant test turns. Measure it in the A/B.
-10. **Permission for hx-generated test commands:** *Recommend:* no implicit allow, even in `auto-edit` (test code is arbitrary code); provide `hx trust allow` to add explicit rules. Alternative: `auto-edit` implies allow for built-in templates only.
+10. **Permission for tautly-generated test commands:** *Recommend:* no implicit allow, even in `auto-edit` (test code is arbitrary code); provide `tautly trust allow` to add explicit rules. Alternative: `auto-edit` implies allow for built-in templates only.
 11. **No tests found:** *Recommend:* label `unproven` with no nudge to write tests (that is AGENTS.md policy). Alternative: nudge once when non-test code changed.
 12. **Labeller weight for `unproven` success:** *Recommend:* 0.5, as in the learned-skills draft. Alternative: label `Unknown` so Economics learns only from proven work (cleaner, less data).
-13. **Receipts in git:** *Recommend:* only on request (`--git-note`, `refs/notes/hx`), never automatic. Alternative: commit trailers referencing `root`.
+13. **Receipts in git:** *Recommend:* only on request (`--git-note`, `refs/notes/tautly`), never automatic. Alternative: commit trailers referencing `root`.

@@ -1,8 +1,8 @@
-# hx — Core Engine Design (Sub-project 1)
+# Tautly — Core Engine Design (Sub-project 1)
 
 - **Date:** 2026-11-02
 - **Status:** Draft for review
-- **Working name:** `hx` (codename; rename is a find-and-replace)
+- **Name:** Tautly (crates `tautly-*`, binary `tautly`); renamed from the working name `hx`
 
 ## 1. Intent
 
@@ -35,51 +35,51 @@ An open-source, provider-neutral agentic coding harness that becomes the go-to t
 | 2 | Sandbox + permission enforcement (Seatbelt, Landlock/bubblewrap) | Interface + stub only |
 | 3 | TUI client (ratatui, synchronized output) | Stub only |
 | 4 | Extensions (MCP, hooks, skills, ACP bridge) | No (protocol designed to support) |
-| 5 | Eval & benchmark program | `hx eval` runner + starter set only |
+| 5 | Eval & benchmark program | `tautly eval` runner + starter set only |
 
 Post-v1, out of scope for all of the above: multi-agent orchestration, deterministic replay, team policy-as-code, plugin marketplaces.
 
 ### 1.6 Success criteria for this sub-project
 - Cold start to ready < 50 ms; idle RSS < 30 MB; RSS flat (±10%) across a 4-hour simulated session.
 - All four test layers green; performance gates in CI pass.
-- Cache hit ratio, blocked repeat attempts and edit repairs per stage are reported by `hx eval`.
+- Cache hit ratio, blocked repeat attempts and edit repairs per stage are reported by `tautly eval`.
 - Tokens per solved task on the eval starter set is measured, published, and protected by a CI regression gate (9.1).
-- Usable as a daily driver on a real repository with each of the four adapters, via `hx -p` and the interactive stub (2.3).
+- Usable as a daily driver on a real repository with each of the four adapters, via `tautly -p` and the interactive stub (2.3).
 
 ## 2. Architecture
 
 ### 2.1 Crate layout (Cargo workspace)
 ```
-hx-cli        binary: arg parsing, selects TUI or headless mode
- ├─ hx-tui    ratatui client (stub in this sub-project)
- ├─ hx-rpc    JSON-RPC 2.0 over stdio (headless; later ACP bridge)
- └─ hx-core   the engine — no terminal I/O, no global state
-     ├─ hx-provider   Provider trait + anthropic / openai / google / openai-compat
-     ├─ hx-tools      Tool trait + read, write, edit, bash, grep, glob, outline, symbol, refs,
+tautly-cli        binary: arg parsing, selects TUI or headless mode
+ ├─ tautly-tui    ratatui client (stub in this sub-project)
+ ├─ tautly-rpc    JSON-RPC 2.0 over stdio (headless; later ACP bridge)
+ └─ tautly-core   the engine — no terminal I/O, no global state
+     ├─ tautly-provider   Provider trait + anthropic / openai / google / openai-compat
+     ├─ tautly-tools      Tool trait + read, write, edit, bash, grep, glob, outline, symbol, refs,
      │                web_fetch, recall, remember, pin, state; output filters
-     ├─ hx-context    context assembly, token budget, pinning, working state, compaction, context GC
-     ├─ hx-memory     code-anchored project memory, episodic memory, recall search
-     ├─ hx-index      tree-sitter symbol/reference index (SQLite), incremental
-     ├─ hx-session    append-only session log, resume, fork, undo
-     └─ hx-sandbox    Sandbox trait; this sub-project ships a passthrough-with-policy stub
+     ├─ tautly-context    context assembly, token budget, pinning, working state, compaction, context GC
+     ├─ tautly-memory     code-anchored project memory, episodic memory, recall search
+     ├─ tautly-index      tree-sitter symbol/reference index (SQLite), incremental
+     ├─ tautly-session    append-only session log, resume, fork, undo
+     └─ tautly-sandbox    Sandbox trait; this sub-project ships a passthrough-with-policy stub
 ```
-Dependencies only point downward (`hx-tools → hx-memory → {hx-index, hx-session}`, `hx-index → hx-sandbox`, `hx-tools → hx-sandbox`, `hx-context → {hx-provider, hx-tools, hx-index, hx-sandbox}`). Each crate is independently testable.
+Dependencies only point downward (`tautly-tools → tautly-memory → {tautly-index, tautly-session}`, `tautly-index → tautly-sandbox`, `tautly-tools → tautly-sandbox`, `tautly-context → {tautly-provider, tautly-tools, tautly-index, tautly-sandbox}`). Each crate is independently testable.
 
 ### 2.2 Rules
-- **Single entry point:** `hx-core` exposes an `Engine` handle. Clients send `Command`s and receive a stream of `Event`s. TUI and RPC are both plain consumers, guaranteeing identical behavior.
+- **Single entry point:** `tautly-core` exposes an `Engine` handle. Clients send `Command`s and receive a stream of `Event`s. TUI and RPC are both plain consumers, guaranteeing identical behavior.
 - **Async:** Tokio. Each turn runs in its own task scope with a `CancellationToken`; cancellation propagates to provider streams and child processes.
-- **Sandbox chokepoint:** tools receive `&dyn Sandbox` and have no direct access to `std::fs` or `std::process`. Enforced by crate visibility and a CI lint (`clippy::disallowed_methods` for `std::fs::*`, `std::process::Command` in `hx-tools`).
+- **Sandbox chokepoint:** tools receive `&dyn Sandbox` and have no direct access to `std::fs` or `std::process`. Enforced by crate visibility and a CI lint (`clippy::disallowed_methods` for `std::fs::*`, `std::process::Command` in `tautly-tools`).
 - **Bounded by construction:** fixed-capacity channels between engine and clients; tool output capped with disk spill; session history streamed to disk; only the active context plus an index held in memory.
-- **Config:** layered TOML — user (`~/.config/hx/config.toml`) → project (`.hx/config.toml`) → CLI flags. `AGENTS.md` in the repository root and ancestors is loaded as context.
+- **Config:** layered TOML — user (`~/.config/tautly/config.toml`) → project (`.tautly/config.toml`) → CLI flags. `AGENTS.md` in the repository root and ancestors is loaded as context.
 
 ### 2.3 Stubs shipped in this sub-project
-- **`hx-tui` stub:** a line-mode interactive REPL (no full-screen UI). Prints streamed text and tool activity, prompts y/n for approvals, shows `ContextStatus` and session cost after each turn, supports `/pin`, `/compact`, `/fork`, `/undo`. Replaced by the ratatui client in sub-project 3.
-- **`hx-sandbox` stub:** applies the permission policy (5.5) and enforces workspace-root path confinement (canonicalized paths, symlinks resolved) in-process; spawns processes directly. No OS-level isolation — that is sub-project 2.
+- **`tautly-tui` stub:** a line-mode interactive REPL (no full-screen UI). Prints streamed text and tool activity, prompts y/n for approvals, shows `ContextStatus` and session cost after each turn, supports `/pin`, `/compact`, `/fork`, `/undo`. Replaced by the ratatui client in sub-project 3.
+- **`tautly-sandbox` stub:** applies the permission policy (5.5) and enforces workspace-root path confinement (canonicalized paths, symlinks resolved) in-process; spawns processes directly. No OS-level isolation — that is sub-project 2.
 
 ## 3. Agent loop and protocol
 
 ### 3.1 Turn lifecycle
-1. **Assemble** — `hx-context` builds a `CanonicalRequest` and a per-block token breakdown.
+1. **Assemble** — `tautly-context` builds a `CanonicalRequest` and a per-block token breakdown.
 2. **Stream** — the provider streams text, reasoning and tool calls; each is re-emitted as an event immediately.
 3. **Decide** — the permission policy returns `allow | ask | deny` per tool call. `ask` emits `ToolApprovalRequested` and awaits `Approve`/`Deny`.
 4. **Execute** — approved calls run via the sandbox. Calls whose `Effect` is `ReadOnly` run concurrently; `Write`/`Exec` calls run sequentially in model-emitted order.
@@ -96,13 +96,13 @@ Typed, serde-serializable, versioned:
 ### 3.3 Commands (client → engine)
 `SendMessage`, `Approve`, `Deny`, `Cancel`, `SetBudget`, `Compact`, `Uncompact`, `Pin`, `Unpin`, `ApproveMemory{proposal_id}`, `RejectMemory{proposal_id}`, `ConsolidateMemory`, `Fork`, `Shutdown`.
 
-### 3.4 Headless protocol (`hx-rpc`)
+### 3.4 Headless protocol (`tautly-rpc`)
 - JSON-RPC 2.0, newline-delimited JSON over stdio. Commands are methods; events are notifications.
 - `initialize` handshake negotiates protocol version. Event and field additions are minor-version and backwards compatible; any removal or semantic change is a major-version bump.
-- One-shot mode: `hx -p "<prompt>" --output json|text` sends one message, streams events to stdout, exits with a code mapped from `TurnFinished.reason` (0 completed, 1 error, 2 budget/max_turns/timeout, 130 cancelled).
+- One-shot mode: `tautly -p "<prompt>" --output json|text` sends one message, streams events to stdout, exits with a code mapped from `TurnFinished.reason` (0 completed, 1 error, 2 budget/max_turns/timeout, 130 cancelled).
 - In headless mode `ask` resolves to `deny` unless `--approve <mode>` is given (`auto-edit` or `yolo`), and memory proposals are rejected unless `--approve-memory` is given. Headless never blocks on input.
 - **Interactive clients (apps, IDE extensions, the ACP bridge):** `initialize` params carry `client: {interactive: bool, name, version}`. With `interactive: true`, `ask` emits `ToolApprovalRequested{request_id, …}` and waits for `approve`/`deny` with that `request_id`; memory proposals wait for `approve_memory`/`reject_memory`. Pending requests are denied when the client disconnects or sends `shutdown`, so nothing hangs. Without `interactive`, the headless rules above apply unchanged.
-- **Several sessions per process:** `session/new {root, resume?, fork?}` returns a `session_id`; `session/list` and `session/close` manage them. Every session-scoped method takes `session_id`, and every `event` notification carries it. Sessions on the same root share one code index, file watcher and memory store (opened once, reference-counted); each session has its own context, read tracker, budget and session log. The single-session form (no `session/new`, `session_id` optional) remains valid for scripts and `hx -p`.
+- **Several sessions per process:** `session/new {root, resume?, fork?}` returns a `session_id`; `session/list` and `session/close` manage them. Every session-scoped method takes `session_id`, and every `event` notification carries it. Sessions on the same root share one code index, file watcher and memory store (opened once, reference-counted); each session has its own context, read tracker, budget and session log. The single-session form (no `session/new`, `session_id` optional) remains valid for scripts and `tautly -p`.
 
 ### 3.5 Stream reliability
 - Provider errors are classified retryable (429, 5xx, network) or fatal.
@@ -132,16 +132,16 @@ trait Provider: Send + Sync {
 Adapters may place the volatile tail (6.1) inside the last tool result's content when the provider would otherwise treat it as a new user turn (earlier reasoning is then dropped); the last cache breakpoint stays on the block before it.
 
 ### 4.3 Model catalog
-Built-in TOML catalog (context window, prices per token class, capabilities). User overrides in config. `hx models update` refreshes from a models.dev-format source. Unknown models get conservative defaults and `cost_usd = null`.
+Built-in TOML catalog (context window, prices per token class, capabilities). User overrides in config. `tautly models update` refreshes from a models.dev-format source. Unknown models get conservative defaults and `cost_usd = null`.
 
 ### 4.4 Auth
 API keys from environment variables or the OS keychain (`keyring` crate). No subscription OAuth.
 
 ### 4.5 Cache stability
-`hx-context` keeps the request prefix byte-stable across turns: fixed tool ordering, no timestamps or volatile data in the system prompt, pinned block after the stable prefix, working state as a tail block after the last message (6.1). Cache hit ratio is reported in `Usage`.
+`tautly-context` keeps the request prefix byte-stable across turns: fixed tool ordering, no timestamps or volatile data in the system prompt, pinned block after the stable prefix, working state as a tail block after the last message (6.1). Cache hit ratio is reported in `Usage`.
 
 ### 4.6 Cost, quota, budgets
-- `Usage` per provider response; cost computed from catalog prices. Aggregated per turn, session and day into a local SQLite ledger (`~/.local/share/hx/ledger.db`).
+- `Usage` per provider response; cost computed from catalog prices. Aggregated per turn, session and day into a local SQLite ledger (`~/.local/share/tautly/ledger.db`).
 - Quota: rate-limit response headers (Anthropic, OpenAI) parsed into `Usage.quota{remaining_requests, remaining_tokens, reset_at}` when present.
 - `SetBudget{scope: turn|session, max_usd?, max_tokens?}`. At 80%: warning event. At 100%: the engine finishes the in-flight tool call, then ends with `TurnFinished{reason: budget}`.
 - Telemetry: optional OpenTelemetry export using GenAI semantic conventions. Off by default; nothing leaves the machine unless enabled.
@@ -176,20 +176,20 @@ trait Tool: Send + Sync {
 - `patch` — apply-patch / unified-diff style. Default for OpenAI models.
 - `hashline` — line references by short content hashes returned from `read`. Default for `openai-compat` and unknown models.
 - Google models default to `str_replace` until eval data says otherwise.
-- Overridable in config. Defaults are revised from `hx eval` results.
+- Overridable in config. Defaults are revised from `tautly eval` results.
 
 ### 5.4 Edit safety pipeline
 1. **Stale-read guard** — reject if the file's mtime or content hash differs from the model's last `read`; the model must re-read.
 2. **Matching** — exact match first; whitespace-normalized fallback only when it yields exactly one match. Zero or multiple matches fail with candidate locations.
 3. **Atomic write** — temp file in same directory → fsync → rename. Preserve line endings, encoding, trailing newline, file mode.
 4. **Syntax check** — tree-sitter parse for supported languages (initially Rust, TypeScript/JavaScript, Python, Go, JSON, TOML, YAML). A newly introduced parse error is reported in the tool result; the edit stays applied.
-5. **Undo** — pre-image recorded in the session log; `hx undo [--turn N]` reverts.
+5. **Undo** — pre-image recorded in the session log; `tautly undo [--turn N]` reverts.
 
 ### 5.5 Permission policy
-Rules are evaluated in `hx-core`; OS-level enforcement is sub-project 2.
+Rules are evaluated in `tautly-core`; OS-level enforcement is sub-project 2.
 - Modes: `ask` (default), `auto-edit` (workspace file writes allowed; exec still asks), `yolo`.
 - TOML rules, e.g. `[permissions] allow = ["bash(cargo test*)"]  deny = ["bash(rm -rf*)"]`. Deny beats allow.
-- **Protected paths always ask, in every mode:** `.git/`, `.hx/`, git hook paths, `.github/workflows/`, `.vscode/`, `.idea/`, `.envrc`, `Makefile`, `package.json`, `Cargo.toml` `build.rs`, shell rc files. Defends against "agent writes a file a trusted host tool later executes."
+- **Protected paths always ask, in every mode:** `.git/`, `.tautly/`, git hook paths, `.github/workflows/`, `.vscode/`, `.idea/`, `.envrc`, `Makefile`, `package.json`, `Cargo.toml` `build.rs`, shell rc files. Defends against "agent writes a file a trusted host tool later executes."
 - **Command parsing:** shell input is parsed (pipes, `&&`, `||`, `;`, subshells, command substitution) into individual commands; every component must pass the rules. Unparseable input resolves to `ask`. No name-based "safe command" shortcuts.
 
 ## 6. Context and sessions
@@ -207,7 +207,7 @@ Requests are assembled in fixed order:
 - Cache stability: the working state changes on almost every tool call (the files list follows effects), so it sits after history; the cached prefix (stable · pinned · history up to the last cache breakpoint) survives state changes. Pinned items change rarely and stay before history.
 - The sandbox root is the git top level when the start directory is inside a git work tree, else the start directory. AGENTS.md links resolving to protected paths (5.x) are refused with a warning; ancestor files above the root must also be owned by the user and not group- or world-writable.
 - `ContextStatus{used, budget, breakdown}` is emitted every turn.
-- `hx prompt show` prints the system prompt; `hx prompt show --full` prints the exact last request.
+- `tautly prompt show` prints the system prompt; `tautly prompt show --full` prints the exact last request.
 - System prompt target: < 2,000 tokens.
 
 ### 6.2 Pinned items
@@ -226,17 +226,17 @@ Structured record: task, plan steps with status, files read/edited with content 
 - Compaction summaries are generated by the side model (7.5).
 
 ### 6.5 Session store
-- Append-only JSONL per session: `~/.local/share/hx/sessions/<project-hash>/<session-id>.jsonl`. Large blobs (file contents, tool outputs) stored content-addressed in a sibling `blobs/` directory and referenced by hash.
+- Append-only JSONL per session: `~/.local/share/tautly/sessions/<project-hash>/<session-id>.jsonl`. Large blobs (file contents, tool outputs) stored content-addressed in a sibling `blobs/` directory and referenced by hash.
 - Records: commands, canonical requests, provider events, tool calls/results, edit pre-images, compactions.
 - Durability: fsync at turn and tool boundaries. On start, a session ending mid-turn is detected and resumable from the last complete step.
-- Operations: `hx --continue`, `hx --resume <id>`, `/fork` (new log referencing parent at an event offset), `hx sessions list|show|export`.
+- Operations: `tautly --continue`, `tautly --resume <id>`, `/fork` (new log referencing parent at an event offset), `tautly sessions list|show|export`.
 - Format documented and versioned (`schema_version` in the header record).
 
 ## 7. Token efficiency and memory
 
-### 7.1 Code index (`hx-index`)
+### 7.1 Code index (`tautly-index`)
 - tree-sitter extraction of symbols (functions, types, methods, constants: name, kind, parent, signature, line range, content hash) and name-based references, for the syntax-check language set (5.4).
-- SQLite at `~/.local/share/hx/index/<project-hash>.db`: `files(path, hash, mtime, size, lang)`, `symbols(file, name, kind, parent, start_line, end_line, signature, hash)`, `refs(file, line, name)`. WAL mode.
+- SQLite at `~/.local/share/tautly/index/<project-hash>.db`: `files(path, hash, mtime, size, lang)`, `symbols(file, name, kind, parent, start_line, end_line, signature, hash)`, `refs(file, line, name)`. WAL mode.
 - Incremental: on engine start a background task re-parses files whose size or mtime changed; it never blocks start-up. Each successful edit re-indexes that file synchronously before the tool result is returned.
 - Reads files only through `Sandbox`; honors `.gitignore`.
 - Until the initial build completes, `outline`/`symbol`/`refs` fall back to tree-sitter on demand (outline) or grep (symbol, refs) and say so in the result.
@@ -255,14 +255,14 @@ Structured record: task, plan steps with status, files read/edited with content 
 - Applied when raw output exceeds 2 KB. Result: counts (passed/failed/errors/warnings) plus each failure or diagnostic (name, `file:line`, message, ≤ 20 lines each), plus the path of the spilled full output.
 - Parse failure falls back to the 30 KB head + tail cap. `raw: true` disables filtering.
 
-### 7.4 Memory (`hx-memory`)
-- **Project memory:** one markdown file per entry in `.hx/memory/<id>.md` (shareable via git). Frontmatter: `id`, `title`, `kind` (`convention | fact | gotcha | command`), `anchors: [{path, symbol?, hash}]`, `created`, `verified`. Body ≤ 300 tokens.
+### 7.4 Memory (`tautly-memory`)
+- **Project memory:** one markdown file per entry in `.tautly/memory/<id>.md` (shareable via git). Frontmatter: `id`, `title`, `kind` (`convention | fact | gotcha | command`), `anchors: [{path, symbol?, hash}]`, `created`, `verified`. Body ≤ 300 tokens.
 - **Memory index:** one line per entry (`- [kind] title` plus ` [stale]` when applicable), capped at 500 tokens (oldest unverified entries dropped from the index first, never deleted), in the stable block after AGENTS.md.
 - **Staleness:** at session start and after each edit, every anchor hash is compared with the code index (symbol hash when `symbol` is set, file hash otherwise). Mismatch marks the entry stale (the memory index in the stable block changes only at a cache epoch (7.7), when the cache is cold, or at the start of a user turn with a cold cache; between epochs the engine holds the pending index text); `recall` returns stale entries with a warning; an entry whose anchors are re-confirmed by the model through `remember` gets `verified` updated.
-- **Episodic memory:** `~/.local/share/hx/memory/<project-hash>/episodes/<session-id>.md` (private, never shared). Written by the side model at session end and at each compaction: task, outcome, what failed, key files. No approval needed.
+- **Episodic memory:** `~/.local/share/tautly/memory/<project-hash>/episodes/<session-id>.md` (private, never shared). Written by the side model at session end and at each compaction: task, outcome, what failed, key files. No approval needed.
 - **`recall(query)`:** BM25 over titles and bodies of project entries and episodes; returns the top 5, capped at 2,000 tokens.
 - **`remember(entry)`:** proposes a new or updated entry; the engine emits `MemoryProposed` and writes the file only after `ApproveMemory`. The system prompt instructs the model to call `remember` when the user corrects it.
-- **Consolidation:** `hx memory consolidate`, and offered automatically when the full index would exceed 500 tokens. The side model proposes merges and deletions, shown as a diff; applied only on approval.
+- **Consolidation:** `tautly memory consolidate`, and offered automatically when the full index would exceed 500 tokens. The side model proposes merges and deletions, shown as a diff; applied only on approval.
 
 ### 7.5 Side-model routing
 - Config `[routing] side_model = "<model id>"`. Default: the catalog model with `tier = "small"` from the main model's provider; if none, the main model.
@@ -271,7 +271,7 @@ Structured record: task, plan steps with status, files read/edited with content 
 
 ### 7.7 Cache-aware scheduling
 - The catalog gains `cache_ttl_s: Option<u32>` per model (default 300 for `explicit`/`automatic` cache styles, `None` for `none`).
-- `hx-context` tracks the time of the last provider request and the token length of the cached prefix (up to the last cache breakpoint).
+- `tautly-context` tracks the time of the last provider request and the token length of the cached prefix (up to the last cache breakpoint).
 - Every history mutation (context GC 7.2, threshold compaction 6.4) goes through one scheduler that decides at step start (before each provider request):
   - **Cold cache** (time since last request ≥ TTL): apply all pending mutations; nothing cached is lost.
   - **Warm cache:** apply only when `saved > cost`, where `saved = tokens_freed × input_price × 5` (5 = expected further requests in the turn horizon) and `cost = invalidated_prefix_tokens × (cache_write_price − cache_read_price)`. Without catalog prices, fall back to the 7.2 threshold rule.
@@ -295,17 +295,17 @@ Structured record: task, plan steps with status, files read/edited with content 
   5. **Structural fallback** (`str_replace` only): if the old text starts with a definition the code index can name (7.1), locate that symbol in the file; replace the symbol's range when the old text's similarity to the symbol source ≥ 0.8. The post-edit syntax check (5.4 step 4) must report no new errors, otherwise the edit is reverted and fails.
 - A repaired edit's result says which stage applied (`applied via indentation-relative match`). Repaired (non-exact) edits never record a whole-file re-read baseline. Stages 2–5 may only match inside content the model has seen at the current file hash (whole-file baseline hash equals the current hash, or a range baseline covering the matched lines matches the current lines); otherwise the edit fails as stale.
 - When every stage fails, the error shows the single nearest window of real lines (≤ 20, line-numbered) so the model can retry without re-reading the file.
-- `hx eval` reports edit repairs per stage alongside the edit-failure rate.
+- `tautly eval` reports edit repairs per stage alongside the edit-failure rate.
 
 ### 7.10 Workspace engine (fast file access, fewer lookup steps)
-- **Live workspace** (`hx-index`): an in-memory file tree (path, size, mtime, content hash; ~100 bytes per file) loaded from the index database at start-up, reconciled by the background refresh, and kept current by a file-system watcher (`notify`, 50 ms debounce) that re-indexes only changed files. Edits made by hx tools update it synchronously. `glob` and directory listings are answered from memory. The tree honors `.gitignore` and the same size/binary skips as the index.
+- **Live workspace** (`tautly-index`): an in-memory file tree (path, size, mtime, content hash; ~100 bytes per file) loaded from the index database at start-up, reconciled by the background refresh, and kept current by a file-system watcher (`notify`, 50 ms debounce) that re-indexes only changed files. Edits made by Tautly tools update it synchronously. `glob` and directory listings are answered from memory. The tree honors `.gitignore` and the same size/binary skips as the index.
 - **Trigram text index:** stored on disk in the index database (`trigrams(tri, file_id)`), not in memory, so the idle-RSS target (1.6) holds. `grep` extracts the required literals from the pattern (`regex-syntax`), intersects the postings of their trigrams to get candidate files, then confirms with the real regex. Patterns without a literal of ≥ 3 bytes, and any index error, fall back to the full scan (5.2). The index is trusted only when fresh: watcher alive, no pending post-bash freshness check, and writes guarded by row generations; otherwise tools use the walker. Target: a selective search on a 100,000-file repository < 50 ms.
 - **`find(query, kind?, limit = 20)`:** one call searches file paths (fuzzy), symbol names (index) and text (trigram) concurrently and returns one ranked list — exact symbol definitions, then path matches, then text matches — as `path:line  <kind>  <one-line snippet>`. `kind` ∈ `symbol | path | text`.
 - **Repo map:** a generated block of ≤ 400 tokens — top-level directories with file counts, languages, entry points (e.g. `main.rs`, `lib.rs`, workspace members, `package.json` scripts) and the most-referenced symbols — placed in the stable block after the memory index (6.1). Generated once at session start (never mid-session, to keep the cache prefix stable).
 - **Batched reads:** `read` also accepts `targets: [{path, start_line?, end_line?} | {symbol}]` (≤ 10 per call); results are concatenated with headers and share the 30 KB cap. Each target goes through the same stale-tracking and diff-on-re-read rules (7.2).
 
 ### 7.6 Measurement
-- `hx eval` reports tokens per solved task (total input + output tokens across main and side roles, divided by solved tasks) and cache hit ratio (`cache_read / (input + cache_read)`).
+- `tautly eval` reports tokens per solved task (total input + output tokens across main and side roles, divided by solved tasks) and cache hit ratio (`cache_read / (input + cache_read)`).
 
 ## 8. Error handling
 
@@ -318,7 +318,7 @@ Structured record: task, plan steps with status, files read/edited with content 
 | Sandbox / policy denial | Returned to model and surfaced to user with the blocking rule |
 | Engine bug (panic in a turn task) | Caught at turn boundary, logged with session id, session left resumable |
 
-- Errors are typed per crate (`thiserror`); `anyhow` only in `hx-cli`.
+- Errors are typed per crate (`thiserror`); `anyhow` only in `tautly-cli`.
 - Cancellation: first Ctrl-C cancels the turn and kills child process groups within 200 ms; second Ctrl-C exits.
 - Shutdown: all spawned process groups are terminated; verified by test.
 
@@ -327,10 +327,10 @@ Structured record: task, plan steps with status, files read/edited with content 
 1. **Unit** — edit matching, atomic write, command parser, permission rules, context assembly, cost math. `proptest` for edit application and budget accounting.
 2. **Adapter** — recorded real provider streams replayed through each adapter. Nightly live smoke suite with real keys (not a merge gate).
 3. **Engine** — `MockProvider` with scripted responses: tool calls, errors, stream drops, oversized outputs. Covers loop, approvals, cancellation, budgets, compaction, crash-resume.
-4. **Protocol** — `hx -p` golden-file tests over the JSON event stream.
+4. **Protocol** — `tautly -p` golden-file tests over the JSON event stream.
 
 ### 9.1 CI performance gates (merge-blocking)
-- Cold start < 50 ms (`hyperfine`, release build, `hx --version` and `hx -p` against `MockProvider` to first event).
+- Cold start < 50 ms (`hyperfine`, release build, `tautly --version` and `tautly -p` against `MockProvider` to first event).
 - Idle RSS < 30 MB.
 - 4-hour simulated session (mock provider, accelerated clock): RSS within ±10% of the 10-minute mark.
 - 100 MB tool output: RSS bounded, output spilled to disk.
@@ -340,7 +340,7 @@ Structured record: task, plan steps with status, files read/edited with content 
 - Token regression: tokens per solved task on the starter set (scripted mock replay, deterministic) must not exceed the committed baseline by more than 10%.
 
 ### 9.2 Eval runner (interface for sub-project 5)
-- `hx eval --tasks <dir> --model <id> [--edit-format <fmt>]` runs tasks headlessly in temporary git worktrees and reports pass rate, cost, tokens, tokens per solved task, cache hit ratio, and edit-failure rate as JSON.
+- `tautly eval --tasks <dir> --model <id> [--edit-format <fmt>]` runs tasks headlessly in temporary git worktrees and reports pass rate, cost, tokens, tokens per solved task, cache hit ratio, and edit-failure rate as JSON.
 - Ships with a starter set of ~50 small repository tasks (each: setup script, prompt, verification command).
 - Terminal-Bench adapter and the published benchmark program are sub-project 5.
 
