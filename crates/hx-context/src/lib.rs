@@ -24,13 +24,15 @@ pub use state::{FileNote, WorkingState};
 pub use tokens::TokenEstimator;
 
 /// Everything the engine assembles into a request.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct Context {
     pub pinned: Vec<Pinned>,
     pub state: WorkingState,
     pub history: Vec<Turn>,
-    /// Absolute session turn number of `history[0]` (0 for a fresh session). Compaction
-    /// keeps `history[i]` at turn `first_turn + i`, see [`CompactionRecord`].
+    /// Absolute session turn number of `history[0]`; turns are 1-based like the read
+    /// tracker's (`ToolCx::with_turn`), so a fresh session has 1. Compaction keeps
+    /// `history[i]` at turn `first_turn + i`, see [`CompactionRecord`] and
+    /// [`Context::next_turn`].
     pub first_turn: u32,
     pub agents_md: Option<String>,
     /// Set by the engine from the memory store; rendered in the stable prefix after AGENTS.md.
@@ -41,6 +43,22 @@ pub struct Context {
     pub tokens: TokenEstimator,
     /// Project root; file paths in the working state are displayed relative to it.
     pub root: Option<PathBuf>,
+}
+
+impl Default for Context {
+    fn default() -> Self {
+        Self {
+            pinned: Vec::new(),
+            state: WorkingState::default(),
+            history: Vec::new(),
+            first_turn: 1,
+            agents_md: None,
+            memory_index: None,
+            repo_map: None,
+            tokens: TokenEstimator::default(),
+            root: None,
+        }
+    }
 }
 
 impl Context {

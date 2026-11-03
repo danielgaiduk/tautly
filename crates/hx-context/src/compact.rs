@@ -26,8 +26,8 @@ const COMPACT_PROMPT: &str = include_str!("../prompts/compact.md");
 
 /// What a compaction removed, enough to undo it with [`Context::uncompact`].
 ///
-/// Turns are numbered absolutely over the whole session (see [`Context::first_turn`]), the
-/// numbering the read tracker's baselines use. The summary turn takes the number of the
+/// Turns are numbered absolutely over the whole session, from 1 (see [`Context::first_turn`]),
+/// the numbering the read tracker's baselines use. The summary turn takes the number of the
 /// last turn it replaced, so every kept turn keeps its number. The engine passes
 /// `last_removed_turn` to `ReadTracker::forget_shown_at` after applying a compaction: a
 /// re-read must not answer `unchanged since turn N` for a turn the model can no longer see.
@@ -72,9 +72,17 @@ impl Context {
 
     /// The request that produces the summary, and how many of the oldest turns it covers
     /// (pass that count to [`apply_compaction`](Self::apply_compaction)). `keep_recent` turns
-    /// stay verbatim; the cut moves earlier, keeping more, rather than separating a tool
-    /// call from its result. The count is 0 when there is nothing to remove, and the request
-    /// is then not worth sending.
+    /// stay verbatim. The count is 0 when there is nothing worth summarizing, and the request
+    /// is then not worth sending. It can be smaller than `history.len() - keep_recent`:
+    ///
+    /// - the cut moves earlier rather than separate a tool call from its result, and a tool
+    ///   call that has no result yet is never removed;
+    /// - a lone summary turn is not worth summarizing again;
+    /// - the request must fit the window of `model` (`caps`): the transcript may use
+    ///   `context_window - max_output` less the prompt. Tool inputs and results are cut to
+    ///   their first and last [`KEEP_BYTES`] bytes, and if the transcript is still too big
+    ///   the count shrinks to the longest oldest prefix that fits. Repeated compaction
+    ///   handles the rest; 0 here with a long history means one turn alone is too big.
     ///
     /// The request is for `model`, with a short dedicated system prompt instead of the stable
     /// prefix and no tools; the removed turns are rendered as one transcript in a single user
@@ -85,12 +93,36 @@ impl Context {
         caps: &Capabilities,
         keep_recent: usize,
     ) -> (CanonicalRequest, usize) {
-        let removed = self.removable(keep_recent);
-        let mut transcript = String::from("<transcript>\n");
-        for message in self.history[..removed].iter().flat_map(|t| &t.messages) {
-            render_message(&mut transcript, message);
+        const OPEN: &str = "<transcript>\n";
+        const CLOSE: &str = "</transcript>\n\nWrite the summary now.";
+        let est = &self.tokens;
+
+        let overhead = est.estimate(COMPACT_PROMPT) + est.estimate(OPEN) + est.estimate(CLOSE);
+        let budget = caps
+            .context_window
+            .saturating_sub(caps.max_output)
+            .saturating_sub(overhead);
+
+        // Largest cut up to the wanted one that is valid and whose transcript fits. The cost
+        // of a turn is the sum of its chunks' estimates, which never undercounts the joined
+        // text.
+        let mut cut = self.history.len().saturating_sub(keep_recent);
+        let chunks: Vec<String> = self.history[..cut].iter().map(render_turn).collect();
+        let costs: Vec<u32> = chunks.iter().map(|c| est.estimate(c)).collect();
+        let removed = loop {
+            cut = self.settle(cut);
+            let cost = costs[..cut].iter().fold(0u32, |a, c| a.saturating_add(*c));
+            if cut == 0 || cost <= budget {
+                break cut;
+            }
+            cut -= 1;
+        };
+
+        let mut transcript = String::from(OPEN);
+        for chunk in &chunks[..removed] {
+            transcript.push_str(chunk);
         }
-        transcript.push_str("</transcript>\n\nWrite the summary now.");
+        transcript.push_str(CLOSE);
         let request = CanonicalRequest {
             model: model.clone(),
             system: vec![Block::Text(COMPACT_PROMPT.to_string())],
@@ -109,14 +141,14 @@ impl Context {
     /// Replace the `removed` oldest turns (from [`compaction_request`](Self::compaction_request))
     /// with `summary` as one user turn, `<summary>…</summary>`, at the start of the history:
     /// pinned, summary, recent turns, state. `removed` is capped at the history length.
-    /// None, and no change, when it is 0.
+    /// None, and no change, when it is 0 or only the summary of an earlier compaction.
     pub fn apply_compaction(
         &mut self,
         removed: usize,
         summary: String,
     ) -> Option<CompactionRecord> {
         let removed = removed.min(self.history.len());
-        if removed == 0 {
+        if removed == 0 || (removed == 1 && is_summary_turn(&self.history[0])) {
             return None;
         }
         let first_removed_turn = self.first_turn;
@@ -138,7 +170,8 @@ impl Context {
     /// Undo [`apply_compaction`](Self::apply_compaction): put the removed turns back in place
     /// of the summary, provided the context then fits `budget` (estimated tokens of
     /// everything but the tool schemas: system blocks, pinned, history and state; the engine
-    /// passes the window less the tools). Only the latest compaction can be undone.
+    /// passes the window less the tools and less `max_output`, so a restore cannot fit only
+    /// by leaving no room for the reply). Only the latest compaction can be undone.
     /// Nothing changes on error.
     pub fn uncompact(&mut self, rec: &CompactionRecord, budget: u32) -> Result<(), UncompactError> {
         let summary = summary_turn(&rec.summary);
@@ -160,14 +193,24 @@ impl Context {
         Ok(())
     }
 
-    /// Turns to remove so `keep_recent` stay: the cut moves earlier while it would put a tool
-    /// call on one side and its result on the other.
-    fn removable(&self, keep_recent: usize) -> usize {
-        let mut cut = self.history.len().saturating_sub(keep_recent);
+    /// The largest cut at or below `cut` that may be made: not past a tool call without a
+    /// result yet, not between a tool call and its result, and not covering only a summary.
+    fn settle(&self, mut cut: usize) -> usize {
+        cut = cut.min(first_unanswered_call(&self.history));
         while cut > 0 && splits_tool_pair(&self.history, cut) {
             cut -= 1;
         }
-        cut
+        if cut == 1 && is_summary_turn(&self.history[0]) {
+            0
+        } else {
+            cut
+        }
+    }
+
+    /// The tracker turn number of the next turn: what the engine passes to
+    /// `ToolCx::with_turn`, and the first number a compaction would not cover yet.
+    pub fn next_turn(&self) -> u32 {
+        self.first_turn + self.history.len() as u32
     }
 
     /// Estimated tokens of what `assemble` would send except the tool schemas.
@@ -203,10 +246,63 @@ fn summary_turn(summary: &str) -> Turn {
             role: Role::User,
             content: vec![Content::Text(format!(
                 "<summary>\n{}\n</summary>",
-                summary.trim()
+                neutralize(summary.trim())
             ))],
         }],
     }
+}
+
+/// Whether `turn` has the shape [`summary_turn`] gives.
+fn is_summary_turn(turn: &Turn) -> bool {
+    matches!(
+        &turn.messages[..],
+        [Message { role: Role::User, content }]
+            if matches!(&content[..], [Content::Text(t)]
+                if t.starts_with("<summary>\n") && t.ends_with("\n</summary>"))
+    )
+}
+
+/// `text` with every `</summary` and `</transcript` (any case) written `&lt;/...`, so text
+/// that came from tool output cannot close the wrapper it sits in.
+fn neutralize(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(i) = rest.find("</") {
+        out.push_str(&rest[..i]);
+        let after = &rest[i + 2..];
+        let closes = ["summary", "transcript"].iter().any(|tag| {
+            after
+                .as_bytes()
+                .get(..tag.len())
+                .is_some_and(|b| b.eq_ignore_ascii_case(tag.as_bytes()))
+        });
+        out.push_str(if closes { "&lt;/" } else { "</" });
+        rest = after;
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Index of the first turn with a tool call that has no result anywhere in the history (the
+/// call is still running), or the history length.
+fn first_unanswered_call(history: &[Turn]) -> usize {
+    let answered: HashSet<&str> = history
+        .iter()
+        .flat_map(|t| &t.messages)
+        .flat_map(|m| &m.content)
+        .filter_map(|c| match c {
+            Content::ToolResult { id, .. } => Some(id.as_str()),
+            _ => None,
+        })
+        .collect();
+    history
+        .iter()
+        .position(|t| {
+            t.messages.iter().flat_map(|m| &m.content).any(
+                |c| matches!(c, Content::ToolUse { id, .. } if !answered.contains(id.as_str())),
+            )
+        })
+        .unwrap_or(history.len())
 }
 
 /// Whether a tool call before `cut` has its result at or after it.
@@ -230,6 +326,40 @@ fn splits_tool_pair(history: &[Turn], cut: usize) -> bool {
             .any(|id| results_kept.contains(id))
 }
 
+fn render_turn(turn: &Turn) -> String {
+    let mut out = String::new();
+    for message in &turn.messages {
+        render_message(&mut out, message);
+    }
+    out
+}
+
+/// Bytes kept from each end of a tool input or result in the transcript (about 500 tokens
+/// each). The summary needs what a call did, not its full output; the agent can run it again.
+pub const KEEP_BYTES: usize = 2_000;
+
+/// `text` neutralized, and cut to its first and last [`KEEP_BYTES`] bytes when longer than
+/// both plus a margin, with a marker between.
+fn clip(text: &str) -> String {
+    if text.len() <= 2 * KEEP_BYTES + 200 {
+        return neutralize(text);
+    }
+    let mut head = KEEP_BYTES;
+    while !text.is_char_boundary(head) {
+        head -= 1;
+    }
+    let mut tail = text.len() - KEEP_BYTES;
+    while !text.is_char_boundary(tail) {
+        tail += 1;
+    }
+    format!(
+        "{}\n[... {} bytes omitted ...]\n{}",
+        neutralize(&text[..head]),
+        tail - head,
+        neutralize(&text[tail..])
+    )
+}
+
 fn render_message(out: &mut String, message: &Message) {
     let role = match message.role {
         Role::System => "system",
@@ -239,10 +369,14 @@ fn render_message(out: &mut String, message: &Message) {
     for content in &message.content {
         // Writing to a String cannot fail.
         let _ = match content {
-            Content::Text(t) => writeln!(out, "[{role}]\n{t}\n"),
+            Content::Text(t) => writeln!(out, "[{role}]\n{}\n", neutralize(t)),
             Content::Image { .. } => writeln!(out, "[{role}]\n[image]\n"),
             Content::ToolUse { id, name, input } => {
-                writeln!(out, "[{role} tool call {id}: {name}]\n{input}\n")
+                writeln!(
+                    out,
+                    "[{role} tool call {id}: {name}]\n{}\n",
+                    clip(&input.to_string())
+                )
             }
             Content::ToolResult {
                 id,
@@ -250,7 +384,7 @@ fn render_message(out: &mut String, message: &Message) {
                 is_error,
             } => {
                 let kind = if *is_error { "error" } else { "result" };
-                writeln!(out, "[tool {kind} {id}]\n{output}\n")
+                writeln!(out, "[tool {kind} {id}]\n{}\n", clip(output))
             }
             // Reasoning is the model's scratch work, not conversation.
             Content::Reasoning { .. } | Content::RedactedReasoning { .. } => Ok(()),
