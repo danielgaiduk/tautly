@@ -13,6 +13,7 @@ hx-index = { path = "../hx-index" }
 toml.workspace = true
 globset.workspace = true
 serde_json.workspace = true
+thiserror.workspace = true
 
 [dev-dependencies]
 hx-sandbox = { path = "../hx-sandbox" }

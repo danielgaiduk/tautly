@@ -4,6 +4,7 @@
 pub mod agents_md;
 pub mod assemble;
 pub mod blocks;
+pub mod compact;
 pub mod pinned;
 pub mod prompt;
 pub mod repo_map;
@@ -17,6 +18,7 @@ use hx_tools::{AppliedEffect, ContextOp};
 
 pub use assemble::STABLE_LEN;
 pub use blocks::{Breakdown, ContextStatus, Turn};
+pub use compact::{CompactionRecord, UncompactError};
 pub use pinned::{PinSource, Pinned};
 pub use state::{FileNote, WorkingState};
 pub use tokens::TokenEstimator;
@@ -27,6 +29,9 @@ pub struct Context {
     pub pinned: Vec<Pinned>,
     pub state: WorkingState,
     pub history: Vec<Turn>,
+    /// Absolute session turn number of `history[0]` (0 for a fresh session). Compaction
+    /// keeps `history[i]` at turn `first_turn + i`, see [`CompactionRecord`].
+    pub first_turn: u32,
     pub agents_md: Option<String>,
     /// Set by the engine from the memory store; rendered in the stable prefix after AGENTS.md.
     pub memory_index: Option<String>,
