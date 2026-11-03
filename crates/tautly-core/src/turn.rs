@@ -30,6 +30,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::approvals::Approvals;
+use crate::ledger::Row;
 use crate::protocol::{BudgetScope, Command, ErrorKind, Event, FinishReason, UsageRole};
 use crate::record::{SessionRecord, storable};
 use crate::session::Session;
@@ -720,21 +721,18 @@ impl Session {
     /// (whose 80% and exhausted warnings follow the `Usage` that caused them).
     async fn spend(&mut self, role: UsageRole, u: RawUsage, quota: Option<Quota>, estimated: bool) {
         let cost = cost_usd(&u, self.info.price.as_ref());
-        if let Some(ledger) = self.cost_ledger.clone() {
-            let (session, model) = (self.session_id.clone(), self.model.clone());
-            let written = tokio::task::spawn_blocking(move || {
-                if estimated {
-                    ledger.record_estimated(&session, &model, &u, cost)
-                } else {
-                    ledger.record(&session, &model, &u, cost)
-                }
-            })
-            .await;
-            match written {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => self.ledger_unavailable(e.to_string()).await,
-                Err(e) => self.ledger_unavailable(e.to_string()).await,
-            }
+        let ledger = self.cost_ledger.clone();
+        let row = Row {
+            session: self.session_id.clone(),
+            model: self.model.clone(),
+            usage: u,
+            cost,
+            estimated,
+        };
+        match tokio::task::spawn_blocking(move || ledger.record(row)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(why)) => self.ledger_row_lost(why).await,
+            Err(e) => self.ledger_row_lost(e.to_string()).await,
         }
         self.emit(Event::Usage {
             role,

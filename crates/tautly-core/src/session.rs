@@ -20,7 +20,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::attempts::AttemptLedger;
 use crate::budget::Budgets;
-use crate::ledger::Ledger;
+use crate::ledger::CostLedger;
 use crate::protocol::{Command, ErrorKind, Event};
 use crate::record::SessionRecord;
 use crate::workspace::Workspace;
@@ -309,11 +309,10 @@ pub(crate) struct Session {
     pub budgets: Arc<Mutex<Budgets>>,
     /// Wall-clock limit per user message.
     pub turn_timeout: Option<Duration>,
-    /// The cost ledger file; opened at [`Session::init`].
+    /// The cost ledger file; opened in the background at [`Session::init`].
     pub cost_ledger_path: PathBuf,
-    /// None when it could not be opened (said once).
-    pub cost_ledger: Option<Arc<Ledger>>,
-    /// A ledger problem was reported; later ones are not.
+    pub cost_ledger: CostLedger,
+    /// A lost ledger row was reported; later ones are not.
     pub cost_ledger_reported: bool,
     /// The process groups this session's commands started (killed at shutdown).
     pub groups: ProcessGroups,
@@ -401,12 +400,12 @@ impl Session {
         }
     }
 
-    /// The cost ledger cannot be used: said once, and the session runs without it.
-    pub async fn ledger_unavailable(&mut self, why: String) {
-        self.cost_ledger = None;
+    /// A usage row could not be written: said once; the ledger stays in use.
+    pub async fn ledger_row_lost(&mut self, why: String) {
         if !std::mem::replace(&mut self.cost_ledger_reported, true) {
             self.warn(format!(
-                "the cost ledger is unavailable ({why}); this session's usage is not recorded"
+                "a usage row could not be written to the cost ledger ({why}); later rows \
+                 are still recorded, and further failures are not reported"
             ))
             .await;
         }
@@ -418,12 +417,19 @@ impl Session {
     pub async fn init(&mut self, config_pins: &[String]) {
         let root = self.sandbox.root().to_path_buf();
         tokio::task::spawn_blocking(move || cleanup_spills(&root, SPILL_MAX_AGE, SPILL_MAX_BYTES));
-        let path = self.cost_ledger_path.clone();
-        match tokio::task::spawn_blocking(move || Ledger::open(&path)).await {
-            Ok(Ok(ledger)) => self.cost_ledger = Some(Arc::new(ledger)),
-            Ok(Err(e)) => self.ledger_unavailable(e.to_string()).await,
-            Err(e) => self.ledger_unavailable(e.to_string()).await,
-        }
+        // Off the start path: another process may hold the file for seconds.
+        let (ledger, path, events) = (
+            self.cost_ledger.clone(),
+            self.cost_ledger_path.clone(),
+            self.events.clone(),
+        );
+        tokio::spawn(async move {
+            if let Ok(notes) = tokio::task::spawn_blocking(move || ledger.open(&path)).await {
+                for n in notes {
+                    events.warn(n).await;
+                }
+            }
+        });
         for pin in config_pins {
             pinned::add(
                 &mut self.context.pinned,

@@ -2,7 +2,7 @@
 //! processes, at `<data home>/ledger.sqlite`.
 
 use std::path::Path;
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, params};
@@ -43,6 +43,24 @@ pub enum LedgerError {
     Db(#[from] rusqlite::Error),
     #[error("cost ledger: {0}")]
     Io(#[from] std::io::Error),
+    #[error(
+        "cost ledger: written by a newer tautly (schema {found}, this one knows {SCHEMA_VERSION}); left as it is"
+    )]
+    Newer { found: i64 },
+}
+
+impl LedgerError {
+    /// The file is not a database, or a damaged one.
+    fn is_corrupt(&self) -> bool {
+        matches!(
+            self,
+            LedgerError::Db(rusqlite::Error::SqliteFailure(e, _))
+                if matches!(
+                    e.code,
+                    rusqlite::ErrorCode::NotADatabase | rusqlite::ErrorCode::DatabaseCorrupt
+                )
+        )
+    }
 }
 
 pub type Result<T> = std::result::Result<T, LedgerError>;
@@ -78,23 +96,84 @@ pub struct Ledger {
 
 impl Ledger {
     /// Open (creating it and its directory if needed) in WAL mode with a 5 s busy timeout.
+    /// The file is readable by its owner only. A ledger from a newer schema is refused.
     pub fn open(path: &Path) -> Result<Ledger> {
+        Ok(Self::open_noting(path)?.0)
+    }
+
+    /// [`open`](Self::open) for the engine: a file that is not a database (or is corrupt)
+    /// is moved aside as `<name>.corrupt-<unix secs>` and a new one created. Returns the
+    /// ledger and what the user should be told (the move, WAL mode unavailable).
+    pub fn open_recovering(path: &Path) -> Result<(Ledger, Vec<String>)> {
+        match Self::open_noting(path) {
+            Err(e) if e.is_corrupt() => {
+                let secs = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map_or(0, |d| d.as_secs());
+                let mut aside = path.as_os_str().to_owned();
+                aside.push(format!(".corrupt-{secs}"));
+                std::fs::rename(path, &aside)?;
+                // Journal files of the damaged database would confuse the new one.
+                for ext in ["-wal", "-shm"] {
+                    let mut f = path.as_os_str().to_owned();
+                    f.push(ext);
+                    let _ = std::fs::remove_file(&f);
+                }
+                let (ledger, mut notes) = Self::open_noting(path)?;
+                notes.insert(
+                    0,
+                    format!(
+                        "the cost ledger was corrupt ({e}); it was moved to {} and a new one \
+                         started",
+                        Path::new(&aside).display()
+                    ),
+                );
+                Ok((ledger, notes))
+            }
+            other => other,
+        }
+    }
+
+    fn open_noting(path: &Path) -> Result<(Ledger, Vec<String>)> {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
         if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
             std::fs::create_dir_all(dir)?;
         }
+        // Owner-only before SQLite creates it; its -wal and -shm files take the same mode.
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .mode(0o600)
+            .open(path)?;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
         let conn = Connection::open(path)?;
         conn.busy_timeout(BUSY_TIMEOUT)?;
+        let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
+        if version > SCHEMA_VERSION {
+            return Err(LedgerError::Newer { found: version });
+        }
+        let mut notes = Vec::new();
         // Switching to WAL needs the file to itself and does not wait for a busy handler:
         // when another process is creating the ledger at the same moment, retry.
-        until_not_busy(|| conn.pragma_update_and_check(None, "journal_mode", "WAL", |_| Ok(())))?;
+        let mode: String = until_not_busy(|| {
+            conn.pragma_update_and_check(None, "journal_mode", "WAL", |r| r.get(0))
+        })?;
+        if !mode.eq_ignore_ascii_case("wal") {
+            notes.push(format!(
+                "the cost ledger could not use WAL mode (the file system gave `{mode}`); \
+                 sessions writing at once may wait on each other"
+            ));
+        }
         conn.pragma_update(None, "synchronous", "NORMAL")?;
-        let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
         if version < SCHEMA_VERSION {
             until_not_busy(|| migrate(&conn))?;
         }
-        Ok(Ledger {
-            conn: Mutex::new(conn),
-        })
+        Ok((
+            Ledger {
+                conn: Mutex::new(conn),
+            },
+            notes,
+        ))
     }
 
     pub fn record(
@@ -134,6 +213,7 @@ impl Ledger {
         Ok(())
     }
 
+    /// [`record`](Self::record) for usage the engine estimated.
     /// [`record`](Self::record) for usage the engine estimated.
     pub fn record_estimated(
         &self,
@@ -220,4 +300,106 @@ fn until_not_busy<T>(mut f: impl FnMut() -> rusqlite::Result<T>) -> rusqlite::Re
 fn unix_ms(t: SystemTime) -> i64 {
     t.duration_since(UNIX_EPOCH)
         .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+}
+
+/// Most rows kept while the ledger is still opening.
+const PENDING_ROWS: usize = 1000;
+
+/// One row on its way to the ledger.
+pub(crate) struct Row {
+    pub session: String,
+    pub model: ModelId,
+    pub usage: RawUsage,
+    pub cost: Option<f64>,
+    pub estimated: bool,
+}
+
+enum Slot {
+    /// Opening in the background; rows wait here.
+    Opening(Vec<Row>),
+    Open(Arc<Ledger>),
+    /// Could not be opened (said once); rows are dropped.
+    Off,
+}
+
+/// A session's way to the ledger: opened off the start path, rows recorded meanwhile are
+/// kept (up to [`PENDING_ROWS`]) and written once it is open. A failed write loses only
+/// that row; the handle stays in use.
+#[derive(Clone)]
+pub(crate) struct CostLedger {
+    slot: Arc<Mutex<Slot>>,
+}
+
+impl CostLedger {
+    pub fn opening() -> Self {
+        CostLedger {
+            slot: Arc::new(Mutex::new(Slot::Opening(Vec::new()))),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Slot> {
+        self.slot.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Open `path` and write the rows that waited. Blocking. Returns what the user should
+    /// be told.
+    pub fn open(&self, path: &Path) -> Vec<String> {
+        let mut notes = Vec::new();
+        let ledger = match Ledger::open_recovering(path) {
+            Ok((ledger, n)) => {
+                notes.extend(n);
+                Arc::new(ledger)
+            }
+            Err(e) => {
+                *self.lock() = Slot::Off;
+                notes.push(format!(
+                    "the cost ledger is unavailable ({e}); this session's usage is not recorded"
+                ));
+                return notes;
+            }
+        };
+        // Rows that arrive while the waiting ones are written queue up behind them.
+        loop {
+            let pending = match &mut *self.lock() {
+                Slot::Opening(rows) if !rows.is_empty() => std::mem::take(rows),
+                slot => {
+                    *slot = Slot::Open(Arc::clone(&ledger));
+                    break;
+                }
+            };
+            let failed = pending
+                .iter()
+                .filter(|r| write(&ledger, r).is_err())
+                .count();
+            if failed > 0 {
+                notes.push(format!(
+                    "{failed} usage row(s) could not be written to the cost ledger"
+                ));
+            }
+        }
+        notes
+    }
+
+    /// Record one row. Blocking when the ledger is open. An error says the row was lost.
+    pub fn record(&self, row: Row) -> std::result::Result<(), String> {
+        let ledger = match &mut *self.lock() {
+            Slot::Opening(rows) => {
+                if rows.len() < PENDING_ROWS {
+                    rows.push(row);
+                }
+                return Ok(());
+            }
+            Slot::Off => return Ok(()),
+            Slot::Open(l) => Arc::clone(l),
+        };
+        write(&ledger, &row).map_err(|e| e.to_string())
+    }
+}
+
+fn write(ledger: &Ledger, r: &Row) -> Result<()> {
+    if r.estimated {
+        ledger.record_estimated(&r.session, &r.model, &r.usage, r.cost)
+    } else {
+        ledger.record(&r.session, &r.model, &r.usage, r.cost)
+    }
 }

@@ -35,7 +35,7 @@ use crate::approvals::{Approvals, Verdict};
 use crate::attempts::AttemptLedger;
 use crate::budget::{Budget, Budgets};
 use crate::config::{Config, LoadedConfig};
-use crate::ledger::LEDGER_FILE;
+use crate::ledger::{CostLedger, LEDGER_FILE};
 use crate::protocol::{BudgetScope, Command, ErrorKind, Event, FinishReason};
 use crate::provider_setup::provider_for;
 use crate::record::SessionRecord;
@@ -222,7 +222,7 @@ impl EngineBuilder {
             budgets: Arc::clone(&budgets),
             turn_timeout: config.turn_timeout_s.map(Duration::from_secs),
             cost_ledger_path: data_home.join(LEDGER_FILE),
-            cost_ledger: None,
+            cost_ledger: CostLedger::opening(),
             cost_ledger_reported: false,
             groups: groups.clone(),
         };

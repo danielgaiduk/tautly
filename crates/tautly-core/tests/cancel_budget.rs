@@ -954,11 +954,8 @@ async fn usage_of_an_attempt_the_retry_wrapper_discarded_is_counted() {
 #[tokio::test]
 async fn an_unopenable_ledger_is_reported_once_and_the_session_runs() {
     let fx = Fx::new();
-    std::fs::write(
-        fx.home.path().join("ledger.sqlite"),
-        "this is not a database at all, really",
-    )
-    .unwrap();
+    // A directory where the file should be: nothing to recover.
+    std::fs::create_dir(fx.home.path().join("ledger.sqlite")).unwrap();
     let mock = MockProvider::new(vec![
         text_step("one", tokens(1, 1)),
         text_step("two", tokens(1, 1)),
@@ -974,6 +971,61 @@ async fn an_unopenable_ledger_is_reported_once_and_the_session_runs() {
         .filter(|w| w.contains("ledger"))
         .collect();
     assert_eq!(about_ledger.len(), 1, "{about_ledger:?}");
+}
+
+#[tokio::test]
+async fn a_corrupt_ledger_is_moved_aside_with_one_warning_and_recording_goes_on() {
+    let fx = Fx::new();
+    std::fs::write(
+        fx.home.path().join("ledger.sqlite"),
+        "this is not a database at all, really",
+    )
+    .unwrap();
+    let mock = MockProvider::new(vec![
+        text_step("one", tokens(1, 1)),
+        text_step("two", tokens(1, 1)),
+    ]);
+    let mut run = start(fx.builder(config(true), &mock));
+    let first = run.turn_with("go").await;
+    let second = run.turn_with("again").await;
+    let about_ledger: Vec<String> = warnings(&first)
+        .into_iter()
+        .chain(warnings(&second))
+        .filter(|w| w.contains("ledger"))
+        .collect();
+    assert_eq!(about_ledger.len(), 1, "{about_ledger:?}");
+    assert!(about_ledger[0].contains("corrupt"), "{about_ledger:?}");
+    assert_eq!(fx.ledger().totals(UNIX_EPOCH).unwrap().requests, 2);
+}
+
+#[tokio::test]
+async fn a_locked_ledger_does_not_delay_the_session_and_its_rows_arrive_later() {
+    let fx = Fx::new();
+    let path = fx.home.path().join("ledger.sqlite");
+    // Another process holds the (rollback-journal) file exclusively while we start.
+    let holder = rusqlite::Connection::open(&path).unwrap();
+    holder
+        .execute_batch("CREATE TABLE other (x); BEGIN EXCLUSIVE; INSERT INTO other VALUES (1);")
+        .unwrap();
+    let mock = MockProvider::new(vec![text_step("one", tokens(10, 2))]);
+    let t0 = Instant::now();
+    let mut run = start(fx.builder(config(true), &mock));
+    let events = run.turn_with("go").await;
+    assert_eq!(finish_reason(&events), FinishReason::Completed);
+    assert!(t0.elapsed() < Duration::from_secs(3), "{:?}", t0.elapsed());
+    holder.execute_batch("COMMIT;").unwrap();
+    drop(holder);
+    // The buffered row is written once the ledger opens.
+    let end = Instant::now() + WAIT;
+    loop {
+        if let Ok(l) = Ledger::open(&path)
+            && l.totals(UNIX_EPOCH).unwrap().requests == 1
+        {
+            break;
+        }
+        assert!(Instant::now() < end, "the buffered row never arrived");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }
 
 // ---- signals ---------------------------------------------------------------------------

@@ -138,3 +138,67 @@ fn a_version_1_ledger_gains_the_estimated_column_and_keeps_its_rows() {
     let t = ledger.totals(UNIX_EPOCH).unwrap();
     assert_eq!((t.requests, t.estimated, t.input), (2, 1, 15));
 }
+
+#[test]
+fn the_ledger_file_is_private() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("ledger.sqlite");
+    let ledger = Ledger::open(&path).unwrap();
+    ledger
+        .record("s", &ModelId::from("m"), &usage(1, 1, 0, 0), None)
+        .unwrap();
+    for f in ["ledger.sqlite", "ledger.sqlite-wal"] {
+        let mode = std::fs::metadata(dir.path().join(f))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600, "{f}: {mode:o}");
+    }
+}
+
+#[test]
+fn a_corrupt_ledger_is_moved_aside_and_recreated() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("ledger.sqlite");
+    let junk = "this is not a database, just text that is long enough to matter";
+    std::fs::write(&path, junk).unwrap();
+    let (ledger, notes) = Ledger::open_recovering(&path).unwrap();
+    assert_eq!(notes.len(), 1, "{notes:?}");
+    assert!(notes[0].contains("corrupt"), "{notes:?}");
+    ledger
+        .record("s", &ModelId::from("m"), &usage(1, 1, 0, 0), None)
+        .unwrap();
+    assert_eq!(ledger.totals(UNIX_EPOCH).unwrap().requests, 1);
+    let moved: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .filter(|n| n.starts_with("ledger.sqlite.corrupt-"))
+        .collect();
+    assert_eq!(moved.len(), 1, "{moved:?}");
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join(&moved[0])).unwrap(),
+        junk
+    );
+    // A healthy ledger opens with nothing to say.
+    drop(ledger);
+    assert!(Ledger::open_recovering(&path).unwrap().1.is_empty());
+}
+
+#[test]
+fn a_ledger_from_a_newer_version_is_left_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("ledger.sqlite");
+    rusqlite::Connection::open(&path)
+        .unwrap()
+        .execute_batch("PRAGMA user_version = 99;")
+        .unwrap();
+    let err = Ledger::open_recovering(&path).err().expect("refused");
+    assert!(err.to_string().contains("newer"), "{err}");
+    // Not moved or changed.
+    let v: i64 = rusqlite::Connection::open(&path)
+        .unwrap()
+        .pragma_query_value(None, "user_version", |r| r.get(0))
+        .unwrap();
+    assert_eq!(v, 99);
+}
