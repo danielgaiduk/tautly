@@ -1,0 +1,100 @@
+//! The cost ledger (spec 4.6): a SQLite file shared by every session and process.
+
+use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use tautly_core::{Ledger, Totals};
+use tautly_provider::{ModelId, RawUsage};
+
+fn usage(input: u64, output: u64, cache_read: u64, cache_write: u64) -> RawUsage {
+    RawUsage {
+        input,
+        output,
+        cache_read,
+        cache_write,
+    }
+}
+
+#[test]
+fn ledger_two_processes_concurrent_writes() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = Arc::new(dir.path().join("nested").join("ledger.sqlite"));
+    let model = ModelId::from("mock/test");
+    let writers: Vec<_> = (0..2)
+        .map(|w| {
+            let path = Arc::clone(&path);
+            let model = model.clone();
+            std::thread::spawn(move || {
+                // Its own handle (its own connection), as a second process would have.
+                let ledger = Ledger::open(&path).unwrap();
+                for i in 0..500u64 {
+                    ledger
+                        .record(&format!("s{w}"), &model, &usage(i, 1, 0, 0), Some(0.001))
+                        .unwrap();
+                }
+            })
+        })
+        .collect();
+    for w in writers {
+        w.join().unwrap();
+    }
+    let t = Ledger::open(&path).unwrap().totals(UNIX_EPOCH).unwrap();
+    assert_eq!(t.requests, 1000);
+    assert_eq!(t.output, 1000);
+    assert_eq!(t.input, 2 * (0..500u64).sum::<u64>());
+    assert!((t.usd - 1.0).abs() < 1e-9, "{}", t.usd);
+    assert_eq!(t.unpriced, 0);
+    // WAL mode (kept in the file): readers never block the writers.
+    let conn = rusqlite::Connection::open(path.as_path()).unwrap();
+    let mode: String = conn
+        .pragma_query_value(None, "journal_mode", |r| r.get(0))
+        .unwrap();
+    assert_eq!(mode, "wal");
+}
+
+#[test]
+fn totals_count_unpriced_rows_apart_and_filter_by_time() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("ledger.sqlite");
+    let ledger = Ledger::open(&path).unwrap();
+    let model = ModelId::from("mock/test");
+    ledger
+        .record("s1", &model, &usage(100, 10, 1000, 50), Some(0.25))
+        .unwrap();
+    ledger
+        .record("s1", &model, &usage(7, 3, 0, 0), None)
+        .unwrap();
+    let all = ledger.totals(UNIX_EPOCH).unwrap();
+    assert_eq!(
+        all,
+        Totals {
+            requests: 2,
+            input: 107,
+            output: 13,
+            cache_read: 1000,
+            cache_write: 50,
+            usd: 0.25,
+            unpriced: 1,
+        }
+    );
+    assert_eq!(all.tokens(), 1170);
+    let later = SystemTime::now() + Duration::from_secs(3600);
+    assert_eq!(ledger.totals(later).unwrap(), Totals::default());
+
+    // The rows outlive the handle.
+    drop(ledger);
+    let again = Ledger::open(&path).unwrap();
+    assert_eq!(again.totals(UNIX_EPOCH).unwrap().requests, 2);
+}
+
+#[test]
+fn opening_a_path_that_is_not_a_database_fails() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("ledger.sqlite");
+    std::fs::write(
+        &path,
+        "not a database, just text that is long enough to matter",
+    )
+    .unwrap();
+    assert!(Ledger::open(&path).is_err());
+}

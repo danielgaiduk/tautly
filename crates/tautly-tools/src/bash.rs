@@ -14,6 +14,7 @@ use tokio::time::Instant;
 
 use crate::cap::{OUTPUT_CAP, cap_text};
 use crate::filters;
+use crate::procs::{GroupGuard, group_alive, killpg};
 use crate::spec::{parse_args, tool_spec};
 use crate::{AppliedEffect, Tool, ToolCx, ToolError, ToolResult};
 
@@ -24,6 +25,8 @@ const MAX_TIMEOUT_S: u64 = 600;
 const FILTER_THRESHOLD: usize = 2 * 1024;
 /// Grace between SIGTERM and SIGKILL.
 const TERM_GRACE: Duration = Duration::from_millis(100);
+/// How often the group is checked during [`TERM_GRACE`].
+const KILL_POLL: Duration = Duration::from_millis(5);
 /// Absolute cap on how long to keep reading pipes after the shell exits (background children may hold them).
 const DRAIN_GRACE: Duration = Duration::from_millis(200);
 /// Upper bound on output kept in memory; the rest is drained and discarded.
@@ -159,16 +162,6 @@ async fn read_chunk<R: AsyncBufRead + Unpin>(r: &mut R) -> std::io::Result<Vec<u
     }
 }
 
-fn killpg(pgid: u32, sig: libc::c_int) {
-    let Ok(pgid) = libc::pid_t::try_from(pgid) else {
-        return;
-    };
-    // SAFETY: killpg has no memory-safety preconditions; failure (e.g. ESRCH) is harmless.
-    unsafe {
-        libc::killpg(pgid, sig);
-    }
-}
-
 struct Capture<'a> {
     buf: Vec<u8>,
     tx: Option<&'a mpsc::Sender<String>>,
@@ -265,6 +258,8 @@ impl Tool for BashTool {
             Err(e) => return ToolResult::error(format!("failed to start: {e}")),
         };
         let pgid = child.id();
+        // Kills the group if this future is dropped before the command is settled.
+        let guard = pgid.map(|p| GroupGuard::new(cx.process_groups(), p));
         let (line_tx, mut lines) = mpsc::channel(CHANNEL_CHUNKS);
         let mut readers = JoinSet::new();
         if let Some(out) = child.stdout.take() {
@@ -327,7 +322,16 @@ impl Tool for BashTool {
         if !matches!(outcome, Outcome::Exited(_)) {
             if let Some(pgid) = pgid {
                 killpg(pgid, libc::SIGTERM);
-                tokio::time::sleep(TERM_GRACE).await;
+                // Most commands die on SIGTERM at once: wait only while the group lives.
+                let end = Instant::now() + TERM_GRACE;
+                loop {
+                    // Reap the shell, so an exited group does not linger as a zombie.
+                    let _ = child.try_wait();
+                    if !group_alive(pgid) || Instant::now() >= end {
+                        break;
+                    }
+                    tokio::time::sleep(KILL_POLL).await;
+                }
                 killpg(pgid, libc::SIGKILL);
             }
             let _ = child.wait().await;
@@ -338,6 +342,11 @@ impl Tool for BashTool {
             }
         }
 
+        // A group with a background child left (a dev server) stays registered, so the
+        // session ends it at shutdown.
+        if let Some(g) = guard {
+            g.settle();
+        }
         let (is_error, trailer, exit_code) = match outcome {
             Outcome::Exited(s) => {
                 let code = s.code().unwrap_or_else(|| {

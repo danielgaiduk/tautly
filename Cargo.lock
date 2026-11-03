@@ -2499,6 +2499,8 @@ dependencies = [
  "insta",
  "keyring",
  "libc",
+ "proptest",
+ "rusqlite",
  "serde",
  "serde_json",
  "tautly-context",

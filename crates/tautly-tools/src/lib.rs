@@ -11,6 +11,7 @@ mod index_tools;
 mod memory_tools;
 mod persist;
 mod pin_state;
+mod procs;
 mod read;
 mod reread;
 mod spec;
@@ -45,6 +46,7 @@ pub use pin_state::{
     ContextOp, MAX_PIN_BYTES, PinTool, PlanStep, StatePatch, StateTool, StepStatus,
     parse_context_op,
 };
+pub use procs::{ProcessGroups, group_alive};
 pub use read::ReadTool;
 pub use web_fetch::WebFetchTool;
 pub use write::WriteTool;
@@ -277,6 +279,13 @@ impl ReadTracker {
         ranges.retain(|_, prev| prev.turn > turn);
     }
 
+    /// Drop every baseline shown at `turn`: the engine abandoned a call of that turn
+    /// (it did not stop in time after a cancel), so what the model saw then is unknown.
+    pub fn forget_recorded_at(&self, turn: u32) {
+        let mut ranges = self.ranges.lock().unwrap_or_else(|e| e.into_inner());
+        ranges.retain(|_, prev| prev.turn != turn);
+    }
+
     /// Drop every baseline. The stale-read guard is kept: it says what is on disk, not
     /// what is in context.
     pub fn clear(&self) {
@@ -424,6 +433,7 @@ pub struct ToolCx {
     index: Option<Arc<Index>>,
     memory: Option<Arc<RwLock<MemoryStore>>>,
     turn: u32,
+    groups: ProcessGroups,
 }
 
 impl std::fmt::Debug for ToolCx {
@@ -449,6 +459,7 @@ impl ToolCx {
             index: None,
             memory: None,
             turn: 0,
+            groups: ProcessGroups::default(),
         }
     }
 
@@ -485,6 +496,12 @@ impl ToolCx {
         self
     }
 
+    /// The session's registry of process groups (`bash` records each command's group).
+    pub fn with_process_groups(mut self, groups: ProcessGroups) -> Self {
+        self.groups = groups;
+        self
+    }
+
     pub fn edit_format(&self) -> EditFormat {
         self.edit_format
     }
@@ -515,6 +532,10 @@ impl ToolCx {
 
     pub fn turn(&self) -> u32 {
         self.turn
+    }
+
+    pub fn process_groups(&self) -> &ProcessGroups {
+        &self.groups
     }
 }
 

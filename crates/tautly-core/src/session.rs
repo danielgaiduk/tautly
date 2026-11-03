@@ -13,12 +13,14 @@ use tautly_context::{CompactionRecord, Context, agents_md};
 use tautly_provider::{CanonicalRequest, ModelId, ModelInfo, Provider, ToolSpec};
 use tautly_sandbox::{Policy, Sandbox, cleanup_spills};
 use tautly_session::{BlobRef, SessionWriter};
-use tautly_tools::{ReadTracker, Tool};
+use tautly_tools::{ProcessGroups, ReadTracker, Tool};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::attempts::AttemptLedger;
+use crate::budget::Budgets;
+use crate::ledger::Ledger;
 use crate::protocol::{Command, ErrorKind, Event};
 use crate::record::SessionRecord;
 use crate::workspace::Workspace;
@@ -302,6 +304,19 @@ pub(crate) struct Session {
     /// Where [`Session::log_request`] keeps the latest request.
     pub last_request_path: PathBuf,
     pub index_error_reported: bool,
+    pub session_id: String,
+    /// Limits and spend; `SetBudget` changes the limits from the actor at any time.
+    pub budgets: Arc<Mutex<Budgets>>,
+    /// Wall-clock limit per user message.
+    pub turn_timeout: Option<Duration>,
+    /// The cost ledger file; opened at [`Session::init`].
+    pub cost_ledger_path: PathBuf,
+    /// None when it could not be opened (said once).
+    pub cost_ledger: Option<Arc<Ledger>>,
+    /// A ledger problem was reported; later ones are not.
+    pub cost_ledger_reported: bool,
+    /// The process groups this session's commands started (killed at shutdown).
+    pub groups: ProcessGroups,
 }
 
 impl Session {
@@ -386,11 +401,29 @@ impl Session {
         }
     }
 
-    /// Session start, after the first event: spill cleanup in the background, config pins,
-    /// AGENTS.md (once), and the background build of the repo map and memory index.
+    /// The cost ledger cannot be used: said once, and the session runs without it.
+    pub async fn ledger_unavailable(&mut self, why: String) {
+        self.cost_ledger = None;
+        if !std::mem::replace(&mut self.cost_ledger_reported, true) {
+            self.warn(format!(
+                "the cost ledger is unavailable ({why}); this session's usage is not recorded"
+            ))
+            .await;
+        }
+    }
+
+    /// Session start, after the first event: spill cleanup in the background, the cost
+    /// ledger, config pins, AGENTS.md (once), and the background build of the repo map and
+    /// memory index.
     pub async fn init(&mut self, config_pins: &[String]) {
         let root = self.sandbox.root().to_path_buf();
         tokio::task::spawn_blocking(move || cleanup_spills(&root, SPILL_MAX_AGE, SPILL_MAX_BYTES));
+        let path = self.cost_ledger_path.clone();
+        match tokio::task::spawn_blocking(move || Ledger::open(&path)).await {
+            Ok(Ok(ledger)) => self.cost_ledger = Some(Arc::new(ledger)),
+            Ok(Err(e)) => self.ledger_unavailable(e.to_string()).await,
+            Err(e) => self.ledger_unavailable(e.to_string()).await,
+        }
         for pin in config_pins {
             pinned::add(
                 &mut self.context.pinned,

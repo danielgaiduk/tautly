@@ -798,3 +798,22 @@ fn recording_a_baseline_at_turn_zero_panics_in_debug_builds() {
         }),
     );
 }
+
+#[tokio::test]
+async fn forgetting_a_turn_drops_only_the_baselines_shown_at_that_turn() {
+    let e = env();
+    e.put("a.txt", &ten_lines(&[])).await;
+    e.put("b.txt", &ten_lines(&[])).await;
+    e.read_at(3, json!({"path": "a.txt"})).await;
+    e.read_at(4, json!({"path": "b.txt"})).await;
+    e.reads.forget_recorded_at(4);
+    // b.txt was shown at the forgotten turn: its next read is full again.
+    assert_eq!(
+        e.read_at(5, json!({"path": "b.txt"})).await,
+        numbered(&ten_lines(&[]))
+    );
+    assert_eq!(
+        e.read_at(5, json!({"path": "a.txt"})).await,
+        "unchanged since turn 3"
+    );
+}

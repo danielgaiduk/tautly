@@ -9,10 +9,17 @@
 //! becomes an error result), the attempt ledger and the working state are updated, the
 //! result is logged with its effects and checkpointed, and only then is `ToolFinished`
 //! shown.
+//!
+//! Every run boundary is a tool boundary for the budgets: once one is used up, the calls
+//! not started are answered "not run" (a call already running finishes). After a cancel,
+//! running calls get [`ABANDON_AFTER`] to stop; one that has not is dropped (`bash` kills
+//! its process group when dropped), answered as abandoned, and every read baseline
+//! recorded in that step is forgotten, since what the dropped call showed is unknown.
 
 use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use futures::FutureExt;
 use futures::future::join_all;
@@ -24,13 +31,16 @@ use tautly_tools::{ContextOp, PersistedEffect, Tool, ToolCx, ToolResult, parse_c
 use tokio::sync::mpsc;
 
 use crate::approvals::Verdict;
-use crate::protocol::{EffectView, Event};
+use crate::protocol::{BudgetScope, EffectView, Event};
 use crate::record::{SessionRecord, storable, utf8_effects};
 use crate::session::{Log, LogFailure, Session};
 use crate::turn::{Call, TurnControl};
 
 /// Output lines buffered per running tool before they are dropped (bash never blocks).
 const OUTPUT_BUFFER: usize = 64;
+/// How long a running call may take to stop after a cancel before it is dropped; with the
+/// log writes after it, the turn still ends within spec 8's 200 ms.
+const ABANDON_AFTER: Duration = Duration::from_millis(150);
 
 /// One call, checked for what can be known before running it.
 struct Planned<'a> {
@@ -71,6 +81,23 @@ impl Outcome {
             "cancelled: the turn was cancelled before this call ran",
         ))
     }
+
+    fn abandoned() -> Self {
+        Outcome::refused(ToolResult::error(
+            "cancelled: the call did not stop in time and was abandoned; whatever it \
+             changed before that is unknown",
+        ))
+    }
+
+    fn over_budget(scope: BudgetScope) -> Self {
+        let name = match scope {
+            BudgetScope::Turn => "turn",
+            BudgetScope::Session => "session",
+        };
+        Outcome::refused(ToolResult::error(format!(
+            "not run: the {name} budget is exhausted"
+        )))
+    }
 }
 
 /// What identifies a failure for the ledger: `exit N #<hash of the output>` for commands,
@@ -109,7 +136,16 @@ impl Session {
                         .count()
             };
             let run = &planned[start..end];
-            let outcomes = self.execute(run, turn, ctl).await;
+            let outcomes = match self.budget_exhausted().await {
+                Some(scope) => run
+                    .iter()
+                    .map(|p| match &p.rejected {
+                        Some(r) => Outcome::refused(r.clone()),
+                        None => Outcome::over_budget(scope),
+                    })
+                    .collect(),
+                None => self.execute(run, turn, ctl).await,
+            };
             let mut finished = Vec::with_capacity(run.len());
             for (p, o) in run.iter().zip(outcomes) {
                 let (content, event) = self.finish(p.call, o, turn).await;
@@ -172,16 +208,27 @@ impl Session {
             .map(|(p, _)| p)
             .collect();
         let this = &*self;
-        let mut ran = join_all(admitted.iter().map(|p| this.invoke(p, turn, ctl)))
-            .await
-            .into_iter();
+        let bounded = admitted.iter().map(|p| async move {
+            tokio::select! {
+                r = this.invoke(p, turn, ctl) => Some(r),
+                () = abandon_after_cancel(ctl) => None,
+            }
+        });
+        let ran: Vec<Option<ToolResult>> = join_all(bounded).await;
+        if ran.iter().any(Option::is_none) {
+            self.reads.forget_recorded_at(turn);
+        }
+        let mut ran = ran.into_iter();
         gated
             .into_iter()
             .map(|g| {
-                g.unwrap_or_else(|| Outcome {
-                    result: ran.next().expect("one result per admitted call"),
-                    blocked: false,
-                    ran: true,
+                g.unwrap_or_else(|| match ran.next().expect("one result per admitted call") {
+                    Some(result) => Outcome {
+                        result,
+                        blocked: false,
+                        ran: true,
+                    },
+                    None => Outcome::abandoned(),
                 })
             })
             .collect()
@@ -280,7 +327,8 @@ impl Session {
             .with_reads(Arc::clone(&self.reads))
             .with_cancel(ctl.cancel.child_token())
             .with_output_tx(tx)
-            .with_turn(turn);
+            .with_turn(turn)
+            .with_process_groups(self.groups.clone());
         if let Some(index) = self.workspace.index() {
             cx = cx.with_index(index);
         }
@@ -374,6 +422,12 @@ impl Session {
         }
         (content, event)
     }
+}
+
+/// Completes [`ABANDON_AFTER`] after the turn is cancelled.
+async fn abandon_after_cancel(ctl: &TurnControl) {
+    ctl.cancel.cancelled().await;
+    tokio::time::sleep(ABANDON_AFTER).await;
 }
 
 /// What [`persist_result`] left out of the log.

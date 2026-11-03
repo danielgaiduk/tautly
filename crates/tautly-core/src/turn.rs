@@ -6,7 +6,16 @@
 //! Every step starts with the cache epoch (spec 7.7): collection and threshold compaction
 //! are decided together and applied together, with the session pins and a pending memory
 //! index riding on the same epoch, so the cached prefix breaks at most once.
+//!
+//! Every provider response's usage (main and side, including a response that broke off
+//! and was sent again) is written to the cost ledger, shown as `Usage` and counted against
+//! the budgets (`budget.rs`). The budgets are checked at every step start, before every
+//! request and at every tool boundary. The turn timeout (`turn_timeout_s`) cancels the
+//! turn like `Cancel` does, and the turn ends with `timeout`.
 
+use std::sync::Arc;
+use std::sync::PoisonError;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use futures::StreamExt;
@@ -21,7 +30,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::approvals::Approvals;
-use crate::protocol::{Command, ErrorKind, Event, FinishReason, UsageRole};
+use crate::protocol::{BudgetScope, Command, ErrorKind, Event, FinishReason, UsageRole};
 use crate::record::{SessionRecord, storable};
 use crate::session::Session;
 
@@ -159,6 +168,8 @@ fn parse_args(input_json: &str) -> Result<serde_json::Value, String> {
 enum StreamEnd {
     Cancelled,
     Failed(ProviderError),
+    /// A discarded attempt used up the budget; it is not sent again.
+    Budget,
 }
 
 /// Remove reasoning items from every turn: they belong to the provider that produced them.
@@ -212,15 +223,38 @@ impl Session {
     }
 
     async fn run_turn_inner(&mut self, text: String, ctl: &mut TurnControl) {
+        let timed_out = Arc::new(AtomicBool::new(false));
+        let timer = self.turn_timeout.map(|limit| {
+            let (cancel, timed_out) = (ctl.cancel.clone(), Arc::clone(&timed_out));
+            tokio::spawn(async move {
+                tokio::select! {
+                    () = tokio::time::sleep(limit) => {
+                        timed_out.store(true, Ordering::Relaxed);
+                        cancel.cancel();
+                    }
+                    () = cancel.cancelled() => {}
+                }
+            })
+        });
         self.apply_startup().await;
         self.emit(Event::TurnStarted).await;
+        self.budgets
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .start_turn();
         self.context.history.push(Turn {
             messages: vec![Message {
                 role: Role::User,
                 content: vec![Content::Text(text)],
             }],
         });
-        let reason = self.steps(ctl).await;
+        let mut reason = self.steps(ctl).await;
+        if let Some(t) = timer {
+            t.abort();
+        }
+        if reason == FinishReason::Cancelled && timed_out.load(Ordering::Relaxed) {
+            reason = FinishReason::Timeout;
+        }
         self.log(SessionRecord::TurnEnd { reason }).await;
         self.checkpoint().await;
         self.emit(Event::TurnFinished { reason }).await;
@@ -235,6 +269,9 @@ impl Session {
             if steps >= self.max_turns {
                 return FinishReason::MaxTurns;
             }
+            if self.budget_exhausted().await.is_some() {
+                return FinishReason::Budget;
+            }
             while let Ok(cmd) = ctl.inbox.try_recv() {
                 self.context_command(cmd).await;
             }
@@ -247,12 +284,17 @@ impl Session {
             if ctl.cancel.is_cancelled() {
                 return FinishReason::Cancelled;
             }
+            // The epoch's compaction summary may have spent the rest.
+            if self.budget_exhausted().await.is_some() {
+                return FinishReason::Budget;
+            }
             let turn = self.context.next_turn();
             self.log_request(&req).await;
             let sent_at = Instant::now();
             let resp = match self.stream(req, ctl).await {
                 Ok(r) => r,
                 Err(StreamEnd::Cancelled) => return FinishReason::Cancelled,
+                Err(StreamEnd::Budget) => return FinishReason::Budget,
                 Err(StreamEnd::Failed(e)) => {
                     self.emit(error_event(&e)).await;
                     return FinishReason::Error;
@@ -269,16 +311,7 @@ impl Session {
             self.context.note_request(sent_at, status.cached_prefix);
             if let Some(u) = resp.usage {
                 self.context.calibrate(&status, &u);
-                self.emit(Event::Usage {
-                    role: UsageRole::Main,
-                    tokens_in: u.input,
-                    tokens_out: u.output,
-                    cache_read: u.cache_read,
-                    cache_write: u.cache_write,
-                    cost_usd: cost_usd(&u, self.info.price.as_ref()),
-                    quota: resp.quota.clone(),
-                })
-                .await;
+                self.spend(UsageRole::Main, u, resp.quota.clone()).await;
             }
             self.emit(Event::context_status(&status)).await;
             steps += 1;
@@ -384,19 +417,28 @@ impl Session {
                     Some(Err(e)) => break Some(e),
                 }
             };
-            match broke {
-                None => return Ok(resp.finish()),
-                // Before any content, `Retrying` has already retried (spec 3.5): its error
-                // is final. Only a response that broke off after content is sent again.
-                Some(e) if content && e.is_transient() && attempt < MAX_REISSUES => {
-                    attempt += 1;
-                    self.warn(format!(
-                        "the response broke off ({e}); discarding it and sending the request again"
-                    ))
-                    .await;
-                }
-                Some(e) => return Err(StreamEnd::Failed(e)),
+            let Some(e) = broke else {
+                return Ok(resp.finish());
+            };
+            // What the provider billed for the broken attempt counts, so cost is never
+            // under-reported.
+            if let Some(u) = resp.usage {
+                self.spend(UsageRole::Main, u, resp.quota.clone()).await;
             }
+            // Before any content, `Retrying` has already retried (spec 3.5): its error is
+            // final. Only a response that broke off after content is sent again, and not
+            // once the budget is used up.
+            if !(content && e.is_transient() && attempt < MAX_REISSUES) {
+                return Err(StreamEnd::Failed(e));
+            }
+            if self.budget_exhausted().await.is_some() {
+                return Err(StreamEnd::Budget);
+            }
+            attempt += 1;
+            self.warn(format!(
+                "the response broke off ({e}); discarding it and sending the request again"
+            ))
+            .await;
         }
     }
 
@@ -505,7 +547,7 @@ impl Session {
         self.emit(Event::context_status(&status)).await;
         let summary = match self.summarize(req, ctl).await {
             Ok(s) => Some(s),
-            Err(StreamEnd::Cancelled) => return false,
+            Err(StreamEnd::Cancelled | StreamEnd::Budget) => return false,
             Err(StreamEnd::Failed(e)) => {
                 self.warn(format!(
                     "the compaction summary failed ({e}); dropping the oldest turns without one"
@@ -561,33 +603,72 @@ impl Session {
         let mut s = self.provider.stream(req, ctl.cancel.child_token());
         let mut text = String::new();
         let mut usage = None;
-        loop {
+        let failed = loop {
             let item = tokio::select! {
                 biased;
                 () = ctl.cancel.cancelled() => return Err(StreamEnd::Cancelled),
                 item = s.next() => item,
             };
             match item {
-                None => break,
+                None => break None,
                 Some(Ok(ProviderEvent::TextDelta(t))) => text.push_str(&t),
                 Some(Ok(ProviderEvent::Usage(u))) => usage = Some(u),
                 Some(Ok(_)) => {}
-                Some(Err(e)) => return Err(StreamEnd::Failed(e)),
+                Some(Err(e)) => break Some(e),
+            }
+        };
+        // A failed summary that was billed counts as well.
+        if let Some(u) = usage {
+            self.spend(UsageRole::Side, u, None).await;
+        }
+        match failed {
+            None => Ok(text.trim().to_string()),
+            Some(e) => Err(StreamEnd::Failed(e)),
+        }
+    }
+
+    /// Account for one provider response: the ledger first, then `Usage`, then the budgets
+    /// (whose 80% and exhausted warnings follow the `Usage` that caused them).
+    async fn spend(&mut self, role: UsageRole, u: RawUsage, quota: Option<Quota>) {
+        let cost = cost_usd(&u, self.info.price.as_ref());
+        if let Some(ledger) = self.cost_ledger.clone() {
+            let (session, model) = (self.session_id.clone(), self.model.clone());
+            let written =
+                tokio::task::spawn_blocking(move || ledger.record(&session, &model, &u, cost))
+                    .await;
+            match written {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => self.ledger_unavailable(e.to_string()).await,
+                Err(e) => self.ledger_unavailable(e.to_string()).await,
             }
         }
-        if let Some(u) = usage {
-            self.emit(Event::Usage {
-                role: UsageRole::Side,
-                tokens_in: u.input,
-                tokens_out: u.output,
-                cache_read: u.cache_read,
-                cache_write: u.cache_write,
-                cost_usd: cost_usd(&u, self.info.price.as_ref()),
-                quota: None,
-            })
-            .await;
+        self.emit(Event::Usage {
+            role,
+            tokens_in: u.input,
+            tokens_out: u.output,
+            cache_read: u.cache_read,
+            cache_write: u.cache_write,
+            cost_usd: cost,
+            quota,
+        })
+        .await;
+        self.budgets
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .spend(&u, cost);
+        self.budget_exhausted().await;
+    }
+
+    /// Show what the budgets have to say, and which one (if any) is used up.
+    pub(crate) async fn budget_exhausted(&self) -> Option<BudgetScope> {
+        let (news, exceeded) = {
+            let mut b = self.budgets.lock().unwrap_or_else(PoisonError::into_inner);
+            (b.news(), b.exceeded())
+        };
+        for w in news {
+            self.warn(w).await;
         }
-        Ok(text.trim().to_string())
+        exceeded
     }
 }
 

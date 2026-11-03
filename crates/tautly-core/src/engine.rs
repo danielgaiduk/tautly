@@ -6,8 +6,11 @@
 //! (further messages included) waits for the turn to end. Every command is logged as it
 //! arrives.
 //!
-//! Seams for later tasks: budgets, turn timeouts and the cost ledger (Task 25) hook into
-//! the step loop after each `Usage` (`turn.rs`); resume and fork (Task 26) build the
+//! `SetBudget` is applied at once, even mid-turn: the running turn sees the new limits at
+//! its next tool boundary (`budget.rs`). At shutdown, after the turn has ended, every
+//! process group the session's commands left behind is terminated.
+//!
+//! Seams for later tasks: resume and fork (Task 26) build the
 //! `Session` from a log instead of [`Session::init`]'s fresh state (`EngineBuilder::resume`
 //! is refused until then); side-model routing (Task 27) replaces the provider used by
 //! `Session::summarize`; memory proposals (Task 28) plug in at the `ContextOp::Remember`
@@ -16,21 +19,24 @@
 
 use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Duration;
 
 use tautly_context::Context;
 use tautly_provider::{Catalog, Provider, Retrying};
 use tautly_sandbox::{LocalSandbox, Policy, PolicyError, Sandbox, SandboxError};
 use tautly_session::SessionWriter;
-use tautly_tools::{ReadTracker, registry};
+use tautly_tools::{ProcessGroups, ReadTracker, registry};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::approvals::{Approvals, Verdict};
 use crate::attempts::AttemptLedger;
+use crate::budget::{Budget, Budgets};
 use crate::config::{Config, LoadedConfig};
-use crate::protocol::{Command, ErrorKind, Event, FinishReason};
+use crate::ledger::LEDGER_FILE;
+use crate::protocol::{BudgetScope, Command, ErrorKind, Event, FinishReason};
 use crate::provider_setup::provider_for;
 use crate::record::SessionRecord;
 use crate::session::{EventSink, Log, LogFailure, Session};
@@ -41,6 +47,8 @@ use crate::workspace::Workspace;
 pub const EVENT_CAPACITY: usize = 256;
 /// Commands buffered before [`Engine::send`] waits.
 const COMMAND_CAPACITY: usize = 64;
+/// At shutdown, how long left-behind process groups get between SIGTERM and SIGKILL.
+const GROUP_GRACE: Duration = Duration::from_millis(500);
 
 #[derive(Debug, thiserror::Error)]
 pub enum EngineError {
@@ -84,7 +92,8 @@ pub struct EngineBuilder {
     /// An interactive client answers `ToolApprovalRequested`; otherwise (headless) `ask`
     /// resolves to deny and nothing ever waits for input.
     pub interactive: bool,
-    /// Default: [`tautly_session::paths::data_home`].
+    /// Where session logs and the cost ledger (`ledger.sqlite`) live. Default:
+    /// [`tautly_session::paths::data_home`].
     pub data_home: Option<PathBuf>,
     /// Lines from loading the configuration ([`LoadedConfig::warnings`]), shown as
     /// warnings at session start.
@@ -180,6 +189,12 @@ impl EngineBuilder {
             root: Some(root.clone()),
             ..Context::default()
         };
+        let budgets = Arc::new(Mutex::new(Budgets::new(
+            &config.budget,
+            info.price.is_some(),
+            config.model.as_str(),
+        )));
+        let groups = ProcessGroups::default();
         let session = Session {
             context,
             reads: Arc::new(ReadTracker::default()),
@@ -203,6 +218,13 @@ impl EngineBuilder {
             untracked_paths: HashSet::new(),
             last_request_path: last_request_path(&session_path),
             index_error_reported: false,
+            session_id: session_id.clone(),
+            budgets: Arc::clone(&budgets),
+            turn_timeout: config.turn_timeout_s.map(Duration::from_secs),
+            cost_ledger_path: data_home.join(LEDGER_FILE),
+            cost_ledger: None,
+            cost_ledger_reported: false,
+            groups: groups.clone(),
         };
         let actor = Actor {
             log: session.log.clone(),
@@ -210,6 +232,8 @@ impl EngineBuilder {
             approvals: Approvals::new(self.interactive),
             shutdown: CancellationToken::new(),
             session_id: session_id.clone(),
+            budgets,
+            groups,
         };
         runtime.spawn(actor.run(
             session,
@@ -259,6 +283,11 @@ impl Engine {
         &self.session_id
     }
 
+    /// The command channel, held weakly (the signal listener).
+    pub(crate) fn weak_commands(&self) -> mpsc::WeakSender<Command> {
+        self.commands.downgrade()
+    }
+
     /// The session log file.
     pub fn session_path(&self) -> &Path {
         &self.session_path
@@ -290,6 +319,16 @@ struct Actor {
     approvals: Approvals,
     shutdown: CancellationToken,
     session_id: String,
+    budgets: Arc<Mutex<Budgets>>,
+    groups: ProcessGroups,
+}
+
+/// The actor's task dropped without a shutdown (the runtime went away): no process group
+/// may outlive the session. After a normal shutdown the registry is already empty.
+impl Drop for Actor {
+    fn drop(&mut self) {
+        self.groups.kill_all_now();
+    }
 }
 
 impl Actor {
@@ -362,6 +401,9 @@ impl Actor {
                                 r.cancel.cancel();
                             }
                         }
+                        Command::SetBudget { scope, max_usd, max_tokens } => {
+                            self.set_budget(scope, max_usd, max_tokens);
+                        }
                         cmd @ (Command::Pin { .. } | Command::Unpin { .. }) if running.is_some() => {
                             if let Some(r) = &running {
                                 let _ = r.inbox.send(cmd);
@@ -385,7 +427,31 @@ impl Actor {
                 }
             }
         }
+        // The turn has ended (its own command was killed with it); what is left are groups
+        // with background children, such as dev servers.
+        self.groups.terminate_all(GROUP_GRACE).await;
         self.with_log(|l| l.checkpoint()).await;
+    }
+
+    /// `SetBudget`: replace one scope's limits. Clients are trusted (the project layer's
+    /// tighten-only rule applies to configuration files only).
+    fn set_budget(&self, scope: BudgetScope, max_usd: Option<f64>, max_tokens: Option<u64>) {
+        if max_usd.is_some_and(|usd| !usd.is_finite() || usd < 0.0) {
+            self.events.try_emit(Event::Warning {
+                message: "SetBudget ignored: max_usd must be a number of at least 0".into(),
+            });
+            return;
+        }
+        self.budgets
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .set(
+                scope,
+                Budget {
+                    max_usd,
+                    max_tokens,
+                },
+            );
     }
 
     /// Run `f` on the log off the async workers; a first failure is shown.
