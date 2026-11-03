@@ -205,6 +205,7 @@ Requests are assembled in fixed order:
 - Adapters whose wire API requires alternating roles merge consecutive same-role messages (e.g. tool results followed by the state tail).
 - AGENTS.md is read through the sandbox resolver (regular files only; in-root symlinks are accepted), capped at 32 KB per file and 64 KB in total, with a visible truncation marker and a status warning. A file above the sandbox root is accepted only when its link target stays inside the directory holding it.
 - Cache stability: the working state changes on almost every tool call (the files list follows effects), so it sits after history; the cached prefix (stable · pinned · history up to the last cache breakpoint) survives state changes. Pinned items change rarely and stay before history.
+- The sandbox root is the git top level when the start directory is inside a git work tree, else the start directory. AGENTS.md links resolving to protected paths (5.x) are refused with a warning; ancestor files above the root must also be owned by the user and not group- or world-writable.
 - `ContextStatus{used, budget, breakdown}` is emitted every turn.
 - `hx prompt show` prints the system prompt; `hx prompt show --full` prints the exact last request.
 - System prompt target: < 2,000 tokens.
@@ -275,7 +276,7 @@ Structured record: task, plan steps with status, files read/edited with content 
   - **Cold cache** (time since last request ≥ TTL): apply all pending mutations; nothing cached is lost.
   - **Warm cache:** apply only when `saved > cost`, where `saved = tokens_freed × input_price × 5` (5 = expected further requests in the turn horizon) and `cost = invalidated_prefix_tokens × (cache_write_price − cache_read_price)`. Without catalog prices, fall back to the 7.2 threshold rule.
   - **Forced:** always apply when context use ≥ 90% of the window. Threshold compaction may therefore be deferred from 80% up to 90% while the cache is warm and the cost model says it is not yet worth it — never beyond 90%.
-- All mutations decided at one step start are applied together as one "cache epoch", so the prefix breaks at most once.
+- All mutations decided at one step start are applied together as one "cache epoch", so the prefix breaks at most once. An epoch (including a cold-cache step) also folds session pins into `[pinned]` (6.2) and applies a pending memory index (7.4).
 - `ContextCollected` and `Compacted` gain `reason: cold_cache | cost_benefit | forced | manual`.
 
 ### 7.8 Attempt ledger and loop breaker
