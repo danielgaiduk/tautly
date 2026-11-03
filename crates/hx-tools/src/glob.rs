@@ -8,7 +8,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::cap::{OUTPUT_CAP, cap_text};
-use crate::spec::{display_rel, parse_args, tool_spec, walk_files};
+use crate::spec::{display_rel, live_index, parse_args, tool_spec, tree_covers, walk_files};
 use crate::{Tool, ToolCx, ToolError, ToolResult};
 
 const MAX_RESULTS: usize = 1000;
@@ -81,33 +81,34 @@ impl Tool for GlobTool {
         };
         // A ready index answers from its in-memory tree; its paths are sorted as
         // strings, like `hits` below.
-        let mut hits: Vec<String> = if let Some(index) = cx.index().filter(|i| i.is_ready()) {
-            if cx.cancel().is_cancelled() {
-                return ToolResult::error("cancelled");
-            }
-            index
-                .tree()
-                .glob(&a.pattern, &base_rel)
-                .iter()
-                .map(|p| p.display().to_string())
-                .collect()
-        } else {
-            let files = match walk_files(sb, &base_rel).await {
-                Ok(f) => f,
-                Err(e) => return ToolResult::error(e),
-            };
-            // Patterns match relative to the search directory; output is root-relative.
-            let mut hits = Vec::new();
-            for f in &files {
+        let mut hits: Vec<String> =
+            if let Some(index) = live_index(cx).filter(|i| tree_covers(i, &base_rel)) {
                 if cx.cancel().is_cancelled() {
                     return ToolResult::error("cancelled");
                 }
-                if matcher.is_match(f.strip_prefix(&base_rel).unwrap_or(f)) {
-                    hits.push(display_rel(sb, f));
+                index
+                    .tree()
+                    .glob(&a.pattern, &base_rel)
+                    .iter()
+                    .map(|p| p.display().to_string())
+                    .collect()
+            } else {
+                let files = match walk_files(sb, &base_rel).await {
+                    Ok(f) => f,
+                    Err(e) => return ToolResult::error(e),
+                };
+                // Patterns match relative to the search directory; output is root-relative.
+                let mut hits = Vec::new();
+                for f in &files {
+                    if cx.cancel().is_cancelled() {
+                        return ToolResult::error("cancelled");
+                    }
+                    if matcher.is_match(f.strip_prefix(&base_rel).unwrap_or(f)) {
+                        hits.push(display_rel(sb, f));
+                    }
                 }
-            }
-            hits
-        };
+                hits
+            };
         if hits.is_empty() {
             return ToolResult::ok("no files matched");
         }

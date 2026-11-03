@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock};
 use std::time::Duration;
 
@@ -154,6 +154,10 @@ pub(crate) struct Inner {
     pub sb: Arc<dyn Sandbox>,
     ready: AtomicBool,
     trigrams_ready: AtomicBool,
+    /// How many times [`Index::mark_stale`] was called.
+    stale_marks: AtomicU64,
+    /// The highest mark count a completed refresh or watcher batch is known to cover.
+    covered_marks: AtomicU64,
     /// The last scan met symlinks: a change under one path may alias another.
     has_links: AtomicBool,
     last_error: Mutex<Option<String>>,
@@ -190,6 +194,8 @@ impl Index {
                 sb,
                 ready: AtomicBool::new(false),
                 trigrams_ready: AtomicBool::new(false),
+                stale_marks: AtomicU64::new(0),
+                covered_marks: AtomicU64::new(0),
                 has_links: AtomicBool::new(false),
                 last_error: Mutex::new(None),
                 tree: RwLock::new(tree),
@@ -219,6 +225,21 @@ impl Index {
     /// until then [`Index::grep_candidates`] answers [`crate::Candidates::FullScan`].
     pub fn trigrams_ready(&self) -> bool {
         self.inner.trigrams_ready.load(Ordering::Acquire)
+    }
+
+    /// Record that files may have changed behind the index's back (a shell command ran).
+    /// Until a refresh, or a watcher batch, that started after this call has completed,
+    /// [`Index::is_stale`] is true and callers should not trust the tree or the trigram
+    /// candidates for files that may have just appeared.
+    pub fn mark_stale(&self) {
+        self.inner.stale_marks.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// True between [`Index::mark_stale`] and the next completed refresh or watcher batch
+    /// that started after it.
+    pub fn is_stale(&self) -> bool {
+        self.inner.stale_marks.load(Ordering::SeqCst)
+            > self.inner.covered_marks.load(Ordering::SeqCst)
     }
 
     /// The error of the most recent refresh, if it failed.
@@ -421,6 +442,15 @@ impl Inner {
 
     pub fn ensure_indexes(&self) -> Result<(), IndexError> {
         ensure_indexes(&self.conn())
+    }
+
+    /// Marks up to `seen` (the mark count read when an operation started) as covered.
+    pub fn cover_marks(&self, seen: u64) {
+        self.covered_marks.fetch_max(seen, Ordering::SeqCst);
+    }
+
+    pub fn stale_mark_count(&self) -> u64 {
+        self.stale_marks.load(Ordering::SeqCst)
     }
 
     pub fn mark_ready(&self) {

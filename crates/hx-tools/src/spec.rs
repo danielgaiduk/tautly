@@ -1,10 +1,14 @@
 //! Helpers shared by tool implementations.
 
+use std::path::Path;
+use std::sync::Arc;
+
+use hx_index::Index;
 use hx_provider::ToolSpec;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 
-use crate::ToolError;
+use crate::{ToolCx, ToolError};
 
 pub(crate) fn parse_args<T: DeserializeOwned>(args: &Value) -> Result<T, ToolError> {
     serde_json::from_value(args.clone()).map_err(|e| ToolError::BadArgs(e.to_string()))
@@ -50,4 +54,18 @@ pub(crate) async fn walk_files(
 
 pub(crate) fn display_rel(sb: &dyn hx_sandbox::Sandbox, p: &std::path::Path) -> String {
     p.strip_prefix(sb.root()).unwrap_or(p).display().to_string()
+}
+
+/// The index when its tree and trigram candidates can be trusted: it has completed a
+/// refresh, and nothing (a shell command) may have changed files since without a refresh or
+/// watcher batch having caught up.
+pub(crate) fn live_index(cx: &ToolCx) -> Option<&Arc<Index>> {
+    cx.index().filter(|i| i.is_ready() && !i.is_stale())
+}
+
+/// Whether the tree can answer for the search directory or file `base` (absolute, as the
+/// sandbox resolved it). The tree omits hidden and ignored paths, which the walker does
+/// visit when asked for them by name, so a base the tree does not know goes to the walker.
+pub(crate) fn tree_covers(index: &Index, base: &Path) -> bool {
+    index.tree().contains(base)
 }

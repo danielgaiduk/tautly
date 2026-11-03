@@ -242,21 +242,47 @@ async fn symbol_section(t: &SymbolTarget, sb: &dyn Sandbox, cx: &ToolCx) -> Sect
     section
 }
 
-/// Concatenate the sections under the shared output cap: each target may use an equal
-/// share of what is left, so a large file cannot crowd out the others.
+/// Room kept in a truncated section for the notes the renderer appends.
+const NOTE_ALLOWANCE: usize = 120;
+
+impl Section {
+    /// The section's text within `body_cap` bytes of body.
+    fn body_text(&self, body_cap: usize) -> String {
+        match &self.body {
+            Ok(lines) => lines.render(body_cap),
+            Err(why) => cap_text(&format!("[error] {why}"), body_cap).0,
+        }
+    }
+}
+
+/// Concatenate the sections under the shared output cap by water-filling: the smallest
+/// sections get their full size, and what is left is split evenly among the larger ones,
+/// so the result does not depend on the order of the targets.
 fn assemble(sections: &[Section]) -> String {
+    const SEPARATOR: &str = "\n\n";
+    let full: Vec<String> = sections.iter().map(|s| s.body_text(usize::MAX)).collect();
+    let size = |i: usize| sections[i].header.len() + 1 + full[i].len();
+    let mut budget = OUTPUT_CAP.saturating_sub(SEPARATOR.len() * (sections.len() - 1));
+    let mut order: Vec<usize> = (0..sections.len()).collect();
+    order.sort_by_key(|&i| size(i));
+    let mut allowed = vec![0; sections.len()];
+    for (k, &i) in order.iter().enumerate() {
+        let share = budget / (sections.len() - k);
+        allowed[i] = size(i).min(share);
+        budget -= allowed[i];
+    }
     let mut out = String::new();
     for (i, section) in sections.iter().enumerate() {
         if i > 0 {
-            out.push_str("\n\n");
+            out.push_str(SEPARATOR);
         }
         out.push_str(&section.header);
         out.push('\n');
-        let left = sections.len() - i;
-        let share = OUTPUT_CAP.saturating_sub(out.len()) / left;
-        match &section.body {
-            Ok(lines) => out.push_str(&lines.render(share)),
-            Err(why) => out.push_str(&format!("[error] {why}")),
+        if size(i) <= allowed[i] {
+            out.push_str(&full[i]);
+        } else {
+            let cap = allowed[i].saturating_sub(section.header.len() + 1 + NOTE_ALLOWANCE);
+            out.push_str(&section.body_text(cap));
         }
     }
     out

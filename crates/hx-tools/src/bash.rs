@@ -155,6 +155,17 @@ impl Capture<'_> {
     }
 }
 
+/// Marks the code index stale when dropped.
+struct StaleOnDrop(Option<std::sync::Arc<hx_index::Index>>);
+
+impl Drop for StaleOnDrop {
+    fn drop(&mut self) {
+        if let Some(index) = &self.0 {
+            index.mark_stale();
+        }
+    }
+}
+
 #[async_trait]
 impl Tool for BashTool {
     fn name(&self) -> &'static str {
@@ -194,6 +205,9 @@ impl Tool for BashTool {
     }
 
     async fn run(&self, args: Value, sb: &dyn Sandbox, cx: &ToolCx) -> ToolResult {
+        // Whatever the command did to the files (even if cancelled half way), the index
+        // can no longer vouch for them until it catches up.
+        let _stale = StaleOnDrop(cx.index().cloned());
         let a = match parse(&args) {
             Ok(a) => a,
             Err(e) => return ToolResult::error(e.to_string()),

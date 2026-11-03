@@ -164,3 +164,44 @@ async fn batched_read_records_each_file_in_tracker() {
     let missing = e.sb.resolve(Path::new("missing.txt")).unwrap();
     assert!(e.cx.reads().last(&missing).is_none());
 }
+
+#[tokio::test]
+async fn batched_read_gives_small_targets_their_full_size_before_sharing_the_rest() {
+    // About 20.8 KB and 2.5 KB: together under the 30 KB cap, though the big one is over an
+    // equal share of it.
+    let big: String = (0..520)
+        .map(|i| format!("big {i:04} {}\n", "x".repeat(30)))
+        .collect();
+    let small: String = (0..60)
+        .map(|i| format!("s{i:02} {}\n", "y".repeat(35)))
+        .collect();
+    let e = env(
+        &[("big.txt", big.as_bytes()), ("small.txt", small.as_bytes())],
+        Built::None,
+    )
+    .await;
+    let env_ref = &e;
+    let run = |targets: serde_json::Value| async move {
+        let r = env_ref.run(&ReadTool, json!({ "targets": targets })).await;
+        assert!(!r.is_error, "{}", r.output);
+        r.output
+    };
+    let large_first = run(json!([{"path": "big.txt"}, {"path": "small.txt"}])).await;
+    let small_first = run(json!([{"path": "small.txt"}, {"path": "big.txt"}])).await;
+    for out in [&large_first, &small_first] {
+        assert!(
+            !out.contains("truncated") && !out.contains("omitted"),
+            "{}",
+            out.len()
+        );
+        assert!(out.contains("big 0519") && out.contains("s59"));
+    }
+    assert_eq!(large_first.len(), small_first.len());
+
+    // Over the cap in total, the small target is still whole and the big ones share the rest.
+    e.put("big2.txt", big.as_bytes()).await;
+    let out = run(json!([{"path": "big.txt"}, {"path": "big2.txt"}, {"path": "small.txt"}])).await;
+    assert!(out.len() <= 31 * 1024, "{}", out.len());
+    assert!(out.contains("s59") && !out.contains("== small.txt ==\n1\t[error]"));
+    assert_eq!(out.matches("truncated").count(), 2, "{out}");
+}

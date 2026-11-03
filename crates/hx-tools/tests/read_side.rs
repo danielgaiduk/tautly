@@ -5,7 +5,8 @@ use std::path::Path;
 use hx_provider::{Capabilities, EditFormat};
 use hx_sandbox::{Effect, LocalSandbox, Sandbox};
 use hx_tools::{
-    AppliedEffect, GlobTool, GrepTool, ReadTool, Tool, ToolCx, ToolResult, WriteTool, registry,
+    AppliedEffect, BashTool, FindTool, GlobTool, GrepTool, ReadTool, Tool, ToolCx, ToolResult,
+    WriteTool, registry,
 };
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -521,4 +522,112 @@ async fn glob_served_from_tree_when_index_ready() {
     let e = common::env(REPO, common::Built::None).await;
     let r = e.run(&GlobTool, json!({"pattern": "*.md"})).await;
     assert_eq!(r.output, "docs/readme.md");
+}
+
+#[tokio::test]
+async fn explicit_path_into_hidden_or_ignored_directory_matches_the_walker() {
+    for built in [common::Built::Refreshed, common::Built::Full] {
+        let e = repo(built).await;
+        let cases = [
+            ("ignored", "needle"),
+            ("ignored/skip.rs", "needle"),
+            (".hidden", "needle"),
+            (".hidden/x.txt", "needle"),
+        ];
+        for (path, pattern) in cases {
+            let args = json!({"pattern": pattern, "path": path});
+            let with = e.run(&GrepTool, args.clone()).await;
+            let without = e.run_without_index(&GrepTool, args.clone()).await;
+            assert_eq!(with, without, "grep {args}");
+            assert!(
+                with.output.contains("needle"),
+                "grep {args}: {}",
+                with.output
+            );
+            let args = json!({"pattern": "*", "path": path});
+            let with = e.run(&GlobTool, args.clone()).await;
+            let without = e.run_without_index(&GlobTool, args.clone()).await;
+            assert_eq!(with, without, "glob {args}");
+        }
+        let r = e
+            .run(&GlobTool, json!({"pattern": "*", "path": "ignored"}))
+            .await;
+        assert_eq!(r.output, "ignored/skip.rs");
+        let r = e
+            .run(&GlobTool, json!({"pattern": "*", "path": ".hidden"}))
+            .await;
+        assert_eq!(r.output, ".hidden/x.txt");
+    }
+}
+
+#[tokio::test]
+async fn stale_index_sends_grep_glob_and_find_to_the_walker_until_refreshed() {
+    let e = repo(common::Built::Full).await;
+    e.index.mark_stale();
+    // Created behind the index's back, right after the mark.
+    e.put("fresh/made.txt", b"needle from the shell\n").await;
+
+    e.sb.reset();
+    let r = e.run(&GlobTool, json!({"pattern": "*.txt"})).await;
+    assert!(e.sb.walks() > 0, "stale: glob walks");
+    assert!(r.output.contains("fresh/made.txt"), "{}", r.output);
+
+    e.sb.reset();
+    let r = e.run(&GrepTool, json!({"pattern": "needle from"})).await;
+    assert!(e.sb.walks() > 0, "stale: grep walks");
+    assert!(
+        r.output
+            .starts_with("fresh/made.txt:1:needle from the shell"),
+        "{}",
+        r.output
+    );
+
+    e.sb.reset();
+    let r = e.run(&FindTool, json!({"query": "made.txt"})).await;
+    assert!(e.sb.walks() > 0, "stale: find's path search walks");
+    assert!(r.output.contains("fresh/made.txt:1  path"), "{}", r.output);
+    let r = e
+        .run(&FindTool, json!({"query": "needle from", "kind": "text"}))
+        .await;
+    assert!(r.output.contains("fresh/made.txt:1  text"), "{}", r.output);
+
+    // A refresh that started after the mark makes the index trustworthy again.
+    e.index.refresh().await.unwrap();
+    assert!(!e.index.is_stale());
+    e.sb.reset();
+    let r = e.run(&GlobTool, json!({"pattern": "*.txt"})).await;
+    assert_eq!(e.sb.walks(), 0, "fresh: glob from the tree");
+    assert!(r.output.contains("fresh/made.txt"), "{}", r.output);
+    let r = e.run(&GrepTool, json!({"pattern": "needle from"})).await;
+    assert_eq!(e.sb.walks(), 0, "fresh: grep from candidates");
+    assert!(
+        r.output
+            .starts_with("fresh/made.txt:1:needle from the shell"),
+        "{}",
+        r.output
+    );
+}
+
+#[tokio::test]
+async fn bash_marks_the_index_stale_so_files_it_creates_are_found() {
+    let e = common::env(REPO, common::Built::Full).await;
+    assert!(!e.index.is_stale());
+    let r = e
+        .run(
+            &BashTool,
+            json!({"command": "echo shell_made_needle > made.txt"}),
+        )
+        .await;
+    assert!(!r.is_error, "{}", r.output);
+    assert!(e.index.is_stale());
+    let r = e
+        .run(&GrepTool, json!({"pattern": "shell_made_needle"}))
+        .await;
+    assert!(
+        r.output.starts_with("made.txt:1:shell_made_needle"),
+        "{}",
+        r.output
+    );
+    let r = e.run(&GlobTool, json!({"pattern": "made.txt"})).await;
+    assert_eq!(r.output, "made.txt");
 }

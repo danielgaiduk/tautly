@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 use crate::cap::{OUTPUT_CAP, cap_text};
 use crate::grep::{SearchSpec, search};
 use crate::index_tools::fallback_header;
-use crate::spec::{display_rel, parse_args, tool_spec, walk_files};
+use crate::spec::{display_rel, live_index, parse_args, tool_spec, walk_files};
 use crate::{Tool, ToolCx, ToolError, ToolResult};
 
 const DEFAULT_LIMIT: usize = 20;
@@ -254,7 +254,7 @@ async fn path_rows(
     sb: &dyn Sandbox,
     cx: &ToolCx,
 ) -> Result<Vec<Row>, String> {
-    let paths: Vec<String> = match cx.index().filter(|i| i.is_ready()) {
+    let paths: Vec<String> = match live_index(cx) {
         Some(index) => index
             .tree()
             .glob("*", Path::new("."))

@@ -58,6 +58,7 @@ impl Index {
     /// reparsed. A failure is also recorded in [`Index::last_error`] and leaves
     /// `is_ready` as it was.
     pub async fn refresh(&self) -> Result<RefreshStats, IndexError> {
+        let marks_seen = self.inner.stale_mark_count();
         self.inner.run(|i| i.set_bulk_cache(true)).await?;
         let mut result = self.refresh_inner().await;
         // A bulk build may have dropped the name indexes; they must be back whatever
@@ -68,6 +69,9 @@ impl Index {
         // Best effort: failing to shrink the cache must not hide the refresh's result.
         let _ = self.inner.run(|i| i.set_bulk_cache(false)).await;
         self.inner.record_refresh(&result);
+        if result.is_ok() {
+            self.inner.cover_marks(marks_seen);
+        }
         result
     }
 

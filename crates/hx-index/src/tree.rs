@@ -179,6 +179,13 @@ impl TreeView {
         self.data().files.get(&key).map(|s| s.entry(&key))
     }
 
+    /// Whether `path` is a file of the tree, or a directory with files under it. A path the
+    /// tree does not know may still exist on disk (hidden or ignored, or created since).
+    pub fn contains(&self, path: &Path) -> bool {
+        let key = self.inner.key(path);
+        self.data().contains_or_under(&key)
+    }
+
     pub fn len(&self) -> usize {
         self.data().files.len()
     }

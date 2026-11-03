@@ -177,6 +177,8 @@ async fn dir_admitted(inner: &Inner, cache: &mut HashMap<String, bool>, dir: &st
 /// directory (`target/`, `.git/`) is dropped without touching the database.
 async fn process(index: &Index, batch: Batch, stop: &AtomicBool) {
     let inner = &index.inner;
+    let marks_seen = inner.stale_mark_count();
+    let mut clean = true;
     let mut dirs: HashMap<String, bool> = HashMap::new();
     let mut resync = batch.refresh;
     let mut work: Vec<String> = Vec::new();
@@ -218,6 +220,7 @@ async fn process(index: &Index, batch: Batch, stop: &AtomicBool) {
             .await;
         if let Err(e) = marked {
             inner.record_error(format!("watcher: {e}"));
+            clean = false;
         }
     }
     for key in &work {
@@ -228,13 +231,22 @@ async fn process(index: &Index, batch: Batch, stop: &AtomicBool) {
         // next event or refresh retries.
         if let Err(e) = index.reindex_path(Path::new(key)).await {
             inner.record_error(format!("watcher: {key}: {e}"));
+            clean = false;
         }
     }
     // With symlinks in the tree one change can alias several paths, and a changed ignore
     // file changes which files are admitted: reconcile with a full refresh.
     resync |= inner.has_links() && !work.is_empty();
-    if resync && !stop.load(Ordering::Acquire) && index.refresh().await.is_ok() {
-        let _ = index.build_trigrams().await;
+    if resync && !stop.load(Ordering::Acquire) {
+        if index.refresh().await.is_ok() {
+            let _ = index.build_trigrams().await;
+        } else {
+            clean = false;
+        }
+    }
+    // A completed batch that began after a `mark_stale` has seen what that mark was about.
+    if clean {
+        inner.cover_marks(marks_seen);
     }
 }
 

@@ -846,3 +846,59 @@ async fn deleting_through_an_alias_drops_the_canonical_row() {
     assert!(idx.tree().get(Path::new("real/x.rs")).is_none());
     assert!(idx.tree().get(Path::new("alias/x.rs")).is_none());
 }
+
+#[tokio::test]
+async fn tree_contains_files_and_directories_with_files_only() {
+    let fx = sample();
+    let idx = fx.open();
+    idx.refresh().await.unwrap();
+    let tree = idx.tree();
+    for known in ["src", "src/a.rs", "README.md", "./src", "."] {
+        assert!(tree.contains(Path::new(known)), "{known}");
+    }
+    // Ignored, hidden-by-ignore and missing paths are not in the tree.
+    for unknown in [
+        "ignored",
+        "ignored/skip.rs",
+        "src/x.gen.rs",
+        "nope",
+        "src/a",
+    ] {
+        assert!(!tree.contains(Path::new(unknown)), "{unknown}");
+    }
+}
+
+#[tokio::test]
+async fn mark_stale_lasts_until_a_refresh_that_started_after_it_completes() {
+    let fx = sample();
+    let idx = fx.open();
+    idx.refresh().await.unwrap();
+    assert!(!idx.is_stale());
+    idx.mark_stale();
+    assert!(idx.is_stale());
+    idx.refresh().await.unwrap();
+    assert!(!idx.is_stale());
+    idx.mark_stale();
+    idx.mark_stale();
+    assert!(idx.is_stale());
+    idx.refresh().await.unwrap();
+    assert!(!idx.is_stale());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn mark_stale_is_cleared_by_a_watcher_batch_that_sees_the_change() {
+    let fx = sample();
+    let idx = Arc::new(fx.open());
+    idx.refresh().await.unwrap();
+    let _watch = idx.clone().start_watcher().unwrap();
+    std::fs::write(fx.path("made_by_shell.rs"), "fn s() {}\n").unwrap();
+    idx.mark_stale();
+    // The marks only clear once a batch that began after the mark has completed; the
+    // create event is delivered after it, so wait for the tree to know the file.
+    assert!(
+        eventually(WATCH_WAIT, || {
+            idx.tree().get(Path::new("made_by_shell.rs")).is_some() && !idx.is_stale()
+        })
+        .await
+    );
+}

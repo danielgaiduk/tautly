@@ -10,7 +10,9 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::cap::{OUTPUT_CAP, cap_text};
-use crate::spec::{decode_text, display_rel, parse_args, tool_spec, walk_files};
+use crate::spec::{
+    decode_text, display_rel, live_index, parse_args, tool_spec, tree_covers, walk_files,
+};
 use crate::{Tool, ToolCx, ToolError, ToolResult};
 
 const MAX_MATCHES: usize = 500;
@@ -225,9 +227,13 @@ async fn index_candidates(
     sb: &dyn Sandbox,
     cx: &ToolCx,
 ) -> Result<Option<Vec<PathBuf>>, String> {
-    let Some(index) = cx.index().filter(|i| i.is_ready()) else {
+    let Some(index) = live_index(cx) else {
         return Ok(None);
     };
+    let base = sb.resolve(Path::new(base)).map_err(|e| e.to_string())?;
+    if !tree_covers(index, &base) {
+        return Ok(None);
+    }
     let (index, pattern, ci) = (
         Arc::clone(index),
         spec.pattern.to_string(),
@@ -239,7 +245,6 @@ async fn index_candidates(
     let Candidates::Files(rels) = candidates else {
         return Ok(None);
     };
-    let base = sb.resolve(Path::new(base)).map_err(|e| e.to_string())?;
     let mut files: Vec<PathBuf> = rels
         .iter()
         .map(|rel| sb.root().join(rel))
