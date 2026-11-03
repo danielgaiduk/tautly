@@ -453,3 +453,19 @@ fn leading_assignments_need_an_explicit_allow_rule() {
         Decision::Deny { .. }
     ));
 }
+
+// --- checkpoint fix: C3 hidden substitution ---
+#[test]
+fn hidden_arithmetic_substitution_is_not_allowlisted() {
+    let p = with_rules(
+        Mode::Ask,
+        &["bash(echo*)", "bash(cat*)", "bash(read*)"],
+        &[],
+    );
+    for cmd in [
+        "x='a[$(touch /tmp/pwn)]'; echo $((x))",
+        "echo x | read 'a[$(touch pwn4)]'",
+    ] {
+        assert!(asks(p.decide("bash", &exec("echo"), Some(cmd))), "{cmd}");
+    }
+}

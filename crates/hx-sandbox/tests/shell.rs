@@ -250,3 +250,95 @@ fn bare_assignment_to_dangerous_variable_is_unparseable() {
     }
     assert!(parse_commands("FOO=1; ls").is_ok());
 }
+
+// ---- checkpoint fix: C3 hidden command substitution, I4 nesting depth ----
+
+#[test]
+fn arithmetic_and_subscripts_on_variables_are_unparseable() {
+    // bash evaluates variable values inside arithmetic and subscripts as code.
+    for s in [
+        "x='a[$(touch /tmp/pwn)]'; echo $((x))",
+        "echo $((x+1))",
+        "echo $[x]",
+        "((x)); ls",
+        "for ((i=0;i<n;i++)); do echo; done",
+        "echo ${a[$i]}",
+        "echo ${a[i]}",
+        "a[$i]=1",
+        "a=([$x]=1)",
+        "echo ${!x}",
+        "echo ${s:o}",
+        "[[ $x -eq 1 ]]",
+        "[[ x -lt 2 ]]",
+        "[[ -v $x ]]",
+        "test -v \"$x\"",
+        "[ -v \"$x\" ]",
+        "echo $((a[$(id)]))",
+        "let x=1",
+        "declare -i n=x",
+        "declare -n r=x",
+        "local -i n",
+    ] {
+        assert!(parse_commands(s).is_err(), "{s}");
+    }
+    for s in [
+        "echo $((1+2))",
+        "echo $((0x1f))",
+        "[[ $? -eq 0 ]]",
+        "[[ $# -gt 1 ]]",
+        "echo ${a[0]} ${#x} ${x:-y} ${x:1:2}",
+        "[[ -f x && $y == z ]]",
+        "a[1]=2",
+        "x=(a b)",
+    ] {
+        assert!(parse_commands(s).is_ok(), "{s}");
+    }
+}
+
+#[test]
+fn variable_name_arguments_with_code_are_unparseable() {
+    for s in [
+        "echo x | read 'a[$(touch pwn4)]'",
+        "read \"$x\"",
+        "read -r -a \"$x\"",
+        "unset 'a[$(id)]'",
+        "unset \"$x\"",
+        "printf -v 'a[$(id)]' %s 1",
+        "printf -v \"$x\" %s 1",
+        "export \"$x\"",
+        "declare \"$x\"=1",
+        "mapfile -C cb arr",
+        "readarray -t \"$x\"",
+        "getopts ab \"$x\"",
+        "wait -p \"$x\"",
+    ] {
+        assert!(parse_commands(s).is_err(), "{s}");
+    }
+    for s in [
+        "read -r line",
+        "read -p \"$prompt\" -r x",
+        "printf '%s\\n' \"$x\" 'a[$(id)]'",
+        "unset X",
+        "export X=$(id)",
+        "mapfile -t lines",
+    ] {
+        assert!(parse_commands(s).is_ok(), "{s}");
+    }
+}
+
+#[test]
+fn deeply_nested_input_is_unparseable_not_a_crash() {
+    let n = 20_000;
+    for s in [
+        format!("{}true{}", "(".repeat(n), ")".repeat(n)),
+        format!("echo {}x{}", "$(".repeat(n), ")".repeat(n)),
+        format!("{}true{}", "{ ".repeat(n), "; }".repeat(n)),
+        format!("{}:{}", "if true; then ".repeat(n), "; fi".repeat(n)),
+        format!("echo $(({}1{}))", "(".repeat(n), ")".repeat(n)),
+    ] {
+        assert!(parse_commands(&s).is_err());
+    }
+    // Moderate nesting still parses.
+    let ok = format!("{}true{}", "( ".repeat(50), " )".repeat(50));
+    assert_eq!(argv0s(&parse_commands(&ok).unwrap()), ["true"]);
+}
