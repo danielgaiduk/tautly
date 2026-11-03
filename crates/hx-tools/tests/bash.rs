@@ -265,3 +265,20 @@ async fn non_utf8_environment_does_not_panic() {
     unsafe { std::env::remove_var("HX_TEST_BAD") };
     assert!(!r.is_error, "{}", r.output);
 }
+
+#[tokio::test]
+async fn flooding_background_child_does_not_hang_the_call() {
+    let marker = format!("hx-flood-{}", unique_sleep());
+    let cmd = format!("yes {marker} &\nexit 0");
+    let t = Instant::now();
+    let r = tokio::time::timeout(Duration::from_secs(10), run_bash(&cmd)).await;
+    let _ = Command::new("pkill").args(["-f", &marker]).status();
+    let r = r.expect("call hung while a background child floods the pipe");
+    assert!(t.elapsed() < Duration::from_secs(2), "{:?}", t.elapsed());
+    assert!(
+        !r.is_error,
+        "{}",
+        &r.output[r.output.len().saturating_sub(200)..]
+    );
+    assert!(r.output.trim_end().ends_with("exit code: 0"));
+}

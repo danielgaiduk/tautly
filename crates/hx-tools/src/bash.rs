@@ -190,6 +190,13 @@ impl Tool for BashTool {
             if let (Some(status), false) = (exit, pipes_open) {
                 break Outcome::Exited(status);
             }
+            // Checked explicitly: with a flooding background child `recv` is always ready
+            // and the biased select below would never reach the drain timer.
+            if let (Some(status), Some(d)) = (exit, drain_until)
+                && Instant::now() >= d
+            {
+                break Outcome::Exited(status);
+            }
             tokio::select! {
                 biased;
                 _ = cx.cancel().cancelled(), if exit.is_none() => break Outcome::Cancelled,
