@@ -11,6 +11,7 @@ pub mod config;
 mod dispatch;
 pub mod engine;
 pub mod ledger;
+pub mod mcp;
 pub mod protocol;
 mod provider_setup;
 pub mod record;
@@ -27,8 +28,9 @@ pub use config::{
 };
 pub use engine::{Engine, EngineBuilder, EngineError};
 pub use ledger::{Ledger, LedgerError, Totals};
+pub use mcp::{Approval, McpPlan, NoPreExec, PlannedServer, PreExecHook, plan_servers};
 pub use protocol::{
-    BudgetScope, Command, EffectView, ErrorKind, Event, FinishReason, PROTOCOL_VERSION,
+    BudgetScope, Command, EffectView, ErrorKind, Event, FinishReason, McpState, PROTOCOL_VERSION,
     ToolMetaView, UsageRole,
 };
 pub use record::SessionRecord;
@@ -36,5 +38,6 @@ pub use signals::{Signal, SignalPolicy, handle_signals, install_signal_handlers}
 pub use workspace::Workspace;
 // Types that appear in `Event` and `Command`, re-exported so clients need no other crate.
 pub use tautly_context::{Breakdown, MutationReason};
+pub use tautly_mcp::{McpConfig, ServerSource, ServerSpec};
 pub use tautly_memory::{MemAnchor, MemoryChange, MemoryEntry};
 pub use tautly_provider::Quota;

@@ -14,6 +14,8 @@ tautly-context = { path = "../tautly-context" }
 tautly-memory = { path = "../tautly-memory" }
 tautly-index = { path = "../tautly-index" }
 tautly-session = { path = "../tautly-session" }
+tautly-mcp = { path = "../tautly-mcp" }
+async-trait.workspace = true
 tokio = { workspace = true, features = ["signal"] }
 tokio-util.workspace = true
 futures.workspace = true

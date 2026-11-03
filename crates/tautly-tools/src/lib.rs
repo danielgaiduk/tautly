@@ -552,7 +552,8 @@ impl ToolCx {
 
 #[async_trait]
 pub trait Tool: Send + Sync {
-    fn name(&self) -> &'static str;
+    /// Built-in tools have fixed names; MCP tools (`mcp__<server>__<tool>`) do not.
+    fn name(&self) -> &str;
     fn spec(&self, caps: &Capabilities) -> ToolSpec;
     /// The side-effect class of this call, used for permission checks before `run`.
     fn effect(&self, args: &Value) -> Result<Effect, ToolError>;
@@ -560,9 +561,10 @@ pub trait Tool: Send + Sync {
     async fn run(&self, args: Value, sb: &dyn Sandbox, cx: &ToolCx) -> ToolResult;
 }
 
-/// The tools available for a model, in a fixed order.
-pub fn registry(_caps: &Capabilities) -> Vec<Arc<dyn Tool>> {
-    vec![
+/// The tools available for a model: the built-in ones in a fixed order, then `extra`
+/// (MCP tools). Requests list tools sorted by name, whatever this order.
+pub fn registry(_caps: &Capabilities, extra: Vec<Arc<dyn Tool>>) -> Vec<Arc<dyn Tool>> {
+    let builtin: Vec<Arc<dyn Tool>> = vec![
         Arc::new(ReadTool),
         Arc::new(EditTool),
         Arc::new(WriteTool),
@@ -578,5 +580,6 @@ pub fn registry(_caps: &Capabilities) -> Vec<Arc<dyn Tool>> {
         Arc::new(RememberTool),
         Arc::new(PinTool),
         Arc::new(StateTool),
-    ]
+    ];
+    builtin.into_iter().chain(extra).collect()
 }

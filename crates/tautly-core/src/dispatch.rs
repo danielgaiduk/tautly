@@ -351,8 +351,9 @@ impl Session {
     /// Run one admitted call. Output lines are forwarded as `ToolOutputDelta` and all of
     /// them are out before this returns. A panicking tool becomes an error result.
     async fn invoke(&self, p: &Planned<'_>, turn: u32, ctl: &TurnControl) -> ToolResult {
-        let (tool, _) = p.runnable.as_ref().expect("admitted calls are runnable");
+        let (tool, effect) = p.runnable.as_ref().expect("admitted calls are runnable");
         let call = p.call;
+        self.before_exec(&call.name, effect, turn).await;
         self.emit(Event::ToolStarted {
             call_id: call.id.clone(),
             tool: call.name.clone(),

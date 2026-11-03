@@ -21,6 +21,7 @@ use tokio_util::sync::CancellationToken;
 use crate::attempts::AttemptLedger;
 use crate::budget::Budgets;
 use crate::ledger::Ledger;
+use crate::mcp::{McpSession, PreExecHook};
 use crate::protocol::{Command, ErrorKind, Event};
 use crate::record::SessionRecord;
 use crate::workspace::Workspace;
@@ -317,6 +318,11 @@ pub(crate) struct Session {
     pub cost_ledger_reported: bool,
     /// The process groups this session's commands started (killed at shutdown).
     pub groups: ProcessGroups,
+    /// The session's MCP servers, once started (`mcp.rs`); their tools join `tools` at
+    /// user-turn starts only.
+    pub mcp: Option<McpSession>,
+    /// Runs before every stdio MCP call (checkpoints, Task 47).
+    pub pre_exec: Arc<dyn PreExecHook>,
 }
 
 impl Session {

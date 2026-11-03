@@ -35,6 +35,11 @@ impl Approvals {
         }
     }
 
+    /// Whether a client can answer requests (otherwise [`Approvals::open`] gives None).
+    pub fn is_interactive(&self) -> bool {
+        self.interactive
+    }
+
     /// Open a request: its id and where the verdict arrives. None in headless mode, where
     /// nobody can answer.
     pub fn open(&self) -> Option<(String, oneshot::Receiver<Verdict>)> {

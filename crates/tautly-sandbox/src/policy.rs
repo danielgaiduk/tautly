@@ -51,10 +51,16 @@ const READ_ONLY_TOOLS: &[&str] = &[
     "read", "grep", "glob", "outline", "symbol", "refs", "recall",
 ];
 
+/// MCP tools (`mcp__<server>__<tool>`) are matched by name only, and the name may be a
+/// glob (`mcp__github__*`).
+const MCP_PREFIX: &str = "mcp__";
+
 #[derive(Debug)]
 struct Rule {
     text: String,
     tool: String,
+    /// For an MCP rule with glob characters: what tool names it matches.
+    tool_glob: Option<GlobMatcher>,
     /// `None` matches any invocation of the tool.
     glob: Option<GlobMatcher>,
 }
@@ -65,6 +71,40 @@ impl Rule {
             rule: text.to_string(),
             why: why.to_string(),
         };
+        if text.starts_with(MCP_PREFIX) {
+            if text.contains(['(', ')']) {
+                return Err(bad(
+                    "MCP tools are matched by name only, without parentheses",
+                ));
+            }
+            let pattern = text.contains(['*', '?', '[']);
+            let name_ok = text.chars().all(|c| {
+                c.is_ascii_alphanumeric()
+                    || c == '_'
+                    || c == '-'
+                    || (pattern && "*?[]!".contains(c))
+            });
+            if !name_ok {
+                return Err(bad(
+                    "an MCP tool name has only [A-Za-z0-9_-] (and glob characters)",
+                ));
+            }
+            let tool_glob = if pattern {
+                let g = globset::GlobBuilder::new(text)
+                    .literal_separator(false)
+                    .build()
+                    .map_err(|e| bad(&e.to_string()))?;
+                Some(g.compile_matcher())
+            } else {
+                None
+            };
+            return Ok(Rule {
+                text: text.to_string(),
+                tool: text.to_string(),
+                tool_glob,
+                glob: None,
+            });
+        }
         let (tool, glob) = match text.find(['(', ')']) {
             None => (text, None),
             Some(i) if text.as_bytes()[i] == b'(' => {
@@ -94,12 +134,20 @@ impl Rule {
         Ok(Rule {
             text: text.to_string(),
             tool: tool.to_string(),
+            tool_glob: None,
             glob,
         })
     }
 
+    fn is_for(&self, tool: &str) -> bool {
+        match &self.tool_glob {
+            Some(g) => tool.starts_with(MCP_PREFIX) && g.is_match(tool),
+            None => self.tool == tool,
+        }
+    }
+
     fn matches_str(&self, tool: &str, s: &str) -> bool {
-        self.tool == tool && self.glob.as_ref().is_none_or(|g| g.is_match(s))
+        self.is_for(tool) && self.glob.as_ref().is_none_or(|g| g.is_match(s))
     }
 }
 
@@ -230,7 +278,7 @@ impl Policy {
                 rule: r.text.clone(),
             })
         };
-        for r in self.deny.iter().filter(|r| r.tool == tool) {
+        for r in self.deny.iter().filter(|r| r.is_for(tool)) {
             let hit = match subjects {
                 Subjects::None => r.glob.is_none(),
                 Subjects::Commands(cmds) => {

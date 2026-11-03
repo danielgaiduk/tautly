@@ -52,3 +52,9 @@ regex-syntax = "0.8"
 ulid = "1"
 keyring = { version = "3.6", default-features = false }
 insta = { version = "1", features = ["json"] }
+rmcp = { version = "3.8", default-features = false }
+toml_edit = "0.22"
+http = "1"
+hyper = "1"
+hyper-util = "0.1"
+tower-service = "0.3"

@@ -238,6 +238,8 @@ impl Session {
         });
         self.apply_startup().await;
         self.emit(Event::TurnStarted).await;
+        // The tool set changes only here, so the turn's requests share one prefix.
+        self.refresh_mcp_tools().await;
         self.budgets
             .lock()
             .unwrap_or_else(PoisonError::into_inner)

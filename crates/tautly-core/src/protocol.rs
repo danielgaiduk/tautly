@@ -24,6 +24,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tautly_context::{Breakdown, ContextStatus, MutationReason};
+pub use tautly_mcp::McpState;
 use tautly_memory::MemoryChange;
 use tautly_provider::Quota;
 use tautly_tools::{AppliedEffect, LineRange, Shown, ToolMeta};
@@ -247,6 +248,23 @@ pub enum Event {
     Warning {
         message: String,
     },
+    /// A repository-declared MCP server (`source`: `project` or `mcp_json`) wants to start
+    /// `launch` (its command line or URL, and the names of its variables or headers). It
+    /// starts only after [`Command::Approve`] naming `request_id`, which is remembered;
+    /// [`Command::Deny`] keeps it stopped for the session.
+    McpServerApprovalRequested {
+        request_id: String,
+        server: String,
+        source: String,
+        launch: String,
+    },
+    /// An MCP server changed state; `tools` is how many of its tools are offered.
+    McpServerStatus {
+        server: String,
+        state: McpState,
+        tools: u32,
+        message: Option<String>,
+    },
     /// An event type this version does not know.
     #[serde(other)]
     Unknown,
@@ -279,7 +297,8 @@ pub enum Command {
     SendMessage {
         text: String,
     },
-    /// Allow the call behind a [`Event::ToolApprovalRequested`].
+    /// Allow the call behind a [`Event::ToolApprovalRequested`], or the server behind a
+    /// [`Event::McpServerApprovalRequested`] (request ids are unique across both).
     Approve {
         request_id: String,
     },

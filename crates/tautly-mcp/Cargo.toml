@@ -1,0 +1,53 @@
+[package]
+name = "tautly-mcp"
+description = "Tools-only Model Context Protocol client for Tautly"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+tautly-tools = { path = "../tautly-tools" }
+tautly-sandbox = { path = "../tautly-sandbox" }
+tautly-provider = { path = "../tautly-provider" }
+rmcp = { workspace = true, features = [
+    "client",
+    "transport-async-rw",
+    "transport-streamable-http-client-reqwest",
+    "reqwest",
+    # The test fixture (`echo_server`) is a bin of this package, so the server side is
+    # compiled too; the library does not use it.
+    "server",
+    "transport-io",
+    "transport-streamable-http-server",
+] }
+async-trait.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["net", "io-std"] }
+tokio-util.workspace = true
+futures.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+blake3.workspace = true
+libc.workspace = true
+url = { workspace = true, features = ["serde"] }
+toml_edit.workspace = true
+http.workspace = true
+# Fixture only: the HTTP server of `echo_server`.
+hyper = { workspace = true, features = ["server", "http1"] }
+hyper-util = { workspace = true, features = ["tokio"] }
+tower-service.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio.workspace = true
+toml.workspace = true
+
+# A test MCP server (stdio, streamable HTTP, and a hand-written legacy `initialize`-only
+# mode), so the client tests talk to a real `rmcp` server. The tests run it through
+# `CARGO_BIN_EXE_echo_server`; it is not shipped.
+[[bin]]
+name = "echo_server"
+path = "tests/fixtures/echo_server.rs"
+test = false
+doc = false
