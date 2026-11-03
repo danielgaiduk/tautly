@@ -15,7 +15,7 @@ pub enum Effect {
     Exec {
         argv: Vec<String>,
     },
-    /// Network egress to `host` (lowercase, no port).
+    /// Network egress to `host`: lowercase, no port, no trailing dot, no IPv6 brackets.
     Network {
         host: String,
     },

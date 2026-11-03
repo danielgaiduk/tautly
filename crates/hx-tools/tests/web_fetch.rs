@@ -171,7 +171,74 @@ fn web_fetch_effect_names_the_host() {
             host: "127.0.0.1".into()
         }
     );
+    // Canonical form: lowercase, no port, no trailing dot, no IPv6 brackets.
+    for (url, host) in [
+        ("http://evil.test./", "evil.test"),
+        ("http://x.evil.test../p", "x.evil.test"),
+        ("HTTP://EVIL.TEST.:8080/", "evil.test"),
+        ("http://localhost./", "localhost"),
+        ("http://[::1]/", "::1"),
+        ("http://[::1]:3000/x", "::1"),
+        ("http://[FE80::1]/", "fe80::1"),
+    ] {
+        assert_eq!(
+            e(url).unwrap(),
+            Effect::Network { host: host.into() },
+            "{url}"
+        );
+    }
     for bad in ["file:///etc/passwd", "not a url", "", "ftp://a.test/"] {
         assert!(e(bad).is_err(), "{bad}");
     }
+}
+
+#[tokio::test]
+async fn web_fetch_surfaces_redirects_without_following() {
+    let server = MockServer::start().await;
+    Mock::given(path("/old"))
+        .respond_with(ResponseTemplate::new(301).insert_header("location", "/new"))
+        .mount(&server)
+        .await;
+    Mock::given(path("/abs"))
+        .respond_with(
+            ResponseTemplate::new(302).insert_header("location", "http://169.254.169.254/meta"),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(path("/new"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw("moved", "text/plain"))
+        .mount(&server)
+        .await;
+    Mock::given(path("/nowhere"))
+        .respond_with(ResponseTemplate::new(302))
+        .mount(&server)
+        .await;
+
+    let r = fetch(json!({"url": format!("{}/old", server.uri())})).await;
+    assert!(!r.is_error, "{}", r.output);
+    assert_eq!(
+        r.output,
+        format!(
+            "redirected (301) to {}/new; call web_fetch with that URL to follow it",
+            server.uri()
+        )
+    );
+    let r = fetch(json!({"url": format!("{}/abs", server.uri())})).await;
+    assert!(!r.is_error);
+    assert_eq!(
+        r.output,
+        "redirected (302) to http://169.254.169.254/meta; call web_fetch with that URL to follow it"
+    );
+    // A redirect with no Location is just a failed fetch.
+    let r = fetch(json!({"url": format!("{}/nowhere", server.uri())})).await;
+    assert!(r.is_error);
+    // Nothing behind a redirect was requested.
+    let paths: Vec<String> = server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| r.url.path().to_string())
+        .collect();
+    assert!(!paths.contains(&"/new".to_string()), "{paths:?}");
 }

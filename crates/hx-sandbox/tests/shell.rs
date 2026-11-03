@@ -1040,3 +1040,27 @@ fn continuation_that_would_merge_two_operators_is_unparseable() {
         assert!(parse_commands(s).is_err(), "{s:?}");
     }
 }
+
+// --- bytes bash treats differently from the grammar: \r, \f, \v ---
+
+#[test]
+fn carriage_return_form_feed_and_vertical_tab_are_unparseable() {
+    for s in [
+        "ls \\\r\necho SECOND",
+        "ls\recho SECOND",
+        "ls\r\necho SECOND",
+        "ls\x0cecho SECOND",
+        "ls\x0becho SECOND",
+        "echo hi # c\rmment",
+        "echo \"a\rb\"",
+    ] {
+        assert!(parse_commands(s).is_err(), "{s:?}");
+    }
+}
+
+#[test]
+fn control_whitespace_inside_single_quotes_or_quoted_heredoc_still_parses() {
+    assert!(parse_commands("echo 'a\rb\x0c\x0b'").is_ok());
+    assert!(parse_commands("cat <<'EOF'\nfoo\r\nbar\x0c\nEOF\n").is_ok());
+    assert!(parse_commands("cat <<EOF\nfoo\r\nEOF\n").is_err());
+}

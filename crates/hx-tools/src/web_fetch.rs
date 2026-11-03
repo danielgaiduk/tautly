@@ -4,7 +4,8 @@
 use async_trait::async_trait;
 use htmd::HtmlToMarkdown;
 use hx_provider::{Capabilities, ToolSpec};
-use hx_sandbox::{Effect, HttpResponse, Sandbox, Url};
+use hx_sandbox::{Effect, Host, HttpResponse, Sandbox, Url};
+
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -97,6 +98,30 @@ fn parse_url(raw: &str) -> Result<Url, String> {
     }
 }
 
+/// The host as policy rules see it: lowercase, no port, no trailing dot, no IPv6
+/// brackets. `evil.test.` and `evil.test` are the same host to the network, so they
+/// must be the same host to a rule.
+fn canonical_host(url: &Url) -> Option<String> {
+    let host = match url.host()? {
+        Host::Domain(d) => d.to_ascii_lowercase().trim_end_matches('.').to_string(),
+        Host::Ipv4(ip) => ip.to_string(),
+        Host::Ipv6(ip) => ip.to_string(),
+    };
+    (!host.is_empty()).then_some(host)
+}
+
+/// A 3xx response with a usable `Location`, resolved against the request URL.
+fn redirect_target(url: &Url, resp: &HttpResponse) -> Option<Url> {
+    if !matches!(resp.status, 301 | 302 | 303 | 307 | 308) {
+        return None;
+    }
+    let (_, location) = resp
+        .headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("location"))?;
+    url.join(location.trim()).ok()
+}
+
 #[async_trait]
 impl Tool for WebFetchTool {
     fn name(&self) -> &'static str {
@@ -123,7 +148,8 @@ impl Tool for WebFetchTool {
     fn effect(&self, args: &Value) -> Result<Effect, ToolError> {
         let a: Args = parse_args(args)?;
         let url = parse_url(&a.url).map_err(ToolError::BadArgs)?;
-        let host = url.host_str().unwrap_or_default().to_string();
+        let host = canonical_host(&url)
+            .ok_or_else(|| ToolError::BadArgs(format!("invalid url `{}`: no host", a.url)))?;
         Ok(Effect::Network { host })
     }
 
@@ -143,6 +169,13 @@ impl Tool for WebFetchTool {
                 Err(e) => return ToolResult::error(format!("{url}: {e}")),
             },
         };
+        // Never followed here: every hop is its own call, so policy sees each host.
+        if let Some(target) = redirect_target(&url, &resp) {
+            return ToolResult::ok(format!(
+                "redirected ({}) to {target}; call web_fetch with that URL to follow it",
+                resp.status
+            ));
+        }
         if !(200..300).contains(&resp.status) {
             return ToolResult::error(format!("{url}: HTTP {}", resp.status));
         }

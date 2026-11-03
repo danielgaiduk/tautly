@@ -82,16 +82,26 @@ pub fn parse_commands(src: &str) -> Result<Vec<SimpleCommand>, Unparseable> {
 /// it is followed by whitespace (or the end of the input), when it follows
 /// unescaped space or tab, or when it follows a shell operator token (`|`, `&&`,
 /// `||`, `;`, `(`) and the next byte could not fuse with that operator.
+///
+/// Carriage return, form feed and vertical tab are refused on the same terms: the
+/// grammar treats them as whitespace (`\<CR><LF>` as a continuation) while bash makes
+/// them part of a word (or ends the command at `<CR><LF>`).
 fn reject_split_continuations(root: Node, src: &str) -> Result<(), Unparseable> {
     let bytes = src.as_bytes();
-    let mut hits = bytes
+    let hits: Vec<usize> = bytes
         .windows(3)
         .enumerate()
         .filter(|(_, w)| w[0] == b'\\' && w[1] == b'\n' && !w[2].is_ascii_whitespace())
         .map(|(i, _)| i)
         .filter(|&i| !separates_words(root, bytes, i))
-        .peekable();
-    if hits.peek().is_none() {
+        .collect();
+    let controls: Vec<usize> = bytes
+        .iter()
+        .enumerate()
+        .filter(|&(_, &b)| matches!(b, b'\r' | 0x0b | 0x0c))
+        .map(|(i, _)| i)
+        .collect();
+    if hits.is_empty() && controls.is_empty() {
         return Ok(());
     }
     // Byte ranges where a backslash-newline stays literal.
@@ -117,7 +127,13 @@ fn reject_split_continuations(root: Node, src: &str) -> Result<(), Unparseable> 
         }
         stack.extend(n.children(&mut n.walk()));
     }
-    if hits.any(|i| !literal.iter().any(|&(s, e)| s <= i && i < e)) {
+    let outside = |i: &usize| !literal.iter().any(|&(s, e)| s <= *i && *i < e);
+    if controls.iter().any(outside) {
+        return Err(Unparseable(
+            "carriage return, form feed or vertical tab changes how bash splits words".into(),
+        ));
+    }
+    if hits.iter().any(outside) {
         return Err(Unparseable("line continuation splits a word".into()));
     }
     Ok(())

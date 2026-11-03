@@ -864,3 +864,12 @@ fn network_deny_rule_beats_allow_and_yolo() {
         Decision::Deny { .. }
     ));
 }
+
+#[test]
+fn network_rules_match_ipv6_literal_hosts() {
+    let pol = with_rules(Mode::Yolo, &[], &["web_fetch(::1)"]);
+    assert!(matches!(
+        pol.decide("web_fetch", &net("::1"), None),
+        Decision::Deny { .. }
+    ));
+}

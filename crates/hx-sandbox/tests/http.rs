@@ -43,7 +43,7 @@ async fn http_get_enforces_body_cap() {
 }
 
 #[tokio::test]
-async fn http_get_limits_redirects() {
+async fn http_get_does_not_follow_redirects() {
     let server = MockServer::start().await;
     Mock::given(path("/loop"))
         .respond_with(ResponseTemplate::new(302).insert_header("location", "/loop"))
@@ -51,10 +51,12 @@ async fn http_get_limits_redirects() {
         .await;
     let (_t, sb) = sandbox();
     let url = Url::parse(&format!("{}/loop", server.uri())).unwrap();
-    assert!(matches!(
-        sb.http_get(&url).await,
-        Err(SandboxError::Network(_))
-    ));
-    let hits = server.received_requests().await.unwrap().len();
-    assert!(hits <= 6, "hits={hits}");
+    let r = sb.http_get(&url).await.unwrap();
+    assert_eq!(r.status, 302);
+    assert!(
+        r.headers
+            .iter()
+            .any(|(k, v)| k == "location" && v == "/loop")
+    );
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
 }

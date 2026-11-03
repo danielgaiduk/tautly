@@ -22,7 +22,7 @@ impl LocalSandbox {
     pub fn new(root: PathBuf) -> Result<Self, SandboxError> {
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(30))
-            .redirect(reqwest::redirect::Policy::limited(5))
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|e| SandboxError::Network(e.to_string()))?;
         Ok(Self {
