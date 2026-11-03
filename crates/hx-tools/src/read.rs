@@ -84,7 +84,9 @@ impl Tool for ReadTool {
             ));
         }
         let mut remaining = 0;
-        if a.end_line.is_none() && end + 1 > start + MAX_LINES {
+        // Line numbers come from the model and may be near usize::MAX.
+        if a.end_line.is_none() && end.saturating_add(1) > start.saturating_add(MAX_LINES) {
+            // No overflow: start + MAX_LINES < end + 1 <= total + 1 here.
             end = start + MAX_LINES - 1;
             remaining = total - end;
         }

@@ -329,3 +329,36 @@ async fn glob_star_does_not_cross_directories() {
     let r = run(&e, &GrepTool, json!({"pattern":"", "glob":"src/*.rs"})).await;
     assert!(!r.output.contains("src/a/b.rs"));
 }
+
+// ---- checkpoint fix: I3 model-supplied line numbers never overflow ----
+#[tokio::test]
+async fn huge_line_numbers_do_not_panic() {
+    let e = env(EditFormat::StrReplace);
+    put(&e, "f.txt", b"a\nb\n").await;
+    put(&e, "empty.txt", b"").await;
+    let max = u64::MAX;
+    for (path, args) in [
+        ("f.txt", json!({"start_line": max})),
+        ("f.txt", json!({"start_line": max, "end_line": max})),
+        ("f.txt", json!({"start_line": 1, "end_line": max})),
+        ("f.txt", json!({"start_line": max - 1})),
+        ("empty.txt", json!({"start_line": max})),
+        ("empty.txt", json!({"start_line": max - 2000})),
+    ] {
+        let mut args = args;
+        args["path"] = json!(path);
+        // Reaching here without a panic is the point; past-the-end ranges are errors.
+        let r = run(&e, &ReadTool, args.clone()).await;
+        if path == "f.txt" && args["start_line"] != json!(1) {
+            assert!(r.is_error, "{args}: {}", r.output);
+        }
+    }
+    let r = run(
+        &e,
+        &ReadTool,
+        json!({"path": "f.txt", "start_line": 1, "end_line": max}),
+    )
+    .await;
+    assert!(!r.is_error, "{}", r.output);
+    assert_eq!(r.output, "1\ta\n2\tb");
+}
