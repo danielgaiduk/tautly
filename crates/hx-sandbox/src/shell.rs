@@ -58,6 +58,7 @@ pub fn parse_commands(src: &str) -> Result<Vec<SimpleCommand>, Unparseable> {
     if root.has_error() {
         return Err(Unparseable(describe_error(root, src)));
     }
+    reject_split_continuations(root, src)?;
     let mut out = Vec::new();
     walk(root, src.as_bytes(), &mut out, &mut Cwd::default(), 0)?;
     if out.is_empty() && !src.trim().is_empty() {
@@ -71,6 +72,52 @@ pub fn parse_commands(src: &str) -> Result<Vec<SimpleCommand>, Unparseable> {
         }
     }
     Ok(out)
+}
+
+/// Bash deletes a backslash-newline pair before tokenizing, so `.g\<nl>it` is the
+/// word `.git`; the grammar keeps the pieces apart and every later check would
+/// judge the wrong words. Such a pair is refused wherever bash would join it: the
+/// only literal places are single-quoted strings and bodies of heredocs whose
+/// delimiter is quoted. A continuation followed by whitespace (or the end of the
+/// input) cannot change any word and stays fine.
+fn reject_split_continuations(root: Node, src: &str) -> Result<(), Unparseable> {
+    let bytes = src.as_bytes();
+    let mut hits = bytes
+        .windows(3)
+        .enumerate()
+        .filter(|(_, w)| w[0] == b'\\' && w[1] == b'\n' && !w[2].is_ascii_whitespace())
+        .map(|(i, _)| i)
+        .peekable();
+    if hits.peek().is_none() {
+        return Ok(());
+    }
+    // Byte ranges where a backslash-newline stays literal.
+    let mut literal: Vec<(usize, usize)> = Vec::new();
+    let mut stack = vec![root];
+    while let Some(n) = stack.pop() {
+        match n.kind() {
+            "raw_string" => literal.push((n.start_byte(), n.end_byte())),
+            "heredoc_redirect" => {
+                let quoted = n
+                    .named_children(&mut n.walk())
+                    .find(|c| c.kind() == "heredoc_start")
+                    .is_some_and(|c| text(c, bytes).contains(['\'', '"', '\\']));
+                if quoted {
+                    literal.extend(
+                        n.named_children(&mut n.walk())
+                            .filter(|c| c.kind() == "heredoc_body")
+                            .map(|c| (c.start_byte(), c.end_byte())),
+                    );
+                }
+            }
+            _ => {}
+        }
+        stack.extend(n.children(&mut n.walk()));
+    }
+    if hits.any(|i| !literal.iter().any(|&(s, e)| s <= i && i < e)) {
+        return Err(Unparseable("line continuation splits a word".into()));
+    }
+    Ok(())
 }
 
 /// Locate the first error or missing node without recursion (the tree may be

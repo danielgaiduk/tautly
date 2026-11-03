@@ -899,12 +899,12 @@ fn line_continuation_inside_a_word_is_unparseable() {
         "c\\\nd .git && echo pwn > hooks/pre-commit",
         "ec\\\nho x",
         "cat .g\\\nit/config",
+        "echo a \\\nb",
+        "echo \"a\\\nb\"",
     ] {
         assert!(parse_commands(s).is_err(), "{s:?}");
     }
-    for s in ["cargo test \\\n  --all", "echo a \\\nb", "echo \"a\\\nb\""] {
-        assert!(parse_commands(s).is_ok(), "{s:?}");
-    }
+    assert!(parse_commands("cargo test \\\n  --all").is_ok());
 }
 
 #[test]
@@ -939,4 +939,63 @@ fn printf_nonstandard_length_modifiers_are_numeric() {
     for s in ["printf '%Zd' \"$x\"", "printf '%Id' \"$x\""] {
         assert!(parse_commands(s).is_err(), "{s}");
     }
+}
+
+// --- line continuations that split a word (bash joins them, tree-sitter does not) ---
+
+fn assert_split(src: &str) {
+    let err = parse_commands(src).expect_err(&format!("must be unparseable: {src:?}"));
+    assert!(
+        err.0.contains("line continuation splits a word"),
+        "wrong reason for {src:?}: {err}"
+    );
+}
+
+#[test]
+fn continuation_splitting_a_redirect_target_is_unparseable() {
+    assert_split("echo pwn > .g\\\nit/hooks/pre-commit");
+    assert_split("echo pwn >> .g\\\nit/hooks/pre-commit");
+    assert_split("echo pwn 2> .g\\\nit/hooks/pre-commit");
+    assert_split("echo pwn &> .g\\\nit/hooks/pre-commit");
+    assert_split("{ echo pwn; } > .g\\\nit/hooks/pre-commit");
+}
+
+#[test]
+fn continuation_splitting_an_exported_name_or_value_is_unparseable() {
+    assert_split("export CDP\\\nATH=.g\\\nit; cd hooks && echo pwn > pre-commit");
+    assert_split("declare CDP\\\nATH=x; cd y");
+    assert_split("readonly CDP\\\nATH=x; cd y");
+    assert_split("export L\\\nD_PRELOAD=x; cargo test");
+}
+
+#[test]
+fn continuation_before_whitespace_still_parses() {
+    let c = parse_commands("cargo test \\\n  --workspace").unwrap();
+    assert_eq!(c[0].argv, ["cargo", "test", "--workspace"]);
+    let c = parse_commands("docker run \\\n  -it x").unwrap();
+    assert_eq!(c[0].argv, ["docker", "run", "-it", "x"]);
+    assert!(parse_commands("cargo test \\\n\tfoo").is_ok());
+}
+
+#[test]
+fn continuation_inside_single_quotes_still_parses() {
+    let c = parse_commands("echo 'a\\\nb'").unwrap();
+    assert_eq!(argv0s(&c), ["echo"]);
+}
+
+#[test]
+fn continuation_inside_quoted_heredoc_body_still_parses() {
+    let c = parse_commands("cat <<'EOF'\nfoo \\\nx\nEOF\n").unwrap();
+    assert_eq!(argv0s(&c), ["cat"]);
+}
+
+#[test]
+fn continuation_in_double_quotes_or_unquoted_heredoc_is_unparseable() {
+    assert_split("echo \"a\\\nb\"");
+    assert_split("cat <<EOF\nfoo \\\nx\nEOF\n");
+}
+
+#[test]
+fn apostrophe_in_comment_does_not_hide_a_later_continuation() {
+    assert_split("echo hi # it's\necho pwn > .g\\\nit/hooks/pre-commit");
 }
