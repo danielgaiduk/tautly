@@ -1,0 +1,39 @@
+warning: unused variable: `x`
+ --> src/lib.rs:2:9
+  |
+2 |     let x = 1;
+  |         ^ help: prefix with underscore: `_x`
+  |
+  = note: `#[warn(unused_variables)]` on by default
+
+running 1 test
+test tests::it_works ... FAILED
+
+failures:
+
+---- tests::it_works stdout ----
+thread 'tests::it_works' panicked at src/lib.rs:9:5:
+boom
+
+failures:
+    tests::it_works
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `--lib`
+
+running 1 test
+test tests::it_works ... FAILED
+
+failures:
+
+---- tests::it_works stdout ----
+thread 'tests::it_works' panicked at tests/b.rs:4:5:
+other failure
+
+failures:
+    tests::it_works
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `--test b`

@@ -11,8 +11,8 @@ pub(super) fn parse(output: &str) -> Option<Summary> {
     let mut passed: u32 = 0;
     let mut package_lines = 0;
     let mut build_errors: Vec<Item> = Vec::new();
-    let mut panic_item: Option<Item> = None;
-    let mut panic_detail: Vec<String> = Vec::new();
+    // Every panic, with the lines that follow it (goroutine traces).
+    let mut panics: Vec<(String, Vec<String>)> = Vec::new();
     // The test whose log lines are being read; `None` outside of tests.
     let mut current: Option<String> = None;
     let mut in_panic = false;
@@ -38,9 +38,7 @@ pub(super) fn parse(output: &str) -> Option<Summary> {
             current = Some(c[2].to_string());
             in_panic = false;
         } else if let Some(c) = re!(r"^panic: (.*?)(?: \[recovered\])?$").captures(line) {
-            if panic_item.is_none() {
-                panic_item = Some(Item::new("panic", None, &c[1], Vec::<String>::new()));
-            }
+            panics.push((c[1].to_string(), Vec::new()));
             current = None;
             in_panic = true;
         } else if let Some(c) = re!(r"^(\S+\.go):(\d+):(\d+): (.*)$").captures(line) {
@@ -58,7 +56,7 @@ pub(super) fn parse(output: &str) -> Option<Summary> {
             if line.starts_with("exit status") {
                 continue;
             }
-            let known = failed_names.len() + build_errors.len() + usize::from(panic_item.is_some());
+            let known = failed_names.len() + build_errors.len() + panics.len();
             if let Some(c) = re!(r"^FAIL\s+(\S+)").captures(line)
                 && known == known_at_last_pkg
             {
@@ -74,15 +72,15 @@ pub(super) fn parse(output: &str) -> Option<Summary> {
                 stray.clear();
             }
         } else if line.starts_with([' ', '\t']) && !line.trim().is_empty() {
-            if in_panic {
-                panic_detail.push(line.trim_start().to_string());
+            if in_panic && let Some((_, detail)) = panics.last_mut() {
+                detail.push(line.trim_start().to_string());
             } else if let Some(t) = &current {
                 logs.entry(t.clone())
                     .or_default()
                     .push(line.trim_start().to_string());
             }
-        } else if in_panic {
-            panic_detail.push(line.to_string());
+        } else if in_panic && let Some((_, detail)) = panics.last_mut() {
+            detail.push(line.to_string());
         } else {
             current = None;
             stray.push(line.to_string());
@@ -103,10 +101,9 @@ pub(super) fn parse(output: &str) -> Option<Summary> {
     let mut errors = (build_errors.len() + package_errors.len()) as u32;
     items.extend(build_errors);
     items.extend(package_errors);
-    if let Some(mut p) = panic_item {
-        p.detail = Item::new("", None, "", panic_detail).detail;
+    for (message, detail) in panics {
         errors += 1;
-        items.push(p);
+        items.push(Item::new("panic", None, message, detail));
     }
 
     if items.is_empty() && package_lines == 0 {

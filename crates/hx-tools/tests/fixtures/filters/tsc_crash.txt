@@ -1,0 +1,11 @@
+src/a.ts(3,5): error TS2322: Type 'string' is not assignable to type 'number'.
+src/b.ts(9,1): error TS2304: Cannot find name 'foo'.
+/usr/lib/node_modules/typescript/lib/tsc.js:112345
+        throw e;
+        ^
+
+Error: Debug Failure. False expression: Expected node to be ...
+    at Object.assert (/usr/lib/node_modules/typescript/lib/tsc.js:1500:19)
+    at checkSourceFile (/usr/lib/node_modules/typescript/lib/tsc.js:80000:3)
+
+Node.js v20.11.0

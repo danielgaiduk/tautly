@@ -1,0 +1,14 @@
+=== RUN   TestA
+panic: runtime error: index out of range [3] with length 3
+
+goroutine 7 [running]:
+testing.tRunner.func1.2({0x1, 0x2})
+	/usr/lib/go/src/testing/testing.go:1545 +0x238
+FAIL	example.com/a	0.010s
+=== RUN   TestB
+panic: nil map assignment [recovered]
+
+goroutine 9 [running]:
+	/usr/lib/go/src/testing/testing.go:1545 +0x238
+FAIL	example.com/b	0.011s
+FAIL

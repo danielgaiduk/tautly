@@ -1,11 +1,15 @@
 // Tests write a fake tool's output to a temp dir; the lint targets src.
 #![allow(clippy::disallowed_methods, clippy::disallowed_types)]
 
-use std::path::Path;
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 
 use hx_provider::EditFormat;
 use hx_sandbox::{LocalSandbox, parse_commands};
-use hx_tools::filters::{FilterKind, Item, Summary, apply, detect};
+use hx_tools::filters::{
+    FilterKind, Item, Summary, apply, detect, detect_command, has_unparsed_crash,
+};
 use hx_tools::{BashTool, Tool, ToolCx, ToolResult};
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -464,8 +468,30 @@ fn render_includes_spill_path_and_counts() {
 
 // ---- bash integration --------------------------------------------------------
 
-/// Run `command` in a fresh sandbox whose root holds `out.txt` with `content`. The
-/// tool under test is a shell function that prints it, so no toolchain is needed.
+/// Fake tools: scripts that print `out.txt` from the working directory, then sleep for
+/// `$SLEEP` seconds if set and exit with `$EXIT` (default 0). Written once, before any
+/// test runs a command, so a script is never executed while another is being written.
+static FAKE_TOOLS: LazyLock<PathBuf> = LazyLock::new(|| {
+    let dir = std::env::temp_dir().join(format!("hx-filter-fakes-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    for tool in ["cargo", "pytest", "ruff"] {
+        let path = dir.join(tool);
+        std::fs::write(
+            &path,
+            "#!/bin/sh\ncat out.txt\n[ -n \"$SLEEP\" ] && sleep \"$SLEEP\"\nexit \"${EXIT:-0}\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    dir
+});
+
+/// A command line running fake `tool` with `args`, after the `env` assignments.
+fn fake(env: &str, tool: &str, args: &str) -> String {
+    format!("{env} '{}' {args}", FAKE_TOOLS.join(tool).display())
+}
+
+/// Run `command` in a fresh sandbox whose root holds `out.txt` with `content`.
 async fn run(content: &str, command: &str, raw: Option<bool>) -> (TempDir, ToolResult) {
     let dir = TempDir::new().unwrap();
     std::fs::write(dir.path().join("out.txt"), content).unwrap();
@@ -490,12 +516,7 @@ fn spill_path(output: &str) -> &str {
 
 #[tokio::test]
 async fn large_output_is_summarized_with_spill() {
-    let (dir, r) = run(
-        CARGO_TEST_FAIL,
-        "cargo() { cat out.txt; }; cargo test",
-        None,
-    )
-    .await;
+    let (dir, r) = run(CARGO_TEST_FAIL, &fake("", "cargo", "test"), None).await;
     assert!(!r.is_error, "{}", r.output);
     assert!(
         r.output
@@ -521,7 +542,7 @@ async fn large_output_is_summarized_with_spill() {
 async fn output_under_2kb_not_filtered() {
     let small = "running 1 test\ntest a::t ... FAILED\n\nfailures:\n\n---- a::t stdout ----\nthread 'a::t' panicked at src/lib.rs:3:5:\nboom\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n";
     assert!(small.len() < 2048);
-    let (_dir, r) = run(small, "cargo() { cat out.txt; }; cargo test", None).await;
+    let (_dir, r) = run(small, &fake("", "cargo", "test"), None).await;
     assert!(r.output.starts_with(small), "{}", r.output);
     assert!(!r.output.contains("summary:"), "{}", r.output);
     assert!(!r.output.contains("[full output saved"), "{}", r.output);
@@ -530,7 +551,7 @@ async fn output_under_2kb_not_filtered() {
 #[tokio::test]
 async fn unparseable_output_falls_back_to_head_tail_cap() {
     let junk = "noise noise noise noise\n".repeat(3000);
-    let (dir, r) = run(&junk, "pytest() { cat out.txt; }; pytest -q", None).await;
+    let (dir, r) = run(&junk, &fake("", "pytest", "-q"), None).await;
     assert!(!r.output.contains("summary:"), "{}", &r.output[..200]);
     assert!(r.output.contains("bytes omitted"), "{}", &r.output[..200]);
     let spilled = std::fs::read_to_string(dir.path().join(spill_path(&r.output))).unwrap();
@@ -540,22 +561,17 @@ async fn unparseable_output_falls_back_to_head_tail_cap() {
 
 #[tokio::test]
 async fn raw_true_disables_filtering() {
-    let cmd = "cargo() { cat out.txt; }; cargo test";
-    let (_dir, r) = run(CARGO_TEST_FAIL, cmd, Some(true)).await;
+    let cmd = fake("", "cargo", "test");
+    let (_dir, r) = run(CARGO_TEST_FAIL, &cmd, Some(true)).await;
     assert!(!r.output.contains("summary:"), "{}", r.output);
     assert!(r.output.starts_with(CARGO_TEST_FAIL), "{}", r.output);
-    let (_dir, r) = run(CARGO_TEST_FAIL, cmd, Some(false)).await;
+    let (_dir, r) = run(CARGO_TEST_FAIL, &cmd, Some(false)).await;
     assert!(r.output.starts_with("cargo summary:"), "{}", r.output);
 }
 
 #[tokio::test]
 async fn piped_output_is_not_filtered() {
-    let (_dir, r) = run(
-        CARGO_TEST_FAIL,
-        "cargo() { cat out.txt; }; cargo test 2>&1 | cat",
-        None,
-    )
-    .await;
+    let (_dir, r) = run(CARGO_TEST_FAIL, &fake("", "cargo", "test 2>&1 | cat"), None).await;
     assert!(r.output.starts_with(CARGO_TEST_FAIL), "{}", r.output);
 }
 
@@ -632,26 +648,26 @@ fn fewer_items_than_reported_failures_gives_no_summary() {
 #[tokio::test]
 async fn failed_command_with_clean_summary_keeps_plain_output() {
     // Only warnings parsed, but the command failed: something the parser missed.
-    let cmd = "cargo() { cat out.txt; return 101; }; cargo clippy";
-    let (_dir, r) = run(CLIPPY_WARN, cmd, None).await;
+    let cmd = fake("EXIT=101", "cargo", "clippy");
+    let (_dir, r) = run(CLIPPY_WARN, &cmd, None).await;
     assert!(r.is_error);
     assert!(r.output.starts_with(CLIPPY_WARN), "{}", r.output);
     assert!(!r.output.contains("summary:"), "{}", r.output);
     // The same output from a successful command is summarized.
-    let (_dir, r) = run(CLIPPY_WARN, "cargo() { cat out.txt; }; cargo clippy", None).await;
+    let (_dir, r) = run(CLIPPY_WARN, &fake("", "cargo", "clippy"), None).await;
     assert!(
         r.output
             .starts_with("cargo summary: 0 failed, 0 errors, 4 warnings")
     );
     // A failed command whose summary shows the failure is still summarized.
-    let cmd = "cargo() { cat out.txt; return 101; }; cargo test";
-    let (_dir, r) = run(CARGO_TEST_FAIL, cmd, None).await;
+    let cmd = fake("EXIT=101", "cargo", "test");
+    let (_dir, r) = run(CARGO_TEST_FAIL, &cmd, None).await;
     assert!(r.output.starts_with("cargo summary:"), "{}", r.output);
 }
 
 #[tokio::test]
 async fn timed_out_command_is_not_filtered() {
-    let cmd = "cargo() { cat out.txt; sleep 30; }; cargo test";
+    let cmd = fake("SLEEP=30", "cargo", "test");
     let dir = TempDir::new().unwrap();
     std::fs::write(dir.path().join("out.txt"), CARGO_TEST_FAIL).unwrap();
     let sb = LocalSandbox::new(dir.path().to_path_buf()).unwrap();
@@ -663,4 +679,144 @@ async fn timed_out_command_is_not_filtered() {
     assert!(!r.output.contains("summary:"), "{}", r.output);
     assert!(r.output.contains("rust_begin_unwind"), "{}", r.output);
     assert!(r.output.contains("timed out"), "{}", r.output);
+}
+
+// ---- fix round 2 ---------------------------------------------------------------
+
+const CARGO_QUIET_WARN: &str = include_str!("fixtures/filters/cargo_quiet_warn.txt");
+const CARGO_DUP: &str = include_str!("fixtures/filters/cargo_dup.txt");
+const TSC_CRASH: &str = include_str!("fixtures/filters/tsc_crash.txt");
+const GO_TWO_PANICS: &str = include_str!("fixtures/filters/go_two_panics.txt");
+const PYTEST_INTERNAL: &str = include_str!("fixtures/filters/pytest_internal.txt");
+
+#[test]
+fn cargo_quiet_mode_recovers_failures_from_blocks() {
+    let s = apply(FilterKind::Cargo, CARGO_QUIET_WARN).expect("parsed");
+    assert_eq!(counts(&s), (Some(1), 1, 0, 1), "{s:?}");
+    assert_eq!(first(&s).name, "b");
+    assert_eq!(first(&s).location.as_deref(), Some("src/lib.rs:9:5"));
+    assert_eq!(first(&s).message, "boom");
+    assert_eq!(s.items[1].name, "unused_variables");
+}
+
+#[test]
+fn cargo_same_test_name_in_two_binaries_gives_two_items() {
+    let s = apply(FilterKind::Cargo, CARGO_DUP).expect("parsed");
+    assert_eq!(counts(&s), (Some(0), 2, 0, 1), "{s:?}");
+    assert_eq!(s.items.len(), 3);
+    assert_eq!(s.items[0].location.as_deref(), Some("src/lib.rs:9:5"));
+    assert_eq!(s.items[1].location.as_deref(), Some("tests/b.rs:4:5"));
+    assert_eq!(s.items[1].message, "other failure");
+}
+
+#[test]
+fn warnings_do_not_stand_in_for_missing_failures() {
+    // One failure counted, none recoverable: only the warning item exists.
+    let out = "warning: unused variable: `x`\n --> src/lib.rs:2:9\n  |\n2 |     let x = 1;\n  |         ^ help: prefix\n  |\n  = note: `#[warn(unused_variables)]` on by default\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n";
+    assert_eq!(apply(FilterKind::Cargo, out), None);
+    // The same holds for linters: every counted problem needs an item.
+    let eslint = "/w/a.js\n  1:1  error  Unexpected console statement  no-console\n\n\u{2716} 3 problems (2 errors, 1 warning)\n";
+    assert_eq!(apply(FilterKind::Eslint, eslint), None);
+}
+
+#[test]
+fn go_each_panic_is_its_own_item() {
+    let s = apply(FilterKind::GoTest, GO_TWO_PANICS).expect("parsed");
+    assert_eq!(counts(&s), (None, 0, 2, 0), "{s:?}");
+    assert_eq!(
+        first(&s).message,
+        "runtime error: index out of range [3] with length 3"
+    );
+    assert_eq!(s.items[1].message, "nil map assignment");
+}
+
+#[test]
+fn detect_requires_harmless_prefixes_around_other_separators() {
+    use FilterKind::*;
+    let cases: &[(&str, Option<FilterKind>)] = &[
+        ("ruff check .; pytest", None),
+        ("lint || echo; pytest", None),
+        ("go vet ./...; go test ./...", None),
+        ("cargo fmt --check; cargo clippy", None),
+        ("make build\npytest", None),
+        ("ruff check . & pytest", None),
+        ("cd web; npx jest", Some(Jest)),
+        ("export CI=1; pytest", Some(Pytest)),
+        ("cargo test; cargo clippy", Some(Cargo)),
+        ("cargo test && cargo clippy", Some(Cargo)),
+    ];
+    for (cmd, want) in cases {
+        assert_eq!(kind(cmd), *want, "{cmd}");
+    }
+}
+
+#[test]
+fn detect_command_allows_any_prefix_only_with_and_chains() {
+    use FilterKind::*;
+    let cases: &[(&str, Option<FilterKind>)] = &[
+        ("cargo fmt --check && cargo clippy", Some(Cargo)),
+        ("ruff check . && pytest", Some(Pytest)),
+        ("cd web && npx jest", Some(Jest)),
+        ("pytest 2>&1", Some(Pytest)),
+        ("echo 'a;b' && pytest", Some(Pytest)),
+        ("cargo test -- --nocapture 2>&1", Some(Cargo)),
+        ("ruff check .; pytest", None),
+        ("ruff check . || pytest", None),
+        ("ruff check . | pytest", None),
+        ("ruff check . & pytest", None),
+        ("make lint\npytest", None),
+        ("(ruff check .) && pytest", None),
+        ("cargo test && pytest", None),
+        ("cargo test 2>&1 | tail", None),
+        ("cd web; npx jest", Some(Jest)),
+        ("cargo test", Some(Cargo)),
+    ];
+    for (cmd, want) in cases {
+        assert_eq!(detect_command(cmd), *want, "{cmd}");
+    }
+}
+
+#[test]
+fn crash_markers_outside_items_are_found() {
+    let s = apply(FilterKind::Tsc, TSC_CRASH).expect("parsed");
+    assert_eq!(s.errors, 2);
+    assert!(has_unparsed_crash(TSC_CRASH, &s));
+    let s = apply(FilterKind::Pytest, PYTEST_INTERNAL).expect("parsed");
+    assert!(has_unparsed_crash(PYTEST_INTERNAL, &s));
+    // A parsed go panic is an item, not a hidden crash.
+    let s = apply(FilterKind::GoTest, GO_TWO_PANICS).unwrap();
+    assert!(!has_unparsed_crash(GO_TWO_PANICS, &s));
+    // A traceback that is part of a failure's own detail is not hidden either.
+    let s = apply(FilterKind::Pytest, PYTEST_FAIL).unwrap();
+    assert!(!has_unparsed_crash(PYTEST_FAIL, &s));
+}
+
+#[tokio::test]
+async fn crash_after_parsed_failures_keeps_plain_output_on_nonzero_exit() {
+    // pytest's INTERNALERROR output (an exit code 3 crash) through the fake pytest.
+    let padded = format!("{PYTEST_INTERNAL}{}", "   \n".repeat(600));
+    let (_d, r) = run(&padded, &fake("EXIT=3", "pytest", "-q"), None).await;
+    assert!(r.output.contains("INTERNALERROR> KeyError"), "{}", r.output);
+    assert!(!r.output.contains("summary:"), "{}", r.output);
+    // Same output with a zero exit (contrived) is summarized: the check is for failures.
+    let (_d, r) = run(&padded, &fake("", "pytest", "-q"), None).await;
+    assert!(r.output.starts_with("pytest summary:"), "{}", r.output);
+}
+
+#[tokio::test]
+async fn failing_unrecognized_command_before_the_tool_is_not_hidden() {
+    let cmd = format!(
+        "{}; {}",
+        fake("EXIT=1", "ruff", "check ."),
+        fake("", "pytest", "")
+    );
+    let (_d, r) = run(PYTEST_FAIL, &cmd, None).await;
+    assert!(!r.output.contains("summary:"), "{}", r.output);
+    let cmd = format!(
+        "{} && {}",
+        fake("", "ruff", "check ."),
+        fake("", "pytest", "")
+    );
+    let (_d, r) = run(PYTEST_FAIL, &cmd, None).await;
+    assert!(r.output.contains("pytest summary:"), "{}", r.output);
 }

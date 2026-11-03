@@ -19,3 +19,10 @@ If a real tool's format drifts, replace a fixture with a captured run and adjust
 the expectations in `tests/filters.rs`; the parsers key on stable markers
 (`--> file:line`, `FAILED path::name`, `--- FAIL:`, `file(line,col): error TS`,
 stylish blocks, `●` blocks) rather than on exact spacing.
+
+Small review probes (hand-written, below the 2 KB filter threshold; they are
+passed to `apply` directly): `cargo_quiet_warn.txt` (`cargo test -q`, one warning and
+one failing test with no `... FAILED` line), `cargo_dup.txt` (same test name failing
+in two test binaries), `tsc_crash.txt` (tsc errors followed by a compiler crash),
+`go_two_panics.txt` (two packages each panicking), `pytest_internal.txt` (pytest
+`INTERNALERROR`).

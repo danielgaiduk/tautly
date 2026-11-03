@@ -1,0 +1,27 @@
+warning: unused variable: `x`
+ --> src/lib.rs:2:9
+  |
+2 |     let x = 1;
+  |         ^ help: if this is intentional, prefix it with an underscore: `_x`
+  |
+  = note: `#[warn(unused_variables)]` on by default
+
+warning: `demo` (lib test) generated 1 warning
+
+running 2 tests
+.F
+
+failures:
+
+---- b stdout ----
+thread 'b' panicked at src/lib.rs:9:5:
+boom
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    b
+
+test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `--lib`

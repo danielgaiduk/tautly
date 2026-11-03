@@ -139,46 +139,79 @@ fn body<'a>(lines: &[&'a str]) -> Vec<&'a str> {
         .collect()
 }
 
+/// Failures of one test binary: names in order of appearance (from `... FAILED`
+/// lines, the `failures:` list and `---- name stdout ----` blocks, which are all
+/// there is in `-q` mode) and each name's block. The same test can fail in several
+/// binaries, so segments are kept apart.
+#[derive(Default)]
+struct Segment<'a> {
+    names: Vec<&'a str>,
+    blocks: HashMap<&'a str, Vec<&'a str>>,
+}
+
+impl<'a> Segment<'a> {
+    fn add(&mut self, name: &'a str) {
+        if !self.names.contains(&name) {
+            self.names.push(name);
+        }
+    }
+
+    fn items(&self) -> impl Iterator<Item = Item> + '_ {
+        self.names
+            .iter()
+            .map(|n| failure_item(n, self.blocks.get(n).map_or(&[][..], Vec::as_slice)))
+    }
+}
+
 pub(super) fn parse(output: &str) -> Option<Summary> {
     let lines: Vec<&str> = output.lines().collect();
     let d = diagnostics(&lines);
 
-    // Failure blocks, keyed by test name.
-    let mut blocks: HashMap<&str, Vec<&str>> = HashMap::new();
-    let mut current: Option<&str> = None;
-    for line in &lines {
-        if let Some(c) = re!(r"^---- (.+) stdout ----$").captures(line) {
-            let name = c.get(1).map_or("", |m| m.as_str());
-            current = Some(name);
-            blocks.entry(name).or_default();
-        } else if line.trim_end() == "failures:" {
-            current = None;
-        } else if let Some(name) = current {
-            blocks.entry(name).or_default().push(line);
-        }
-    }
-
-    let mut failed_names: Vec<&str> = Vec::new();
+    let mut failures: Vec<Item> = Vec::new();
+    let mut seg = Segment::default();
+    let mut block: Option<&str> = None;
+    let mut in_list = false;
     let mut result_lines = 0;
     let (mut passed, mut failed) = (0, 0);
     for line in &lines {
-        if let Some(c) = re!(r"^test (.+) \.\.\. FAILED$").captures(line) {
+        if re!(r"^\s+(?:Running|Doc-tests) ").is_match(line) {
+            // A binary that crashed has no result line; its failures end here.
+            failures.extend(seg.items());
+            seg = Segment::default();
+            block = None;
+            in_list = false;
+        } else if let Some(c) = re!(r"^---- (.+) stdout ----$").captures(line) {
             let name = c.get(1).map_or("", |m| m.as_str());
-            if !failed_names.contains(&name) {
-                failed_names.push(name);
-            }
+            seg.add(name);
+            seg.blocks.entry(name).or_default();
+            block = Some(name);
+            in_list = false;
+        } else if line.trim_end() == "failures:" {
+            block = None;
+            in_list = true;
+        } else if let Some(c) = re!(r"^test (.+) \.\.\. FAILED$").captures(line) {
+            seg.add(c.get(1).map_or("", |m| m.as_str()));
         } else if let Some(c) =
             re!(r"^test result: (?:ok|FAILED)\. (\d+) passed; (\d+) failed;").captures(line)
         {
             result_lines += 1;
             passed += num(&c[1]);
             failed += num(&c[2]);
+            failures.extend(seg.items());
+            seg = Segment::default();
+            block = None;
+            in_list = false;
+        } else if in_list {
+            if line.trim().is_empty() {
+                in_list = false;
+            } else if line.starts_with("    ") {
+                seg.add(line.trim());
+            }
+        } else if let Some(name) = block {
+            seg.blocks.entry(name).or_default().push(line);
         }
     }
-    let failures: Vec<Item> = failed_names
-        .iter()
-        .map(|n| failure_item(n, blocks.get(n).map_or(&[][..], Vec::as_slice)))
-        .collect();
+    failures.extend(seg.items());
 
     if d.errors.is_empty() && d.warnings.is_empty() && failures.is_empty() && result_lines == 0 {
         return None;

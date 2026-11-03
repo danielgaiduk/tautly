@@ -84,7 +84,8 @@ pub async fn cap_output(full: &str, cap: usize, sb: &dyn Sandbox) -> (String, Op
 /// the summary. `None` (use the plain cap) when any of that does not hold, when the
 /// run was cut short (`exit_code` is `None`: killed, timed out or cancelled, so the
 /// output is partial), or when the command failed but the summary shows no failure
-/// or error (the parser missed what went wrong).
+/// or error, or the output holds a crash the summary leaves out (the parser missed
+/// what went wrong).
 async fn filtered_output(
     command: &str,
     full: &str,
@@ -95,9 +96,10 @@ async fn filtered_output(
     if full.len() <= FILTER_THRESHOLD {
         return None;
     }
-    let cmds = parse_commands(command).ok()?;
-    let summary = filters::apply(filters::detect(&cmds)?, full)?;
-    if code != 0 && summary.failed + summary.errors == 0 {
+    let summary = filters::apply(filters::detect_command(command)?, full)?;
+    if code != 0
+        && (summary.failed + summary.errors == 0 || filters::has_unparsed_crash(full, &summary))
+    {
         return None;
     }
     let spill = sb.spill(full.as_bytes()).await.ok()?;
