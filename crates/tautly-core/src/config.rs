@@ -1,6 +1,11 @@
 //! Layered configuration: built-in defaults, then the user file
 //! (`<config home>/config.toml`), then the project file (`<root>/.tautly/config.toml`),
 //! then command-line overrides. Tables merge key by key, arrays and scalars replace.
+//!
+//! The project file is repository content, so it is untrusted: it cannot set `providers`,
+//! `telemetry`, `approve_memory`, `catalog_overrides` or `routing`, and in `permissions` it
+//! can only lower the mode and add `deny` rules. Dropped settings come back as
+//! [`LoadedConfig::warnings`]. Command-line flags are the user's own and override all.
 
 use std::collections::HashSet;
 use std::ffi::OsString;
@@ -251,10 +256,19 @@ pub fn config_home_from(get: impl Fn(&str) -> Option<OsString>) -> PathBuf {
         .join("tautly")
 }
 
+/// A loaded [`Config`] and what loading ignored.
+#[derive(Debug, Clone)]
+pub struct LoadedConfig {
+    pub config: Config,
+    /// One line per setting the project file was not allowed to make, for the engine to
+    /// report as `Event::Warning`.
+    pub warnings: Vec<String>,
+}
+
 impl Config {
     /// Defaults, then `<config home>/config.toml`, then `<root>/.tautly/config.toml`, then
     /// `cli`. A missing file is skipped.
-    pub fn load(root: &Path, cli: CliOverrides) -> Result<Config, ConfigError> {
+    pub fn load(root: &Path, cli: CliOverrides) -> Result<LoadedConfig, ConfigError> {
         Config::load_from(Some(&config_home().join("config.toml")), root, cli)
     }
 
@@ -267,16 +281,18 @@ impl Config {
         user_file: Option<&Path>,
         root: &Path,
         cli: CliOverrides,
-    ) -> Result<Config, ConfigError> {
+    ) -> Result<LoadedConfig, ConfigError> {
+        let mut warnings = Vec::new();
         let project_file = root.join(".tautly").join("config.toml");
+        // The user file is the user's own; the project file is repository content.
         let layers = [
-            user_file.map(|p| (p.to_path_buf(), true)),
-            Some((project_file, false)),
+            user_file.map(|p| (p.to_path_buf(), Trust::User)),
+            Some((project_file, Trust::Project)),
         ];
 
         let mut merged = Table::new();
-        for (path, follow_symlinks) in layers.into_iter().flatten() {
-            let Some(layer) = read_layer(&path, follow_symlinks)? else {
+        for (path, trust) in layers.into_iter().flatten() {
+            let Some(mut layer) = read_layer(&path, trust == Trust::User)? else {
                 continue;
             };
             // Check the layer alone so a bad value names the file it came from.
@@ -287,6 +303,9 @@ impl Config {
                     message: e.to_string(),
                 })
                 .and_then(|cfg| cfg.check(Some(&path)))?;
+            if trust == Trust::Project {
+                restrict_project_layer(&mut layer, &merged, &path, &mut warnings);
+            }
             deep_merge(&mut merged, layer);
         }
         deep_merge(&mut merged, cli_table(&cli));
@@ -298,7 +317,10 @@ impl Config {
                 message: e.to_string(),
             })?;
         cfg.validate()?;
-        Ok(cfg)
+        Ok(LoadedConfig {
+            config: cfg,
+            warnings,
+        })
     }
 
     /// Rejects values no layer should set: out-of-range numbers, non-http(s) URLs,
@@ -414,6 +436,98 @@ fn check_env_name(what: &str, name: &Option<String>) -> Result<(), String> {
             Err(format!("{what} is not a valid environment variable name"))
         }
         _ => Ok(()),
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Trust {
+    User,
+    Project,
+}
+
+/// Settings a project file may not make: where requests and keys go, what leaves the
+/// machine, what is written without asking, and which model data the engine believes.
+const USER_ONLY_KEYS: &[&str] = &[
+    "providers",
+    "telemetry",
+    "approve_memory",
+    "catalog_overrides",
+    "routing",
+];
+
+/// Strips from a project layer everything that would loosen what the user set up, and
+/// says what it dropped. `so_far` is the merged defaults and user layer: a project may
+/// lower `permissions.mode` below it and add `permissions.deny` rules to it, nothing else.
+/// (`PolicyConfig` has no `ask` rules, so deny rules are the only rule a project can add.)
+fn restrict_project_layer(
+    layer: &mut Table,
+    so_far: &Table,
+    path: &Path,
+    warnings: &mut Vec<String>,
+) {
+    let mut ignore = |key: &str, why: &str| {
+        warnings.push(format!("{}: ignored `{key}`: {why}", path.display()));
+    };
+    for key in USER_ONLY_KEYS {
+        if layer.remove(*key).is_some() {
+            ignore(key, "a project config may not set this");
+        }
+    }
+
+    let Some(Value::Table(perms)) = layer.get_mut("permissions") else {
+        return;
+    };
+    let user_perms = so_far.get("permissions").and_then(Value::as_table);
+
+    if let Some(mode) = perms.get("mode").cloned() {
+        let wanted = mode.try_into::<Mode>().ok();
+        let current = user_perms
+            .and_then(|p| p.get("mode"))
+            .and_then(|m| m.clone().try_into::<Mode>().ok())
+            .unwrap_or(Mode::Ask);
+        if wanted.is_some_and(|m| strictness(m) < strictness(current)) {
+            perms.remove("mode");
+            ignore(
+                "permissions.mode",
+                "a project config can only lower the permission mode",
+            );
+        }
+    }
+
+    if perms
+        .get("allow")
+        .and_then(Value::as_array)
+        .is_some_and(|a| !a.is_empty())
+    {
+        perms.remove("allow");
+        ignore(
+            "permissions.allow",
+            "a project config cannot add allow rules",
+        );
+    }
+
+    // Arrays replace across layers, but a project must not drop the user's deny rules.
+    if let Some(Value::Array(project_deny)) = perms.get_mut("deny") {
+        let mut deny = user_perms
+            .and_then(|p| p.get("deny"))
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        for rule in std::mem::take(project_deny) {
+            if !deny.contains(&rule) {
+                deny.push(rule);
+            }
+        }
+        *project_deny = deny;
+    }
+}
+
+/// How much a mode asks of the user: higher is stricter.
+fn strictness(mode: Mode) -> u8 {
+    match mode {
+        Mode::Ask => 2,
+        Mode::AutoEdit => 1,
+        Mode::Yolo => 0,
     }
 }
 

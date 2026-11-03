@@ -6,10 +6,10 @@ pub mod auth;
 pub mod config;
 pub mod protocol;
 
-pub use auth::{AuthError, KEYCHAIN_SERVICE, KeyringStore, SecretStore, api_key};
+pub use auth::{AuthError, KEYCHAIN_SERVICE, KeyLookup, KeyringStore, SecretStore, api_key};
 pub use config::{
-    BudgetConfig, BudgetLimits, CliOverrides, CompatEntry, Config, ConfigError, ProviderEntry,
-    ProvidersConfig, RoutingConfig, TelemetryConfig, config_home,
+    BudgetConfig, BudgetLimits, CliOverrides, CompatEntry, Config, ConfigError, LoadedConfig,
+    ProviderEntry, ProvidersConfig, RoutingConfig, TelemetryConfig, config_home,
 };
 pub use protocol::{
     BudgetScope, Command, EffectView, ErrorKind, Event, FinishReason, PROTOCOL_VERSION,
