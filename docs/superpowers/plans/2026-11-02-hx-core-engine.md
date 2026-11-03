@@ -727,6 +727,8 @@ proptest! { #[test] fn apply_then_inverse_restores(text in "[a-z\\n]{1,200}", ..
 
 ### Task 24: Engine turn loop and approvals
 
+**CP3 round-2 note (binding):** apply a tool call's `ContextOp` before its result is sent to the model; if `Context::pin`/`apply_op` returns an error (e.g. `PinError::TooMany`, over-size), replace that call's result with the error text so the model never believes a refused pin was kept.
+
 **Client-protocol amendment (binding, user-approved 2026-11-03; spec 3.4):** `EngineBuilder` takes an optional shared `Arc<Workspace>` (index, watcher, memory store for one root) so several engines in one process share them; without it the builder opens its own. Approval requests carry a `request_id`, and `Command::Approve`/`Deny` name it.
 
 **Task 38 review note (binding):** build the repo map off the startup path (spawn_blocking) once per session; on a first-ever session with no ready index the map is empty for that session — acceptable in v1, but log it. Call `init_repo_map` exactly once at session start, ignore a `false` return, never retry per turn (a later success would change the stable prefix mid-session). Before the first `assemble`, await both the repo map and the first memory index for a bounded ~300 ms (otherwise request 2's stable prefix differs and the cache is lost); on timeout the slot stays empty for the session. Read-tracker turn numbers and `Context` turn numbers are the same absolute step counter (Task 20's `CompactionRecord` reports the last removed absolute turn; pass it to `ReadTracker::forget_shown_at` and call `ReadTracker::forget_path` for every `CompactionRecord.forgotten_paths` entry).
