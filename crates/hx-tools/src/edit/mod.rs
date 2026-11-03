@@ -215,11 +215,10 @@ async fn load_fresh(
 
 /// Remember what was written, so consecutive edits need no re-read.
 async fn record_written(sb: &dyn Sandbox, cx: &ToolCx, full: &Path, bytes: &[u8]) -> blake3::Hash {
-    let hash = blake3::hash(bytes);
     if let Ok(meta) = sb.metadata(full).await {
-        cx.reads().record(full, &meta, hash);
+        crate::record_written_file(sb, cx, full, &meta, bytes).await;
     }
-    hash
+    blake3::hash(bytes)
 }
 
 /// Most errors a syntax warning lists.

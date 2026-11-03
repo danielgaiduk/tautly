@@ -58,7 +58,12 @@ async fn read<S: Sandbox>(e: &Env<S>, path: &str) -> String {
 
 /// The `<n>:<hash>` anchor `read` printed for line `n` of `path`.
 async fn anchor<S: Sandbox>(e: &Env<S>, path: &str, n: usize) -> String {
-    let out = read(e, path).await;
+    // `full`: a repeated read would otherwise say `unchanged`, without the anchors.
+    let r = ReadTool
+        .run(json!({"path": path, "full": true}), &e.sb, &e.cx)
+        .await;
+    assert!(!r.is_error, "{}", r.output);
+    let out = r.output;
     let prefix = format!("{n}:");
     out.lines()
         .find(|l| l.starts_with(&prefix))

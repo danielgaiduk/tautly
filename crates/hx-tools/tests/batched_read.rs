@@ -181,8 +181,11 @@ async fn batched_read_gives_small_targets_their_full_size_before_sharing_the_res
     )
     .await;
     let env_ref = &e;
+    // `full`: these are repeated reads of the same files, which would otherwise be diffed.
     let run = |targets: serde_json::Value| async move {
-        let r = env_ref.run(&ReadTool, json!({ "targets": targets })).await;
+        let r = env_ref
+            .run(&ReadTool, json!({ "targets": targets, "full": true }))
+            .await;
         assert!(!r.is_error, "{}", r.output);
         r.output
     };

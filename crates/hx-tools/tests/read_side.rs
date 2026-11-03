@@ -376,7 +376,8 @@ async fn huge_line_numbers_do_not_panic() {
     let r = run(
         &e,
         &ReadTool,
-        json!({"path": "f.txt", "start_line": 1, "end_line": max}),
+        // `full`: the loop above already read this range.
+        json!({"path": "f.txt", "start_line": 1, "end_line": max, "full": true}),
     )
     .await;
     assert!(!r.is_error, "{}", r.output);

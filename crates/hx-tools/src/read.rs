@@ -8,10 +8,12 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::cap::{OUTPUT_CAP, cap_text};
+use crate::reread::small_diff;
 use crate::spec::{decode_text, parse_args, tool_spec};
-use crate::{AppliedEffect, Tool, ToolCx, ToolError, ToolResult};
+use crate::{
+    AppliedEffect, LineRange, MAX_READ_LINES, PrevRead, Tool, ToolCx, ToolError, ToolResult,
+};
 
-const MAX_LINES: usize = 2000;
 /// Most targets in one batched read.
 const MAX_TARGETS: usize = 10;
 
@@ -27,6 +29,8 @@ struct Args {
     start_line: Option<usize>,
     end_line: Option<usize>,
     targets: Option<Vec<Target>>,
+    /// Return full content even when the range was read before.
+    full: Option<bool>,
 }
 
 /// One item of a batched read.
@@ -111,6 +115,7 @@ async fn read_lines(
     path: &str,
     start_line: Option<usize>,
     end_line: Option<usize>,
+    force_full: bool,
     sb: &dyn Sandbox,
     cx: &ToolCx,
 ) -> Result<Lines, String> {
@@ -121,7 +126,8 @@ async fn read_lines(
     };
     let text = decode_text(&bytes).map_err(|why| format!("{path}: {why}"))?;
     let hash = blake3::hash(&bytes);
-    cx.reads().record(&full, &meta, hash);
+    // The stale-read guard sees this read even if the range below turns out to be invalid.
+    cx.reads().refresh(&full, &meta, hash);
 
     let lines: Vec<&str> = text.lines().collect();
     let total = lines.len();
@@ -137,21 +143,69 @@ async fn read_lines(
     }
     let mut remaining = 0;
     // Line numbers come from the model and may be near usize::MAX.
-    if end_line.is_none() && end.saturating_add(1) > start.saturating_add(MAX_LINES) {
-        // No overflow: start + MAX_LINES < end + 1 <= total + 1 here.
-        end = start + MAX_LINES - 1;
+    if end_line.is_none() && end.saturating_add(1) > start.saturating_add(MAX_READ_LINES) {
+        // No overflow: start + MAX_READ_LINES < end + 1 <= total + 1 here.
+        end = start + MAX_READ_LINES - 1;
         remaining = total - end;
     }
+    let shown = if end >= start {
+        &lines[start - 1..end]
+    } else {
+        &[]
+    };
+    let content = shown.join("\n");
+    let range = LineRange {
+        start: start_line,
+        end: end_line,
+    };
     let hashline = cx.edit_format() == EditFormat::Hashline;
-    let mut out: Vec<String> = Vec::new();
-    for (i, line) in lines.iter().enumerate().take(end).skip(start - 1) {
-        let n = i + 1;
-        if hashline {
-            let tag = &blake3::hash(line.as_bytes()).to_hex()[..4];
-            out.push(format!("{n}:{tag}|{line}"));
+    let mut text = shown
+        .iter()
+        .enumerate()
+        .map(|(i, line)| {
+            let n = start + i;
+            if hashline {
+                let tag = &blake3::hash(line.as_bytes()).to_hex()[..4];
+                format!("{n}:{tag}|{line}")
+            } else {
+                format!("{n}\t{line}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let prev = cx.reads().previous(&full, range).filter(|_| !force_full);
+    let mut unchanged = false;
+    if let Some(prev) = prev {
+        let turn = prev.turn;
+        if prev.content_hash == blake3::hash(content.as_bytes()) {
+            // The earlier content is still in context; say nothing more.
+            unchanged = true;
+            remaining = 0;
+            text = format!("unchanged since turn {turn}");
         } else {
-            out.push(format!("{n}\t{line}"));
+            // A hashline edit needs the anchors of the current lines, which a diff would
+            // lack, so in that format a change always returns the full content.
+            let diff = if hashline {
+                None
+            } else {
+                diff_against(sb, &prev, shown, start).await
+            };
+            text = match diff {
+                Some(diff) => {
+                    remaining = 0;
+                    format!("changed since turn {turn}:\n{diff}")
+                }
+                None => format!("changed since turn {turn} (full content):\n{text}"),
+            };
         }
+    }
+    // An unchanged read keeps its baseline, and with it the turn the content was shown.
+    if !unchanged {
+        let turn = cx.turn();
+        cx.reads()
+            .record(sb, &full, range, &meta, hash, turn, &content)
+            .await;
     }
     Ok(Lines {
         full,
@@ -159,8 +213,30 @@ async fn read_lines(
         start,
         end,
         remaining,
-        text: out.join("\n"),
+        text,
     })
+}
+
+/// A small diff from what `prev` returned to `new` (the lines of the same range, starting
+/// at file line `first_line`). `None` when the old content is gone from disk or altered,
+/// or when too much changed for a diff to be worth it: the caller then returns full content.
+async fn diff_against(
+    sb: &dyn Sandbox,
+    prev: &PrevRead,
+    new: &[&str],
+    first_line: usize,
+) -> Option<String> {
+    let bytes = sb.read(&prev.content_path).await.ok()?;
+    if blake3::hash(&bytes) != prev.content_hash {
+        return None;
+    }
+    let old = String::from_utf8(bytes).ok()?;
+    let old: Vec<&str> = if old.is_empty() {
+        Vec::new()
+    } else {
+        old.split('\n').collect()
+    };
+    small_diff(&old, new, first_line)
 }
 
 /// One target's section of a batched read.
@@ -170,11 +246,11 @@ struct Section {
     body: Result<Lines, String>,
 }
 
-async fn read_target(target: &Target, sb: &dyn Sandbox, cx: &ToolCx) -> Section {
+async fn read_target(target: &Target, force_full: bool, sb: &dyn Sandbox, cx: &ToolCx) -> Section {
     match target {
         Target::Path(t) => {
             let ranged = t.start_line.is_some() || t.end_line.is_some();
-            let body = read_lines(&t.path, t.start_line, t.end_line, sb, cx).await;
+            let body = read_lines(&t.path, t.start_line, t.end_line, force_full, sb, cx).await;
             let header = match &body {
                 Ok(l) if ranged => format!("{}:{}-{}", t.path, l.start, l.end),
                 _ => t.path.clone(),
@@ -184,11 +260,16 @@ async fn read_target(target: &Target, sb: &dyn Sandbox, cx: &ToolCx) -> Section 
                 body,
             }
         }
-        Target::Symbol(t) => symbol_section(t, sb, cx).await,
+        Target::Symbol(t) => symbol_section(t, force_full, sb, cx).await,
     }
 }
 
-async fn symbol_section(t: &SymbolTarget, sb: &dyn Sandbox, cx: &ToolCx) -> Section {
+async fn symbol_section(
+    t: &SymbolTarget,
+    force_full: bool,
+    sb: &dyn Sandbox,
+    cx: &ToolCx,
+) -> Section {
     let mut section = Section {
         header: format!("== symbol {} ==", t.symbol),
         body: Err(String::new()),
@@ -213,7 +294,7 @@ async fn symbol_section(t: &SymbolTarget, sb: &dyn Sandbox, cx: &ToolCx) -> Sect
         [row] => {
             let path = row.path.display().to_string();
             let (s, e) = (row.start_line as usize, row.end_line as usize);
-            section.body = read_lines(&path, Some(s), Some(e), sb, cx).await;
+            section.body = read_lines(&path, Some(s), Some(e), force_full, sb, cx).await;
             if section.body.is_ok() {
                 section.header = format!("== symbol {} ({path}:{s}-{e}) ==", t.symbol);
             }
@@ -298,13 +379,15 @@ impl Tool for ReadTool {
         tool_spec(
             "read",
             "Read a text file with line numbers. Use start_line/end_line (1-based, inclusive) for a range. \
-             To read several files or definitions in one call, pass `targets` (at most 10) instead of `path`.",
+             To read several files or definitions in one call, pass `targets` (at most 10) instead of `path`. \
+             Reading a range again returns `unchanged since turn N` or a diff of what changed; pass `full: true` to get the whole content.",
             json!({
                 "type": "object",
                 "properties": {
                     "path": {"type": "string", "description": "File path."},
                     "start_line": {"type": "integer", "minimum": 1, "description": "First line to read."},
                     "end_line": {"type": "integer", "minimum": 1, "description": "Last line to read."},
+                    "full": {"type": "boolean", "description": "Return the full content even if this range was read before. By default a repeated read says `unchanged since turn N` or shows a diff."},
                     "targets": {
                         "type": "array",
                         "maxItems": MAX_TARGETS,
@@ -345,30 +428,38 @@ impl Tool for ReadTool {
             Ok(a) => a,
             Err(e) => return ToolResult::error(e.to_string()),
         };
+        let full = a.full.unwrap_or(false);
         match (&a.path, &a.targets) {
             (Some(_), Some(_)) => ToolResult::error("pass either `path` or `targets`, not both"),
             (None, None) => ToolResult::error("pass `path`, or `targets` to read several"),
-            (Some(path), None) => match read_lines(path, a.start_line, a.end_line, sb, cx).await {
-                Ok(lines) => {
-                    let mut r = ToolResult::ok(lines.render(OUTPUT_CAP));
-                    r.effects.push(AppliedEffect::Read(lines.full, lines.hash));
-                    r
+            (Some(path), None) => {
+                match read_lines(path, a.start_line, a.end_line, full, sb, cx).await {
+                    Ok(lines) => {
+                        let mut r = ToolResult::ok(lines.render(OUTPUT_CAP));
+                        r.effects.push(AppliedEffect::Read(lines.full, lines.hash));
+                        r
+                    }
+                    Err(e) => ToolResult::error(e),
                 }
-                Err(e) => ToolResult::error(e),
-            },
+            }
             (None, Some(targets)) => {
                 if a.start_line.is_some() || a.end_line.is_some() {
                     return ToolResult::error(
                         "start_line/end_line belong on each target when using `targets`",
                     );
                 }
-                read_batch(targets, sb, cx).await
+                read_batch(targets, full, sb, cx).await
             }
         }
     }
 }
 
-async fn read_batch(targets: &[Target], sb: &dyn Sandbox, cx: &ToolCx) -> ToolResult {
+async fn read_batch(
+    targets: &[Target],
+    force_full: bool,
+    sb: &dyn Sandbox,
+    cx: &ToolCx,
+) -> ToolResult {
     if targets.is_empty() {
         return ToolResult::error("`targets` is empty");
     }
@@ -383,7 +474,7 @@ async fn read_batch(targets: &[Target], sb: &dyn Sandbox, cx: &ToolCx) -> ToolRe
         if cx.cancel().is_cancelled() {
             return ToolResult::error("cancelled");
         }
-        sections.push(read_target(target, sb, cx).await);
+        sections.push(read_target(target, force_full, sb, cx).await);
     }
     let mut result = if sections.iter().all(|s| s.body.is_err()) {
         ToolResult::error(assemble(&sections))
