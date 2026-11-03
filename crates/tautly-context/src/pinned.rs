@@ -12,6 +12,9 @@ pub enum PinSource {
     Config,
     Model,
     AgentsMd,
+    /// A `Constraints` / `Rules` section of a `CLAUDE.md` used in place of `AGENTS.md`
+    /// (spec 7.11.6); as authoritative as an AGENTS.md pin.
+    ClaudeMd,
 }
 
 impl PinSource {
@@ -22,6 +25,7 @@ impl PinSource {
             PinSource::Config => "config",
             PinSource::Model => "model",
             PinSource::AgentsMd => "AGENTS.md",
+            PinSource::ClaudeMd => "CLAUDE.md",
         }
     }
 }

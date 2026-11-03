@@ -256,10 +256,14 @@ impl Session {
         if reason == FinishReason::Cancelled && timed_out.load(Ordering::Relaxed) {
             reason = FinishReason::Timeout;
         }
-        self.log(SessionRecord::TurnEnd { reason }).await;
-        self.checkpoint().await;
         let next = self.evidence.fresh();
         let evidence = std::mem::replace(&mut self.evidence, next).finish();
+        self.log(SessionRecord::TurnEnd {
+            reason,
+            evidence: evidence.clone(),
+        })
+        .await;
+        self.checkpoint().await;
         self.emit(Event::TurnFinished { reason, evidence }).await;
     }
 

@@ -13,6 +13,7 @@ use tautly_provider::ProviderEvent;
 use tautly_session::BlobRef;
 use tautly_tools::{PersistedEffect, ToolMeta};
 
+use crate::evidence::TestEvidence;
 use crate::protocol::{Command, FinishReason};
 
 /// One line of a session log, in the order things happened.
@@ -76,7 +77,13 @@ pub enum SessionRecord {
     /// follows.
     EngineError { message: String },
     /// A user message's turn ended.
-    TurnEnd { reason: FinishReason },
+    TurnEnd {
+        reason: FinishReason,
+        /// The turn's last test run (spec 7.11.7), as `TurnFinished` carried it; kept here
+        /// so a receipt on a resumed session can show it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        evidence: Option<TestEvidence>,
+    },
     /// A record type this version does not know (read only; never written).
     #[serde(skip)]
     Unknown,
@@ -198,6 +205,7 @@ mod tests {
             SessionRecord::PinsFolded,
             SessionRecord::TurnEnd {
                 reason: FinishReason::Completed,
+                evidence: None,
             },
         ];
         for r in recs {
@@ -254,6 +262,7 @@ mod tests {
             },
             SessionRecord::TurnEnd {
                 reason: FinishReason::Error,
+                evidence: None,
             },
         ];
         assert_eq!(all.len(), KNOWN_TYPES.len());

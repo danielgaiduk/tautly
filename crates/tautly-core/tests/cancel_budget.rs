@@ -543,7 +543,8 @@ async fn turn_timeout_finishes_with_timeout() {
         matches!(
             end,
             Some(SessionRecord::TurnEnd {
-                reason: FinishReason::Timeout
+                reason: FinishReason::Timeout,
+                ..
             })
         ),
         "{end:?}"

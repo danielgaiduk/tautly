@@ -3,9 +3,9 @@
 //! then command-line overrides. Tables merge key by key, arrays and scalars replace.
 //!
 //! The project file is repository content, so it is untrusted: it cannot set `providers`,
-//! `telemetry`, `approve_memory`, `catalog_overrides`, `routing` or `evidence`, and in `permissions` it
-//! can only lower the mode and add `deny` rules; `budget`, `max_turns` and `turn_timeout_s`
-//! can only go down. Dropped settings come back as
+//! `telemetry`, `approve_memory`, `catalog_overrides`, `routing` or `evidence`, and in
+//! `permissions` it can only lower the mode and add `deny` rules; `budget`, `max_turns`
+//! and `turn_timeout_s` can only go down. Dropped settings come back as
 //! [`LoadedConfig::warnings`]. Command-line flags are the user's own and override all.
 
 use std::collections::HashSet;

@@ -266,6 +266,25 @@ fn event_json_shape_is_stable() {
 }
 
 #[test]
+fn turn_finished_with_evidence_has_a_stable_shape() {
+    let e = Event::TurnFinished {
+        reason: FinishReason::Completed,
+        evidence: Some(tautly_core::TestEvidence {
+            command: "cargo test -p tautly-core".into(),
+            exit_code: Some(101),
+            passed: Some(41),
+            failed: Some(2),
+            step: 3,
+            write_gen: 12,
+            stale: true,
+            edits_since: 2,
+            execs_since: 1,
+        }),
+    };
+    insta::assert_json_snapshot!("turn_finished_with_evidence", e);
+}
+
+#[test]
 fn approval_events_and_commands_carry_request_ids() {
     let v = serde_json::to_value(&every_event()[4]).unwrap();
     assert_eq!(v["type"], "tool_approval_requested");

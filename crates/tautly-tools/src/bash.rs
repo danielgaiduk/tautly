@@ -90,9 +90,26 @@ fn parse_summary(command: &str, full: &str, exit_code: Option<i32>) -> Option<fi
     filters::apply(filters::detect_command(command)?, full)
 }
 
+/// Whether a failed run (`code != 0`) shows nothing the summary accounts for: no failure or
+/// error in it, or a crash in the output that it leaves out (the parser missed what went
+/// wrong), so neither the summary nor its counts can be trusted.
+fn contradicts_exit(summary: &filters::Summary, full: &str, code: i32) -> bool {
+    code != 0
+        && (summary.failed + summary.errors == 0 || filters::has_unparsed_crash(full, summary))
+}
+
 /// Passed and failed counts of a test tool's summary (builds and linters report no passes);
-/// a crashed test binary or collection error counts as a failure.
-fn test_counts(summary: &filters::Summary) -> Option<TestCounts> {
+/// a crashed test binary or collection error counts as a failure. None when the summary
+/// contradicts the exit code ([`contradicts_exit`]): the footer must not say "4 passed,
+/// 0 failed" about a run that exited non-zero.
+fn test_counts(
+    summary: &filters::Summary,
+    full: &str,
+    exit_code: Option<i32>,
+) -> Option<TestCounts> {
+    if contradicts_exit(summary, full, exit_code?) {
+        return None;
+    }
     Some(TestCounts {
         passed: summary.passed?,
         failed: summary.failed.saturating_add(summary.errors),
@@ -115,9 +132,7 @@ async fn filtered_output(
         return None;
     }
     let summary = summary?;
-    if code != 0
-        && (summary.failed + summary.errors == 0 || filters::has_unparsed_crash(full, summary))
-    {
+    if contradicts_exit(summary, full, code) {
         return None;
     }
     let spill = sb.spill(full.as_bytes()).await.ok()?;
@@ -402,7 +417,9 @@ impl Tool for BashTool {
         let mut r = ToolResult::ok(text);
         r.is_error = is_error;
         r.meta.exit_code = exit_code;
-        r.meta.counts = summary.as_ref().and_then(test_counts);
+        r.meta.counts = summary
+            .as_ref()
+            .and_then(|s| test_counts(s, &full, exit_code));
         r.effects.push(AppliedEffect::Exec { may_write: true });
         r
     }

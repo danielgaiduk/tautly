@@ -687,7 +687,13 @@ async fn records_appended_before_events_visible() {
             }
             Event::TurnFinished { reason, .. } => {
                 let recs = records(&run.engine);
-                assert_eq!(recs.last(), Some(&SessionRecord::TurnEnd { reason }));
+                assert_eq!(
+                    recs.last(),
+                    Some(&SessionRecord::TurnEnd {
+                        reason,
+                        evidence: None
+                    })
+                );
                 assert!(matches!(
                     recs.first(),
                     Some(SessionRecord::Command(Command::SendMessage { .. }))

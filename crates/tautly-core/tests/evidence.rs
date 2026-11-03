@@ -67,6 +67,32 @@ fn default_patterns_detect_common_test_commands() {
 }
 
 #[test]
+fn compile_only_invocations_are_not_test_runs() {
+    let m = matcher(&EvidenceConfig::default());
+    for cmd in [
+        "cargo test --no-run",
+        "cargo test -p x --no-run",
+        "cargo nextest run --no-run",
+        "pytest --collect-only -q",
+        "python -m pytest --collect-only",
+        "jest --no-execute",
+        "cd a && cargo test --no-run",
+    ] {
+        assert!(!m.is_test(cmd), "{cmd} runs no test");
+    }
+    // Another component of the line may still be a real run.
+    assert!(m.is_test("cargo test --no-run && cargo test"));
+    assert!(m.is_test("pytest --collect-only; pytest -q"));
+    // A user pattern is held to it as well.
+    let user = matcher(&EvidenceConfig {
+        test_commands: vec!["./check.sh*".into()],
+        replace_defaults: false,
+    });
+    assert!(!user.is_test("./check.sh --no-run"));
+    assert!(user.is_test("./check.sh --fast"));
+}
+
+#[test]
 fn user_patterns_add_and_replace_defaults() {
     let add = EvidenceConfig {
         test_commands: vec!["./check.sh*".into(), "tox*".into()],
@@ -552,6 +578,50 @@ async fn turn_finished_carries_the_last_test_run_and_its_staleness() {
     // carries over from the earlier turns.
     assert_eq!(turn(&engine, &mut events, "three").await, None);
     assert_eq!(turn(&engine, &mut events, "four").await, None);
+}
+
+#[tokio::test]
+async fn turn_end_record_carries_the_evidence() {
+    use tautly_core::SessionRecord;
+    use tautly_session::SessionReader;
+    let (dir, home) = project();
+    let (engine, mut events) = start(
+        &dir,
+        &home,
+        &["./cargo test*"],
+        vec![
+            tools_step(vec![call("t1", "bash", json!({"command": "./cargo test"}))]),
+            text_step(),
+            text_step(),
+        ],
+    );
+    let e = turn(&engine, &mut events, "one").await.expect("evidence");
+    assert_eq!(turn(&engine, &mut events, "two").await, None);
+    let reader = SessionReader::<SessionRecord>::open(engine.session_path()).unwrap();
+    let ends: Vec<Option<TestEvidence>> = reader
+        .records()
+        .filter_map(|r| match r.unwrap().1 {
+            SessionRecord::TurnEnd { evidence, .. } => Some(evidence),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(ends, [Some(e), None]);
+
+    // Logs written before the field existed still read.
+    let old: SessionRecord =
+        serde_json::from_str(r#"{"type":"turn_end","data":{"reason":"completed"}}"#).unwrap();
+    assert_eq!(
+        old,
+        SessionRecord::TurnEnd {
+            reason: FinishReason::Completed,
+            evidence: None
+        }
+    );
+    // And a turn without evidence writes the old shape.
+    assert_eq!(
+        serde_json::to_string(&old).unwrap(),
+        r#"{"type":"turn_end","data":{"reason":"completed"}}"#
+    );
 }
 
 #[tokio::test]

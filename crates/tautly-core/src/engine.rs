@@ -536,6 +536,7 @@ impl Actor {
             },
             SessionRecord::TurnEnd {
                 reason: FinishReason::Error,
+                evidence: None,
             },
         ];
         self.with_log(move |l| {

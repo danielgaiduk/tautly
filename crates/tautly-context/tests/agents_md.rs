@@ -206,7 +206,7 @@ fn fifo_in_an_ancestor_is_skipped_promptly() {
     std::fs::write(root.join("AGENTS.md"), "inner text\n").unwrap();
     mkfifo(&dir.path().join("AGENTS.md"));
     let found = load_within_2s(&root).expect("load returned within 2 s");
-    assert_eq!(found.text.as_deref(), Some("inner text"));
+    assert_eq!(found.text.as_deref(), Some("[from AGENTS.md]\ninner text"));
 }
 
 #[test]
@@ -220,7 +220,10 @@ fn ancestor_may_link_within_its_own_directory() {
     // A stow-style link that stays under the directory holding the AGENTS.md.
     std::os::unix::fs::symlink(dotfiles.join("mine.md"), dir.path().join("AGENTS.md")).unwrap();
     let found = load(&root);
-    assert_eq!(found.text.as_deref(), Some("the user's own notes"));
+    assert_eq!(
+        found.text.as_deref(),
+        Some("[from AGENTS.md]\nthe user's own notes")
+    );
     assert!(found.warnings.is_empty(), "{:?}", found.warnings);
 }
 
@@ -246,7 +249,7 @@ fn ancestor_link_out_of_its_directory_is_refused() {
     let found = load(&root);
     let text = found.text.unwrap_or_default();
     assert!(!text.contains("TEST-NOT-A-SECRET"), "{text}");
-    assert_eq!(text, "package notes");
+    assert_eq!(text, "[from AGENTS.md]\npackage notes");
     assert!(
         found
             .warnings
@@ -328,8 +331,8 @@ fn oversize_file_is_truncated_with_a_marker_and_a_warning() {
         "{}",
         &text[text.len() - 80..]
     );
-    assert!(text.len() <= 32 * 1024 + 64, "{}", text.len());
-    assert!(text.starts_with(line.trim_end()));
+    assert!(text.len() <= 32 * 1024, "{}", text.len());
+    assert!(text.starts_with(&format!("[from AGENTS.md]\n{}", line.trim_end())));
     assert_eq!(found.warnings.len(), 1, "{:?}", found.warnings);
     assert!(found.warnings[0].contains("32 KB"), "{:?}", found.warnings);
 
@@ -364,7 +367,7 @@ fn total_is_capped_keeping_the_nearest_files_whole() {
     let middle = text.find("MIDDLE").unwrap();
     let nearest = text.find("NEAREST").unwrap();
     assert!(outer < middle && middle < nearest);
-    assert!(text[outer..middle].contains("[AGENTS.md truncated at 4 KB]"));
+    assert!(text[outer..middle].contains("[AGENTS.md truncated at 3 KB]"));
     assert!(text[nearest..].len() >= 30 * 1024 - 1);
     assert!(
         found.warnings.iter().any(|w| w.contains("64 KB")),
@@ -398,7 +401,10 @@ fn ancestor_case(file_mode: u32, dir_mode: u32) -> (tempfile::TempDir, AgentsMd)
 #[test]
 fn own_ancestor_file_in_a_private_directory_is_accepted() {
     let (_d, found) = ancestor_case(0o644, 0o755);
-    assert_eq!(found.text.as_deref(), Some("ancestor notes"));
+    assert_eq!(
+        found.text.as_deref(),
+        Some("[from AGENTS.md]\nancestor notes")
+    );
     assert!(found.warnings.is_empty(), "{:?}", found.warnings);
 }
 
@@ -426,7 +432,10 @@ fn ancestor_in_a_world_writable_directory_needs_the_sticky_bit() {
     );
     // Sticky (like /tmp) and the file is the current user's: accepted.
     let (_d, found) = ancestor_case(0o644, 0o1777);
-    assert_eq!(found.text.as_deref(), Some("ancestor notes"));
+    assert_eq!(
+        found.text.as_deref(),
+        Some("[from AGENTS.md]\nancestor notes")
+    );
 }
 
 #[test]
@@ -436,7 +445,10 @@ fn the_roots_own_file_is_not_subject_to_the_ancestor_rule() {
     let file = dir.path().join("AGENTS.md");
     std::fs::write(&file, "repo notes\n").unwrap();
     chmod(&file, 0o664);
-    assert_eq!(load(dir.path()).text.as_deref(), Some("repo notes"));
+    assert_eq!(
+        load(dir.path()).text.as_deref(),
+        Some("[from AGENTS.md]\nrepo notes")
+    );
 }
 
 // ---- CLAUDE.md fallback (spec 7.11.6) ----
@@ -492,21 +504,79 @@ fn agents_md_wins_when_both_exist() {
 }
 
 #[test]
-fn an_unusable_agents_md_still_wins_over_claude_md() {
-    // "Where both files exist, only AGENTS.md is read": a refused AGENTS.md is not a
-    // reason to trust the other file instead.
+fn an_agents_md_that_contributes_nothing_falls_back_to_claude_md() {
+    // Empty, whitespace-only, dangling and refused AGENTS.md files own no level: the
+    // CLAUDE.md is read, and a warning names the AGENTS.md that was skipped.
+    for case in ["empty", "blank", "dangling", "outside"] {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = dir.path().join("outside");
+        let root = dir.path().join("root");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::create_dir(&root).unwrap();
+        let agents = root.join("AGENTS.md");
+        match case {
+            "empty" => std::fs::write(&agents, "").unwrap(),
+            "blank" => std::fs::write(&agents, " \n\t\n").unwrap(),
+            "dangling" => std::os::unix::fs::symlink("nope.md", &agents).unwrap(),
+            _ => {
+                std::fs::write(outside.join("x"), "elsewhere\n").unwrap();
+                std::os::unix::fs::symlink("../outside/x", &agents).unwrap();
+            }
+        }
+        std::fs::write(root.join("CLAUDE.md"), "claude notes\n").unwrap();
+        let found = load(&root);
+        let text = found.text.clone().unwrap_or_default();
+        assert!(text.contains("claude notes"), "{case}: {found:?}");
+        assert!(!text.contains("elsewhere"), "{case}: {text}");
+        assert_eq!(
+            found.sources,
+            [(canon(&root).join("CLAUDE.md"), InstructionFile::ClaudeMd)],
+            "{case}"
+        );
+        assert!(
+            found
+                .warnings
+                .iter()
+                .any(|w| w.contains("AGENTS.md") && w.contains("CLAUDE.md")),
+            "{case}: {:?}",
+            found.warnings
+        );
+    }
+    // A usable AGENTS.md still wins, with no fallback warning.
     let dir = tempfile::tempdir().unwrap();
-    let outside = dir.path().join("outside");
-    let root = dir.path().join("root");
-    std::fs::create_dir(&outside).unwrap();
-    std::fs::create_dir(&root).unwrap();
-    std::fs::write(outside.join("x"), "elsewhere\n").unwrap();
-    std::os::unix::fs::symlink("../outside/x", root.join("AGENTS.md")).unwrap();
-    std::fs::write(root.join("CLAUDE.md"), "claude notes\n").unwrap();
-    let found = load(&root);
-    assert_eq!(found.text, None, "{found:?}");
-    assert!(found.sources.is_empty());
-    assert!(found.warnings.iter().any(|w| w.contains("outside")));
+    std::fs::write(dir.path().join("AGENTS.md"), "agents notes\n").unwrap();
+    std::fs::write(dir.path().join("CLAUDE.md"), "claude notes\n").unwrap();
+    let found = load(dir.path());
+    assert!(!found.text.unwrap().contains("claude notes"));
+    assert!(found.warnings.is_empty());
+    // An empty AGENTS.md with no CLAUDE.md just contributes nothing, as before.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("AGENTS.md"), "").unwrap();
+    let found = load(dir.path());
+    assert_eq!(found.text, None);
+    assert!(found.warnings.is_empty(), "{:?}", found.warnings);
+}
+
+#[test]
+fn header_bytes_count_against_the_caps() {
+    // Four CLAUDE.md levels of 20 KB each against the 64 KB total: the block, headers and
+    // markers included, stays within it.
+    let dir = tempfile::tempdir().unwrap();
+    let mut level = dir.path().to_path_buf();
+    for name in ["a", "b", "c"] {
+        std::fs::write(level.join("CLAUDE.md"), "x".repeat(20 * 1024)).unwrap();
+        level = level.join(name);
+        std::fs::create_dir(&level).unwrap();
+    }
+    std::fs::write(level.join("CLAUDE.md"), "x".repeat(20 * 1024)).unwrap();
+    let text = load(&level).text.unwrap();
+    assert_eq!(
+        text.matches("[from CLAUDE.md]").count(),
+        4,
+        "{}",
+        text.len()
+    );
+    assert!(text.len() <= 64 * 1024, "{}", text.len());
 }
 
 #[test]
@@ -602,7 +672,7 @@ fn claude_md_obeys_caps_confinement_and_ownership() {
         "{}",
         &text[text.len() - 60..]
     );
-    assert!(text.len() <= 32 * 1024 + 128, "{}", text.len());
+    assert!(text.len() <= 32 * 1024, "{}", text.len());
     assert!(
         found.warnings.iter().any(|w| w.contains("32 KB")),
         "{:?}",
@@ -623,7 +693,7 @@ fn claude_md_obeys_caps_confinement_and_ownership() {
     assert!(text.len() <= 64 * 1024 + 256, "{}", text.len());
     assert!(
         text[text.find("OUTER").unwrap()..text.find("MIDDLE").unwrap()]
-            .contains("[CLAUDE.md truncated at 4 KB]")
+            .contains("[CLAUDE.md truncated at 3 KB]")
     );
     assert!(
         found.warnings.iter().any(|w| w.contains("64 KB")),
@@ -655,7 +725,7 @@ fn claude_md_rules_section_auto_pinned() {
     let found = load(dir.path());
     let pins: Vec<&str> = found.pins.iter().map(|p| p.text.as_str()).collect();
     assert_eq!(pins, ["- never touch migrations/", "- no network"]);
-    assert!(found.pins.iter().all(|p| p.source == PinSource::AgentsMd));
+    assert!(found.pins.iter().all(|p| p.source == PinSource::ClaudeMd));
     assert!(found.warnings.is_empty(), "{:?}", found.warnings);
 }
 
@@ -684,22 +754,22 @@ fn block_header_names_file_used() {
     std::fs::write(dir.path().join("CLAUDE.md"), "claude notes\n").unwrap();
     let found = load(dir.path());
     let text = found.text.clone().unwrap();
-    assert!(
-        text.starts_with("[instructions from CLAUDE.md]\n"),
-        "{text}"
-    );
+    assert_eq!(text, "[from CLAUDE.md]\nclaude notes");
     // The header is part of the `<agents_md>` block the model sees.
     let mut c = Context::default();
     c.set_agents_md(found);
     let (req, _) = c.assemble(&caps(), &[], &"anthropic/claude-sonnet".into());
     let block = format!("{:?}", req.system[1]);
-    assert!(block.contains("instructions from CLAUDE.md"), "{block}");
+    assert!(block.contains("[from CLAUDE.md]"), "{block}");
 
-    // With an AGENTS.md at the same level, only it is read and no header names CLAUDE.md.
+    // With an AGENTS.md at the same level, only it is read, and it is labelled the same way.
     std::fs::write(dir.path().join("AGENTS.md"), "agents notes\n").unwrap();
-    assert_eq!(load(dir.path()).text.unwrap(), "agents notes");
+    assert_eq!(
+        load(dir.path()).text.unwrap(),
+        "[from AGENTS.md]\nagents notes"
+    );
 
-    // Mixed levels: only the CLAUDE.md level is labelled.
+    // Mixed levels: each is labelled with the file it used.
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("pkg");
     std::fs::create_dir(&root).unwrap();
@@ -707,6 +777,24 @@ fn block_header_names_file_used() {
     std::fs::write(root.join("CLAUDE.md"), "inner claude\n").unwrap();
     assert_eq!(
         load(&root).text.unwrap(),
-        "outer agents\n\n[instructions from CLAUDE.md]\ninner claude"
+        "[from AGENTS.md]\nouter agents\n\n[from CLAUDE.md]\ninner claude"
+    );
+}
+
+#[test]
+fn claude_md_pins_carry_their_own_source() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("CLAUDE.md"), "## Rules\n- be careful\n").unwrap();
+    let found = load(dir.path());
+    assert_eq!(found.pins.len(), 1);
+    assert_eq!(found.pins[0].source, PinSource::ClaudeMd);
+    assert_eq!(PinSource::ClaudeMd.label(), "CLAUDE.md");
+    let mut c = Context::default();
+    c.set_agents_md(found);
+    let (req, _) = c.assemble(&caps(), &[], &"anthropic/claude-sonnet".into());
+    let all = format!("{:?}", req.messages);
+    assert!(
+        all.contains("[CLAUDE.md] - be careful") || all.contains("[CLAUDE.md] be careful"),
+        "{all}"
     );
 }

@@ -5,8 +5,12 @@
 //! pattern (permission-rule glob syntax). The [`EvidenceTracker`] watches the turn's tool
 //! results and keeps the last test run as a [`TestEvidence`]; `TurnFinished` carries it.
 //! The run is *stale* once a later step applied an `Edited` / `Deleted` effect or a later
-//! `Exec { may_write: true }` that was not itself a test run. No claim of the model is
-//! parsed: only the command, the exit code, the output filter's counts and the effects.
+//! `Exec { may_write: true }` that was not itself a test run. Staleness comes from counting
+//! those effects (`edits_since`, `execs_since`), not from comparing write generations:
+//! `write_gen` is reported for clients, never consulted here. Since `bash` always reports
+//! `Exec { may_write: true }`, any later non-test `bash` call, even `git status`, makes the
+//! run stale. No claim of the model is parsed: only the command, the exit code, the output
+//! filter's counts and the effects.
 
 use std::sync::Arc;
 
@@ -14,6 +18,11 @@ use globset::{Glob, GlobMatcher};
 use serde::{Deserialize, Serialize};
 use tautly_sandbox::{PolicyError, parse_commands};
 use tautly_tools::{AppliedEffect, ToolResult};
+
+/// Flags that make a test command build or list its tests without running them
+/// (`cargo test --no-run`, `jest --no-execute`, `pytest --collect-only`): a component
+/// carrying one is not a test run.
+const COMPILE_ONLY_FLAGS: &[&str] = &["--no-run", "--no-execute", "--collect-only"];
 
 /// Longest `TestEvidence::command`, in characters.
 const MAX_COMMAND_CHARS: usize = 200;
@@ -97,24 +106,36 @@ impl TestMatcher {
 
     /// Whether any parsed component of `raw_cmd` matches a test pattern, the way a
     /// permission rule sees it (the words, with and without leading `NAME=VALUE`
-    /// assignments). A command that cannot be parsed is not a test run.
+    /// assignments). A command that cannot be parsed is not a test run, and neither is a
+    /// component that only compiles or lists tests ([`COMPILE_ONLY_FLAGS`]).
+    ///
+    /// It is a heuristic over the command line, not a proof: `cargo test --help` or
+    /// `true || cargo test` still count, and a run's exit code and counts are what say
+    /// whether anything ran.
     pub fn is_test(&self, raw_cmd: &str) -> bool {
         let Ok(commands) = parse_commands(raw_cmd) else {
             return false;
         };
-        commands.iter().any(|c| {
-            let words = c.argv.join(" ");
-            let with_env = c
-                .assignments
-                .iter()
-                .chain(&c.argv)
-                .map(String::as_str)
-                .collect::<Vec<_>>()
-                .join(" ");
-            self.globs
-                .iter()
-                .any(|g| g.is_match(&words) || g.is_match(&with_env))
-        })
+        commands
+            .iter()
+            .filter(|c| {
+                !c.argv
+                    .iter()
+                    .any(|w| COMPILE_ONLY_FLAGS.contains(&w.as_str()))
+            })
+            .any(|c| {
+                let words = c.argv.join(" ");
+                let with_env = c
+                    .assignments
+                    .iter()
+                    .chain(&c.argv)
+                    .map(String::as_str)
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                self.globs
+                    .iter()
+                    .any(|g| g.is_match(&words) || g.is_match(&with_env))
+            })
     }
 }
 

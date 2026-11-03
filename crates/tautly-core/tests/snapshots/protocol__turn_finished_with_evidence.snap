@@ -1,0 +1,19 @@
+---
+source: crates/tautly-core/tests/protocol.rs
+expression: e
+---
+{
+  "type": "turn_finished",
+  "reason": "completed",
+  "evidence": {
+    "command": "cargo test -p tautly-core",
+    "exit_code": 101,
+    "passed": 41,
+    "failed": 2,
+    "step": 3,
+    "write_gen": 12,
+    "stale": true,
+    "edits_since": 2,
+    "execs_since": 1
+  }
+}
