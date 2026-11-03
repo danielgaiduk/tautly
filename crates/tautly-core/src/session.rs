@@ -4,7 +4,7 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -36,17 +36,27 @@ const SPILL_MAX_BYTES: u64 = 256 * 1024 * 1024;
 /// How long an event waits for room in the channel once the turn is cancelled (or for
 /// the actor's last words) before it is dropped.
 const SEND_GRACE: Duration = Duration::from_secs(1);
+/// How long a cancelled turn's `TurnFinished` (and the drop warning before it) waits.
+const FINISH_GRACE: Duration = Duration::from_secs(5);
 
 /// Where events go. A client that stopped listening is not an error, and a client that
-/// stopped reading cannot wedge the engine: a sink [`bound`](EventSink::bound) to a turn
-/// waits on a full channel only until the turn is cancelled (then [`SEND_GRACE`]); an
-/// unbound sink (the actor's, and the session's between turns) never waits. Dropped
-/// events are counted and announced with a warning as soon as there is room.
+/// stopped reading cannot wedge the engine:
+///
+/// - A sink [`bound`](EventSink::bound) to a turn waits on a full channel until the turn is
+///   cancelled. After that one event may wait [`SEND_GRACE`]; once one has timed out the
+///   turn's sink is overflowing and every further event is dropped at once, except
+///   `TurnFinished`, which (with the drop warning just before it) waits [`FINISH_GRACE`]
+///   once, so a busy but reading client still learns that the turn ended.
+/// - An unbound sink (the actor's, and the session's between turns) never waits.
+///
+/// Dropped events are counted and announced with a warning when there is room.
 #[derive(Clone)]
 pub(crate) struct EventSink {
     tx: mpsc::Sender<Event>,
     cancel: Option<CancellationToken>,
     dropped: Arc<AtomicU64>,
+    /// Set for the turn once a post-cancel send timed out.
+    overflowing: Arc<AtomicBool>,
 }
 
 impl EventSink {
@@ -55,6 +65,7 @@ impl EventSink {
             tx,
             cancel: None,
             dropped: Arc::default(),
+            overflowing: Arc::default(),
         }
     }
 
@@ -62,24 +73,61 @@ impl EventSink {
     pub fn bound(&self, cancel: CancellationToken) -> Self {
         EventSink {
             cancel: Some(cancel),
+            overflowing: Arc::default(),
             ..self.clone()
         }
     }
 
     pub async fn emit(&self, ev: Event) {
-        self.announce_dropped();
-        match &self.cancel {
-            None => self.try_emit(ev),
-            Some(cancel) => {
-                let permit = tokio::select! {
-                    permit = self.tx.reserve() => Some(permit),
-                    () = cancel.cancelled() => None,
-                };
-                match permit {
-                    Some(Ok(permit)) => permit.send(ev),
-                    Some(Err(_)) => {}
-                    None => self.send_or_drop(ev).await,
+        let Some(cancel) = &self.cancel else {
+            return self.try_emit(ev);
+        };
+        if !cancel.is_cancelled() {
+            self.announce_dropped();
+            let permit = tokio::select! {
+                permit = self.tx.reserve() => Some(permit),
+                () = cancel.cancelled() => None,
+            };
+            match permit {
+                Some(Ok(permit)) => return permit.send(ev),
+                Some(Err(_)) => return,
+                None => {}
+            }
+        }
+        if matches!(ev, Event::TurnFinished { .. }) {
+            return self.finish(ev).await;
+        }
+        if self.overflowing.load(Ordering::Relaxed) {
+            self.dropped.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        if let Err(mpsc::error::SendTimeoutError::Timeout(_)) =
+            self.tx.send_timeout(ev, SEND_GRACE).await
+        {
+            self.overflowing.store(true, Ordering::Relaxed);
+            self.dropped.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// A cancelled turn's last event: the drop warning (if any), then `ev`, within one
+    /// [`FINISH_GRACE`].
+    async fn finish(&self, ev: Event) {
+        let deadline = tokio::time::Instant::now() + FINISH_GRACE;
+        let n = self.dropped.swap(0, Ordering::Relaxed);
+        if n > 0 {
+            match tokio::time::timeout_at(deadline, self.tx.reserve()).await {
+                Ok(Ok(permit)) => permit.send(dropped_warning(n)),
+                Ok(Err(_)) => return,
+                Err(_) => {
+                    self.dropped.fetch_add(n, Ordering::Relaxed);
                 }
+            }
+        }
+        match tokio::time::timeout_at(deadline, self.tx.reserve()).await {
+            Ok(Ok(permit)) => permit.send(ev),
+            Ok(Err(_)) => {}
+            Err(_) => {
+                self.dropped.fetch_add(1, Ordering::Relaxed);
             }
         }
     }
@@ -114,15 +162,18 @@ impl EventSink {
         if n == 0 {
             return;
         }
-        let ev = Event::Warning {
-            message: format!(
-                "{n} event{} dropped because the client was not reading events",
-                if n == 1 { " was" } else { "s were" }
-            ),
-        };
-        if self.tx.try_send(ev).is_err() {
+        if self.tx.try_send(dropped_warning(n)).is_err() {
             self.dropped.fetch_add(n, Ordering::Relaxed);
         }
+    }
+}
+
+fn dropped_warning(n: u64) -> Event {
+    Event::Warning {
+        message: format!(
+            "{n} event{} dropped because the client was not reading events",
+            if n == 1 { " was" } else { "s were" }
+        ),
     }
 }
 

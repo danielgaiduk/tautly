@@ -1657,3 +1657,76 @@ async fn a_pin_queued_behind_a_message_reaches_that_turn() {
     let second = serde_json::to_string(&reqs[2].messages).unwrap();
     assert!(second.contains("queued pin"), "{second}");
 }
+
+fn flood(deltas: usize, bash_calls: usize) -> MockTurn {
+    let mut evs: Vec<ProviderEvent> = (0..deltas)
+        .map(|i| ProviderEvent::TextDelta(format!("t{i} ")))
+        .collect();
+    evs.extend((0..bash_calls).map(|i| {
+        call(
+            &format!("b{i}"),
+            "bash",
+            json!({"command": format!("echo {i}")}),
+        )
+    }));
+    evs.push(ProviderEvent::Done {
+        stop: StopReason::ToolUse,
+    });
+    MockTurn::Events(evs)
+}
+
+async fn turn_end_logged_within(engine: &Engine, limit: Duration) {
+    let begin = Instant::now();
+    loop {
+        if records(engine)
+            .iter()
+            .any(|r| matches!(r, SessionRecord::TurnEnd { .. }))
+        {
+            return;
+        }
+        assert!(
+            begin.elapsed() < limit,
+            "TurnEnd not logged within {limit:?} of Cancel"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+#[tokio::test]
+async fn cancel_with_many_pending_calls_and_a_stopped_reader_ends_quickly() {
+    for calls in [40, 80] {
+        let fx = Fx::new();
+        let mock = MockProvider::new(vec![flood(200, calls)]);
+        let run = start(fx.builder(config(Mode::Ask), &mock));
+        // The client never reads `run.events`.
+        run.say("go").await;
+        tokio::time::sleep(Duration::from_millis(1000)).await;
+        run.engine.send(Command::Cancel).await.unwrap();
+        // About 1.2-1.5 s alone (one 1 s grace, then every event drops at once); one second
+        // per pending event before the fix (28 s for 40 calls). The bound leaves room for
+        // fsync latency when the whole suite runs in parallel.
+        turn_end_logged_within(&run.engine, Duration::from_secs(10)).await;
+    }
+}
+
+#[tokio::test]
+async fn a_reader_stalled_after_cancel_still_gets_turn_finished() {
+    let fx = Fx::new();
+    let mock = MockProvider::new(vec![flood(400, 0)]);
+    let mut run = start(fx.builder(config(Mode::Ask), &mock));
+    run.say("go").await;
+    // Past the start-up wait, with the stream blocked on a full channel.
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+    run.engine.send(Command::Cancel).await.unwrap();
+    // A busy client: it reads again only after two seconds.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let events = run.until(|e| matches!(e, Event::TurnFinished { .. })).await;
+    assert_eq!(finish_reason(&events), FinishReason::Cancelled);
+    // The drops are announced right before it.
+    let n = events.len();
+    assert!(
+        matches!(&events[n - 2], Event::Warning { message } if message.contains("dropped")),
+        "{:?}",
+        &events[n.saturating_sub(3)..]
+    );
+}
