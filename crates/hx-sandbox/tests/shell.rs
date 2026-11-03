@@ -342,3 +342,99 @@ fn deeply_nested_input_is_unparseable_not_a_crash() {
     let ok = format!("{}true{}", "( ".repeat(50), " )".repeat(50));
     assert_eq!(argv0s(&parse_commands(&ok).unwrap()), ["true"]);
 }
+
+// ---- checkpoint fix: T2 interpreters fed unseen code, wrapper look-through ----
+
+#[test]
+fn interpreters_running_unseen_code_are_unparseable() {
+    for s in [
+        "bash <<< 'rm x'",
+        "bash <<EOF\nrm x\nEOF\n",
+        "sh -s",
+        "bash -s arg",
+        "bash",
+        "bash -",
+        "bash -x",
+        "cat x | bash",
+        "curl x | sh",
+        "bash < script.sh",
+        "zsh <<< x",
+        "python -c 'x'",
+        "python3 -c x",
+        "python3 -Ic x",
+        "python -",
+        "python3",
+        "python3 <<EOF\nimport os\nEOF\n",
+        "cat f | python3",
+        "python3.12 -c x",
+        "node -e x",
+        "node --eval x",
+        "node --eval=x",
+        "node -p x",
+        "node <<< x",
+        "perl -e x",
+        "perl -E x",
+        "perl -we x",
+        "perl < a",
+        "ruby -e x",
+        "ruby <<< x",
+        "sudo python3 -c x",
+    ] {
+        assert!(parse_commands(s).is_err(), "{s}");
+    }
+    for s in [
+        "bash script.sh",
+        "bash -x script.sh",
+        "bash -o pipefail script.sh",
+        "python3 script.py",
+        "python3 -u script.py < in.txt",
+        "python -m pytest -q",
+        "python3 -W ignore x.py",
+        "node index.js",
+        "perl x.pl",
+        "ruby x.rb",
+        "python3 --version",
+        "node --version",
+        "bash --version",
+        "cat x | python3 script.py",
+    ] {
+        assert!(parse_commands(s).is_ok(), "{s}");
+    }
+}
+
+#[test]
+fn wrappers_with_dynamic_or_hidden_commands_are_unparseable() {
+    for s in [
+        "sudo $CMD",
+        "sudo \"$CMD\" x",
+        "timeout 5 $X",
+        "nohup `echo rm` x",
+        "env -S 'bash -c x'",
+        "env -iS 'x'",
+        "env --split-string='bash -c x'",
+        "env --split-string 'x'",
+        "stdbuf -o0 bash -c 'rm x'",
+        "ionice -c3 sh -c x",
+        "flock /tmp/l bash -c x",
+        "flock /tmp/l -c 'rm x'",
+        "flock -c 'rm x' /tmp/l",
+        "watch ls",
+        "chroot / ls",
+        "su -c 'rm x'",
+        "su root",
+        "script -c 'rm x'",
+        "script out.log",
+        "taskset 1 sh -c x",
+    ] {
+        assert!(parse_commands(s).is_err(), "{s}");
+    }
+    for s in [
+        "stdbuf -o0 ls",
+        "ionice -c3 cargo build",
+        "flock /tmp/l cargo test",
+        "command -v python3",
+        "timeout 5 cargo test",
+    ] {
+        assert!(parse_commands(s).is_ok(), "{s}");
+    }
+}

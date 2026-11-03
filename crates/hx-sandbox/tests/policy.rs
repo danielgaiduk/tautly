@@ -469,3 +469,18 @@ fn hidden_arithmetic_substitution_is_not_allowlisted() {
         assert!(asks(p.decide("bash", &exec("echo"), Some(cmd))), "{cmd}");
     }
 }
+
+// --- checkpoint fix: T2 ---
+#[test]
+fn unseen_scripts_and_dynamic_wrappers_ask_in_yolo() {
+    let y = with_rules(Mode::Yolo, &[], &["bash(rm -rf*)"]);
+    for cmd in [
+        "bash <<< 'rm x'",
+        "env -S 'bash -c x'",
+        "sudo $CMD",
+        "stdbuf -o0 bash -c 'rm x'",
+        "python3 -c 'import os'",
+    ] {
+        assert!(asks(y.decide("bash", &exec("x"), Some(cmd))), "{cmd}");
+    }
+}

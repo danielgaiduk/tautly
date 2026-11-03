@@ -678,43 +678,237 @@ pub(crate) fn is_dangerous_env(name: &str) -> bool {
         || DANGEROUS_ENV_PREFIXES.iter().any(|p| upper.starts_with(p))
 }
 
+/// Commands that run the rest of their argv as another command. We look through
+/// them conservatively: any later word may be the inner command.
 const WRAPPERS: &[&str] = &[
-    "sudo", "doas", "env", "command", "builtin", "exec", "nohup", "time", "xargs", "nice",
-    "timeout", "setsid", "find",
+    "sudo",
+    "doas",
+    "env",
+    "command",
+    "builtin",
+    "exec",
+    "nohup",
+    "time",
+    "xargs",
+    "nice",
+    "timeout",
+    "setsid",
+    "find",
+    "stdbuf",
+    "ionice",
+    "flock",
+    "taskset",
+    "chrt",
+    "numactl",
+    "unbuffer",
+    "caffeinate",
+    "pkexec",
+    "runuser",
+    "strace",
+    "ltrace",
+    "busybox",
+    "nsenter",
+    "unshare",
+    "firejail",
 ];
+
+/// Commands that run their arguments through a shell (`watch`, `su -c`, `script -c`)
+/// or start a shell that reads unseen input (`su`, `script`, `chroot` without a command).
+const SHELL_RUNNERS: &[&str] = &["watch", "su", "script", "chroot"];
+
+const SHELLS: &[&str] = &[
+    "bash", "sh", "zsh", "dash", "ksh", "ash", "mksh", "fish", "csh", "tcsh",
+];
+
+/// How an interpreter's command line names the code it runs.
+struct Interp {
+    shell: bool,
+    /// Short flags whose value is inline code.
+    inline: &'static str,
+    /// Long options whose value is inline code.
+    inline_long: &'static [&'static str],
+    /// Short flags that take a (non-code) value.
+    value_opts: &'static str,
+    /// Long options that take a separate (non-code) value.
+    long_value: &'static [&'static str],
+    /// Short flag whose value is a module to run (`python -m`), an analyzable operand.
+    module: Option<char>,
+    /// Words that only print information and exit.
+    info: &'static [&'static str],
+}
+
+fn interp(name: &str) -> Option<Interp> {
+    let versioned = |prefix: &str| {
+        name.strip_prefix(prefix)
+            .is_some_and(|v| v.chars().all(|c| c.is_ascii_digit() || c == '.'))
+    };
+    Some(if SHELLS.contains(&name) {
+        Interp {
+            shell: true,
+            inline: "c",
+            inline_long: &["--command"],
+            value_opts: "oO",
+            long_value: &["--rcfile", "--init-file"],
+            module: None,
+            info: &["--version", "--help"],
+        }
+    } else if versioned("python") || versioned("pypy") {
+        Interp {
+            shell: false,
+            inline: "c",
+            inline_long: &[],
+            value_opts: "WX",
+            long_value: &[],
+            module: Some('m'),
+            info: &["--version", "--help", "-V", "-h"],
+        }
+    } else if matches!(name, "node" | "nodejs") {
+        Interp {
+            shell: false,
+            inline: "ep",
+            inline_long: &["--eval", "--print"],
+            value_opts: "r",
+            long_value: &["--require", "--import", "--loader"],
+            module: None,
+            info: &["--version", "--help", "-v", "-h"],
+        }
+    } else if name == "perl" || versioned("perl") {
+        Interp {
+            shell: false,
+            inline: "eE",
+            inline_long: &[],
+            value_opts: "",
+            long_value: &[],
+            module: None,
+            info: &["--version", "--help", "-v", "-V", "-h"],
+        }
+    } else if name == "ruby" || versioned("ruby") {
+        Interp {
+            shell: false,
+            inline: "e",
+            inline_long: &[],
+            value_opts: "CIrE",
+            long_value: &[],
+            module: None,
+            info: &["--version", "--help", "-v", "-h"],
+        }
+    } else {
+        return None;
+    })
+}
+
+/// Why an interpreter invocation runs code we cannot see: inline code (`-c`,
+/// `-e`), or a script read from stdin (`-s`, `-`, or no script operand at all,
+/// which covers heredocs, herestrings, `<` redirects and pipes).
+fn interpreter_reason(a: &[String]) -> Option<&'static str> {
+    let spec = interp(base(&a[0]))?;
+    let inline = Some("runs inline code");
+    let stdin = Some("reads its script from stdin");
+    let mut it = a[1..].iter();
+    while let Some(w) = it.next() {
+        if spec.info.contains(&w.as_str()) {
+            return None;
+        }
+        if w == "-" {
+            return stdin;
+        }
+        if w == "--" {
+            return if it.next().is_some() { None } else { stdin };
+        }
+        if let Some(long) = w.strip_prefix("--") {
+            let (key, value) = match long.split_once('=') {
+                Some((k, _)) => (k, true),
+                None => (long, false),
+            };
+            let key = format!("--{key}");
+            if spec.inline_long.contains(&key.as_str()) {
+                return inline;
+            }
+            if spec.long_value.contains(&key.as_str()) && !value {
+                it.next();
+            }
+            continue;
+        }
+        let cluster = w
+            .strip_prefix('-')
+            .or_else(|| w.strip_prefix('+').filter(|_| spec.shell));
+        let Some(cluster) = cluster else {
+            return None; // the script operand
+        };
+        for (i, ch) in cluster.char_indices() {
+            if spec.inline.contains(ch) {
+                return inline;
+            }
+            if spec.shell && ch == 's' {
+                return stdin;
+            }
+            if spec.module == Some(ch) {
+                return None;
+            }
+            if spec.value_opts.contains(ch) {
+                if cluster[i + ch.len_utf8()..].is_empty() {
+                    it.next();
+                }
+                break;
+            }
+        }
+    }
+    stdin
+}
 
 fn base(s: &str) -> &str {
     s.rsplit('/').next().unwrap_or(s)
 }
 
-/// Reject commands that execute strings we cannot see, directly or through a
+/// Reject commands that execute code we cannot see, directly or through a
 /// wrapper (wrapper argv is kept as written; we only look through it).
 fn reject_unanalyzable(argv: &[String]) -> Result<(), Unparseable> {
     if argv[0].contains('$') || argv[0].contains('`') {
         return Err(Unparseable(format!("dynamic command name `{}`", argv[0])));
     }
-    let bad = |a: &[String]| -> bool {
-        match base(&a[0]) {
-            "eval" | "source" | "." | "trap" | "coproc" => true,
-            "bash" | "sh" | "zsh" | "dash" | "ksh" => a[1..].iter().any(|x| {
-                x == "--command"
-                    || (!x.starts_with("--")
-                        && (x.starts_with('-') || x.starts_with('+'))
-                        && x.contains('c'))
-            }),
-            _ => false,
+    let single_dash =
+        |w: &String, flag: char| w.starts_with('-') && !w.starts_with("--") && w.contains(flag);
+    let bad = |a: &[String]| -> Option<&'static str> {
+        let name = base(&a[0]);
+        match name {
+            "eval" | "source" | "." | "trap" | "coproc" => Some("runs a string as code"),
+            _ if SHELL_RUNNERS.contains(&name) => Some("runs its arguments through a shell"),
+            "env"
+                if a[1..]
+                    .iter()
+                    .any(|w| w.starts_with("--split-string") || single_dash(w, 'S')) =>
+            {
+                Some("splits a string into a command")
+            }
+            "flock"
+                if a[1..]
+                    .iter()
+                    .any(|w| w.starts_with("--command") || single_dash(w, 'c')) =>
+            {
+                Some("runs its arguments through a shell")
+            }
+            _ => interpreter_reason(a),
         }
     };
-    let wrapped = WRAPPERS.contains(&base(&argv[0]));
-    // Conservative: through a wrapper, any later word may be the inner command.
-    let found = bad(argv) || (wrapped && (1..argv.len()).any(|i| bad(&argv[i..])));
-    if found {
-        Err(Unparseable(format!(
-            "`{}` runs code that cannot be statically analyzed",
-            argv.join(" ")
-        )))
-    } else {
-        Ok(())
+    let found = bad(argv).or_else(|| {
+        let name = base(&argv[0]);
+        // `command -v x` only looks `x` up.
+        let lookup = name == "command"
+            && argv[1..]
+                .iter()
+                .any(|w| single_dash(w, 'v') || single_dash(w, 'V'));
+        if !WRAPPERS.contains(&name) || lookup {
+            return None;
+        }
+        if argv[1..].iter().any(|w| w.contains(['$', '`'])) {
+            return Some("may run a dynamic command");
+        }
+        // Conservative: through a wrapper, any later word may be the inner command.
+        (1..argv.len()).find_map(|i| bad(&argv[i..]))
+    });
+    match found {
+        Some(why) => Err(Unparseable(format!("`{}` {why}", argv.join(" ")))),
+        None => Ok(()),
     }
 }
 
