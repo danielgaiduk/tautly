@@ -165,9 +165,11 @@ impl Context {
 
     /// Pin `text` mid-session: it joins [`session_pins`](Self::session_pins) and is shown
     /// in the state tail until the next cache epoch. False when the same text is already
-    /// pinned. Refused when empty or over [`pinned::MAX_PIN_BYTES`] (trimmed); the `pin`
-    /// tool refuses the same, so the model gets the error as its tool result. Session-start
-    /// pins (config, AGENTS.md, the user's startup pins) go into `pinned` directly.
+    /// pinned. Refused when empty or over [`pinned::MAX_PIN_BYTES`] (trimmed), which the
+    /// `pin` tool refuses as well, and when [`pinned::MAX_SESSION_PINS`] session pins are
+    /// already waiting. The `pin` tool cannot know the count, so the engine reports a
+    /// refused model pin back to the model (as that call's result). Session-start pins
+    /// (config, AGENTS.md, the user's startup pins) go into `pinned` directly.
     pub fn pin(&mut self, text: impl Into<String>, source: PinSource) -> Result<bool, PinError> {
         let text = text.into();
         let bytes = text.trim().len();
@@ -188,14 +190,21 @@ impl Context {
         {
             return Ok(false);
         }
+        if self.session_pins.len() >= pinned::MAX_SESSION_PINS {
+            return Err(PinError::TooMany {
+                max: pinned::MAX_SESSION_PINS,
+            });
+        }
         self.session_pins.push(Pinned::new(text, source));
         Ok(true)
     }
 
     /// Move the session pins into `pinned`, where they become part of the cached prefix.
-    /// That rewrites the first message and so the whole cached history: the engine calls
-    /// this only when it applies a cache epoch anyway (a collection or compaction the
-    /// scheduler allowed, or a cold cache), never on its own. True when anything moved.
+    /// That rewrites the first message and so the whole cached history, so the engine calls
+    /// this only at a step start where nothing cached is lost or the prefix breaks anyway:
+    /// when it applies a collection or compaction the scheduler allowed, and whenever the
+    /// cache is cold ([`MutationReason::ColdCache`]: no request within the cache's TTL),
+    /// even if nothing else is applied then. True when anything moved.
     pub fn fold_session_pins(&mut self) -> bool {
         if self.session_pins.is_empty() {
             return false;

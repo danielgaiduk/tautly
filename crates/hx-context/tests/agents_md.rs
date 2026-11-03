@@ -210,17 +210,107 @@ fn fifo_in_an_ancestor_is_skipped_promptly() {
 }
 
 #[test]
-fn ancestor_may_link_anywhere_but_must_be_a_regular_file() {
+fn ancestor_may_link_within_its_own_directory() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("root");
-    let elsewhere = dir.path().join("elsewhere");
+    let dotfiles = dir.path().join("dotfiles");
     std::fs::create_dir(&root).unwrap();
-    std::fs::create_dir(&elsewhere).unwrap();
-    std::fs::write(elsewhere.join("mine.md"), "the user's own notes\n").unwrap();
-    // Above the root the files are the user's own: a link out of the root is fine there.
-    std::os::unix::fs::symlink(elsewhere.join("mine.md"), dir.path().join("AGENTS.md")).unwrap();
+    std::fs::create_dir(&dotfiles).unwrap();
+    std::fs::write(dotfiles.join("mine.md"), "the user's own notes\n").unwrap();
+    // A stow-style link that stays under the directory holding the AGENTS.md.
+    std::os::unix::fs::symlink(dotfiles.join("mine.md"), dir.path().join("AGENTS.md")).unwrap();
     let found = load(&root);
     assert_eq!(found.text.as_deref(), Some("the user's own notes"));
+    assert!(found.warnings.is_empty(), "{:?}", found.warnings);
+}
+
+#[test]
+fn ancestor_link_out_of_its_directory_is_refused() {
+    // `git clone evil && cd evil/pkg && hx`: the clone's top-level AGENTS.md is an
+    // "ancestor" of the root but just as repository-controlled.
+    let dir = tempfile::tempdir().unwrap();
+    let clone = dir.path().join("clone");
+    let root = clone.join("pkg");
+    let home_secret = dir.path().join("home_secret");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::create_dir_all(clone.join(".git")).unwrap();
+    std::fs::create_dir(&home_secret).unwrap();
+    std::fs::write(
+        home_secret.join("credentials"),
+        "fake_key = TEST-NOT-A-SECRET\n",
+    )
+    .unwrap();
+    std::os::unix::fs::symlink("../home_secret/credentials", clone.join("AGENTS.md")).unwrap();
+    std::fs::write(root.join("AGENTS.md"), "package notes\n").unwrap();
+
+    let found = load(&root);
+    let text = found.text.unwrap_or_default();
+    assert!(!text.contains("TEST-NOT-A-SECRET"), "{text}");
+    assert_eq!(text, "package notes");
+    assert!(
+        found
+            .warnings
+            .iter()
+            .any(|w| w.contains("outside the directory")),
+        "{:?}",
+        found.warnings
+    );
+}
+
+#[test]
+fn in_root_link_to_a_protected_path_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join(".git")).unwrap();
+    std::fs::write(
+        dir.path().join(".git").join("config"),
+        "[remote \"origin\"]\n\turl = https://TEST-TOKEN@example.invalid/x.git\n",
+    )
+    .unwrap();
+    std::os::unix::fs::symlink(".git/config", dir.path().join("AGENTS.md")).unwrap();
+    let found = load(dir.path());
+    assert_eq!(found.text, None, "{found:?}");
+    assert!(
+        found.warnings.iter().any(|w| w.contains("protected")),
+        "{:?}",
+        found.warnings
+    );
+}
+
+#[test]
+fn rules_pins_are_capped_each_and_in_total() {
+    let dir = tempfile::tempdir().unwrap();
+    let section = |c: char| format!("## Rules\n{}\n", c.to_string().repeat(3_000));
+    std::fs::write(
+        dir.path().join("AGENTS.md"),
+        format!("intro\n{}{}{}", section('a'), section('b'), section('c')),
+    )
+    .unwrap();
+    let found = load(dir.path());
+    // The full sections stay in the <agents_md> text.
+    assert!(found.text.as_ref().unwrap().contains(&"c".repeat(3_000)));
+    // Pins: 2 KB each at most, 4 KB together; the third does not fit.
+    assert_eq!(
+        found.pins.len(),
+        2,
+        "{:?}",
+        found.pins.iter().map(|p| p.text.len()).collect::<Vec<_>>()
+    );
+    for p in &found.pins {
+        assert!(p.text.starts_with(&"a".repeat(10)) || p.text.starts_with(&"b".repeat(10)));
+        assert!(
+            p.text.contains("truncated"),
+            "{}",
+            &p.text[p.text.len() - 80..]
+        );
+        assert!(p.text.len() <= 2_048 + 100, "{}", p.text.len());
+    }
+    let pinned: usize = found.pins.iter().map(|p| p.text.len()).sum();
+    assert!(pinned <= 4_096 + 200, "{pinned}");
+    assert!(
+        found.warnings.iter().any(|w| w.contains("pinned")),
+        "{:?}",
+        found.warnings
+    );
 }
 
 #[test]

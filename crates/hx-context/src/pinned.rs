@@ -2,6 +2,10 @@
 
 pub use hx_tools::MAX_PIN_BYTES;
 
+/// Most pins waiting in the state tail ([`Context::session_pins`](crate::Context::session_pins)).
+/// They are uncached on every request until folded, so their number is bounded.
+pub const MAX_SESSION_PINS: usize = 20;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PinSource {
     User,
@@ -46,6 +50,13 @@ pub enum PinError {
     /// can mean something else.
     #[error("the pin is {bytes} bytes; a pin holds at most {max} bytes")]
     TooLong { bytes: usize, max: usize },
+    /// [`MAX_SESSION_PINS`] pins were added this session; more are refused until the
+    /// engine folds them into `<pinned>` at the next cache epoch.
+    #[error(
+        "{max} pins were added this session already; no more until they move into <pinned> \
+         at the next context reorganization"
+    )]
+    TooMany { max: usize },
 }
 
 /// Add a pin unless an identical text is already pinned.

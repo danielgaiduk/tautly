@@ -351,3 +351,22 @@ fn compaction_prompt_attributes_requirements_to_user_turns_only() {
     assert!(sys.contains("[user]"), "{sys}");
     assert!(sys.to_lowercase().contains("tool result"), "{sys}");
 }
+
+#[test]
+fn session_pins_are_capped_in_count_until_folded() {
+    let mut c = Context::default();
+    for i in 0..20 {
+        assert_eq!(c.pin(format!("rule {i}"), PinSource::Model), Ok(true));
+    }
+    assert_eq!(
+        c.pin("one more", PinSource::Model),
+        Err(PinError::TooMany { max: 20 })
+    );
+    assert!(c.apply_op(ContextOp::Pin("one more".into())).is_err());
+    assert_eq!(c.session_pins.len(), 20);
+    // A duplicate is still just a no-op.
+    assert_eq!(c.pin("rule 3", PinSource::Model), Ok(false));
+    // Folding at the next epoch makes room again.
+    assert!(c.fold_session_pins());
+    assert_eq!(c.pin("one more", PinSource::Model), Ok(true));
+}

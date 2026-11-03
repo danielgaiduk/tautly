@@ -4,7 +4,7 @@ use std::io::Read;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
-use hx_sandbox::{Sandbox, SandboxError};
+use hx_sandbox::{Sandbox, SandboxError, is_protected};
 
 use crate::pinned::{self, PinSource, Pinned};
 
@@ -23,6 +23,9 @@ pub struct AgentsMd {
 pub const MAX_FILE_BYTES: usize = 32 * 1024;
 /// Bytes kept of all AGENTS.md files together (about 16k tokens).
 pub const MAX_TOTAL_BYTES: usize = 64 * 1024;
+/// Bytes of all pinned `Rules` / `Constraints` sections together; each one is also capped
+/// at [`pinned::MAX_PIN_BYTES`]. The full sections stay in the `<agents_md>` text.
+pub const MAX_PINNED_BYTES: usize = 4 * 1024;
 
 /// AGENTS.md files from the sandbox root up to the filesystem root, concatenated outermost
 /// first (the nearest file is last), and a pin for each `Constraints` / `Rules` section.
@@ -34,12 +37,18 @@ pub const MAX_TOTAL_BYTES: usize = 64 * 1024;
 /// - The root's `AGENTS.md` is resolved through the sandbox (the policy's resolver), so a
 ///   link inside the repository (`AGENTS.md -> docs/agents.md`) works and a link out of it
 ///   is refused with a warning.
-/// - Every file is opened without blocking (a FIFO cannot hang start-up) and must be a
-///   regular file (no devices); the root's is opened `O_NOFOLLOW` after resolving.
-///   Files in directories above the root are the user's own and may be links.
+/// - An `AGENTS.md` above the root may be a link only to a file under the directory that
+///   holds it (stow-style `~/AGENTS.md -> ~/dotfiles/AGENTS.md`): when hx starts in a
+///   subdirectory of a clone, the clone's top-level file is just as repository-controlled.
+/// - A link whose target is a protected path (`.git/config`, `.hx/...`; relative to the
+///   directory holding the file) is refused with a warning.
+/// - Every file is opened `O_NOFOLLOW` (after resolving) and without blocking (a FIFO
+///   cannot hang start-up), and must be a regular file (no devices).
 /// - Each file is cut to [`MAX_FILE_BYTES`] and all of them together to
 ///   [`MAX_TOTAL_BYTES`], nearest files first; a cut file ends in
 ///   `[AGENTS.md truncated at N KB]` and adds a warning.
+/// - Each pinned section is cut to [`pinned::MAX_PIN_BYTES`] and all of them together to
+///   [`MAX_PINNED_BYTES`], nearest files first, with a marker and a warning.
 pub fn load(sb: &dyn Sandbox) -> AgentsMd {
     let root = sb.root();
     let mut warnings = Vec::new();
@@ -47,7 +56,9 @@ pub fn load(sb: &dyn Sandbox) -> AgentsMd {
     let mut found: Vec<(PathBuf, String)> = Vec::new();
     match sb.resolve(Path::new(FILE_NAME)) {
         Ok(path) => {
-            if let Some(text) = read_capped(&path, true, &mut warnings) {
+            if !refuse_protected(root, &path, &mut warnings)
+                && let Some(text) = read_capped(&path, &mut warnings)
+            {
                 found.push((path, text));
             }
         }
@@ -62,20 +73,39 @@ pub fn load(sb: &dyn Sandbox) -> AgentsMd {
     }
     for dir in root.ancestors().skip(1) {
         let path = dir.join(FILE_NAME);
-        if let Some(text) = read_capped(&path, false, &mut warnings) {
+        let target = match std::fs::canonicalize(&path) {
+            Ok(t) => t,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                warnings.push(format!("{} could not be resolved: {e}", path.display()));
+                continue;
+            }
+        };
+        // `dir` is canonical: the ancestors of the canonical root.
+        if !target.starts_with(dir) {
+            warnings.push(format!(
+                "{} links outside the directory that holds it; it was not loaded",
+                path.display()
+            ));
+            continue;
+        }
+        if refuse_protected(dir, &target, &mut warnings) {
+            continue;
+        }
+        if let Some(text) = read_capped(&target, &mut warnings) {
             found.push((path, text));
         }
     }
 
     // The total cap, spent on the nearest files first.
     let mut left = MAX_TOTAL_BYTES;
-    let mut kept: Vec<String> = Vec::new();
+    let mut kept: Vec<(PathBuf, String)> = Vec::new();
     for (path, text) in found {
         if text.len() <= left {
             left -= text.len();
-            kept.push(text);
+            kept.push((path, text));
         } else if left > 0 {
-            kept.push(truncate(&text, left));
+            kept.push((path.clone(), truncate(&text, left)));
             left = 0;
             warnings.push(format!(
                 "{} was truncated: all AGENTS.md files together are capped at {} KB",
@@ -90,15 +120,49 @@ pub fn load(sb: &dyn Sandbox) -> AgentsMd {
             ));
         }
     }
-    kept.reverse();
 
-    let mut pins = Vec::new();
-    for body in kept.iter().flat_map(|text| pinned_sections(text)) {
-        pinned::add(&mut pins, Pinned::new(body, PinSource::AgentsMd));
+    // Pins, spent on the nearest files first like the text; outermost first again after.
+    let mut left = MAX_PINNED_BYTES;
+    let mut pins: Vec<Pinned> = Vec::new();
+    for (path, text) in &kept {
+        let mut file_pins = Vec::new();
+        for body in pinned_sections(text) {
+            if pins
+                .iter()
+                .chain(&file_pins)
+                .any(|p: &Pinned| p.text == body)
+            {
+                continue;
+            }
+            let cap = left.min(pinned::MAX_PIN_BYTES);
+            if cap == 0 {
+                warnings.push(format!(
+                    "a Rules/Constraints section of {} was not pinned: pinned AGENTS.md \
+                     sections are capped at {} KB together (it is still in the AGENTS.md text)",
+                    path.display(),
+                    MAX_PINNED_BYTES / 1024
+                ));
+                continue;
+            }
+            let body = if body.len() > cap {
+                warnings.push(format!(
+                    "a Rules/Constraints section of {} was pinned only in part ({cap} bytes; \
+                     the full section is in the AGENTS.md text)",
+                    path.display()
+                ));
+                cut_pin(&body, cap)
+            } else {
+                body
+            };
+            left = left.saturating_sub(body.len());
+            file_pins.push(Pinned::new(body, PinSource::AgentsMd));
+        }
+        pins.splice(0..0, file_pins);
     }
+    kept.reverse();
     let text = (!kept.is_empty()).then(|| {
         kept.iter()
-            .map(|t| t.trim())
+            .map(|(_, t)| t.trim())
             .collect::<Vec<_>>()
             .join("\n\n")
     });
@@ -109,17 +173,43 @@ pub fn load(sb: &dyn Sandbox) -> AgentsMd {
     }
 }
 
-/// The text of the AGENTS.md at `path`, cut to [`MAX_FILE_BYTES`]; None when it is
-/// missing, empty or unusable (with a warning unless it is simply missing). `nofollow`
-/// refuses a symlink at `path` itself. Never blocks on a FIFO, never reads a device.
-fn read_capped(path: &Path, nofollow: bool, warnings: &mut Vec<String>) -> Option<String> {
-    let mut flags = libc::O_NONBLOCK;
-    if nofollow {
-        flags |= libc::O_NOFOLLOW;
+/// Whether `target` (resolved, under `base`) is a protected path relative to `base`; if so
+/// a warning says it was refused.
+fn refuse_protected(base: &Path, target: &Path, warnings: &mut Vec<String>) -> bool {
+    let Ok(rel) = target.strip_prefix(base) else {
+        return false;
+    };
+    if !is_protected(rel) {
+        return false;
     }
+    warnings.push(format!(
+        "{} resolves to the protected path {}; it was not loaded",
+        base.join(FILE_NAME).display(),
+        rel.display()
+    ));
+    true
+}
+
+/// `body` cut at a character boundary to at most `max` bytes, with a marker.
+fn cut_pin(body: &str, max: usize) -> String {
+    let mut end = max.min(body.len());
+    while !body.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!(
+        "{}\n[pinned section truncated at {end} bytes; the full section is in <agents_md>]",
+        body[..end].trim_end()
+    )
+}
+
+/// The text of the AGENTS.md at `path` (already resolved), cut to [`MAX_FILE_BYTES`];
+/// None when it is missing, empty or unusable (with a warning unless it is simply
+/// missing). Opened `O_NOFOLLOW`, so a link swapped in after resolving is refused. Never
+/// blocks on a FIFO, never reads a device.
+fn read_capped(path: &Path, warnings: &mut Vec<String>) -> Option<String> {
     let file = match std::fs::OpenOptions::new()
         .read(true)
-        .custom_flags(flags)
+        .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW)
         .open(path)
     {
         Ok(f) => f,
