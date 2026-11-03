@@ -841,6 +841,8 @@ proptest! { #[test] fn apply_then_inverse_restores(text in "[a-z\\n]{1,200}", ..
 
 ### Task 28: Memory in the engine
 
+**Task 24 re-review note (binding):** emit `MemoryProposed` through the turn's bound event sink (which waits on a full channel), never the actor's best-effort sink, so an interactive client never misses a proposal.
+
 **Task 22 note (binding):** call `MemoryStore::refresh_staleness()` once the index is ready and before building the first memory index block (the engine awaits it for ~300 ms before the first `assemble`; on timeout the slot stays empty for the session); route `ContextOp::Remember` to the approval flow only when the `remember` result is not an error. Surface `MemoryStore::skipped_count()` and `staleness_error()` to the user (status line or warning event) at session start.
 
 **Task 19 review note (binding):** the memory index lives in the cached system prefix, so `[stale]` flags and index content change only at session start, inside a cache epoch chosen by the scheduler (spec 7.7), when `decide` returns `ColdCache`, or when a new user turn starts with a cold cache; never while the cache is warm. `MemoryStore::refresh_staleness` and `apply` change engine-visible state (also called by `RecallTool` and `ApproveMemory`), so their results are held as pending text and never rendered into `Context` directly.
