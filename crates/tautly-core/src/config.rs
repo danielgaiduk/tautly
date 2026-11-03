@@ -4,7 +4,8 @@
 //!
 //! The project file is repository content, so it is untrusted: it cannot set `providers`,
 //! `telemetry`, `approve_memory`, `catalog_overrides` or `routing`, and in `permissions` it
-//! can only lower the mode and add `deny` rules. Dropped settings come back as
+//! can only lower the mode and add `deny` rules; `budget`, `max_turns` and `turn_timeout_s`
+//! can only go down. Dropped settings come back as
 //! [`LoadedConfig::warnings`]. Command-line flags are the user's own and override all.
 
 use std::collections::HashSet;
@@ -474,6 +475,35 @@ fn restrict_project_layer(
         }
     }
 
+    // Limits only get lower: against the default, or what the user set.
+    let loosening = "a project config can only lower this limit";
+    for (key, default) in [("max_turns", Some(100.0)), ("turn_timeout_s", None)] {
+        if !tightens(layer, Some(so_far), key, default) {
+            layer.remove(key);
+            ignore(key, loosening);
+        }
+    }
+    for scope in ["turn", "session"] {
+        let Some(Value::Table(project)) = layer
+            .get_mut("budget")
+            .and_then(Value::as_table_mut)
+            .and_then(|b| b.get_mut(scope))
+        else {
+            continue;
+        };
+        let user = so_far
+            .get("budget")
+            .and_then(Value::as_table)
+            .and_then(|b| b.get(scope))
+            .and_then(Value::as_table);
+        for key in ["max_usd", "max_tokens"] {
+            if !tightens(project, user, key, None) {
+                project.remove(key);
+                ignore(&format!("budget.{scope}.{key}"), loosening);
+            }
+        }
+    }
+
     let Some(Value::Table(perms)) = layer.get_mut("permissions") else {
         return;
     };
@@ -520,6 +550,21 @@ fn restrict_project_layer(
         }
         *project_deny = deny;
     }
+}
+
+/// Whether `project[key]` is absent or at most the value `user` sets (else `default`);
+/// no current value means unlimited, so any project value tightens.
+fn tightens(project: &Table, user: Option<&Table>, key: &str, default: Option<f64>) -> bool {
+    let number = |v: &Value| match v {
+        Value::Integer(i) => Some(*i as f64),
+        Value::Float(f) => Some(*f),
+        _ => None,
+    };
+    let Some(wanted) = project.get(key).and_then(number) else {
+        return true;
+    };
+    let current = user.and_then(|t| t.get(key)).and_then(number).or(default);
+    current.is_none_or(|c| wanted <= c)
 }
 
 /// How much a mode asks of the user: higher is stricter.

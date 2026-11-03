@@ -754,3 +754,121 @@ allow = ["bash(*)"]
         (Mode::Yolo, &["bash(*)".to_string()][..])
     );
 }
+
+// ---- project limits are tighten-only ----
+
+const USER_LIMITS: &str = r#"
+max_turns = 50
+turn_timeout_s = 600
+[budget.turn]
+max_usd = 1.0
+max_tokens = 20000
+[budget.session]
+max_usd = 5.0
+max_tokens = 1000000
+"#;
+
+#[test]
+fn project_cannot_loosen_budget_or_limits() {
+    let f = Fixture::new();
+    f.user(USER_LIMITS);
+    f.project(
+        r#"
+max_turns = 80
+turn_timeout_s = 900
+[budget.turn]
+max_usd = 2
+max_tokens = 40000
+[budget.session]
+max_usd = 10.0
+max_tokens = 2000000
+"#,
+    );
+    let loaded = f.load_full(CliOverrides::default()).unwrap();
+    let c = &loaded.config;
+    assert_eq!((c.max_turns, c.turn_timeout_s), (50, Some(600)));
+    assert_eq!(
+        (c.budget.turn.max_usd, c.budget.turn.max_tokens),
+        (Some(1.0), Some(20_000))
+    );
+    assert_eq!(
+        (c.budget.session.max_usd, c.budget.session.max_tokens),
+        (Some(5.0), Some(1_000_000))
+    );
+    for key in [
+        "max_turns",
+        "turn_timeout_s",
+        "budget.turn.max_usd",
+        "budget.turn.max_tokens",
+        "budget.session.max_usd",
+        "budget.session.max_tokens",
+    ] {
+        assert!(
+            loaded
+                .warnings
+                .iter()
+                .any(|w| w.contains(&format!("`{key}`"))),
+            "no warning for {key}: {:?}",
+            loaded.warnings
+        );
+    }
+    assert_eq!(loaded.warnings.len(), 6, "{:?}", loaded.warnings);
+}
+
+#[test]
+fn project_can_lower_budget_and_limits_and_equal_is_fine() {
+    let f = Fixture::new();
+    f.user(USER_LIMITS);
+    f.project(
+        r#"
+max_turns = 20
+turn_timeout_s = 600
+[budget.turn]
+max_usd = 0.5
+[budget.session]
+max_usd = 5.0
+max_tokens = 500000
+"#,
+    );
+    let loaded = f.load_full(CliOverrides::default()).unwrap();
+    assert!(loaded.warnings.is_empty(), "{:?}", loaded.warnings);
+    let c = loaded.config;
+    assert_eq!((c.max_turns, c.turn_timeout_s), (20, Some(600)));
+    assert_eq!(
+        (c.budget.turn.max_usd, c.budget.turn.max_tokens),
+        (Some(0.5), Some(20_000))
+    );
+    assert_eq!(
+        (c.budget.session.max_usd, c.budget.session.max_tokens),
+        (Some(5.0), Some(500_000))
+    );
+}
+
+#[test]
+fn project_limits_are_measured_against_defaults_when_the_user_set_none() {
+    // The default max_turns is 100; "unlimited" budgets and timeout accept any project value.
+    let f = Fixture::new();
+    f.project("max_turns = 150\nturn_timeout_s = 120\n[budget.session]\nmax_usd = 3.0\n");
+    let loaded = f.load_full(CliOverrides::default()).unwrap();
+    assert_eq!(loaded.config.max_turns, 100);
+    assert!(loaded.warnings.iter().any(|w| w.contains("`max_turns`")));
+    assert_eq!(loaded.config.turn_timeout_s, Some(120));
+    assert_eq!(loaded.config.budget.session.max_usd, Some(3.0));
+    assert_eq!(loaded.warnings.len(), 1, "{:?}", loaded.warnings);
+
+    let f = Fixture::new();
+    f.project("max_turns = 30\n");
+    let loaded = f.load_full(CliOverrides::default()).unwrap();
+    assert_eq!(loaded.config.max_turns, 30);
+    assert!(loaded.warnings.is_empty());
+}
+
+#[test]
+fn user_layer_may_set_any_limit() {
+    let f = Fixture::new();
+    f.user("max_turns = 500\nturn_timeout_s = 99999\n[budget.session]\nmax_usd = 1000.0\n");
+    let loaded = f.load_full(CliOverrides::default()).unwrap();
+    assert!(loaded.warnings.is_empty());
+    assert_eq!(loaded.config.max_turns, 500);
+    assert_eq!(loaded.config.budget.session.max_usd, Some(1000.0));
+}
