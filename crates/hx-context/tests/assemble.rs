@@ -1,0 +1,553 @@
+use std::path::PathBuf;
+
+use hx_context::{Context, PinSource, Pinned, STABLE_LEN, TokenEstimator, Turn, agents_md, prompt};
+use hx_provider::{
+    Block, CachePoint, CacheStyle, Capabilities, Content, EditFormat, Message, ModelId,
+    ReasoningStyle, Role, ToolSpec,
+};
+use hx_tools::{AppliedEffect, ContextOp, LineRange, PlanStep, Shown, StatePatch, StepStatus};
+use serde_json::json;
+
+fn caps() -> Capabilities {
+    Capabilities {
+        context_window: 100_000,
+        max_output: 8_000,
+        parallel_tools: true,
+        reasoning: ReasoningStyle::None,
+        cache: CacheStyle::Explicit,
+        images: false,
+        edit_format: EditFormat::StrReplace,
+    }
+}
+
+fn tools() -> Vec<ToolSpec> {
+    ["read", "edit", "bash"]
+        .iter()
+        .map(|n| ToolSpec {
+            name: (*n).into(),
+            description: format!("the {n} tool"),
+            schema: json!({"type": "object"}),
+        })
+        .collect()
+}
+
+fn m() -> ModelId {
+    "anthropic/claude-sonnet".into()
+}
+
+fn ctx() -> Context {
+    Context {
+        agents_md: Some("Use tabs.".into()),
+        memory_index: Some("- m1: a fact".into()),
+        ..Default::default()
+    }
+}
+
+fn turn(text: &str) -> Turn {
+    Turn {
+        messages: vec![Message {
+            role: Role::User,
+            content: vec![Content::Text(text.into())],
+        }],
+    }
+}
+
+fn text_of(b: &Block) -> &str {
+    match b {
+        Block::Text(t) => t,
+        other => panic!("not text: {other:?}"),
+    }
+}
+
+fn content_text(c: &Content) -> &str {
+    match c {
+        Content::Text(t) => t,
+        other => panic!("not text: {other:?}"),
+    }
+}
+
+#[test]
+fn block_order_is_system_tools_agents_memory_pinned_state_history() {
+    let mut c = ctx();
+    c.apply_op(ContextOp::Pin("never drop tables".into()));
+    c.apply_op(ContextOp::StateUpdate(StatePatch {
+        decisions_add: vec!["use sqlite".into()],
+        ..Default::default()
+    }));
+    c.history.push(turn("do the thing"));
+    let (req, _) = c.assemble(&caps(), &tools(), &m());
+
+    assert_eq!(req.system.len(), STABLE_LEN);
+    assert!(text_of(&req.system[0]).starts_with("You are hx"));
+    assert!(text_of(&req.system[1]).contains("Use tabs."));
+    assert!(text_of(&req.system[2]).contains("m1: a fact"));
+    // Tools travel in the tools field, sorted by name for a fixed order.
+    let names: Vec<&str> = req.tools.iter().map(|t| t.name.as_str()).collect();
+    assert_eq!(names, ["bash", "edit", "read"]);
+    // Pinned and state are user content after the prefix, before the history, in that order.
+    let first = &req.messages[0];
+    assert_eq!(first.role, Role::User);
+    let texts: Vec<&str> = first.content.iter().map(content_text).collect();
+    assert_eq!(texts.len(), 3);
+    assert!(texts[0].starts_with("<pinned>") && texts[0].contains("never drop tables"));
+    assert!(texts[1].starts_with("<working_state>") && texts[1].contains("use sqlite"));
+    assert_eq!(texts[2], "do the thing");
+    for blk in &req.system {
+        let t = text_of(blk);
+        assert!(!t.contains("never drop tables") && !t.contains("use sqlite"));
+    }
+}
+
+#[test]
+fn stable_prefix_is_byte_identical_across_turns() {
+    let mut c = ctx();
+    let (a, _) = c.assemble(&caps(), &tools(), &m());
+    c.history.push(turn("hi"));
+    c.apply_op(ContextOp::Pin("x".into()));
+    let (b, _) = c.assemble(&caps(), &tools(), &m());
+    assert_eq!(
+        serde_json::to_vec(&a.system[..STABLE_LEN]).unwrap(),
+        serde_json::to_vec(&b.system[..STABLE_LEN]).unwrap()
+    );
+    // Tools are part of the prefix too.
+    assert_eq!(
+        serde_json::to_vec(&a.tools).unwrap(),
+        serde_json::to_vec(&b.tools).unwrap()
+    );
+}
+
+#[test]
+fn stable_prefix_has_full_length_without_agents_md_or_memory() {
+    let c = Context::default();
+    let (req, _) = c.assemble(&caps(), &tools(), &m());
+    assert_eq!(req.system.len(), STABLE_LEN);
+    for b in &req.system {
+        assert!(!text_of(b).is_empty());
+    }
+}
+
+#[test]
+fn cache_breakpoints_after_stable_prefix_and_last_message() {
+    let mut c = ctx();
+    c.history.push(turn("one"));
+    c.history.push(Turn {
+        messages: vec![
+            Message {
+                role: Role::Assistant,
+                content: vec![Content::Text("two".into())],
+            },
+            Message {
+                role: Role::User,
+                content: vec![Content::Text("three".into())],
+            },
+        ],
+    });
+    let (req, _) = c.assemble(&caps(), &tools(), &m());
+    assert_eq!(req.messages.len(), 3);
+    assert_eq!(
+        req.cache_breakpoints,
+        vec![
+            CachePoint::AfterTools,
+            CachePoint::AfterSystem,
+            CachePoint::AfterMessage(2)
+        ]
+    );
+}
+
+#[test]
+fn cache_breakpoints_skip_absent_parts() {
+    let c = Context::default();
+    let (req, _) = c.assemble(&caps(), &[], &m());
+    assert_eq!(req.cache_breakpoints, vec![CachePoint::AfterSystem]);
+    assert!(req.messages.is_empty());
+}
+
+#[test]
+fn pinned_and_state_prepend_to_first_user_message_or_stand_alone() {
+    let mut c = Context::default();
+    c.pinned.push(Pinned {
+        text: "p".into(),
+        source: PinSource::User,
+    });
+    // History starting with an assistant message: pinned gets its own leading user message.
+    c.history.push(Turn {
+        messages: vec![Message {
+            role: Role::Assistant,
+            content: vec![Content::Text("hello".into())],
+        }],
+    });
+    let (req, _) = c.assemble(&caps(), &[], &m());
+    assert_eq!(req.messages.len(), 2);
+    assert_eq!(req.messages[0].role, Role::User);
+    assert_eq!(req.messages[1].role, Role::Assistant);
+    // The history itself is never mutated.
+    assert_eq!(c.history[0].messages[0].content.len(), 1);
+}
+
+#[test]
+fn system_prompt_under_2000_tokens() {
+    assert!(TokenEstimator::default().estimate(prompt::system()) < 2000);
+}
+
+#[test]
+fn system_prompt_has_no_volatile_text() {
+    let p = prompt::system();
+    assert!(!p.contains("claude") && !p.contains("gpt") && !p.contains("gemini"));
+    assert!(!p.contains("202"));
+}
+
+#[test]
+fn breakdown_sums_to_used() {
+    let mut c = ctx();
+    c.apply_op(ContextOp::Pin("pin me".into()));
+    c.state.task = Some("fix bug".into());
+    c.history.push(turn("a fairly long user message to count"));
+    let (_, st) = c.assemble(&caps(), &tools(), &m());
+    let b = st.breakdown;
+    assert_eq!(
+        st.used,
+        b.system + b.tools + b.agents_md + b.memory + b.pinned + b.state + b.history
+    );
+    assert_eq!(st.budget, 100_000);
+    for part in [
+        b.system,
+        b.tools,
+        b.agents_md,
+        b.memory,
+        b.pinned,
+        b.state,
+        b.history,
+    ] {
+        assert!(part > 0);
+    }
+}
+
+#[test]
+fn history_tokens_count_tool_traffic() {
+    let mut c = Context::default();
+    let (_, empty) = c.assemble(&caps(), &[], &m());
+    c.history.push(Turn {
+        messages: vec![
+            Message {
+                role: Role::Assistant,
+                content: vec![Content::ToolUse {
+                    id: "1".into(),
+                    name: "read".into(),
+                    input: json!({"path": "src/main.rs"}),
+                }],
+            },
+            Message {
+                role: Role::User,
+                content: vec![Content::ToolResult {
+                    id: "1".into(),
+                    output: "x".repeat(4000),
+                    is_error: false,
+                }],
+            },
+        ],
+    });
+    let (_, st) = c.assemble(&caps(), &[], &m());
+    assert_eq!(empty.breakdown.history, 0);
+    assert!(st.breakdown.history >= 1000);
+}
+
+#[test]
+fn pinned_over_10_percent_warns() {
+    let mut c = Context::default();
+    let mut small = caps();
+    small.context_window = 1_000;
+    c.apply_op(ContextOp::Pin("y".repeat(600))); // ~150 tokens: 15% of the window
+    let (_, st) = c.assemble(&small, &[], &m());
+    assert!(
+        st.warnings.iter().any(|w| w.contains("pinned")),
+        "{:?}",
+        st.warnings
+    );
+    let mut ok = Context::default();
+    ok.apply_op(ContextOp::Pin("short".into()));
+    let (_, st) = ok.assemble(&caps(), &[], &m());
+    assert!(st.warnings.is_empty(), "{:?}", st.warnings);
+}
+
+#[test]
+fn near_full_window_warns_at_80_percent() {
+    let mut c = Context::default();
+    let mut small = caps();
+    small.context_window = 4_000;
+    c.history.push(turn(&"w".repeat(13_000)));
+    let (_, st) = c.assemble(&small, &[], &m());
+    assert!(
+        st.warnings.iter().any(|w| w.contains("80%")),
+        "{:?}",
+        st.warnings
+    );
+}
+
+fn read_effect(path: &str, hash: &[u8], shown: Shown) -> AppliedEffect {
+    AppliedEffect::Read {
+        path: PathBuf::from(path),
+        range: LineRange::ALL,
+        file_hash: blake3::hash(hash),
+        shown,
+    }
+}
+
+#[test]
+fn files_list_comes_from_effects_not_model() {
+    let mut c = Context::default();
+    // A model-driven state patch cannot touch the files list.
+    c.apply_op(ContextOp::StateUpdate(StatePatch::default()));
+    assert!(c.state.files.is_empty());
+
+    c.apply_effects(&[AppliedEffect::Edited {
+        path: "/p/a.rs".into(),
+        pre_image: None,
+        pre_mode: None,
+        post_hash: blake3::hash(b"new"),
+    }]);
+    let note = &c.state.files[&PathBuf::from("/p/a.rs")];
+    assert!(note.edited);
+    assert!(!note.deleted);
+    assert_eq!(
+        note.read_hash,
+        Some(blake3::hash(b"new").to_hex().to_string())
+    );
+}
+
+#[test]
+fn read_effect_records_hash_for_any_shown_variant() {
+    let mut c = Context::default();
+    for (i, shown) in [
+        Shown::Full,
+        Shown::Partial,
+        Shown::Unchanged { since: 1 },
+        Shown::Diff { since: 1 },
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let path = format!("/p/f{i}.rs");
+        c.apply_effects(&[read_effect(&path, path.as_bytes(), shown)]);
+        let note = &c.state.files[&PathBuf::from(&path)];
+        assert_eq!(
+            note.read_hash,
+            Some(blake3::hash(path.as_bytes()).to_hex().to_string())
+        );
+        assert!(!note.edited);
+    }
+}
+
+#[test]
+fn delete_clears_edited_and_marks_deleted_and_exec_is_ignored() {
+    let mut c = Context::default();
+    c.apply_effects(&[AppliedEffect::Edited {
+        path: "/p/a.rs".into(),
+        pre_image: None,
+        pre_mode: None,
+        post_hash: blake3::hash(b"x"),
+    }]);
+    c.apply_effects(&[
+        AppliedEffect::Exec { may_write: true },
+        AppliedEffect::Deleted {
+            path: "/p/a.rs".into(),
+            pre_image: b"x".to_vec(),
+            pre_mode: 0o644,
+        },
+    ]);
+    assert_eq!(c.state.files.len(), 1);
+    let note = &c.state.files[&PathBuf::from("/p/a.rs")];
+    assert!(!note.edited);
+    assert!(note.deleted);
+    assert_eq!(note.read_hash, None);
+    // Reading it again (recreated) clears the deleted mark.
+    c.apply_effects(&[read_effect("/p/a.rs", b"y", Shown::Full)]);
+    assert!(!c.state.files[&PathBuf::from("/p/a.rs")].deleted);
+}
+
+#[test]
+fn files_render_root_relative() {
+    let mut c = Context {
+        root: Some("/p".into()),
+        ..Default::default()
+    };
+    c.apply_effects(&[
+        read_effect("/p/src/a.rs", b"a", Shown::Full),
+        AppliedEffect::Deleted {
+            path: "/p/old.rs".into(),
+            pre_image: vec![],
+            pre_mode: 0o644,
+        },
+    ]);
+    let (req, _) = c.assemble(&caps(), &[], &m());
+    let t = content_text(&req.messages[0].content[0]);
+    assert!(t.contains("src/a.rs"), "{t}");
+    assert!(!t.contains("/p/src"), "{t}");
+    assert!(t.contains("old.rs") && t.contains("deleted"), "{t}");
+}
+
+#[test]
+fn state_patch_updates_plan_decisions_questions() {
+    let mut c = Context::default();
+    c.apply_op(ContextOp::StateUpdate(StatePatch {
+        plan: Some(vec![PlanStep {
+            text: "step one".into(),
+            status: StepStatus::InProgress,
+        }]),
+        decisions_add: vec!["d1".into()],
+        questions_add: vec!["q0".into(), "q1".into(), "q2".into()],
+        ..Default::default()
+    }));
+    c.apply_op(ContextOp::StateUpdate(StatePatch {
+        questions_resolve: vec![1, 1, 9],
+        decisions_add: vec!["d1".into(), "d2".into()],
+        ..Default::default()
+    }));
+    assert_eq!(c.state.plan.len(), 1);
+    assert_eq!(c.state.questions, ["q0", "q2"]);
+    assert_eq!(c.state.decisions, ["d1", "d2"]);
+    // An absent plan leaves the plan alone.
+    assert_eq!(c.state.plan[0].status, StepStatus::InProgress);
+}
+
+#[test]
+fn model_pin_is_recorded_once() {
+    let mut c = Context::default();
+    c.apply_op(ContextOp::Pin("same".into()));
+    c.apply_op(ContextOp::Pin("same".into()));
+    assert_eq!(c.pinned.len(), 1);
+    assert_eq!(c.pinned[0].source, PinSource::Model);
+}
+
+#[test]
+fn failed_attempts_render_at_most_10_within_300_tokens() {
+    let mut c = Context::default();
+    c.state.failed_attempts = (0..15).map(|i| format!("attempt {i}")).collect();
+    let (req, _) = c.assemble(&caps(), &[], &m());
+    let t = content_text(&req.messages[0].content[0]);
+    assert!(t.contains("attempt 14") && t.contains("attempt 5"), "{t}");
+    assert!(
+        !t.contains("attempt 4\n") && !t.contains("attempt 0"),
+        "{t}"
+    );
+
+    let mut c = Context::default();
+    c.state.failed_attempts = (0..10)
+        .map(|i| format!("{i}:{}", "z".repeat(1000)))
+        .collect();
+    let (req, st) = c.assemble(&caps(), &[], &m());
+    let t = content_text(&req.messages[0].content[0]);
+    assert!(t.contains("9:z"), "newest attempt is kept");
+    assert!(!t.contains("0:z"), "oldest attempt is dropped to fit");
+    assert!(
+        st.breakdown.state <= 300 + 40,
+        "state tokens {}",
+        st.breakdown.state
+    );
+}
+
+#[test]
+fn empty_pinned_and_state_add_no_blocks() {
+    let mut c = Context::default();
+    c.history.push(turn("hi"));
+    let (req, st) = c.assemble(&caps(), &[], &m());
+    assert_eq!(req.messages.len(), 1);
+    assert_eq!(req.messages[0].content.len(), 1);
+    assert_eq!(st.breakdown.pinned, 0);
+    assert_eq!(st.breakdown.state, 0);
+}
+
+#[test]
+fn request_carries_model_and_max_output() {
+    let c = Context::default();
+    let (req, _) = c.assemble(&caps(), &[], &m());
+    assert_eq!(req.model, m());
+    assert_eq!(req.max_output, 8_000);
+}
+
+#[test]
+fn agents_md_rules_section_autopinned() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("AGENTS.md"),
+        "# Project\nhello\n\n## Rules\n- never touch migrations/\n",
+    )
+    .unwrap();
+    let (text, pins) = agents_md::load(dir.path());
+    assert!(text.unwrap().contains("hello"));
+    assert_eq!(pins.len(), 1);
+    assert_eq!(pins[0].source, PinSource::AgentsMd);
+    assert_eq!(pins[0].text, "- never touch migrations/");
+}
+
+#[test]
+fn agents_md_heading_matching_and_section_extent() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("AGENTS.md"),
+        "# Constraints\n- a\n\n### sub\n- b\n\n# Style\n- not pinned\n\n## RULES\n- c\n\n## Rules and more\n- not this\n\n```\n# Rules\n- in a fence\n```\n",
+    )
+    .unwrap();
+    let (_, pins) = agents_md::load(dir.path());
+    let texts: Vec<&str> = pins.iter().map(|p| p.text.as_str()).collect();
+    assert_eq!(texts, ["- a\n\n### sub\n- b", "- c"]);
+}
+
+#[test]
+fn agents_md_concatenates_ancestors_nearest_last() {
+    let dir = tempfile::tempdir().unwrap();
+    let sub = dir.path().join("pkg");
+    std::fs::create_dir(&sub).unwrap();
+    std::fs::write(
+        dir.path().join("AGENTS.md"),
+        "outer text\n## Rules\n- outer rule\n",
+    )
+    .unwrap();
+    std::fs::write(
+        sub.join("AGENTS.md"),
+        "inner text\n## Rules\n- inner rule\n",
+    )
+    .unwrap();
+    let (text, pins) = agents_md::load(&sub);
+    let text = text.unwrap();
+    assert!(text.find("outer text").unwrap() < text.find("inner text").unwrap());
+    let texts: Vec<&str> = pins.iter().map(|p| p.text.as_str()).collect();
+    assert_eq!(texts, ["- outer rule", "- inner rule"]);
+}
+
+#[test]
+fn agents_md_absent_gives_none() {
+    let dir = tempfile::tempdir().unwrap();
+    // Ancestors of a temp dir normally hold no AGENTS.md; only assert pins are empty.
+    let (_, pins) = agents_md::load(dir.path());
+    assert!(pins.is_empty());
+}
+
+#[test]
+fn calibrate_moves_ratio_toward_actual() {
+    let mut t = TokenEstimator::default();
+    assert_eq!(t.estimate("abcdefgh"), 2);
+    assert_eq!(t.estimate("abcdefghi"), 3);
+    assert_eq!(t.estimate(""), 0);
+    t.calibrate(100, 150);
+    let r1 = t.ratio();
+    assert!(r1 > 1.0 && r1 < 1.5, "{r1}");
+    t.calibrate(100, 150);
+    assert!(t.ratio() > r1 && t.ratio() < 1.5);
+    assert!(t.estimate("abcdefgh") >= 2);
+}
+
+#[test]
+fn calibrate_clamps_and_ignores_zero_estimates() {
+    let mut t = TokenEstimator::default();
+    for _ in 0..50 {
+        t.calibrate(10, 1000);
+    }
+    assert_eq!(t.ratio(), 2.0);
+    for _ in 0..50 {
+        t.calibrate(1000, 10);
+    }
+    assert_eq!(t.ratio(), 0.5);
+    let before = t.ratio();
+    t.calibrate(0, 100);
+    assert_eq!(t.ratio(), before);
+}

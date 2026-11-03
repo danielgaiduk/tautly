@@ -1,0 +1,16 @@
+[package]
+name = "hx-context"
+description = "Context blocks, token accounting, pinned items and working state for hx"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+hx-provider = { path = "../hx-provider" }
+hx-tools = { path = "../hx-tools" }
+
+[dev-dependencies]
+serde_json.workspace = true
+blake3.workspace = true
+tempfile.workspace = true
