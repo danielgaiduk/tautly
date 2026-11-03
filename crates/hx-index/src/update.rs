@@ -35,6 +35,10 @@ struct Candidate {
     lang: Option<Lang>,
     mtime: i64,
     size: i64,
+    /// Reached through a symlink (the file itself or a directory on the way): its
+    /// content can change through another path without this one being told, so the
+    /// trigram index never vouches for it.
+    aliased: bool,
 }
 
 /// What to do with one re-read file.
@@ -58,7 +62,7 @@ impl Index {
         let mut result = self.refresh_inner().await;
         // A bulk build may have dropped the name indexes; they must be back whatever
         // happened (a no-op otherwise).
-        if let Err(e) = self.inner.run(|i| i.ensure_name_indexes()).await {
+        if let Err(e) = self.inner.run(|i| i.ensure_indexes()).await {
             result = result.and(Err(e));
         }
         // Best effort: failing to shrink the cache must not hide the refresh's result.
@@ -104,6 +108,7 @@ impl Index {
                     lang: None,
                     mtime: 0,
                     size: p.size,
+                    aliased: false,
                 })
                 .collect();
             let read = read_all(inner, candidates).await;
@@ -186,15 +191,32 @@ impl Index {
             pos += n;
             let (big, batch): (Vec<Candidate>, Vec<Candidate>) =
                 stale.by_ref().take(n).partition(|c| is_oversize(c.size));
+            let wanted: Vec<String> = batch.iter().map(|c| c.key.clone()).collect();
             let read = read_all(inner, batch).await;
-            let hashes: Vec<Option<String>> = read
+            // A known file that changed but could not be read: its old postings no
+            // longer describe it, so it must become a candidate.
+            let readable: HashSet<&str> = read.iter().map(|(c, _)| c.key.as_str()).collect();
+            let unreadable: Vec<String> = wanted
                 .iter()
-                .map(|(c, _)| known.get(&c.key).filter(|_| !force).map(|k| k.hash.clone()))
+                .filter(|k| !readable.contains(k.as_str()) && known.contains_key(k.as_str()))
+                .cloned()
+                .collect();
+            let olds: Vec<Option<(String, u8)>> = read
+                .iter()
+                .map(|(c, _)| {
+                    known
+                        .get(&c.key)
+                        .filter(|_| !force)
+                        .map(|k| (k.hash.clone(), k.tri_state))
+                })
                 .collect();
             let outcomes = tokio::task::spawn_blocking(move || {
                 read.into_par_iter()
-                    .zip(hashes)
-                    .map(|((c, bytes), old)| process(c, &bytes, old.as_deref(), false))
+                    .zip(olds)
+                    .map(|((c, bytes), old)| {
+                        let old = old.as_ref().map(|(h, s)| (h.as_str(), *s));
+                        process(c, &bytes, old, false)
+                    })
                     .collect::<Vec<_>>()
             })
             .await
@@ -209,7 +231,8 @@ impl Index {
                 prev.finish().await?;
             }
             write = Some(Write::start(inner, move |i| {
-                i.apply(&parsed, &touched, &[])
+                i.apply(&parsed, &touched, &[])?;
+                i.mark_pending(&unreadable)
             }));
         }
         if let Some(prev) = write.take() {
@@ -239,27 +262,50 @@ impl Index {
             Err(SandboxError::OutsideRoot(_)) => return forget(inner, key).await,
             Err(e) => return Err(e.into()),
         };
-        match admission(inner, &key).await? {
-            Admission::File => {}
+        let aliased = match admission(inner, &key).await? {
+            Admission::File { aliased } => aliased,
             Admission::Dir => return Ok(()),
             Admission::No => return forget(inner, key).await,
-        }
-        let cand = candidate(key.clone(), &meta);
+        };
+        let cand = candidate(key.clone(), &meta, aliased);
         if is_oversize(cand.size) {
             let file = oversize_file(cand);
             return inner.run(move |i| i.apply(&[file], &[], &[])).await;
         }
-        let bytes = inner.sb.read(Path::new(&key)).await?;
-        let old = inner
-            .run(move |i| i.known_file(&key))
-            .await?
-            .map(|k| k.hash);
-        let outcome =
-            tokio::task::spawn_blocking(move || process(cand, &bytes, old.as_deref(), true))
-                .await
-                .map_err(|e| IndexError::Task(e.to_string()))?;
+        let bytes = match inner.sb.read(Path::new(&key)).await {
+            Ok(b) => b,
+            Err(e) => {
+                // The edit could not be read: whatever the postings said about the old
+                // content must not vouch for the file any more.
+                let key = key.clone();
+                let _ = inner.run(move |i| i.mark_pending(&[key])).await;
+                return Err(e.into());
+            }
+        };
+        let old = {
+            let key = key.clone();
+            inner.run(move |i| i.known_file(&key)).await?
+        };
+        let old_hash = old.as_ref().map(|k| k.hash.clone());
+        let outcome = tokio::task::spawn_blocking(move || {
+            let old = old.as_ref().map(|k| (k.hash.as_str(), k.tri_state));
+            process(cand, &bytes, old, true)
+        })
+        .await
+        .map_err(|e| IndexError::Task(e.to_string()))?;
         let (parsed, touched) = split(vec![outcome]);
-        inner.run(move |i| i.apply(&parsed, &touched, &[])).await
+        let new_hash = parsed.first().map(|p| p.hash.clone());
+        inner.run(move |i| i.apply(&parsed, &touched, &[])).await?;
+        // The same file under other paths (links, copies) has the old content in its
+        // postings: they must be re-read before they can vouch for anything again.
+        if aliased {
+            if let Some(old) = old_hash.filter(|h| !h.is_empty() && new_hash.as_ref() != Some(h)) {
+                inner
+                    .run(move |i| i.mark_pending_with_hash(&old, &key))
+                    .await?;
+            }
+        }
+        Ok(())
     }
 
     /// Bring whatever is at `rel` in line with the disk: a file is re-indexed, a
@@ -273,7 +319,7 @@ impl Index {
             return Ok(());
         }
         match admission(inner, &key).await? {
-            Admission::File => self.reindex_file(Path::new(&key)).await,
+            Admission::File { .. } => self.reindex_file(Path::new(&key)).await,
             Admission::Dir => {
                 let found = files_under(inner, &key).await?;
                 let live: HashSet<&str> = found.iter().map(String::as_str).collect();
@@ -284,10 +330,15 @@ impl Index {
                 if !gone.is_empty() {
                     inner.run(move |i| i.apply(&[], &[], &gone)).await?;
                 }
+                // One unreadable file must not hide the rest of the directory; the first
+                // failure is the one reported.
+                let mut first_error = None;
                 for file in &found {
-                    self.reindex_file(Path::new(file)).await?;
+                    if let Err(e) = self.reindex_file(Path::new(file)).await {
+                        first_error.get_or_insert(e);
+                    }
                 }
-                Ok(())
+                first_error.map_or(Ok(()), Err)
             }
             Admission::No => {
                 let mut gone = tree_keys_under(inner, &key);
@@ -366,13 +417,14 @@ impl<T: Send + 'static> Write<T> {
     }
 }
 
-fn candidate(key: String, meta: &FileMeta) -> Candidate {
+fn candidate(key: String, meta: &FileMeta, aliased: bool) -> Candidate {
     let mtime = meta
         .mtime
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_nanos() as i64);
     Candidate {
         lang: Lang::from_path(Path::new(&key)),
+        aliased,
         key,
         mtime,
         size: meta.len as i64,
@@ -391,9 +443,10 @@ fn walker_at(sb: &dyn Sandbox, dir: &str) -> Result<ignore::WalkBuilder, IndexEr
     Ok(builder)
 }
 
-enum Admission {
-    /// A regular file the walker visits.
-    File,
+pub(crate) enum Admission {
+    /// A regular file the walker visits; `aliased` when it, or a directory on the way,
+    /// is a symlink.
+    File { aliased: bool },
     /// A directory the walker descends into.
     Dir,
     /// Missing, ignored, hidden, filtered by the sandbox, or not a regular file.
@@ -405,12 +458,13 @@ enum Admission {
 /// never replaced) and ignore rules that still see the parents' ignore files, which
 /// makes a hidden or ignored directory on the way hide everything below it, exactly as
 /// the full walk does.
-async fn admission(inner: &Inner, key: &str) -> Result<Admission, IndexError> {
+pub(crate) async fn admission(inner: &Inner, key: &str) -> Result<Admission, IndexError> {
     let sb = Arc::clone(&inner.sb);
     let key = key.to_string();
     tokio::task::spawn_blocking(move || {
         let parts: Vec<&str> = key.split('/').collect();
         let mut dir = String::new();
+        let mut aliased = false;
         for (i, part) in parts.iter().enumerate() {
             let mut builder = walker_at(sb.as_ref(), &dir)?;
             builder.max_depth(Some(1));
@@ -418,6 +472,7 @@ async fn admission(inner: &Inner, key: &str) -> Result<Admission, IndexError> {
                 .build()
                 .flatten()
                 .find(|e| e.depth() == 1 && e.file_name() == *part);
+            aliased |= entry.as_ref().is_some_and(|e| e.path_is_symlink());
             let kind = entry.as_ref().and_then(|e| e.file_type());
             let last = i + 1 == parts.len();
             match kind {
@@ -428,7 +483,7 @@ async fn admission(inner: &Inner, key: &str) -> Result<Admission, IndexError> {
                     dir.push_str(part);
                 }
                 Some(t) if t.is_dir() => return Ok(Admission::Dir),
-                Some(t) if t.is_file() && last => return Ok(Admission::File),
+                Some(t) if t.is_file() && last => return Ok(Admission::File { aliased }),
                 _ => return Ok(Admission::No),
             }
         }
@@ -469,17 +524,24 @@ async fn scan(inner: &Inner) -> Result<Vec<Candidate>, IndexError> {
     let root = inner.sb.root().to_path_buf();
     let (paths, links) = tokio::task::spawn_blocking(move || {
         let mut out = Vec::new();
-        let mut links = false;
+        // Symlinked directories seen so far (the walk is depth-first, so a directory
+        // comes before its contents).
+        let mut link_dirs: HashSet<std::path::PathBuf> = HashSet::new();
         for entry in builder.build().flatten() {
-            links |= entry.path_is_symlink();
-            if !entry.file_type().is_some_and(|t| t.is_file()) {
-                continue;
-            }
+            let is_link = entry.path_is_symlink();
             let Ok(rel) = entry.path().strip_prefix(&root) else {
                 continue;
             };
-            out.push(rel.to_path_buf());
+            if is_link && entry.file_type().is_some_and(|t| t.is_dir()) {
+                link_dirs.insert(rel.to_path_buf());
+            }
+            if !entry.file_type().is_some_and(|t| t.is_file()) {
+                continue;
+            }
+            let aliased = is_link || rel.ancestors().skip(1).any(|a| link_dirs.contains(a));
+            out.push((rel.to_path_buf(), aliased));
         }
+        let links = !link_dirs.is_empty() || out.iter().any(|(_, a)| *a);
         (out, links)
     })
     .await
@@ -488,9 +550,9 @@ async fn scan(inner: &Inner) -> Result<Vec<Candidate>, IndexError> {
 
     let sb = &inner.sb;
     let stats: Vec<Option<Candidate>> = stream::iter(paths)
-        .map(|rel| async move {
+        .map(|(rel, aliased)| async move {
             let meta = sb.metadata(&rel).await.ok()?;
-            Some(candidate(inner.key(&rel), &meta))
+            Some(candidate(inner.key(&rel), &meta, aliased))
         })
         .buffer_unordered(IO_CONCURRENCY)
         .collect()
@@ -528,21 +590,34 @@ fn split(outcomes: Vec<Outcome>) -> Split {
 /// Hash, decode and (when the content changed) parse one file; with `with_trigrams` its
 /// postings are computed too, otherwise the file is left pending for
 /// [`Index::build_trigrams`]. Content that is over the cap (it grew since the stat) or
-/// not UTF-8 is recorded by hash only.
-fn process(c: Candidate, bytes: &[u8], old_hash: Option<&str>, with_trigrams: bool) -> Outcome {
+/// not UTF-8 is recorded by hash only, and a file reached through a symlink never gets
+/// postings (see [`Candidate::aliased`]). `old` is the stored (hash, trigram state): a
+/// row is only left alone if the content is unchanged and the row is the kind of row
+/// this file needs now.
+fn process(c: Candidate, bytes: &[u8], old: Option<(&str, u8)>, with_trigrams: bool) -> Outcome {
     let hash = blake3::hash(bytes).to_hex().to_string();
-    if old_hash == Some(hash.as_str()) {
-        return Outcome::Touch(c.key, c.mtime, c.size);
-    }
     let src = if bytes.len() as u64 > MAX_FILE_BYTES {
         None
     } else {
         std::str::from_utf8(bytes).ok()
     };
+    let wants_postings = src.is_some() && !c.aliased;
+    if let Some((old_hash, old_state)) = old {
+        if old_hash == hash && (old_state != TRI_NONE) == wants_postings {
+            return Outcome::Touch(c.key, c.mtime, c.size);
+        }
+    }
     let Some(src) = src else {
         let mut file = oversize_file(c);
         file.hash = hash;
         return Outcome::Parsed(Box::new(file));
+    };
+    let tri_state = if !wants_postings {
+        TRI_NONE
+    } else if with_trigrams {
+        TRI_DONE
+    } else {
+        TRI_PENDING
     };
     let extracted = match c.lang {
         Some(lang) if lang.has_symbols() => extract(lang, src),
@@ -569,11 +644,11 @@ fn process(c: Candidate, bytes: &[u8], old_hash: Option<&str>, with_trigrams: bo
         mtime: c.mtime,
         size: c.size,
         lang: c.lang,
-        tri_state: if with_trigrams { TRI_DONE } else { TRI_PENDING },
+        tri_state,
         symbols,
         refs: extracted.refs,
         lines,
-        trigrams: if with_trigrams {
+        trigrams: if tri_state == TRI_DONE {
             trigrams(bytes)
         } else {
             Vec::new()

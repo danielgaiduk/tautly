@@ -147,3 +147,86 @@ pub fn synthetic_corpus(root: &Path, files: usize, fns: usize) {
         std::fs::write(dir.join(format!("f{i}.rs")), body).unwrap();
     }
 }
+
+/// Delegates to a real sandbox, counting `metadata` calls (a full refresh stats every
+/// file; a single reindex stats one) and failing `read` for chosen paths.
+pub struct ProbeSandbox {
+    pub inner: LocalSandbox,
+    pub metadata_calls: std::sync::atomic::AtomicUsize,
+    pub fail_read: std::sync::Mutex<std::collections::HashSet<PathBuf>>,
+}
+
+impl ProbeSandbox {
+    pub fn new(root: &Path) -> Arc<ProbeSandbox> {
+        Arc::new(ProbeSandbox {
+            inner: LocalSandbox::new(root.to_path_buf()).unwrap(),
+            metadata_calls: std::sync::atomic::AtomicUsize::new(0),
+            fail_read: Default::default(),
+        })
+    }
+
+    pub fn calls(&self) -> usize {
+        self.metadata_calls
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub fn fail_reads_of(&self, rel: &str, on: bool) {
+        let mut set = self.fail_read.lock().unwrap();
+        if on {
+            set.insert(PathBuf::from(rel));
+        } else {
+            set.remove(Path::new(rel));
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl Sandbox for ProbeSandbox {
+    fn root(&self) -> &Path {
+        self.inner.root()
+    }
+    fn resolve(&self, p: &Path) -> Result<PathBuf, SandboxError> {
+        self.inner.resolve(p)
+    }
+    async fn read(&self, p: &Path) -> Result<Vec<u8>, SandboxError> {
+        let rel = p.strip_prefix(self.inner.root()).unwrap_or(p);
+        if self.fail_read.lock().unwrap().contains(rel) {
+            return Err(SandboxError::Io(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "injected read failure",
+            )));
+        }
+        self.inner.read(p).await
+    }
+    async fn metadata(&self, p: &Path) -> Result<FileMeta, SandboxError> {
+        self.metadata_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.inner.metadata(p).await
+    }
+    async fn write_atomic(
+        &self,
+        p: &Path,
+        bytes: &[u8],
+        mode: Option<u32>,
+    ) -> Result<(), SandboxError> {
+        self.inner.write_atomic(p, bytes, mode).await
+    }
+    async fn remove_file(&self, p: &Path) -> Result<(), SandboxError> {
+        self.inner.remove_file(p).await
+    }
+    async fn spill(&self, bytes: &[u8]) -> Result<PathBuf, SandboxError> {
+        self.inner.spill(bytes).await
+    }
+    async fn spawn(&self, spec: hx_sandbox::SpawnSpec) -> Result<hx_sandbox::Child, SandboxError> {
+        self.inner.spawn(spec).await
+    }
+    fn walker(&self, base: &Path) -> Result<ignore::WalkBuilder, SandboxError> {
+        self.inner.walker(base)
+    }
+    async fn http_get(
+        &self,
+        url: &hx_sandbox::Url,
+    ) -> Result<hx_sandbox::HttpResponse, SandboxError> {
+        self.inner.http_get(url).await
+    }
+}

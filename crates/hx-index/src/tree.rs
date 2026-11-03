@@ -1,7 +1,7 @@
 //! The in-memory workspace tree: every admitted file with its size, mtime and hash,
 //! loaded from the index database at open and kept current by every write to it.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard};
@@ -49,19 +49,11 @@ impl Slot {
 #[derive(Default)]
 pub(crate) struct TreeData {
     files: BTreeMap<String, Slot>,
-    /// Files the trigram index cannot vouch for: over the size cap, not UTF-8, or postings
-    /// not built yet.
-    opaque: BTreeSet<String>,
 }
 
 impl TreeData {
-    pub fn insert(&mut self, key: String, size: i64, mtime: i64, hash: &str, indexed: bool) {
+    pub fn insert(&mut self, key: String, size: i64, mtime: i64, hash: &str) {
         let hash = blake3::Hash::from_hex(hash).ok().map(|h| *h.as_bytes());
-        if indexed {
-            self.opaque.remove(&key);
-        } else {
-            self.opaque.insert(key.clone());
-        }
         self.files.insert(
             key,
             Slot {
@@ -80,18 +72,19 @@ impl TreeData {
         }
     }
 
-    /// The file's postings were stored.
-    pub fn set_indexed(&mut self, key: &str) {
-        self.opaque.remove(key);
-    }
-
     pub fn remove(&mut self, key: &str) {
         self.files.remove(key);
-        self.opaque.remove(key);
     }
 
-    pub fn opaque(&self) -> impl Iterator<Item = &String> {
-        self.opaque.iter()
+    /// Whether `key` is a file, or a directory with files under it.
+    pub fn contains_or_under(&self, key: &str) -> bool {
+        if self.files.contains_key(key) {
+            return true;
+        }
+        let prefix = dir_prefix(key);
+        self.range_from(&prefix)
+            .next()
+            .is_some_and(|(k, _)| k.starts_with(prefix.as_str()))
     }
 
     /// Every file at or under the directory `dir` (empty for the root).

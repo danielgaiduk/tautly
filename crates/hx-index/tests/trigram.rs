@@ -33,22 +33,28 @@ async fn grep_candidates_narrows_to_files_containing_literal() {
         ("d.md", "parse_conf only\n"),
     ])
     .await;
-    assert_eq!(files(idx.grep_candidates("parse_config")), ["a.rs", "b.rs"]);
-    assert_eq!(files(idx.grep_candidates("nothing")), ["c.txt"]);
-    assert!(files(idx.grep_candidates("absent_literal")).is_empty());
+    assert_eq!(
+        files(idx.grep_candidates("parse_config", false)),
+        ["a.rs", "b.rs"]
+    );
+    assert_eq!(files(idx.grep_candidates("nothing", false)), ["c.txt"]);
+    assert!(files(idx.grep_candidates("absent_literal", false)).is_empty());
     // Required literals are found inside a pattern, not only at its start.
     // `fn` is too short to look up; the literal after it is not.
     assert_eq!(
-        files(idx.grep_candidates(r"fn\s+parse_config")),
+        files(idx.grep_candidates(r"fn\s+parse_config", false)),
         ["a.rs", "b.rs"]
     );
     assert_eq!(
-        files(idx.grep_candidates(r"fn\s+parse_config\(\)")),
+        files(idx.grep_candidates(r"fn\s+parse_config\(\)", false)),
         ["a.rs", "b.rs"]
     );
-    assert_eq!(files(idx.grep_candidates(r"nothing\s+here")), ["c.txt"]);
     assert_eq!(
-        files(idx.grep_candidates(r".*parse_config")),
+        files(idx.grep_candidates(r"nothing\s+here", false)),
+        ["c.txt"]
+    );
+    assert_eq!(
+        files(idx.grep_candidates(r".*parse_config", false)),
         ["a.rs", "b.rs"]
     );
 }
@@ -62,9 +68,18 @@ async fn grep_candidates_is_a_case_insensitive_superset() {
     ])
     .await;
     // Trigrams are folded: a case-sensitive pattern may over-select, never under-select.
-    assert_eq!(files(idx.grep_candidates("Hello")), ["a.txt", "b.txt"]);
-    assert_eq!(files(idx.grep_candidates("(?i)hello")), ["a.txt", "b.txt"]);
-    assert_eq!(files(idx.grep_candidates("hello")), ["a.txt", "b.txt"]);
+    assert_eq!(
+        files(idx.grep_candidates("Hello", false)),
+        ["a.txt", "b.txt"]
+    );
+    assert_eq!(
+        files(idx.grep_candidates("(?i)hello", false)),
+        ["a.txt", "b.txt"]
+    );
+    assert_eq!(
+        files(idx.grep_candidates("hello", false)),
+        ["a.txt", "b.txt"]
+    );
 }
 
 #[tokio::test]
@@ -78,15 +93,15 @@ async fn grep_candidates_alternation_unions_postings() {
     ])
     .await;
     assert_eq!(
-        files(idx.grep_candidates("foo|barbaz")),
+        files(idx.grep_candidates("foo|barbaz", false)),
         ["a.rs", "b.rs", "c.rs"]
     );
     assert_eq!(
-        files(idx.grep_candidates("(foo|barbaz)")),
+        files(idx.grep_candidates("(foo|barbaz)", false)),
         ["a.rs", "b.rs", "c.rs"]
     );
     // A concatenation requires both parts.
-    assert_eq!(files(idx.grep_candidates("foo.*barbaz")), ["c.rs"]);
+    assert_eq!(files(idx.grep_candidates("foo.*barbaz", false)), ["c.rs"]);
 }
 
 #[tokio::test]
@@ -103,36 +118,49 @@ async fn short_literal_or_complex_pattern_falls_back_to_full_scan() {
         "(unclosed", // parse error
         "",
     ] {
-        assert_eq!(idx.grep_candidates(pat), Candidates::FullScan, "{pat:?}");
+        assert_eq!(
+            idx.grep_candidates(pat, false),
+            Candidates::FullScan,
+            "{pat:?}"
+        );
     }
-    assert!(matches!(idx.grep_candidates("foo"), Candidates::Files(_)));
+    assert!(matches!(
+        idx.grep_candidates("foo", false),
+        Candidates::Files(_)
+    ));
 }
 
 #[tokio::test]
 async fn not_ready_index_falls_back_to_full_scan() {
     let fx = Fixture::new(&[("a.rs", "foo bar\n")]);
     let idx = fx.open();
-    assert_eq!(idx.grep_candidates("foo bar"), Candidates::FullScan);
+    assert_eq!(idx.grep_candidates("foo bar", false), Candidates::FullScan);
     assert!(!idx.is_ready() && !idx.trigrams_ready());
     idx.refresh().await.unwrap();
     // Symbols are ready, postings are not: still a full scan.
     assert!(idx.is_ready() && !idx.trigrams_ready());
-    assert_eq!(idx.grep_candidates("foo bar"), Candidates::FullScan);
+    assert_eq!(idx.grep_candidates("foo bar", false), Candidates::FullScan);
     idx.build_trigrams().await.unwrap();
     assert!(idx.trigrams_ready());
-    assert_eq!(files(idx.grep_candidates("foo bar")), ["a.rs"]);
+    assert_eq!(files(idx.grep_candidates("foo bar", false)), ["a.rs"]);
     // A new handle on a populated database is not ready until it has refreshed and
     // confirmed its postings.
     let again = fx.open();
-    assert_eq!(again.grep_candidates("foo bar"), Candidates::FullScan);
+    assert_eq!(
+        again.grep_candidates("foo bar", false),
+        Candidates::FullScan
+    );
     again.refresh().await.unwrap();
-    assert_eq!(again.grep_candidates("foo bar"), Candidates::FullScan);
+    assert_eq!(
+        again.grep_candidates("foo bar", false),
+        Candidates::FullScan
+    );
     assert_eq!(
         again.build_trigrams().await.unwrap(),
         0,
         "nothing was pending"
     );
-    assert_eq!(files(again.grep_candidates("foo bar")), ["a.rs"]);
+    assert_eq!(files(again.grep_candidates("foo bar", false)), ["a.rs"]);
 }
 
 #[tokio::test]
@@ -147,7 +175,7 @@ async fn refresh_leaves_postings_pending_and_pending_files_stay_candidates() {
     );
     assert_eq!(idx.build_trigrams().await.unwrap(), 2);
     assert!(trigram_count(&fx.db(), "a.rs") > 0);
-    assert_eq!(files(idx.grep_candidates("alpha")), ["a.rs"]);
+    assert_eq!(files(idx.grep_candidates("alpha", false)), ["a.rs"]);
 
     // A refresh that re-reads a changed file drops its postings and marks it pending;
     // until phase 2 runs the index cannot vouch for it, so it stays a candidate.
@@ -155,11 +183,11 @@ async fn refresh_leaves_postings_pending_and_pending_files_stay_candidates() {
     set_future_mtime(&fx.path("a.rs"));
     idx.refresh().await.unwrap();
     assert_eq!(trigram_count(&fx.db(), "a.rs"), 0);
-    assert_eq!(files(idx.grep_candidates("gamma")), ["a.rs"]);
-    assert_eq!(files(idx.grep_candidates("beta")), ["a.rs", "b.rs"]);
+    assert_eq!(files(idx.grep_candidates("gamma", false)), ["a.rs"]);
+    assert_eq!(files(idx.grep_candidates("beta", false)), ["a.rs", "b.rs"]);
     assert_eq!(idx.build_trigrams().await.unwrap(), 1);
-    assert_eq!(files(idx.grep_candidates("gamma")), ["a.rs"]);
-    assert_eq!(files(idx.grep_candidates("beta")), ["b.rs"]);
+    assert_eq!(files(idx.grep_candidates("gamma", false)), ["a.rs"]);
+    assert_eq!(files(idx.grep_candidates("beta", false)), ["b.rs"]);
 }
 
 fn set_future_mtime(path: &Path) {
@@ -174,7 +202,7 @@ async fn background_refresh_runs_both_phases() {
     let idx = Arc::new(fx.open());
     idx.clone().spawn_background_refresh().await.unwrap();
     assert!(idx.is_ready() && idx.trigrams_ready());
-    assert_eq!(files(idx.grep_candidates("alpha")), ["a.rs"]);
+    assert_eq!(files(idx.grep_candidates("alpha", false)), ["a.rs"]);
 }
 
 #[tokio::test]
@@ -192,31 +220,31 @@ async fn postings_survive_vacuum() {
         .unwrap()
         .execute_batch("VACUUM")
         .unwrap();
-    assert_eq!(files(idx.grep_candidates("second_one")), ["b.rs"]);
-    assert_eq!(files(idx.grep_candidates("third_one")), ["c.rs"]);
-    assert!(files(idx.grep_candidates("first_one")).is_empty());
+    assert_eq!(files(idx.grep_candidates("second_one", false)), ["b.rs"]);
+    assert_eq!(files(idx.grep_candidates("third_one", false)), ["c.rs"]);
+    assert!(files(idx.grep_candidates("first_one", false)).is_empty());
 }
 
 #[tokio::test]
 async fn trigram_rows_follow_edits_deletes_and_refresh() {
     let (fx, idx) = ready(&[("a.rs", "fn alpha() {}\n"), ("b.rs", "fn beta() {}\n")]).await;
-    assert_eq!(files(idx.grep_candidates("alpha")), ["a.rs"]);
+    assert_eq!(files(idx.grep_candidates("alpha", false)), ["a.rs"]);
 
     std::fs::write(fx.path("a.rs"), "fn gamma() {}\n").unwrap();
     idx.reindex_file(Path::new("a.rs")).await.unwrap();
-    assert!(files(idx.grep_candidates("alpha")).is_empty());
-    assert_eq!(files(idx.grep_candidates("gamma")), ["a.rs"]);
+    assert!(files(idx.grep_candidates("alpha", false)).is_empty());
+    assert_eq!(files(idx.grep_candidates("gamma", false)), ["a.rs"]);
 
     std::fs::remove_file(fx.path("b.rs")).unwrap();
     idx.reindex_file(Path::new("b.rs")).await.unwrap();
-    assert!(files(idx.grep_candidates("beta")).is_empty());
+    assert!(files(idx.grep_candidates("beta", false)).is_empty());
 
     write_all(fx.root.path(), &[("c.txt", "delta text\n")]);
     std::fs::remove_file(fx.path("a.rs")).unwrap();
     idx.refresh().await.unwrap();
     idx.build_trigrams().await.unwrap();
-    assert_eq!(files(idx.grep_candidates("delta")), ["c.txt"]);
-    assert!(files(idx.grep_candidates("gamma")).is_empty());
+    assert_eq!(files(idx.grep_candidates("delta", false)), ["c.txt"]);
+    assert!(files(idx.grep_candidates("gamma", false)).is_empty());
     // No orphaned postings are left behind by the deletes.
     let conn = rusqlite::Connection::open(fx.db()).unwrap();
     let orphans: i64 = conn
@@ -256,9 +284,12 @@ async fn binary_and_oversize_files_have_no_trigrams() {
     assert_eq!(trigram_count(&fx.db(), "big.txt"), 0);
     // They are still tracked, and a narrowed search never silently skips them: the
     // index cannot vouch for their content, so they stay candidates.
-    assert_eq!(files(idx.grep_candidates("needle")), ["big.txt", "bin.dat"]);
     assert_eq!(
-        files(idx.grep_candidates("plenty")),
+        files(idx.grep_candidates("needle", false)),
+        ["big.txt", "bin.dat"]
+    );
+    assert_eq!(
+        files(idx.grep_candidates("plenty", false)),
         ["big.txt", "bin.dat", "ok.txt"]
     );
 }
@@ -325,7 +356,10 @@ async fn v1_database_migrates_and_is_fully_reparsed() {
     for name in ["trigrams", "meta", "refs_name_file_line"] {
         assert!(tables.contains(name), "{name} missing from {tables:?}");
     }
-    assert_eq!(idx.grep_candidates("needle_fn"), Candidates::FullScan);
+    assert_eq!(
+        idx.grep_candidates("needle_fn", false),
+        Candidates::FullScan
+    );
 
     let stats = idx.refresh().await.unwrap();
     assert_eq!(
@@ -333,7 +367,7 @@ async fn v1_database_migrates_and_is_fully_reparsed() {
         "every file is reparsed after the migration"
     );
     idx.build_trigrams().await.unwrap();
-    assert_eq!(files(idx.grep_candidates("needle_fn")), ["a.rs"]);
+    assert_eq!(files(idx.grep_candidates("needle_fn", false)), ["a.rs"]);
     assert_eq!(idx.find_symbol("needle_fn", None).unwrap().len(), 1);
 
     // The reparse is a one-time cost.
@@ -365,7 +399,27 @@ async fn changed_extractor_version_forces_a_full_reparse() {
 
 // ----------------------------------------------------------------- proptest
 
-const WORDS: [&str; 7] = ["abc", "bca", "cab", "aab", "ABC", "bab", "éab"];
+/// Includes Unicode case-fold families: ſ/s, K (Kelvin sign)/k, ẞ/ß, Σ/σ/ς, İ/ı.
+const WORDS: [&str; 18] = [
+    "abc",
+    "bca",
+    "cab",
+    "aab",
+    "ABC",
+    "bab",
+    "éab",
+    "ÉAB",
+    "sab",
+    "ſab",
+    "kab",
+    "\u{212a}ab",
+    "ßab",
+    "ẞab",
+    "σab",
+    "Σab",
+    "ςab",
+    "İab",
+];
 
 /// Files are made of a few words, so that random patterns built from the same words
 /// regularly have true matches and the index narrows (rather than always falling back).
@@ -398,6 +452,8 @@ fn arb_pattern() -> impl Strategy<Value = String> {
         Just("\\s".to_string()),
         Just("_".to_string()),
         Just("^".to_string()),
+        Just("[sſ]ab".to_string()),
+        Just("(?i:k)ab".to_string()),
     ];
     let seq = proptest::collection::vec(atom, 1..4).prop_map(|v| v.concat());
     let alt = proptest::collection::vec(seq, 1..4).prop_map(|v| v.join("|"));
@@ -414,7 +470,7 @@ proptest! {
     #[test]
     fn candidates_never_miss_a_true_match(
         contents in proptest::collection::vec(arb_content(), 1..8),
-        patterns in proptest::collection::vec(arb_pattern(), 1..8),
+        patterns in proptest::collection::vec((arb_pattern(), any::<bool>()), 1..8),
     ) {
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         let root = tempfile::tempdir().unwrap();
@@ -430,15 +486,15 @@ proptest! {
         let idx = open_at(root.path(), &db_dir.path().join("i.db"));
         rt.block_on(idx.refresh()).unwrap();
         rt.block_on(idx.build_trigrams()).unwrap();
-        for pat in &patterns {
-            let re = regex::Regex::new(pat).unwrap();
+        for (pat, ci) in &patterns {
+            let re = regex::RegexBuilder::new(pat).case_insensitive(*ci).build().unwrap();
             // The full scan is the oracle.
             let truth: BTreeSet<&str> = named
                 .iter()
                 .filter(|(_, c)| re.is_match(c))
                 .map(|(r, _)| r.as_str())
                 .collect();
-            match idx.grep_candidates(pat) {
+            match idx.grep_candidates(pat, *ci) {
                 Candidates::FullScan => {}
                 Candidates::Files(got) => {
                     let got: BTreeSet<&str> = paths(&got).into_iter().collect();
@@ -450,4 +506,119 @@ proptest! {
             }
         }
     }
+}
+
+// ------------------------------------------------------- review round 1 (RED first)
+
+fn contains(c: Candidates, rel: &str) -> bool {
+    files(c).iter().any(|f| f == rel)
+}
+
+#[tokio::test]
+async fn case_insensitive_flag_covers_unicode_case_folds() {
+    // (text in the file, pattern): the regex with `case_insensitive(true)` matches each.
+    let cases = [
+        ("CAFÉ au lait", "café"),
+        ("STRAẞE nord", "straße"),
+        ("ΣΟΦΊΑ", "σοφία"),
+        ("sofia ΣΟΦΊΑ", "σοφία"),
+        ("taſk list", "TASK"),
+        ("TAſK", "task"),
+        ("the kelvin sign: \u{212a}elvin", "kelvin"),
+        ("Kelvin", "\u{212a}ELVIN"),
+        ("ΜΈΤΡΟΝ", "μέτρον"),
+        ("ςοφία", "ΣΟΦΊΑ"),
+    ];
+    let fx = Fixture::new(&[]);
+    for (i, (text, _)) in cases.iter().enumerate() {
+        std::fs::write(fx.path(&format!("f{i}.txt")), text).unwrap();
+    }
+    let idx = fx.open();
+    idx.refresh().await.unwrap();
+    idx.build_trigrams().await.unwrap();
+    for (i, (text, pattern)) in cases.iter().enumerate() {
+        let re = regex::RegexBuilder::new(pattern)
+            .case_insensitive(true)
+            .build()
+            .unwrap();
+        assert!(
+            re.is_match(text),
+            "fixture: {pattern:?} must match {text:?}"
+        );
+        let got = idx.grep_candidates(pattern, true);
+        assert!(
+            contains(got, &format!("f{i}.txt")),
+            "{pattern:?} lost {text:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn candidates_follow_a_second_handles_changes() {
+    let fx = Fixture::new(&[("f.txt", "alpha only\n"), ("g.txt", "other\n")]);
+    let a = fx.open();
+    a.refresh().await.unwrap();
+    a.build_trigrams().await.unwrap();
+    assert_eq!(files(a.grep_candidates("alpha", false)), ["f.txt"]);
+
+    // Another handle (think: another process) re-reads the changed file but does not
+    // build postings yet. Handle `a` cannot know from its own memory.
+    std::fs::write(fx.path("f.txt"), "alpha and gamma\n").unwrap();
+    set_future_mtime(&fx.path("f.txt"));
+    let b = fx.open();
+    b.refresh().await.unwrap();
+    assert!(contains(a.grep_candidates("gamma", false), "f.txt"));
+}
+
+#[tokio::test]
+async fn a_file_replaced_between_lookups_is_not_lost() {
+    // Same-handle variant: postings and the always-candidate set come from one snapshot.
+    let (fx, idx) = ready(&[("f.txt", "alpha\n"), ("g.txt", "beta\n")]).await;
+    std::fs::write(fx.path("f.txt"), "alpha gamma\n").unwrap();
+    set_future_mtime(&fx.path("f.txt"));
+    idx.refresh().await.unwrap();
+    // f.txt is pending; finishing phase 2 flips it to done with fresh postings.
+    assert!(contains(idx.grep_candidates("gamma", false), "f.txt"));
+    idx.build_trigrams().await.unwrap();
+    assert!(contains(idx.grep_candidates("gamma", false), "f.txt"));
+}
+
+#[tokio::test]
+async fn refresh_read_failure_leaves_the_file_a_candidate() {
+    let fx = Fixture::new(&[("f.txt", "alpha\n"), ("g.txt", "beta\n")]);
+    let sb = common::ProbeSandbox::new(fx.root.path());
+    let idx = Index::open(&fx.db(), sb.clone()).unwrap();
+    idx.refresh().await.unwrap();
+    idx.build_trigrams().await.unwrap();
+    std::fs::write(fx.path("f.txt"), "alpha gamma\n").unwrap();
+    set_future_mtime(&fx.path("f.txt"));
+    sb.fail_reads_of("f.txt", true);
+    idx.refresh().await.unwrap();
+    // The new content could not be read, so the old postings must not vouch for it.
+    assert!(contains(idx.grep_candidates("gamma", false), "f.txt"));
+    // Once readable again the next refresh repairs it.
+    sb.fail_reads_of("f.txt", false);
+    idx.refresh().await.unwrap();
+    idx.build_trigrams().await.unwrap();
+    assert_eq!(files(idx.grep_candidates("gamma", false)), ["f.txt"]);
+    assert_eq!(files(idx.grep_candidates("beta", false)), ["g.txt"]);
+}
+
+#[tokio::test]
+async fn reindex_file_read_failure_leaves_the_file_a_candidate() {
+    let fx = Fixture::new(&[("f.txt", "alpha\n"), ("g.txt", "beta\n")]);
+    let sb = common::ProbeSandbox::new(fx.root.path());
+    let idx = Index::open(&fx.db(), sb.clone()).unwrap();
+    idx.refresh().await.unwrap();
+    idx.build_trigrams().await.unwrap();
+    std::fs::write(fx.path("f.txt"), "alpha gamma\n").unwrap();
+    sb.fail_reads_of("f.txt", true);
+    assert!(idx.reindex_file(Path::new("f.txt")).await.is_err());
+    assert!(contains(idx.grep_candidates("gamma", false), "f.txt"));
+    // The failed file is a candidate for everything; other files stay narrowed.
+    assert_eq!(
+        files(idx.grep_candidates("beta", false)),
+        ["f.txt", "g.txt"]
+    );
+    assert_eq!(files(idx.grep_candidates("alpha", false)), ["f.txt"]);
 }

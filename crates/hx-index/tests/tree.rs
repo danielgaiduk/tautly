@@ -465,7 +465,7 @@ async fn files_reachable_through_in_root_symlinks_are_indexed_like_the_tools_see
         tree.get(Path::new("real/x.rs")).unwrap().hash
     );
     idx.build_trigrams().await.unwrap();
-    match idx.grep_candidates("unique_link_token") {
+    match idx.grep_candidates("unique_link_token", false) {
         hx_index::Candidates::Files(f) => {
             let f = paths(&f);
             assert!(f.contains(&"alias/x.rs") && f.contains(&"link.rs"), "{f:?}");
@@ -477,16 +477,96 @@ async fn files_reachable_through_in_root_symlinks_are_indexed_like_the_tools_see
         hx_index::Candidates::FullScan => panic!("expected candidates"),
     }
 
-    // A single-file reindex through the link agrees with the walk.
+    // Rows reached through a link are never vouched for by postings: they stay
+    // candidates for every pattern, so an edit through any alias cannot hide a match.
+    for rel in ["alias/x.rs", "link.rs"] {
+        let any = idx.grep_candidates("zzz_absent_zzz", false);
+        assert!(
+            matches!(&any, hx_index::Candidates::Files(f) if paths(f).contains(&rel)),
+            "{rel}: {any:?}"
+        );
+    }
+    // Edit through one alias: every path to the same file stays a candidate.
     std::fs::write(
         fx.path("real/x.rs"),
         "fn via_link() { changed_token_xyz(); }\n",
     )
     .unwrap();
     idx.reindex_file(Path::new("alias/x.rs")).await.unwrap();
-    assert_ne!(
-        tree.get(Path::new("alias/x.rs")).unwrap().hash,
-        tree.get(Path::new("link.rs")).unwrap().hash
+    match idx.grep_candidates("changed_token_xyz", false) {
+        hx_index::Candidates::Files(f) => {
+            let f = paths(&f);
+            for want in ["alias/x.rs", "link.rs", "real/x.rs"] {
+                assert!(
+                    f.contains(&want),
+                    "{want} lost after an edit through a link: {f:?}"
+                );
+            }
+        }
+        hx_index::Candidates::FullScan => panic!("expected candidates"),
+    }
+}
+
+fn probe_fixture(extra: &[(&str, &str)]) -> (Fixture, Arc<common::ProbeSandbox>, Arc<Index>) {
+    let mut files = vec![
+        (".gitignore", "target/\n"),
+        ("src/a.rs", "fn a() {}\n"),
+        ("src/b.rs", "fn b() {}\n"),
+        ("src/c.rs", "fn c() {}\n"),
+        ("src/d.rs", "fn d() {}\n"),
+        ("src/e.rs", "fn e() {}\n"),
+        ("target/keep", "x"),
+    ];
+    files.extend_from_slice(extra);
+    let fx = Fixture::new(&files);
+    let sb = common::ProbeSandbox::new(fx.root.path());
+    let idx = Arc::new(Index::open(&fx.db(), sb.clone()).unwrap());
+    (fx, sb, idx)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn events_under_ignored_directories_cause_no_work_even_with_symlinks() {
+    let (fx, sb, idx) = probe_fixture(&[]);
+    std::os::unix::fs::symlink("src", fx.path("alias")).unwrap();
+    idx.refresh().await.unwrap();
+    let _watch = idx.clone().start_watcher().unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let before = sb.calls();
+
+    for i in 0..20 {
+        write_all(fx.root.path(), &[(&format!("target/debug/f{i}.o"), "obj")]);
+    }
+    std::fs::write(fx.path("target/.gitignore"), "*\n").unwrap();
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    assert_eq!(
+        sb.calls(),
+        before,
+        "ignored paths must not trigger a refresh or reindex"
     );
-    assert!(tree.get(Path::new("alias/x.rs")).is_some());
+
+    // Control: a change to an admitted file is picked up (and, with links in the tree,
+    // reconciled by a full refresh that stats every file).
+    std::fs::write(fx.path("src/a.rs"), "fn a() {}\nfn extra() {}\n").unwrap();
+    assert!(
+        eventually(WATCH_WAIT, || sb.calls() > before + 5).await,
+        "admitted change must be processed"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn watcher_failure_leaves_the_file_a_candidate_and_is_reported() {
+    let (fx, sb, idx) = probe_fixture(&[]);
+    idx.refresh().await.unwrap();
+    idx.build_trigrams().await.unwrap();
+    let _watch = idx.clone().start_watcher().unwrap();
+    sb.fail_reads_of("src/a.rs", true);
+    std::fs::write(fx.path("src/a.rs"), "fn a() { gamma_marker(); }\n").unwrap();
+    assert!(
+        eventually(WATCH_WAIT, || idx.last_error().is_some()).await,
+        "the failed reindex is reported"
+    );
+    match idx.grep_candidates("gamma_marker", false) {
+        hx_index::Candidates::Files(f) => assert!(paths(&f).contains(&"src/a.rs"), "{f:?}"),
+        hx_index::Candidates::FullScan => {}
+    }
 }

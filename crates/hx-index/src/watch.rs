@@ -1,6 +1,6 @@
 //! File-system watcher: keeps the index and tree current with edits made outside hx.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -10,7 +10,8 @@ use std::time::{Duration, Instant};
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use tokio::runtime::Handle;
 
-use crate::store::{Index, IndexError};
+use crate::store::{Index, IndexError, Inner};
+use crate::update::{Admission, admission};
 
 /// Quiet time after the last event before a batch is processed.
 const DEBOUNCE: Duration = Duration::from_millis(50);
@@ -33,13 +34,19 @@ impl Drop for WatchHandle {
 }
 
 impl Index {
-    /// Watch the workspace root recursively. Changes are debounced by 50 ms, then every
-    /// changed path is brought in line with the disk ([`Index::reindex_file`] for
-    /// files, a walk for directories, row removal for paths that are gone or not
-    /// admitted); a change to an ignore file triggers a full [`Index::refresh`], and
-    /// so does an overflow or error from the OS watcher, and so does any change while the
-    /// workspace contains symlinks (the OS reports the target's path, not its aliases). Must be called inside a Tokio
-    /// runtime, which the watcher thread borrows for the index's async work.
+    /// Watch the workspace root recursively. Changes are debounced by 50 ms. Only paths
+    /// that can matter are handled: admitted ones, and ones the tree still knows (gone or
+    /// newly ignored); events under ignored directories are dropped without any work.
+    /// Before anything is re-read, the changed files lose their postings and become
+    /// candidates for every search, so a failure while re-reading (recorded in
+    /// [`Index::last_error`]) never leaves stale postings vouching for them. Each path is
+    /// then brought in line with the disk ([`Index::reindex_file`] for files, a walk for
+    /// directories, row removal for paths that are gone or not admitted). A change to an
+    /// ignore file in an admitted directory triggers a full [`Index::refresh`], and so
+    /// does an overflow or error from the OS watcher, and so does any relevant change
+    /// while the workspace contains symlinks (the OS reports the target's path, not its
+    /// aliases). Must be called inside a Tokio runtime, which the watcher thread borrows
+    /// for the index's async work.
     pub fn start_watcher(self: Arc<Self>) -> Result<WatchHandle, IndexError> {
         let runtime = Handle::try_current()
             .map_err(|_| IndexError::Task("start_watcher needs a Tokio runtime".into()))?;
@@ -64,6 +71,7 @@ impl Index {
 #[derive(Default)]
 struct Batch {
     paths: BTreeSet<PathBuf>,
+    /// The OS watcher lost track of something: resync whatever the paths are.
     refresh: bool,
 }
 
@@ -87,12 +95,6 @@ impl Batch {
             let Ok(rel) = path.strip_prefix(root) else {
                 continue;
             };
-            if matches!(
-                rel.file_name().and_then(|n| n.to_str()),
-                Some(".gitignore" | ".ignore")
-            ) {
-                self.refresh = true;
-            }
             if !rel.as_os_str().is_empty() {
                 self.paths.insert(rel.to_path_buf());
             }
@@ -122,23 +124,98 @@ fn run(
                 Err(_) => break,
             }
         }
-        for rel in &batch.paths {
-            if stop.load(Ordering::Acquire) {
-                return;
-            }
-            // Best effort: a path that cannot be handled now is retried by the next
-            // event or the next refresh.
-            let _ = runtime.block_on(index.reindex_path(rel));
+        if stop.load(Ordering::Acquire) {
+            return;
         }
-        // With symlinks in the tree one change can alias several paths, and a changed
-        // ignore file changes which files are admitted: reconcile with a full refresh.
-        let resync = batch.refresh || (index.inner.has_links() && !batch.paths.is_empty());
-        if resync && !stop.load(Ordering::Acquire) {
-            runtime.block_on(async {
-                if index.refresh().await.is_ok() {
-                    let _ = index.build_trigrams().await;
-                }
-            });
+        runtime.block_on(process(index, batch, stop));
+    }
+}
+
+fn is_ignore_file(key: &str) -> bool {
+    matches!(key.rsplit('/').next(), Some(".gitignore" | ".ignore"))
+}
+
+/// Whether directory `dir` is one the walker descends into; memoized for the batch.
+async fn dir_admitted(inner: &Inner, cache: &mut HashMap<String, bool>, dir: &str) -> bool {
+    if dir.is_empty() {
+        return true;
+    }
+    if let Some(&known) = cache.get(dir) {
+        return known;
+    }
+    // When in doubt, process the path.
+    let admitted = !matches!(
+        admission(inner, dir).await,
+        Ok(Admission::No | Admission::File { .. })
+    );
+    cache.insert(dir.to_string(), admitted);
+    admitted
+}
+
+/// Handle one debounced batch. Only paths that can matter are processed: admitted ones,
+/// and ones the tree still knows (deleted or newly ignored). Everything under an ignored
+/// directory (`target/`, `.git/`) is dropped without touching the database.
+async fn process(index: &Index, batch: Batch, stop: &AtomicBool) {
+    let inner = &index.inner;
+    let mut dirs: HashMap<String, bool> = HashMap::new();
+    let mut resync = batch.refresh;
+    let mut work: Vec<String> = Vec::new();
+    for rel in &batch.paths {
+        let key = inner.key(rel);
+        if key.is_empty() {
+            continue;
+        }
+        let parent = key.rsplit_once('/').map_or("", |(p, _)| p);
+        let parent_ok = dir_admitted(inner, &mut dirs, parent).await;
+        if parent_ok && is_ignore_file(&key) {
+            resync = true;
+        }
+        let known = tree_has(inner, &key);
+        if !parent_ok && !known {
+            continue;
+        }
+        if !known && matches!(admission(inner, &key).await, Ok(Admission::No)) {
+            continue;
+        }
+        work.push(key);
+    }
+
+    // Before anything is re-read, the changed files stop being vouched for by their
+    // postings: they are candidates whatever happens next.
+    if !work.is_empty() {
+        let keys = work.clone();
+        let marked = inner
+            .run(move |i| {
+                i.mark_pending(&keys)?;
+                i.mark_pending_under(&keys)
+            })
+            .await;
+        if let Err(e) = marked {
+            inner.record_error(format!("watcher: {e}"));
         }
     }
+    for key in &work {
+        if stop.load(Ordering::Acquire) {
+            return;
+        }
+        // A failure leaves the file pending (still a candidate); it is reported, and the
+        // next event or refresh retries.
+        if let Err(e) = index.reindex_path(Path::new(key)).await {
+            inner.record_error(format!("watcher: {key}: {e}"));
+        }
+    }
+    // With symlinks in the tree one change can alias several paths, and a changed ignore
+    // file changes which files are admitted: reconcile with a full refresh.
+    resync |= inner.has_links() && !work.is_empty();
+    if resync && !stop.load(Ordering::Acquire) && index.refresh().await.is_ok() {
+        let _ = index.build_trigrams().await;
+    }
+}
+
+fn tree_has(inner: &Inner, key: &str) -> bool {
+    inner
+        .tree()
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .contains_or_under(key)
 }

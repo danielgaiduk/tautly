@@ -45,11 +45,11 @@ async fn scale_build_phases_and_selective_search() {
         Candidates::FullScan => usize::MAX,
     };
     let t = Instant::now();
-    let found = idx.grep_candidates("the_one_needle_marker");
+    let found = idx.grep_candidates("the_one_needle_marker", false);
     println!("selective search: {:?} -> {}", t.elapsed(), count(&found));
     assert_eq!(count(&found), 1);
     let t = Instant::now();
-    let found = idx.grep_candidates("fn w1");
+    let found = idx.grep_candidates("fn w1", false);
     println!("common search: {:?} -> {}", t.elapsed(), count(&found));
     let t = Instant::now();
     let n = idx.tree().glob("d3/**/*.rs", Path::new(".")).len();

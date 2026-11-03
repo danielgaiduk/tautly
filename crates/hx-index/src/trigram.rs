@@ -35,27 +35,23 @@ pub enum Candidates {
 impl Index {
     /// Narrow a regex search to the files that can contain a match.
     ///
-    /// Patterns are Rust-regex syntax; put case-insensitivity in the pattern
-    /// (`(?i)`). Every file with a match is in the result, but not every file in the
-    /// result matches. Files the index cannot vouch for (over 1 MB, not UTF-8, postings
-    /// not built yet) are always included. A pattern with no literal of at least 3
-    /// bytes, a syntax error, an index whose [`Index::refresh`] or
-    /// [`Index::build_trigrams`] has not completed, and any database error all yield
-    /// [`Candidates::FullScan`].
-    pub fn grep_candidates(&self, pattern: &str) -> Candidates {
+    /// Patterns are Rust-regex syntax; pass the same `case_insensitive` flag the search
+    /// regex is built with (inline `(?i)` works too). Every file with a match is in the
+    /// result, but not every file in the result matches. Files the index cannot vouch
+    /// for are always included: over 1 MB, not UTF-8, reached through a symlink, or
+    /// with postings that are not built yet or were invalidated by a change. A pattern
+    /// with no literal of at least 3 bytes, a syntax error, an index whose
+    /// [`Index::refresh`] or [`Index::build_trigrams`] has not completed, and any
+    /// database error all yield [`Candidates::FullScan`].
+    pub fn grep_candidates(&self, pattern: &str, case_insensitive: bool) -> Candidates {
         if !self.is_ready() || !self.trigrams_ready() {
             return Candidates::FullScan;
         }
-        let Some(plan) = plan(pattern) else {
+        let Some(plan) = plan(pattern, case_insensitive) else {
             return Candidates::FullScan;
         };
-        match self.inner.with_conn(|conn| lookup(conn, &plan)) {
-            Ok(mut files) => {
-                files.extend(self.inner.opaque_files());
-                files.sort();
-                files.dedup();
-                Candidates::Files(files.into_iter().map(PathBuf::from).collect())
-            }
+        match self.inner.with_conn(|conn| candidates(conn, &plan)) {
+            Ok(files) => Candidates::Files(files.into_iter().map(PathBuf::from).collect()),
             Err(_) => Candidates::FullScan,
         }
     }
@@ -85,6 +81,26 @@ fn pack(a: u8, b: u8, c: u8) -> u32 {
 /// Clauses that must all hold; a clause holds for a file that contains every trigram
 /// of at least one of its literals.
 type Plan = Vec<Vec<Vec<u8>>>;
+
+/// Postings hits plus every file the postings cannot vouch for (`trigram_state != done`:
+/// binary, oversize, reached through a symlink, or postings not built or invalidated),
+/// read in one snapshot so that a commit between the two reads (another handle, phase 2,
+/// a reindex) cannot drop a file from both.
+fn candidates(conn: &Connection, plan: &Plan) -> Result<Vec<String>, IndexError> {
+    let tx = conn.unchecked_transaction()?;
+    let mut files = lookup(&tx, plan)?;
+    {
+        let mut opaque = tx.prepare_cached("SELECT path FROM files WHERE trigram_state != 1")?;
+        let rows = opaque.query_map([], |r| r.get::<_, String>(0))?;
+        for row in rows {
+            files.push(row?);
+        }
+    }
+    tx.commit()?;
+    files.sort();
+    files.dedup();
+    Ok(files)
+}
 
 fn lookup(conn: &Connection, plan: &Plan) -> Result<Vec<String>, IndexError> {
     let mut ids: Option<BTreeSet<i64>> = None;
@@ -126,8 +142,14 @@ fn literal_files(conn: &Connection, literal: &[u8]) -> Result<Vec<i64>, IndexErr
 }
 
 /// The required-literal plan for `pattern`; None when no clause is worth a lookup.
-fn plan(pattern: &str) -> Option<Plan> {
-    let hir = regex_syntax::Parser::new().parse(pattern).ok()?;
+/// `case_insensitive` is the flag the real regex will be built with, so the planner
+/// expands the same Unicode case-fold alternatives (`k`, `K`, the Kelvin sign...).
+fn plan(pattern: &str, case_insensitive: bool) -> Option<Plan> {
+    let hir = regex_syntax::ParserBuilder::new()
+        .case_insensitive(case_insensitive)
+        .build()
+        .parse(pattern)
+        .ok()?;
     let mut clauses = info(&hir).into_clauses();
     clauses.retain(|c| !c.is_empty() && c.iter().all(|l| l.len() >= MIN_LITERAL));
     clauses.sort();

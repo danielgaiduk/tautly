@@ -125,6 +125,8 @@ pub(crate) struct KnownFile {
     pub mtime: i64,
     pub size: i64,
     pub hash: String,
+    /// One of the `TRI_*` states.
+    pub tri_state: u8,
 }
 
 /// One file ready to be written: its row, symbols, references and the source lines
@@ -180,7 +182,7 @@ impl Index {
         conn.pragma_update_and_check(None, "journal_mode", "WAL", |_| Ok(()))?;
         migrate(&mut conn)?;
         // A bulk refresh that was interrupted may have left these dropped.
-        ensure_name_indexes(&conn)?;
+        ensure_indexes(&conn)?;
         let tree = load_tree(&conn)?;
         Ok(Index {
             inner: Arc::new(Inner {
@@ -365,12 +367,6 @@ impl Inner {
         &self.tree
     }
 
-    /// Files whose content the trigram index cannot vouch for.
-    pub fn opaque_files(&self) -> Vec<String> {
-        let tree = self.tree.read().unwrap_or_else(PoisonError::into_inner);
-        tree.opaque().cloned().collect()
-    }
-
     /// Whether the stored extractor version differs from this build's, so that no
     /// content hash can be trusted to mean "already extracted".
     pub fn extractor_changed(&self) -> Result<bool, IndexError> {
@@ -415,7 +411,7 @@ impl Inner {
 
     /// Drop the two name indexes before a bulk build: with them in place every inserted
     /// symbol and reference is a random b-tree insert, which is half the build time;
-    /// [`ensure_name_indexes`] rebuilds them sorted afterwards.
+    /// [`ensure_indexes`] rebuilds them sorted afterwards.
     pub fn drop_name_indexes(&self) -> Result<(), IndexError> {
         self.conn().execute_batch(
             "DROP INDEX IF EXISTS symbols_name; DROP INDEX IF EXISTS refs_name_file_line;",
@@ -423,8 +419,8 @@ impl Inner {
         Ok(())
     }
 
-    pub fn ensure_name_indexes(&self) -> Result<(), IndexError> {
-        ensure_name_indexes(&self.conn())
+    pub fn ensure_indexes(&self) -> Result<(), IndexError> {
+        ensure_indexes(&self.conn())
     }
 
     pub fn mark_ready(&self) {
@@ -444,6 +440,69 @@ impl Inner {
     }
 
     /// Record the outcome of a refresh: success clears the last error.
+    /// Remember a failure outside a refresh (the watcher); the next successful refresh
+    /// clears it.
+    pub fn record_error(&self, message: String) {
+        *self
+            .last_error
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(message);
+    }
+
+    /// The postings of these files may no longer describe them: forget the postings and
+    /// make the files candidates for every search until they are re-read. Only files
+    /// that have postings are affected (the others are candidates already).
+    pub fn mark_pending(&self, paths: &[String]) -> Result<(), IndexError> {
+        self.mark_pending_where("path = ?1", paths)
+    }
+
+    /// [`Inner::mark_pending`] for every file under the directories `dirs`.
+    pub fn mark_pending_under(&self, dirs: &[String]) -> Result<(), IndexError> {
+        // `0` is the character after `/`, so this is the range of `dir/...`.
+        self.mark_pending_where("(path >= ?1 || '/' AND path < ?1 || '0')", dirs)
+    }
+
+    /// [`Inner::mark_pending`] for every other file with this content hash: the paths
+    /// that lead to the same file through symlinks, and copies.
+    pub fn mark_pending_with_hash(&self, hash: &str, except: &str) -> Result<(), IndexError> {
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let rows = format!("hash = ?1 AND path != ?2 AND trigram_state = {TRI_DONE}");
+        tx.execute(
+            &format!("DELETE FROM trigrams WHERE file_id IN (SELECT id FROM files WHERE {rows})"),
+            params![hash, except],
+        )?;
+        tx.execute(
+            &format!("UPDATE files SET trigram_state = {TRI_PENDING} WHERE {rows}"),
+            params![hash, except],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn mark_pending_where(&self, condition: &str, keys: &[String]) -> Result<(), IndexError> {
+        if keys.is_empty() {
+            return Ok(());
+        }
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        {
+            let rows = format!("{condition} AND trigram_state = {TRI_DONE}");
+            let mut delete = tx.prepare_cached(&format!(
+                "DELETE FROM trigrams WHERE file_id IN (SELECT id FROM files WHERE {rows})"
+            ))?;
+            let mut mark = tx.prepare_cached(&format!(
+                "UPDATE files SET trigram_state = {TRI_PENDING} WHERE {rows}"
+            ))?;
+            for key in keys {
+                delete.execute([key])?;
+                mark.execute([key])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn record_refresh<T>(&self, result: &Result<T, IndexError>) {
         let mut slot = self
             .last_error
@@ -490,7 +549,8 @@ impl Inner {
 
     pub fn known_files(&self) -> Result<HashMap<String, KnownFile>, IndexError> {
         let conn = self.conn();
-        let mut stmt = conn.prepare_cached("SELECT path, mtime, size, hash FROM files")?;
+        let mut stmt =
+            conn.prepare_cached("SELECT path, mtime, size, hash, trigram_state FROM files")?;
         let rows = stmt.query_map([], |r| {
             Ok((
                 r.get::<_, String>(0)?,
@@ -498,6 +558,7 @@ impl Inner {
                     mtime: r.get(1)?,
                     size: r.get(2)?,
                     hash: r.get(3)?,
+                    tri_state: r.get(4)?,
                 },
             ))
         })?;
@@ -508,13 +569,14 @@ impl Inner {
         Ok(self
             .conn()
             .query_row(
-                "SELECT mtime, size, hash FROM files WHERE path = ?1",
+                "SELECT mtime, size, hash, trigram_state FROM files WHERE path = ?1",
                 [key],
                 |r| {
                     Ok(KnownFile {
                         mtime: r.get(0)?,
                         size: r.get(1)?,
                         hash: r.get(2)?,
+                        tri_state: r.get(3)?,
                     })
                 },
             )
@@ -531,7 +593,7 @@ impl Inner {
         let mut conn = self.conn();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         {
-            // Postings carry no foreign key (they point at a rowid), so they go first.
+            // Postings carry no foreign key (they point at `files.id`), so they go first.
             let mut delete_tris = tx.prepare_cached(
                 "DELETE FROM trigrams WHERE file_id = (SELECT id FROM files WHERE path = ?1)",
             )?;
@@ -609,13 +671,7 @@ impl Inner {
             tree.touch(path, *size, *mtime);
         }
         for f in parsed {
-            tree.insert(
-                f.path.clone(),
-                f.size,
-                f.mtime,
-                &f.hash,
-                f.tri_state == TRI_DONE,
-            );
+            tree.insert(f.path.clone(), f.size, f.mtime, &f.hash);
         }
         Ok(())
     }
@@ -676,19 +732,17 @@ impl Inner {
             }
         }
         tx.commit()?;
-        let mut tree = self.tree.write().unwrap_or_else(PoisonError::into_inner);
-        for path in &done {
-            tree.set_indexed(path);
-        }
         Ok(done)
     }
 }
 
-fn ensure_name_indexes(conn: &Connection) -> Result<(), IndexError> {
-    conn.execute_batch(
+fn ensure_indexes(conn: &Connection) -> Result<(), IndexError> {
+    conn.execute_batch(&format!(
         "CREATE INDEX IF NOT EXISTS symbols_name ON symbols(name); \
-         CREATE INDEX IF NOT EXISTS refs_name_file_line ON refs(name, file, line);",
-    )?;
+         CREATE INDEX IF NOT EXISTS refs_name_file_line ON refs(name, file, line); \
+         CREATE INDEX IF NOT EXISTS files_pending ON files(id) WHERE trigram_state = {TRI_PENDING}; \
+         CREATE INDEX IF NOT EXISTS files_opaque ON files(path) WHERE trigram_state != {TRI_DONE};"
+    ))?;
     Ok(())
 }
 
@@ -703,19 +757,18 @@ fn pack_posting(tri: u32, file_id: i64) -> u64 {
 /// The tree as the database remembers it.
 fn load_tree(conn: &Connection) -> Result<TreeData, IndexError> {
     let mut tree = TreeData::default();
-    let mut stmt = conn.prepare("SELECT path, size, mtime, hash, trigram_state FROM files")?;
+    let mut stmt = conn.prepare("SELECT path, size, mtime, hash FROM files")?;
     let rows = stmt.query_map([], |r| {
         Ok((
             r.get::<_, String>(0)?,
             r.get::<_, i64>(1)?,
             r.get::<_, i64>(2)?,
             r.get::<_, String>(3)?,
-            r.get::<_, u8>(4)?,
         ))
     })?;
     for row in rows {
-        let (path, size, mtime, hash, state) = row?;
-        tree.insert(path, size, mtime, &hash, state == TRI_DONE);
+        let (path, size, mtime, hash) = row?;
+        tree.insert(path, size, mtime, &hash);
     }
     Ok(tree)
 }
@@ -768,6 +821,7 @@ CREATE TABLE files (
     trigram_state INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX files_pending ON files(id) WHERE trigram_state = 2;
+CREATE INDEX files_opaque ON files(path) WHERE trigram_state != 1;
 CREATE TABLE symbols (
     id         INTEGER PRIMARY KEY,
     file       TEXT NOT NULL REFERENCES files(path) ON DELETE CASCADE,
