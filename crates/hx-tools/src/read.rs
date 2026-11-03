@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use async_trait::async_trait;
 use hx_index::SymbolKind;
 use hx_provider::{Capabilities, EditFormat, ToolSpec};
-use hx_sandbox::{Effect, FileMeta, Sandbox};
+use hx_sandbox::{Effect, Sandbox};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -96,28 +96,15 @@ struct Lines {
 }
 
 /// What the tracker records for a read, committed only if the model gets all of the output.
-struct Pending {
-    meta: FileMeta,
-    /// The range's lines, newline-joined.
-    content: String,
-}
+/// `None`: the content could not be kept, so the commit only drops overlapping baselines.
+struct Pending(Option<PrevRead>);
 
 impl Lines {
-    /// Make this read the baseline for the next read of its range.
-    async fn commit(&self, sb: &dyn Sandbox, cx: &ToolCx) {
-        if let Some(p) = &self.pending {
-            cx.reads()
-                .record(
-                    sb,
-                    &self.full,
-                    self.range,
-                    cx.edit_format(),
-                    &p.meta,
-                    self.hash,
-                    cx.turn(),
-                    &p.content,
-                )
-                .await;
+    /// Make this read the baseline for the next read of its range. Synchronous (all the
+    /// I/O was done by `read_lines`), so it either happens whole or not at all.
+    fn commit(&self, cx: &ToolCx) {
+        if let Some(Pending(prev)) = &self.pending {
+            cx.reads().supersede(&self.full, self.range, prev.clone());
         }
     }
 
@@ -162,6 +149,15 @@ async fn read_lines(
     let hash = blake3::hash(&bytes);
     // The stale-read guard sees this read even if the range below turns out to be invalid.
     cx.reads().refresh(&full, &meta, hash);
+    let range = LineRange {
+        start: start_line,
+        end: end_line,
+    };
+    // A partial read cannot refresh the guard past a change to the rest of the file while a
+    // whole-file baseline of the older content still stands.
+    if range != LineRange::ALL {
+        cx.reads().drop_stale_whole(&full, hash);
+    }
 
     let lines: Vec<&str> = text.lines().collect();
     let total = lines.len();
@@ -188,10 +184,6 @@ async fn read_lines(
         &[]
     };
     let content = shown.join("\n");
-    let range = LineRange {
-        start: start_line,
-        end: end_line,
-    };
     let hashline = cx.edit_format() == EditFormat::Hashline;
     let mut text = shown
         .iter()
@@ -243,7 +235,20 @@ async fn read_lines(
         // An unchanged read keeps its baseline, and with it the turn the content was shown.
         // The commit waits until the caller knows the output was delivered whole.
         if !unchanged {
-            pending = Some(Pending { meta, content });
+            // Spilled now (content-addressed, harmless if never committed).
+            let kept = sb
+                .spill(content.as_bytes())
+                .await
+                .ok()
+                .map(|content_path| PrevRead {
+                    hash,
+                    format: cx.edit_format(),
+                    content_hash: blake3::hash(content.as_bytes()),
+                    turn: cx.turn(),
+                    mtime: meta.mtime,
+                    content_path,
+                });
+            pending = Some(Pending(kept));
         }
     }
     Ok(Lines {
@@ -484,8 +489,10 @@ impl Tool for ReadTool {
                         if truncated {
                             // The model did not see all of it; show it again next time.
                             cx.reads().forget(&lines.full, lines.range);
+                        } else if cx.cancel().is_cancelled() {
+                            return ToolResult::error("cancelled");
                         } else {
-                            lines.commit(sb, cx).await;
+                            lines.commit(cx);
                         }
                         let mut r = ToolResult::ok(output);
                         r.effects.push(AppliedEffect::Read(lines.full, lines.hash));
@@ -538,7 +545,7 @@ async fn read_batch(
             if *cut {
                 cx.reads().forget(&lines.full, lines.range);
             } else {
-                lines.commit(sb, cx).await;
+                lines.commit(cx);
             }
         }
     }

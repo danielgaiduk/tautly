@@ -70,7 +70,15 @@ impl Tool for WriteTool {
         }
         let post_hash = blake3::hash(a.content.as_bytes());
         if let Ok(meta) = sb.metadata(&full).await {
-            crate::record_written_file(sb, cx, &full, &meta, a.content.as_bytes(), true).await;
+            crate::record_written_file(
+                sb,
+                cx,
+                &full,
+                &meta,
+                a.content.as_bytes(),
+                crate::WrittenBy::Write,
+            )
+            .await;
         }
         let verb = if pre_image.is_some() {
             "overwrote"

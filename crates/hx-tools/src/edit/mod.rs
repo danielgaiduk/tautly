@@ -214,9 +214,16 @@ async fn load_fresh(
 }
 
 /// Remember what was written, so consecutive edits need no re-read.
-async fn record_written(sb: &dyn Sandbox, cx: &ToolCx, full: &Path, bytes: &[u8]) -> blake3::Hash {
+async fn record_written(
+    sb: &dyn Sandbox,
+    cx: &ToolCx,
+    full: &Path,
+    from: Option<&[u8]>,
+    bytes: &[u8],
+) -> blake3::Hash {
     if let Ok(meta) = sb.metadata(full).await {
-        crate::record_written_file(sb, cx, full, &meta, bytes, false).await;
+        crate::record_written_file(sb, cx, full, &meta, bytes, crate::WrittenBy::Edit { from })
+            .await;
     }
     blake3::hash(bytes)
 }
@@ -284,8 +291,14 @@ async fn write_edited(
     atomic::preserve_and_write(sb, Path::new(path), &file.original, edited)
         .await
         .map_err(|e| format!("{path}: {e}"))?;
-    let post_hash =
-        record_written(sb, cx, &file.full, &atomic::restore(&file.original, edited)).await;
+    let post_hash = record_written(
+        sb,
+        cx,
+        &file.full,
+        Some(&file.original),
+        &atomic::restore(&file.original, edited),
+    )
+    .await;
     let warning = join_notes([
         syntax_warning(path, &file.text, edited),
         reindex(cx, path).await,
@@ -603,7 +616,8 @@ async fn run_patch(a: PatchArgs, sb: &dyn Sandbox, cx: &ToolCx) -> ToolResult {
         let (verb, post_hash) = match step.op {
             PatchOp::Delete => ("deleted", blake3::hash(b"")),
             PatchOp::Update(_) | PatchOp::Add(_) => {
-                let h = record_written(sb, cx, &step.full, &step.bytes).await;
+                let h =
+                    record_written(sb, cx, &step.full, step.original.as_deref(), &step.bytes).await;
                 let verb = if matches!(step.op, PatchOp::Add(_)) {
                     "added"
                 } else {

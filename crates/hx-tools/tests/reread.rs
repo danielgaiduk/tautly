@@ -679,3 +679,99 @@ async fn baselines_from_another_edit_format_are_ignored() {
         "unchanged since turn 3"
     );
 }
+
+// ---- fix round 2 ----
+
+#[tokio::test]
+async fn edit_after_an_unseen_outside_change_does_not_claim_the_whole_file_seen() {
+    let e = env();
+    e.put("a.txt", &rows(100)).await;
+    e.read_at(1, json!({"path": "a.txt"})).await;
+    e.put("a.txt", &rows(100).replace("row50\n", "CHANGED50\n"))
+        .await;
+    // Errors (past the end) but still refreshes the stale-read guard.
+    let r = e
+        .run_at(&ReadTool, 2, json!({"path": "a.txt", "start_line": 500}))
+        .await;
+    assert!(r.is_error, "{}", r.output);
+    let r = e
+        .run_at(
+            &EditTool,
+            3,
+            json!({"path": "a.txt", "old_text": "row5\n", "new_text": "EDITED5\n"}),
+        )
+        .await;
+    assert!(!r.is_error, "{}", r.output);
+    let out = e.read_at(4, json!({"path": "a.txt"})).await;
+    assert!(out.contains("50\tCHANGED50"), "{}", &out[..40]);
+    assert!(!out.contains("unchanged"));
+}
+
+#[tokio::test]
+async fn guard_refresh_without_recording_drops_a_stale_whole_file_baseline() {
+    // Same probe, stopping after the read that refreshes the guard without recording.
+    let e = env();
+    e.put("a.txt", &rows(100)).await;
+    e.read_at(1, json!({"path": "a.txt"})).await;
+    e.put("a.txt", &rows(100).replace("row50\n", "CHANGED50\n"))
+        .await;
+    let r = e
+        .run_at(&ReadTool, 2, json!({"path": "a.txt", "start_line": 500}))
+        .await;
+    assert!(r.is_error);
+    let full = e.sb.resolve(Path::new("a.txt")).unwrap();
+    assert!(
+        e.reads
+            .previous(&full, LineRange::ALL, EditFormat::StrReplace)
+            .is_none(),
+        "a whole-file baseline of different content must not outlive the refresh"
+    );
+}
+
+#[tokio::test]
+async fn cancel_during_the_last_batch_target_commits_nothing() {
+    let e = env();
+    for f in ["a.txt", "b.txt"] {
+        e.put(f, "one\ntwo\n").await;
+    }
+    let token = CancellationToken::new();
+    let sb = CancelOnRead {
+        inner: LocalSandbox::new(e.dir.path().to_path_buf()).unwrap(),
+        token: token.clone(),
+        trigger: "b.txt",
+    };
+    let cx = e.cx(1, EditFormat::StrReplace).with_cancel(token);
+    let args = json!({"targets": [{"path": "a.txt"}, {"path": "b.txt"}]});
+    let r = ReadTool.run(args, &sb, &cx).await;
+    assert!(r.is_error, "{}", r.output);
+    for f in ["a.txt", "b.txt"] {
+        let full = e.sb.resolve(Path::new(f)).unwrap();
+        assert!(
+            e.reads
+                .previous(&full, LineRange::ALL, EditFormat::StrReplace)
+                .is_none(),
+            "{f}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn cancelled_single_read_commits_nothing() {
+    let e = env();
+    e.put("a.txt", "one\ntwo\n").await;
+    let token = CancellationToken::new();
+    let sb = CancelOnRead {
+        inner: LocalSandbox::new(e.dir.path().to_path_buf()).unwrap(),
+        token: token.clone(),
+        trigger: "a.txt",
+    };
+    let cx = e.cx(1, EditFormat::StrReplace).with_cancel(token);
+    let r = ReadTool.run(json!({"path": "a.txt"}), &sb, &cx).await;
+    assert!(r.is_error, "{}", r.output);
+    let full = e.sb.resolve(Path::new("a.txt")).unwrap();
+    assert!(
+        e.reads
+            .previous(&full, LineRange::ALL, EditFormat::StrReplace)
+            .is_none()
+    );
+}

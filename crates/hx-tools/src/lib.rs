@@ -149,20 +149,38 @@ impl ReadTracker {
         turn: u32,
         content: &str,
     ) {
-        self.refresh(path, meta, hash);
+        // Spill first: everything after is synchronous, so a dropped future cannot leave
+        // a half-applied record.
         let spilled = sb.spill(content.as_bytes()).await;
+        self.refresh(path, meta, hash);
+        let prev = spilled.ok().map(|content_path| PrevRead {
+            hash,
+            format,
+            content_hash: blake3::hash(content.as_bytes()),
+            turn,
+            mtime: meta.mtime,
+            content_path,
+        });
+        self.supersede(path, range, prev);
+    }
+
+    /// Make `new` the baseline of `range` of `path`, dropping every baseline of the path
+    /// that overlaps it. `None` (the content could not be kept) only drops them.
+    pub fn supersede(&self, path: &Path, range: LineRange, new: Option<PrevRead>) {
         let mut ranges = self.ranges.lock().unwrap_or_else(|e| e.into_inner());
         ranges.retain(|(p, r), _| p != path || !r.overlaps(&range));
-        if let Ok(content_path) = spilled {
-            let prev = PrevRead {
-                hash,
-                format,
-                content_hash: blake3::hash(content.as_bytes()),
-                turn,
-                mtime: meta.mtime,
-                content_path,
-            };
+        if let Some(prev) = new {
             ranges.insert((path.to_path_buf(), range), prev);
+        }
+    }
+
+    /// Drop the whole-file baseline of `path` unless it describes a file with `hash`: the
+    /// guard has moved on to newer content that the model has not seen whole.
+    pub fn drop_stale_whole(&self, path: &Path, hash: blake3::Hash) {
+        let mut ranges = self.ranges.lock().unwrap_or_else(|e| e.into_inner());
+        let key = (path.to_path_buf(), LineRange::ALL);
+        if ranges.get(&key).is_some_and(|prev| prev.hash != hash) {
+            ranges.remove(&key);
         }
     }
 
@@ -199,16 +217,25 @@ pub(crate) const MAX_READ_LINES: usize = 2000;
 /// Record the post-edit state of `full` (`bytes` as just written) so a later read of the
 /// whole file is diffed against what the edit left, not against the pre-edit read.
 ///
-/// `whole_file_seen` is true when the model supplied the entire content (`write`). After an
-/// edit it has seen the whole file only if it holds a whole-file baseline already; an edit
-/// after a partial read must not make a whole-file read answer `unchanged`.
+/// After `write` the model supplied the entire content. After an edit it has seen the whole
+/// file only if its whole-file baseline describes the file the edit started from (`from`,
+/// the pre-edit bytes): an edit after a partial read, or after a change it never saw, must
+/// not make a whole-file read answer `unchanged`.
+pub(crate) enum WrittenBy<'a> {
+    Write,
+    /// An edit of a file that had these bytes (none: the edit created the file).
+    Edit {
+        from: Option<&'a [u8]>,
+    },
+}
+
 pub(crate) async fn record_written_file(
     sb: &dyn Sandbox,
     cx: &ToolCx,
     full: &Path,
     meta: &FileMeta,
     bytes: &[u8],
-    whole_file_seen: bool,
+    by: WrittenBy<'_>,
 ) {
     let hash = blake3::hash(bytes);
     // Hashline edits move line numbers and the model has not seen the new anchors, so a
@@ -218,11 +245,14 @@ pub(crate) async fn record_written_file(
         cx.reads().refresh(full, meta, hash);
         return;
     }
-    let seen_whole = whole_file_seen
-        || cx
-            .reads()
-            .previous(full, LineRange::ALL, cx.edit_format())
-            .is_some();
+    let seen_whole = match by {
+        WrittenBy::Write => true,
+        WrittenBy::Edit { from } => from.is_some_and(|from| {
+            cx.reads()
+                .previous(full, LineRange::ALL, cx.edit_format())
+                .is_some_and(|prev| prev.hash == blake3::hash(from))
+        }),
+    };
     if !seen_whole {
         cx.reads().refresh(full, meta, hash);
         cx.reads().forget(full, LineRange::ALL);
