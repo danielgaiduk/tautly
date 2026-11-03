@@ -71,3 +71,22 @@ fn suffixed(name: &str, server: &str, tool: &str) -> String {
     let hex = h.finalize().to_hex();
     format!("{}_{}", &name[..name.len().min(KEPT)], &hex[..6])
 }
+
+/// Longest name of a repository-declared server.
+pub const MAX_SERVER_NAME: usize = 32;
+
+/// Whether `name` may name a repository-declared server: `[A-Za-z0-9]`, then
+/// `[A-Za-z0-9-]` with single `_` between parts (`^[A-Za-z0-9][A-Za-z0-9-]*(_[A-Za-z0-9-]+)*$`),
+/// at most [`MAX_SERVER_NAME`] characters. Such a name is its own sanitized form and has
+/// no `__`, so its tools (`mcp__<name>__<tool>`) can never pass for another server's and
+/// fall under that server's permission rules (`mcp__gh__*` must not cover a server named
+/// `gh__x` or `gh.`).
+pub fn is_valid_server_name(name: &str) -> bool {
+    name.len() <= MAX_SERVER_NAME
+        && name.starts_with(|c: char| c.is_ascii_alphanumeric())
+        && !name.ends_with('_')
+        && !name.contains("__")
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}

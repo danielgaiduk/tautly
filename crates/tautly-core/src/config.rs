@@ -429,12 +429,12 @@ impl Config {
         if self.model.as_str().is_empty() {
             return Err("model must not be empty".into());
         }
-        if let Some(t) = self.compaction_threshold {
-            if !(t.is_finite() && t > 0.0 && t <= 1.0) {
-                return Err(format!(
-                    "compaction_threshold must be in (0, 1], or 0 to disable; got {t}"
-                ));
-            }
+        if let Some(t) = self.compaction_threshold
+            && !(t.is_finite() && t > 0.0 && t <= 1.0)
+        {
+            return Err(format!(
+                "compaction_threshold must be in (0, 1], or 0 to disable; got {t}"
+            ));
         }
         if self.max_turns == 0 {
             return Err("max_turns must be at least 1".into());
@@ -453,10 +453,10 @@ impl Config {
                 return Err(format!("budget.{scope}.max_tokens must be at least 1"));
             }
         }
-        if let Some(m) = &self.routing.side_model {
-            if m.as_str().is_empty() {
-                return Err("routing.side_model must not be empty".into());
-            }
+        if let Some(m) = &self.routing.side_model
+            && m.as_str().is_empty()
+        {
+            return Err("routing.side_model must not be empty".into());
         }
         for pin in &self.pins {
             if pin.trim().is_empty() {

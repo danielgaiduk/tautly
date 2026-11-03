@@ -222,10 +222,10 @@ async fn process(index: &Index, batch: Batch, stop: &AtomicBool) {
             resync = true;
         }
         // `.git` itself is never admitted; the exclude file counts if its repository is.
-        if let Some(repo) = git_exclude_repo(&key) {
-            if dir_admitted(inner, &mut dirs, repo).await {
-                resync = true;
-            }
+        if let Some(repo) = git_exclude_repo(&key)
+            && dir_admitted(inner, &mut dirs, repo).await
+        {
+            resync = true;
         }
         let known = tree_has(inner, &key);
         if !parent_ok && !known {

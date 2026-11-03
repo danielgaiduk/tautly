@@ -11,6 +11,7 @@ use tautly_sandbox::{Effect, Sandbox};
 use tautly_tools::{AppliedEffect, Tool, ToolCx, ToolError, ToolResult, cap_output};
 
 use crate::client::Connection;
+use crate::text::strip_control;
 
 /// Longest description sent to the model, in bytes.
 pub const DESCRIPTION_CAP: usize = 1024;
@@ -92,7 +93,10 @@ impl Tool for McpTool {
                 "timeout",
             ),
             Ok(Err(e)) => ToolResult::error_kind(
-                format!("the MCP call failed (server `{}`): {e}", self.conn.server),
+                strip_control(&format!(
+                    "the MCP call failed (server `{}`): {e}",
+                    self.conn.server
+                )),
                 "mcp_error",
             ),
             Ok(Ok(CallToolResponse::Complete(r))) => {
@@ -180,10 +184,12 @@ pub(crate) fn map_result(r: &CallToolResult) -> (String, bool) {
             other => parts.push(format!("[{other} content, not shown]")),
         }
     }
-    if !has_text {
-        if let Some(sc) = &r.structured_content {
-            parts.insert(0, sc.to_string());
-        }
+    if !has_text && let Some(sc) = &r.structured_content {
+        parts.insert(0, sc.to_string());
     }
-    (parts.join("\n"), r.is_error.unwrap_or(false))
+    // Server text reaches the model: no terminal controls or invisible characters.
+    (
+        strip_control(&parts.join("\n")),
+        r.is_error.unwrap_or(false),
+    )
 }

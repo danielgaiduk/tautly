@@ -9,6 +9,11 @@ use serde::{Deserialize, Deserializer};
 use serde_json::Value;
 use url::Url;
 
+use crate::text::{cut, printable};
+
+/// Bytes of each repository variable or header value an approval prompt shows.
+pub const LAUNCH_VALUE_CAP: usize = 200;
+
 /// Provider key variables no server ever sees (spec 7.11.10); the engine adds every
 /// configured `api_key_env`.
 pub const PROVIDER_KEY_VARS: &[&str] = &[
@@ -112,15 +117,29 @@ impl ServerSpec {
         }
     }
 
-    /// What starting it means, for an approval prompt: the command line (or URL) and the
-    /// names, never the values, of its variables and headers.
-    pub fn launch(&self) -> String {
-        let names = |what: &str, keys: Vec<&str>| {
-            if keys.is_empty() {
-                String::new()
-            } else {
-                format!(" ({what}: {})", keys.join(", "))
+    /// What starting it means, for an approval prompt or a listing: the command line (or
+    /// URL) and its variables (or headers). A repository server's values are shown, each
+    /// cut to [`LAUNCH_VALUE_CAP`] bytes: they are repository content and they decide what
+    /// runs (`NODE_OPTIONS`, `PATH`). A trusted server's values may be the user's secrets,
+    /// so only the names are shown. Control and invisible characters are escaped
+    /// ([`printable`]), so the text cannot redraw itself in a terminal.
+    pub fn launch(&self, source: ServerSource) -> String {
+        let show_values = source.is_repository();
+        let vars = |what: &str, map: &BTreeMap<String, String>| {
+            if map.is_empty() {
+                return String::new();
             }
+            let items: Vec<String> = map
+                .iter()
+                .map(|(k, v)| {
+                    if show_values {
+                        format!("{}={}", printable(k), cut(&printable(v), LAUNCH_VALUE_CAP))
+                    } else {
+                        printable(k)
+                    }
+                })
+                .collect();
+            format!(" ({what}: {})", items.join(", "))
         };
         match self {
             ServerSpec::Stdio {
@@ -135,17 +154,14 @@ impl ServerSpec {
                     .collect();
                 let cwd = cwd
                     .as_ref()
-                    .map(|c| format!(" (cwd: {})", c.display()))
+                    .map(|c| format!(" (cwd: {})", printable(&c.to_string_lossy())))
                     .unwrap_or_default();
-                format!(
-                    "stdio: {}{cwd}{}",
-                    argv.join(" "),
-                    names("env", env.keys().map(String::as_str).collect())
-                )
+                format!("stdio: {}{cwd}{}", argv.join(" "), vars("env", env))
             }
             ServerSpec::Http { url, headers } => format!(
-                "http: {url}{}",
-                names("headers", headers.keys().map(String::as_str).collect())
+                "http: {}{}",
+                printable(url.as_str()),
+                vars("headers", headers)
             ),
         }
     }
@@ -311,7 +327,7 @@ fn json_spec(entry: &Value) -> Result<ServerSpec, String> {
     Ok(spec)
 }
 
-/// `s` as one shell word, for display.
+/// `s` as one shell word, for display, with control and invisible characters escaped.
 fn quote(s: &str) -> String {
     let plain = !s.is_empty()
         && s.chars()
@@ -319,7 +335,7 @@ fn quote(s: &str) -> String {
     if plain {
         s.to_string()
     } else {
-        format!("'{}'", s.replace('\'', r"'\''"))
+        format!("'{}'", printable(s).replace('\'', r"'\''"))
     }
 }
 

@@ -1,6 +1,6 @@
 //! MCP servers in the engine (spec 7.11.10): repository-server approval, the tool set per
 //! user turn, policy, checkpoints and the loop breaker. The servers are `tautly-mcp`'s
-//! `echo_server` fixture.
+//! `echo_server` fixture (crate `tautly-mcp-fixture`).
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -22,6 +22,8 @@ use tokio::sync::mpsc;
 
 const MODEL: &str = "mock/test";
 const WAIT: Duration = Duration::from_secs(20);
+/// Tools the fixture offers by default.
+const ECHO_TOOL_COUNT: usize = 11;
 
 /// The `echo_server` binary of `tautly-mcp`, next to this test's directory
 /// (`cargo test --workspace` builds it; otherwise it is built here once).
@@ -34,7 +36,7 @@ fn fixture() -> String {
         if !bin.exists() {
             let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
             let status = std::process::Command::new(cargo)
-                .args(["build", "-p", "tautly-mcp", "--bin", "echo_server"])
+                .args(["build", "-p", "tautly-mcp-fixture", "--bin", "echo_server"])
                 .status()
                 .unwrap();
             assert!(status.success(), "could not build the echo_server fixture");
@@ -309,9 +311,10 @@ async fn repo_server_not_spawned_without_approval() {
         launch.contains(&fixture()) && launch.contains("ECHO_PID_FILE"),
         "{launch}"
     );
+    // A repository server's values are shown: they decide what runs.
     assert!(
-        !launch.contains(&*pid_file.to_string_lossy()),
-        "values are not shown: {launch}"
+        launch.contains(&format!("ECHO_PID_FILE={}", pid_file.to_string_lossy())),
+        "{launch}"
     );
     // The status may come before or after the request.
     let awaiting = |e: &Event| matches!(e, Event::McpServerStatus { server, state: McpState::AwaitingApproval, .. } if server == "echo");
@@ -608,7 +611,7 @@ async fn mcp_tools_sorted_by_name_in_request() {
     assert_eq!(names, sorted);
     assert!(names.contains(&"mcp__echo__echo".to_string()));
     assert!(names.contains(&"read".to_string()));
-    assert_eq!(mcp_names(req).len(), 8);
+    assert_eq!(mcp_names(req).len(), ECHO_TOOL_COUNT);
     run.shutdown().await;
 }
 
@@ -709,7 +712,7 @@ async fn first_request_waits_up_to_startup_timeout() {
     let mock = MockProvider::new(vec![text_step("done")]);
     let mut run = start(fx.builder(cfg, &mock));
     run.turn_with("hi").await;
-    assert_eq!(mcp_names(&mock.requests()[0]).len(), 8);
+    assert_eq!(mcp_names(&mock.requests()[0]).len(), ECHO_TOOL_COUNT);
     run.shutdown().await;
 
     // Not ready: the first request goes without them, after about the wait.
@@ -761,7 +764,7 @@ async fn late_server_joins_at_next_user_turn_once() {
     );
     let reqs = mock.requests();
     assert_eq!(reqs.len(), 5);
-    assert_eq!(mcp_names(&reqs[2]).len(), 8);
+    assert_eq!(mcp_names(&reqs[2]).len(), ECHO_TOOL_COUNT);
     for later in &reqs[3..] {
         assert_eq!(later.tools, reqs[2].tools);
         assert_eq!(later.system, reqs[2].system);
@@ -797,6 +800,16 @@ async fn list_changed_applies_at_next_user_turn() {
     run.shutdown().await;
 }
 
+/// The fixture's call log without its `tools/list` lines.
+fn tool_calls(path: &Path) -> String {
+    std::fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .filter(|l| *l != "tools/list")
+        .map(|l| format!("{l}\n"))
+        .collect()
+}
+
 struct Recorder {
     calls_file: PathBuf,
     seen: Mutex<Vec<(String, String)>>,
@@ -805,7 +818,7 @@ struct Recorder {
 #[async_trait]
 impl PreExecHook for Recorder {
     async fn before_exec(&self, tool: &str, _turn: u32) {
-        let calls = std::fs::read_to_string(&self.calls_file).unwrap_or_default();
+        let calls = tool_calls(&self.calls_file);
         self.seen.lock().unwrap().push((tool.to_string(), calls));
     }
 }
@@ -837,7 +850,7 @@ async fn checkpoint_taken_before_stdio_mcp_call() {
     let seen = hook.seen.lock().unwrap().clone();
     // Once, for the MCP call only, before the server saw it.
     assert_eq!(seen, vec![("mcp__echo__echo".to_string(), String::new())]);
-    assert_eq!(std::fs::read_to_string(&calls).unwrap(), "echo\n");
+    assert_eq!(tool_calls(&calls), "echo\n");
     run.shutdown().await;
 }
 
@@ -958,4 +971,199 @@ async fn plan_lists_servers_with_source_and_approval() {
     cfg.mcp.enabled = false;
     let plan = plan_servers(&cfg.mcp, &cfg.project_mcp_servers, &[], true, home, &sb).await;
     assert!(plan.servers.is_empty());
+}
+
+#[tokio::test]
+async fn changed_env_value_asks_again() {
+    let fx = Fx::new();
+    fx.project_server("echo", &[("NODE_OPTIONS", "")]);
+    let (cfg, _) = fx.loaded(Mode::Ask);
+    let k = key(&fx.root(), "echo", &cfg.project_mcp_servers["echo"]);
+    fx.approvals().approve(&k, &fx.root(), "echo").unwrap();
+
+    // Same variable, new value: asks again, and the prompt shows the value.
+    fx.project_server("echo", &[("NODE_OPTIONS", "--require ./evil.js")]);
+    let (cfg, _) = fx.loaded(Mode::Ask);
+    let mock = MockProvider::new(vec![]);
+    let mut run = start(EngineBuilder {
+        interactive: true,
+        ..fx.builder(cfg, &mock)
+    });
+    let events = run
+        .until(|e| matches!(e, Event::McpServerApprovalRequested { .. }))
+        .await;
+    let (_, _, _, launch) = approval_request(&events).unwrap();
+    assert!(
+        launch.contains("NODE_OPTIONS=--require ./evil.js"),
+        "{launch}"
+    );
+    run.shutdown().await;
+}
+
+#[tokio::test]
+async fn repository_server_names_cannot_borrow_user_rules() {
+    let fx = Fx::new();
+    let server = |name: &str| {
+        format!(
+            "[mcp.servers.\"{name}\"]\ncommand = {}\nargs = [\"stdio\"]\n",
+            toml_str(&fixture())
+        )
+    };
+    fx.write(
+        ".tautly/config.toml",
+        &format!("{}{}{}", server("gh__x"), server("gh."), server("my_srv")),
+    );
+    let (mut cfg, _) = fx.loaded(Mode::Ask);
+    cfg.mcp.servers.insert("gh".into(), stdio(&[]));
+    // The user's `my.srv` has the tool prefix `mcp__my_srv__` too.
+    cfg.mcp.servers.insert("my.srv".into(), stdio(&[]));
+    cfg.permissions.allow = vec!["mcp__gh__*".into(), "mcp__my_srv__*".into()];
+    let mock = MockProvider::new(vec![text_step("done")]);
+    let mut run = start(EngineBuilder {
+        approve_mcp: true,
+        ..fx.builder(cfg, &mock)
+    });
+    let ready = |events: &[Event], name: &str| {
+        events.iter().any(|e| matches!(e, Event::McpServerStatus { server, state: McpState::Ready, .. } if server == name))
+    };
+    let mut events = Vec::new();
+    while !(ready(&events, "gh") && ready(&events, "my.srv")) {
+        events.push(run.next().await);
+    }
+    let warnings: Vec<&String> = events
+        .iter()
+        .filter_map(|e| match e {
+            Event::Warning { message } => Some(message),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.contains("gh__x") && w.contains("not a valid")),
+        "{warnings:?}"
+    );
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.contains("`gh.`") && w.contains("not a valid")),
+        "{warnings:?}"
+    );
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.contains("my_srv") && w.contains("shadowed")),
+        "{warnings:?}"
+    );
+    run.turn_with("hi").await;
+    // Only the user's servers' tools carry their prefixes; no repository tool falls under
+    // the user's rules.
+    let names = mcp_names(&mock.requests()[0]);
+    assert_eq!(names.len(), 2 * ECHO_TOOL_COUNT, "{names:?}");
+    assert!(
+        names
+            .iter()
+            .all(|n| !n.starts_with("mcp__gh__x__") && !n.starts_with("mcp__gh___")),
+        "{names:?}"
+    );
+    run.shutdown().await;
+}
+
+#[tokio::test]
+async fn approval_prompt_escapes_control_characters() {
+    let fx = Fx::new();
+    fx.write(
+        ".mcp.json",
+        &json!({"mcpServers": {"echo": {
+            "command": fixture(),
+            "args": ["\r\u{1b}[2Kstdio\u{202e}"],
+            "env": {"ECHO_NOTE": "a\u{7}b"}
+        }}})
+        .to_string(),
+    );
+    let (cfg, _) = fx.loaded(Mode::Ask);
+    let mock = MockProvider::new(vec![]);
+    let mut run = start(EngineBuilder {
+        interactive: true,
+        ..fx.builder(cfg, &mock)
+    });
+    let events = run
+        .until(|e| matches!(e, Event::McpServerApprovalRequested { .. }))
+        .await;
+    let (_, _, _, launch) = approval_request(&events).unwrap();
+    assert!(
+        !launch.chars().any(|c| c.is_control() || c == '\u{202e}'),
+        "{launch:?}"
+    );
+    assert!(launch.contains("\\r\\u{1b}[2Kstdio\\u{202e}"), "{launch}");
+    assert!(launch.contains("ECHO_NOTE=a\\u{7}b"), "{launch}");
+    run.shutdown().await;
+}
+
+#[tokio::test]
+async fn pending_approval_is_announced_again_each_turn() {
+    let fx = Fx::new();
+    fx.project_server("echo", &[]);
+    let (cfg, _) = fx.loaded(Mode::Ask);
+    let mock = MockProvider::new(vec![text_step("a"), text_step("b")]);
+    let mut run = start(EngineBuilder {
+        interactive: true,
+        ..fx.builder(cfg, &mock)
+    });
+    let events = run
+        .until(|e| matches!(e, Event::McpServerApprovalRequested { .. }))
+        .await;
+    let (first, ..) = approval_request(&events).unwrap();
+    for text in ["one", "two"] {
+        let turn = run.turn_with(text).await;
+        let (again, ..) = approval_request(&turn).expect("re-announced at the turn start");
+        assert_eq!(again, first);
+    }
+    run.send(Command::Approve { request_id: first }).await;
+    run.until_state("echo", McpState::Ready).await;
+    run.shutdown().await;
+}
+
+#[tokio::test]
+async fn dead_server_tools_removed_at_next_user_turn() {
+    let fx = Fx::new();
+    let mock = MockProvider::new(vec![
+        tools_step(vec![call("c1", "mcp__echo__exit", json!({}))]),
+        text_step("turn 1"),
+        text_step("turn 2"),
+    ]);
+    let mut run = start(fx.builder(with_user_server(Mode::Yolo, &[]), &mock));
+    run.turn_with("one").await;
+    run.until_state("echo", McpState::Failed).await;
+    let events = run.turn_with("two").await;
+    assert!(
+        events.iter().any(
+            |e| matches!(e, Event::Warning { message } if message.contains("MCP tools changed"))
+        ),
+        "{events:?}"
+    );
+    let reqs = mock.requests();
+    assert_eq!(mcp_names(&reqs[0]).len(), ECHO_TOOL_COUNT);
+    assert_eq!(mcp_names(&reqs[1]).len(), ECHO_TOOL_COUNT);
+    assert!(mcp_names(&reqs[2]).is_empty());
+    run.shutdown().await;
+}
+
+#[tokio::test]
+async fn mcp_json_fifo_does_not_block_startup() {
+    let fx = Fx::new();
+    let fifo = std::ffi::CString::new(fx.path(".mcp.json").to_string_lossy().as_bytes()).unwrap();
+    // SAFETY: a valid NUL-terminated path.
+    assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o644) }, 0);
+    let mock = MockProvider::new(vec![text_step("done")]);
+    let mut run = start(fx.builder(with_user_server(Mode::Ask, &[]), &mock));
+    let events = run.until_state("echo", McpState::Ready).await;
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, Event::Warning { message } if message.contains(".mcp.json"))),
+        "{events:?}"
+    );
+    run.turn_with("hi").await;
+    run.shutdown().await;
 }

@@ -1,23 +1,28 @@
 //! A test MCP server for the `tautly-mcp` and `tautly-core` tests.
 //!
-//! `echo_server [stdio|http|legacy] [URL_FILE]`:
+//! `echo_server [stdio|http|legacy|hang] [URL_FILE]`:
 //! - `stdio` (default): an `rmcp` server on stdin/stdout.
 //! - `http`: an `rmcp` streamable-HTTP server on 127.0.0.1 (a free port); the endpoint URL
 //!   is written to `URL_FILE`.
 //! - `legacy`: a hand-written server that knows only the `initialize` handshake of
 //!   2025-06-18 and answers `server/discover` with "method not found", like servers built
 //!   before 2026-07-28.
+//! - `hang`: writes the pid file, then never answers (a server stuck in its handshake).
 //!
 //! Tools: `echo {text}`, `env` (its environment, `NAME=VALUE` per line), `slow {ms}`,
 //! `mixed` (text, image, resource link), `structured` (only `structuredContent`), `big
 //! {bytes}`, `fail` (an error result) and `change_tools` (adds `extra` and sends
-//! `notifications/tools/list_changed`).
+//! `notifications/tools/list_changed`), `storm` (200 such notifications), `exit` (answers,
+//! then the process exits with status 3) and, over HTTP, `headers` (the request's headers,
+//! `name: value` per line).
 //!
 //! Environment: `ECHO_FILLER=N` adds tools `filler_000`..; `ECHO_BIG_SCHEMA=1` adds
 //! `big_schema` (a 9 KB input schema); `ECHO_LONG_DESC=1` adds `long_desc` (a 3 KB
 //! description); `ECHO_START_DELAY_MS` delays start-up; `ECHO_PID_FILE` receives this
 //! process's pid and that of a `sleep` child in the same process group, one per line;
-//! `ECHO_CALLS` is a file each call's tool name is appended to.
+//! `ECHO_CALLS` is a file each call's tool name (and `tools/list` for each listing) is
+//! appended to; `ECHO_CONTROL=1` adds `ctl`, whose description and result hold control
+//! characters; `ECHO_PAGES=endless` lists one tool per page with a next cursor, forever.
 
 use std::io::Write as _;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -103,18 +108,43 @@ fn tools(extra: bool) -> Vec<Value> {
     if std::env::var_os("ECHO_LONG_DESC").is_some() {
         v.push(tool("long_desc", &"d".repeat(3000), object(json!({}))));
     }
+    if std::env::var_os("ECHO_CONTROL").is_some() {
+        v.push(tool(
+            "ctl",
+            "red\u{1b}[31m text\u{7}\r\u{202e}reversed",
+            object(json!({})),
+        ));
+    }
+    for name in ["storm", "exit", "headers"] {
+        v.push(tool(name, name, object(json!({}))));
+    }
     v
 }
 
+/// Send `n` tool-list-changed notifications to every client that can receive them.
+async fn notify(state: &State, n: usize) {
+    let sinks: Vec<_> = state.sinks.lock().unwrap().clone();
+    let peers: Vec<_> = state.peers.lock().unwrap().clone();
+    for _ in 0..n {
+        if sinks.is_empty() {
+            for p in &peers {
+                let _ = p.notify_tool_list_changed().await;
+            }
+        }
+        for s in &sinks {
+            let _ = s.notify_tool_list_changed().await;
+        }
+    }
+}
+
 fn log_call(name: &str) {
-    if let Some(path) = std::env::var_os("ECHO_CALLS") {
-        if let Ok(mut f) = std::fs::OpenOptions::new()
+    if let Some(path) = std::env::var_os("ECHO_CALLS")
+        && let Ok(mut f) = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(path)
-        {
-            let _ = writeln!(f, "{name}");
-        }
+    {
+        let _ = writeln!(f, "{name}");
     }
 }
 
@@ -151,18 +181,21 @@ async fn call(name: &str, args: &Value, state: &State) -> Value {
         "fail" => json!({"content": [{"type": "text", "text": "boom"}], "isError": true}),
         "change_tools" => {
             state.extra.store(true, Ordering::SeqCst);
-            let sinks: Vec<_> = state.sinks.lock().unwrap().clone();
-            let peers: Vec<_> = state.peers.lock().unwrap().clone();
-            if sinks.is_empty() {
-                for p in peers {
-                    let _ = p.notify_tool_list_changed().await;
-                }
-            }
-            for s in sinks {
-                let _ = s.notify_tool_list_changed().await;
-            }
+            notify(state, 1).await;
             json!({"content": [{"type": "text", "text": "changed"}]})
         }
+        "storm" => {
+            notify(state, 200).await;
+            json!({"content": [{"type": "text", "text": "stormed"}]})
+        }
+        "exit" => {
+            tokio::spawn(async {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                std::process::exit(3);
+            });
+            json!({"content": [{"type": "text", "text": "bye"}]})
+        }
+        "ctl" => json!({"content": [{"type": "text", "text": "a\u{1b}[2Kb\u{7}c\td\ne"}]}),
         other => {
             json!({"content": [{"type": "text", "text": format!("no tool {other}")}], "isError": true})
         }
@@ -181,22 +214,43 @@ impl ServerHandler for Echo {
 
     async fn list_tools(
         &self,
-        _request: Option<PaginatedRequestParams>,
+        request: Option<PaginatedRequestParams>,
         context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, ErrorData> {
+        log_call("tools/list");
         self.state.peers.lock().unwrap().push(context.peer.clone());
-        let extra = self.state.extra.load(Ordering::SeqCst);
-        serde_json::from_value(json!({"tools": tools(extra)}))
-            .map_err(|e| ErrorData::internal_error(e.to_string(), None))
+        let page = if std::env::var("ECHO_PAGES").as_deref() == Ok("endless") {
+            let n: u64 = request
+                .and_then(|r| r.cursor)
+                .and_then(|c| c.parse().ok())
+                .unwrap_or(0);
+            json!({"tools": [tool(&format!("page_{n:06}"), "a page", object(json!({})))],
+                   "nextCursor": (n + 1).to_string()})
+        } else {
+            let extra = self.state.extra.load(Ordering::SeqCst);
+            json!({"tools": tools(extra)})
+        };
+        serde_json::from_value(page).map_err(|e| ErrorData::internal_error(e.to_string(), None))
     }
 
     async fn call_tool(
         &self,
         request: CallToolRequestParams,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
         let args = Value::Object(request.arguments.unwrap_or_default());
-        let v = call(&request.name, &args, &self.state).await;
+        let v = match context.extensions.get::<http::request::Parts>() {
+            Some(parts) if request.name == "headers" => {
+                let mut lines: Vec<String> = parts
+                    .headers
+                    .iter()
+                    .map(|(k, v)| format!("{k}: {}", String::from_utf8_lossy(v.as_bytes())))
+                    .collect();
+                lines.sort();
+                json!({"content": [{"type": "text", "text": lines.join("\n")}]})
+            }
+            _ => call(&request.name, &args, &self.state).await,
+        };
         let result: CallToolResult = serde_json::from_value(v)
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
         Ok(result.into())
@@ -350,6 +404,7 @@ async fn main() {
     match args.get(1).map(String::as_str) {
         Some("http") => serve_http(args.get(2).expect("URL_FILE")).await,
         Some("legacy") => serve_legacy().await,
+        Some("hang") => std::future::pending::<()>().await,
         _ => serve_stdio().await,
     }
 }

@@ -152,6 +152,13 @@ impl EventSink {
         }
     }
 
+    /// Send now if there is room; false when it was not sent (not counted as dropped: the
+    /// caller sends it again later). Never waits.
+    pub fn try_send(&self, ev: Event) -> bool {
+        self.announce_dropped();
+        self.tx.try_send(ev).is_ok()
+    }
+
     pub async fn warn(&self, message: impl Into<String>) {
         self.emit(Event::Warning {
             message: message.into(),

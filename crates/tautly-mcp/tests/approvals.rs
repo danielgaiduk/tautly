@@ -30,8 +30,8 @@ fn approval_remembered_by_root_and_launch_hash() {
     let k = key(repo.path(), "github", &spec);
     assert_eq!(k.len(), 64);
     assert!(k.chars().all(|c| c.is_ascii_hexdigit()));
-    // Variable values are not part of the key; names are.
-    assert_eq!(
+    // Variable names and values are both part of the key (repository servers).
+    assert_ne!(
         k,
         key(
             repo.path(),
@@ -79,7 +79,7 @@ fn approval_remembered_by_root_and_launch_hash() {
         .unwrap()
         .map(|e| e.unwrap().file_name())
         .collect();
-    assert_eq!(names.len(), 2, "{names:?}"); // the file and the symlink
+    assert_eq!(names.len(), 3, "{names:?}"); // the file, its lock file and the symlink
 }
 
 #[test]
@@ -144,12 +144,15 @@ fn changed_command_asks_again() {
             &http("https://a.example/mcp", &["X-Other"])
         )
     );
-    // Header values are not part of the key.
-    let mut same = http("https://a.example/mcp", &["Authorization"]);
-    if let ServerSpec::Http { headers, .. } = &mut same {
-        headers.insert("Authorization".into(), "other".into());
-    }
-    assert_eq!(h, key(repo.path(), "s", &same));
+    // The same headers, with the same values, are the same approval.
+    assert_eq!(
+        h,
+        key(
+            repo.path(),
+            "s",
+            &http("https://a.example/mcp", &["Authorization"])
+        )
+    );
 
     // A corrupt store is an empty one, and approving rewrites it.
     let data = tempfile::tempdir().unwrap();
@@ -159,4 +162,87 @@ fn changed_command_asks_again() {
     assert!(!store.is_approved(&k));
     store.approve(&k, repo.path(), "s").unwrap();
     assert!(ApprovalStore::open(&path).is_approved(&k));
+}
+
+#[test]
+fn changed_env_value_asks_again() {
+    let repo = tempfile::tempdir().unwrap();
+    let k = key(
+        repo.path(),
+        "s",
+        &stdio("node", &["server.js"], &[("NODE_OPTIONS", "")]),
+    );
+    for (name, value) in [
+        ("NODE_OPTIONS", "--require ./evil.js"),
+        ("NODE_OPTIONS", " "),
+    ] {
+        let changed = stdio("node", &["server.js"], &[(name, value)]);
+        assert_ne!(k, key(repo.path(), "s", &changed), "{name}={value}");
+    }
+    // Pairs, not a bag of strings: `A=b, B=a` is not `A=a, B=b`.
+    assert_ne!(
+        key(
+            repo.path(),
+            "s",
+            &stdio("x", &[], &[("A", "b"), ("B", "a")])
+        ),
+        key(
+            repo.path(),
+            "s",
+            &stdio("x", &[], &[("A", "a"), ("B", "b")])
+        )
+    );
+    assert_eq!(
+        key(repo.path(), "s", &stdio("x", &[], &[("PATH", "/bin")])),
+        key(repo.path(), "s", &stdio("x", &[], &[("PATH", "/bin")]))
+    );
+}
+
+#[test]
+fn changed_header_value_asks_again() {
+    let repo = tempfile::tempdir().unwrap();
+    let http = |v: &str| ServerSpec::Http {
+        url: "https://a.example/mcp".parse().unwrap(),
+        headers: BTreeMap::from([("X-Target".to_string(), v.to_string())]),
+    };
+    assert_ne!(
+        key(repo.path(), "s", &http("prod")),
+        key(repo.path(), "s", &http("attacker"))
+    );
+}
+
+#[test]
+fn concurrent_approvals_are_all_kept() {
+    let repo = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let path = data.path().join(APPROVALS_FILE);
+    let keys: Vec<String> = (0..8)
+        .map(|i| key(repo.path(), &format!("s{i}"), &stdio("x", &[], &[])))
+        .collect();
+    std::thread::scope(|scope| {
+        for (i, k) in keys.iter().enumerate() {
+            let (path, root) = (path.clone(), repo.path().to_path_buf());
+            scope.spawn(move || {
+                // Each its own store, as two sessions (or two approval tasks) would have.
+                let mut store = ApprovalStore::open(&path);
+                store.approve(k, &root, &format!("s{i}")).unwrap();
+            });
+        }
+    });
+    let text = std::fs::read_to_string(&path).unwrap();
+    serde_json::from_str::<serde_json::Value>(&text).expect("the store is valid JSON");
+    let store = ApprovalStore::open(&path);
+    for k in &keys {
+        assert!(store.is_approved(k), "lost {k}");
+    }
+    // Only the store and its lock file remain.
+    let mut names: Vec<_> = std::fs::read_dir(data.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    assert_eq!(
+        names,
+        vec![APPROVALS_FILE.to_string(), format!("{APPROVALS_FILE}.lock")]
+    );
 }

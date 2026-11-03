@@ -16,17 +16,18 @@
 //! servers still starting; a server ready later, or a changed tool list, joins at the next
 //! one, with a warning that the cached prefix breaks once.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use tautly_mcp::approvals::key;
 use tautly_mcp::config::parse_mcp_json;
+use tautly_mcp::names::{MAX_SERVER_NAME, is_valid_server_name, sanitize};
 use tautly_mcp::{
     APPROVALS_FILE, ApprovalStore, McpConfig, McpHub, McpState, PROVIDER_KEY_VARS, ServerSource,
-    ServerSpec,
+    ServerSpec, printable,
 };
 use tautly_provider::ToolSpec;
 use tautly_sandbox::{Effect, Sandbox};
@@ -49,6 +50,8 @@ const MAX_MCP_JSON_BYTES: u64 = 256 * 1024;
 const MAX_REPO_SERVERS: usize = 32;
 /// Planning warnings shown before the rest are summarized.
 const MAX_WARNINGS: usize = 20;
+/// Longest planning (reading `.mcp.json` and the approvals) may take at session start.
+const PLAN_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Runs before a call that may change files the engine does not see change: every stdio
 /// MCP call (spec 7.11.11). Git checkpoints (Task 47) snapshot the work tree here; the
@@ -170,17 +173,33 @@ pub async fn plan_servers(
     if config.import_mcp_json {
         let (servers, warnings) = read_mcp_json(sandbox).await;
         plan.warnings.extend(warnings);
+        let declared: HashSet<String> = project.keys().map(|n| sanitize(n)).collect();
         for (name, spec) in servers {
-            if project.contains_key(&name) {
+            if declared.contains(&sanitize(&name)) {
                 plan.warnings.push(format!(
-                    "MCP server `{name}` of {MCP_JSON} is shadowed by the project config's \
-                     server of the same name"
+                    "MCP server `{}` of {MCP_JSON} is shadowed by the project config's server \
+                     of the same name",
+                    printable(&name)
                 ));
             } else {
                 repo.push((name, spec, ServerSource::McpJson));
             }
         }
     }
+    // A repository server's name must not let its tools pass for another server's
+    // (`gh__x` would get tools `mcp__gh__x__…`, which the user's `mcp__gh__*` rules cover).
+    repo.retain(|(name, _, source)| {
+        let ok = is_valid_server_name(name);
+        if !ok {
+            plan.warnings.push(format!(
+                "MCP server `{}` declared by the repository ({source}) is not a valid server \
+                 name (letters, digits and `-`, parts joined by single `_`, at most \
+                 {MAX_SERVER_NAME} characters); it is ignored",
+                printable(name)
+            ));
+        }
+        ok
+    });
     let mut trusted: BTreeMap<String, (ServerSpec, ServerSource)> = config
         .servers
         .iter()
@@ -189,22 +208,32 @@ pub async fn plan_servers(
     for (name, spec) in client {
         if trusted.contains_key(name) {
             plan.warnings.push(format!(
-                "MCP server `{name}` from the client replaces the user config's server of the \
-                 same name"
+                "MCP server `{}` from the client replaces the user config's server of the \
+                 same name",
+                printable(name)
             ));
         }
         trusted.insert(name.clone(), (spec.clone(), ServerSource::Client));
     }
-    repo.retain(|(name, _, source)| match trusted.get(name) {
-        Some((_, by)) => {
-            plan.warnings.push(format!(
-                "MCP server `{name}` declared by the repository ({source}) is shadowed by the \
-                 {by} server of the same name; the {by} one is used"
-            ));
-            false
-        }
-        None => true,
-    });
+    // Compared as tool names see them: `my.srv` (user) and `my_srv` (repository) are the
+    // same `mcp__my_srv__` prefix.
+    let by_tool_name: HashMap<String, ServerSource> = trusted
+        .iter()
+        .map(|(n, (_, source))| (sanitize(n), *source))
+        .collect();
+    repo.retain(
+        |(name, _, source)| match by_tool_name.get(&sanitize(name)) {
+            Some(by) => {
+                plan.warnings.push(format!(
+                    "MCP server `{}` declared by the repository ({source}) is shadowed by the {by} \
+                 server of the same name; the {by} one is used",
+                    printable(name)
+                ));
+                false
+            }
+            None => true,
+        },
+    );
     // A repository cannot flood the user with approval requests (or the session with
     // processes).
     repo.sort_by(|a, b| a.0.cmp(&b.0));
@@ -259,12 +288,21 @@ pub async fn plan_servers(
     plan
 }
 
+/// A server's status as last told to the client.
+type Told = HashMap<String, (McpState, u32, Option<String>)>;
+
 /// The servers of one session and the tasks that report on them.
 pub(crate) struct McpSession {
     hub: Arc<McpHub>,
     startup_timeout: Duration,
     /// The first user turn has waited for the servers.
     waited: bool,
+    /// Approval requests not answered yet (by request id), announced again at every
+    /// user-turn start until they are: one the client missed would otherwise wait unseen
+    /// for the whole session.
+    pending: Arc<Mutex<Vec<(String, Event)>>>,
+    /// The statuses the client has been sent; any other is sent at the next turn start.
+    told: Arc<Mutex<Told>>,
     tasks: Vec<JoinHandle<()>>,
 }
 
@@ -285,17 +323,31 @@ impl McpSession {
         events: EventSink,
         approvals: Approvals,
     ) -> Option<McpSession> {
-        let plan = plan_servers(
-            &setup.config,
-            &setup.project,
-            &setup.client,
-            setup.approve_mcp,
-            &setup.data_home,
-            sandbox.as_ref(),
+        let planned = tokio::time::timeout(
+            PLAN_TIMEOUT,
+            plan_servers(
+                &setup.config,
+                &setup.project,
+                &setup.client,
+                setup.approve_mcp,
+                &setup.data_home,
+                sandbox.as_ref(),
+            ),
         )
         .await;
+        let Ok(plan) = planned else {
+            events.try_emit(Event::Warning {
+                message: format!(
+                    "MCP servers not started: reading their configuration took longer than {} s",
+                    PLAN_TIMEOUT.as_secs()
+                ),
+            });
+            return None;
+        };
         for w in plan.warnings {
-            events.try_emit(Event::Warning { message: w });
+            events.try_emit(Event::Warning {
+                message: printable(&w),
+            });
         }
         if plan.servers.is_empty() {
             return None;
@@ -318,11 +370,14 @@ impl McpSession {
         let hub = Arc::new(
             McpHub::start(start, Arc::clone(&sandbox), &setup.config, &setup.strip_env).await,
         );
+        let told: Arc<Mutex<Told>> = Arc::default();
         let mut session = McpSession {
             hub: Arc::clone(&hub),
             startup_timeout: Duration::from_millis(setup.config.startup_timeout_ms),
             waited: false,
-            tasks: vec![tokio::spawn(report(Arc::clone(&hub), events.clone()))],
+            pending: Arc::default(),
+            told: Arc::clone(&told),
+            tasks: vec![tokio::spawn(report(Arc::clone(&hub), events.clone(), told))],
         };
         for (name, source) in skip {
             hub.note(
@@ -341,20 +396,24 @@ impl McpSession {
                 continue;
             };
             hub.note(&name, source, McpState::AwaitingApproval, None);
-            // Not dropped lightly: unseen, the request would wait for the whole session.
             // What runs once approved is this `spec`, exactly as shown and keyed.
-            events
-                .send_or_drop(Event::McpServerApprovalRequested {
-                    request_id,
-                    server: name.clone(),
-                    source: source.as_str().to_string(),
-                    launch: spec.launch(),
-                })
-                .await;
+            let request = Event::McpServerApprovalRequested {
+                request_id: request_id.clone(),
+                server: printable(&name),
+                source: source.as_str().to_string(),
+                launch: spec.launch(source),
+            };
+            lock(&session.pending).push((request_id.clone(), request.clone()));
+            // Sent again at each user-turn start while unanswered, so a full channel now
+            // does not lose it.
+            events.try_send(request);
             let hub = Arc::clone(&hub);
+            let pending = Arc::clone(&session.pending);
             let (store_path, root, events) = (store_path.clone(), root.clone(), events.clone());
             session.tasks.push(tokio::spawn(async move {
-                match rx.await.unwrap_or(Verdict::Denied { reason: None }) {
+                let verdict = rx.await.unwrap_or(Verdict::Denied { reason: None });
+                lock(&pending).retain(|(id, _)| *id != request_id);
+                match verdict {
                     Verdict::Approved => {
                         let (n, r) = (name.clone(), root.clone());
                         let saved = tokio::task::spawn_blocking(move || {
@@ -364,8 +423,9 @@ impl McpSession {
                         if !matches!(saved, Ok(Ok(()))) {
                             events.try_emit(Event::Warning {
                                 message: format!(
-                                    "the approval of MCP server `{name}` could not be saved; \
-                                     it is approved for this session only"
+                                    "the approval of MCP server `{}` could not be saved; it \
+                                     is approved for this session only",
+                                    printable(&name)
                                 ),
                             });
                         }
@@ -393,16 +453,60 @@ impl McpSession {
         (self.hub.ready_tools(), first)
     }
 
+    /// What to tell the client at a user-turn start: every unanswered approval request,
+    /// and every status it has not been sent (a full channel dropped it). The statuses are
+    /// counted as told.
+    fn announcements(&self) -> Vec<Event> {
+        let mut out: Vec<Event> = lock(&self.pending)
+            .iter()
+            .map(|(_, ev)| ev.clone())
+            .collect();
+        let mut told = lock(&self.told);
+        for s in self.hub.status() {
+            let now = (s.state, s.tools, s.message.clone());
+            if told.get(&s.name) != Some(&now) {
+                out.push(status_event(
+                    &s.name,
+                    s.state,
+                    s.tools,
+                    s.message.as_deref(),
+                ));
+                told.insert(s.name, now);
+            }
+        }
+        out
+    }
+
     pub async fn shutdown(&self) {
         self.hub.shutdown().await;
     }
 }
 
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+fn status_event(server: &str, state: McpState, tools: u32, message: Option<&str>) -> Event {
+    Event::McpServerStatus {
+        server: printable(server),
+        state,
+        tools,
+        message: message.map(printable),
+    }
+}
+
 impl Session {
-    /// At a user-turn start: offer the MCP tools that are ready now (the first turn waits
-    /// for servers still starting). A different tool set than the last turn's is
-    /// announced, since it breaks the cached prompt prefix once.
+    /// At a user-turn start: repeat unanswered approval requests and missed statuses, then
+    /// offer the MCP tools that are ready now (the first turn waits for servers still
+    /// starting). A different tool set than the last turn's is announced, since it breaks
+    /// the cached prompt prefix once.
     pub(crate) async fn refresh_mcp_tools(&mut self) {
+        let Some(told) = self.mcp.as_ref().map(McpSession::announcements) else {
+            return;
+        };
+        for ev in told {
+            self.emit(ev).await;
+        }
         let Some(mcp) = self.mcp.as_mut() else {
             return;
         };
@@ -438,24 +542,28 @@ impl Session {
 }
 
 /// Emit `McpServerStatus` for every state change and a `Warning` for every hub warning,
-/// for as long as the hub lives.
-async fn report(hub: Arc<McpHub>, events: EventSink) {
+/// for as long as the hub lives. A status the channel had no room for is not counted as
+/// told, so the next user-turn start sends it.
+async fn report(hub: Arc<McpHub>, events: EventSink, told: Arc<Mutex<Told>>) {
     let mut changes = hub.changes();
-    let mut last: HashMap<String, (McpState, u32, Option<String>)> = HashMap::new();
     loop {
         for w in hub.take_warnings() {
-            events.try_emit(Event::Warning { message: w });
+            events.try_emit(Event::Warning {
+                message: printable(&w),
+            });
         }
         for s in hub.status() {
             let now = (s.state, s.tools, s.message.clone());
-            if last.get(&s.name) != Some(&now) {
-                events.try_emit(Event::McpServerStatus {
-                    server: s.name.clone(),
-                    state: s.state,
-                    tools: s.tools,
-                    message: s.message.clone(),
-                });
-                last.insert(s.name, now);
+            let mut told = lock(&told);
+            if told.get(&s.name) != Some(&now)
+                && events.try_send(status_event(
+                    &s.name,
+                    s.state,
+                    s.tools,
+                    s.message.as_deref(),
+                ))
+            {
+                told.insert(s.name, now);
             }
         }
         if changes.changed().await.is_err() {
@@ -464,24 +572,29 @@ async fn report(hub: Arc<McpHub>, events: EventSink) {
     }
 }
 
-/// The servers of the repository root's `.mcp.json`, through the sandbox (so a symlink
-/// out of the workspace is refused), with a warning per problem.
+/// The servers of the repository root's `.mcp.json`, with a warning per problem. The path
+/// is resolved through the sandbox (a symlink out of the workspace is refused), then
+/// opened once without blocking and read only if that handle is a regular file, at most
+/// [`MAX_MCP_JSON_BYTES`] (a FIFO or device in a checkout cannot hang the session).
 async fn read_mcp_json(sb: &dyn Sandbox) -> (BTreeMap<String, ServerSpec>, Vec<String>) {
-    let path = Path::new(MCP_JSON);
-    let Ok(meta) = sb.metadata(path).await else {
-        return (BTreeMap::new(), Vec::new());
+    let none = || (BTreeMap::new(), Vec::new());
+    let not_read = |why: String| (BTreeMap::new(), vec![format!("{MCP_JSON} not read: {why}")]);
+    let full = match sb.resolve(Path::new(MCP_JSON)) {
+        Ok(p) => p,
+        Err(e) => {
+            return if std::fs::symlink_metadata(sb.root().join(MCP_JSON)).is_ok() {
+                not_read(e.to_string())
+            } else {
+                none()
+            };
+        }
     };
-    if meta.len > MAX_MCP_JSON_BYTES {
-        return (
-            BTreeMap::new(),
-            vec![format!(
-                "{MCP_JSON} not read: larger than {MAX_MCP_JSON_BYTES} bytes"
-            )],
-        );
-    }
-    let text = match sb.read(path).await {
-        Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
-        Err(e) => return (BTreeMap::new(), vec![format!("{MCP_JSON} not read: {e}")]),
+    let read = tokio::task::spawn_blocking(move || read_bounded(&full)).await;
+    let text = match read {
+        Ok(Ok(Some(text))) => text,
+        Ok(Ok(None)) => return none(),
+        Ok(Err(why)) => return not_read(why),
+        Err(e) => return not_read(e.to_string()),
     };
     match parse_mcp_json(&text) {
         Ok((servers, skipped)) => (
@@ -491,6 +604,33 @@ async fn read_mcp_json(sb: &dyn Sandbox) -> (BTreeMap<String, ServerSpec>, Vec<S
                 .map(|w| format!("{MCP_JSON}: {w}"))
                 .collect(),
         ),
-        Err(e) => (BTreeMap::new(), vec![format!("{MCP_JSON} not read: {e}")]),
+        Err(e) => not_read(e),
     }
+}
+
+/// The text of `path`: None when it does not exist; an error unless it is a regular file
+/// of at most [`MAX_MCP_JSON_BYTES`].
+fn read_bounded(path: &Path) -> Result<Option<String>, String> {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+    let f = match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW)
+        .open(path)
+    {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.to_string()),
+    };
+    if !f.metadata().map_err(|e| e.to_string())?.is_file() {
+        return Err("it is not a regular file".into());
+    }
+    let mut bytes = Vec::new();
+    f.take(MAX_MCP_JSON_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| e.to_string())?;
+    if bytes.len() as u64 > MAX_MCP_JSON_BYTES {
+        return Err(format!("larger than {MAX_MCP_JSON_BYTES} bytes"));
+    }
+    Ok(Some(String::from_utf8_lossy(&bytes).into_owned()))
 }

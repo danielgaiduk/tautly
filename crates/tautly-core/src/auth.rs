@@ -80,17 +80,17 @@ pub fn api_key_with(
         .api_key_env
         .as_deref()
         .or_else(|| default_env_var(provider));
-    if let Some(name) = var {
-        if let Some(raw) = env(name) {
-            let text = raw.into_string().map_err(|_| AuthError::EnvNotUnicode {
-                name: name.to_string(),
-            })?;
-            if let Some(key) = non_blank(&text) {
-                return Ok(KeyLookup {
-                    key: Some(key),
-                    keychain_note: None,
-                });
-            }
+    if let Some(name) = var
+        && let Some(raw) = env(name)
+    {
+        let text = raw.into_string().map_err(|_| AuthError::EnvNotUnicode {
+            name: name.to_string(),
+        })?;
+        if let Some(key) = non_blank(&text) {
+            return Ok(KeyLookup {
+                key: Some(key),
+                keychain_note: None,
+            });
         }
     }
     match store.get(KEYCHAIN_SERVICE, provider) {

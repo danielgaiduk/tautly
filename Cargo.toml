@@ -4,7 +4,7 @@ members = ["crates/*"]
 
 [workspace.package]
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.90"
 license = "Apache-2.0"
 version = "0.1.0"
 
@@ -58,3 +58,7 @@ http = "1"
 hyper = "1"
 hyper-util = "0.1"
 tower-service = "0.3"
+# The reqwest rmcp uses (0.13); the rest of the workspace is on 0.12.
+reqwest013 = { package = "reqwest", version = "0.13.2", default-features = false }
+rustls = { version = "0.23", default-features = false }
+webpki-roots = "1"

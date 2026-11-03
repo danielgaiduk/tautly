@@ -5,10 +5,17 @@
 //! 2026-07-28), falling back to the `initialize` handshake for older servers. The client
 //! declares no capabilities and refuses `roots/list`, elicitation and sampling requests.
 //! A `notifications/tools/list_changed` (through a `subscriptions/listen` subscription
-//! for 2026-07-28 servers, directly for older ones) fetches the tool list again; the
-//! engine picks the new list up at its next user-turn start.
+//! for 2026-07-28 servers, directly for older ones) fetches the tool list again, one
+//! listing at a time per server however many notifications arrive; the engine picks the
+//! new list up at its next user-turn start. A server that exits or drops its connection
+//! is `Failed` and its tools are no longer offered.
+//!
+//! Bounds: connecting (and the first listing) takes at most the connect timeout (120 s),
+//! after which the server's process group is killed; a listing stops after
+//! [`MAX_PAGES`] pages or `4 × max_tools` tools; at most [`MAX_TOTAL_TOOLS`] tools are
+//! offered across all servers; at most [`MAX_HUB_WARNINGS`] distinct warnings are kept.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::Duration;
@@ -17,12 +24,12 @@ use std::time::Duration;
 use rmcp::model::{
     ClientCapabilities, ClientConfig, ElicitRequestParams, ElicitResult,
     ElicitationCreateRequestMethod, Implementation, ListRootsRequestMethod, ListRootsResult,
-    ProtocolVersion, ServerNotification, SubscriptionFilter,
+    PaginatedRequestParams, ProtocolVersion, ServerNotification, SubscriptionFilter,
 };
 use rmcp::service::{NotificationContext, RequestContext, RunningService};
 use rmcp::transport::StreamableHttpClientTransport;
 use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
-use rmcp::{ClientHandler, ClientLifecycleMode, ErrorData, Peer, RoleClient};
+use rmcp::{ClientHandler, ClientLifecycleMode, ErrorData, Peer, RoleClient, ServiceError};
 use serde::{Deserialize, Serialize};
 use tautly_sandbox::{Effect, Sandbox, SpawnSpec};
 use tautly_tools::{Tool, group_alive};
@@ -34,17 +41,29 @@ use tokio_util::sync::CancellationToken;
 
 use crate::config::{McpConfig, ServerSource, ServerSpec};
 use crate::names;
+use crate::text::{printable, strip_control};
 use crate::tool::{DESCRIPTION_CAP, McpTool, RemoteTool, SCHEMA_CAP, truncate};
 
-/// Longest a server may take to connect and list its tools before it is `Failed` (an
-/// `npx` server may first download itself).
+/// Most MCP tools offered in one request, across all servers (by name).
+pub const MAX_TOTAL_TOOLS: usize = 200;
+/// Most pages of one tool listing.
+pub const MAX_PAGES: usize = 20;
+/// Distinct warnings a hub keeps; past this one line says the rest are not shown.
+pub const MAX_HUB_WARNINGS: usize = 100;
+/// Default longest a server may take to connect and list its tools before it is `Failed`
+/// (an `npx` server may first download itself).
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(120);
 /// At shutdown, between SIGTERM and SIGKILL of a stdio server's process group.
 const TERM_GRACE: Duration = Duration::from_millis(500);
-/// Bytes of a stdio server's stderr kept for the message of a failed start.
+/// Bytes of a stdio server's stderr kept for the message of a failure.
 const STDERR_TAIL: usize = 2048;
 /// How long closing a session (an HTTP session delete, a transport flush) may take.
 const CLOSE_GRACE: Duration = Duration::from_secs(1);
+/// A tool-list change is listed this long after it is announced, so a burst of
+/// announcements costs one listing (the engine only looks at the next user turn anyway).
+const RELIST_DEBOUNCE: Duration = Duration::from_millis(250);
+/// How often a ready server is checked for having exited or disconnected.
+const WATCH_EVERY: Duration = Duration::from_millis(200);
 
 /// Where a server is (spec 7.11.10).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -83,6 +102,8 @@ pub(crate) struct Connection {
     process: Mutex<Option<Child>>,
     pgid: Option<u32>,
     groups: Groups,
+    /// The last [`STDERR_TAIL`] bytes of a stdio server's stderr.
+    stderr: Arc<Mutex<Vec<u8>>>,
 }
 
 impl Connection {
@@ -97,6 +118,37 @@ impl Connection {
         if let Some(mut child) = child {
             end_group(self.pgid, &mut child, &self.groups).await;
         }
+    }
+
+    /// Why the server is gone, if it is: its process exited, or the transport closed.
+    fn gone(&self) -> Option<String> {
+        if let Some(child) = lock(&self.process).as_mut()
+            && let Ok(Some(status)) = child.try_wait()
+        {
+            return Some(format!("the server exited ({status})"));
+        }
+        if self.peer.is_transport_closed() {
+            return Some(if self.may_write {
+                "the server exited or closed its stdio".into()
+            } else {
+                "the server closed the connection".into()
+            });
+        }
+        None
+    }
+
+    /// The stderr tail, escaped, for a failure message.
+    fn stderr_note(&self) -> String {
+        stderr_note(&self.stderr)
+    }
+}
+
+fn stderr_note(tail: &Mutex<Vec<u8>>) -> String {
+    let text = String::from_utf8_lossy(&lock(tail)).trim().to_string();
+    if text.is_empty() {
+        String::new()
+    } else {
+        format!("; stderr: {}", printable(&truncate(&text, STDERR_TAIL)))
     }
 }
 
@@ -147,6 +199,11 @@ struct Server {
     message: Option<String>,
     conn: Option<Arc<Connection>>,
     tools: Vec<RemoteTool>,
+    /// The stdio server's process group, from its spawn on.
+    pgid: Option<u32>,
+    /// A listing is running; `dirty` asks for one more after it.
+    relisting: bool,
+    dirty: bool,
 }
 
 impl Server {
@@ -157,6 +214,9 @@ impl Server {
             message,
             conn: None,
             tools: Vec::new(),
+            pgid: None,
+            relisting: false,
+            dirty: false,
         }
     }
 }
@@ -165,13 +225,36 @@ impl Server {
 struct HubState {
     servers: BTreeMap<String, Server>,
     warnings: Vec<String>,
+    /// Every warning ever kept, so a repeated one is not shown again.
+    warned: HashSet<String>,
     closed: bool,
+}
+
+impl HubState {
+    /// Keep `w` unless it was seen before or the cap is reached; true when kept.
+    fn warn(&mut self, w: String) -> bool {
+        if self.warned.contains(&w) {
+            return false;
+        }
+        if self.warned.len() >= MAX_HUB_WARNINGS {
+            let last = "further MCP warnings are not shown".to_string();
+            if self.warned.insert(last.clone()) {
+                self.warnings.push(last);
+                return true;
+            }
+            return false;
+        }
+        self.warned.insert(w.clone());
+        self.warnings.push(w);
+        true
+    }
 }
 
 struct Inner {
     sb: Arc<dyn Sandbox>,
     cfg: McpConfig,
     strip_env: Vec<String>,
+    connect_timeout: Duration,
     state: Mutex<HubState>,
     changes: watch::Sender<u64>,
     shutdown: CancellationToken,
@@ -187,6 +270,18 @@ impl Inner {
             if group_alive(g) {
                 killpg(g, libc::SIGKILL);
             }
+        }
+    }
+
+    /// SIGKILL `server`'s process group and forget it. Called while the task that holds
+    /// its (unreaped) process still runs, so the group id is still the server's.
+    fn kill_server_group(&self, server: &str) {
+        let pgid = lock(&self.state).servers.get(server).and_then(|s| s.pgid);
+        if let Some(g) = pgid {
+            if group_alive(g) {
+                killpg(g, libc::SIGKILL);
+            }
+            lock(&self.groups).retain(|&x| x != g);
         }
     }
 
@@ -209,8 +304,9 @@ impl Inner {
     }
 
     fn warn(&self, w: String) {
-        lock(&self.state).warnings.push(w);
-        self.changed();
+        if lock(&self.state).warn(w) {
+            self.changed();
+        }
     }
 
     fn spawn(self: &Arc<Self>, f: impl Future<Output = ()> + Send + 'static) {
@@ -226,37 +322,88 @@ impl Inner {
         tasks.push(task);
     }
 
+    /// List `server`'s tools again, coalesced: one task per server lists after
+    /// [`RELIST_DEBOUNCE`]; requests while it waits are folded in, and requests while it
+    /// lists ask for one more round.
+    fn request_relist(self: &Arc<Self>, server: String) {
+        {
+            let mut st = lock(&self.state);
+            let Some(s) = st.servers.get_mut(&server) else {
+                return;
+            };
+            if s.relisting {
+                s.dirty = true;
+                return;
+            }
+            s.relisting = true;
+        }
+        let me = Arc::clone(self);
+        self.spawn(async move {
+            loop {
+                // Notifications arriving meanwhile are folded into this listing.
+                tokio::time::sleep(RELIST_DEBOUNCE).await;
+                if let Some(s) = lock(&me.state).servers.get_mut(&server) {
+                    s.dirty = false;
+                }
+                me.relist(&server).await;
+                let again = {
+                    let mut st = lock(&me.state);
+                    let Some(s) = st.servers.get_mut(&server) else {
+                        return;
+                    };
+                    let again = std::mem::take(&mut s.dirty);
+                    s.relisting = again;
+                    again
+                };
+                if !again {
+                    return;
+                }
+            }
+        });
+    }
+
     /// Fetch `server`'s tool list again and keep it if the server is still the one
     /// connected.
-    async fn relist(self: Arc<Self>, server: String) {
+    async fn relist(&self, server: &str) {
         let conn = lock(&self.state)
             .servers
-            .get(&server)
+            .get(server)
             .and_then(|s| s.conn.clone());
         let Some(conn) = conn else {
             return;
         };
-        match tokio::time::timeout(CONNECT_TIMEOUT, conn.peer.list_all_tools()).await {
-            Ok(Ok(tools)) => {
-                let (tools, warnings) = select_tools(&server, tools, self.cfg.max_tools);
+        let listed = tokio::time::timeout(
+            self.connect_timeout,
+            list_tools(&conn.peer, server, self.cfg.max_tools),
+        )
+        .await;
+        match listed {
+            Ok(Ok((tools, cut))) => {
+                let (tools, mut warnings) = select_tools(server, tools, self.cfg.max_tools);
+                warnings.extend(cut);
                 {
                     let mut st = lock(&self.state);
-                    let Some(s) = st.servers.get_mut(&server) else {
+                    let Some(s) = st.servers.get_mut(server) else {
                         return;
                     };
                     if !s.conn.as_ref().is_some_and(|c| Arc::ptr_eq(c, &conn)) {
                         return;
                     }
                     s.tools = tools;
-                    st.warnings.extend(warnings);
+                    for w in warnings {
+                        st.warn(w);
+                    }
                 }
                 self.changed();
             }
             Ok(Err(e)) => self.warn(format!(
-                "MCP server `{server}`: listing its tools again failed: {e}"
+                "MCP server `{}`: listing its tools again failed: {}",
+                printable(server),
+                printable(&e.to_string())
             )),
             Err(_) => self.warn(format!(
-                "MCP server `{server}`: listing its tools again timed out"
+                "MCP server `{}`: listing its tools again timed out",
+                printable(server)
             )),
         }
     }
@@ -264,22 +411,28 @@ impl Inner {
     /// Start one server: connect, list its tools, and report it `Ready` (or `Failed`).
     async fn run_server(self: Arc<Self>, name: String, spec: ServerSpec, source: ServerSource) {
         self.set(&name, source, McpState::Starting, None);
-        let started = tokio::time::timeout(CONNECT_TIMEOUT, self.connect(&name, &spec, source))
-            .await
-            .unwrap_or_else(|_| {
+        let mut connect = Box::pin(self.connect(&name, &spec, source));
+        let started = tokio::select! {
+            r = &mut connect => r,
+            () = tokio::time::sleep(self.connect_timeout) => {
+                // The pinned handshake still holds the process: its group is still ours.
+                self.kill_server_group(&name);
                 Err(format!(
                     "did not start within {} s",
-                    CONNECT_TIMEOUT.as_secs()
+                    self.connect_timeout.as_secs_f32()
                 ))
-            });
-        let (conn, tools) = match started {
+            }
+        };
+        drop(connect);
+        let (conn, tools, cut) = match started {
             Ok(ok) => ok,
             Err(why) => {
                 self.set(&name, source, McpState::Failed, Some(why));
                 return;
             }
         };
-        let (tools, warnings) = select_tools(&name, tools, self.cfg.max_tools);
+        let (tools, mut warnings) = select_tools(&name, tools, self.cfg.max_tools);
+        warnings.extend(cut);
         let kept = {
             let mut st = lock(&self.state);
             if st.closed {
@@ -293,7 +446,9 @@ impl Inner {
                 server.message = None;
                 server.conn = Some(Arc::clone(&conn));
                 server.tools = tools;
-                st.warnings.extend(warnings);
+                for w in warnings {
+                    st.warn(w);
+                }
                 true
             }
         };
@@ -302,7 +457,39 @@ impl Inner {
             return;
         }
         self.changed();
-        self.subscribe(name, conn);
+        self.subscribe(name.clone(), Arc::clone(&conn));
+        let me = Arc::clone(&self);
+        self.spawn(me.watch(name, conn));
+    }
+
+    /// Report a ready server that exits or disconnects as `Failed` and stop offering its
+    /// tools (the engine drops them at the next user-turn start).
+    async fn watch(self: Arc<Self>, name: String, conn: Arc<Connection>) {
+        let why = loop {
+            tokio::time::sleep(WATCH_EVERY).await;
+            if let Some(why) = conn.gone() {
+                break why;
+            }
+        };
+        let current = {
+            let mut st = lock(&self.state);
+            let closed = st.closed;
+            match st.servers.get_mut(&name) {
+                Some(s) if !closed && s.conn.as_ref().is_some_and(|c| Arc::ptr_eq(c, &conn)) => {
+                    s.state = McpState::Failed;
+                    s.message = Some(format!("{why}{}", conn.stderr_note()));
+                    s.conn = None;
+                    s.tools.clear();
+                    true
+                }
+                _ => false,
+            }
+        };
+        if current {
+            self.changed();
+            // What the server left behind in its group goes with it.
+            conn.close().await;
+        }
     }
 
     /// For a 2026-07-28 server that announces tool list changes, open the subscription
@@ -332,7 +519,7 @@ impl Inner {
                     let Some(inner) = me.upgrade() else {
                         return;
                     };
-                    inner.relist(name.clone()).await;
+                    inner.request_relist(name.clone());
                 }
             }
         });
@@ -343,7 +530,7 @@ impl Inner {
         name: &str,
         spec: &ServerSpec,
         source: ServerSource,
-    ) -> Result<(Arc<Connection>, Vec<rmcp::model::Tool>), String> {
+    ) -> Result<Connected, String> {
         let handler = Handler {
             hub: Arc::downgrade(self),
             server: name.to_string(),
@@ -352,7 +539,8 @@ impl Inner {
             preferred_versions: vec![ProtocolVersion::V_2026_07_28],
             legacy_version: Some(ProtocolVersion::V_2025_11_25),
         };
-        match spec {
+        let stderr = Arc::new(Mutex::new(Vec::new()));
+        let conn = match spec {
             ServerSpec::Stdio {
                 command,
                 args,
@@ -371,20 +559,29 @@ impl Inner {
                         new_process_group: true,
                     })
                     .await
-                    .map_err(|e| format!("could not start `{command}`: {e}"))?;
+                    .map_err(|e| {
+                        format!(
+                            "could not start `{}`: {}",
+                            printable(command),
+                            printable(&e.to_string())
+                        )
+                    })?;
                 let pgid = child.id();
-                // Tracked from now on, so a shutdown during the handshake still ends it.
+                // Tracked from now on, so a shutdown or a connect timeout during the
+                // handshake still ends it.
                 lock(&self.groups).extend(pgid);
+                if let Some(s) = lock(&self.state).servers.get_mut(name) {
+                    s.pgid = pgid;
+                }
                 let (Some(stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
                     end_group(pgid, &mut child, &self.groups).await;
                     return Err("the sandbox gave the server no stdin or stdout".into());
                 };
-                let stderr_tail = Arc::new(Mutex::new(Vec::new()));
-                if let Some(mut stderr) = child.stderr.take() {
-                    let tail = Arc::clone(&stderr_tail);
+                if let Some(mut pipe) = child.stderr.take() {
+                    let tail = Arc::clone(&stderr);
                     self.spawn(async move {
                         let mut buf = [0u8; 4096];
-                        while let Ok(n @ 1..) = stderr.read(&mut buf).await {
+                        while let Ok(n @ 1..) = pipe.read(&mut buf).await {
                             let mut t = lock(&tail);
                             t.extend_from_slice(&buf[..n]);
                             let excess = t.len().saturating_sub(STDERR_TAIL);
@@ -398,18 +595,14 @@ impl Inner {
                     Ok(s) => s,
                     Err(e) => {
                         end_group(pgid, &mut child, &self.groups).await;
-                        let tail = String::from_utf8_lossy(&lock(&stderr_tail))
-                            .trim()
-                            .to_string();
-                        let tail = if tail.is_empty() {
-                            String::new()
-                        } else {
-                            format!("; stderr: {}", truncate(&tail, STDERR_TAIL))
-                        };
-                        return Err(format!("handshake failed: {e}{tail}"));
+                        return Err(format!(
+                            "handshake failed: {}{}",
+                            printable(&e.to_string()),
+                            stderr_note(&stderr)
+                        ));
                     }
                 };
-                let conn = Arc::new(Connection {
+                Arc::new(Connection {
                     server: name.to_string(),
                     peer: service.peer().clone(),
                     effect: Effect::Exec { argv },
@@ -418,14 +611,8 @@ impl Inner {
                     process: Mutex::new(Some(child)),
                     pgid,
                     groups: Arc::clone(&self.groups),
-                });
-                match conn.peer.list_all_tools().await {
-                    Ok(tools) => Ok((conn, tools)),
-                    Err(e) => {
-                        conn.close().await;
-                        Err(format!("listing its tools failed: {e}"))
-                    }
-                }
+                    stderr,
+                })
             }
             ServerSpec::Http { url, headers } => {
                 let host = url
@@ -437,24 +624,32 @@ impl Inner {
                     .to_ascii_lowercase();
                 let mut custom = HashMap::new();
                 for (k, v) in headers {
+                    // `${VAR}` only from the user's (or the client's) own configuration: a
+                    // repository must not send the user's environment anywhere.
                     let v = if matches!(source, ServerSource::User | ServerSource::Client) {
                         expand_env(v)
                     } else {
                         v.clone()
                     };
                     let k = http::HeaderName::try_from(k.as_str())
-                        .map_err(|e| format!("bad header name `{k}`: {e}"))?;
+                        .map_err(|e| format!("bad header name `{}`: {e}", printable(k)))?;
                     let v = http::HeaderValue::try_from(v.as_str())
                         .map_err(|e| format!("bad value for header `{k}`: {e}"))?;
                     custom.insert(k, v);
                 }
                 let config = StreamableHttpClientTransportConfig::with_uri(url.as_str())
                     .custom_headers(custom);
-                let transport = StreamableHttpClientTransport::from_config(config);
+                let transport = StreamableHttpClientTransport::with_client(http_client()?, config);
                 let service = rmcp::serve_client_with_lifecycle(handler, transport, lifecycle)
                     .await
-                    .map_err(|e| format!("could not connect to {url}: {e}"))?;
-                let conn = Arc::new(Connection {
+                    .map_err(|e| {
+                        format!(
+                            "could not connect to {}: {}",
+                            printable(url.as_str()),
+                            printable(&e.to_string())
+                        )
+                    })?;
+                Arc::new(Connection {
                     server: name.to_string(),
                     peer: service.peer().clone(),
                     effect: Effect::Network { host },
@@ -463,17 +658,81 @@ impl Inner {
                     process: Mutex::new(None),
                     pgid: None,
                     groups: Arc::clone(&self.groups),
-                });
-                match conn.peer.list_all_tools().await {
-                    Ok(tools) => Ok((conn, tools)),
-                    Err(e) => {
-                        conn.close().await;
-                        Err(format!("listing its tools failed: {e}"))
-                    }
-                }
+                    stderr,
+                })
+            }
+        };
+        match list_tools(&conn.peer, name, self.cfg.max_tools).await {
+            Ok((tools, cut)) => Ok((conn, tools, cut)),
+            Err(e) => {
+                let why = format!(
+                    "listing its tools failed: {}{}",
+                    printable(&e.to_string()),
+                    conn.stderr_note()
+                );
+                conn.close().await;
+                Err(why)
             }
         }
     }
+}
+
+/// A connection, its listed tools, and a warning when the listing was cut short.
+type Connected = (Arc<Connection>, Vec<rmcp::model::Tool>, Option<String>);
+
+/// The reqwest client for streamable HTTP: rustls on the `ring` provider the rest of the
+/// workspace uses (rmcp is built without a TLS provider of its own), the webpki roots,
+/// HTTP/1.1, no redirects (a server must not move the session to another host), and no
+/// idle connection pool (rmcp's advice for its transport).
+fn http_client() -> Result<reqwest013::Client, String> {
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let roots = rustls::RootCertStore {
+        roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
+    };
+    let mut tls = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(|e| format!("TLS setup failed: {e}"))?
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    tls.alpn_protocols = vec![b"http/1.1".to_vec()];
+    reqwest013::Client::builder()
+        .tls_backend_preconfigured(tls)
+        .redirect(reqwest013::redirect::Policy::none())
+        .pool_max_idle_per_host(0)
+        .build()
+        .map_err(|e| format!("HTTP client setup failed: {e}"))
+}
+
+/// The tool list, following cursors for at most [`MAX_PAGES`] pages and `4 × max_tools`
+/// tools; when cut short, the warning that says so.
+async fn list_tools(
+    peer: &Peer<RoleClient>,
+    server: &str,
+    max_tools: usize,
+) -> Result<(Vec<rmcp::model::Tool>, Option<String>), ServiceError> {
+    let limit = max_tools.saturating_mul(4).max(1);
+    let mut tools = Vec::new();
+    let mut cursor = None;
+    for page in 1..=MAX_PAGES {
+        let r = peer
+            .list_tools(Some(PaginatedRequestParams::default().with_cursor(cursor)))
+            .await?;
+        tools.extend(r.tools);
+        cursor = r.next_cursor;
+        if cursor.is_none() {
+            return Ok((tools, None));
+        }
+        if tools.len() >= limit || page == MAX_PAGES {
+            let note = format!(
+                "MCP server `{}`: stopped listing tools after {page} pages ({} tools); the \
+                 rest are not used",
+                printable(server),
+                tools.len()
+            );
+            return Ok((tools, Some(note)));
+        }
+    }
+    Ok((tools, None))
 }
 
 /// `${VAR}` in `v` replaced by the variable's value (empty when unset).
@@ -493,9 +752,10 @@ fn expand_env(v: &str) -> String {
     out
 }
 
-/// The tools of `server` within the caps, by name: a schema over [`SCHEMA_CAP`] is skipped
-/// and descriptions are cut to [`DESCRIPTION_CAP`]; past `max_tools` the rest are left
-/// out. Each skipped or cut tool list gives a warning.
+/// The tools of `server` within the caps, by name: a schema over [`SCHEMA_CAP`] is skipped;
+/// a description is marked `[MCP server <name>]`, stripped of control characters and cut
+/// to [`DESCRIPTION_CAP`]; past `max_tools` the rest are left out. Each skipped or cut
+/// tool list gives a warning.
 fn select_tools(
     server: &str,
     mut listed: Vec<rmcp::model::Tool>,
@@ -506,27 +766,34 @@ fn select_tools(
     let offered = listed.len();
     let mut warnings = Vec::new();
     let mut kept = Vec::new();
+    let prefix = format!("[MCP server {}] ", strip_control(server));
     for t in listed {
         let schema = serde_json::Value::Object((*t.input_schema).clone());
         let size = serde_json::to_vec(&schema).map_or(usize::MAX, |b| b.len());
         if size > SCHEMA_CAP {
             warnings.push(format!(
-                "MCP server `{server}`: tool `{}` skipped: its input schema is {size} bytes, \
-                 over the {SCHEMA_CAP} byte limit",
-                t.name
+                "MCP server `{}`: tool `{}` skipped: its input schema is {size} bytes, over \
+                 the {SCHEMA_CAP} byte limit",
+                printable(server),
+                printable(&t.name)
             ));
             continue;
         }
+        let description = format!(
+            "{prefix}{}",
+            strip_control(t.description.as_deref().unwrap_or(""))
+        );
         kept.push(RemoteTool {
             name: t.name.to_string(),
-            description: truncate(t.description.as_deref().unwrap_or(""), DESCRIPTION_CAP),
+            description: truncate(&description, DESCRIPTION_CAP),
             schema,
         });
     }
     if kept.len() > max_tools {
         warnings.push(format!(
-            "MCP server `{server}` offers {offered} tools; only the first {max_tools} by name \
-             are used"
+            "MCP server `{}` offers {offered} tools; only the first {max_tools} by name are \
+             used",
+            printable(server)
         ));
         kept.truncate(max_tools);
     }
@@ -567,9 +834,7 @@ impl ClientHandler for Handler {
 
     async fn on_tool_list_changed(&self, _context: NotificationContext<RoleClient>) {
         if let Some(inner) = self.hub.upgrade() {
-            let server = self.server.clone();
-            let task = Arc::clone(&inner).relist(server);
-            inner.spawn(task);
+            inner.request_relist(self.server.clone());
         }
     }
 }
@@ -590,6 +855,17 @@ impl McpHub {
         cfg: &McpConfig,
         strip_env: &[String],
     ) -> McpHub {
+        McpHub::start_with_connect_timeout(servers, sb, cfg, strip_env, CONNECT_TIMEOUT).await
+    }
+
+    /// [`McpHub::start`] with another limit on connecting (default 120 s).
+    pub async fn start_with_connect_timeout(
+        servers: Vec<(String, ServerSpec, ServerSource)>,
+        sb: Arc<dyn Sandbox>,
+        cfg: &McpConfig,
+        strip_env: &[String],
+        connect_timeout: Duration,
+    ) -> McpHub {
         let (changes, _) = watch::channel(0);
         let hub = McpHub {
             inner: Arc::new(Inner {
@@ -599,6 +875,7 @@ impl McpHub {
                     ..cfg.clone()
                 },
                 strip_env: strip_env.to_vec(),
+                connect_timeout,
                 state: Mutex::default(),
                 changes,
                 shutdown: CancellationToken::new(),
@@ -628,31 +905,41 @@ impl McpHub {
     }
 
     /// The tools of every ready server, sorted by name, names distinct
-    /// ([`names::assign`]).
+    /// ([`names::assign`]); at most [`MAX_TOTAL_TOOLS`] (the first by name).
     pub fn ready_tools(&self) -> Vec<Arc<dyn Tool>> {
-        let st = lock(&self.inner.state);
-        let mut found: Vec<(&str, &RemoteTool, &Arc<Connection>)> = Vec::new();
-        for (name, server) in &st.servers {
-            if let (McpState::Ready, Some(conn)) = (server.state, &server.conn) {
-                found.extend(server.tools.iter().map(|t| (name.as_str(), t, conn)));
+        let mut tools: Vec<McpTool> = {
+            let st = lock(&self.inner.state);
+            let mut found: Vec<(&str, &RemoteTool, &Arc<Connection>)> = Vec::new();
+            for (name, server) in &st.servers {
+                if let (McpState::Ready, Some(conn)) = (server.state, &server.conn) {
+                    found.extend(server.tools.iter().map(|t| (name.as_str(), t, conn)));
+                }
             }
-        }
-        let pairs: Vec<(&str, &str)> = found
-            .iter()
-            .map(|(s, t, _)| (*s, t.name.as_str()))
-            .collect();
-        let timeout = Duration::from_secs(self.inner.cfg.timeout_s);
-        let mut tools: Vec<McpTool> = names::assign(&pairs)
-            .into_iter()
-            .zip(&found)
-            .map(|(name, (_, remote, conn))| McpTool {
-                name,
-                remote: (*remote).clone(),
-                conn: Arc::clone(conn),
-                timeout,
-            })
-            .collect();
+            let pairs: Vec<(&str, &str)> = found
+                .iter()
+                .map(|(s, t, _)| (*s, t.name.as_str()))
+                .collect();
+            let timeout = Duration::from_secs(self.inner.cfg.timeout_s);
+            names::assign(&pairs)
+                .into_iter()
+                .zip(&found)
+                .map(|(name, (_, remote, conn))| McpTool {
+                    name,
+                    remote: (*remote).clone(),
+                    conn: Arc::clone(conn),
+                    timeout,
+                })
+                .collect()
+        };
         tools.sort_by(|a, b| a.name.cmp(&b.name));
+        if tools.len() > MAX_TOTAL_TOOLS {
+            self.inner.warn(format!(
+                "MCP servers offer {} tools in all; only the first {MAX_TOTAL_TOOLS} by name \
+                 are used",
+                tools.len()
+            ));
+            tools.truncate(MAX_TOTAL_TOOLS);
+        }
         tools
             .into_iter()
             .map(|t| Arc::new(t) as Arc<dyn Tool>)
@@ -679,7 +966,8 @@ impl McpHub {
         self.inner.changes.subscribe()
     }
 
-    /// Warnings since the last call (skipped tools, capped tool lists).
+    /// Warnings since the last call (skipped tools, capped tool lists), each distinct one
+    /// once, at most [`MAX_HUB_WARNINGS`] in the hub's life.
     pub fn take_warnings(&self) -> Vec<String> {
         std::mem::take(&mut lock(&self.inner.state).warnings)
     }

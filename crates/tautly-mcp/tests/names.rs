@@ -1,4 +1,4 @@
-use tautly_mcp::names::{MAX_TOOL_NAME, assign, sanitize, tool_name};
+use tautly_mcp::names::{MAX_TOOL_NAME, assign, is_valid_server_name, sanitize, tool_name};
 
 fn ok_chars(s: &str) -> bool {
     s.chars()
@@ -69,4 +69,25 @@ fn collisions_get_distinct_names() {
     assert_eq!(long[0], tool_name("s", &a));
     assert_eq!(long[1], tool_name("s", &b));
     assert_ne!(long[0], long[1]);
+}
+
+#[test]
+fn repository_server_names_are_validated() {
+    for ok in ["github", "my-srv", "a_b", "A9", "x_y_z", &"a".repeat(32)] {
+        assert!(is_valid_server_name(ok), "{ok}");
+    }
+    for bad in [
+        "",
+        "gh__x",
+        "_a",
+        "a_",
+        "gh.",
+        "gh ",
+        "g\u{200b}h",
+        "ünï",
+        "-a",
+        &"a".repeat(33),
+    ] {
+        assert!(!is_valid_server_name(bad), "{bad:?}");
+    }
 }

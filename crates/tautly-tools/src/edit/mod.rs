@@ -486,18 +486,18 @@ async fn run_str_replace(a: StrReplaceArgs, sb: &dyn Sandbox, cx: &ToolCx) -> To
     }
     // A symbol-level guess must leave the file parsing at least as well as before. Nothing
     // has been written yet, so rejecting it leaves the pre-image in place.
-    if stage == RepairStage::Structural {
-        if let Some(errors) = new_error_list(&a.path, &file.text, &edited) {
-            return ToolResult::error_kind(
-                format!(
-                    "{}: old_text not found exactly; the symbol it names was matched structurally, \
+    if stage == RepairStage::Structural
+        && let Some(errors) = new_error_list(&a.path, &file.text, &edited)
+    {
+        return ToolResult::error_kind(
+            format!(
+                "{}: old_text not found exactly; the symbol it names was matched structurally, \
                  but replacing it would introduce syntax errors at {errors}, so nothing was \
                  changed. Retry with old_text copied from `read` or `symbol` output.",
-                    a.path
-                ),
-                kind::SYNTAX,
-            );
-        }
+                a.path
+            ),
+            kind::SYNTAX,
+        );
     }
     let repaired = stage != RepairStage::Exact;
     let (effect, warning) = match write_edited(sb, cx, &a.path, file, &edited, repaired).await {

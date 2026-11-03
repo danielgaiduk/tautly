@@ -491,10 +491,10 @@ impl Actor {
     /// Run `f` on the log off the async workers; a first failure is shown.
     async fn with_log(&self, f: impl FnOnce(&Log) -> Result<(), LogFailure> + Send + 'static) {
         let log = self.log.clone();
-        if let Ok(Err(failure)) = tokio::task::spawn_blocking(move || f(&log)).await {
-            if let Some(ev) = failure.event() {
-                self.events.try_emit(ev);
-            }
+        if let Ok(Err(failure)) = tokio::task::spawn_blocking(move || f(&log)).await
+            && let Some(ev) = failure.event()
+        {
+            self.events.try_emit(ev);
         }
     }
 

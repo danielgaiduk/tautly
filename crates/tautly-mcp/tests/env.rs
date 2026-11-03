@@ -1,6 +1,8 @@
 //! A stdio server's environment. This binary has one test because it changes the
 //! process environment.
 
+mod common;
+
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -22,7 +24,7 @@ async fn server_env_has_no_provider_keys() {
     let dir = tempfile::tempdir().unwrap();
     let sb: Arc<dyn Sandbox> = Arc::new(LocalSandbox::new(dir.path().to_path_buf()).unwrap());
     let spec = ServerSpec::Stdio {
-        command: env!("CARGO_BIN_EXE_echo_server").into(),
+        command: common::fixture(),
         args: vec![],
         env: BTreeMap::from([
             ("ECHO_MARKER".to_string(), "from-config".to_string()),

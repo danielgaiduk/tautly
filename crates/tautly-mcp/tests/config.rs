@@ -4,7 +4,7 @@
 use std::collections::BTreeMap;
 
 use tautly_mcp::config::{import_into_toml, parse_mcp_json};
-use tautly_mcp::{McpConfig, ServerSpec};
+use tautly_mcp::{McpConfig, ServerSource, ServerSpec, printable};
 
 #[test]
 fn mcp_config_defaults_and_server_shapes() {
@@ -39,11 +39,11 @@ fn mcp_config_defaults_and_server_shapes() {
         matches!(&cfg.servers["remote"], ServerSpec::Http { url, .. } if url.host_str() == Some("mcp.example.com"))
     );
     assert_eq!(
-        cfg.servers["files"].launch(),
+        cfg.servers["files"].launch(ServerSource::User),
         "stdio: npx -y fs (env: ROOT)"
     );
     assert_eq!(
-        cfg.servers["remote"].launch(),
+        cfg.servers["remote"].launch(ServerSource::User),
         "http: https://mcp.example.com/mcp (headers: Authorization)"
     );
 
@@ -130,4 +130,63 @@ fn mcp_import_from_claude_json_preserves_comments() {
     assert_eq!(mcp.servers, servers);
 
     assert!(import_into_toml("not = [toml", &servers).is_err());
+}
+
+#[test]
+fn launch_shows_repository_values_escaped_and_cut() {
+    let spec = ServerSpec::Stdio {
+        command: "node".into(),
+        args: vec!["\r\u{1b}[2Kok".into(), "a b".into()],
+        env: BTreeMap::from([
+            ("NODE_OPTIONS".into(), "--require ./evil.js".into()),
+            ("LONG".into(), "x".repeat(500)),
+        ]),
+        cwd: Some("sub\u{202e}dir".into()),
+    };
+    let user = spec.launch(ServerSource::User);
+    assert!(!user.contains("evil"), "{user}");
+    assert!(user.contains("(env: LONG, NODE_OPTIONS)"), "{user}");
+    for source in [ServerSource::Project, ServerSource::McpJson] {
+        let repo = spec.launch(source);
+        assert!(repo.contains("NODE_OPTIONS=--require ./evil.js"), "{repo}");
+        // Each value is cut to 200 bytes.
+        assert!(
+            repo.contains(&format!("LONG={}…", "x".repeat(200))),
+            "{repo}"
+        );
+        assert!(!repo.contains(&"x".repeat(201)), "{repo}");
+        // Nothing a terminal would act on gets through.
+        assert!(
+            !repo.chars().any(|c| c.is_control() || c == '\u{202e}'),
+            "{repo:?}"
+        );
+        assert!(repo.contains("\\r\\u{1b}[2Kok"), "{repo}");
+        assert!(repo.contains("sub\\u{202e}dir"), "{repo}");
+    }
+    let http = ServerSpec::Http {
+        url: "https://mcp.example.com/mcp".parse().unwrap(),
+        headers: BTreeMap::from([("X-Target".into(), "prod\u{7}".into())]),
+    };
+    assert_eq!(
+        http.launch(ServerSource::Project),
+        "http: https://mcp.example.com/mcp (headers: X-Target=prod\\u{7})"
+    );
+    assert_eq!(
+        http.launch(ServerSource::User),
+        "http: https://mcp.example.com/mcp (headers: X-Target)"
+    );
+}
+
+#[test]
+fn printable_escapes_control_and_invisible_characters() {
+    assert_eq!(printable("plain text, ü ok"), "plain text, ü ok");
+    assert_eq!(printable("a\u{1b}[31mb"), "a\\u{1b}[31mb");
+    assert_eq!(printable("x\r\ny\t"), "x\\r\\ny\\t");
+    for c in [
+        '\u{202e}', '\u{2066}', '\u{200b}', '\u{feff}', '\u{85}', '\u{2028}',
+    ] {
+        let out = printable(&format!("a{c}b"));
+        assert!(!out.contains(c), "{out:?}");
+        assert!(out.contains("\\u{"), "{out:?}");
+    }
 }

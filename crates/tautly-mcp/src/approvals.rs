@@ -3,12 +3,14 @@
 //!
 //! An approval is keyed by [`key`]: the canonical workspace root, the server name and
 //! what decides what runs (transport, command line or URL, working directory, variable
-//! and header names). Any change to those asks again.
+//! and header names and values). Any change to those asks again.
 
 use std::collections::BTreeMap;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -20,12 +22,25 @@ pub const APPROVALS_FILE: &str = "mcp-approvals.json";
 /// A larger approvals file is not read (it is treated as empty).
 const MAX_FILE_BYTES: u64 = 4 * 1024 * 1024;
 
-/// The approval key of server `name` declared as `spec` in the repository at `root`:
+/// Serializes this process's writers; the lock file (`flock`) serializes processes.
+static WRITERS: Mutex<()> = Mutex::new(());
+
+/// The approval key of server `name`, declared by the repository at `root` as `spec`:
 /// lowercase blake3 hex of the canonical root, the name, the transport, the argv (or the
-/// URL), the working directory and the sorted variable (or header) names. Values are left
-/// out: they may be secrets, and the prompt never shows them either.
+/// URL), the working directory, the sorted variable (or header) names, and a hash of the
+/// sorted `(name, value)` pairs.
+///
+/// Only repository servers have keys (the user's and the client's own servers need no
+/// approval). Their values are repository content, not the user's secrets, and they decide
+/// what runs (`NODE_OPTIONS`, `LD_PRELOAD`, `PATH`), so a changed value asks again.
 pub fn key(root: &Path, name: &str, spec: &ServerSpec) -> String {
     let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let pairs_hash = |m: &BTreeMap<String, String>| {
+        let pairs: Vec<(&String, &String)> = m.iter().collect();
+        blake3::hash(serde_json::to_string(&pairs).unwrap_or_default().as_bytes())
+            .to_hex()
+            .to_string()
+    };
     let launch = match spec {
         ServerSpec::Stdio {
             command,
@@ -37,11 +52,13 @@ pub fn key(root: &Path, name: &str, spec: &ServerSpec) -> String {
             "argv": std::iter::once(command).chain(args).collect::<Vec<_>>(),
             "cwd": cwd.as_ref().map(|c| c.to_string_lossy().into_owned()),
             "env": env.keys().collect::<Vec<_>>(),
+            "env_values": pairs_hash(env),
         }),
         ServerSpec::Http { url, headers } => serde_json::json!({
             "transport": "http",
             "url": url.as_str(),
             "headers": headers.keys().collect::<Vec<_>>(),
+            "header_values": pairs_hash(headers),
         }),
     };
     let input = serde_json::json!({
@@ -90,10 +107,19 @@ impl ApprovalStore {
         self.file.approvals.contains_key(key)
     }
 
-    /// Record an approval and write the file atomically (temporary file, fsync, rename),
-    /// readable by the user only (mode 0600; the directory is created 0700). Approvals
-    /// another process recorded since [`open`](Self::open) are kept.
+    /// Record an approval. Writers are serialized (a process-wide mutex, then an `flock`
+    /// on `<file>.lock` against other processes); under the lock the file is read again,
+    /// merged and replaced atomically through a uniquely named temporary file (mode 0600,
+    /// fsync, rename). The directory is created 0700 when missing. Approvals recorded by
+    /// others since [`open`](Self::open) are kept.
     pub fn approve(&mut self, key: &str, root: &Path, name: &str) -> io::Result<()> {
+        let _writer = WRITERS.lock().unwrap_or_else(PoisonError::into_inner);
+        let dir = parent(&self.path);
+        if !dir.exists() {
+            std::fs::create_dir_all(dir)?;
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+        }
+        let _lock = FileLock::take(&lock_path(&self.path))?;
         let mut file = read(&self.path);
         file.approvals
             .extend(std::mem::take(&mut self.file.approvals));
@@ -116,56 +142,75 @@ impl ApprovalStore {
     }
 }
 
+fn parent(path: &Path) -> &Path {
+    path.parent()
+        .filter(|d| !d.as_os_str().is_empty())
+        .unwrap_or(Path::new("."))
+}
+
+fn lock_path(path: &Path) -> PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(".lock");
+    path.with_file_name(name)
+}
+
+/// An exclusive `flock` on a lock file, released when dropped (the descriptor closes).
+struct FileLock(#[allow(dead_code)] std::fs::File);
+
+impl FileLock {
+    fn take(path: &Path) -> io::Result<FileLock> {
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)?;
+        // SAFETY: `flock` on a descriptor this function owns.
+        if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(FileLock(f))
+    }
+}
+
+/// The store at `path`, read through one descriptor that must be a regular file, at most
+/// [`MAX_FILE_BYTES`].
 fn read(path: &Path) -> File {
-    let Ok(meta) = std::fs::metadata(path) else {
+    let Ok(f) = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
+    else {
         return File::default();
     };
-    if !meta.is_file() || meta.len() > MAX_FILE_BYTES {
+    if !f.metadata().is_ok_and(|m| m.is_file()) {
         return File::default();
     }
-    std::fs::read(path)
-        .ok()
-        .and_then(|b| serde_json::from_slice(&b).ok())
-        .unwrap_or_default()
+    let mut bytes = Vec::new();
+    if f.take(MAX_FILE_BYTES + 1).read_to_end(&mut bytes).is_err()
+        || bytes.len() as u64 > MAX_FILE_BYTES
+    {
+        return File::default();
+    }
+    serde_json::from_slice(&bytes).unwrap_or_default()
 }
 
 fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    let dir = path
-        .parent()
-        .filter(|d| !d.as_os_str().is_empty())
-        .unwrap_or(Path::new("."));
-    if !dir.exists() {
-        std::fs::create_dir_all(dir)?;
-        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+    let dir = parent(path);
+    // A unique name per write; created 0600 by `tempfile`, removed if anything fails.
+    let mut tmp = tempfile::Builder::new()
+        .prefix(".mcp-approvals.")
+        .suffix(".tmp")
+        .tempfile_in(dir)?;
+    tmp.as_file()
+        .set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    tmp.write_all(bytes)?;
+    tmp.as_file().sync_all()?;
+    tmp.persist(path).map_err(|e| e.error)?;
+    if let Ok(d) = std::fs::File::open(dir) {
+        let _ = d.sync_all();
     }
-    let file_name = path
-        .file_name()
-        .ok_or_else(|| io::Error::other("the approvals path has no file name"))?;
-    let tmp = dir.join(format!(
-        ".{}.{}.tmp",
-        file_name.to_string_lossy(),
-        std::process::id()
-    ));
-    let result = (|| {
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(&tmp)?;
-        // An existing temporary file keeps its mode; make sure.
-        f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-        f.write_all(bytes)?;
-        f.sync_all()?;
-        std::fs::rename(&tmp, path)?;
-        if let Ok(d) = std::fs::File::open(dir) {
-            let _ = d.sync_all();
-        }
-        Ok(())
-    })();
-    if result.is_err() {
-        let _ = std::fs::remove_file(&tmp);
-    }
-    result
+    Ok(())
 }
