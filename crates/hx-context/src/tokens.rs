@@ -28,7 +28,7 @@ impl TokenEstimator {
 
     /// [`calibrate`](Self::calibrate) for totals that include `flat` tokens of fixed
     /// estimates (images) which the ratio does not scale: the sample is the text part only.
-    pub fn calibrate_excluding(&mut self, estimated: u32, actual: u64, flat: u32) {
+    pub(crate) fn calibrate_excluding(&mut self, estimated: u32, actual: u64, flat: u32) {
         self.calibrate(
             estimated.saturating_sub(flat),
             actual.saturating_sub(u64::from(flat)),
@@ -39,6 +39,9 @@ impl TokenEstimator {
     /// (so it already includes the current ratio) and `actual` the provider's count for the
     /// same text. The ratio moves toward `actual / unscaled estimate`, an exponential moving
     /// average clamped to 0.5-2.0; a zero estimate carries no information and is ignored.
+    ///
+    /// The engine calibrates with [`Context::calibrate`](crate::Context::calibrate), which
+    /// builds the sample from a request's status and the provider's usage.
     pub fn calibrate(&mut self, estimated: u32, actual: u64) {
         if estimated == 0 {
             return;

@@ -6,7 +6,7 @@ use hx_provider::{
     ToolSpec,
 };
 
-use crate::blocks::{Breakdown, ContextStatus, message_tokens};
+use crate::blocks::{self, Breakdown, ContextStatus, ReasoningWire, message_tokens};
 use crate::{Context, pinned, prompt};
 
 /// Leading `system` blocks that form the cache-stable prefix: system prompt, AGENTS.md,
@@ -57,7 +57,9 @@ impl Context {
             .iter()
             .flat_map(|t| t.messages.iter().cloned())
             .collect();
-        let history_tokens = messages.iter().map(|m| message_tokens(m, est)).sum();
+        let wire = ReasoningWire::for_model(model);
+        let history_tokens = messages.iter().map(|m| message_tokens(m, est, wire)).sum();
+        let flat_tokens = blocks::flat_tokens(&messages);
 
         // Pinned leads the conversation: it joins the first message when that is a user
         // message, else stands in front of it. It changes rarely, so it stays cacheable.
@@ -123,6 +125,12 @@ impl Context {
         };
         let used = breakdown.total();
         let budget = caps.context_window;
+        // Everything before the tail: the last breakpoint marks the message before it.
+        let cached_prefix = if caps.cache == CacheStyle::None {
+            0
+        } else {
+            used - breakdown.state
+        };
 
         let mut warnings = self.load_warnings.clone();
         if u64::from(breakdown.pinned) * 100 > u64::from(budget) * PINNED_WARN_PERCENT {
@@ -156,6 +164,8 @@ impl Context {
             budget,
             breakdown,
             warnings,
+            flat_tokens,
+            cached_prefix,
         };
         (request, status)
     }

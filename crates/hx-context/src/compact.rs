@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 
 use hx_provider::{Block, CanonicalRequest, Capabilities, Content, Message, ModelId, Price, Role};
 
-use crate::blocks::{ContextStatus, Turn, message_tokens};
+use crate::blocks::{ContextStatus, ReasoningWire, Turn, message_tokens};
 use crate::schedule::{self, MutationReason};
 use crate::{Context, assemble, pinned};
 
@@ -143,7 +143,7 @@ impl Context {
         self.history[..cut]
             .iter()
             .flat_map(|t| &t.messages)
-            .map(|m| message_tokens(m, est))
+            .map(|m| message_tokens(m, est, ReasoningWire::default()))
             .fold(0, u32::saturating_add)
     }
 
@@ -243,7 +243,7 @@ impl Context {
         let turn_tokens = |t: &Turn| -> u32 {
             t.messages
                 .iter()
-                .map(|m| message_tokens(m, est))
+                .map(|m| message_tokens(m, est, ReasoningWire::default()))
                 .fold(0, u32::saturating_add)
         };
         let replacement = summary_turn(&summary);
@@ -302,8 +302,12 @@ impl Context {
             return Err(UncompactError::NotLatest);
         }
         let est = &self.tokens;
-        let turn_tokens =
-            |t: &Turn| -> u32 { t.messages.iter().map(|m| message_tokens(m, est)).sum() };
+        let turn_tokens = |t: &Turn| -> u32 {
+            t.messages
+                .iter()
+                .map(|m| message_tokens(m, est, ReasoningWire::default()))
+                .sum()
+        };
         let needed = self
             .estimated_tokens()
             .saturating_sub(turn_tokens(&summary))
@@ -351,7 +355,7 @@ impl Context {
             .history
             .iter()
             .flat_map(|t| &t.messages)
-            .map(|m| message_tokens(m, est))
+            .map(|m| message_tokens(m, est, ReasoningWire::default()))
             .sum();
         est.estimate(crate::prompt::system())
             + tagged("agents_md", &self.agents_md)

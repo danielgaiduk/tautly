@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use hx_context::{Context, PinSource, Pinned, STABLE_LEN, TokenEstimator, Turn, prompt};
 use hx_provider::{
-    Block, CachePoint, CacheStyle, Capabilities, Content, EditFormat, Message, ModelId,
+    Block, CachePoint, CacheStyle, Capabilities, Content, EditFormat, Message, ModelId, RawUsage,
     ReasoningStyle, Role, ToolSpec,
 };
 use hx_tools::{AppliedEffect, ContextOp, LineRange, PlanStep, Shown, StatePatch, StepStatus};
@@ -726,9 +726,8 @@ fn second_breakpoint_marks_previous_steps_last_message() {
     );
 }
 
-#[test]
-fn calibrate_ignores_flat_image_tokens() {
-    let image_turn = Turn {
+fn image_turn() -> Turn {
+    Turn {
         messages: vec![Message {
             role: Role::User,
             content: vec![
@@ -739,12 +738,30 @@ fn calibrate_ignores_flat_image_tokens() {
                 },
             ],
         }],
-    };
+    }
+}
+
+/// Provider usage for a request of `total` input tokens, as the adapters report it: most of
+/// it read from the cache, a little written to it, and only the rest as plain input.
+fn warm_usage(total: u64) -> RawUsage {
+    let cache_write = total / 20;
+    let input = total / 50;
+    RawUsage {
+        input,
+        output: 100,
+        cache_read: total - cache_write - input,
+        cache_write,
+    }
+}
+
+#[test]
+fn calibrate_ignores_flat_image_tokens() {
     let mut c = Context::default();
-    c.history.push(image_turn);
+    c.history.push(image_turn());
     let (_, st) = c.assemble(&caps(), &[], &m());
+    assert_eq!(st.flat_tokens, 1_000);
     // Provider counted exactly the text estimate plus the same flat image cost.
-    c.calibrate(st.used, u64::from(st.used));
+    c.calibrate(&st, &warm_usage(u64::from(st.used)));
     assert!(
         (c.tokens.ratio() - 1.0).abs() < 1e-9,
         "{}",
@@ -752,8 +769,134 @@ fn calibrate_ignores_flat_image_tokens() {
     );
     // Text really is 50% more than estimated: image cost must not dilute the sample.
     let text_est = st.used - 1_000;
-    c.calibrate(st.used, u64::from(text_est) * 3 / 2 + 1_000);
+    c.calibrate(&st, &warm_usage(u64::from(text_est) * 3 / 2 + 1_000));
     assert!(c.tokens.ratio() > 1.1, "{}", c.tokens.ratio());
+}
+
+#[test]
+fn calibrate_uses_the_images_of_the_measured_request() {
+    let mut c = Context::default();
+    c.history.push(turn(&"y".repeat(20_000)));
+    c.history.push(image_turn());
+    let (_, st) = c.assemble(&caps(), &[], &m());
+    // A result with two more images arrives before the engine calibrates request 1.
+    c.history.push(image_turn());
+    c.history.push(image_turn());
+    // The provider counts the text 50% higher than estimated, and the one image flat.
+    let text = u64::from(st.used - 1_000);
+    c.calibrate(&st, &warm_usage(text * 3 / 2 + 1_000));
+    // The sample is exactly 1.5, so the average moves to 0.7 + 0.3 * 1.5.
+    let r = c.tokens.ratio();
+    assert!((r - 1.15).abs() < 1e-3, "ratio {r}");
+}
+
+#[test]
+fn warm_cache_calibrations_keep_the_ratio_near_one() {
+    let mut c = Context::default();
+    for i in 0..40 {
+        c.history.push(turn(&format!(
+            "{i} {}",
+            "some words of history ".repeat(40)
+        )));
+    }
+    // The provider counts exactly what we estimate at ratio 1.0, mostly as cache reads.
+    let (_, st) = c.assemble(&caps(), &tools(), &m());
+    let truth = u64::from(st.used);
+    for _ in 0..3 {
+        let (_, st) = c.assemble(&caps(), &tools(), &m());
+        c.calibrate(&st, &warm_usage(truth));
+    }
+    let r = c.tokens.ratio();
+    assert!((r - 1.0).abs() < 0.01, "ratio {r}");
+    let (_, st) = c.assemble(&caps(), &tools(), &m());
+    assert!(
+        st.used.abs_diff(truth as u32) * 100 <= truth as u32,
+        "{} vs {truth}",
+        st.used
+    );
+}
+
+fn reasoning_turn() -> Turn {
+    let openai_item = json!({
+        "type": "reasoning",
+        "id": "rs_1",
+        "encrypted_content": "E".repeat(8_000),
+        "summary": [{"type": "summary_text", "text": "s".repeat(400)}],
+    });
+    Turn {
+        messages: vec![
+            Message {
+                role: Role::User,
+                content: vec![Content::Text("go".into())],
+            },
+            Message {
+                role: Role::Assistant,
+                content: vec![
+                    Content::Reasoning {
+                        text: "t".repeat(4_000),
+                        signature: Some("sig".into()),
+                    },
+                    Content::Reasoning {
+                        text: "u".repeat(4_000),
+                        signature: None,
+                    },
+                    Content::RedactedReasoning {
+                        data: openai_item.to_string(),
+                    },
+                    Content::Text("done".into()),
+                ],
+            },
+        ],
+    }
+}
+
+#[test]
+fn reasoning_counts_only_what_the_adapter_sends() {
+    let mut c = Context::default();
+    c.history.push(reasoning_turn());
+    let history = |model: &str| c.assemble(&caps(), &[], &model.into()).1.breakdown.history;
+    let base = {
+        let mut plain = Context::default();
+        plain.history.push(turn("go"));
+        plain.history.push(Turn {
+            messages: vec![Message {
+                role: Role::Assistant,
+                content: vec![Content::Text("done".into())],
+            }],
+        });
+        plain.assemble(&caps(), &[], &m()).1.breakdown.history
+    };
+    let item_without_payload = 400 / 4;
+    // Google and compat send no reasoning text back.
+    assert_eq!(history("google/gemini-pro"), base);
+    assert_eq!(history("compat:local/qwen"), base);
+    // OpenAI replays the reasoning item, whose encrypted payload is not counted.
+    let openai = history("openai/gpt-5");
+    assert!(openai > base + item_without_payload, "{openai}");
+    assert!(openai < base + item_without_payload + 100, "{openai}");
+    // Anthropic sends signed thinking text (never unsigned) and the opaque data.
+    let anthropic = history("anthropic/claude-sonnet");
+    assert!(
+        anthropic >= base + 1_000 + item_without_payload,
+        "{anthropic}"
+    );
+    assert!(
+        anthropic < base + 1_000 + item_without_payload + 100,
+        "{anthropic}"
+    );
+}
+
+#[test]
+fn cached_prefix_is_everything_before_the_state_tail() {
+    let mut c = ctx_with_history();
+    c.state.task = Some("a task".into());
+    let (_, st) = c.assemble(&caps(), &tools(), &m());
+    assert!(st.breakdown.state > 0);
+    assert_eq!(st.cached_prefix, st.used - st.breakdown.state);
+    // Without a prompt cache nothing is cached.
+    let mut none = caps();
+    none.cache = CacheStyle::None;
+    assert_eq!(c.assemble(&none, &tools(), &m()).1.cached_prefix, 0);
 }
 
 #[test]

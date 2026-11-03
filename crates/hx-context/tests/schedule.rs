@@ -207,8 +207,7 @@ fn status(used: u32) -> ContextStatus {
     ContextStatus {
         used,
         budget: WINDOW,
-        breakdown: Default::default(),
-        warnings: vec![],
+        ..Default::default()
     }
 }
 

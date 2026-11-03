@@ -60,8 +60,7 @@ fn status(used: u32, budget: u32) -> hx_context::ContextStatus {
     hx_context::ContextStatus {
         used,
         budget,
-        breakdown: Default::default(),
-        warnings: vec![],
+        ..Default::default()
     }
 }
 

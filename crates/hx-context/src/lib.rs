@@ -17,10 +17,11 @@ pub mod tokens;
 use std::path::PathBuf;
 use std::time::Instant;
 
+use hx_provider::RawUsage;
 use hx_tools::{AppliedEffect, ContextOp};
 
 pub use assemble::STABLE_LEN;
-pub use blocks::{Breakdown, ContextStatus, Turn};
+pub use blocks::{Breakdown, ContextStatus, ReasoningWire, Turn};
 pub use compact::{CompactError, CompactionRecord, UncompactError};
 pub use gc::{GcRecord, ReadTarget, ResultMeta};
 pub use pinned::{PinSource, Pinned};
@@ -94,19 +95,19 @@ impl Context {
         self.state.apply_effects(effects);
     }
 
-    fn flat_tokens(&self) -> u32 {
-        self.history
-            .iter()
-            .map(|t| blocks::flat_tokens(&t.messages))
-            .sum()
-    }
-
-    /// Calibrate token estimation: `estimated` is the `used` of a request assembled from the
-    /// current history and `actual` the provider's input count for it. Images are a flat
-    /// estimate the ratio never scaled, so their share is left out of the sample.
-    pub fn calibrate(&mut self, estimated: u32, actual: u64) {
-        let flat = self.flat_tokens();
-        self.tokens.calibrate_excluding(estimated, actual, flat);
+    /// Calibrate token estimation after a request: `status` is what [`assemble`](Self::assemble)
+    /// returned for it and `usage` the provider's usage for the same request. The
+    /// provider's count of the whole request is `input + cache_read + cache_write`: every
+    /// adapter reports `input` without the cached tokens, which with a warm cache is only
+    /// the newest few thousand. Images are a flat estimate the ratio never scales, so the
+    /// flat tokens the request contained (`status.flat_tokens`) are left out of the sample.
+    pub fn calibrate(&mut self, status: &ContextStatus, usage: &RawUsage) {
+        let actual = usage
+            .input
+            .saturating_add(usage.cache_read)
+            .saturating_add(usage.cache_write);
+        self.tokens
+            .calibrate_excluding(status.used, actual, status.flat_tokens);
     }
 
     /// Build the repo map from `index` and keep it for the rest of the session. The engine
@@ -133,8 +134,8 @@ impl Context {
     }
 
     /// Record that a provider request went out at `at` whose cache-marked prefix (up to the
-    /// last cache breakpoint) was `cached_prefix_tokens` long. The scheduler measures the
-    /// cache's age from `at`.
+    /// last cache breakpoint) was `cached_prefix_tokens` long: the request's
+    /// [`ContextStatus::cached_prefix`]. The scheduler measures the cache's age from `at`.
     pub fn note_request(&mut self, at: Instant, cached_prefix_tokens: u32) {
         self.clock = CacheClock {
             last_request: Some(at),
