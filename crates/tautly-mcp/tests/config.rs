@@ -149,12 +149,16 @@ fn launch_shows_repository_values_escaped_and_cut() {
     for source in [ServerSource::Project, ServerSource::McpJson] {
         let repo = spec.launch(source);
         assert!(repo.contains("NODE_OPTIONS=--require ./evil.js"), "{repo}");
-        // Each value is cut to 200 bytes.
+        // A long value shows its head, its tail and its length.
         assert!(
-            repo.contains(&format!("LONG={}…", "x".repeat(200))),
+            repo.contains(&format!(
+                "LONG={}…{} (500 bytes)",
+                "x".repeat(120),
+                "x".repeat(60)
+            )),
             "{repo}"
         );
-        assert!(!repo.contains(&"x".repeat(201)), "{repo}");
+        assert!(!repo.contains(&"x".repeat(121)), "{repo}");
         // Nothing a terminal would act on gets through.
         assert!(
             !repo.chars().any(|c| c.is_control() || c == '\u{202e}'),
@@ -189,4 +193,59 @@ fn printable_escapes_control_and_invisible_characters() {
         assert!(!out.contains(c), "{out:?}");
         assert!(out.contains("\\u{"), "{out:?}");
     }
+}
+
+#[test]
+fn long_values_show_what_follows_padding() {
+    let padded = format!(
+        "{}--require ./evil.js",
+        "--max-old-space-size=4096 ".repeat(8)
+    );
+    let spec = ServerSpec::Stdio {
+        command: "node".into(),
+        args: vec![],
+        env: BTreeMap::from([("NODE_OPTIONS".into(), padded.clone())]),
+        cwd: None,
+    };
+    let shown = spec.launch(ServerSource::Project);
+    assert!(shown.contains("--require ./evil.js"), "{shown}");
+    assert!(
+        shown.contains(&format!("({} bytes)", padded.len())),
+        "{shown}"
+    );
+}
+
+#[test]
+fn printable_escapes_backslashes_and_every_invisible_character() {
+    // A literal backslash-r is not an escaped carriage return.
+    assert_eq!(printable("a\\rb"), "a\\\\rb");
+    assert_ne!(printable("a\\rb"), printable("a\rb"));
+    for c in [
+        '\u{e0041}', // tag characters (ASCII smuggling)
+        '\u{e007f}',
+        '\u{e0001}',
+        '\u{206a}',
+        '\u{206f}',
+        '\u{115f}', // Hangul fillers
+        '\u{1160}',
+        '\u{3164}',
+        '\u{ffa0}',
+        '\u{fe00}', // variation selectors
+        '\u{fe0f}',
+        '\u{e0100}',
+        '\u{e01ef}',
+        '\u{34f}',
+        '\u{600}', // other format (Cf) characters
+        '\u{6dd}',
+        '\u{180e}',
+        '\u{1d173}',
+        '\u{13430}',
+    ] {
+        let out = printable(&format!("a{c}b"));
+        assert!(!out.contains(c), "{c:?} -> {out:?}");
+    }
+    assert_eq!(
+        printable("plain ü, 日本, emoji 🙂"),
+        "plain ü, 日本, emoji 🙂"
+    );
 }

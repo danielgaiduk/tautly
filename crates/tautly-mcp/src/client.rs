@@ -17,6 +17,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
+use std::process::ExitStatus;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::Duration;
 
@@ -41,7 +42,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::config::{McpConfig, ServerSource, ServerSpec};
 use crate::names;
-use crate::text::{printable, strip_control};
+use crate::text::{printable, strip_control, strip_control_json};
 use crate::tool::{DESCRIPTION_CAP, McpTool, RemoteTool, SCHEMA_CAP, truncate};
 
 /// Most MCP tools offered in one request, across all servers (by name).
@@ -62,6 +63,8 @@ const CLOSE_GRACE: Duration = Duration::from_secs(1);
 /// A tool-list change is listed this long after it is announced, so a burst of
 /// announcements costs one listing (the engine only looks at the next user turn anyway).
 const RELIST_DEBOUNCE: Duration = Duration::from_millis(250);
+/// How often [`end_group`] looks whether the leader has exited.
+const EXIT_POLL: Duration = Duration::from_millis(10);
 /// How often a ready server is checked for having exited or disconnected.
 const WATCH_EVERY: Duration = Duration::from_millis(200);
 
@@ -107,34 +110,24 @@ pub(crate) struct Connection {
 }
 
 impl Connection {
-    /// Close the session and end the server's process group: SIGTERM, a grace period,
-    /// SIGKILL for what is left; the server process is reaped.
-    async fn close(&self) {
+    /// Close the session and end the server's process group (see [`end_group`]); the
+    /// server's exit status, when it was a process.
+    async fn close(&self) -> Option<ExitStatus> {
         let service = lock(&self.service).take();
         if let Some(s) = service {
             let _ = tokio::time::timeout(CLOSE_GRACE, s.cancel()).await;
         }
         let child = lock(&self.process).take();
-        if let Some(mut child) = child {
-            end_group(self.pgid, &mut child, &self.groups).await;
+        match child {
+            Some(mut child) => end_group(self.pgid, &mut child, &self.groups).await,
+            None => None,
         }
     }
 
-    /// Why the server is gone, if it is: its process exited, or the transport closed.
-    fn gone(&self) -> Option<String> {
-        if let Some(child) = lock(&self.process).as_mut()
-            && let Ok(Some(status)) = child.try_wait()
-        {
-            return Some(format!("the server exited ({status})"));
-        }
-        if self.peer.is_transport_closed() {
-            return Some(if self.may_write {
-                "the server exited or closed its stdio".into()
-            } else {
-                "the server closed the connection".into()
-            });
-        }
-        None
+    /// Whether the server is gone: its process exited (seen without reaping it, so its
+    /// group id stays ours until the group is killed), or the transport closed.
+    fn gone(&self) -> bool {
+        self.pgid.is_some_and(leader_exited) || self.peer.is_transport_closed()
     }
 
     /// The stderr tail, escaped, for a failure message.
@@ -157,24 +150,26 @@ fn stderr_note(tail: &Mutex<Vec<u8>>) -> String {
 /// have been reused by another process.
 type Groups = Arc<Mutex<Vec<u32>>>;
 
-/// End `child`'s process group and reap it; the group is then forgotten.
-async fn end_group(pgid: Option<u32>, child: &mut Child, groups: &Groups) {
-    if let Some(g) = pgid {
-        killpg(g, libc::SIGTERM);
-    }
-    if tokio::time::timeout(TERM_GRACE, child.wait())
-        .await
-        .is_err()
-    {
+/// End `child`'s process group, then reap the leader; the group is then forgotten.
+///
+/// SIGTERM to the group, up to [`TERM_GRACE`] for the leader to exit (watched without
+/// reaping it), then SIGKILL to the group, and only then the reap. Until the reap the
+/// leader, alive or a zombie, holds its pid, so the group id cannot have been given to
+/// another process when it is signalled.
+async fn end_group(pgid: Option<u32>, child: &mut Child, groups: &Groups) -> Option<ExitStatus> {
+    let Some(g) = pgid else {
         let _ = child.start_kill();
+        return child.wait().await.ok();
+    };
+    killpg(g, libc::SIGTERM);
+    let deadline = tokio::time::Instant::now() + TERM_GRACE;
+    while !leader_exited(g) && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(EXIT_POLL).await;
     }
-    if let Some(g) = pgid.filter(|&g| group_alive(g)) {
-        killpg(g, libc::SIGKILL);
-    }
-    let _ = child.wait().await;
-    if let Some(g) = pgid {
-        lock(groups).retain(|&x| x != g);
-    }
+    killpg(g, libc::SIGKILL);
+    let status = child.wait().await.ok();
+    lock(groups).retain(|&x| x != g);
+    status
 }
 
 fn killpg(pgid: u32, signal: i32) {
@@ -465,11 +460,13 @@ impl Inner {
     /// Report a ready server that exits or disconnects as `Failed` and stop offering its
     /// tools (the engine drops them at the next user-turn start).
     async fn watch(self: Arc<Self>, name: String, conn: Arc<Connection>) {
-        let why = loop {
+        while !conn.gone() {
             tokio::time::sleep(WATCH_EVERY).await;
-            if let Some(why) = conn.gone() {
-                break why;
-            }
+        }
+        let gone = if conn.may_write {
+            "the server exited or closed its stdio"
+        } else {
+            "the server closed the connection"
         };
         let current = {
             let mut st = lock(&self.state);
@@ -477,7 +474,7 @@ impl Inner {
             match st.servers.get_mut(&name) {
                 Some(s) if !closed && s.conn.as_ref().is_some_and(|c| Arc::ptr_eq(c, &conn)) => {
                     s.state = McpState::Failed;
-                    s.message = Some(format!("{why}{}", conn.stderr_note()));
+                    s.message = Some(format!("{gone}{}", conn.stderr_note()));
                     s.conn = None;
                     s.tools.clear();
                     true
@@ -485,11 +482,29 @@ impl Inner {
                 _ => false,
             }
         };
-        if current {
-            self.changed();
-            // What the server left behind in its group goes with it.
-            conn.close().await;
+        if !current {
+            return;
         }
+        self.changed();
+        // What the server left in its group goes with it: the leader is not reaped yet
+        // (it was seen exiting with WNOWAIT), so the group id is still ours to signal.
+        if let Some(g) = conn.pgid {
+            killpg(g, libc::SIGKILL);
+        }
+        let status = conn.close().await;
+        if let Some(status) = status {
+            let mut st = lock(&self.state);
+            if let Some(s) = st.servers.get_mut(&name)
+                && s.state == McpState::Failed
+                && s.conn.is_none()
+            {
+                s.message = Some(format!(
+                    "the server exited ({status}){}",
+                    conn.stderr_note()
+                ));
+            }
+        }
+        self.changed();
     }
 
     /// For a 2026-07-28 server that announces tool list changes, open the subscription
@@ -768,7 +783,9 @@ fn select_tools(
     let mut kept = Vec::new();
     let prefix = format!("[MCP server {}] ", strip_control(server));
     for t in listed {
-        let schema = serde_json::Value::Object((*t.input_schema).clone());
+        let mut schema = serde_json::Value::Object((*t.input_schema).clone());
+        // Descriptions and titles inside the schema reach the model as well.
+        strip_control_json(&mut schema);
         let size = serde_json::to_vec(&schema).map_or(usize::MAX, |b| b.len());
         if size > SCHEMA_CAP {
             warnings.push(format!(
@@ -1027,5 +1044,62 @@ impl Drop for McpHub {
         for t in lock(&self.inner.tasks).iter() {
             t.abort();
         }
+    }
+}
+
+/// Whether the process `pid` (our child) has exited, without reaping it
+/// (`waitid(P_PID, pid, WEXITED | WNOHANG | WNOWAIT)`): a zombie still holds its pid, so
+/// its process group id cannot be reused while the group is signalled.
+fn leader_exited(pid: u32) -> bool {
+    let id = libc::id_t::from(pid);
+    // SAFETY: an all-zero `siginfo_t` is a valid out-parameter for `waitid`.
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    // SAFETY: `info` outlives the call; WNOWAIT leaves the child waitable.
+    let r = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            id,
+            &mut info,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    };
+    // With WNOHANG and no exited child, `si_pid` stays 0.
+    r == 0 && siginfo_pid(&info) != 0
+}
+
+#[cfg(target_os = "linux")]
+fn siginfo_pid(info: &libc::siginfo_t) -> libc::pid_t {
+    // SAFETY: `waitid` filled in the child fields.
+    unsafe { info.si_pid() }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn siginfo_pid(info: &libc::siginfo_t) -> libc::pid_t {
+    info.si_pid
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn exit_is_detected_without_reaping() {
+        let mut child = tokio::process::Command::new("sh")
+            .args(["-c", "exit 3"])
+            .spawn()
+            .unwrap();
+        let pid = child.id().unwrap();
+        let end = std::time::Instant::now() + Duration::from_secs(10);
+        while !leader_exited(pid) {
+            assert!(std::time::Instant::now() < end, "exit not seen");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        // Still a zombie: not reaped, so the pid (and group id) is still taken.
+        // SAFETY: signal 0 only checks that the process exists.
+        assert_eq!(unsafe { libc::kill(pid as i32, 0) }, 0);
+        assert!(leader_exited(pid), "asking again does not reap either");
+        assert_eq!(child.wait().await.unwrap().code(), Some(3));
+        // SAFETY: as above.
+        assert_eq!(unsafe { libc::kill(pid as i32, 0) }, -1);
     }
 }

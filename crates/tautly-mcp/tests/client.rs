@@ -407,12 +407,12 @@ async fn descriptions_and_results_marked_and_stripped_of_control_characters() {
     )
     .await;
     let ctl = find(&hub, "mcp__echo__ctl");
-    let desc = ctl.spec(&Capabilities::conservative()).description;
-    assert!(desc.starts_with("[MCP server echo] red"), "{desc:?}");
-    assert!(
-        !desc.chars().any(|c| c.is_control() || c == '\u{202e}'),
-        "{desc:?}"
-    );
+    let spec = ctl.spec(&Capabilities::conservative());
+    let desc = spec.description;
+    assert_eq!(desc, "[MCP server echo] red[31m textreversed");
+    // Strings inside the input schema reach the model too.
+    assert_eq!(spec.schema["properties"]["x"]["title"], "t");
+    assert_eq!(spec.schema["properties"]["x"]["description"], "d[2K");
     let r = call(&s, &ctl, json!({})).await;
     // Tabs and newlines stay; ESC, BEL and the like do not.
     assert_eq!(r.output, "a[2Kbc\td\ne");
@@ -443,6 +443,53 @@ async fn dead_server_is_failed_and_its_tools_removed() {
     );
     assert_eq!(st.tools, 0);
     assert!(hub.ready_tools().is_empty());
+    hub.shutdown().await;
+}
+
+/// The server exits while a child that ignores SIGTERM keeps running in its group: the
+/// child is killed (the group is signalled while the dead leader still holds its id) and
+/// the leader is reaped, all without a shutdown.
+#[tokio::test]
+async fn exited_leader_group_is_killed_then_reaped() {
+    let s = setup();
+    let pid_file = s.sb.root().join("pids");
+    // `$$` is the shell, which becomes the server (the group leader) by `exec`.
+    let script = format!(
+        "trap '' TERM; sleep 300 & echo $$ $! > '{}'; exec '{}' stdio",
+        pid_file.display(),
+        fixture()
+    );
+    let spec = ServerSpec::Stdio {
+        command: "/bin/sh".into(),
+        args: vec!["-c".into(), script],
+        env: BTreeMap::new(),
+        cwd: None,
+    };
+    let hub = hub(&s, vec![("echo", spec)], &McpConfig::default()).await;
+    let pids: Vec<i32> = wait_for_file(&pid_file)
+        .await
+        .split_whitespace()
+        .map(|p| p.parse().unwrap())
+        .collect();
+    let (leader, child) = (pids[0], pids[1]);
+    assert!(alive(leader) && alive(child));
+    let r = call(&s, &find(&hub, "mcp__echo__exit"), json!({})).await;
+    assert_eq!(r.output, "bye");
+    let end = Instant::now() + WAIT;
+    while hub.status()[0].state != McpState::Failed {
+        assert!(Instant::now() < end, "{:?}", hub.status());
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let end = Instant::now() + Duration::from_secs(5);
+    while alive(child) && Instant::now() < end {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(!alive(child), "the SIGTERM-ignoring child survived");
+    // The leader is reaped too (a zombie would still answer signal 0).
+    while alive(leader) && Instant::now() < end {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(!alive(leader), "the leader was not reaped");
     hub.shutdown().await;
 }
 

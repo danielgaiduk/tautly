@@ -25,15 +25,16 @@ const WAIT: Duration = Duration::from_secs(20);
 /// Tools the fixture offers by default.
 const ECHO_TOOL_COUNT: usize = 11;
 
-/// The `echo_server` binary of `tautly-mcp`, next to this test's directory
-/// (`cargo test --workspace` builds it; otherwise it is built here once).
+/// The `echo_server` binary of `tautly-mcp-fixture`, next to this test's directory,
+/// brought up to date once per test binary (a test run of this package alone does not
+/// rebuild another package's binary).
 fn fixture() -> String {
     static PATH: OnceLock<String> = OnceLock::new();
     PATH.get_or_init(|| {
         let exe = std::env::current_exe().unwrap();
         let dir = exe.parent().unwrap().parent().unwrap();
         let bin = dir.join("echo_server");
-        if !bin.exists() {
+        {
             let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
             let status = std::process::Command::new(cargo)
                 .args(["build", "-p", "tautly-mcp-fixture", "--bin", "echo_server"])

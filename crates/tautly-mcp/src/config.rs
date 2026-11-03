@@ -9,10 +9,13 @@ use serde::{Deserialize, Deserializer};
 use serde_json::Value;
 use url::Url;
 
-use crate::text::{cut, printable};
+use crate::text::{head_tail, printable};
 
-/// Bytes of each repository variable or header value an approval prompt shows.
-pub const LAUNCH_VALUE_CAP: usize = 200;
+/// Of a long repository variable or header value, an approval prompt shows this many
+/// bytes from the start…
+pub const LAUNCH_VALUE_HEAD: usize = 120;
+/// …and this many from the end, with the value's length.
+pub const LAUNCH_VALUE_TAIL: usize = 60;
 
 /// Provider key variables no server ever sees (spec 7.11.10); the engine adds every
 /// configured `api_key_env`.
@@ -118,9 +121,10 @@ impl ServerSpec {
     }
 
     /// What starting it means, for an approval prompt or a listing: the command line (or
-    /// URL) and its variables (or headers). A repository server's values are shown, each
-    /// cut to [`LAUNCH_VALUE_CAP`] bytes: they are repository content and they decide what
-    /// runs (`NODE_OPTIONS`, `PATH`). A trusted server's values may be the user's secrets,
+    /// URL) and its variables (or headers). A repository server's values are shown: they
+    /// are repository content and they decide what runs (`NODE_OPTIONS`, `PATH`). A long
+    /// one shows its first [`LAUNCH_VALUE_HEAD`] and last [`LAUNCH_VALUE_TAIL`] bytes and its
+    /// length, so nothing hides behind padding. A trusted server's values may be the user's secrets,
     /// so only the names are shown. Control and invisible characters are escaped
     /// ([`printable`]), so the text cannot redraw itself in a terminal.
     pub fn launch(&self, source: ServerSource) -> String {
@@ -133,7 +137,9 @@ impl ServerSpec {
                 .iter()
                 .map(|(k, v)| {
                     if show_values {
-                        format!("{}={}", printable(k), cut(&printable(v), LAUNCH_VALUE_CAP))
+                        let shown =
+                            head_tail(&printable(v), LAUNCH_VALUE_HEAD, LAUNCH_VALUE_TAIL, v.len());
+                        format!("{}={shown}", printable(k))
                     } else {
                         printable(k)
                     }

@@ -111,8 +111,14 @@ fn tools(extra: bool) -> Vec<Value> {
     if std::env::var_os("ECHO_CONTROL").is_some() {
         v.push(tool(
             "ctl",
-            "red\u{1b}[31m text\u{7}\r\u{202e}reversed",
-            object(json!({})),
+            // Terminal controls, bidi, and "ASCII smuggling" (tag characters spelling
+            // `HI`, plus other invisible characters).
+            "red\u{1b}[31m text\u{7}\r\u{202e}reversed\u{e0048}\u{e0049}\u{206a}\u{3164}\u{fe0f}\u{34f}",
+            object(json!({"x": {
+                "type": "string",
+                "title": "t\u{e0041}\u{e0042}",
+                "description": "d\u{1b}[2K\u{e0043}\u{200b}"
+            }})),
         ));
     }
     for name in ["storm", "exit", "headers"] {
@@ -195,7 +201,9 @@ async fn call(name: &str, args: &Value, state: &State) -> Value {
             });
             json!({"content": [{"type": "text", "text": "bye"}]})
         }
-        "ctl" => json!({"content": [{"type": "text", "text": "a\u{1b}[2Kb\u{7}c\td\ne"}]}),
+        "ctl" => {
+            json!({"content": [{"type": "text", "text": "a\u{1b}[2Kb\u{7}c\td\ne\u{e0052}\u{115f}\u{e0100}"}]})
+        }
         other => {
             json!({"content": [{"type": "text", "text": format!("no tool {other}")}], "isError": true})
         }
