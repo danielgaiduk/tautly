@@ -157,29 +157,7 @@ impl Session {
             ))
             .await;
         }
-        if let Some(note) = side_note {
-            self.warn(note).await;
-        }
-        self.provider = provider;
-        // MCP tools stay; the next user turn refreshes them as usual.
-        let mcp: Vec<Arc<dyn Tool>> = self
-            .tools
-            .iter()
-            .filter(|t| t.name().starts_with(MCP_TOOL_PREFIX))
-            .cloned()
-            .collect();
-        self.tools = registry(&info.caps, mcp);
-        self.specs = self.tools.iter().map(|t| t.spec(&info.caps)).collect();
-        self.budgets
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .set_model(info.price.is_some(), model.as_str());
-        self.info = info;
-        self.model = model.clone();
-        self.setup.config.model = model.clone();
-        // What the old side model was asked is its own spend; then the new route.
-        self.drain_usage().await;
-        self.side = side;
+        self.install_model(&model, provider, side, side_note).await;
         self.context.strip_reasoning(Some(&label));
         if !same_provider {
             // The learned ratio is the old provider's tokenizer's.
@@ -201,6 +179,82 @@ impl Session {
         .await;
         // An unpriced model with a USD limit is said now.
         self.budget_exhausted().await;
+    }
+
+    /// Put `model` in place with its `provider` and `side` route: capabilities, window,
+    /// tools (MCP tools kept), whether USD budgets apply, and the side model. The context is
+    /// left as it is (the reasoning and the estimator are the caller's).
+    async fn install_model(
+        &mut self,
+        model: &ModelId,
+        provider: Arc<dyn Provider>,
+        side: Side,
+        side_note: Option<String>,
+    ) {
+        if let Some(note) = side_note {
+            self.warn(note).await;
+        }
+        let info = self.setup.catalog.get(model);
+        self.provider = provider;
+        // MCP tools stay; the next user turn refreshes them as usual.
+        let mcp: Vec<Arc<dyn Tool>> = self
+            .tools
+            .iter()
+            .filter(|t| t.name().starts_with(MCP_TOOL_PREFIX))
+            .cloned()
+            .collect();
+        self.tools = registry(&info.caps, mcp);
+        self.specs = self.tools.iter().map(|t| t.spec(&info.caps)).collect();
+        self.budgets
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .set_model(info.price.is_some(), model.as_str());
+        self.info = info;
+        self.model = model.clone();
+        self.setup.config.model = model.clone();
+        // What the old side model was asked is its own spend; then the new route.
+        self.drain_usage().await;
+        self.side = side;
+    }
+
+    /// A resumed session or a fork continues on the model its log ends on (`model`: the
+    /// last `ModelSet` replayed, else the header's), whose `ModelSet` and
+    /// `ReasoningStripped` records the rebuild already applied to the context. Announced
+    /// with `ModelChanged`. When that model cannot be used now (no key, say) the session
+    /// stays on its own model, which is logged as a `ModelSet`, with a `Warning`; the next
+    /// step start strips another provider's reasoning as after any switch. The provider is
+    /// built before the session takes commands, so a keychain prompt holds them.
+    pub(crate) async fn restore_model(&mut self, model: ModelId) {
+        if model == self.model {
+            return;
+        }
+        match self.build_provider(&model).await {
+            Ok((provider, side, side_note)) => {
+                self.install_model(&model, provider, side, side_note).await;
+                self.emit(Event::ModelChanged {
+                    provider: provider_label(&model),
+                    model,
+                })
+                .await;
+            }
+            Err(e) => {
+                let current = self.model.clone();
+                self.warn(format!(
+                    "this session was on {model}, which cannot be used now ({e}); it \
+                     continues on {current}"
+                ))
+                .await;
+                let label = provider_label(&current);
+                if self.context.reasoning_provider.as_deref() != Some(label.as_str()) {
+                    self.context.tokens = TokenEstimator::default();
+                }
+                self.context.strip_reasoning(Some(&label));
+                self.reasoning_retry = false;
+                self.context.force_cold_epoch();
+                self.log(SessionRecord::ModelSet { model: current }).await;
+                self.checkpoint().await;
+            }
+        }
     }
 
     /// The new main provider (wrapped in `Retrying`), the side route for it, and why the

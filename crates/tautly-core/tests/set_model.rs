@@ -1204,3 +1204,174 @@ async fn shutdown_does_not_wait_for_a_slow_provider_build() {
             .any(|r| matches!(r, SessionRecord::ModelSet { .. }))
     );
 }
+
+// ----------------------------------------------------------- resume and fork after a switch
+
+impl Fx {
+    fn resumed(&self, cfg: Config, mock: &MockProvider, id: &str) -> EngineBuilder {
+        EngineBuilder {
+            resume: Some(id.to_string()),
+            ..self.builder(cfg, mock)
+        }
+    }
+}
+
+impl Run {
+    /// Shut down and wait until the engine has stopped (its log is closed).
+    async fn stop(mut self) {
+        self.send(Command::Shutdown).await;
+        let closed =
+            tokio::time::timeout(WAIT, async { while self.events.recv().await.is_some() {} }).await;
+        assert!(closed.is_ok(), "the engine did not stop");
+    }
+}
+
+/// A session resumed after a switch is on the model it switched to, with that model's
+/// tools (`patch` edits) and without the reasoning the switch stripped: its next request
+/// is the one the live session sent.
+#[tokio::test]
+async fn a_resumed_session_continues_on_the_model_it_switched_to() {
+    let script = || {
+        vec![
+            signed_thought("THINK-1", "SIG-1", "answer one"),
+            reply("two"),
+            reply("three"),
+        ]
+    };
+    let live_fx = Fx::new();
+    let live_mock = MockProvider::new(script());
+    let mut live = start(live_fx.builder(config("anthropic/a1"), &live_mock));
+    live.turn_with("one").await;
+    live.set_model("openai/o1").await;
+    live.turn_with("two").await;
+    live.turn_with("three").await;
+    live.stop().await;
+    let expected = live_mock.requests()[2].clone();
+    assert_eq!(expected.model, m("openai/o1"));
+
+    let fx = Fx::new();
+    let mock = MockProvider::new(script());
+    let mut run = start(fx.builder(config("anthropic/a1"), &mock));
+    run.turn_with("one").await;
+    run.set_model("openai/o1").await;
+    run.turn_with("two").await;
+    let id = run.engine.session_id().to_string();
+    run.stop().await;
+
+    let mock = MockProvider::new(vec![reply("three")]);
+    let mut run = start(fx.resumed(config("anthropic/a1"), &mock, &id));
+    let events = run.turn_with("three").await;
+    assert_eq!(
+        finish_reason(&events),
+        FinishReason::Completed,
+        "{events:?}"
+    );
+    let got = &mock.requests()[0];
+    assert_eq!(got.model, expected.model);
+    assert_eq!(edit_required(got), json!(["patch"]));
+    assert_eq!(reasoning_items(got), []);
+    assert_eq!(got.tools, expected.tools);
+    assert_eq!(got.messages, expected.messages);
+    run.stop().await;
+}
+
+/// A resumed session does not send again the reasoning a model refused (`ReasoningStripped`
+/// is replayed where it was logged).
+#[tokio::test]
+async fn a_resumed_session_does_not_resend_the_reasoning_a_model_refused() {
+    let fx = Fx::new();
+    let mock = MockProvider::new(vec![
+        signed_thought("THINK-1", "SIG-1", "answer one"),
+        rejected_reasoning(),
+        reply("two"),
+    ]);
+    let mut run = start(fx.builder(config("anthropic/a1"), &mock));
+    run.turn_with("one").await;
+    run.set_model("anthropic/a2").await;
+    let t2 = run.turn_with("two").await;
+    assert_eq!(finish_reason(&t2), FinishReason::Completed, "{t2:?}");
+    let id = run.engine.session_id().to_string();
+    run.stop().await;
+
+    let mock = MockProvider::new(vec![reply("three")]);
+    let mut run = start(fx.resumed(config("anthropic/a1"), &mock, &id));
+    run.turn_with("three").await;
+    let got = &mock.requests()[0];
+    assert_eq!(got.model, m("anthropic/a2"));
+    assert_eq!(reasoning_items(got), []);
+    let text = serde_json::to_string(&got.messages).unwrap();
+    assert!(
+        text.contains("answer one") && text.contains("two"),
+        "{text}"
+    );
+    run.stop().await;
+}
+
+/// A session resumed right after a switch within one provider (no request since) still
+/// gets the one retry without reasoning.
+#[tokio::test]
+async fn a_session_resumed_right_after_a_switch_still_retries_without_reasoning() {
+    let fx = Fx::new();
+    let mock = MockProvider::new(vec![signed_thought("THINK-1", "SIG-1", "answer one")]);
+    let mut run = start(fx.builder(config("anthropic/a1"), &mock));
+    run.turn_with("one").await;
+    run.set_model("anthropic/a2").await;
+    let id = run.engine.session_id().to_string();
+    run.stop().await;
+
+    let mock = MockProvider::new(vec![rejected_reasoning(), reply("two")]);
+    let mut run = start(fx.resumed(config("anthropic/a1"), &mock, &id));
+    let events = run.turn_with("two").await;
+    assert_eq!(
+        finish_reason(&events),
+        FinishReason::Completed,
+        "{events:?}"
+    );
+    let reqs = mock.requests();
+    assert_eq!(reqs.len(), 2);
+    assert_eq!(reqs[0].model, m("anthropic/a2"));
+    assert_eq!(reasoning_items(&reqs[0]).len(), 1);
+    assert_eq!(reasoning_items(&reqs[1]), []);
+    run.stop().await;
+}
+
+/// A branch cut before a later switch is on the model of its cut, not the session's. (A
+/// switch between turns is part of the cut at the step before it, as step n + 1 was built
+/// after it.)
+#[tokio::test]
+async fn a_fork_before_a_later_switch_is_on_the_model_of_its_cut() {
+    let fx = Fx::new();
+    let mock = MockProvider::new(vec![reply("one"), reply("two"), reply("three")]);
+    let mut run = start(fx.builder(config("anthropic/a1"), &mock));
+    run.turn_with("one").await;
+    run.set_model("openai/o1").await;
+    run.turn_with("two").await;
+    run.set_model("anthropic/a2").await;
+    // Steps: 1 "one", 2 its answer, (switch to o1), 3 "two", 4 its answer, (switch to a2).
+    run.send(Command::Fork {
+        at: Some(2),
+        label: None,
+    })
+    .await;
+    let events = run
+        .until(|e| matches!(e, Event::SessionChanged { .. } | Event::Error { .. }))
+        .await;
+    assert!(
+        matches!(events.last(), Some(Event::SessionChanged { .. })),
+        "{events:?}"
+    );
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            Event::ModelChanged { model, .. } if *model == m("openai/o1")
+        )),
+        "{events:?}"
+    );
+    run.turn_with("three").await;
+    let got = mock.requests().last().unwrap().clone();
+    assert_eq!(got.model, m("openai/o1"));
+    assert_eq!(edit_required(&got), json!(["patch"]));
+    let text = serde_json::to_string(&got.messages).unwrap();
+    assert!(text.contains("one") && !text.contains("two"), "{text}");
+    run.stop().await;
+}

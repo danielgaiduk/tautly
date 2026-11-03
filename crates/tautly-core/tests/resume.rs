@@ -826,6 +826,46 @@ async fn fork_at_tip_keeps_idle_pins_and_budgets() {
     run.stop().await;
 }
 
+/// A fork at the last step takes the commands sent between turns after it as a fork at
+/// the tip does, whatever their order.
+#[tokio::test]
+async fn fork_at_the_last_step_keeps_idle_commands_like_a_fork_at_the_tip() {
+    let fx = Fx::new();
+    let mock = MockProvider::new(vec![text_step("answer one"), text_step("answer two")]);
+    let mut run = start(fx.builder(config(Mode::Ask), &mock));
+    run.turn_with("one").await;
+    run.send(Command::SetBudget {
+        scope: BudgetScope::Session,
+        max_usd: None,
+        max_tokens: Some(250),
+    })
+    .await;
+    run.send(Command::Pin {
+        text: "IDLE-PIN keep it".into(),
+    })
+    .await;
+    let parent = run.engine.session_path().to_path_buf();
+    // The user message is step 1, its answer step 2.
+    let child_id = run.fork(Some(2), "last step").await;
+    let recs = records_at(&log_of(&parent, &child_id));
+    assert!(
+        recs.iter().any(|r| matches!(
+            r,
+            SessionRecord::Command(Command::Pin { text }) if text.starts_with("IDLE-PIN")
+        )),
+        "{recs:?}"
+    );
+    assert!(
+        recs.iter()
+            .any(|r| matches!(r, SessionRecord::Command(Command::SetBudget { .. }))),
+        "{recs:?}"
+    );
+    run.turn_with("two").await;
+    let text = text_of(mock.requests().last().unwrap());
+    assert!(text.contains("IDLE-PIN"), "{text}");
+    run.stop().await;
+}
+
 /// A branch is a new session with nothing spent, even resumed before its first request
 /// (no ledger rows of its own) or without the ledger (its own usage records only).
 #[tokio::test]
@@ -1480,4 +1520,43 @@ async fn undo_refuses_an_earlier_turn_whose_files_later_turns_changed() {
     }
     assert_eq!(fx.read("a.txt").as_deref(), Some("v2\n"));
     // Once turn 2 is undone, turn 1 can be (undo_deletes_files_created_in_turn).
+}
+
+/// A human's mode-only change (the content is still what the turn left) is a change too.
+#[tokio::test]
+async fn undo_refuses_a_mode_only_change() {
+    let fx = Fx::new();
+    let path = two_turns_of_edits(&fx).await;
+    let records = records_at(&path).len();
+    let a = fx.dir.path().join("a.txt");
+    std::fs::set_permissions(&a, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let reader = SessionReader::<SessionRecord>::open(&path).unwrap();
+    match resume::undo(&reader, &fx.sandbox(), None).await {
+        Err(UndoError::Changed { paths }) => assert_eq!(paths, [fx.root().join("a.txt")]),
+        other => panic!("{other:?}"),
+    }
+    let mode = std::fs::metadata(&a).unwrap().permissions().mode();
+    assert_eq!(mode & 0o7777, 0o600);
+    assert_eq!(fx.read("a.txt").as_deref(), Some("v2\n"));
+    assert!(fx.read("run.sh").is_none());
+    assert_eq!(records_at(&path).len(), records);
+}
+
+/// A file already back at the turn's pre-image (reverted by hand) is still recorded as
+/// undone, so the earlier turn that also changed it can be undone next.
+#[tokio::test]
+async fn files_already_back_at_their_pre_image_do_not_block_earlier_undos() {
+    let fx = Fx::new();
+    let path = two_turns_of_edits(&fx).await;
+    fx.write("a.txt", "v1\n");
+    let restored = undo(&fx, &path, Some(2)).await;
+    let root = fx.root();
+    assert_eq!(restored, [root.join("new/made.txt"), root.join("run.sh")]);
+    assert_eq!(fx.read("a.txt").as_deref(), Some("v1\n"));
+    // Turn 1 created a.txt; nothing later stands in the way now.
+    let restored = undo(&fx, &path, Some(1)).await;
+    assert_eq!(restored, [root.join("a.txt")]);
+    assert!(fx.read("a.txt").is_none());
+    // Both undone: nothing is left.
+    assert_eq!(undo(&fx, &path, Some(2)).await, Vec::<PathBuf>::new());
 }

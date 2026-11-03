@@ -20,6 +20,12 @@
 //!   live (at the step's first epoch record, its request, or the turn's end).
 //! - `Forked` (a branch's first own record) starts the spend over: the usage logged
 //!   before it is the parent's.
+//! - `ModelSet` switches the model as the live switch did: it strips another provider's
+//!   reasoning, restarts the estimator's calibration on a change of provider, and arms
+//!   the one retry without reasoning for a switch within one provider; `ReasoningStripped`
+//!   strips all reasoning where the live retry did. A step's `Request` strips reasoning of
+//!   another provider than its model's, as every live step start does. The resumed (or
+//!   forked) session continues on the model the log ends on (`Session::restore_model`).
 //!
 //! `rebuild(reader, Some(n))` stops at the end of step `n` (spec 7.12.1: steps 1..=n kept;
 //! steps are numbered by the context turn counter, so user messages count too). It cuts
@@ -27,7 +33,9 @@
 //! step (its user message, an epoch at its start, its request) is left out. The state at
 //! the cut is what step `n + 1` would be built from, so pins sent during step `n` are in
 //! it (live, they reach the next step start, or the turn's end); a fork's branch closes a
-//! cut turn with `TurnEnd{cancelled}`, which applies them in the same place.
+//! cut turn with `TurnEnd{cancelled}`, which applies them in the same place. For the same
+//! reason what happened between turns after step `n` (commands such as `Pin` and
+//! `SetBudget`, a switch, a manual compaction) is in it, in any order, as at the tip.
 //!
 //! The read tracker is not rebuilt from the log (what it remembers lives in spill files):
 //! a resumed session starts with no re-read baselines, so a re-read returns the full
@@ -40,32 +48,40 @@
 //! (and mode) before it, newest change first, deleting files the turn created, and logs
 //! `Undone` with each file's content just before (H7), so the undone state can be
 //! restored in turn. It never overwrites what it did not write (spec 7.12): a file whose
-//! content differs from what the log says it is now (a human edit, or a command) is
-//! [`UndoError::Changed`], and a file a later turn changed is [`UndoError::LaterTurns`]
-//! until that turn is undone; either way nothing is written.
+//! content or mode differs from what the log says it is now (a human edit or `chmod`, or
+//! a command) is [`UndoError::Changed`], and a file a later turn changed is
+//! [`UndoError::LaterTurns`] until that turn is undone; either way nothing is written. A
+//! file already back at its content before the turn is logged as undone without a write,
+//! so the turns before it can be undone in turn.
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, PoisonError};
+
+use tautly_context::TokenEstimator;
 
 use tautly_context::pinned::{self, PinSource};
 use tautly_context::{
     CompactionRecord, Context, ContextStatus, GcElision, GcRecord, MutationReason, Turn,
 };
 use tautly_provider::{
-    Capabilities, Content, Message, ModelId, RawUsage, Role, ToolSpec, cost_usd,
+    Capabilities, Catalog, Content, Message, ModelId, RawUsage, Role, ToolSpec, cost_usd,
 };
 use tautly_sandbox::{Sandbox, SandboxError};
 use tautly_session::{
     BlobRef, ConfineError, HeaderInit, Origin, RelPath, SessionReader, SessionWriter,
 };
-use tautly_tools::{AppliedEffect, ContextOp, PersistedEffect, ReadTracker, ToolResult};
+use tautly_tools::{
+    AppliedEffect, ContextOp, PersistedEffect, ReadTracker, Tool, ToolResult, registry,
+};
 
 use crate::attempts::AttemptLedger;
 use crate::budget::Budget;
 use crate::dispatch::signature;
 use crate::ledger::{LEDGER_FILE, Ledger};
+use crate::mcp::MCP_TOOL_PREFIX;
 use crate::protocol::{BudgetScope, Command, Event, FinishReason};
+use crate::provider_setup::provider_label;
 use crate::record::{SessionRecord, UndoneFile};
 use crate::session::{PrefixLog, Session};
 use crate::turn::{Response, TurnControl};
@@ -96,8 +112,11 @@ pub struct Rebuilt {
     /// `Fork` itself, a message whose turn has not started) are left out after it. None:
     /// no record is.
     pub(crate) end_offset: Option<u64>,
-    /// The model of the last request.
+    /// The model the log ends on: the last `ModelSet`'s, else the header's.
     pub(crate) model: Option<ModelId>,
+    /// The log ends on a switch within one provider with no request since: the next
+    /// request, if refused for its reasoning, is sent again once without it.
+    pub(crate) reasoning_retry: bool,
     /// What the session last saw of each file: the hash its last read showed or its last
     /// edit wrote.
     pub(crate) seen: HashMap<PathBuf, blake3::Hash>,
@@ -144,8 +163,22 @@ fn list(paths: &[PathBuf]) -> String {
 /// estimator as the live session did (its ratio decides when collection and compaction
 /// run, and how much of the working state is listed).
 pub(crate) struct Calibration {
-    pub caps: Capabilities,
-    pub specs: Vec<ToolSpec>,
+    /// Each request's model's capabilities come from here, as they did live.
+    pub catalog: Arc<Catalog>,
+    /// Tools offered besides the built-in ones (MCP).
+    pub extra: Vec<Arc<dyn Tool>>,
+}
+
+impl Calibration {
+    /// What a request on `model` was assembled with.
+    fn assembly(&self, model: &ModelId) -> (Capabilities, Vec<ToolSpec>) {
+        let caps = self.catalog.get(model).caps;
+        let specs = registry(&caps, self.extra.clone())
+            .iter()
+            .map(|t| t.spec(&caps))
+            .collect();
+        (caps, specs)
+    }
 }
 
 /// The context as it stood at the end of step `until` (None: the end of the log). An
@@ -165,13 +198,17 @@ pub(crate) fn rebuild_with(
     calibration: Option<&Calibration>,
 ) -> Result<Rebuilt, ResumeError> {
     let root = reader.header().root.clone();
+    let model = reader.header().model.clone().map(ModelId::from);
     let mut r = Replay {
         reader,
         until,
         calibration,
+        assemblies: HashMap::new(),
         out: Rebuilt {
             context: Context {
                 root: Some(root.clone()),
+                // As the session started: the history holds its first model's reasoning.
+                reasoning_provider: model.as_ref().map(provider_label),
                 ..Context::default()
             },
             incomplete_turn: false,
@@ -183,7 +220,8 @@ pub(crate) fn rebuild_with(
             budgets: Vec::new(),
             usage: Vec::new(),
             end_offset: None,
-            model: None,
+            model,
+            reasoning_retry: false,
             seen: HashMap::new(),
             start_pins: false,
         },
@@ -244,6 +282,8 @@ struct Replay<'a> {
     reader: &'a SessionReader<SessionRecord>,
     until: Option<u32>,
     calibration: Option<&'a Calibration>,
+    /// What requests were assembled with, per model (with a calibration).
+    assemblies: HashMap<ModelId, (Capabilities, Vec<ToolSpec>)>,
     out: Rebuilt,
     root: PathBuf,
     step: Option<OpenStep>,
@@ -314,6 +354,16 @@ impl Replay<'_> {
                 self.close_step();
                 self.out.usage.clear();
             }
+            SessionRecord::ModelSet { model } => {
+                self.close_step();
+                if self.running && self.beyond() {
+                    return Flow::Stop;
+                }
+                self.apply_pending();
+                self.switch(model);
+            }
+            // The refused request's retry is sent without any reasoning.
+            SessionRecord::ReasoningStripped => self.ctx().strip_reasoning(None),
             SessionRecord::Request { step, model, .. } => {
                 self.close_step();
                 if self.beyond() {
@@ -327,10 +377,19 @@ impl Replay<'_> {
                          may not match the log"
                     ));
                 }
-                let status = self
-                    .calibration
-                    .map(|c| self.out.context.assemble(&c.caps, &c.specs, &model).1);
-                self.out.model = Some(model);
+                // Every step start strips another provider's reasoning, and takes the
+                // switch's retry and forced cold epoch.
+                let ctx = &mut self.out.context;
+                ctx.strip_reasoning(Some(&provider_label(&model)));
+                ctx.cold_epoch_forced = false;
+                self.out.reasoning_retry = false;
+                let status = self.calibration.map(|c| {
+                    let (caps, specs) = self
+                        .assemblies
+                        .entry(model.clone())
+                        .or_insert_with(|| c.assembly(&model));
+                    self.out.context.assemble(caps, specs, &model).1
+                });
                 self.step = Some(OpenStep {
                     number: next,
                     resp: Response::default(),
@@ -348,7 +407,9 @@ impl Replay<'_> {
             | SessionRecord::Uncompacted { .. }
             | SessionRecord::Undone { .. }) => {
                 self.close_step();
-                if self.started && self.beyond() {
+                // An epoch at the start of a step past the cut; one between turns (or
+                // before the first) is part of the cut.
+                if self.running && self.beyond() {
                     return Flow::Stop;
                 }
                 self.apply_pending();
@@ -361,8 +422,6 @@ impl Replay<'_> {
             | SessionRecord::CheckpointSkipped { .. }
             | SessionRecord::Labeled { .. }
             | SessionRecord::EngineError { .. }
-            | SessionRecord::ModelSet { .. }
-            | SessionRecord::ReasoningStripped
             | SessionRecord::Unknown => {}
         }
         Flow::Go
@@ -386,16 +445,28 @@ impl Replay<'_> {
             cmd @ (Command::Pin { .. } | Command::Unpin { .. }) if self.running => {
                 self.pending.push(cmd);
             }
+            // Sent between turns: part of what the next step is built from.
             cmd @ (Command::Pin { .. } | Command::Unpin { .. }) => {
                 self.close_step();
-                if self.started && self.beyond() {
-                    return Flow::Stop;
-                }
                 context_command(self.ctx(), cmd);
             }
             _ => return Flow::Skip,
         }
         Flow::Go
+    }
+
+    /// A `ModelSet`, as `Session::set_model` changed the context.
+    fn switch(&mut self, model: ModelId) {
+        let label = provider_label(&model);
+        let same_provider = self.out.model.as_ref().map(provider_label) == Some(label.clone());
+        let ctx = &mut self.out.context;
+        ctx.strip_reasoning(Some(&label));
+        if !same_provider {
+            ctx.tokens = TokenEstimator::default();
+        }
+        ctx.force_cold_epoch();
+        self.out.reasoning_retry = same_provider;
+        self.out.model = Some(model);
     }
 
     fn apply_pending(&mut self) {
@@ -778,6 +849,8 @@ pub enum OpenError {
 
 /// What a resumed session still has to do once it took the rebuilt state.
 pub(crate) struct Resumed {
+    /// The model the log ends on.
+    model: Option<ModelId>,
     prefix: Option<SessionRecord>,
     usage: Vec<RawUsage>,
     seen: HashMap<PathBuf, blake3::Hash>,
@@ -794,10 +867,7 @@ impl Session {
     pub(crate) async fn resume(&mut self, config_pins: &[String]) -> Result<(), String> {
         let path = self.log.path();
         let log = self.log.clone();
-        let calibration = Calibration {
-            caps: self.info.caps.clone(),
-            specs: self.specs.clone(),
-        };
+        let calibration = self.calibration();
         let (rebuilt, closed) = tokio::task::spawn_blocking(move || -> Result<_, String> {
             let reader = SessionReader::<SessionRecord>::open(&path).map_err(err)?;
             let rebuilt = rebuild_with(&reader, None, Some(&calibration)).map_err(err)?;
@@ -818,12 +888,30 @@ impl Session {
         if let Some(failure) = closed {
             self.report(failure).await;
         }
-        let resumed = self.adopt(rebuilt);
+        let mut resumed = self.adopt(rebuilt);
+        if let Some(model) = resumed.model.take() {
+            self.restore_model(model).await;
+        }
         self.resume_start(resumed, config_pins).await;
         Ok(())
     }
 
-    /// Take the state `r` rebuilt (a resume or a fork) in place of the session's own. The
+    /// What a rebuild calibrates the estimator with: this session's catalog and its MCP
+    /// tools.
+    fn calibration(&self) -> Calibration {
+        Calibration {
+            catalog: Arc::clone(&self.setup.catalog),
+            extra: self
+                .tools
+                .iter()
+                .filter(|t| t.name().starts_with(MCP_TOOL_PREFIX))
+                .cloned()
+                .collect(),
+        }
+    }
+
+    /// Take the state `r` rebuilt (a resume or a fork) in place of the session's own (the
+    /// model it ends on is the caller's: [`restore_model`](Self::restore_model)). The
     /// read tracker starts fresh. Without a logged prefix (no request was sent yet) the
     /// session keeps its own AGENTS.md text and repo map.
     pub(crate) fn adopt(&mut self, r: Rebuilt) -> Resumed {
@@ -842,9 +930,7 @@ impl Session {
         if let Some(p) = r.prefix.clone() {
             self.prefix_log.logged(p);
         }
-        if let Some(m) = &r.model {
-            self.context.reasoning_provider = Some(crate::provider_setup::provider_label(m));
-        }
+        self.reasoning_retry = r.reasoning_retry;
         self.reads = Arc::new(ReadTracker::default());
         self.evidence = self.evidence.fresh();
         {
@@ -854,6 +940,7 @@ impl Session {
             }
         }
         Resumed {
+            model: r.model,
             prefix: r.prefix,
             usage: r.usage,
             seen: r.seen,
@@ -1004,10 +1091,7 @@ impl Session {
             origin: Origin::Fork,
             ..self.header_init.clone()
         };
-        let calibration = Calibration {
-            caps: self.info.caps.clone(),
-            specs: self.specs.clone(),
-        };
+        let calibration = self.calibration();
         let made = tokio::task::spawn_blocking(move || -> Result<_, String> {
             let parent = SessionReader::<SessionRecord>::open(&parent_path).map_err(err)?;
             let cut = rebuild(&parent, at).map_err(err)?;
@@ -1018,8 +1102,10 @@ impl Session {
                  that point"
                     .to_string()
             })?;
+            // The branch's records start from the parent's first model.
             let init = HeaderInit {
                 parent: Some((parent_id, end)),
+                model: parent.header().model.clone(),
                 ..init
             };
             let child = branch(
@@ -1055,9 +1141,12 @@ impl Session {
             .unwrap_or_else(PoisonError::into_inner)
             .without_spend();
         *self.budgets.lock().unwrap_or_else(PoisonError::into_inner) = fresh;
-        let resumed = self.adopt(rebuilt);
-        for w in resumed.warnings {
+        let mut resumed = self.adopt(rebuilt);
+        for w in std::mem::take(&mut resumed.warnings) {
             self.warn(format!("fork: {w}")).await;
+        }
+        if let Some(model) = resumed.model {
+            self.restore_model(model).await;
         }
         Ok((id, path))
     }
@@ -1216,12 +1305,14 @@ fn discard(child: SessionWriter<SessionRecord>) {
 }
 
 /// One file to undo: its log path, what it is restored to (none: deleted), and what the
-/// log says its content is now (blake3 hex; none: absent).
+/// log says its content is now (blake3 hex; none: absent) and its mode (none: unknown, as
+/// for a file a tool created).
 struct Target {
     path: RelPath,
     pre: Option<BlobRef>,
     mode: Option<u32>,
     tip: Option<String>,
+    tip_mode: Option<u32>,
 }
 
 /// Undo the file changes Tautly's tools made in user turn `turn` (default: the last one
@@ -1229,15 +1320,18 @@ struct Target {
 /// turn's first change of it, newest change first; a file the turn created is deleted.
 /// Each file's content just before the undo is stored as a blob first, and the undo is
 /// logged as `Undone`, so it can itself be reverted. Changes made by commands are not
-/// undone. Returns the paths changed (none: nothing was left to undo, and nothing is
-/// logged).
+/// undone. A file already as it was before the turn (reverted by hand, say) is not written
+/// but is listed in `Undone` too, so earlier turns that changed it can be undone next.
+/// Returns the paths written (none: nothing needed a write; nothing is logged when nothing
+/// was left to undo either).
 ///
 /// Nothing the undo did not write is overwritten (spec 7.12), and every check comes before
 /// the first write, so a refusal writes nothing:
 /// - [`UndoError::LaterTurns`]: a later turn changed one of the files and is not undone;
 ///   undo the later turns first (newest first).
-/// - [`UndoError::Changed`]: a file's content is not what the log says the session left
-///   it at (the last tool edit or delete, or undo, of it): a human edit, or a command.
+/// - [`UndoError::Changed`]: a file's content or mode is not what the log says the session
+///   left it at (the last tool edit or delete, or undo, of it): a human edit or `chmod`, or
+///   a command. (Tools keep a file's mode, so an edit leaves the mode it found.)
 ///
 /// The log is reopened for writing, so the session must not be running in an engine
 /// ([`tautly_session::Error::AlreadyOpen`]). Blocking file I/O on the log.
@@ -1265,6 +1359,7 @@ pub async fn undo(
     };
     // First what every file is now, checked against what the session left it at.
     let mut planned = Vec::with_capacity(plan.targets.len());
+    let mut already = Vec::new();
     let mut changed = Vec::new();
     for t in plan.targets {
         let full = t.path.resolve(sandbox.root())?;
@@ -1286,10 +1381,20 @@ pub async fn undo(
         };
         let to = t.pre.as_ref().map(|b| reader.read_blob(b)).transpose()?;
         if now == to && (to.is_none() || now_mode == t.mode) {
+            // Nothing to write; logged as undone all the same (its content is the blob
+            // it is restored to).
+            already.push(UndoneFile {
+                path: t.path,
+                from_blob: t.pre.clone(),
+                from_mode: now_mode,
+                to_mode: to.as_ref().and(t.mode),
+                to: t.pre,
+            });
             continue;
         }
         let now_hash = now.as_deref().map(|b| blake3::hash(b).to_hex().to_string());
-        if now_hash != t.tip && now != to {
+        let mode_kept = now.is_none() || t.tip_mode.is_none() || now_mode == t.tip_mode;
+        if now_hash != t.tip || !mode_kept {
             changed.push(full);
             continue;
         }
@@ -1299,7 +1404,7 @@ pub async fn undo(
         changed.sort();
         return Err(UndoError::Changed { paths: changed });
     }
-    if planned.is_empty() {
+    if planned.is_empty() && already.is_empty() {
         return Ok(Vec::new());
     }
     // Then their current content, as blobs.
@@ -1308,7 +1413,7 @@ pub async fn undo(
         let from_blob = now.as_deref().map(|b| writer.blob(b)).transpose()?;
         blobbed.push((t, full, to, from_blob, now_mode));
     }
-    let mut files = Vec::with_capacity(blobbed.len());
+    let mut files = already;
     let mut done = Vec::with_capacity(blobbed.len());
     let mut failed = None;
     for (t, full, to, from_blob, from_mode) in blobbed {
@@ -1362,9 +1467,9 @@ fn undo_plan(
     let mut turns = 0u32;
     // Per user turn: each path's earliest pre-image, in order of its latest change.
     let mut changes: HashMap<u32, Vec<Target>> = HashMap::new();
-    // Per path: its content as the session last left it, and the turns that changed it
-    // (in order), less those an undo reverted.
-    let mut tips: HashMap<RelPath, Option<String>> = HashMap::new();
+    // Per path: its content (and mode, if known) as the session last left it, and the
+    // turns that changed it (in order), less those an undo reverted.
+    let mut tips: HashMap<RelPath, (Option<String>, Option<u32>)> = HashMap::new();
     let mut changed_in: HashMap<RelPath, Vec<u32>> = HashMap::new();
     for rec in reader.records() {
         match rec?.1 {
@@ -1374,6 +1479,8 @@ fn undo_plan(
             }
             SessionRecord::ToolResult { effects, .. } => {
                 for e in effects {
+                    // An edit keeps the mode it found (none: it created the file, whose
+                    // mode is not logged).
                     let (path, pre, mode, tip) = match e {
                         PersistedEffect::Edited {
                             path,
@@ -1385,13 +1492,13 @@ fn undo_plan(
                             path,
                             pre_image_blob,
                             pre_mode,
-                            Some(post_hash.to_hex().to_string()),
+                            (Some(post_hash.to_hex().to_string()), pre_mode),
                         ),
                         PersistedEffect::Deleted {
                             path,
                             pre_image_blob,
                             pre_mode,
-                        } => (path, Some(pre_image_blob), Some(pre_mode), None),
+                        } => (path, Some(pre_image_blob), Some(pre_mode), (None, None)),
                         _ => continue,
                     };
                     let pre = pre.map(|b| BlobRef::parse(&b)).transpose()?;
@@ -1408,6 +1515,7 @@ fn undo_plan(
                             pre,
                             mode,
                             tip: None,
+                            tip_mode: None,
                         },
                     };
                     list.push(first);
@@ -1416,7 +1524,10 @@ fn undo_plan(
             SessionRecord::Undone { turn, files, .. } => {
                 for f in files {
                     // A blob reference is the blake3 hex of its content.
-                    tips.insert(f.path.clone(), f.to.map(|b| b.as_str().to_string()));
+                    tips.insert(
+                        f.path.clone(),
+                        (f.to.map(|b| b.as_str().to_string()), f.to_mode),
+                    );
                     if let Some(by) = changed_in.get_mut(&f.path) {
                         by.retain(|&t| t != turn);
                     }
@@ -1437,7 +1548,7 @@ fn undo_plan(
     let mut later = Vec::new();
     let mut later_turns = Vec::new();
     for t in &mut targets {
-        t.tip = tips.get(&t.path).cloned().flatten();
+        (t.tip, t.tip_mode) = tips.get(&t.path).cloned().unwrap_or_default();
         let after: Vec<u32> = changed_in
             .get(&t.path)
             .into_iter()
