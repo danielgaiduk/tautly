@@ -9,8 +9,12 @@ license.workspace = true
 [dependencies]
 hx-provider = { path = "../hx-provider" }
 hx-tools = { path = "../hx-tools" }
+hx-index = { path = "../hx-index" }
+toml.workspace = true
+serde_json.workspace = true
 
 [dev-dependencies]
-serde_json.workspace = true
+hx-sandbox = { path = "../hx-sandbox" }
+tokio.workspace = true
 blake3.workspace = true
 tempfile.workspace = true

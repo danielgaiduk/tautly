@@ -63,7 +63,7 @@ hx-cli        binary: arg parsing, selects TUI or headless mode
      ├─ hx-session    append-only session log, resume, fork, undo
      └─ hx-sandbox    Sandbox trait; this sub-project ships a passthrough-with-policy stub
 ```
-Dependencies only point downward (`hx-tools → hx-memory → {hx-index, hx-session}`, `hx-index → hx-sandbox`, `hx-tools → hx-sandbox`, `hx-context → {hx-provider, hx-tools}`). Each crate is independently testable.
+Dependencies only point downward (`hx-tools → hx-memory → {hx-index, hx-session}`, `hx-index → hx-sandbox`, `hx-tools → hx-sandbox`, `hx-context → {hx-provider, hx-tools, hx-index}`). Each crate is independently testable.
 
 ### 2.2 Rules
 - **Single entry point:** `hx-core` exposes an `Engine` handle. Clients send `Command`s and receive a stream of `Event`s. TUI and RPC are both plain consumers, guaranteeing identical behavior.

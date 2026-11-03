@@ -1,5 +1,5 @@
 //! Request assembly in the fixed block order: system prompt, tools, AGENTS.md, memory index,
-//! then pinned and history as messages, and the working state as a tail message.
+//! repo map, then pinned and history as messages, and the working state as a tail message.
 
 use hx_provider::{
     Block, CachePoint, CacheStyle, CanonicalRequest, Capabilities, Content, Message, ModelId, Role,
@@ -10,9 +10,9 @@ use crate::blocks::{Breakdown, ContextStatus, message_tokens};
 use crate::{Context, pinned, prompt};
 
 /// Leading `system` blocks that form the cache-stable prefix: system prompt, AGENTS.md,
-/// memory index. Tools travel in `CanonicalRequest.tools`; pinned items follow as the first
+/// memory index, repo map. Tools travel in `CanonicalRequest.tools`; pinned items follow as the first
 /// user content and the working state as a tail message after the history, never in `system`.
-pub const STABLE_LEN: usize = 3;
+pub const STABLE_LEN: usize = 4;
 
 /// Pinned text above this share of the window triggers a warning.
 const PINNED_WARN_PERCENT: u64 = 10;
@@ -28,11 +28,12 @@ impl Context {
     ) -> (CanonicalRequest, ContextStatus) {
         let est = &self.tokens;
 
-        // Stable prefix. Absent AGENTS.md / memory still occupy their slot (an empty tag), so
+        // Stable prefix. Absent AGENTS.md / memory / repo map still occupy their slot (an empty tag), so
         // the prefix has a fixed length and shape.
         let system_text = prompt::system();
         let agents_text = tagged("agents_md", self.agents_md.as_deref());
         let memory_text = tagged("memory_index", self.memory_index.as_deref());
+        let repo_map_text = tagged("repo_map", self.repo_map.as_deref());
 
         // Fixed tool order keeps the serialized prefix byte-stable whatever order the caller
         // collected the tools in.
@@ -115,6 +116,7 @@ impl Context {
             tools: tools_tokens,
             agents_md: est.estimate(&agents_text),
             memory: est.estimate(&memory_text),
+            repo_map: est.estimate(&repo_map_text),
             pinned: tokens_of(&pinned_text),
             state: tokens_of(&state_text),
             history: history_tokens,
@@ -141,6 +143,7 @@ impl Context {
                 Block::Text(system_text.to_string()),
                 Block::Text(agents_text),
                 Block::Text(memory_text),
+                Block::Text(repo_map_text),
             ],
             tools,
             messages,

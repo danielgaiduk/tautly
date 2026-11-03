@@ -86,6 +86,7 @@ fn block_order_is_system_tools_agents_memory_pinned_history_state() {
     assert!(text_of(&req.system[0]).starts_with("You are hx"));
     assert!(text_of(&req.system[1]).contains("Use tabs."));
     assert!(text_of(&req.system[2]).contains("m1: a fact"));
+    assert_eq!(text_of(&req.system[3]), "<repo_map></repo_map>");
     // Tools travel in the tools field, sorted by name for a fixed order.
     let names: Vec<&str> = req.tools.iter().map(|t| t.name.as_str()).collect();
     assert_eq!(names, ["bash", "edit", "read"]);
@@ -225,7 +226,7 @@ fn breakdown_sums_to_used() {
     let b = st.breakdown;
     assert_eq!(
         st.used,
-        b.system + b.tools + b.agents_md + b.memory + b.pinned + b.state + b.history
+        b.system + b.tools + b.agents_md + b.memory + b.repo_map + b.pinned + b.state + b.history
     );
     assert_eq!(st.budget, 100_000);
     for part in [
@@ -233,6 +234,7 @@ fn breakdown_sums_to_used() {
         b.tools,
         b.agents_md,
         b.memory,
+        b.repo_map,
         b.pinned,
         b.state,
         b.history,

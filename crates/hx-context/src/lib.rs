@@ -6,6 +6,7 @@ pub mod assemble;
 pub mod blocks;
 pub mod pinned;
 pub mod prompt;
+pub mod repo_map;
 pub mod state;
 pub mod tokens;
 
@@ -28,6 +29,9 @@ pub struct Context {
     pub agents_md: Option<String>,
     /// Set by the engine from the memory store; rendered in the stable prefix after AGENTS.md.
     pub memory_index: Option<String>,
+    /// Generated once at session start ([`Context::init_repo_map`]) and never rebuilt, so
+    /// the cached prefix stays byte-stable; rendered after the memory index.
+    pub repo_map: Option<String>,
     pub tokens: TokenEstimator,
     /// Project root; file paths in the working state are displayed relative to it.
     pub root: Option<PathBuf>,
@@ -53,6 +57,14 @@ impl Context {
     pub fn calibrate(&mut self, estimated: u32, actual: u64) {
         let flat = self.flat_tokens();
         self.tokens.calibrate_excluding(estimated, actual, flat);
+    }
+
+    /// Build the repo map from `index` and keep it for the rest of the session. The engine
+    /// calls this once at session start, off the startup path (see [`repo_map::build`]);
+    /// [`Context::assemble`] only renders the stored text and never rebuilds it.
+    pub fn init_repo_map(&mut self, index: &hx_index::Index) {
+        let map = repo_map::build(index, &self.tokens, repo_map::BUDGET);
+        self.repo_map = Some(map).filter(|m| !m.is_empty());
     }
 
     /// Apply a `pin` or `state` tool call.

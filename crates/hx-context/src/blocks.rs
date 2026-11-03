@@ -19,6 +19,7 @@ pub struct Breakdown {
     pub tools: u32,
     pub agents_md: u32,
     pub memory: u32,
+    pub repo_map: u32,
     pub pinned: u32,
     pub state: u32,
     pub history: u32,
@@ -30,6 +31,7 @@ impl Breakdown {
             + self.tools
             + self.agents_md
             + self.memory
+            + self.repo_map
             + self.pinned
             + self.state
             + self.history

@@ -615,10 +615,14 @@ name = "hx-context"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "hx-index",
  "hx-provider",
+ "hx-sandbox",
  "hx-tools",
  "serde_json",
  "tempfile",
+ "tokio",
+ "toml",
 ]
 
 [[package]]
