@@ -81,13 +81,25 @@ pub async fn cap_output(full: &str, cap: usize, sb: &dyn Sandbox) -> (String, Op
 
 /// The filtered summary of `full` when `command` ends in a recognized tool and its
 /// output is large enough and parseable. The complete output is spilled and named in
-/// the summary; `None` when any of that does not hold (including a failed spill).
-async fn filtered_output(command: &str, full: &str, sb: &dyn Sandbox) -> Option<String> {
+/// the summary. `None` (use the plain cap) when any of that does not hold, when the
+/// run was cut short (`exit_code` is `None`: killed, timed out or cancelled, so the
+/// output is partial), or when the command failed but the summary shows no failure
+/// or error (the parser missed what went wrong).
+async fn filtered_output(
+    command: &str,
+    full: &str,
+    exit_code: Option<i32>,
+    sb: &dyn Sandbox,
+) -> Option<String> {
+    let code = exit_code?;
     if full.len() <= FILTER_THRESHOLD {
         return None;
     }
     let cmds = parse_commands(command).ok()?;
     let summary = filters::apply(filters::detect(&cmds)?, full)?;
+    if code != 0 && summary.failed + summary.errors == 0 {
+        return None;
+    }
     let spill = sb.spill(full.as_bytes()).await.ok()?;
     Some(cap_text(&summary.render(&spill), OUTPUT_CAP).0)
 }
@@ -319,16 +331,16 @@ impl Tool for BashTool {
             }
         }
 
-        let (is_error, trailer) = match outcome {
+        let (is_error, trailer, exit_code) = match outcome {
             Outcome::Exited(s) => {
                 let code = s.code().unwrap_or_else(|| {
                     use std::os::unix::process::ExitStatusExt;
                     128 + s.signal().unwrap_or(0)
                 });
-                (code != 0, format!("exit code: {code}"))
+                (code != 0, format!("exit code: {code}"), Some(code))
             }
-            Outcome::TimedOut => (true, format!("killed: timed out after {timeout_s}s")),
-            Outcome::Cancelled => (true, "killed: cancelled".to_string()),
+            Outcome::TimedOut => (true, format!("killed: timed out after {timeout_s}s"), None),
+            Outcome::Cancelled => (true, "killed: cancelled".to_string(), None),
         };
         // Stop the readers now (a background child may still hold the pipes) and
         // release what is in flight.
@@ -341,7 +353,7 @@ impl Tool for BashTool {
         let filtered = if a.raw == Some(true) {
             None
         } else {
-            filtered_output(&a.command, &full, sb).await
+            filtered_output(&a.command, &full, exit_code, sb).await
         };
         // A summary already names the spilled file; otherwise the cap spills when it cuts.
         let (mut text, spilled) = match filtered {

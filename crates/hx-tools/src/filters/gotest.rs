@@ -16,6 +16,12 @@ pub(super) fn parse(output: &str) -> Option<Summary> {
     // The test whose log lines are being read; `None` outside of tests.
     let mut current: Option<String> = None;
     let mut in_panic = false;
+    // Unattributed output since the last package result, and the number of failures
+    // known at that point: a `FAIL pkg` line that adds none has a cause no test names
+    // (`log.Fatal`, `os.Exit`, a setup failure).
+    let mut stray: Vec<String> = Vec::new();
+    let mut known_at_last_pkg = 0;
+    let mut package_errors: Vec<Item> = Vec::new();
 
     for line in output.lines() {
         if let Some(c) = re!(r"^\s*=== (?:RUN|NAME|CONT|PAUSE)\s+(\S+)").captures(line) {
@@ -49,6 +55,24 @@ pub(super) fn parse(output: &str) -> Option<Summary> {
             package_lines += 1;
             current = None;
             in_panic = false;
+            if line.starts_with("exit status") {
+                continue;
+            }
+            let known = failed_names.len() + build_errors.len() + usize::from(panic_item.is_some());
+            if let Some(c) = re!(r"^FAIL\s+(\S+)").captures(line)
+                && known == known_at_last_pkg
+            {
+                package_errors.push(Item::new(
+                    "package",
+                    None,
+                    format!("{} failed", &c[1]),
+                    std::mem::take(&mut stray),
+                ));
+            }
+            if re!(r"^(?:FAIL|ok)\s").is_match(line) {
+                known_at_last_pkg = known;
+                stray.clear();
+            }
         } else if line.starts_with([' ', '\t']) && !line.trim().is_empty() {
             if in_panic {
                 panic_detail.push(line.trim_start().to_string());
@@ -61,6 +85,7 @@ pub(super) fn parse(output: &str) -> Option<Summary> {
             panic_detail.push(line.to_string());
         } else {
             current = None;
+            stray.push(line.to_string());
         }
     }
 
@@ -75,8 +100,9 @@ pub(super) fn parse(output: &str) -> Option<Summary> {
         .map(|name| failure_item(name, logs.get(name).map_or(&[][..], Vec::as_slice)))
         .collect();
     let failed = items.len() as u32;
-    let mut errors = build_errors.len() as u32;
+    let mut errors = (build_errors.len() + package_errors.len()) as u32;
     items.extend(build_errors);
+    items.extend(package_errors);
     if let Some(mut p) = panic_item {
         p.detail = Item::new("", None, "", panic_detail).detail;
         errors += 1;

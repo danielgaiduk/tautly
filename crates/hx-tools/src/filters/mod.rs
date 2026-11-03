@@ -124,11 +124,16 @@ impl Summary {
     }
 }
 
-/// The filter for the command that produced the output, if any. Only the last
-/// command of the line counts: anything after the tool (a pipe into `tail`, a
-/// trailing `echo`) changes what the output is.
+/// The filter for the command that produced the output, if any. The last command
+/// of the line must be the tool (anything after it, such as a pipe into `tail` or a
+/// trailing `echo`, changes what the output is), and no other recognized tool of a
+/// different kind may appear, since its output would go through the wrong parser.
 pub fn detect(cmds: &[SimpleCommand]) -> Option<FilterKind> {
-    tool_kind(&cmds.last()?.argv)
+    let kind = tool_kind(&cmds.last()?.argv)?;
+    cmds.iter()
+        .filter_map(|c| tool_kind(&c.argv))
+        .all(|k| k == kind)
+        .then_some(kind)
 }
 
 fn base(word: &str) -> &str {
@@ -210,17 +215,21 @@ fn python_module(args: &[String]) -> Option<FilterKind> {
     None
 }
 
-/// Parse `output`; `None` when it has no recognizable counts or items.
+/// Parse `output`; `None` when it has no recognizable counts or items, or when the
+/// items found do not account for the failures and errors counted (the summary
+/// would hide some).
 pub fn apply(kind: FilterKind, output: &str) -> Option<Summary> {
     let output = strip_ansi(output);
-    match kind {
+    let summary = match kind {
         FilterKind::Cargo => cargo::parse(&output),
         FilterKind::Pytest => pytest::parse(&output),
         FilterKind::Jest => jest::parse(&output),
         FilterKind::GoTest => gotest::parse(&output),
         FilterKind::Tsc => tsc::parse(&output),
         FilterKind::Eslint => eslint::parse(&output),
-    }
+    }?;
+    let reported = u64::from(summary.failed) + u64::from(summary.errors);
+    (summary.items.len() as u64 >= reported).then_some(summary)
 }
 
 fn strip_ansi(s: &str) -> Cow<'_, str> {

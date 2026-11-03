@@ -63,8 +63,13 @@ fn detects_common_invocations() {
         // Only the last command of the line is filtered; a pipe hides the tool.
         ("cd web && npx jest", Some(Jest)),
         ("cargo test && cargo clippy", Some(Cargo)),
-        ("cargo test && pytest", Some(Pytest)),
-        ("pytest && cargo build", Some(Cargo)),
+        // Output of different tools would be parsed by one parser: no filter.
+        ("cargo test && pytest", None),
+        ("pytest && cargo build", None),
+        ("pytest; eslint .", None),
+        ("cargo test; tsc", None),
+        ("cargo test || npx tsc --noEmit", None),
+        ("cargo test && cargo clippy", Some(Cargo)),
         ("cargo test 2>&1 | tail -n 20", None),
         ("cargo test | tee out.log", None),
         ("cargo test; echo done", None),
@@ -552,4 +557,110 @@ async fn piped_output_is_not_filtered() {
     )
     .await;
     assert!(r.output.starts_with(CARGO_TEST_FAIL), "{}", r.output);
+}
+
+// ---- a filter must never hide a failure ---------------------------------------
+
+#[test]
+fn cargo_aborted_test_binary_counts_as_error() {
+    let out = "     Running unittests src/lib.rs (target/debug/deps/x-1)\n\nrunning 3 tests\ntest a ... ok\ntest b ... ok\ntest c ... ok\n\ntest result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n     Running tests/db.rs (target/debug/deps/db-2)\n\nrunning 2 tests\ntest db::connects ... ok\nerror: test failed, to rerun pass `-p x --test db`\n\nCaused by:\n  process didn't exit successfully: `/w/target/debug/deps/db-2` (signal: 6, SIGABRT: process abort signal)\n";
+    let s = apply(FilterKind::Cargo, out).expect("parsed");
+    assert_eq!(counts(&s), (Some(3), 0, 1, 0), "{s:?}");
+    assert!(first(&s).message.contains("SIGABRT"), "{s:?}");
+    // Older cargo prints it as an `error:` header; still one error.
+    let old = out.replace("Caused by:\n  process", "error: process");
+    assert_eq!(apply(FilterKind::Cargo, &old).unwrap().errors, 1);
+}
+
+#[test]
+fn go_package_failure_without_failing_test_counts_as_error() {
+    let out = "ok  \texample.com/proj/lex\t0.002s\n2024/05/01 10:00:00 fatal: cannot open db\nexit status 1\nFAIL\texample.com/proj/db\t0.012s\nFAIL\n";
+    let s = apply(FilterKind::GoTest, out).expect("parsed");
+    assert_eq!((s.failed, s.errors), (0, 1), "{s:?}");
+    assert!(first(&s).message.contains("example.com/proj/db"));
+    assert!(
+        first(&s)
+            .detail
+            .iter()
+            .any(|l| l.contains("cannot open db"))
+    );
+    // A package whose failure is explained by a failing test is not double counted.
+    let s = apply(FilterKind::GoTest, GOTEST_FAIL).unwrap();
+    assert_eq!((s.failed, s.errors), (5, 0));
+}
+
+#[test]
+fn vitest_unhandled_errors_count_as_errors() {
+    let out = "\n RUN  v2.1.8 /home/dev/proj\n\n \u{2713} src/a.test.ts (3 tests) 4ms\n\n\
+         \u{23af}\u{23af}\u{23af}\u{23af}\u{23af}\u{23af} Unhandled Errors \u{23af}\u{23af}\u{23af}\u{23af}\u{23af}\u{23af}\n\n\
+         Vitest caught 1 unhandled error during the test run.\n\n\
+         \u{23af}\u{23af}\u{23af}\u{23af}\u{23af}\u{23af} Unhandled Rejection \u{23af}\u{23af}\u{23af}\u{23af}\u{23af}\u{23af}\n\
+         Error: boom\n \u{276f} src/x.ts:3:9\n\
+         This error originated in \"src/a.test.ts\" test file.\n\
+         \u{23af}\u{23af}\u{23af}\u{23af}\u{23af}\u{23af}\u{23af}\u{23af}\u{23af}\u{23af}\u{23af}\u{23af}\u{23af}\u{23af}\u{23af}\n\n\
+          Test Files  1 passed (1)\n      Tests  3 passed (3)\n     Errors  1 error\n   Duration  412ms\n";
+    let s = apply(FilterKind::Jest, out).expect("parsed");
+    assert_eq!(s.tool, "vitest");
+    assert_eq!(counts(&s), (Some(3), 0, 1, 0), "{s:?}");
+    assert_eq!(first(&s).message, "Error: boom");
+    assert_eq!(first(&s).location.as_deref(), Some("src/x.ts:3:9"));
+}
+
+#[test]
+fn pytest_ids_with_spaces_are_kept() {
+    let out = "=========================== short test summary info ============================\n\
+               FAILED tests/t.py::test_p[hello world] - assert 1 == 2\n\
+               FAILED tests/t.py::test_q[a - b] - KeyError: 'x'\n\
+               ERROR tests/t.py::test_r[x y]\n\
+               ============= 2 failed, 1 passed, 1 error in 0.10s =============\n";
+    let s = apply(FilterKind::Pytest, out).expect("parsed");
+    assert_eq!(counts(&s), (Some(1), 2, 1, 0));
+    assert_eq!(s.items.len(), 3);
+    assert_eq!(first(&s).name, "tests/t.py::test_p[hello world]");
+    assert_eq!(first(&s).message, "assert 1 == 2");
+}
+
+#[test]
+fn fewer_items_than_reported_failures_gives_no_summary() {
+    let out = "=========================== short test summary info ============================\n\
+               FAILED tests/t.py::test_a - assert 1 == 2\n\
+               FAILED tests/t.py::test_b - assert 2 == 3\n\
+               ============= 3 failed, 1 passed in 0.10s =============\n";
+    assert_eq!(apply(FilterKind::Pytest, out), None);
+}
+
+#[tokio::test]
+async fn failed_command_with_clean_summary_keeps_plain_output() {
+    // Only warnings parsed, but the command failed: something the parser missed.
+    let cmd = "cargo() { cat out.txt; return 101; }; cargo clippy";
+    let (_dir, r) = run(CLIPPY_WARN, cmd, None).await;
+    assert!(r.is_error);
+    assert!(r.output.starts_with(CLIPPY_WARN), "{}", r.output);
+    assert!(!r.output.contains("summary:"), "{}", r.output);
+    // The same output from a successful command is summarized.
+    let (_dir, r) = run(CLIPPY_WARN, "cargo() { cat out.txt; }; cargo clippy", None).await;
+    assert!(
+        r.output
+            .starts_with("cargo summary: 0 failed, 0 errors, 4 warnings")
+    );
+    // A failed command whose summary shows the failure is still summarized.
+    let cmd = "cargo() { cat out.txt; return 101; }; cargo test";
+    let (_dir, r) = run(CARGO_TEST_FAIL, cmd, None).await;
+    assert!(r.output.starts_with("cargo summary:"), "{}", r.output);
+}
+
+#[tokio::test]
+async fn timed_out_command_is_not_filtered() {
+    let cmd = "cargo() { cat out.txt; sleep 30; }; cargo test";
+    let dir = TempDir::new().unwrap();
+    std::fs::write(dir.path().join("out.txt"), CARGO_TEST_FAIL).unwrap();
+    let sb = LocalSandbox::new(dir.path().to_path_buf()).unwrap();
+    let cx = ToolCx::new(EditFormat::StrReplace, dir.path().join(".spill"));
+    let r = BashTool
+        .run(json!({ "command": cmd, "timeout_s": 1 }), &sb, &cx)
+        .await;
+    assert!(r.is_error);
+    assert!(!r.output.contains("summary:"), "{}", r.output);
+    assert!(r.output.contains("rust_begin_unwind"), "{}", r.output);
+    assert!(r.output.contains("timed out"), "{}", r.output);
 }

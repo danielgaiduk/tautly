@@ -14,6 +14,8 @@ fn is_noise(message: &str) -> bool {
         "build failed",
         "some errors have",
         "doctest failed",
+        // Reported as its own error item, whichever way cargo words it.
+        "process didn't exit successfully",
     ];
     PREFIXES.iter().any(|p| message.starts_with(p))
         || message.contains(" target failed")
@@ -83,6 +85,17 @@ fn diagnostics(lines: &[&str]) -> Diagnostics {
         };
         if !list.contains(&item) {
             list.push(item);
+        }
+    }
+    // A test binary that crashed (SIGABRT, SIGSEGV, exit code) has no failing test to show.
+    for line in lines {
+        if let Some(c) =
+            re!(r"^\s*(?:error: )?(process didn't exit successfully: .*)$").captures(line)
+        {
+            let item = Item::new("process", None, &c[1], Vec::<String>::new());
+            if !d.errors.contains(&item) {
+                d.errors.push(item);
+            }
         }
     }
     d

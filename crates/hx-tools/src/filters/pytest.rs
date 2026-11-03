@@ -81,7 +81,7 @@ pub(super) fn parse(output: &str) -> Option<Summary> {
             in_summary = false;
             continue;
         }
-        let Some(c) = re!(r"^(FAILED|ERROR) (\S+)(?: - (.*))?$").captures(line) else {
+        let Some(c) = re!(r"^(FAILED|ERROR) (.+?)(?: - (.*))?$").captures(line) else {
             continue;
         };
         if &c[1] == "FAILED" {
