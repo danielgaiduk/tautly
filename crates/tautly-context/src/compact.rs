@@ -20,7 +20,7 @@ use tautly_provider::{
 
 use crate::blocks::{ContextStatus, ReasoningWire, Turn, message_tokens};
 use crate::schedule::{self, MutationReason};
-use crate::{Context, assemble, pinned};
+use crate::{Context, TokenEstimator, assemble, pinned};
 
 /// Share of the window at which compaction starts (80%).
 pub const DEFAULT_THRESHOLD: f32 = 0.8;
@@ -382,7 +382,8 @@ impl Context {
     /// The history as a transcript, rendered as compaction renders it (tool inputs and
     /// results clipped, text neutralized): the first turn (the task, or an earlier
     /// compaction's summary) and the newest turns that fit `max_tokens`, with a marker
-    /// where turns were left out. For side-model notes (episodes).
+    /// where turns were left out. The newest turn is always there: when it alone does not
+    /// fit, its head and tail are. For side-model notes (episodes).
     pub fn transcript(&self, max_tokens: u32) -> String {
         let est = &self.tokens;
         let chunks: Vec<String> = self.history.iter().map(render_turn).collect();
@@ -406,9 +407,19 @@ impl Context {
             left -= costs[from - 1];
             from -= 1;
         }
+        // The newest turn alone does not fit: its head and tail.
+        let clipped = (from == chunks.len() && from > first).then(|| {
+            from -= 1;
+            clip_to(&chunks[from], left, est)
+        });
         let mut out = chunks[..first].concat();
-        out.push_str(&marker(from - first));
-        out.push_str(&chunks[from..].concat());
+        if from > first {
+            out.push_str(&marker(from - first));
+        }
+        match clipped {
+            Some(newest) => out.push_str(&newest),
+            None => out.push_str(&chunks[from..].concat()),
+        }
         out
     }
 
@@ -564,6 +575,40 @@ fn clip(text: &str) -> String {
         tail - head,
         neutralize(&text[tail..])
     )
+}
+
+/// `text` (already neutralized) within `max_tokens`: whole when it fits, else its head and
+/// tail with a marker between, or nothing when not even the marker fits.
+fn clip_to(text: &str, max_tokens: u32, est: &TokenEstimator) -> String {
+    if est.estimate(text) <= max_tokens {
+        return text.to_string();
+    }
+    let mut keep = text.len();
+    loop {
+        // Shrink in proportion to the overshoot, and by at least a tenth.
+        let over = f64::from(max_tokens) / f64::from(est.estimate(text).max(1));
+        keep = ((keep as f64 * over) as usize).min(keep - keep / 10 - 1);
+        if keep == 0 {
+            return String::new();
+        }
+        let mut head = keep / 2;
+        while !text.is_char_boundary(head) {
+            head -= 1;
+        }
+        let mut tail = text.len() - (keep - keep / 2);
+        while !text.is_char_boundary(tail) {
+            tail += 1;
+        }
+        let clipped = format!(
+            "{}\n[... {} bytes omitted ...]\n{}",
+            &text[..head],
+            tail - head,
+            &text[tail..]
+        );
+        if est.estimate(&clipped) <= max_tokens {
+            return clipped;
+        }
+    }
 }
 
 fn render_message(out: &mut String, message: &Message) {

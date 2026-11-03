@@ -14,7 +14,7 @@ use crate::entry::{check_id, normalize_rel, sanitize_title, valid_session_id};
 use crate::episodes::{self, Episode};
 use crate::search::{self, Doc, Hit, HitSource};
 use crate::stale;
-use crate::vault::{clean_tags, file_slug, is_entry_file, parse_links};
+use crate::vault::{clean_tags, file_slug, is_entry_file, link_by_file_name, parse_links};
 use crate::{MAX_BODY_TOKENS, MemAnchor, MemoryChange, MemoryDraft, MemoryEntry, MemoryError};
 
 /// Entry files larger than this are not loaded.
@@ -494,7 +494,8 @@ impl MemoryStore {
 
     /// Write the change to disk and update the in-memory entries. The upserted file is
     /// written first, so a failure there changes nothing; a failed delete is reported after
-    /// the others were tried.
+    /// the others were tried. The upserted body's links to known entries are written by
+    /// file name (see [`obsidian_links`](Self::obsidian_links)).
     pub fn apply(&mut self, c: &MemoryChange) -> Result<(), MemoryError> {
         verify_dirs(&self.dir_chain)?;
         if let Some(e) = &c.upsert {
@@ -520,9 +521,10 @@ impl MemoryStore {
                 Some(name) => name.clone(),
                 None => self.new_file_name(&e.title),
             };
+            let mut e = e.clone();
+            e.body = self.obsidian_links(&e, &name, &c.delete);
             write_private(&self.dir_chain, &name, &e.to_markdown())?;
             self.files.insert(e.id.clone(), name);
-            let mut e = e.clone();
             e.links = parse_links(&e.body);
             self.entries.retain(|x| x.id != e.id);
             self.entries.push(e);
@@ -545,6 +547,40 @@ impl MemoryStore {
         }
         self.rebuild();
         failure.map_or(Ok(()), Err)
+    }
+
+    /// `e`'s body (to be written to `name`) with each link that names an entry by id or
+    /// title written as `[[<file stem>|label]]`: Obsidian resolves links by file name
+    /// only, and following an unresolved one creates a stray note. Links that already name
+    /// a file, unknown targets and links to entries in `deleted` are kept as written.
+    fn obsidian_links(&self, e: &MemoryEntry, name: &str, deleted: &[String]) -> String {
+        let own = name.strip_suffix(".md").unwrap_or(name);
+        let names_file = |target: &str| {
+            let t = target.to_lowercase();
+            own.to_lowercase() == t
+                || self
+                    .files
+                    .values()
+                    .any(|f| f.strip_suffix(".md").is_some_and(|s| s.to_lowercase() == t))
+        };
+        link_by_file_name(&e.body, |target| {
+            if names_file(target) {
+                return None;
+            }
+            let itself = Some((own.to_string(), e.title.clone()));
+            if target == e.id || target.to_lowercase() == e.title.to_lowercase() {
+                return itself;
+            }
+            let other = &self.entries[self.resolve_link(target)?];
+            if other.id == e.id {
+                return itself;
+            }
+            if deleted.contains(&other.id) {
+                return None;
+            }
+            let stem = self.files.get(&other.id)?.strip_suffix(".md")?;
+            Some((stem.to_string(), other.title.clone()))
+        })
     }
 
     fn episodes(&self) -> Arc<Vec<Episode>> {

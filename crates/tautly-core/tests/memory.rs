@@ -8,13 +8,13 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 use tautly_core::{
-    Command, Config, Engine, EngineBuilder, Event, FinishReason, SessionRecord, UsageRole,
-    Workspace,
+    BudgetLimits, Command, Config, Engine, EngineBuilder, Event, FinishReason, SessionRecord,
+    UsageRole, Workspace,
 };
 use tautly_memory::{MemoryDraft, MemoryKind};
 use tautly_provider::{
-    Block, CanonicalRequest, Catalog, Content, MockProvider, MockTurn, ModelId, ProviderEvent,
-    RawUsage, StopReason,
+    Block, CanonicalRequest, Catalog, Content, MockProvider, MockTurn, ModelId, ProviderError,
+    ProviderEvent, RawUsage, StopReason,
 };
 use tautly_sandbox::{LocalSandbox, Mode, Sandbox};
 use tautly_session::SessionReader;
@@ -305,10 +305,37 @@ fn proposals(events: &[Event]) -> Vec<(String, tautly_core::MemoryChange)> {
             Event::MemoryProposed {
                 proposal_id,
                 change,
+                ..
             } => Some((proposal_id.clone(), change.clone())),
             _ => None,
         })
         .collect()
+}
+
+/// The ids of the entries each proposal in `events` replaces, by proposal id.
+fn replaced(events: &[Event]) -> Vec<(String, Vec<String>)> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            Event::MemoryProposed {
+                proposal_id,
+                replaces,
+                ..
+            } => Some((
+                proposal_id.clone(),
+                replaces.iter().map(|r| r.id.clone()).collect(),
+            )),
+            _ => None,
+        })
+        .collect()
+}
+
+fn running(pattern: &str) -> bool {
+    std::process::Command::new("pgrep")
+        .args(["-f", pattern])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
 }
 
 fn tool_output(events: &[Event], id: &str) -> (String, bool) {
@@ -342,7 +369,8 @@ async fn memory_index_rendered_after_agents_md_in_stable_block() {
     fx.write("AGENTS.md", "AGENTS-RULE: keep it short.\n");
     fx.write("src/lib.rs", "pub fn alpha() {}\n");
     fx.entry_file("use-pnpm", "use-pnpm", "Use pnpm");
-    fx.write(".tautly/memory/broken.md", "not an entry");
+    // A broken file's text (and the project's path) stays out of the warning.
+    fx.write(".tautly/memory/broken.md", "---\n\"SECRET-CONTENT\n---\n");
     let mock = MockProvider::new(vec![text_step("ok")]);
     let mut run = start(fx.ready(config(Mode::Ask), &mock).await);
     let events = run.turn_with("hi").await;
@@ -351,6 +379,13 @@ async fn memory_index_rendered_after_agents_md_in_stable_block() {
         warnings(&events)
             .iter()
             .any(|w| w.contains("1 memory entry could not be loaded") && w.contains("broken.md")),
+        "{events:?}"
+    );
+    let root = fx.root().to_string_lossy().into_owned();
+    assert!(
+        !warnings(&events)
+            .iter()
+            .any(|w| w.contains("SECRET") || w.contains(&root)),
         "{events:?}"
     );
     let req = &mock.requests()[0];
@@ -477,6 +512,8 @@ async fn reject_writes_nothing() {
     let events = run.turn_with("remember").await;
     let (out, _) = tool_output(&events, "m1");
     assert!(out.contains("not saved"), "{out}");
+    // Nobody is asked, so nothing is shown as waiting for an answer.
+    assert!(proposals(&events).is_empty(), "{events:?}");
     assert!(
         warnings(&events)
             .iter()
@@ -508,6 +545,14 @@ async fn reject_writes_nothing() {
     let (out, _) = tool_output(&events, "m1");
     assert!(out.contains("saved"), "{out}");
     assert_eq!(fx.memory_files().len(), 1);
+    // Saved without asking: said, not shown as a proposal.
+    assert!(proposals(&events).is_empty(), "{events:?}");
+    assert!(
+        warnings(&events)
+            .iter()
+            .any(|w| w.contains("approve_memory") && w.contains("Use pnpm")),
+        "{events:?}"
+    );
 }
 
 #[tokio::test]
@@ -736,6 +781,10 @@ async fn consolidate_emits_proposals_and_applies_only_approved() {
     );
     let props = proposals(&events);
     assert_eq!(props.len(), 2);
+    // Each shows the entries it replaces, so a client can show a diff.
+    let mut shown: Vec<Vec<String>> = replaced(&events).into_iter().map(|(_, r)| r).collect();
+    shown.sort();
+    assert_eq!(shown, [vec!["a", "b"], vec!["c"]]);
     let req = &mock.requests()[0];
     assert!(request_text(req).contains("Old note"), "{req:?}");
     assert!(events.iter().any(|e| matches!(
@@ -806,4 +855,170 @@ async fn pending_proposal_survives_resume() {
     )
     .await;
     assert_eq!(fx.memory_files().len(), 1);
+}
+
+#[tokio::test]
+async fn an_update_shows_the_entry_it_replaces() {
+    let fx = Fx::new();
+    fx.entry_file("use-pnpm", "use-pnpm", "Use pnpm");
+    let mock = MockProvider::new(vec![
+        tools_step(vec![
+            call(
+                "m1",
+                "remember",
+                json!({"id": "use-pnpm", "title": "Use pnpm only", "kind": "convention",
+                       "body": "pnpm, never npm."}),
+            ),
+            remember("m2", "Brand new"),
+        ]),
+        text_step("noted"),
+    ]);
+    let mut run = start(fx.ready(config(Mode::Ask), &mock).await);
+    let events = run.turn_with("update it").await;
+    let shown: Vec<Vec<String>> = replaced(&events).into_iter().map(|(_, r)| r).collect();
+    assert_eq!(shown, [vec!["use-pnpm".to_string()], vec![]], "{events:?}");
+    let old = events
+        .iter()
+        .find_map(|e| match e {
+            Event::MemoryProposed { replaces, .. } if !replaces.is_empty() => {
+                Some(replaces[0].clone())
+            }
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(old.title, "Use pnpm");
+    assert_eq!(old.body, "Body of use-pnpm.");
+}
+
+#[tokio::test]
+async fn exhausted_budget_sends_no_episode_or_consolidation_request() {
+    let fx = Fx::new();
+    fx.entry_file("a", "a", "Use pnpm");
+    fx.entry_file("b", "b", "Always pnpm");
+    let mut cfg = config(Mode::Ask);
+    // The first response (110 tokens) uses it up.
+    cfg.budget.session = BudgetLimits {
+        max_usd: None,
+        max_tokens: Some(50),
+    };
+    let mock = MockProvider::new(vec![
+        text_step("done"),
+        text_step("[]"),
+        text_step("# Never asked"),
+    ]);
+    let mut run = start(fx.ready(cfg, &mock).await);
+    run.turn_with("work").await;
+    assert_eq!(mock.requests().len(), 1);
+    run.send(Command::ConsolidateMemory).await;
+    let ev = run
+        .until(|e| matches!(e, Event::Warning { message } if message.contains("consolidation")))
+        .await;
+    assert!(
+        warnings(&ev)
+            .iter()
+            .any(|w| w.contains("consolidation") && w.contains("budget")),
+        "{ev:?}"
+    );
+    assert_eq!(
+        mock.requests().len(),
+        1,
+        "consolidation asked the side model"
+    );
+    let session = run.engine.session_id().to_string();
+    let after = run.stop().await;
+    assert_eq!(mock.requests().len(), 1, "the episode asked the side model");
+    assert!(
+        warnings(&after)
+            .iter()
+            .any(|w| w.contains("episode") && w.contains("budget")),
+        "{after:?}"
+    );
+    assert!(!fx.episode_path(&session).exists());
+}
+
+#[tokio::test]
+async fn consolidation_prompt_fits_the_side_model_window() {
+    let fx = Fx::new();
+    for i in 0..40 {
+        fx.write(
+            &format!(".tautly/memory/e{i:02}.md"),
+            &format!(
+                "---\nid: e{i:02}\ntitle: \"Entry {i:02}\"\nkind: fact\ncreated: 2026-01-01T00:00:00\n---\n{}\n",
+                "a fact worth keeping ".repeat(50)
+            ),
+        );
+    }
+    let mut cfg = config(Mode::Ask);
+    // 6,000 tokens: the side runner takes about 10,500 bytes of input.
+    cfg.catalog_overrides = Some(catalog_with(6_000, 1_000, "none"));
+    let mock = MockProvider::new(vec![text_step("[]")]);
+    let mut run = start(fx.ready(cfg, &mock).await);
+    run.send(Command::ConsolidateMemory).await;
+    run.until(|e| matches!(e, Event::Warning { message } if message.contains("no changes")))
+        .await;
+    let text = request_text(&mock.requests()[0]);
+    assert!(text.len() <= 12_000, "{} bytes", text.len());
+    assert!(text.contains("left out"), "{text}");
+}
+
+#[tokio::test]
+async fn shutdown_stops_background_commands_before_the_episode() {
+    let fx = Fx::new();
+    let mock = MockProvider::new(vec![
+        // A background child that outlives its call (a dev server, say).
+        tools_step(vec![call(
+            "c1",
+            "bash",
+            json!({"command": "sleep 317 >/dev/null 2>&1 &"}),
+        )]),
+        text_step("started"),
+        // The session-end episode, which takes its time.
+        MockTurn::Stall,
+    ]);
+    let mut run = start(fx.ready(config(Mode::Yolo), &mock).await);
+    run.turn_with("start the server").await;
+    assert!(running("^sleep 317$"), "the background child should run");
+    run.send(Command::Shutdown).await;
+    let deadline = Instant::now() + WAIT;
+    while mock.requests().len() < 3 {
+        assert!(Instant::now() < deadline, "no episode request");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    // The episode is being written; background commands were stopped before it.
+    assert!(
+        !running("^sleep 317$"),
+        "the background child outlived the session into its episode"
+    );
+    let closed =
+        tokio::time::timeout(WAIT, async { while run.events.recv().await.is_some() {} }).await;
+    assert!(closed.is_ok(), "the engine did not stop");
+}
+
+#[tokio::test]
+async fn no_episode_for_a_session_without_a_reply() {
+    let fx = Fx::new();
+    let mock = MockProvider::new(vec![
+        MockTurn::Error(ProviderError::Auth("no key".into())),
+        text_step("# Never asked"),
+    ]);
+    let mut run = start(fx.ready(config(Mode::Ask), &mock).await);
+    let events = run.turn_with("hello").await;
+    assert!(
+        matches!(
+            events.last(),
+            Some(Event::TurnFinished {
+                reason: FinishReason::Error,
+                ..
+            })
+        ),
+        "{events:?}"
+    );
+    let session = run.engine.session_id().to_string();
+    run.stop().await;
+    assert_eq!(
+        mock.requests().len(),
+        1,
+        "an episode of nothing was asked for"
+    );
+    assert!(!fx.episode_path(&session).exists());
 }

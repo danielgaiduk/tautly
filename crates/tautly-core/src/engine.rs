@@ -579,10 +579,6 @@ impl Actor {
                 }
             }
         }
-        // The session's episode, by the side model (spec 7.4), before anything stops.
-        if let Some(s) = state.as_mut() {
-            s.end_episode().await;
-        }
         // MCP servers end with their process groups. (A session lost to a crashed turn
         // dropped its servers, which kills their groups.)
         if let Some(mcp) = state.as_ref().and_then(|s| s.mcp.as_ref()) {
@@ -591,6 +587,11 @@ impl Actor {
         // The turn has ended (its own command was killed with it); what is left are groups
         // with background children, such as dev servers.
         self.groups.terminate_all(GROUP_GRACE).await;
+        // The session's episode, by the side model (spec 7.4), which needs neither: last,
+        // so nothing the session started outlives it while the side model writes.
+        if let Some(s) = state.as_mut() {
+            s.end_episode().await;
+        }
         self.with_log(|l| l.checkpoint()).await;
     }
 

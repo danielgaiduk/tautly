@@ -251,7 +251,8 @@ impl Tool for RememberTool {
              Use it when the user corrects you or states a convention, or when you learn a \
              lasting fact, gotcha or command. Keep the body short (under 300 tokens) and \
              anchor it to the code it is about, so it can be flagged when that code changes. \
-             Link related entries with [[their title]] in the body. Pass `id` to update an \
+             Link related entries with [[their title]] in the body (saved as \
+             [[file-name|title]], which Obsidian resolves). Pass `id` to update an \
              existing entry; its anchors are kept unless you give new ones.",
             json!({
                 "type": "object",

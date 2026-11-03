@@ -10,7 +10,9 @@
 //! bytes), since entry files come from the repository and may be hostile; the parser is
 //! panic-free by design and is also run under `catch_unwind`. Files of the first version
 //! (`key: <JSON>` lines) are valid YAML; a hand-edited one YAML refuses (a plain `: ` in a
-//! title) is read by the old line parser.
+//! title) is read by the old line parser, but only when it is flat (one `key: value` per
+//! line, no indented or `- ` lines), so the two readers never disagree on structure. A
+//! property given twice is refused by both, as Obsidian flags it.
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
@@ -19,7 +21,7 @@ use std::time::{Duration, SystemTime};
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::entry::{normalize_rel, valid_id};
+use crate::entry::{normalize_rel, sanitize_title, valid_id};
 use crate::vault::{clean_tags, parse_links};
 use crate::{MemAnchor, MemoryEntry, MemoryKind};
 
@@ -87,8 +89,10 @@ pub(crate) fn parse(text: &str) -> Result<MemoryEntry, String> {
         .ok_or("missing `---` frontmatter")?;
     let (front, body) = split_frontmatter(rest).ok_or("unterminated frontmatter")?;
     let raw = match yaml(front) {
-        Some(value) => from_yaml(value)?,
-        None => legacy(front)?,
+        Ok(value) => from_yaml(value)?,
+        Err(Refused::Duplicate(key)) => return Err(duplicate(key.as_deref())),
+        Err(Refused::Other) if is_flat(front) => legacy(front)?,
+        Err(Refused::Other) => return Err("the frontmatter is not valid YAML".into()),
     };
     let id = raw.id.ok_or("missing `id`")?;
     if !valid_id(&id) {
@@ -122,8 +126,34 @@ pub(crate) fn parse(text: &str) -> Result<MemoryEntry, String> {
     })
 }
 
-/// The frontmatter as YAML, or None when it is not YAML within the budget.
-fn yaml(front: &str) -> Option<Value> {
+/// Why YAML did not read a frontmatter.
+enum Refused {
+    /// A property is given twice (its name, when YAML could say).
+    Duplicate(Option<String>),
+    /// Not YAML, or not within the budget.
+    Other,
+}
+
+fn duplicate(key: Option<&str>) -> String {
+    match key {
+        Some(k) => format!(
+            "duplicate property `{}`",
+            sanitize_title(k).chars().take(64).collect::<String>()
+        ),
+        None => "a property is given twice".into(),
+    }
+}
+
+/// One `key: value` per line: no indented lines and no `- ` list items.
+fn is_flat(front: &str) -> bool {
+    front
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .all(|l| !l.starts_with(char::is_whitespace) && !l.starts_with('-'))
+}
+
+/// The frontmatter as YAML, or why not.
+fn yaml(front: &str) -> Result<Value, Refused> {
     let mut budget = serde_saphyr::Budget::default();
     budget.max_events = 20_000;
     budget.max_nodes = 10_000;
@@ -138,6 +168,7 @@ fn yaml(front: &str) -> Option<Value> {
     budget.max_merge_keys = 16;
     let mut options = serde_saphyr::Options::default();
     options.budget = Some(budget);
+    options.duplicate_keys = serde_saphyr::DuplicateKeyPolicy::Error;
     options.alias_limits.max_total_replayed_events = 10_000;
     options.alias_limits.max_replay_stack_depth = 16;
     options.alias_limits.max_alias_expansions_per_anchor = 64;
@@ -145,8 +176,14 @@ fn yaml(front: &str) -> Option<Value> {
         serde_saphyr::from_str_with_options::<Value>(front, options)
     }));
     match parsed {
-        Ok(Ok(v)) => Some(v),
-        _ => None,
+        Ok(Ok(v)) => Ok(v),
+        Ok(Err(e)) => match e.without_snippet() {
+            serde_saphyr::Error::DuplicateMappingKey { key, .. } => {
+                Err(Refused::Duplicate(key.clone()))
+            }
+            _ => Err(Refused::Other),
+        },
+        Err(_) => Err(Refused::Other),
     }
 }
 
@@ -225,11 +262,20 @@ fn anchor_list(v: Value) -> Result<Vec<RawAnchor>, String> {
 /// `anchors` a JSON list.
 fn legacy(front: &str) -> Result<Raw, String> {
     let mut raw = Raw::default();
+    let mut seen: Vec<&str> = Vec::new();
     for line in front.lines().filter(|l| !l.trim().is_empty()) {
-        let (key, value) = line
-            .split_once(':')
-            .ok_or_else(|| format!("bad frontmatter line `{line}`"))?;
-        match key.trim() {
+        let (key, value) = line.split_once(':').ok_or_else(|| {
+            format!(
+                "bad frontmatter line `{}`",
+                sanitize_title(line).chars().take(80).collect::<String>()
+            )
+        })?;
+        let key = key.trim();
+        if seen.contains(&key) {
+            return Err(duplicate(Some(key)));
+        }
+        seen.push(key);
+        match key {
             "id" => raw.id = Some(scalar(value)?),
             "title" => raw.title = Some(scalar(value)?),
             "kind" => raw.kind = Some(scalar(value)?),
@@ -394,6 +440,38 @@ mod tests {
             format_time(UNIX_EPOCH + Duration::from_secs(ten)),
             "2026-11-03T10:00:00"
         );
+    }
+
+    fn file(front: &str) -> String {
+        format!("---\n{front}---\nbody\n")
+    }
+
+    #[test]
+    fn duplicate_properties_are_refused_by_both_readers() {
+        // YAML reader (block list present) and the old line reader (flat lines) agree.
+        for front in [
+            "id: a-1\nid: b-2\ntitle: t\nkind: fact\ncreated: 2026-01-01\n",
+            "id: a-1\ntitle: t\nkind: fact\ncreated: 2026-01-01\ntags:\n  - x\ntitle: u\n",
+            "id: a-1\ntitle: Note: colon\ntitle: other\nkind: fact\ncreated: 2026-01-01\n",
+        ] {
+            let err = parse(&file(front)).unwrap_err();
+            assert!(err.contains("duplicate"), "{front:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn the_old_line_reader_reads_only_flat_frontmatter() {
+        // Flat lines YAML refuses (a plain `: `): the old reader.
+        let flat = "id: x-1\ntitle: Note: colon\nkind: fact\ncreated: 2026-01-01\n";
+        assert_eq!(parse(&file(flat)).unwrap().title, "Note: colon");
+        // With block structure YAML has the last word: refused, not half-read.
+        for front in [
+            "id: x-1\ntitle: Note: colon\nkind: fact\ncreated: 2026-01-01\nextra:\n  nested: y\n",
+            "id: x-1\ntitle: Note: colon\nkind: fact\ncreated: 2026-01-01\nlist:\n- y\n",
+        ] {
+            let err = parse(&file(front)).unwrap_err();
+            assert!(err.contains("not valid YAML"), "{front:?}: {err}");
+        }
     }
 
     #[test]

@@ -156,7 +156,21 @@ expression: events
       "delete": [
         "old-entry"
       ]
-    }
+    },
+    "replaces": [
+      {
+        "id": "old-entry",
+        "title": "Building",
+        "kind": "command",
+        "anchors": [],
+        "created": 1690000000,
+        "verified": 1695000000,
+        "tags": [
+          "build"
+        ],
+        "body": "make all"
+      }
+    ]
   },
   {
     "type": "session_changed",

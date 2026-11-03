@@ -4,7 +4,9 @@
 //! after its title (`<title-slug>.md`, `-2`, `-3`... on collision) and shareable via git.
 //! The directory opens as an Obsidian vault: the frontmatter is YAML properties (the
 //! stable `id` among them, so renaming a file breaks nothing), entries have `tags`, and
-//! bodies link each other with `[[title]]`, which `recall` follows one hop. Episodes are private session summaries in
+//! bodies link each other with `[[title]]` (written as `[[<file stem>|title]]`, which
+//! Obsidian resolves), and `recall` follows links one hop. Episodes are private session
+//! summaries in
 //! `<data_home>/memory/<project_id>/episodes/<session-id>.md`. Every file is written
 //! atomically (temp file + rename) with mode 0600 in directories of mode 0700.
 

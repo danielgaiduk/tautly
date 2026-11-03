@@ -25,7 +25,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tautly_context::{Breakdown, ContextStatus, MutationReason};
 pub use tautly_mcp::McpState;
-use tautly_memory::MemoryChange;
+use tautly_memory::{MemoryChange, MemoryEntry};
 use tautly_provider::{ModelId, Quota};
 use tautly_tools::{AppliedEffect, DiffPreview, LineRange, Shown, ToolMeta};
 
@@ -33,6 +33,9 @@ use crate::evidence::TestEvidence;
 
 /// `(major, minor)` of this protocol.
 pub const PROTOCOL_VERSION: (u32, u32) = (1, 0);
+
+/// Most entries an [`Event::MemoryProposed`] shows in `replaces`.
+pub const MAX_REPLACED_SHOWN: usize = 16;
 
 /// Which request a [`Event::Usage`] belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -238,11 +241,23 @@ pub enum Event {
         reason: MutationReason,
     },
     /// A memory entry to write and/or entries to delete, waiting for
-    /// [`Command::ApproveMemory`] or [`Command::RejectMemory`].
+    /// [`Command::ApproveMemory`] or [`Command::RejectMemory`]. Sent only when the user is
+    /// asked: a proposal saved without asking (`approve_memory`) or rejected because nobody
+    /// can approve it (headless) is reported by a [`Event::Warning`] instead.
     MemoryProposed {
         proposal_id: String,
         #[serde(with = "memory_change_wire")]
         change: MemoryChange,
+        /// The entries as they are now that the change would overwrite (the upserted id, if
+        /// it exists) or delete, so a client can show the change as a diff; at most
+        /// [`MAX_REPLACED_SHOWN`]. Absent when there are none, and in events from before
+        /// this field existed.
+        #[serde(
+            default,
+            skip_serializing_if = "Vec::is_empty",
+            with = "memory_entries_wire"
+        )]
+        replaces: Vec<MemoryEntry>,
     },
     SessionChanged {
         session_id: String,
@@ -481,7 +496,7 @@ pub(crate) mod memory_change_wire {
     }
 
     #[derive(Serialize, Deserialize)]
-    struct EntryWire {
+    pub(super) struct EntryWire {
         id: String,
         title: String,
         kind: MemoryKind,
@@ -494,9 +509,9 @@ pub(crate) mod memory_change_wire {
         body: String,
     }
 
-    pub fn serialize<S: Serializer>(change: &MemoryChange, s: S) -> Result<S::Ok, S::Error> {
-        Wire {
-            upsert: change.upsert.as_ref().map(|e| EntryWire {
+    impl From<&MemoryEntry> for EntryWire {
+        fn from(e: &MemoryEntry) -> Self {
+            EntryWire {
                 id: e.id.clone(),
                 title: e.title.clone(),
                 kind: e.kind,
@@ -505,16 +520,13 @@ pub(crate) mod memory_change_wire {
                 verified: e.verified.map(unix_secs),
                 tags: e.tags.clone(),
                 body: e.body.clone(),
-            }),
-            delete: change.delete.clone(),
+            }
         }
-        .serialize(s)
     }
 
-    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<MemoryChange, D::Error> {
-        let w = Wire::deserialize(d)?;
-        Ok(MemoryChange {
-            upsert: w.upsert.map(|e| MemoryEntry {
+    impl From<EntryWire> for MemoryEntry {
+        fn from(e: EntryWire) -> Self {
+            MemoryEntry {
                 id: e.id,
                 title: e.title,
                 kind: e.kind,
@@ -525,8 +537,41 @@ pub(crate) mod memory_change_wire {
                 links: tautly_memory::parse_links(&e.body),
                 body: e.body,
                 stale: false,
-            }),
+            }
+        }
+    }
+
+    pub fn serialize<S: Serializer>(change: &MemoryChange, s: S) -> Result<S::Ok, S::Error> {
+        Wire {
+            upsert: change.upsert.as_ref().map(EntryWire::from),
+            delete: change.delete.clone(),
+        }
+        .serialize(s)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<MemoryChange, D::Error> {
+        let w = Wire::deserialize(d)?;
+        Ok(MemoryChange {
+            upsert: w.upsert.map(MemoryEntry::from),
             delete: w.delete,
         })
+    }
+}
+
+/// Memory entries on the wire, as [`memory_change_wire`] writes an upserted one.
+pub(crate) mod memory_entries_wire {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use tautly_memory::MemoryEntry;
+
+    use super::memory_change_wire::EntryWire;
+
+    pub fn serialize<S: Serializer>(entries: &[MemoryEntry], s: S) -> Result<S::Ok, S::Error> {
+        let wire: Vec<EntryWire> = entries.iter().map(EntryWire::from).collect();
+        wire.serialize(s)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<MemoryEntry>, D::Error> {
+        let wire = Vec::<EntryWire>::deserialize(d)?;
+        Ok(wire.into_iter().map(MemoryEntry::from).collect())
     }
 }

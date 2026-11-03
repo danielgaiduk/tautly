@@ -3,31 +3,38 @@
 //!
 //! - **Proposals.** A `remember` call whose result is not an error, and each change a
 //!   consolidation parses, becomes a proposal: logged (`MemoryProposal`) before its
-//!   `MemoryProposed` event, which goes through the turn's (or job's) bound sink. The store
+//!   `MemoryProposed` event, which goes through the turn's (or job's) bound sink and shows
+//!   the entries the change would overwrite or delete (`replaces`), for a diff. The store
 //!   is written only on `ApproveMemory`; `RejectMemory` discards. Without an interactive
-//!   client a proposal is rejected at once, unless `approve_memory` saves it without asking.
-//!   Every decision is logged (`MemoryDecision`), so pending proposals survive a resume.
+//!   client a proposal is rejected at once, unless `approve_memory` saves it without asking;
+//!   either way nobody is asked, so no `MemoryProposed` is sent and a `Warning` says what
+//!   became of it. Every decision is logged (`MemoryDecision`), so pending proposals
+//!   survive a resume.
 //! - **The index.** Store changes (an approval, a staleness check after an edit) change the
 //!   store only; the engine renders the index text into a pending slot
 //!   (`Session::pending_memory_index`), which the cache epoch applies (spec 7.7): never
 //!   while the cache is warm. When the full index exceeds its 500 tokens, the context
 //!   status warns and suggests consolidation.
 //! - **Staleness.** An edit (or a command that may have written) makes a check due; it runs
-//!   at the next step start once the index is ready and caught up (`!is_stale()`).
+//!   at the next step start once the index is ready and caught up (`!is_stale()`). Only the
+//!   first such step start waits (briefly) for the index to be ready; later ones just look.
 //! - **Episodes.** Private (in the data home), so no approval. After each compaction the
 //!   episode is the side model's summary of what was compacted; at session end the side
-//!   model writes the whole session's, replacing it.
+//!   model writes the whole session's, replacing it, if the model replied at all.
+//! - **Budgets.** The session-end episode and consolidation are side-model requests the
+//!   user did not ask for turn by turn: with a budget used up they are not sent (a warning
+//!   says so), as no main request would be.
 
 use std::sync::{Arc, PoisonError, RwLock};
 use std::time::Duration;
 
 use tautly_context::Turn;
-use tautly_memory::{MemoryChange, MemoryDraft, MemoryStore, sanitize_title};
+use tautly_memory::{MemoryChange, MemoryDraft, MemoryEntry, MemoryStore, sanitize_title};
 use tautly_provider::{Content, Role};
 use tautly_tools::{AppliedEffect, ToolResult};
 use tokio_util::sync::CancellationToken;
 
-use crate::protocol::Event;
+use crate::protocol::{Event, MAX_REPLACED_SHOWN};
 use crate::record::SessionRecord;
 use crate::session::Session;
 use crate::turn::TurnControl;
@@ -36,8 +43,8 @@ use crate::turn::TurnControl;
 pub(crate) const MEMORY_INDEX_TOKENS: u32 = 500;
 /// The context status line shown while the full index does not fit.
 pub(crate) const OVER_BUDGET_WARNING: &str = "memory index over budget — run /memory consolidate";
-/// How long a step start waits for the index to be ready before a due staleness check
-/// (which then waits for the next step).
+/// How long the first step start with a due staleness check waits for the index to be
+/// ready (the check then waits for a later step, which does not wait).
 const INDEX_READY_WAIT: Duration = Duration::from_millis(100);
 /// Longest episode the side model is asked for.
 const EPISODE_MAX_TOKENS: u32 = 1_000;
@@ -90,6 +97,8 @@ pub(crate) struct MemoryState {
     pub live: bool,
     /// An edit happened since the last staleness check.
     pub refresh_due: bool,
+    /// A step start has waited for the index to be ready once; later ones only look.
+    pub waited_for_index: bool,
     /// The full index did not fit its budget at the last rendering.
     pub over_budget: bool,
     /// A user turn ran since the last episode.
@@ -106,6 +115,7 @@ impl MemoryState {
             seq: 0,
             live: false,
             refresh_due: false,
+            waited_for_index: false,
             over_budget: false,
             episode_due: false,
             task: None,
@@ -131,6 +141,27 @@ pub(crate) fn first_task(history: &[Turn]) -> Option<String> {
             Content::Text(t) if !t.starts_with("<summary>") => Some(t.clone()),
             _ => None,
         })
+}
+
+/// Whether the model replied in `history` (a turn that failed before any reply has
+/// nothing for an episode).
+fn has_reply(history: &[Turn]) -> bool {
+    history
+        .iter()
+        .flat_map(|t| &t.messages)
+        .any(|m| m.role == Role::Assistant && !m.content.is_empty())
+}
+
+/// What `change` does, in a few words: `write "title"`, `delete a, b`.
+fn describe(change: &MemoryChange) -> String {
+    let mut parts = Vec::new();
+    if let Some(e) = &change.upsert {
+        parts.push(format!("write \"{}\"", e.title));
+    }
+    if !change.delete.is_empty() {
+        parts.push(format!("delete {}", change.delete.join(", ")));
+    }
+    parts.join(" and ")
 }
 
 /// About four bytes per token: the rule `remember` checked the draft with.
@@ -215,7 +246,13 @@ impl Session {
         let Some(index) = self.workspace.index() else {
             return;
         };
-        if !index.wait_ready(INDEX_READY_WAIT).await || index.is_stale() {
+        let ready = if self.memory.waited_for_index {
+            index.is_ready()
+        } else {
+            self.memory.waited_for_index = true;
+            index.wait_ready(INDEX_READY_WAIT).await
+        };
+        if !ready || index.is_stale() {
             return;
         }
         self.memory.refresh_due = false;
@@ -259,9 +296,41 @@ impl Session {
         }
     }
 
+    /// The entries `change` would overwrite or delete, as the store has them now (at most
+    /// [`MAX_REPLACED_SHOWN`]).
+    async fn replaced_entries(&self, change: &MemoryChange) -> Vec<MemoryEntry> {
+        let Some(store) = self.store() else {
+            return Vec::new();
+        };
+        let ids: Vec<String> = change
+            .upsert
+            .iter()
+            .map(|e| e.id.clone())
+            .chain(change.delete.iter().cloned())
+            .collect();
+        tokio::task::spawn_blocking(move || {
+            let store = store.read().unwrap_or_else(PoisonError::into_inner);
+            ids.iter()
+                .filter_map(|id| store.entries().iter().find(|e| &e.id == id).cloned())
+                .take(MAX_REPLACED_SHOWN)
+                .collect()
+        })
+        .await
+        .unwrap_or_default()
+    }
+
+    /// The `MemoryProposed` event of a pending proposal.
+    async fn proposed_event(&self, id: &str, change: &MemoryChange) -> Event {
+        Event::MemoryProposed {
+            proposal_id: id.to_string(),
+            change: change.clone(),
+            replaces: self.replaced_entries(change).await,
+        }
+    }
+
     /// Log `change` as a proposal and decide it as the session's mode says. Returns the
-    /// events to show (`MemoryProposed`, and a warning when it was not saved without the
-    /// user being asked) and a line for the model.
+    /// events to show (`MemoryProposed` when the user is asked, else a warning saying what
+    /// became of it) and a line for the model.
     pub(crate) async fn propose(&mut self, change: MemoryChange) -> (Vec<Event>, String) {
         self.memory.seq += 1;
         let id = format!("mem-{}", self.memory.seq);
@@ -270,17 +339,23 @@ impl Session {
             change: change.clone(),
         })
         .await;
-        let mut events = vec![Event::MemoryProposed {
-            proposal_id: id.clone(),
-            change: change.clone(),
-        }];
+        let mut events = Vec::new();
         let note = match self.memory.mode {
             MemoryMode::Ask => {
+                events.push(self.proposed_event(&id, &change).await);
                 self.memory.pending.push((id.clone(), change));
                 format!("proposed as {id}; awaiting user approval")
             }
             MemoryMode::Auto => match self.apply_memory(&id, &change).await {
-                Ok(()) => format!("saved to project memory ({id}); approve_memory is on"),
+                Ok(()) => {
+                    events.push(Event::Warning {
+                        message: format!(
+                            "memory proposal {id} saved without asking (approve_memory): {}",
+                            describe(&change)
+                        ),
+                    });
+                    format!("saved to project memory ({id}); approve_memory is on")
+                }
                 Err(e) => {
                     self.log(SessionRecord::MemoryDecision {
                         id: id.clone(),
@@ -366,12 +441,8 @@ impl Session {
     /// Show the proposals still waiting (a resumed session's client has not seen them).
     pub(crate) async fn show_pending_proposals(&self) {
         for (id, change) in &self.memory.pending {
-            self.events
-                .send_or_drop(Event::MemoryProposed {
-                    proposal_id: id.clone(),
-                    change: change.clone(),
-                })
-                .await;
+            let event = self.proposed_event(id, change).await;
+            self.events.send_or_drop(event).await;
         }
     }
 
@@ -391,10 +462,17 @@ impl Session {
                 .await;
             return;
         };
+        if self.budget_exhausted().await.is_some() {
+            self.warn("memory consolidation not run: the budget is used up")
+                .await;
+            return;
+        }
+        // Entries at about four bytes per token, within the side model's window.
+        let room = u32::try_from(self.side.runner.max_input_bytes() / 4).unwrap_or(u32::MAX);
         let read = Arc::clone(&store);
         let request = tokio::task::spawn_blocking(move || {
             let store = read.read().unwrap_or_else(PoisonError::into_inner);
-            (!store.entries().is_empty()).then(|| store.consolidation_request())
+            (!store.entries().is_empty()).then(|| store.consolidation_request_within(room))
         })
         .await;
         let Ok(Some(request)) = request else {
@@ -450,11 +528,20 @@ impl Session {
     }
 
     /// Write this session's episode (replacing an earlier one) with the side model, from
-    /// the history as it stands. A failure is a warning; `cancel` abandons it.
+    /// the history as it stands: not when the model never replied, nor (with a warning)
+    /// when a budget is used up. A failure is a warning; `cancel` abandons it.
     async fn write_episode(&mut self, cancel: &CancellationToken) {
         let Some(store) = self.store() else {
             return;
         };
+        if !has_reply(&self.context.history) {
+            return;
+        }
+        if self.budget_exhausted().await.is_some() {
+            self.warn("the session's episode was not written: the budget is used up")
+                .await;
+            return;
+        }
         let room = (self.side.runner.max_input_bytes() / 4).min(EPISODE_INPUT_TOKENS as usize);
         let transcript = self.context.transcript(room as u32);
         if transcript.trim().is_empty() {

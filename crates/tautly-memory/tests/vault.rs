@@ -329,23 +329,109 @@ async fn renamed_file_keeps_links_by_id() {
             &format!("Zebra step. See [[{b}|the cache]]."),
         ),
     );
-    // A teammate renames the file (git mv, or Obsidian's rename).
+    // Written as a link Obsidian resolves: by file name, the label kept.
+    let a_file = e.dir().join(e.store.file_name(&a).unwrap());
+    let a_text = fs::read_to_string(&a_file).unwrap();
+    assert!(a_text.contains("[[build-cache|the cache]]"), "{a_text}");
+    // Obsidian renames the file and updates the links to it.
     let old = e.dir().join(e.store.file_name(&b).unwrap());
     fs::rename(&old, e.dir().join("Where artifacts go.md")).unwrap();
+    fs::write(
+        &a_file,
+        a_text.replace("[[build-cache|", "[[Where artifacts go|"),
+    )
+    .unwrap();
+    // A note a teammate wrote by hand links by id, which no rename breaks.
+    fs::write(
+        e.dir().join("hand-note.md"),
+        format!(
+            "---\nid: hand-note\ntitle: Hand note\nkind: fact\ncreated: 2026-01-01\n---\n\
+             Quokka facts, see [[{b}]].\n"
+        ),
+    )
+    .unwrap();
 
-    let mut m = e.reopen();
+    let m = e.reopen();
     assert_eq!(m.file_name(&b), Some("Where artifacts go.md"));
     let hits = m.search("zebra", 5, 2000, &est);
     assert_eq!(hits.len(), 2, "{hits:?}");
     assert_eq!(hits[1].source, HitSource::Project(b.clone()));
     assert_eq!(hits[1].linked_from.as_deref(), Some(a.as_str()));
+    // A git mv updates no links; the link by id still finds the entry.
+    fs::rename(
+        e.dir().join("Where artifacts go.md"),
+        e.dir().join("cache-notes.md"),
+    )
+    .unwrap();
+    let mut m = e.reopen();
+    let hits = m.search("quokka", 5, 2000, &est);
+    assert_eq!(hits.len(), 2, "{hits:?}");
+    assert_eq!(hits[1].source, HitSource::Project(b.clone()));
     // Updating the entry writes the renamed file, not a new one.
     let mut upd = draft("Build cache", "Artifacts live in target/ and ~/.cache.");
     upd.id = Some(b.clone());
     add(&mut m, upd);
-    assert_eq!(e.files().len(), 2, "{:?}", e.files());
-    let text = fs::read_to_string(e.dir().join("Where artifacts go.md")).unwrap();
+    assert_eq!(e.files().len(), 3, "{:?}", e.files());
+    let text = fs::read_to_string(e.dir().join("cache-notes.md")).unwrap();
     assert!(text.contains("~/.cache"), "{text}");
+}
+
+/// Obsidian resolves `[[...]]` by file name, so the links of an applied entry that name an
+/// entry by title or id are written as `[[<file stem>|label]]` (the label defaults to the
+/// linked entry's title); unknown targets and links that already name a file are kept.
+#[tokio::test]
+async fn applied_links_name_files_so_obsidian_resolves_them() {
+    let mut e = setup(&[]).await;
+    let pnpm = add(&mut e.store, draft("Use pnpm, not npm", "Always pnpm."));
+    let odd = add(&mut e.store, draft("Old | odd [title]", "Old."));
+    let body = format!(
+        "See [[Use pnpm, not npm]], [[use pnpm, NOT npm#Why]], [[{pnpm}|the rule]], \
+         [[use-pnpm-not-npm]], [[Nowhere]], ![[Use pnpm, not npm]], [[{odd}]] \
+         and [[Lint rules]]."
+    );
+    let lint = add(&mut e.store, draft("Lint rules", &body));
+    let text = fs::read_to_string(e.dir().join("lint-rules.md")).unwrap();
+    let written = text.split("---\n").nth(2).unwrap().trim_end();
+    assert_eq!(
+        written,
+        "See [[use-pnpm-not-npm|Use pnpm, not npm]], \
+         [[use-pnpm-not-npm#Why|Use pnpm, not npm]], [[use-pnpm-not-npm|the rule]], \
+         [[use-pnpm-not-npm]], [[Nowhere]], ![[use-pnpm-not-npm|Use pnpm, not npm]], \
+         [[old-odd-title|Old - odd (title)]] and [[lint-rules|Lint rules]].",
+        "{text}"
+    );
+    // Recall resolves the rewritten links (by file name).
+    let entry = e.store.entries().iter().find(|x| x.id == lint).unwrap();
+    assert!(
+        entry.links.contains(&"use-pnpm-not-npm".to_string()),
+        "{:?}",
+        entry.links
+    );
+    let hits = e.reopen().search("lint", 5, 2000, &est);
+    assert!(
+        hits.iter()
+            .any(|h| h.source == HitSource::Project(pnpm.clone())
+                && h.linked_from.as_deref() == Some(lint.as_str())),
+        "{hits:?}"
+    );
+    // A link to an entry the same change deletes is kept as written.
+    let merged = MemoryChange {
+        upsert: Some(MemoryEntry {
+            body: format!("Merged: [[Use pnpm, not npm]] and [[{odd}|odd]]."),
+            ..e.store
+                .draft_to_change(draft("Merged", "m"), &est)
+                .unwrap()
+                .upsert
+                .unwrap()
+        }),
+        delete: vec![pnpm.clone()],
+    };
+    e.store.apply(&merged).unwrap();
+    let text = fs::read_to_string(e.dir().join("merged.md")).unwrap();
+    assert!(
+        text.contains("Merged: [[Use pnpm, not npm]] and [[old-odd-title|odd]]."),
+        "{text}"
+    );
 }
 
 #[tokio::test]
