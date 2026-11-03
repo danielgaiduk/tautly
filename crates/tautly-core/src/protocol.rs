@@ -290,6 +290,18 @@ pub enum Event {
         source: String,
         launch: String,
     },
+    /// The answer to [`Command::Undo`] (spec 7.11.11): the root-relative paths user turn
+    /// `turn`'s undo restored and deleted (with `dry_run`, would have; nothing changed),
+    /// the ref of the snapshot taken just before (`git` can restore it), and a `note` on
+    /// what was not undone.
+    Undone {
+        turn: u32,
+        restored: Vec<String>,
+        deleted: Vec<String>,
+        dry_run: bool,
+        backup_ref: Option<String>,
+        note: Option<String>,
+    },
     /// An MCP server changed state; `tools` is how many of its tools are offered.
     McpServerStatus {
         server: String,
@@ -400,6 +412,16 @@ pub enum Command {
     /// the model as it was.
     SetModel {
         model: ModelId,
+    },
+    /// Revert the file changes of user turn `turn` (1-based; default: the last), its
+    /// commands' too where git checkpoints were taken (spec 7.11.11). Waits for a running
+    /// turn to end. Answered with [`Event::Undone`], or an `Error` (nothing changed) when a
+    /// file was changed since by someone else or by a later turn that is not undone.
+    Undo {
+        #[serde(default)]
+        turn: Option<u32>,
+        #[serde(default)]
+        dry_run: bool,
     },
     Shutdown,
 }

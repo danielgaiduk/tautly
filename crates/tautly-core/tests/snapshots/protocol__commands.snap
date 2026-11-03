@@ -84,6 +84,16 @@ expression: every_command()
     "model": "openai/gpt-5"
   },
   {
+    "type": "undo",
+    "turn": null,
+    "dry_run": false
+  },
+  {
+    "type": "undo",
+    "turn": 2,
+    "dry_run": true
+  },
+  {
     "type": "shutdown"
   }
 ]

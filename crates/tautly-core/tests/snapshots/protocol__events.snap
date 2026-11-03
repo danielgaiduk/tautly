@@ -215,5 +215,18 @@ expression: events
     "state": "ready",
     "tools": 12,
     "message": null
+  },
+  {
+    "type": "undone",
+    "turn": 2,
+    "restored": [
+      "src/lib.rs"
+    ],
+    "deleted": [
+      "new.txt"
+    ],
+    "dry_run": false,
+    "backup_ref": "refs/tautly/checkpoints/01J0/undo-7",
+    "note": "ignored files and submodules are not restored"
   }
 ]

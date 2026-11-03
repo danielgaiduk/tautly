@@ -33,8 +33,10 @@ use tautly_provider::ToolSpec;
 use tautly_sandbox::{Effect, Sandbox};
 use tautly_tools::{Tool, registry};
 use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 
 use crate::approvals::{Approvals, Verdict};
+use crate::checkpoint::Point;
 use crate::config::Config;
 use crate::protocol::Event;
 use crate::session::{EventSink, Session};
@@ -53,9 +55,9 @@ const MAX_WARNINGS: usize = 20;
 /// Longest planning (reading `.mcp.json` and the approvals) may take at session start.
 const PLAN_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Runs before a call that may change files the engine does not see change: every stdio
-/// MCP call (spec 7.11.11). Git checkpoints (Task 47) snapshot the work tree here; the
-/// default does nothing.
+/// Runs before a call that may change files the engine does not see change: every `bash`
+/// and stdio MCP call (spec 7.11.11), right after the engine's checkpoint of the work tree
+/// (`checkpoint.rs`). The default does nothing.
 #[async_trait]
 pub trait PreExecHook: Send + Sync {
     /// `tool` is about to run as part of step `turn`.
@@ -533,9 +535,20 @@ impl Session {
         self.specs = specs;
     }
 
-    /// Before a call that may change files unseen: a stdio MCP call.
-    pub(crate) async fn before_exec(&self, tool: &str, effect: &Effect, turn: u32) {
-        if tool.starts_with(MCP_TOOL_PREFIX) && matches!(effect, Effect::Exec { .. }) {
+    /// Before a call that may change files unseen (`bash`, a stdio MCP call) of step
+    /// `turn`: a checkpoint of the work tree (spec 7.11.11; a cancel abandons it), then the
+    /// pre-exec hook. Inside the call's barrier, so its time counts in the call's.
+    pub(crate) async fn before_exec(
+        &self,
+        tool: &str,
+        effect: &Effect,
+        turn: u32,
+        cancel: &CancellationToken,
+    ) {
+        let command = tool == "bash" || tool.starts_with(MCP_TOOL_PREFIX);
+        if command && matches!(effect, Effect::Exec { .. }) {
+            self.git_checkpoint(Point::BeforeExec, turn, Some(cancel))
+                .await;
             self.pre_exec.before_exec(tool, turn).await;
         }
     }

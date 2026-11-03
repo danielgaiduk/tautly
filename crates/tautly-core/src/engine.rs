@@ -48,6 +48,7 @@ use tokio_util::sync::CancellationToken;
 use crate::approvals::{Approvals, Verdict};
 use crate::attempts::AttemptLedger;
 use crate::budget::{Budget, Budgets};
+use crate::checkpoint::{self, Checkpointer, GitCheckpoints, Point};
 use crate::config::{Config, LoadedConfig};
 use crate::evidence::{EvidenceTracker, TestMatcher};
 use crate::ledger::{CostLedger, LEDGER_FILE};
@@ -254,6 +255,19 @@ impl EngineBuilder {
             config.model.as_str(),
         )));
         let groups = ProcessGroups::default();
+        let checkpoints = config
+            .checkpoints
+            .enabled
+            .then(|| {
+                Checkpointer::new(
+                    Arc::clone(&sandbox),
+                    root.clone(),
+                    session_id.clone(),
+                    config.checkpoints,
+                )
+            })
+            .flatten()
+            .map(|cp| GitCheckpoints::shared(cp.with_process_groups(groups.clone())));
         let session = Session {
             context,
             reads: Arc::new(ReadTracker::default()),
@@ -291,6 +305,7 @@ impl EngineBuilder {
             evidence: EvidenceTracker::new(test_matcher),
             mcp: None,
             pre_exec: self.pre_exec.unwrap_or_else(|| Arc::new(NoPreExec)),
+            checkpoints,
             data_home,
             header_init: init,
         };
@@ -326,6 +341,23 @@ impl EngineBuilder {
             event_rx,
         ))
     }
+}
+
+/// Delete checkpoint refs older than `[checkpoints] keep_days` (spec 7.11.11), in the
+/// background after the session-start checkpoint, one git snapshot at a time.
+fn prune_checkpoints(session: &Session) {
+    let Some(shared) = session.checkpoints.clone() else {
+        return;
+    };
+    let sandbox = Arc::clone(&session.sandbox);
+    tokio::spawn(async move {
+        let st = shared.lock().await;
+        let keep_days = st.cp.config().keep_days;
+        let root = sandbox.root().to_path_buf();
+        // Best effort: what is not pruned now is at the next start.
+        let _ = checkpoint::prune(sandbox.as_ref(), &root, keep_days).await;
+        drop(st);
+    });
 }
 
 /// The git top level above `start` (a `.git` directory or file), else `start` itself.
@@ -483,6 +515,10 @@ impl Actor {
         // A log that cannot be rebuilt leaves nothing to run: every command is refused.
         let mut state = match started {
             Ok(()) => {
+                session
+                    .git_checkpoint(Point::Start, session.last_step(), None)
+                    .await;
+                prune_checkpoints(&session);
                 session.mcp = McpSession::start(
                     start.mcp,
                     Arc::clone(&session.sandbox),
@@ -724,6 +760,7 @@ impl Actor {
                 }
             },
             Command::Uncompact => session.uncompact_command().await,
+            Command::Undo { turn, dry_run } => session.undo_command(turn, dry_run).await,
             other => {
                 let name = serde_json::to_value(&other)
                     .ok()

@@ -99,19 +99,23 @@ struct Batch {
 }
 
 impl Batch {
-    fn add(&mut self, root: &Path, event: notify::Result<Event>) {
+    /// Add `event`; returns whether it may have changed work-tree content (anything but
+    /// an access, a cookie or a path inside a `.git` directory; counted at once by
+    /// [`Index::fs_events`]).
+    fn add(&mut self, root: &Path, event: notify::Result<Event>) -> bool {
         let event = match event {
             Ok(e) => e,
             // The watcher lost track of something (queue overflow, limits): resync.
             Err(_) => {
                 self.refresh = true;
                 self.failed = true;
-                return;
+                return true;
             }
         };
         if matches!(event.kind, EventKind::Access(_)) {
-            return;
+            return false;
         }
+        let mut content = event.need_rescan();
         if event.need_rescan() {
             self.refresh = true;
         }
@@ -122,9 +126,11 @@ impl Batch {
             if let Some(id) = cookie_id(rel) {
                 self.cookies.push(id);
             } else if !rel.as_os_str().is_empty() {
+                content |= !rel.components().any(|c| c.as_os_str() == ".git");
                 self.paths.insert(rel.to_path_buf());
             }
         }
+        content
     }
 }
 
@@ -143,12 +149,17 @@ fn run(
             Err(_) => return,
         };
         let mut batch = Batch::default();
-        batch.add(root, first);
+        let count = |changed: bool| {
+            if changed {
+                index.inner.fresh.fs_events.fetch_add(1, Ordering::SeqCst);
+            }
+        };
+        count(batch.add(root, first));
         let give_up = Instant::now() + MAX_DEBOUNCE;
         // A cookie comes after everything it vouches for: no need to wait for more.
         while Instant::now() < give_up && batch.cookies.is_empty() {
             match rx.recv_timeout(DEBOUNCE) {
-                Ok(e) => batch.add(root, e),
+                Ok(e) => count(batch.add(root, e)),
                 Err(_) => break,
             }
         }

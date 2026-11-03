@@ -72,6 +72,8 @@ pub(crate) struct Freshness {
     next_cookie: AtomicU64,
     /// `.tautly/tmp/.gitignore` is known to exist.
     cookie_dir_ready: AtomicBool,
+    /// Watcher events that may have changed work-tree content, counted as they arrive.
+    pub(crate) fs_events: AtomicU64,
 }
 
 impl Default for Freshness {
@@ -88,6 +90,7 @@ impl Default for Freshness {
             cookies: Mutex::new(HashMap::new()),
             next_cookie: AtomicU64::new(1),
             cookie_dir_ready: AtomicBool::new(false),
+            fs_events: AtomicU64::new(0),
         }
     }
 }
@@ -180,6 +183,14 @@ impl Index {
     /// until then [`Index::grep_candidates`] answers [`crate::Candidates::FullScan`].
     pub fn trigrams_ready(&self) -> bool {
         self.inner.fresh.trigrams_ready.load(Ordering::SeqCst)
+    }
+
+    /// How many events the watcher has received that may have changed work-tree content
+    /// (not accesses, cookies or paths inside `.git`), counted on arrival, before
+    /// debouncing. Unchanged across two reads while [`Index::watching`] holds: the watcher
+    /// was told of no change in between (the OS may still deliver one late).
+    pub fn fs_events(&self) -> u64 {
+        self.inner.fresh.fs_events.load(Ordering::SeqCst)
     }
 
     /// True while a file watcher started by [`Index::start_watcher`] is running and has

@@ -1384,9 +1384,13 @@ async fn two_turns_of_edits(fx: &Fx) -> PathBuf {
 
 async fn undo(fx: &Fx, path: &Path, turn: Option<u32>) -> Vec<PathBuf> {
     let reader = SessionReader::<SessionRecord>::open(path).unwrap();
-    let mut restored = resume::undo(&reader, &fx.sandbox(), turn).await.unwrap();
-    restored.sort();
-    restored
+    let report = resume::undo(&reader, &fx.sandbox(), None, turn, false)
+        .await
+        .unwrap();
+    let mut changed = report.restored;
+    changed.extend(report.deleted);
+    changed.sort();
+    changed
 }
 
 #[tokio::test]
@@ -1425,7 +1429,11 @@ async fn undo_deletes_files_created_in_turn() {
     assert!(fx.read("run.sh").is_some());
     // There is no turn 3.
     let reader = SessionReader::<SessionRecord>::open(&path).unwrap();
-    assert!(resume::undo(&reader, &fx.sandbox(), Some(3)).await.is_err());
+    assert!(
+        resume::undo(&reader, &fx.sandbox(), None, Some(3), false)
+            .await
+            .is_err()
+    );
 }
 
 #[tokio::test]
@@ -1481,7 +1489,7 @@ async fn undo_refuses_files_changed_since_the_turn() {
     let refused = |fx: &Fx| {
         let reader = SessionReader::<SessionRecord>::open(&path).unwrap();
         let sandbox = fx.sandbox();
-        async move { resume::undo(&reader, &sandbox, None).await }
+        async move { resume::undo(&reader, &sandbox, None, None, false).await }
     };
     // A human edit after the turn.
     fx.write("a.txt", "HUMAN EDIT\n");
@@ -1511,7 +1519,7 @@ async fn undo_refuses_an_earlier_turn_whose_files_later_turns_changed() {
     let fx = Fx::new();
     let path = two_turns_of_edits(&fx).await;
     let reader = SessionReader::<SessionRecord>::open(&path).unwrap();
-    match resume::undo(&reader, &fx.sandbox(), Some(1)).await {
+    match resume::undo(&reader, &fx.sandbox(), None, Some(1), false).await {
         Err(UndoError::LaterTurns { turns, paths }) => {
             assert_eq!(turns, [2]);
             assert_eq!(paths, [fx.root().join("a.txt")]);
@@ -1531,7 +1539,7 @@ async fn undo_refuses_a_mode_only_change() {
     let a = fx.dir.path().join("a.txt");
     std::fs::set_permissions(&a, std::fs::Permissions::from_mode(0o600)).unwrap();
     let reader = SessionReader::<SessionRecord>::open(&path).unwrap();
-    match resume::undo(&reader, &fx.sandbox(), None).await {
+    match resume::undo(&reader, &fx.sandbox(), None, None, false).await {
         Err(UndoError::Changed { paths }) => assert_eq!(paths, [fx.root().join("a.txt")]),
         other => panic!("{other:?}"),
     }
