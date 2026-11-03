@@ -44,3 +44,6 @@ tree-sitter-json = "0.24"
 tree-sitter-toml-ng = "0.7"
 tree-sitter-yaml = "0.7"
 htmd = "0.5"
+rusqlite = { version = "0.37", features = ["bundled"] }
+rayon = "1"
+streaming-iterator = "0.1"
