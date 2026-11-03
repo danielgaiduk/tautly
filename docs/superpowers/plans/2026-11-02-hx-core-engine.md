@@ -17,7 +17,7 @@
 - Auth: API keys from env vars or OS keychain only. No subscription OAuth, ever.
 - Telemetry: none in v1 (OpenTelemetry export removed, Task 32). The `[telemetry]` table is reserved: parsed, ignored, `Warning` when `enabled = true` (Task 40). Nothing leaves the machine except provider, `web_fetch`, MCP and `doctor` network checks.
 - Cold start < 50 ms; idle RSS < 30 MB; RSS within ±10% over 4-hour simulated session.
-- Dependencies point downward only: `tautly-cli → {tautly-tui, tautly-rpc, tautly-acp} → tautly-core → {tautly-provider, tautly-tools, tautly-context, tautly-memory, tautly-index, tautly-session, tautly-sandbox, tautly-mcp}`; `tautly-mcp → {tautly-tools, tautly-sandbox}`; `tautly-tools → {tautly-sandbox, tautly-provider, tautly-index, tautly-memory}`; `tautly-memory → {tautly-index, tautly-session}`; `tautly-index → tautly-sandbox`; `tautly-context → {tautly-provider, tautly-tools, tautly-index, tautly-sandbox}`.
+- Dependencies point downward only: `tautly-cli → {tautly-tui, tautly-rpc, tautly-acp} → tautly-core → {tautly-provider, tautly-tools, tautly-context, tautly-memory, tautly-index, tautly-session, tautly-sandbox, tautly-mcp}`; `tautly-mcp → {tautly-tools, tautly-sandbox}`; `tautly-tools → {tautly-sandbox, tautly-provider, tautly-index, tautly-memory, tautly-session}`; `tautly-memory → {tautly-index, tautly-session}`; `tautly-index → tautly-sandbox`; `tautly-context → {tautly-provider, tautly-tools, tautly-index, tautly-sandbox}`.
 - `tautly-tools` must not call `std::fs::*`, `tokio::fs::*`, `std::process::Command`, `tokio::process::Command` directly (enforced by `clippy::disallowed_methods`/`disallowed_types`).
 - Errors: `thiserror` per crate; `anyhow` only in `tautly-cli`. No `panic = "abort"`.
 - Paths: config `~/.config/tautly/config.toml`, project `.tautly/config.toml`, sessions `~/.local/share/tautly/sessions/<project-id>/<session-id>.jsonl` (+ `blobs/`; `<project-id>` = blake3 of the git common dir, else of the root, Task 48), ledger `~/.local/share/tautly/ledger.sqlite` (+ `receipts` table), worktree forks and bisect worktrees `~/.local/share/tautly/worktrees/<project-id>/<id>`, working-tree leases `~/.local/share/tautly/locks/<root-hash>.lock`, REPL history `~/.local/share/tautly/repl_history`, MCP approvals `~/.local/share/tautly/mcp-approvals.json`, checkpoint refs `refs/tautly/checkpoints/<session>/<n>` in the user's repository. Honor `XDG_CONFIG_HOME` / `XDG_DATA_HOME` and an `TAUTLY_HOME` override (used by tests).
@@ -858,6 +858,8 @@ proptest! { #[test] fn apply_then_inverse_restores(text in "[a-z\\n]{1,200}", ..
 - [ ] **Step 5: Commit** `git commit -m "feat(core): cancellation, budgets, cost ledger, signal handling"`
 
 ### Task 26: Resume, fork, undo, compaction wiring
+
+**Lane-merge notes (binding):** every started user turn ends with a `TurnEnd` record; on resume after a crash, write the missing `TurnEnd` before anything else (Task 42's session diff attributes edits by `TurnEnd` count). Fork copies records with `SessionWriter::copy_from` (keeps each record's original `t`); it skips unknown envelope types, so record offsets in a child can differ from the parent's — map `Fork{at}` by step numbers, not raw offsets. Step numbers are the single context turn counter (user messages count too, so they have gaps); `/tree`, replay, compare and `--at N` all use these numbers. "Continue here" lists sessions with `list_here_in(<git top-level root>)`.
 
 **Time-travel note (binding, user-approved 2026-11-03; spec 6.5 H5/H7/H9, 7.12):** Task 48 runs first.
 - **Point-in-time rebuild:**

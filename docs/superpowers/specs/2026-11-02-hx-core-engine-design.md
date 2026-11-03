@@ -80,7 +80,7 @@ tautly-cli        binary: arg parsing, selects REPL, headless or ACP mode; docto
      ├─ tautly-session    append-only session log, resume, fork, undo
      └─ tautly-sandbox    Sandbox trait; this sub-project ships a passthrough-with-policy stub
 ```
-Dependencies only point downward (`tautly-acp → tautly-core`, `tautly-core → tautly-mcp → {tautly-tools, tautly-sandbox}`, `tautly-tools → tautly-memory → {tautly-index, tautly-session}`, `tautly-index → tautly-sandbox`, `tautly-tools → tautly-sandbox`, `tautly-context → {tautly-provider, tautly-tools, tautly-index, tautly-sandbox}`). Each crate is independently testable.
+Dependencies only point downward (`tautly-acp → tautly-core`, `tautly-core → tautly-mcp → {tautly-tools, tautly-sandbox}`, `tautly-tools → {tautly-memory, tautly-session}`, `tautly-memory → {tautly-index, tautly-session}`, `tautly-index → tautly-sandbox`, `tautly-tools → tautly-sandbox`, `tautly-context → {tautly-provider, tautly-tools, tautly-index, tautly-sandbox}`). Each crate is independently testable.
 
 ### 2.2 Rules
 - **Single entry point:** `tautly-core` exposes an `Engine` handle. Clients send `Command`s and receive a stream of `Event`s. TUI and RPC are both plain consumers, guaranteeing identical behavior.
@@ -604,7 +604,7 @@ At each directory level where `AGENTS.md` is read (root and ancestors, 6.1), a d
 Every operation here creates a new branch or a new view. None truncates a log, and none overwrites a file the user changed without explicit consent. Rationale: the 2026-11-03 research notes. Untrustworthy file rewind is the most-voiced complaint about other tools, and forks elsewhere share one mutable working tree.
 
 #### 7.12.1 Step addresses and file states
-- **Step addresses.** Steps are numbered by the absolute 1-based provider step (the context turn counter, 7.2). "At step N" means steps 1..N are kept and the next step is N+1. `at = 0` means before the first step. CLIs and the REPL show step numbers next to user turns (`tautly sessions show`, `/tree`).
+- **Step addresses.** Steps are numbered by the single context turn counter (7.2), 1-based. User messages are context turns too, so provider steps are not consecutive (e.g. 2, 3, 5); every tool, record and CLI uses this one numbering. "At step N" means steps 1..N are kept and the next step is N+1. `at = 0` means before the first step. CLIs and the REPL show step numbers next to user turns (`tautly sessions show`, `/tree`).
 - **`state_at(session, N)`, the files at a step boundary:**
   1. Take the earliest `Checkpoint` record after step N.
   2. Restore its tree.
