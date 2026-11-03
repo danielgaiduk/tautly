@@ -209,12 +209,17 @@ impl Index {
             .unwrap_or_else(PoisonError::into_inner)
             .insert(id, marks);
         let mut covered = fresh.covered.subscribe();
-        let written = match self.cookie_path(id).await {
+        let path = self.cookie_path(id).await;
+        let written = match path.clone() {
             Some(path) => tokio::task::spawn_blocking(move || std::fs::write(path, b""))
                 .await
                 .is_ok_and(|r| r.is_ok()),
             None => false,
         };
+        if !written {
+            // Perhaps `.hx/tmp` went away: set it up again next time.
+            fresh.cookie_dir_ready.store(false, Ordering::SeqCst);
+        }
         let seen = written
             && matches!(
                 tokio::time::timeout(COOKIE_TIMEOUT, covered.wait_for(|c| *c >= marks)).await,
@@ -225,6 +230,12 @@ impl Index {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .remove(&id);
+        if written && !seen {
+            // Nobody else will remove it.
+            if let Some(path) = path {
+                let _ = tokio::task::spawn_blocking(move || std::fs::remove_file(path)).await;
+            }
+        }
         seen
     }
 

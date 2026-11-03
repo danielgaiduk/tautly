@@ -36,6 +36,8 @@ pub(crate) const TRI_PENDING: u8 = 2;
 /// SQLite's default page cache, and the one used while refreshing, in KiB.
 const DEFAULT_CACHE_KIB: i64 = 2000;
 const BULK_CACHE_KIB: i64 = 64 * 1024;
+/// The page cache while the tree is loaded at open, in KiB.
+const LOAD_CACHE_KIB: i64 = 128;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SymbolKind {
@@ -197,7 +199,11 @@ impl Index {
         migrate(&mut conn)?;
         // A bulk refresh that was interrupted may have left these dropped.
         ensure_indexes(&conn)?;
+        // Loading the tree reads every row once; a small cache keeps those pages from
+        // staying resident.
+        conn.pragma_update(None, "cache_size", -LOAD_CACHE_KIB)?;
         let tree = load_tree(&conn)?;
+        conn.pragma_update(None, "cache_size", -DEFAULT_CACHE_KIB)?;
         let data_version = data_version(&conn)?;
         Ok(Index {
             inner: Arc::new(Inner {
