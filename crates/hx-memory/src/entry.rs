@@ -42,14 +42,14 @@ impl MemoryKind {
 
 /// A piece of code an entry is about: a file (`symbol` None) or one definition in it, with
 /// the hash it had when the entry was written.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MemAnchor {
     pub path: PathBuf,
     pub symbol: Option<String>,
     pub hash: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MemoryEntry {
     pub id: String,
     pub title: String,
@@ -58,7 +58,9 @@ pub struct MemoryEntry {
     pub created: SystemTime,
     pub verified: Option<SystemTime>,
     pub body: String,
-    /// An anchor's code changed since the entry was written. Never stored in the file.
+    /// An anchor's code changed since the entry was written. Never stored in the file or in
+    /// a serialized proposal; it reads back `false`.
+    #[serde(skip)]
     pub stale: bool,
 }
 
@@ -150,7 +152,7 @@ pub struct MemoryDraft {
 }
 
 /// An entry to write and/or entry ids to delete.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MemoryChange {
     pub upsert: Option<MemoryEntry>,
     pub delete: Vec<String>,
