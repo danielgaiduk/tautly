@@ -7,8 +7,9 @@ use hx_provider::{Capabilities, ToolSpec};
 use hx_sandbox::{Effect, Sandbox, SpawnSpec, parse_commands};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, BufReader};
 use tokio::sync::mpsc;
+use tokio::task::JoinSet;
 use tokio::time::Instant;
 
 use crate::cap::{OUTPUT_CAP, cap_text};
@@ -23,6 +24,12 @@ const TERM_GRACE: Duration = Duration::from_millis(100);
 const DRAIN_GRACE: Duration = Duration::from_millis(200);
 /// Upper bound on output kept in memory; the rest is drained and discarded.
 const MAX_CAPTURE: usize = 16 * 1024 * 1024;
+/// Longest piece of output read as one unit; longer lines are split, so a
+/// newline-free flood never sits in memory whole.
+const MAX_CHUNK: usize = 64 * 1024;
+/// Chunks in flight from the pipe readers (at most `CHANNEL_CHUNKS * MAX_CHUNK`
+/// bytes); a full channel blocks the readers, and so the command, instead of growing.
+const CHANNEL_CHUNKS: usize = 32;
 
 pub struct BashTool;
 
@@ -64,21 +71,51 @@ enum Outcome {
     Cancelled,
 }
 
-fn spawn_reader<R: AsyncRead + Unpin + Send + 'static>(r: R, tx: mpsc::UnboundedSender<Vec<u8>>) {
-    tokio::spawn(async move {
-        let mut r = BufReader::new(r);
+/// Read `r` in chunks into `tx`. The task lives in `set`, so dropping the set (when
+/// the call returns, even if a background child still holds the pipe open) aborts
+/// it and closes our end of the pipe.
+fn spawn_reader<R: AsyncRead + Unpin + Send + 'static>(
+    set: &mut JoinSet<()>,
+    r: R,
+    tx: mpsc::Sender<Vec<u8>>,
+) {
+    set.spawn(async move {
+        let mut r = BufReader::with_capacity(MAX_CHUNK, r);
         loop {
-            let mut line = Vec::new();
-            match r.read_until(b'\n', &mut line).await {
-                Ok(0) | Err(_) => break,
-                Ok(_) => {
-                    if tx.send(line).is_err() {
+            match read_chunk(&mut r).await {
+                Ok(chunk) if chunk.is_empty() => break,
+                Ok(chunk) => {
+                    if tx.send(chunk).await.is_err() {
                         break;
                     }
                 }
+                Err(_) => break,
             }
         }
     });
+}
+
+/// Bytes up to and including the next newline, or `MAX_CHUNK` bytes, whichever
+/// comes first. Empty at end of input.
+async fn read_chunk<R: AsyncBufRead + Unpin>(r: &mut R) -> std::io::Result<Vec<u8>> {
+    let mut out = Vec::new();
+    loop {
+        let buf = r.fill_buf().await?;
+        if buf.is_empty() {
+            return Ok(out);
+        }
+        let room = MAX_CHUNK - out.len();
+        let window = &buf[..buf.len().min(room)];
+        let (n, done) = match window.iter().position(|&b| b == b'\n') {
+            Some(i) => (i + 1, true),
+            None => (window.len(), window.len() == room),
+        };
+        out.extend_from_slice(&window[..n]);
+        r.consume(n);
+        if done {
+            return Ok(out);
+        }
+    }
 }
 
 fn killpg(pgid: u32, sig: libc::c_int) {
@@ -102,9 +139,8 @@ impl Capture<'_> {
             // Bounded and lossy by design: never block the command on a slow consumer.
             let _ = tx.try_send(String::from_utf8_lossy(&line).into_owned());
         }
-        if self.buf.len() < MAX_CAPTURE {
-            self.buf.extend_from_slice(&line);
-        }
+        let room = MAX_CAPTURE.saturating_sub(self.buf.len());
+        self.buf.extend_from_slice(&line[..line.len().min(room)]);
     }
 }
 
@@ -169,12 +205,13 @@ impl Tool for BashTool {
             Err(e) => return ToolResult::error(format!("failed to start: {e}")),
         };
         let pgid = child.id();
-        let (line_tx, mut lines) = mpsc::unbounded_channel();
+        let (line_tx, mut lines) = mpsc::channel(CHANNEL_CHUNKS);
+        let mut readers = JoinSet::new();
         if let Some(out) = child.stdout.take() {
-            spawn_reader(out, line_tx.clone());
+            spawn_reader(&mut readers, out, line_tx.clone());
         }
         if let Some(err) = child.stderr.take() {
-            spawn_reader(err, line_tx.clone());
+            spawn_reader(&mut readers, err, line_tx.clone());
         }
         drop(line_tx);
 
@@ -247,7 +284,14 @@ impl Tool for BashTool {
             Outcome::TimedOut => (true, format!("killed: timed out after {timeout_s}s")),
             Outcome::Cancelled => (true, "killed: cancelled".to_string()),
         };
-        let full = String::from_utf8_lossy(&cap.buf).into_owned();
+        // Stop the readers now (a background child may still hold the pipes) and
+        // release what is in flight.
+        drop(readers);
+        drop(lines);
+        let full = match String::from_utf8(cap.buf) {
+            Ok(s) => s,
+            Err(e) => String::from_utf8_lossy(e.as_bytes()).into_owned(),
+        };
         let (mut text, spilled) = cap_output(&full, OUTPUT_CAP, sb).await;
         if !text.is_empty() && !text.ends_with('\n') {
             text.push('\n');
