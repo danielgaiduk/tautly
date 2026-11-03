@@ -484,3 +484,29 @@ fn unseen_scripts_and_dynamic_wrappers_ask_in_yolo() {
         assert!(asks(y.decide("bash", &exec("x"), Some(cmd))), "{cmd}");
     }
 }
+
+// --- checkpoint fix: I7 key=value argv words ---
+#[test]
+fn key_value_argv_values_are_checked_as_paths() {
+    let y = p(Mode::Yolo);
+    for cmd in [
+        "dd of=Makefile if=evil",
+        "dd if=x of=.git/config",
+        "dd if=.git/config of=x",
+        "dd if=evil of=./sub/../GNUmakefile",
+        "tool out=.git/hooks/pre-commit",
+        "tar -f=.git/x",
+    ] {
+        assert!(asks(y.decide("bash", &exec("dd"), Some(cmd))), "{cmd}");
+    }
+    assert_eq!(
+        y.decide(
+            "bash",
+            &exec("dd"),
+            Some("dd if=/dev/zero of=out.bin count=1")
+        ),
+        Decision::Allow
+    );
+    assert!(asks(y.decide("write", &write("GNUmakefile"), None)));
+    assert!(asks(y.decide("write", &write("sub/gnumakefile"), None)));
+}

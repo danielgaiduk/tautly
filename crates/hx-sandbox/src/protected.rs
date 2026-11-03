@@ -9,6 +9,7 @@ const PROTECTED_DIRS: &[&str] = &[".git", ".hx", ".vscode", ".idea"];
 const PROTECTED_FILES: &[&str] = &[
     ".envrc",
     "makefile",
+    "gnumakefile",
     "package.json",
     "cargo.toml",
     "build.rs",
@@ -78,14 +79,20 @@ pub(crate) fn redirect_reason(root: &Path, target: &str) -> Option<String> {
     path_reason(root, target)
 }
 
-/// Reason a non-flag argv word (a literal shell word, not necessarily a path)
-/// needs approval. Only words that are or may be protected paths trigger.
+/// Reason an argv word (a literal shell word, not necessarily a path) needs
+/// approval. Only words that are or may be protected paths trigger. For
+/// `--opt=value` only the value is checked; for `key=value` (`dd of=x`) both the
+/// whole word and the value are.
 pub(crate) fn argv_word_reason(root: &Path, word: &str) -> Option<String> {
-    let word = if word.starts_with('-') {
-        word.split_once('=').map(|(_, v)| v)?
-    } else {
-        word
-    };
+    match word.split_once('=') {
+        Some((_, value)) if word.starts_with('-') => path_word_reason(root, value),
+        Some((_, value)) => path_word_reason(root, word).or_else(|| path_word_reason(root, value)),
+        None if word.starts_with('-') => None,
+        None => path_word_reason(root, word),
+    }
+}
+
+fn path_word_reason(root: &Path, word: &str) -> Option<String> {
     if matches!(word, "~" | "$HOME" | "${HOME}") {
         return None;
     }
