@@ -778,3 +778,40 @@ async fn symbol_hash_in_narrows_by_parent_and_kind() {
     assert_eq!(idx.symbol_hash_in(rel, "new", Some("C"), None), None);
     assert_eq!(idx.symbol_hash_in(rel, "new", Some("A"), Some(Type)), None);
 }
+
+#[tokio::test]
+async fn top_referenced_ranks_defined_symbols_by_reference_count() {
+    let (_t, idx) = index_with(&[
+        (
+            "src/a.rs",
+            "pub struct Widget;\nimpl Widget {\n    pub fn new() -> Widget { Widget }\n}\npub fn helper() {}\n",
+        ),
+        (
+            "src/b.rs",
+            "fn run() {\n    let w = Widget::new();\n    let v = Widget::new();\n    helper();\n    self::unknown();\n    unknown();\n    unknown();\n    unknown();\n}\n",
+        ),
+        (
+            "src/c.rs",
+            "fn zeta() { helper(); }\nfn alpha() { helper(); }\n",
+        ),
+    ]);
+    idx.refresh().await.unwrap();
+
+    let top = idx.top_referenced(10);
+    // Widget is referenced most (impl, return type and body in a.rs, twice in b.rs).
+    let names: Vec<&str> = top.iter().map(|(n, _)| n.as_str()).collect();
+    assert_eq!(names.first().copied(), Some("Widget"));
+    assert!(names.contains(&"helper"));
+    // Undefined identifiers and methods are not symbols worth ranking.
+    assert!(!names.contains(&"unknown"));
+    assert!(!names.contains(&"new"));
+    assert!(
+        top.windows(2)
+            .all(|w| w[0].1 > w[1].1 || (w[0].1 == w[1].1 && w[0].0 < w[1].0))
+    );
+    let helper = top.iter().find(|(n, _)| n == "helper").unwrap().1;
+    assert_eq!(helper, idx.refs("helper", 100).unwrap().len() as u64);
+    // The cap is honored.
+    assert_eq!(idx.top_referenced(1).len(), 1);
+    assert!(idx.top_referenced(0).is_empty());
+}

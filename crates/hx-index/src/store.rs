@@ -308,6 +308,31 @@ impl Index {
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
+    /// The most-referenced defined symbols as `(name, reference count)`, at most `limit`,
+    /// most referenced first (ties by name). Only names the index has a non-method
+    /// definition for count: identifiers like `self` or library calls are not symbols of
+    /// this repository, and method names (`new`, `len`) are shared noise. The cap is
+    /// applied in SQL.
+    pub fn top_referenced(&self, limit: usize) -> Vec<(String, u64)> {
+        let conn = self.inner.conn();
+        let Ok(mut stmt) = conn.prepare_cached(
+            "SELECT r.name, COUNT(*) AS n FROM refs r \
+             WHERE r.name IN (SELECT name FROM symbols WHERE kind != 'method') \
+             GROUP BY r.name ORDER BY n DESC, r.name ASC LIMIT ?1",
+        ) else {
+            return Vec::new();
+        };
+        let Ok(rows) = stmt.query_map([limit as i64], |r| Ok((r.get(0)?, r.get(1)?))) else {
+            return Vec::new();
+        };
+        rows.filter_map(Result::ok).collect()
+    }
+
+    /// The workspace root the index reads from.
+    pub fn root(&self) -> &Path {
+        self.inner.sb.root()
+    }
+
     /// blake3 hex of the file content as last indexed.
     pub fn file_hash(&self, rel: &Path) -> Option<String> {
         let key = self.inner.key(rel);
