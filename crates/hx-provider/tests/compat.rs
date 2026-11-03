@@ -505,3 +505,39 @@ async fn tool_calls_without_index_split_on_new_id() {
         ]
     );
 }
+
+// ---- checkpoint fix: I2 index-less tool call after a finished choice ----
+#[tokio::test]
+async fn new_indexless_tool_call_after_finish_does_not_panic() {
+    let body = [
+        r#"{"id":"n1","choices":[{"index":0,"delta":{"tool_calls":[{"id":"call_x","type":"function","function":{"name":"read_file","arguments":"{}"}}]},"finish_reason":null}]}"#,
+        r#"{"id":"n1","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#,
+        r#"{"id":"n1","choices":[{"index":0,"delta":{"tool_calls":[{"id":"call_y","type":"function","function":{"name":"grep","arguments":"{}"}}]},"finish_reason":null}]}"#,
+        "[DONE]",
+    ]
+    .iter()
+    .map(|d| format!("data: {d}\n\n"))
+    .collect::<String>();
+    let server = serve(sse(body)).await;
+    // Run on its own task so a panic shows up as a JoinError, not a test abort.
+    let handle = tokio::spawn(async move { run(&server).await });
+    let evs = ok(handle.await.expect("compat stream task panicked"));
+    assert_eq!(
+        evs,
+        vec![
+            ProviderEvent::ToolCall {
+                id: "call_x".into(),
+                name: "read_file".into(),
+                input_json: "{}".into()
+            },
+            ProviderEvent::ToolCall {
+                id: "call_y".into(),
+                name: "grep".into(),
+                input_json: "{}".into()
+            },
+            ProviderEvent::Done {
+                stop: StopReason::ToolUse
+            },
+        ]
+    );
+}

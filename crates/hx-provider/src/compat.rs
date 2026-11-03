@@ -241,6 +241,8 @@ struct StreamState {
 
 impl StreamState {
     fn flush_calls(&mut self, out: &mut Vec<ProviderEvent>) {
+        // The flushed calls are gone; a later index-less delta must not continue one.
+        self.current = None;
         for (index, c) in std::mem::take(&mut self.calls) {
             self.has_calls = true;
             out.push(ProviderEvent::ToolCall {
@@ -295,15 +297,13 @@ impl StreamState {
                 Some(i) => i,
                 // Without an index, a delta with a new id starts a new call; anything else
                 // continues the current one.
-                None => match self.current {
-                    Some(k)
-                        if id.is_none_or(|id| {
-                            self.calls[&k].id.is_empty() || self.calls[&k].id == id
-                        }) =>
-                    {
-                        k
-                    }
-                    _ => self.calls.keys().next_back().map_or(0, |k| k + 1),
+                None => match self.current.filter(|k| {
+                    self.calls
+                        .get(k)
+                        .is_some_and(|c| id.is_none_or(|id| c.id.is_empty() || c.id == id))
+                }) {
+                    Some(k) => k,
+                    None => self.calls.keys().next_back().map_or(0, |k| k + 1),
                 },
             };
             self.current = Some(key);
