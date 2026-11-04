@@ -127,6 +127,14 @@ pub enum Skip {
     /// repository it points at.
     #[error("the work tree's .git is a symbolic link (checkpoints are off for this session)")]
     GitDirSymlink,
+    /// Reading the repository's git configuration did not finish in
+    /// [`CONFIG_READ_TIMEOUT`]: an include that never ends (a FIFO), which every later git
+    /// call would wait on too.
+    #[error(
+        "reading the repository's git configuration took too long (an include that never \
+         ends?); checkpoints are off for this session"
+    )]
+    ConfigTimeout,
     /// The root's `.git` names a git directory (a `.git` file, or a `commondir`) that
     /// git's own links do not confirm belongs to this work tree
     /// ([`tautly_session::git_dirs_at`]): checkpoints could write to another repository.
@@ -164,7 +172,7 @@ impl From<Skip> for CheckpointError {
     fn from(s: Skip) -> Self {
         match s {
             Skip::NoGit => CheckpointError::NoGit,
-            Skip::Timeout => CheckpointError::Timeout,
+            Skip::Timeout | Skip::ConfigTimeout => CheckpointError::Timeout,
             Skip::Git(why) => CheckpointError::Git(why),
             other @ (Skip::TooManyUntracked { .. }
             | Skip::UnsafePartialClone
@@ -179,7 +187,10 @@ impl Skip {
     pub fn is_permanent(&self) -> bool {
         matches!(
             self,
-            Skip::UnsafePartialClone | Skip::GitDirSymlink | Skip::GitDirUnverified
+            Skip::UnsafePartialClone
+                | Skip::GitDirSymlink
+                | Skip::GitDirUnverified
+                | Skip::ConfigTimeout
         )
     }
 
@@ -211,6 +222,7 @@ impl Skip {
         match self {
             Skip::NoGit => "no_git",
             Skip::Timeout => "timeout",
+            Skip::ConfigTimeout => "config_timeout",
             Skip::TooManyUntracked { .. } => "too_many_untracked",
             Skip::Git(_) => "git_failed",
             Skip::UnsafePartialClone => "unsafe_partial_clone",
@@ -245,6 +257,9 @@ pub fn ref_name(session: &str, name: &str) -> String {
 enum Fail {
     NoGit,
     Timeout,
+    /// The configuration read ([`Git::read_config`]) did not finish in
+    /// [`CONFIG_READ_TIMEOUT`].
+    ConfigTimeout,
     /// It ran and exited non-zero (`code`; none: killed by a signal).
     Exit {
         code: Option<i32>,
@@ -262,6 +277,7 @@ impl From<Fail> for Skip {
             Fail::NoGit => Skip::NoGit,
             Fail::UnsafePartialClone => Skip::UnsafePartialClone,
             Fail::Timeout => Skip::Timeout,
+            Fail::ConfigTimeout => Skip::ConfigTimeout,
             Fail::Exit { stderr, code } => Skip::Git(if stderr.is_empty() {
                 format!("exit status {code:?}")
             } else {
@@ -341,6 +357,13 @@ struct Git<'a> {
 
 /// The cell a checkpointer keeps its git's version in.
 type GitVersion = tokio::sync::OnceCell<Option<(u32, u32)>>;
+
+/// Longest a read of the repository's configuration may take, whatever the operation's
+/// deadline: an `include.path` naming a FIFO blocks every git call, and each would wait
+/// out its whole deadline (60 s for a restore). Below the default snapshot timeout, so
+/// that case turns checkpoints off for the session ([`Skip::ConfigTimeout`]) instead of
+/// costing every command the full timeout.
+const CONFIG_READ_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// The first git release that honours `GIT_NO_LAZY_FETCH`.
 const LAZY_FETCH_OFF_SINCE: (u32, u32) = (2, 44);
@@ -437,20 +460,24 @@ impl<'a> Git<'a> {
             .await
     }
 
+    /// Within [`CONFIG_READ_TIMEOUT`] as well as `deadline`; running out of the former is
+    /// [`Fail::ConfigTimeout`].
     async fn read_config(&self, deadline: Instant) -> Result<RepoConfig, Fail> {
         let wanted = r"^(filter\..+|protocol\..+\.allow|extensions\.partialclone|remote\..+\.(promisor|partialclonefilter))$";
+        let cap = Instant::now() + CONFIG_READ_TIMEOUT;
         let out = match self
             .exec(
                 &["config", "-z", "--get-regexp", wanted],
                 &[],
                 None,
-                deadline,
+                deadline.min(cap),
             )
             .await
         {
             Ok(out) => out,
             // Nothing matched.
             Err(Fail::Exit { code: Some(1), .. }) => return Ok(RepoConfig::default()),
+            Err(Fail::Timeout) if cap <= deadline => return Err(Fail::ConfigTimeout),
             Err(e) => return Err(e),
         };
         parse_config(&out)

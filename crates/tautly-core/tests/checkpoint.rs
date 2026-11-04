@@ -527,10 +527,13 @@ async fn timeout_skips_with_warning() {
     let repo = Repo::with(&[("a.txt", "a\n")]);
     let pid_file = repo.home.path().join("sleep.pid");
     let shim = repo.home.path().join("git");
+    // The configuration read goes to the real git (one that never ends is another case:
+    // `config_include_that_never_ends_turns_checkpoints_off_once`); the next call hangs.
     executable(
         &shim,
         &format!(
-            "#!/bin/sh\nsleep 30 &\necho $! > '{}'\nwait\n",
+            "#!/bin/sh\ncase \" $* \" in *\" config \"*) exec git \"$@\";; esac\n\
+             sleep 30 &\necho $! > '{}'\nwait\n",
             pid_file.display()
         ),
     );
@@ -1914,6 +1917,60 @@ async fn spill_store_never_enters_a_checkpoint() {
     assert!(files.contains(".tautly/config.toml"), "{files}");
     let config = repo.git(&["show", &format!("{}:.tautly/config.toml", made.commit)]);
     assert_eq!(config, "max_turns = 5");
+}
+
+/// Review B-M3, probe P4: a repository `include.path` naming a FIFO blocks every git
+/// call. The configuration read gives up within its own cap (not the operation's
+/// deadline), and checkpoints are then off for the session with one warning, so later
+/// commands do not each wait out the timeout.
+#[tokio::test]
+async fn config_include_that_never_ends_turns_checkpoints_off_once() {
+    let repo = Repo::with(&[("a.txt", "a\n")]);
+    let fifo = repo.home.path().join("never.fifo");
+    let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+    // SAFETY: mkfifo with a valid NUL-terminated path.
+    assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o644) }, 0);
+    let mut git_config = std::fs::read_to_string(repo.path(".git/config")).unwrap();
+    git_config.push_str(&format!("[include]\n\tpath = {}\n", fifo.display()));
+    std::fs::write(repo.path(".git/config"), git_config).unwrap();
+
+    let mut cp = repo.checkpointer(CheckpointConfig::default());
+    let began = Instant::now();
+    assert_eq!(cp.snapshot_now().await, Err(Skip::ConfigTimeout));
+    assert!(
+        began.elapsed() < Duration::from_millis(2900),
+        "{:?}",
+        began.elapsed()
+    );
+
+    let mock = MockProvider::new(vec![
+        tools_step(vec![bash("b1", "true")]),
+        tools_step(vec![bash("b2", "true")]),
+        tools_step(vec![bash("b3", "true")]),
+        text_step("done"),
+    ]);
+    let began = Instant::now();
+    let mut run = start(repo.builder(config(), &mock));
+    let events = run.turn_with("go").await;
+    let elapsed = began.elapsed();
+    let (_, path) = run.engine.current_session();
+    run.stop().await;
+    let skipped: Vec<String> = warnings(&events)
+        .into_iter()
+        .filter(|w| w.starts_with("checkpoint skipped"))
+        .collect();
+    assert_eq!(skipped, [skip_warning(&Skip::ConfigTimeout)]);
+    let reasons: Vec<String> = records_at(&path)
+        .into_iter()
+        .filter_map(|r| match r {
+            SessionRecord::CheckpointSkipped { reason, .. } => Some(reason),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(reasons, ["config_timeout"]);
+    // Three commands and a turn end did not each wait for git.
+    assert!(elapsed < Duration::from_secs(8), "{elapsed:?}");
+    assert!(!repo.path(".git/refs/tautly").exists());
 }
 
 /// A real linked worktree keeps its checkpoints (in the shared repository).
