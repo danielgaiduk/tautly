@@ -181,7 +181,7 @@ trait Provider: Send + Sync {
 Adapters may place the volatile tail (6.1) inside the last tool result's content when the provider would otherwise treat it as a new user turn (earlier reasoning is then dropped); the last cache breakpoint stays on the block before it.
 
 ### 4.3 Model catalog
-Built-in TOML catalog (context window, prices per token class, capabilities). User overrides in config. `tautly models update` refreshes from a models.dev-format source. Unknown models get conservative defaults and `cost_usd = null`.
+Built-in TOML catalog (context window, prices per token class, capabilities). User overrides in config. `tautly models update [--from URL]` (default `https://models.dev/api.json`) refreshes from a models.dev-format source into `<config home>/models.toml`, which sits under `[catalog_overrides]` of `config.toml` (the file's own entries win) and over the built-in catalog. Only the providers Tautly has adapters for (`anthropic`, `openai`, `google`) and models that can call tools and have a price and limits are read. A model the catalog knows keeps its other fields and takes the source's window, output limit, image support and prices; one it does not know is added with conservative capabilities (no reasoning or cache control, hashline edits, no parallel tools). `tautly models list` shows the merged catalog. Unknown models get conservative defaults and `cost_usd = null`.
 
 ### 4.4 Auth
 API keys from environment variables or the OS keychain (`keyring` crate). No subscription OAuth. `tautly auth add <provider>` writes the keychain; provider detection when no model is configured is in 7.11.2.

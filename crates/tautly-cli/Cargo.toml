@@ -1,6 +1,6 @@
 [package]
 name = "tautly"
-description = "The `tautly` command: one-shot (`-p`) and JSON-RPC (`--rpc`) modes"
+description = "The `tautly` command: one-shot (`-p`), JSON-RPC (`--rpc`) and utility commands"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

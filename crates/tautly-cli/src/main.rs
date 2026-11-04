@@ -9,6 +9,9 @@
 //! - `tautly auth add <provider>` stores an API key in the OS keychain; `tautly doctor`
 //!   checks the setup (spec 7.11.2).
 //!
+//! `tautly prompt|sessions|models|undo|memory|index|mcp ...` are utility commands
+//! (`cmd`): they read or change what sessions leave behind and exit.
+//!
 //! Flags shared by `-p` and `--rpc`: `--approve auto-edit|yolo` (headless `ask` is
 //! otherwise denied), `--approve-memory`, `--approve-mcp`, `--model ID`, `--budget-usd N`
 //! (a session budget, sent before the first message), `--continue` / `--resume ID`,
@@ -52,8 +55,7 @@ const EXIT_GRACE: Duration = Duration::from_secs(2);
     version,
     about = "A token-efficient AI coding agent",
     after_help = "Exit codes with -p: 0 completed, 1 error, 2 budget/max turns/timeout, \
-                  130 cancelled (Ctrl-C), 143 SIGTERM, 129 SIGHUP.",
-    args_conflicts_with_subcommands = true
+                  130 cancelled (Ctrl-C), 143 SIGTERM, 129 SIGHUP."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -128,6 +130,8 @@ enum Sub {
     /// Check the configuration, model, keys, network, data directory, sandbox, git, code
     /// index and MCP servers.
     Doctor(cmd::doctor::DoctorArgs),
+    #[command(flatten)]
+    Util(cmd::Command),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -353,14 +357,26 @@ impl Settings {
     }
 }
 
+fn exit_code(code: i32) -> ExitCode {
+    ExitCode::from(u8::try_from(code).unwrap_or(1))
+}
+
 fn main() -> ExitCode {
     let mut cli = Cli::parse();
-    if let Some(sub) = cli.command.take() {
-        let code = match sub {
-            Sub::Auth(cmd) => cmd::auth::main(cmd),
-            Sub::Doctor(args) => cmd::doctor::main(args),
-        };
-        return ExitCode::from(u8::try_from(code).unwrap_or(1));
+    if cli.command.is_some()
+        && (cli.prompt.is_some() || cli.rpc || cli.continue_latest || cli.resume.is_some())
+    {
+        Cli::command()
+            .error(
+                clap::error::ErrorKind::ArgumentConflict,
+                "-p, --rpc, --continue and --resume do not go with a command",
+            )
+            .exit();
+    }
+    match cli.command.take() {
+        Some(Sub::Auth(cmd)) => return exit_code(cmd::auth::main(cmd)),
+        Some(Sub::Doctor(args)) => return exit_code(cmd::doctor::main(args)),
+        other => cli.command = other,
     }
     if cli.output.is_some() && cli.prompt.is_none() {
         Cli::command()
@@ -393,7 +409,10 @@ fn main() -> ExitCode {
     ExitCode::from(u8::try_from(code).unwrap_or(1))
 }
 
-async fn run(cli: Cli) -> anyhow::Result<i32> {
+async fn run(mut cli: Cli) -> anyhow::Result<i32> {
+    if let Some(Sub::Util(command)) = cli.command.take() {
+        return cmd::run(command, &cli).await;
+    }
     if cli.prompt.is_none() && !cli.rpc {
         eprintln!(
             "tautly: the interactive REPL is not available yet; use -p PROMPT or --rpc \
