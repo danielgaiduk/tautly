@@ -554,25 +554,27 @@ where
             _ => which.to_string(),
         };
         self.close().await?;
-        let (engine, events) = match build(&self.factory, Some(id.clone())).await {
-            Ok(built) => built,
+        let (built, resumed) = match build(&self.factory, Some(id.clone())).await {
+            Ok(built) => (built, true),
             Err(e) => {
                 let text = format!(
                     "cannot resume {}: {e}; starting a new session",
                     printable(&id)
                 );
                 self.print_line(&text).await?;
-                self.st.new_session();
-                build(&self.factory, None).await?
+                (build(&self.factory, None).await?, false)
             }
         };
-        self.engine = engine;
-        self.events = events;
+        (self.engine, self.events) = built;
         self.answered.clear();
         self.st.new_session();
-        self.st.receipts = self.earlier_receipts(&id).await;
-        self.print_line(&format!("resumed {}", printable(&id)))
-            .await?;
+        // The session now running, whichever it is: never the failed id's spend.
+        let current = self.engine.session_id().to_string();
+        self.st.receipts = self.earlier_receipts(&current).await;
+        if resumed {
+            self.print_line(&format!("resumed {}", printable(&current)))
+                .await?;
+        }
         Ok(false)
     }
 

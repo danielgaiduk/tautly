@@ -630,38 +630,52 @@ pub fn evidence_line(ev: &TestEvidence) -> String {
     )
 }
 
-/// Most lines of arguments an approval shows before `(N more lines)`.
+/// Most lines of JSON arguments (MCP and other tools) an approval shows before
+/// `(N more lines)`. A command is never cut.
 pub const APPROVAL_LINES: usize = 200;
 
-/// What an approval shows of a call, in full (never the row's 60-column cut): a command
-/// line by line (a newline in it starts a new `$` line, so two commands never read as
-/// one), a path, a URL, or the arguments as pretty-printed JSON (MCP tools and the rest).
-/// Escaped (spec 3.4); capped at [`APPROVAL_LINES`] lines with a marker.
+/// What an approval shows of a call, in full (never the row's 60-column cut), escaped
+/// (spec 3.4):
+/// - a command, every line of it, however long (a newline starts a new `>` line, so two
+///   commands never read as one; a final newline adds no line);
+/// - a path, or a URL;
+/// - otherwise (MCP tools and the rest) the arguments as pretty-printed JSON, capped at
+///   [`APPROVAL_LINES`] lines with a marker.
 pub fn approval_args(tool: &str, args: &Value) -> String {
     let arg = |k: &str| args.get(k).and_then(Value::as_str);
-    let lines: Vec<String> = match (tool, arg("command"), arg("path"), arg("url")) {
-        ("bash", Some(cmd), _, _) => printable_multiline(cmd)
-            .split('\n')
-            .enumerate()
-            .map(|(i, l)| format!("  {} {l}", if i == 0 { "$" } else { ">" }))
-            .collect(),
-        ("edit" | "write", _, Some(path), _) => vec![format!("  {}", printable(path))],
-        ("web_fetch", _, _, Some(url)) => vec![format!("  {}", printable(url))],
+    let split = |text: &str| -> Vec<String> {
+        let text = printable_multiline(text);
+        let text = text.strip_suffix('\n').unwrap_or(&text);
+        text.split('\n').map(str::to_string).collect()
+    };
+    let (lines, cap): (Vec<String>, usize) = match (tool, arg("command"), arg("path"), arg("url")) {
+        ("bash", Some(cmd), _, _) => (
+            split(cmd)
+                .into_iter()
+                .enumerate()
+                .map(|(i, l)| format!("  {} {l}", if i == 0 { "$" } else { ">" }))
+                .collect(),
+            usize::MAX,
+        ),
+        ("edit" | "write", _, Some(path), _) => {
+            (vec![format!("  {}", printable(path))], usize::MAX)
+        }
+        ("web_fetch", _, _, Some(url)) => (vec![format!("  {}", printable(url))], usize::MAX),
         _ => {
             let json = serde_json::to_string_pretty(args).unwrap_or_default();
-            printable_multiline(&json)
-                .split('\n')
-                .map(|l| format!("  {l}"))
-                .collect()
+            (
+                split(&json).into_iter().map(|l| format!("  {l}")).collect(),
+                APPROVAL_LINES,
+            )
         }
     };
     let mut out = String::new();
-    for l in lines.iter().take(APPROVAL_LINES) {
+    for l in lines.iter().take(cap) {
         out.push_str(l);
         out.push('\n');
     }
-    if lines.len() > APPROVAL_LINES {
-        let _ = writeln!(out, "  ({} more lines)", lines.len() - APPROVAL_LINES);
+    if lines.len() > cap {
+        let _ = writeln!(out, "  ({} more lines)", lines.len() - cap);
     }
     out
 }

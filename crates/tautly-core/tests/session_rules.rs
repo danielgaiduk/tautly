@@ -402,7 +402,7 @@ async fn broad_session_rule_says_so() {
     let n = notices(&seen);
     assert_eq!(n.len(), 1, "{seen:?}");
     assert!(
-        n[0].starts_with("allowed for this session: bash (every `bash` call"),
+        n[0].starts_with("allowed for this session: bash (broad:"),
         "{n:?}"
     );
     run.shutdown().await;

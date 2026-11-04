@@ -244,6 +244,7 @@ Rules are evaluated in `tautly-core`; OS-level enforcement is sub-project 2.
 - Session rules: an approval answered "allow for this session" adds an in-memory allow rule (7.11.8). It is never persisted, not even across resume. Deny rules and protected paths still win over it.
 - **Protected paths always ask, in every mode:** `.git/`, `.tautly/`, git hook paths, `.github/workflows/`, `.vscode/`, `.idea/`, `.envrc`, `Makefile`, `package.json`, `Cargo.toml` `build.rs`, shell rc files. Defends against "agent writes a file a trusted host tool later executes."
 - **Command parsing:** shell input is parsed (pipes, `&&`, `||`, `;`, subshells, command substitution) into individual commands; every component must pass the rules. Unparseable input resolves to `ask`. No name-based "safe command" shortcuts.
+- **Write redirects are part of what an allow rule must match** (configured and session rules alike; Task 30 review). A component's write redirects other than `/dev/null` (`>`, `>>`, `&>`, `2>`, …, all written ` > <target>`) are appended to the command a rule matches, so `bash(cargo test)` does not allow `cargo test > src/lib.rs`. A command with such a redirect is allowed only by a rule that matches it with the redirect and either also matches the bare command (`bash(cargo test*)`) or names a redirect (its pattern holds ` > `), so a model-chosen target never satisfies a suffix or infix pattern (`bash(* --version)` does not allow `rm -rf src > ' --version'`). Deny rules are matched against that form too. Reads and fd duplications (`2>&1`) are not included. Commands that write through their own arguments (`tee`, `dd of=`, `cp`, `sed -i`) are judged like any other component: by their argv.
 
 ## 6. Context and sessions
 
@@ -497,11 +498,11 @@ At each directory level where `AGENTS.md` is read (root and ancestors, 6.1), a d
   - Diffs are coloured (green additions, red removals, dim context).
   - After each turn a footer: `turn N · S steps · 12.4s · ctx <used>/<budget> tok · cache 86% · $0.0712 (session $0.4120) · saved ~41k tok (est.)`, then the evidence line (7.11.7). `[receipts] footer = false` hides it.
 - **Approvals:**
-  - The prompt shows tool, target and the diff preview, then `allow? [y]es [n]o [a]lways this session (<rule>)`.
+  - The prompt shows the tool, the whole call (every line of a command, the path, the URL, or the arguments as JSON, capped at 200 lines for JSON only), escaped, and the diff preview, then `allow? [y]es [n]o [a]lways this session (<rule>)`.
   - `y` approves once; `n` denies.
   - `a` approves and sends `session_rule` with the exact-target rule:
     - `edit(<path>)`, `write(<path>)`
-    - `bash(<command>)`, whitespace-collapsed, with glob metacharacters escaped
+    - `bash(<command>)`: the one parsed command as rules see it (leading assignments, then its words with quotes removed, then ` > <target>` for each write redirect, every write operator written ` > `), with glob metacharacters escaped; none is offered for several commands, an unparseable one, or one containing parentheses
     - `web_fetch(<host>)`
     - `mcp__<server>__<tool>`
   - `a <rule>` sends the user's own pattern instead. The engine accepts a session rule only if it matches the pending call; otherwise it approves once and warns.

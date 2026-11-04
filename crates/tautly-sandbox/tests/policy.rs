@@ -1170,3 +1170,44 @@ fn exact_rule_is_built_from_the_parsed_call_and_matches_it() {
     );
     assert_eq!(pol.exact_rule("read", &Effect::ReadOnly, None), None);
 }
+
+// --- re-review T30-N1: a redirect target never satisfies a suffix or infix pattern ---
+#[test]
+fn redirect_targets_do_not_satisfy_suffix_or_infix_patterns() {
+    let run = |pol: &Policy, raw: &str| pol.decide("bash", &exec("sh"), Some(raw));
+    for (rule, raw) in [
+        ("bash(git * --dry-run)", "git push --force > ' --dry-run'"),
+        ("bash(* --version)", "rm -rf src > ' --version'"),
+        ("bash(*.txt)", "rm -rf src > a.txt"),
+        ("bash(npm * --dry-run)", "npm publish > z' --dry-run'"),
+    ] {
+        let config = with_rules(Mode::Ask, &[rule], &[]);
+        assert!(asks(run(&config, raw)), "config {rule}: {raw}");
+        let mut session = p(Mode::Ask);
+        session.add_session_allow(rule).unwrap();
+        assert!(asks(run(&session, raw)), "session {rule}: {raw}");
+        assert!(
+            !session
+                .rule_matches(rule, "bash", &exec("sh"), Some(raw))
+                .unwrap(),
+            "{rule}: {raw}"
+        );
+    }
+    // Still allowed: a pattern covering the bare command that reaches the redirect, a
+    // pattern naming the redirect, and the suffix patterns on what they mean.
+    let ok = |rule: &str, raw: &str| {
+        assert_eq!(
+            run(&with_rules(Mode::Ask, &[rule], &[]), raw),
+            Decision::Allow,
+            "{rule}: {raw}"
+        );
+    };
+    ok("bash(cargo test*)", "cargo test > out.txt");
+    ok("bash(cargo test > out.txt)", "cargo test > out.txt");
+    ok("bash(cargo test > *)", "cargo test > out.txt");
+    ok("bash(git * --dry-run)", "git push --dry-run");
+    ok("bash(git * --dry-run)", "git push --dry-run 2>&1");
+    // Deny rules see the redirect too.
+    let deny = with_rules(Mode::Yolo, &[], &["bash(* > .env)"]);
+    assert!(matches!(run(&deny, "echo x > .env"), Decision::Deny { .. }));
+}

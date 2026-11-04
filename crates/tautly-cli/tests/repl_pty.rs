@@ -155,3 +155,30 @@ fn repl_runs_on_a_terminal_and_continue_resumes_the_last_session() {
     pty.wait_for("turn 2 ·");
     assert_eq!(pty.finish(), 0);
 }
+
+/// Re-review T30-R6: in REPL mode the engine's signal handler covers SIGTERM and SIGHUP
+/// only. With the full handler, three SIGINTs at the prompt would cancel, shut the
+/// session down, then kill the process; here the REPL alone hears them, and the session
+/// goes on.
+#[test]
+fn sigint_at_the_prompt_does_not_reach_the_engine() {
+    let (work, home) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+    let reply = script(home.path(), "still alive after SIGINT");
+    let mut pty = Pty::spawn(
+        work.path(),
+        home.path(),
+        &["--mock-script", &reply, "--model", "mock/test"],
+    );
+    pty.wait_for("Ctrl+D to exit");
+    let pid = i32::try_from(pty.child.id()).unwrap();
+    for _ in 0..3 {
+        // SAFETY: signalling our own child process.
+        assert_eq!(unsafe { libc::kill(pid, libc::SIGINT) }, 0);
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(pty.child.try_wait().unwrap().is_none(), "{}", pty.text());
+    pty.send("hello\r");
+    pty.wait_for("still alive after SIGINT");
+    pty.wait_for("turn 1 ·");
+    assert_eq!(pty.finish(), 0);
+}

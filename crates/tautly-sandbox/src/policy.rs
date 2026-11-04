@@ -146,6 +146,12 @@ impl Rule {
         }
     }
 
+    /// The rule's pattern names a write redirect (` > `, the form [`allow_subject`] gives
+    /// every write operator).
+    fn names_redirect(&self) -> bool {
+        self.glob.is_some() && self.text.contains(" > ")
+    }
+
     fn matches_str(&self, tool: &str, s: &str) -> bool {
         self.is_for(tool) && self.glob.as_ref().is_none_or(|g| g.is_match(s))
     }
@@ -237,7 +243,7 @@ impl Policy {
             return Ok(rule.is_for(tool));
         }
         let subjects = self.subjects(effect, raw_cmd);
-        Ok(allows(&|s| rule.matches_str(tool, s), &subjects))
+        Ok(allows(&[&rule], tool, &subjects))
     }
 
     /// The narrowest rule that allows this call, as "allow for this session" offers it:
@@ -247,6 +253,10 @@ impl Policy {
     /// outside the root or reached through a symlink, a read-only call, or a subject with
     /// parentheses (which a rule cannot hold). The rule returned always
     /// [matches](Self::rule_matches) the call.
+    ///
+    /// Every write operator is written ` > ` in the rule ([`allow_subject`]):
+    /// `cargo test 2> out.txt` offers `bash(cargo test > out.txt)`, which also allows `>`,
+    /// `>>` or `&>` to that same file (the same target, so nothing more is written to).
     pub fn exact_rule(&self, tool: &str, effect: &Effect, raw_cmd: Option<&str>) -> Option<String> {
         let rule = if tool.starts_with(MCP_PREFIX) {
             tool.to_string()
@@ -291,13 +301,8 @@ impl Policy {
         if let Some(reason) = self.needs_approval(&subjects) {
             return Decision::Ask { reason };
         }
-        let any_rule = |s: &str| {
-            self.allow
-                .iter()
-                .chain(&self.session)
-                .any(|r| r.matches_str(tool, s))
-        };
-        if allows(&any_rule, &subjects) {
+        let rules: Vec<&Rule> = self.allow.iter().chain(&self.session).collect();
+        if allows(&rules, tool, &subjects) {
             return Decision::Allow;
         }
         self.mode_default(effect, &subjects)
@@ -355,6 +360,7 @@ impl Policy {
                         || cmds.iter().any(|c| {
                             r.matches_str(tool, &c.argv.join(" "))
                                 || r.matches_str(tool, &command_line(c))
+                                || r.matches_str(tool, &allow_subject(c))
                         })
                 }
                 Subjects::Unparseable { raw, .. } => r.matches_str(tool, raw) || r.glob.is_none(),
@@ -443,14 +449,13 @@ impl Policy {
     }
 }
 
-/// Whether every subject of a call is allowed, `any` saying whether some rule allows one:
-/// each parsed command, each write path (as normalized inside the root, and after
-/// following symlinks), the host.
-fn allows(any: &dyn Fn(&str) -> bool, subjects: &Subjects) -> bool {
+/// Whether `rules` allow every subject of a call of `tool`: each parsed command, each
+/// write path (as normalized inside the root, and after following symlinks), the host.
+fn allows(rules: &[&Rule], tool: &str, subjects: &Subjects) -> bool {
+    let any = |s: &str| rules.iter().any(|r| r.matches_str(tool, s));
     match subjects {
         Subjects::Commands(cmds) => {
-            // Leading assignments and write redirects are part of what the rule must match.
-            !cmds.is_empty() && cmds.iter().all(|c| any(&allow_subject(c)))
+            !cmds.is_empty() && cmds.iter().all(|c| allows_command(rules, tool, c))
         }
         Subjects::Paths(ps) => {
             !ps.is_empty()
@@ -505,6 +510,24 @@ fn command_line(c: &SimpleCommand) -> String {
         .map(String::as_str)
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// Whether one of `rules` allows command `c`. Leading assignments are part of what a rule
+/// must match, and so are write redirects ([`allow_subject`]). A command with write
+/// redirects needs a single rule that matches it with them and that either also matches
+/// the bare command (`bash(cargo test*)`: the pattern covers the command and reaches the
+/// redirect) or names a redirect (its pattern holds ` > `, as an exact rule does). So the
+/// model-chosen target of a redirect never satisfies a suffix or infix pattern on its own:
+/// `bash(* --version)` does not allow `rm -rf src > ' --version'`.
+fn allows_command(rules: &[&Rule], tool: &str, c: &SimpleCommand) -> bool {
+    let bare = command_line(c);
+    let subject = allow_subject(c);
+    if subject == bare {
+        return rules.iter().any(|r| r.matches_str(tool, &bare));
+    }
+    rules.iter().any(|r| {
+        r.matches_str(tool, &subject) && (r.names_redirect() || r.matches_str(tool, &bare))
+    })
 }
 
 /// The command as allow rules see it: [`command_line`], then ` > <target>` for each write

@@ -428,16 +428,10 @@ impl Session {
         let why = match self.policy.rule_matches(rule, tool, effect, raw_cmd) {
             Ok(true) => match self.policy.add_session_allow(rule) {
                 Ok(()) => {
-                    let broad = match rule.split_once('(') {
-                        None => !tool.starts_with("mcp__"),
-                        Some((_, p)) => p.trim_end_matches(')').chars().all(|c| c == '*'),
-                    };
-                    let note = if broad {
-                        format!(
-                            " (every `{}` call; deny rules, protected paths and unparseable \
-                             commands still ask or refuse)",
-                            crate::printable(tool)
-                        )
+                    let note = if broad_rule(rule) {
+                        " (broad: it matches far more than this call; deny rules, protected \
+                         paths and unparseable commands still ask or refuse)"
+                            .to_string()
                     } else {
                         String::new()
                     };
@@ -870,8 +864,51 @@ fn persist_result(
     })
 }
 
+/// Whether a session rule matches far more than one call, so its acceptance notice says
+/// so: a bare tool (`bash`), a pattern of only wildcards and spaces (`bash(*)`,
+/// `bash(* *)`, `bash(?*)`), or an MCP rule with a part of only wildcards (`mcp__x__*`,
+/// `mcp__*`).
+fn broad_rule(rule: &str) -> bool {
+    let wild = |s: &str| s.chars().all(|c| matches!(c, '*' | '?' | ' '));
+    if let Some(rest) = rule.strip_prefix("mcp__") {
+        return rest.split("__").any(|part| !part.is_empty() && wild(part));
+    }
+    match rule.split_once('(') {
+        None => true,
+        Some((_, p)) => wild(p.strip_suffix(')').unwrap_or(p)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    /// Re-review T30 (M1 nit): rules that match far more than one call are flagged.
+    #[test]
+    fn broad_rules_are_recognized() {
+        for broad in [
+            "bash",
+            "bash(*)",
+            "bash(**)",
+            "bash(* *)",
+            "bash(?*)",
+            "mcp__x__*",
+            "mcp__*",
+            "edit",
+            "edit(*)",
+        ] {
+            assert!(super::broad_rule(broad), "{broad}");
+        }
+        for narrow in [
+            "bash(cargo test*)",
+            "bash(ls)",
+            "mcp__x__create_issue",
+            "mcp__x__create_*",
+            "edit(src/*.rs)",
+            "web_fetch(docs.rs)",
+        ] {
+            assert!(!super::broad_rule(narrow), "{narrow}");
+        }
+    }
+
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
     use std::sync::mpsc;
