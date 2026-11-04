@@ -265,13 +265,30 @@ pub async fn plan_servers(
     }
     if !repo.is_empty() {
         let path = data_home.join(APPROVALS_FILE);
-        let store = tokio::task::spawn_blocking(move || ApprovalStore::open(&path))
-            .await
-            .ok();
-        let root = sandbox.root();
-        for (name, spec, source) in repo {
-            let k = key(root, &name, &spec);
-            let approval = if store.as_ref().is_some_and(|s| s.is_approved(&k)) {
+        let root = sandbox.root().to_path_buf();
+        // Keys read the files the command lines name (bounded), so off the async threads.
+        let keyed = tokio::task::spawn_blocking(move || {
+            let keyed: Vec<_> = repo
+                .into_iter()
+                .map(|(name, spec, source)| {
+                    let k = key(&root, &name, &spec);
+                    (name, spec, source, k)
+                })
+                .collect();
+            (ApprovalStore::open(&path), keyed)
+        })
+        .await;
+        let Ok((store, keyed)) = keyed else {
+            plan.warnings.push(
+                "repository-declared MCP servers not started: their approvals could not be \
+                 checked"
+                    .into(),
+            );
+            plan.servers.sort_by(|a, b| a.name.cmp(&b.name));
+            return plan;
+        };
+        for (name, spec, source, k) in keyed {
+            let approval = if store.is_approved(&k) {
                 Approval::Remembered
             } else if approve_mcp {
                 Approval::ThisRun

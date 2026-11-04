@@ -1053,6 +1053,50 @@ async fn changed_env_value_asks_again() {
     run.shutdown().await;
 }
 
+/// Review B-I1: the approval covers the script the command line names. The same command
+/// line with the script rewritten (a PR branch) asks again instead of starting.
+#[tokio::test]
+async fn rewritten_server_script_asks_again() {
+    let fx = Fx::new();
+    let script = |extra: &str| format!("#!/bin/sh\n{extra}exec '{}' stdio\n", fixture());
+    fx.write("scripts/mcp.sh", &script(""));
+    fx.write(
+        ".tautly/config.toml",
+        "[mcp.servers.echo]\ncommand = \"/bin/sh\"\nargs = [\"scripts/mcp.sh\"]\n",
+    );
+    let (cfg, _) = fx.loaded(Mode::Ask);
+    let k = key(&fx.root(), "echo", &cfg.project_mcp_servers["echo"]);
+    fx.approvals().approve(&k, &fx.root(), "echo").unwrap();
+
+    // Unchanged: remembered, started without asking.
+    let mock = MockProvider::new(vec![]);
+    let mut run = start(fx.builder(cfg.clone(), &mock));
+    let events = run.until_state("echo", McpState::Ready).await;
+    assert!(approval_request(&events).is_none());
+    run.shutdown().await;
+
+    // Rewritten: asks again, and nothing starts meanwhile.
+    let marker = fx.path("ran");
+    fx.write(
+        "scripts/mcp.sh",
+        &script(&format!("touch '{}'\n", marker.display())),
+    );
+    let mock = MockProvider::new(vec![]);
+    let mut run = start(EngineBuilder {
+        interactive: true,
+        ..fx.builder(cfg, &mock)
+    });
+    let events = run
+        .until(|e| matches!(e, Event::McpServerApprovalRequested { .. }))
+        .await;
+    assert!(approval_request(&events).is_some());
+    run.shutdown().await;
+    assert!(
+        !marker.exists(),
+        "the rewritten script ran without approval"
+    );
+}
+
 #[tokio::test]
 async fn repository_server_names_cannot_borrow_user_rules() {
     let fx = Fx::new();

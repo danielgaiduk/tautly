@@ -246,3 +246,93 @@ fn concurrent_approvals_are_all_kept() {
         vec![APPROVALS_FILE.to_string(), format!("{APPROVALS_FILE}.lock")]
     );
 }
+
+/// Review B-I1: an approval covers the code the server runs. A word of the command line
+/// (the command included) that names a file inside the root keys that file's content, so
+/// a branch that rewrites an approved server's script asks again.
+#[test]
+fn rewritten_script_inside_the_root_asks_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().canonicalize().unwrap();
+    let write = |rel: &str, text: &str| {
+        let p = repo.join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, text).unwrap();
+    };
+    let k = |spec: &ServerSpec| key(&repo, "s", spec);
+    let with_cwd = |cwd: &str, command: &str, args: &[&str]| ServerSpec::Stdio {
+        command: command.into(),
+        args: args.iter().map(|s| s.to_string()).collect(),
+        env: BTreeMap::new(),
+        cwd: Some(PathBuf::from(cwd)),
+    };
+    let outside = tempfile::tempdir().unwrap();
+    let elsewhere = outside.path().canonicalize().unwrap().join("tool.js");
+    std::fs::write(&elsewhere, "outside v1").unwrap();
+    let elsewhere = elsewhere.to_str().unwrap().to_string();
+
+    let cases: Vec<(&str, ServerSpec)> = vec![
+        ("scripts/mcp.js", stdio("node", &["scripts/mcp.js"], &[])),
+        ("run.sh", stdio("./run.sh", &["--stdio"], &[])),
+        (
+            "abs.js",
+            stdio("node", &[repo.join("abs.js").to_str().unwrap()], &[]),
+        ),
+        (
+            "pre.js",
+            stdio("node", &["--require=./pre.js", "main.js"], &[]),
+        ),
+        ("sub/s.js", with_cwd("sub", "node", &["s.js"])),
+        ("up.js", with_cwd("sub", "node", &["../up.js"])),
+        ("target.js", stdio("node", &["link.js"], &[])),
+    ];
+    std::os::unix::fs::symlink(repo.join("target.js"), repo.join("link.js")).unwrap();
+    for (file, spec) in &cases {
+        write(file, "v1");
+        let before = k(spec);
+        assert_eq!(
+            before,
+            k(spec),
+            "{file}: the same content is the same approval"
+        );
+        write(file, "v2: rewritten");
+        assert_ne!(before, k(spec), "{file}: a rewritten file asks again");
+    }
+
+    // A file that appears after the approval asks again too.
+    let spec = stdio("node", &["later.js"], &[]);
+    let before = k(&spec);
+    write("later.js", "new");
+    assert_ne!(before, k(&spec));
+
+    // Files outside the root are not the repository's: their content is not keyed (so a
+    // tool update does not ask again), only the command line naming them.
+    let spec = stdio("node", &[&elsewhere], &[]);
+    let before = k(&spec);
+    std::fs::write(&elsewhere, "outside v2").unwrap();
+    assert_eq!(before, k(&spec));
+    // A link inside the root that is re-pointed elsewhere asks again.
+    let other_target = outside.path().canonicalize().unwrap().join("other.js");
+    std::fs::write(&other_target, "x").unwrap();
+    let spec = stdio("node", &["out-link.js"], &[]);
+    std::os::unix::fs::symlink(&elsewhere, repo.join("out-link.js")).unwrap();
+    let before = k(&spec);
+    std::fs::remove_file(repo.join("out-link.js")).unwrap();
+    std::os::unix::fs::symlink(&other_target, repo.join("out-link.js")).unwrap();
+    assert_ne!(before, k(&spec));
+
+    // A file too big to hash, or one that cannot be read as a file (a FIFO, which must
+    // not block), can never match an approval: it asks every time.
+    write("big.js", &"x".repeat(1024 * 1024 + 1));
+    let spec = stdio("node", &["big.js"], &[]);
+    assert_ne!(k(&spec), k(&spec));
+    let fifo = std::ffi::CString::new(repo.join("fifo.js").to_str().unwrap()).unwrap();
+    // SAFETY: mkfifo with a valid NUL-terminated path.
+    assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o644) }, 0);
+    let spec = stdio("node", &["fifo.js"], &[]);
+    assert_ne!(k(&spec), k(&spec));
+
+    // Words that name nothing (flags, package names) keep the key stable.
+    let spec = stdio("npx", &["-y", "@scope/server@1.2.3", "--port=8080"], &[]);
+    assert_eq!(k(&spec), k(&spec));
+}

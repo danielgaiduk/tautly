@@ -3,7 +3,8 @@
 //!
 //! An approval is keyed by [`key`]: the canonical workspace root, the server name and
 //! what decides what runs (transport, command line or URL, working directory, variable
-//! and header names and values). Any change to those asks again.
+//! and header names and values, and the content of the files a stdio command line names
+//! inside the root). Any change to those asks again.
 
 use std::collections::BTreeMap;
 use std::io::{self, Read, Write};
@@ -28,7 +29,8 @@ static WRITERS: Mutex<()> = Mutex::new(());
 /// The approval key of server `name`, declared by the repository at `root` as `spec`:
 /// lowercase blake3 hex of the canonical root, the name, the transport, the argv (or the
 /// URL), the working directory, the sorted variable (or header) names, and a hash of the
-/// sorted `(name, value)` pairs.
+/// sorted `(name, value)` pairs; for a stdio server also what the files its command line
+/// names inside the root hold (see `files_named`). Reads those files (bounded).
 ///
 /// Only repository servers have keys (the user's and the client's own servers need no
 /// approval). Their values are repository content, not the user's secrets, and they decide
@@ -47,13 +49,21 @@ pub fn key(root: &Path, name: &str, spec: &ServerSpec) -> String {
             args,
             env,
             cwd,
-        } => serde_json::json!({
-            "transport": "stdio",
-            "argv": std::iter::once(command).chain(args).collect::<Vec<_>>(),
-            "cwd": cwd.as_ref().map(|c| c.to_string_lossy().into_owned()),
-            "env": env.keys().collect::<Vec<_>>(),
-            "env_values": pairs_hash(env),
-        }),
+        } => {
+            let argv: Vec<&String> = std::iter::once(command).chain(args).collect();
+            let base = match cwd {
+                Some(c) => root.join(c),
+                None => root.clone(),
+            };
+            serde_json::json!({
+                "transport": "stdio",
+                "argv": argv,
+                "cwd": cwd.as_ref().map(|c| c.to_string_lossy().into_owned()),
+                "env": env.keys().collect::<Vec<_>>(),
+                "env_values": pairs_hash(env),
+                "files": files_named(&root, &base, &argv),
+            })
+        }
         ServerSpec::Http { url, headers } => serde_json::json!({
             "transport": "http",
             "url": url.as_str(),
@@ -69,6 +79,113 @@ pub fn key(root: &Path, name: &str, spec: &ServerSpec) -> String {
     blake3::hash(input.to_string().as_bytes())
         .to_hex()
         .to_string()
+}
+
+/// What the files a stdio server's command line names inside the (canonical) `root`
+/// are, for its approval key: the code the server runs is usually a script in the
+/// repository (`node scripts/mcp.js`), which a later revision can rewrite without
+/// touching the command line.
+///
+/// Each word of `argv` (the command included), and the value after the first `=` of a
+/// word such as `--require=./x.js`, is taken as a path (relative ones against `base`, the
+/// server's working directory). One that lies inside the root, by name or once links are
+/// resolved, adds an entry: the blake3 of the file's content when it resolves to a
+/// regular file inside the root of at most [`MAX_KEYED_FILE`] bytes ([`MAX_KEYED_TOTAL`]
+/// for all of them); the resolved path when it resolves outside the root (a link the
+/// repository can re-point); `missing` or `dir`. A file that cannot be hashed (too big,
+/// unreadable, not a regular file) gets a value that is new on every call, so the key
+/// never matches a remembered approval and the user is asked each time. Words naming
+/// nothing in the root (flags, package names, programs found on `PATH`) add nothing.
+///
+/// Not covered: what the script loads in turn (imports, `node_modules`), files named
+/// only through variables, and programs found through a `PATH` the server's `env` sets.
+fn files_named(root: &Path, base: &Path, argv: &[&String]) -> Vec<serde_json::Value> {
+    let mut budget = MAX_KEYED_TOTAL;
+    let mut entries = Vec::new();
+    for (i, word) in argv.iter().enumerate() {
+        let value = word.split_once('=').map(|(_, v)| v);
+        for candidate in std::iter::once(word.as_str()).chain(value) {
+            if candidate.is_empty() {
+                continue;
+            }
+            let path = base.join(candidate);
+            let real = path.canonicalize().ok();
+            let inside = lexical(&path).starts_with(root)
+                || real.as_ref().is_some_and(|r| r.starts_with(root));
+            if !inside {
+                continue;
+            }
+            let state = match real {
+                None => serde_json::json!("missing"),
+                Some(r) if !r.starts_with(root) => {
+                    serde_json::json!({ "target": r.to_string_lossy() })
+                }
+                Some(r) if r.is_dir() => serde_json::json!("dir"),
+                Some(r) => match hash_file(&r, &mut budget) {
+                    Some(h) => serde_json::json!({ "blake3": h }),
+                    None => serde_json::json!({ "unknown": nonce() }),
+                },
+            };
+            entries.push(serde_json::json!({ "word": i, "path": candidate, "state": state }));
+        }
+    }
+    entries
+}
+
+/// Largest file inside the root whose content an approval key covers.
+const MAX_KEYED_FILE: u64 = 1024 * 1024;
+/// Most bytes of files read for one approval key.
+const MAX_KEYED_TOTAL: u64 = 8 * 1024 * 1024;
+
+/// The blake3 hex of the regular file at `path`, if it is at most [`MAX_KEYED_FILE`]
+/// bytes and fits in `budget` (which it is taken from). Opened without blocking, so a
+/// FIFO is refused rather than waited on.
+fn hash_file(path: &Path, budget: &mut u64) -> Option<String> {
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(path)
+        .ok()?;
+    let meta = file.metadata().ok()?;
+    let cap = MAX_KEYED_FILE.min(*budget);
+    if !meta.is_file() || meta.len() > cap {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    file.take(cap + 1).read_to_end(&mut bytes).ok()?;
+    if bytes.len() as u64 > cap {
+        return None;
+    }
+    *budget -= bytes.len() as u64;
+    Some(blake3::hash(&bytes).to_hex().to_string())
+}
+
+/// `path` with `.` and `..` components resolved by name (no links followed).
+fn lexical(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for c in path.components() {
+        match c {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// A value no other call returns: keys an approval that must never be remembered.
+fn nonce() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let t = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let seed = format!("{}:{t}:{n}", std::process::id());
+    blake3::hash(seed.as_bytes()).to_hex().to_string()
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
