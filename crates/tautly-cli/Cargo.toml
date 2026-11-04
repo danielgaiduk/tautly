@@ -72,6 +72,10 @@ required-features = ["mock"]
 name = "fork"
 required-features = ["mock"]
 
+[[test]]
+name = "bisect"
+required-features = ["mock"]
+
 # `cargo binstall tautly` downloads the cargo-dist archive of the host (or the nearest musl)
 # target from the GitHub release instead of building (spec 7.11.3). The names match what
 # `dist plan` produces (`tautly-<target>.tar.xz`, binary at the archive's

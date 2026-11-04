@@ -79,7 +79,7 @@ pub fn lock_path(data_home: &Path, root: &Path) -> PathBuf {
     ))
 }
 
-fn flock(file: &File, op: libc::c_int) -> io::Result<()> {
+pub(crate) fn flock(file: &File, op: libc::c_int) -> io::Result<()> {
     // SAFETY: flock on a file descriptor `file` owns; no memory is shared.
     if unsafe { libc::flock(file.as_raw_fd(), op) } == 0 {
         Ok(())
@@ -93,7 +93,7 @@ fn would_block(e: &io::Error) -> bool {
 }
 
 /// The lock file at `path`, created owner-only with its directory.
-fn open(path: &Path) -> io::Result<File> {
+pub(crate) fn open(path: &Path) -> io::Result<File> {
     if let Some(dir) = path.parent() {
         std::fs::DirBuilder::new()
             .recursive(true)

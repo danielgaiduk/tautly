@@ -160,7 +160,7 @@ pub async fn create(
 }
 
 /// A checkpointer on `root` for the fork `session`, or why there can be none.
-fn checkpointer(
+pub(crate) fn checkpointer(
     sb: &Arc<dyn Sandbox>,
     root: &Path,
     session: &str,
@@ -201,27 +201,8 @@ async fn make(
     session: &str,
 ) -> Result<(PathBuf, CheckpointRef), WtError> {
     let cp = checkpointer(&sb, repo_root, session)?;
-    let Some(base) = state.base.clone() else {
-        let note = state.partial.as_deref().unwrap_or(NOTE_NO_BASE);
-        return Err(WtError::Partial(note.to_string()));
-    };
-    // The overlay's paths, each resolved under the new root (and never anywhere else).
-    let (log, overlay, dir_owned) = (
-        state.log().to_path_buf(),
-        state.overlay.clone(),
-        dir.to_path_buf(),
-    );
-    let entries = blocking(move || {
-        let reader = SessionReader::<SessionRecord>::open(&log)?;
-        let mut entries = Vec::with_capacity(overlay.len());
-        for (path, blob) in &overlay {
-            path.resolve(&dir_owned)?;
-            let bytes = blob.as_ref().map(|b| reader.read_blob(b)).transpose()?;
-            entries.push((PathBuf::from(path.as_str()), bytes));
-        }
-        Ok(entries)
-    })
-    .await?;
+    let base = base_of(state)?;
+    let entries = overlay_entries(state, dir).await?;
     // A link is neither followed nor, on a failure, removed (re-review N2).
     if std::fs::symlink_metadata(dir).is_ok_and(|m| m.file_type().is_symlink()) {
         return Err(WtError::DirIsLink(dir.to_path_buf()));
@@ -251,6 +232,53 @@ async fn make(
             Err(e)
         }
     }
+}
+
+/// The checkpoint commit `state` starts from, or why it has none.
+fn base_of(state: &FileState) -> Result<String, WtError> {
+    state.base.clone().ok_or_else(|| {
+        let note = state.partial.as_deref().unwrap_or(NOTE_NO_BASE);
+        WtError::Partial(note.to_string())
+    })
+}
+
+/// The overlay of `state` as `(path, content)` entries for [`Checkpointer::compose`], each
+/// path resolved under `dir` (and never anywhere else), the contents read from the log's
+/// blob store.
+async fn overlay_entries(
+    state: &FileState,
+    dir: &Path,
+) -> Result<Vec<(PathBuf, Option<Vec<u8>>)>, WtError> {
+    let (log, overlay, dir) = (
+        state.log().to_path_buf(),
+        state.overlay.clone(),
+        dir.to_path_buf(),
+    );
+    blocking(move || {
+        let reader = SessionReader::<SessionRecord>::open(&log)?;
+        let mut entries = Vec::with_capacity(overlay.len());
+        for (path, blob) in &overlay {
+            path.resolve(&dir)?;
+            let bytes = blob.as_ref().map(|b| reader.read_blob(b)).transpose()?;
+            entries.push((PathBuf::from(path.as_str()), bytes));
+        }
+        Ok(entries)
+    })
+    .await
+}
+
+/// `state` (its base checkpoint with its overlay applied) as a commit of its own, by
+/// `cp`, for a worktree at `dir` ([`create`]; a bisect moves its worktree to one).
+pub(crate) async fn compose_state(
+    cp: &Checkpointer,
+    state: &FileState,
+    dir: &Path,
+) -> Result<CheckpointRef, WtError> {
+    let base = base_of(state)?;
+    let entries = overlay_entries(state, dir).await?;
+    Ok(cp
+        .compose(&base, &entries, Checkpointer::housekeeping_deadline())
+        .await?)
 }
 
 /// The directories [`make_dir`] created (outermost first), and whether `dir` was there.
@@ -328,7 +356,7 @@ fn make_dir(dir: &Path) -> Result<MadeDirs, WtError> {
 }
 
 /// `path` with its nearest existing ancestor resolved (links followed), the rest as given.
-fn resolved(path: &Path) -> PathBuf {
+pub(crate) fn resolved(path: &Path) -> PathBuf {
     let mut rest = Vec::new();
     let mut at = path;
     loop {

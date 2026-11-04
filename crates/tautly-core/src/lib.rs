@@ -7,6 +7,7 @@ mod approvals;
 pub use approvals::exact_rule;
 pub mod attempts;
 pub mod auth;
+pub mod bisect;
 pub mod budget;
 pub mod checkpoint;
 pub mod compare;
