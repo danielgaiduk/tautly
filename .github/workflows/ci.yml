@@ -1,4 +1,6 @@
 name: ci
+permissions:
+  contents: read
 on:
   push:
     branches: [main]
@@ -34,7 +36,8 @@ jobs:
 
   # The Linux release binary is static: the keychain backend (keyring's pure-Rust Secret Service)
   # must link on musl. If this job cannot be made green, the release falls back to the -gnu
-  # targets (see the comment in dist-workspace.toml).
+  # targets (see the comment in dist-workspace.toml). Only x86_64 is built here; the aarch64 musl
+  # target is first built by the release workflow.
   musl-static:
     runs-on: ubuntu-latest
     steps:
@@ -48,3 +51,5 @@ jobs:
       # Newer `file` reports a static-pie executable as "static-pie linked".
       - run: file target/x86_64-unknown-linux-musl/release/tautly | grep -Eq 'statically linked|static-pie linked'
       - run: ./target/x86_64-unknown-linux-musl/release/tautly --version
+      # Second proof: no dynamic loader dependencies (glibc ldd says one of these two).
+      - run: ldd target/x86_64-unknown-linux-musl/release/tautly 2>&1 | grep -Eq 'not a dynamic executable|statically linked'

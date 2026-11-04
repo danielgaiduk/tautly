@@ -424,7 +424,7 @@ This section covers what a user sees in the first ten minutes and in every turn.
   Exit code 1 if any check fails, else 0.
 
 #### 7.11.3 Release and installers
-- cargo-dist builds and publishes GitHub releases on `v*` tags for `aarch64-apple-darwin`, `x86_64-apple-darwin`, `x86_64-unknown-linux-musl` and `aarch64-unknown-linux-musl`. Linux binaries are static (musl). Each release has sha256 checksums, a `curl | sh` installer, a Homebrew formula pushed to the project's tap, and binaries laid out so `cargo binstall tautly` finds them.
+- cargo-dist builds and publishes GitHub releases on version tags (`vX.Y.Z`; the generated trigger is the glob `**[0-9]+.[0-9]+.[0-9]+*`, which any tag ending in a version also matches) for `aarch64-apple-darwin`, `x86_64-apple-darwin`, `x86_64-unknown-linux-musl` and `aarch64-unknown-linux-musl`. Linux binaries are static (musl). Each release has sha256 checksums, a `curl | sh` installer, a Homebrew formula pushed to the project's tap, and binaries laid out so `cargo binstall tautly` finds them.
 - The Linux keychain backend must link statically: `keyring` with the pure-Rust Secret Service backend (zbus). If that cannot link on musl, the Linux targets fall back to `-gnu` and the decision is recorded in the release notes.
 - macOS code signing and notarisation are post-v1. Neither curl nor Homebrew sets the quarantine flag.
 
