@@ -1136,6 +1136,59 @@ async fn a_held_ledger_lock_does_not_slow_a_cancel() {
     assert_eq!(t.estimated, 1);
 }
 
+/// The first turn's row is written (the writer has the WAL ledger open); then another
+/// process takes the write lock and the second turn's row queues behind it.
+async fn second_row_queued_behind_a_lock(fx: &Fx, run: &mut Run) -> rusqlite::Connection {
+    run.turn_with("first").await;
+    fx.ledger_rows(1).await;
+    let holder = rusqlite::Connection::open(fx.home.path().join("ledger.sqlite")).unwrap();
+    holder.execute_batch("BEGIN IMMEDIATE;").unwrap();
+    let events = run.turn_with("second").await;
+    assert_eq!(finish_reason(&events), FinishReason::Completed);
+    holder
+}
+
+#[tokio::test]
+async fn rows_queued_at_shutdown_are_written_before_the_event_stream_closes() {
+    let fx = Fx::new();
+    let mock = MockProvider::new(vec![
+        text_step("one", tokens(10, 2)),
+        text_step("two", tokens(20, 3)),
+    ]);
+    let mut run = start(fx.builder(config(true), &mock));
+    let holder = second_row_queued_behind_a_lock(&fx, &mut run).await;
+    let release = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(300));
+        holder.execute_batch("COMMIT;").unwrap();
+    });
+    run.send(Command::Shutdown).await;
+    run.until_closed().await;
+    // A client that exits now has lost nothing: no waiting for the background writer.
+    let t = fx.ledger().totals(UNIX_EPOCH).unwrap();
+    assert_eq!(t.requests, 2, "{t:?}");
+    release.join().unwrap();
+}
+
+#[tokio::test]
+async fn a_stuck_ledger_delays_shutdown_by_at_most_about_a_second() {
+    let fx = Fx::new();
+    let mock = MockProvider::new(vec![
+        text_step("one", tokens(10, 2)),
+        text_step("two", tokens(20, 3)),
+    ]);
+    let mut run = start(fx.builder(config(true), &mock));
+    let holder = second_row_queued_behind_a_lock(&fx, &mut run).await;
+    let t0 = Instant::now();
+    run.send(Command::Shutdown).await;
+    run.until_closed().await;
+    let took = t0.elapsed();
+    assert!(took < Duration::from_millis(1800), "shutdown took {took:?}");
+    holder.execute_batch("COMMIT;").unwrap();
+    drop(holder);
+    // The writer goes on after the session: the row still arrives.
+    fx.ledger_rows(2).await;
+}
+
 // ---- signals ---------------------------------------------------------------------------
 
 /// A router whose escalation is recorded instead of ending the process.

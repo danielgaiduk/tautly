@@ -69,6 +69,8 @@ pub const EVENT_CAPACITY: usize = 256;
 const COMMAND_CAPACITY: usize = 64;
 /// At shutdown, how long left-behind process groups get between SIGTERM and SIGKILL.
 const GROUP_GRACE: Duration = Duration::from_millis(500);
+/// Longest a shutdown waits for the cost ledger to write the rows queued for it.
+const LEDGER_FLUSH: Duration = Duration::from_secs(1);
 
 #[derive(Debug, thiserror::Error)]
 pub enum EngineError {
@@ -645,6 +647,11 @@ impl Actor {
             s.end_episode().await;
         }
         self.with_log(|l| l.checkpoint()).await;
+        // The episode's usage included: a client that exits once the event stream closes
+        // loses no row, unless the ledger is stuck.
+        if let Some(s) = state.as_ref() {
+            s.cost_ledger.flush(LEDGER_FLUSH).await;
+        }
     }
 
     /// A command from the channel: logged, then handled at once (shutdown, approvals,
