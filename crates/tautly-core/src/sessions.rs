@@ -111,15 +111,22 @@ fn lock_if_idle(log: &Path, id: &str) -> Result<std::fs::File, DeleteError> {
         .read(true)
         .open(log)
         .map_err(io)?;
-    // SAFETY: flock on a file descriptor we own; no memory is shared.
-    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+    // A busy lock is tried again briefly: the session tree's liveness probe holds a shared
+    // lock for an instant.
+    for attempt in 0..5 {
+        // SAFETY: flock on a file descriptor we own; no memory is shared.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            return Ok(file);
+        }
         let err = std::io::Error::last_os_error();
-        return Err(match err.raw_os_error() {
-            Some(libc::EWOULDBLOCK) => DeleteError::Running(id.to_string()),
-            _ => io(err),
-        });
+        if err.raw_os_error() != Some(libc::EWOULDBLOCK) {
+            return Err(io(err));
+        }
+        if attempt < 4 {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
     }
-    Ok(file)
+    Err(DeleteError::Running(id.to_string()))
 }
 
 /// Longest [`SessionSummary::first_prompt`], in characters.

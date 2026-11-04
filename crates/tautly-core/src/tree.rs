@@ -109,10 +109,18 @@ fn node(path: &Path) -> Option<TreeNode> {
     let header = reader.header().clone();
     let mut label = header.label.clone();
     let mut last_prompt = String::new();
+    // One pass: the steps, the step at the parent offset, the label and the last prompt.
+    let mut steps = crate::timetravel::StepCounter::default();
+    let fork_at = header.parent.as_ref().map(|(_, offset)| *offset);
+    let mut parent_step = 0;
     for rec in reader.records() {
-        let Ok((_, rec)) = rec else {
+        let Ok((at, rec)) = rec else {
             break;
         };
+        steps.see(&rec);
+        if fork_at.is_some_and(|o| at <= o) {
+            parent_step = steps.last;
+        }
         match rec {
             SessionRecord::Labeled { label: l } => label = Some(l),
             SessionRecord::TurnStart { text, .. } => {
@@ -122,10 +130,8 @@ fn node(path: &Path) -> Option<TreeNode> {
             _ => {}
         }
     }
-    let steps = crate::timetravel::step_at_offset(&reader, u64::MAX);
-    let parent = header
-        .parent
-        .map(|(id, offset)| (id, crate::timetravel::step_at_offset(&reader, offset)));
+    let steps = steps.last;
+    let parent = header.parent.map(|(id, _)| (id, parent_step));
     Some(TreeNode {
         session_id: header.session_id,
         parent,

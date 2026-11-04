@@ -506,28 +506,37 @@ async fn rewind_creates_branch_and_leaves_old_log_unmodified_except_tip_checkpoi
     assert_eq!(run.current().0, branch);
     assert_eq!(repo.read("a.txt").as_deref(), Some("one\n"));
 
-    // The old log: every line as it was, then only the command and the tip checkpoint.
+    // The old log: every line as it was, then only the command, the tip checkpoint and
+    // the restore's begin and end (naming the backup) (spec 7.12.2).
     let after = raw_lines(&old_log);
     assert_eq!(after[..before.len()], before[..]);
-    let added: Vec<SessionRecord> = records(&old_log)[before.len() - 1..].to_vec();
-    assert!(
-        added.iter().all(|r| matches!(
-            r,
-            SessionRecord::Command(Command::Rewind { .. })
-                | SessionRecord::Checkpoint {
-                    point: Some(CheckpointPoint::BeforeRestore),
-                    ..
-                }
-        )),
+    let added: Vec<Value> = after[before.len()..]
+        .iter()
+        .map(|l| serde_json::from_str::<Value>(l).unwrap()["data"].clone())
+        .collect();
+    let kinds: Vec<String> = added
+        .iter()
+        .map(|d| match d["type"].as_str().unwrap() {
+            "checkpoint" => format!("checkpoint:{}", d["data"]["point"].as_str().unwrap()),
+            "command" => format!("command:{}", d["data"]["type"].as_str().unwrap()),
+            other => other.to_string(),
+        })
+        .collect();
+    assert_eq!(
+        kinds,
+        [
+            "command:rewind",
+            "checkpoint:before_restore",
+            "restore_begun",
+            "restore_ended"
+        ],
         "{added:?}"
     );
-    assert!(added.iter().any(|r| matches!(
-        r,
-        SessionRecord::Checkpoint {
-            point: Some(CheckpointPoint::BeforeRestore),
-            ..
-        }
-    )));
+    assert_eq!(
+        added[2]["data"]["backup_ref"].as_str(),
+        report.backup_ref.as_deref()
+    );
+    assert_eq!(added[3]["data"]["applied"], true);
 
     // The branch: origin rewind, parent (old session, offset of step 3's end).
     let branch_log = run.current().1;
@@ -953,4 +962,332 @@ async fn tree_lists_parent_step_label_origin_live_current() {
     run.stop().await;
     let nodes = tree::build(repo.home(), &repo.project(), None).unwrap();
     assert!(nodes.iter().all(|n| !n.live && !n.current));
+}
+
+// ------------------------------------------------- fix round 1: human-owned changes
+
+/// A field of a report as it goes over the wire.
+fn wire(report: &MaterializeReport, field: &str) -> Value {
+    serde_json::to_value(report).unwrap()[field].clone()
+}
+
+#[tokio::test]
+async fn offline_human_edit_absorbed_by_resume_is_a_conflict() {
+    // I2: the resume's start checkpoint holds the edit; it is still the human's.
+    let repo = Repo::git_repo();
+    let mock = two_turns();
+    let run = run_two_turns(&repo, &mock).await;
+    let id = run.current().0;
+    run.stop().await;
+    repo.write("a.txt", "offline\n");
+    let mut run = Run::start(EngineBuilder {
+        resume: Some(id),
+        ..repo.builder(&MockProvider::new(vec![]))
+    });
+    let (_, report) = run.rewind(3, false, &[]).await.done();
+    assert!(!report.applied, "{report:?}");
+    assert!(
+        report.conflicts.contains(&"a.txt".to_string()),
+        "{report:?}"
+    );
+    assert_eq!(repo.read("a.txt").as_deref(), Some("offline\n"));
+    let (_, report) = run.rewind(3, false, &["a.txt"]).await.done();
+    assert!(report.applied, "{report:?}");
+    assert_eq!(repo.read("a.txt").as_deref(), Some("one\n"));
+    run.stop().await;
+}
+
+#[tokio::test]
+async fn human_edit_between_turns_is_a_conflict() {
+    // I3: the next turn's first checkpoint holds the edits; they are still the human's.
+    let repo = Repo::git_repo();
+    let mock = MockProvider::new(vec![
+        tools_step(vec![write("w1", "a.txt", "one\n")]),
+        text_step("first"),
+        tools_step(vec![
+            write("w2", "a.txt", "two\n"),
+            bash("b1", "printf 'x\\n' > c.txt"),
+        ]),
+        text_step("second"),
+    ]);
+    let mut run = Run::start(repo.builder(&mock));
+    run.turn_with("one").await;
+    repo.write("b.txt", "mine\n");
+    repo.write("mine.txt", "new\n");
+    run.turn_with("two").await;
+    let (_, report) = run.rewind(3, false, &[]).await.done();
+    assert!(!report.applied, "{report:?}");
+    let mut conflicts = report.conflicts.clone();
+    conflicts.sort();
+    assert_eq!(conflicts, ["b.txt", "mine.txt"], "{report:?}");
+    assert_eq!(repo.read("b.txt").as_deref(), Some("mine\n"));
+    assert_eq!(repo.read("mine.txt").as_deref(), Some("new\n"));
+    assert_eq!(repo.read("a.txt").as_deref(), Some("two\n"));
+    // A rewind to after the edits does not touch them.
+    let (_, report) = run.rewind(4, true, &[]).await.done();
+    assert!(report.conflicts.is_empty(), "{report:?}");
+    let (_, report) = run.rewind(3, false, &["b.txt", "mine.txt"]).await.done();
+    assert!(report.applied, "{report:?}");
+    assert_eq!(repo.read("b.txt").as_deref(), Some("bee\n"));
+    assert_eq!(repo.read("mine.txt"), None);
+    run.stop().await;
+}
+
+#[tokio::test]
+async fn a_symlinked_parent_is_blocked_and_never_written_through() {
+    // I1, from git (the checkpoint) and outside git (a pre-image).
+    for git in [true, false] {
+        let repo = if git { Repo::git_repo() } else { Repo::plain() };
+        let mock = MockProvider::new(vec![
+            tools_step(vec![write("w1", "sub/y.txt", "one\n")]),
+            text_step("first"),
+            tools_step(vec![write("w2", "sub/y.txt", "two\n")]),
+            text_step("second"),
+        ]);
+        let mut run = run_two_turns(&repo, &mock).await;
+        std::fs::remove_dir_all(repo.root().join("sub")).unwrap();
+        repo.write("other/y.txt", "mine\n");
+        std::os::unix::fs::symlink("other", repo.root().join("sub")).unwrap();
+        for overwrite in [&[][..], &["sub/y.txt"][..]] {
+            let (_, report) = run.rewind(3, false, overwrite).await.done();
+            assert!(!report.applied, "git {git}: {report:?}");
+            assert_eq!(wire(&report, "blocked"), json!(["sub/y.txt"]), "{report:?}");
+            assert_eq!(repo.read("other/y.txt").as_deref(), Some("mine\n"));
+            let link = std::fs::symlink_metadata(repo.root().join("sub")).unwrap();
+            assert!(link.file_type().is_symlink(), "git {git}");
+        }
+        run.stop().await;
+    }
+}
+
+#[tokio::test]
+async fn a_tool_edit_of_an_ignored_file_is_reverted() {
+    // M4: no checkpoint holds `gen.log`; its pre-image (none) is what it goes back to.
+    let repo = Repo::git_repo();
+    repo.write(".gitignore", "*.log\n");
+    repo.git(&["add", "-A"]);
+    repo.git(&["commit", "-q", "-m", "ignore"]);
+    let mock = MockProvider::new(vec![
+        tools_step(vec![write("w1", "a.txt", "one\n")]),
+        text_step("first"),
+        tools_step(vec![write("w2", "gen.log", "generated\n")]),
+        text_step("second"),
+    ]);
+    let mut run = run_two_turns(&repo, &mock).await;
+    repo.write("h.log", "the human's\n");
+    let (_, report) = run.rewind(3, false, &[]).await.done();
+    assert!(report.applied, "{report:?}");
+    assert_eq!(report.deleted, ["gen.log"], "{report:?}");
+    assert_eq!(repo.read("gen.log"), None);
+    assert_eq!(repo.read("h.log").as_deref(), Some("the human's\n"));
+    run.stop().await;
+}
+
+#[tokio::test]
+async fn a_mode_change_is_a_conflict() {
+    use std::os::unix::fs::PermissionsExt;
+    let repo = Repo::git_repo();
+    let mock = two_turns();
+    let mut run = run_two_turns(&repo, &mock).await;
+    let a = repo.root().join("a.txt");
+    std::fs::set_permissions(&a, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let (_, report) = run.rewind(3, false, &[]).await.done();
+    assert!(!report.applied);
+    assert_eq!(report.conflicts, ["a.txt"]);
+    assert_eq!(repo.read("a.txt").as_deref(), Some("two\n"));
+    run.stop().await;
+}
+
+#[tokio::test]
+async fn rewind_to_step_zero_branches_before_the_first_step() {
+    // I6.
+    let repo = Repo::git_repo();
+    let mock = two_turns();
+    let mut run = run_two_turns(&repo, &mock).await;
+    // From a branch too (its copy holds nothing kept before step 1, review probe p9).
+    run.rewind(4, false, &[]).await.done();
+    let (a, _) = run.current();
+    let (branch, report) = run.rewind(0, false, &[]).await.done();
+    assert!(report.applied, "{report:?}");
+    assert!(!branch.is_empty());
+    assert_eq!(repo.read("a.txt").as_deref(), Some("zero\n"));
+    assert_eq!(repo.read("b.txt").as_deref(), Some("bee\n"));
+    assert_eq!(repo.read("c.txt"), None);
+    let b = reader(&run.current().1);
+    let (parent, offset) = b.header().parent.clone().unwrap();
+    assert_eq!(parent, a);
+    assert_eq!(step_at_offset(&b, offset), 0);
+    assert_eq!(step_at_offset(&b, u64::MAX), 0);
+    run.stop().await;
+}
+
+#[tokio::test]
+async fn a_large_human_file_is_a_conflict_and_backed_up_in_git() {
+    // Over the 64 MiB read limit: compared by its streaming hash, kept whole by the backup.
+    let repo = Repo::git_repo();
+    let mock = two_turns();
+    let mut run = run_two_turns(&repo, &mock).await;
+    let size = 65 * 1024 * 1024 + 7;
+    std::fs::write(repo.root().join("c.txt"), vec![b'h'; size]).unwrap();
+    let (_, report) = run.rewind(3, false, &[]).await.done();
+    assert!(!report.applied);
+    assert_eq!(report.conflicts, ["c.txt"]);
+    let (_, report) = run.rewind(3, false, &["c.txt"]).await.done();
+    assert!(report.applied, "{report:?}");
+    assert_eq!(repo.read("c.txt"), None);
+    let backup = report.backup_ref.unwrap();
+    let kept = repo
+        .git(&["cat-file", "-s", &format!("{backup}:c.txt")])
+        .unwrap();
+    assert_eq!(kept.trim(), size.to_string());
+    run.stop().await;
+}
+
+/// Run `f` with `dir` read-only, then make it writable again.
+fn read_only(dir: &Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode)).unwrap();
+}
+
+#[tokio::test]
+async fn a_failed_write_puts_the_files_back_and_names_the_backup() {
+    // I4: c.txt is deleted first; then d/a.txt cannot be written (its directory is
+    // read-only). The deletion is undone and the error says so, with the snapshot.
+    let repo = Repo::git_repo();
+    let mock = MockProvider::new(vec![
+        tools_step(vec![write("w1", "d/a.txt", "one\n")]),
+        text_step("first"),
+        tools_step(vec![
+            write("w2", "d/a.txt", "two\n"),
+            bash("b1", "printf 'x\\n' > c.txt"),
+        ]),
+        text_step("second"),
+    ]);
+    let mut run = run_two_turns(&repo, &mock).await;
+    let d = repo.root().join("d");
+    read_only(&d, 0o555);
+    let why = run.rewind(3, false, &[]).await.error();
+    read_only(&d, 0o755);
+    assert!(why.contains("put back as they were"), "{why}");
+    assert!(why.contains("snapshot refs/tautly/checkpoints/"), "{why}");
+    assert_eq!(repo.read("c.txt").as_deref(), Some("x\n"));
+    assert_eq!(repo.read("d/a.txt").as_deref(), Some("two\n"));
+    run.stop().await;
+}
+
+#[tokio::test]
+async fn a_failed_branch_puts_the_files_back() {
+    // I4: the branch's log cannot be created (its directory is read-only).
+    let repo = Repo::git_repo();
+    let mock = two_turns();
+    let mut run = run_two_turns(&repo, &mock).await;
+    let (id, log) = run.current();
+    let dir = log.parent().unwrap().to_path_buf();
+    read_only(&dir, 0o555);
+    let why = run.rewind(3, false, &[]).await.error();
+    read_only(&dir, 0o755);
+    assert!(why.contains("put back as they were"), "{why}");
+    assert_eq!(repo.read("a.txt").as_deref(), Some("two\n"));
+    assert_eq!(repo.read("c.txt").as_deref(), Some("x\n"));
+    assert_eq!(run.current().0, id);
+    // The old log says how it ended.
+    let last: Value = serde_json::from_str(raw_lines(&log).last().unwrap()).unwrap();
+    assert_eq!(last["data"]["type"], "restore_ended", "{last}");
+    assert_eq!(last["data"]["data"]["rolled_back"], true);
+    run.stop().await;
+}
+
+#[tokio::test]
+async fn outside_git_an_overwrite_keeps_the_content_in_the_session_log() {
+    // I5: no snapshot; the bytes go to the blob store, in a `RestoreBegun` record.
+    let repo = Repo::plain();
+    let mock = MockProvider::new(vec![
+        tools_step(vec![write("w1", "a.txt", "one\n")]),
+        text_step("first"),
+        tools_step(vec![write("w2", "a.txt", "two\n")]),
+        text_step("second"),
+    ]);
+    let mut run = run_two_turns(&repo, &mock).await;
+    let log = run.current().1;
+    repo.write("a.txt", "human\n");
+    let (_, dry) = run.rewind(3, true, &[]).await.done();
+    assert_eq!(wire(&dry, "backup"), json!("log"), "{dry:?}");
+    let (_, report) = run.rewind(3, false, &["a.txt"]).await.done();
+    assert!(report.applied, "{report:?}");
+    assert_eq!(wire(&report, "backup"), json!("log"));
+    let begun: Value = raw_lines(&log)
+        .iter()
+        .map(|l| serde_json::from_str::<Value>(l).unwrap())
+        .find(|v| v["data"]["type"] == "restore_begun")
+        .expect("a RestoreBegun record");
+    let file = &begun["data"]["data"]["files"][0];
+    assert_eq!(file["path"], "a.txt");
+    let blob = tautly_session::BlobRef::parse(file["blob"].as_str().unwrap()).unwrap();
+    assert_eq!(reader(&log).read_blob(&blob).unwrap(), b"human\n");
+    // The branch's assertion records are marked as such (M5).
+    let branch_log = run.current().1;
+    let edits: Vec<Value> = raw_lines(&branch_log)
+        .iter()
+        .map(|l| serde_json::from_str::<Value>(l).unwrap())
+        .filter(|v| v["data"]["type"] == "edit")
+        .collect();
+    assert_eq!(edits.last().unwrap()["data"]["data"]["asserted"], true);
+
+    // A file over 64 MiB cannot be kept: the report says no backup.
+    std::fs::write(repo.root().join("a.txt"), vec![b'h'; 65 * 1024 * 1024]).unwrap();
+    let (_, dry) = run.rewind(1, true, &[]).await.done();
+    assert_eq!(dry.conflicts, ["a.txt"], "{dry:?}");
+    assert_eq!(wire(&dry, "backup"), Value::Null, "{dry:?}");
+    run.stop().await;
+}
+
+#[tokio::test]
+async fn an_unknown_step_changes_nothing() {
+    // M6: refused before the tip checkpoint is taken.
+    let repo = Repo::git_repo();
+    let mock = two_turns();
+    let mut run = run_two_turns(&repo, &mock).await;
+    let log = run.current().1;
+    let before = raw_lines(&log).len();
+    let why = run.rewind(99, false, &[]).await.error();
+    assert!(why.contains("no step 99"), "{why}");
+    run.stop().await;
+    let added: Vec<Value> = raw_lines(&log)[before..]
+        .iter()
+        .map(|l| serde_json::from_str::<Value>(l).unwrap()["data"]["type"].clone())
+        .collect();
+    assert!(!added.contains(&json!("checkpoint")), "{added:?}");
+}
+
+#[tokio::test]
+async fn a_restore_cut_off_is_warned_about_at_resume() {
+    // M7: a `RestoreBegun` with no `RestoreEnded` (a crash mid-restore).
+    let repo = Repo::git_repo();
+    let mock = MockProvider::new(vec![text_step("hi")]);
+    let mut run = Run::start(repo.builder(&mock));
+    run.turn_with("hello").await;
+    let (id, log) = run.current();
+    run.stop().await;
+    let offset = records(&log).len();
+    let line = json!({"type": "record", "offset": offset, "t": 0, "data": {
+        "type": "restore_begun",
+        "data": {"backup_ref": "refs/tautly/checkpoints/x/undo-9", "files": []}}});
+    let mut text = std::fs::read_to_string(&log).unwrap();
+    text.push_str(&format!("{line}\n"));
+    std::fs::write(&log, text).unwrap();
+    let mut run = Run::start(EngineBuilder {
+        resume: Some(id),
+        ..repo.builder(&MockProvider::new(vec![]))
+    });
+    let seen = run
+        .until(|e| matches!(e, Event::Warning { message } if message.contains("cut off")))
+        .await;
+    let Some(Event::Warning { message }) = seen.last() else {
+        unreachable!()
+    };
+    assert!(
+        message.contains("refs/tautly/checkpoints/x/undo-9"),
+        "{message}"
+    );
+    run.stop().await;
 }

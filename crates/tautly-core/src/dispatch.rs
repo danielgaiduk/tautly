@@ -796,6 +796,7 @@ fn edit_record(e: &PersistedEffect, step: u32) -> Option<Option<SessionRecord>> 
         pre_image,
         post_image_blob: post,
         step,
+        asserted: false,
     }))
 }
 

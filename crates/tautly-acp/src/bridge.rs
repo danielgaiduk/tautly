@@ -1439,6 +1439,7 @@ fn call_edits(path: &Path, id: &str) -> Option<Vec<FileChange>> {
                 path,
                 pre_image,
                 post_image_blob,
+                asserted: false,
                 ..
             } if collecting => {
                 let pre = match &pre_image {

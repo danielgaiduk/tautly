@@ -677,7 +677,13 @@ Every operation here creates a new branch or a new view. None truncates a log, a
   - a `CheckpointSkipped` lies between the boundary and the chosen checkpoint (a command whose checkpoint was skipped, or a turn end skipped because the turn was cancelled, which lets the next turn's checkpoint, with human edits, be chosen);
   - the chosen checkpoint is a `resume_start` one: the earlier session crashed after step N's results but before its turn-end checkpoint, and it holds whatever changed while no session ran (a `session_start` one is chosen only for the session's first boundaries, where it is exact);
   - the chosen checkpoint has no `point` (written before the field existed, or by an older build resuming a newer log) or an `unknown` one, and step N's user turn has no `turn_end` checkpoint before it: it may be such a resume checkpoint, so it is read conservatively as partial.
-- **`expected_tip(session)`** is the files as the agent left them: the latest checkpoint plus later tool-edit post-images. A file whose disk hash differs from `expected_tip` was changed by someone else: a **human edit**.
+- **`expected_tip(session)`** is the files as the agent left them: the latest checkpoint (not a `before_restore` one) plus later tool-edit post-images. A file whose disk hash differs from `expected_tip` was changed by someone else: a **human edit**.
+- **Human-changed paths (fix round 1 ruling).** A checkpoint can absorb human edits: a `resume_start` one holds what changed while no session ran, and a turn's first checkpoint holds what changed between turns. So a path counts as human-changed at a checkpoint when:
+  - its content there differs from the previous checkpoint's;
+  - no command ran between the two;
+  - no `Edit` or `Undone` record between them left that content.
+
+  This is checked for every such pair of checkpoints. The last pair that changed a path decides its owner, and a `restored` checkpoint (written by a rewind or switch) gives the path back to the agent. A rewind or switch that would change a human-changed path to anything other than its current disk content reports it as a conflict. For a rewind, this covers pairs after the target step. `expected_tip` stays the agent's tip.
 - **Working-tree lease.** Engines hold a shared `flock` on `<data home>/locks/<root-hash>.lock`. Rewind and switch need it exclusive. They are refused while another live session, in this process or another, uses the same working tree.
 
 #### 7.12.2 Rewind as fork
@@ -690,7 +696,11 @@ Every operation here creates a new branch or a new view. None truncates a log, a
   - A path that would change and has a human edit, including a human-added file that would be deleted, is a **conflict**.
   - When conflicts remain that are not listed in `overwrite`, nothing is written and no branch is created (`applied: false`).
   - Human edits to paths the rewind does not touch are left alone.
-  - Before any write, a backup snapshot is taken (`undo-<n>` ref, 7.11.11).
+  - Before any write, a backup snapshot is taken (`undo-<n>` ref, 7.11.11). Outside git, or with checkpoints off, the engine instead keeps each overwritten file's bytes in the session's blob store, in a `RestoreBegun{backup_ref?, files}` record. When a file cannot be kept (a link, or a file over 64 MiB), the report's `backup` is none and the REPL does not promise a backup.
+  - A path below a symbolic link or a file, or one where a directory is in the way, is **blocked**: it is never written, whatever `overwrite` lists, and nothing is written while any blocked path is left. Each write first checks that the path resolves to itself.
+  - The current log records the command, the tip checkpoint, then `RestoreBegun` (before the first write) and `RestoreEnded{applied, rolled_back}`. A resume warns about a `RestoreBegun` with no end, naming the backup. A failure after files were written puts them back and says whether that worked, and which snapshot holds the files from before.
+  - A step that does not exist is refused before anything is logged. `at = 0` copies the records before the first step; the parent offset is the last of them.
+  - The branch ends with a `restored` checkpoint of exactly the materialized files. Outside git, it ends instead with an `Edit{asserted: true}` per overlay file, which turn diffs and undo ignore. A switch appends a `restored` checkpoint to the session it switches to.
 - **The answer is `Rewound{at, branch, report}`**, where `report` is `{restored, deleted, conflicts, dry_run, applied, backup_ref?, note?}`. The REPL first sends a dry run and shows what would be restored, deleted and in conflict. It asks y/n, and on conflicts asks separately before sending `overwrite` with the paths.
 - **Conversation:** the branch's context is `rebuild(reader, at)` (H9). Requests after a rewind start from that exact prefix.
 - **Outside git:** only tool edits are restored, and `note` says command effects were not.

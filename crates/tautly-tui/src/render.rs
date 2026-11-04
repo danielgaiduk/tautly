@@ -588,8 +588,21 @@ fn materialized(what: &str, r: &tautly_core::MaterializeReport) -> String {
             list(&r.conflicts)
         );
     }
+    if !r.blocked.is_empty() {
+        let _ = write!(
+            out,
+            "\n  blocked (a directory, link or file is in the way; never written): {}",
+            list(&r.blocked)
+        );
+    }
     if let Some(b) = &r.backup_ref {
         let _ = write!(out, "\n  snapshot before: {}", printable(b));
+    } else if r.dry_run && !(r.restored.is_empty() && r.deleted.is_empty()) {
+        let _ = match r.backup.as_deref() {
+            Some("log") => write!(out, "\n  backup: kept in the session log"),
+            Some(_) => write!(out, "\n  backup: a git snapshot"),
+            None => write!(out, "\n  backup: none (what it overwrites is not kept)"),
+        };
     }
     if let Some(n) = &r.note {
         let _ = write!(out, "\n  note: {}", printable(n));

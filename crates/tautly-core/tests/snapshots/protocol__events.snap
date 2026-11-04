@@ -285,8 +285,12 @@ expression: events
         "new.txt"
       ],
       "conflicts": [],
+      "blocked": [
+        "vendor/x"
+      ],
       "dry_run": false,
       "applied": true,
+      "backup": "git",
       "backup_ref": "refs/tautly/checkpoints/01J0/undo-8",
       "note": null
     }
@@ -300,8 +304,10 @@ expression: events
       "conflicts": [
         "notes.md"
       ],
+      "blocked": [],
       "dry_run": true,
       "applied": false,
+      "backup": null,
       "backup_ref": null,
       "note": null
     }

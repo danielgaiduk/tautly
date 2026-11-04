@@ -229,6 +229,7 @@ pub(crate) fn rebuild_with(
         results: HashMap::new(),
         logged_tools: None,
         unknown: 0,
+        restoring: None,
     };
     let mut stopped = false;
     for rec in reader.records() {
@@ -246,6 +247,17 @@ pub(crate) fn rebuild_with(
     // Pins of a turn the log ends in (or the cut closes) reach the context as its
     // leftovers would have.
     r.apply_pending();
+    if let Some(backup) = r.restoring.take() {
+        r.warn(match backup {
+            Some(b) => format!(
+                "a rewind or switch was cut off while it wrote files; the files from before it \
+                 are in the snapshot {b} (`git restore --source {b} -- .`)"
+            ),
+            None => "a rewind or switch was cut off while it wrote files; their content from \
+                 before it is in the session log's last RestoreBegun record"
+                .to_string(),
+        });
+    }
     if r.unknown > 0 {
         let n = r.unknown;
         r.warn(format!(
@@ -310,6 +322,9 @@ struct Replay<'a> {
     logged_tools: Option<Vec<ToolSpec>>,
     /// Records of a type this version does not know, skipped.
     unknown: usize,
+    /// A rewind or switch began writing files and its end is not logged: the backup ref
+    /// it named, if any.
+    restoring: Option<Option<String>>,
 }
 
 impl Replay<'_> {
@@ -473,6 +488,8 @@ impl Replay<'_> {
             | SessionRecord::CheckpointSkipped { .. }
             | SessionRecord::Labeled { .. }
             | SessionRecord::EngineError { .. } => {}
+            SessionRecord::RestoreBegun { backup_ref, .. } => self.restoring = Some(backup_ref),
+            SessionRecord::RestoreEnded { .. } => self.restoring = None,
             SessionRecord::Unknown => self.unknown += 1,
         }
         Flow::Go
@@ -1253,7 +1270,7 @@ impl Session {
         .map_err(err)??;
         let (child, rebuilt) = made;
         Ok(self
-            .continue_on(child, rebuilt, stop, Continue::Branch)
+            .continue_on(child, rebuilt, stop, Continue::Branch, "fork")
             .await)
     }
 
@@ -1261,13 +1278,15 @@ impl Session {
     /// `rebuilt` from it: the log, the session id, the checkpoint refs and numbering
     /// ([`adopt_checkpoints`](Self::adopt_checkpoints)), the last-request file, the spend
     /// (none for a new branch; the session's own for one switched to), the rebuilt state
-    /// and the model the log ends on. Returns the session's id and log.
+    /// and the model the log ends on. Warnings say `what` (`fork`, `rewind`, `switch`).
+    /// Returns the session's id and log.
     pub(crate) async fn continue_on(
         &mut self,
         writer: SessionWriter<SessionRecord>,
         rebuilt: Rebuilt,
         stop: impl std::future::Future<Output = ()>,
         how: Continue,
+        what: &str,
     ) -> (String, PathBuf) {
         let id = writer.session_id().to_string();
         let path = writer.path().to_path_buf();
@@ -1282,10 +1301,6 @@ impl Session {
             .without_spend();
         *self.budgets.lock().unwrap_or_else(PoisonError::into_inner) = fresh;
         let mut resumed = self.adopt(rebuilt);
-        let what = match how {
-            Continue::Branch => "fork",
-            Continue::Resumed => "switch",
-        };
         for w in std::mem::take(&mut resumed.warnings) {
             self.warn(format!("{what}: {w}")).await;
         }

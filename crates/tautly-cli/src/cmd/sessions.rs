@@ -129,7 +129,11 @@ fn turns(reader: &SessionReader<SessionRecord>) -> anyhow::Result<Vec<Turn>> {
                     t.last_step = Some(step);
                 }
             }
-            SessionRecord::Edit { path, .. } => {
+            SessionRecord::Edit {
+                path,
+                asserted: false,
+                ..
+            } => {
                 if let Some(t) = turns.last_mut() {
                     t.files.insert(path.as_str().to_string());
                 }
@@ -275,7 +279,11 @@ fn markdown(reader: &SessionReader<SessionRecord>) -> anyhow::Result<String> {
                     let _ = writeln!(md, "      {line}");
                 }
             }
-            SessionRecord::Edit { path, .. } => {
+            SessionRecord::Edit {
+                path,
+                asserted: false,
+                ..
+            } => {
                 let _ = writeln!(md, "  edited `{}`", path.as_str());
             }
             SessionRecord::Undone { turn, .. } => {

@@ -256,14 +256,14 @@ impl EngineBuilder {
         let mut config_warnings = self.config_warnings;
         config_warnings.extend(side_note);
         // Held for the engine's life; rewind and switch take it exclusively.
-        let lease = match Lease::shared(&data_home, &root) {
-            Ok(lease) => Some(lease.for_workspace(&workspace)),
+        // Not waited for here (this may run on an async worker): while a rewind elsewhere
+        // holds it exclusively, the actor takes it before its first command.
+        let (lease, lease_pending) = match Lease::try_shared(&data_home, &root) {
+            Ok(Some(lease)) => (Some(lease.for_workspace(&workspace)), false),
+            Ok(None) => (None, true),
             Err(e) => {
-                config_warnings.push(format!(
-                    "the working-tree lease is unavailable ({e}); rewind and switch are off \
-                     for this session"
-                ));
-                None
+                config_warnings.push(lease_warning(&e));
+                (None, false)
             }
         };
         let init = HeaderInit {
@@ -400,6 +400,7 @@ impl EngineBuilder {
                 config_pins: config.pins.clone(),
                 resume: self.resume.is_some(),
                 mcp,
+                lease_pending,
             },
         ));
         Ok((
@@ -595,6 +596,16 @@ struct Start {
     /// The session is resumed: its context is rebuilt from the log first.
     resume: bool,
     mcp: McpSetup,
+    /// The working-tree lease was held exclusively elsewhere at build: taken (waiting a
+    /// bounded time, off the async workers) before the first command.
+    lease_pending: bool,
+}
+
+/// The warning when the working-tree lease cannot be had.
+fn lease_warning(e: &std::io::Error) -> String {
+    format!(
+        "the working-tree lease is unavailable ({e}); rewind and switch are off for this session"
+    )
 }
 
 /// The actor's task dropped without a shutdown (the runtime went away): no process group
@@ -616,6 +627,21 @@ impl Actor {
             session_id: self.session_id.clone(),
         });
         session.workspace.start();
+        if start.lease_pending {
+            let (home, root) = (session.data_home.clone(), session.root().to_path_buf());
+            let taken = tokio::task::spawn_blocking(move || {
+                Lease::shared_within(&home, &root, Duration::from_secs(10))
+            })
+            .await
+            .map_err(std::io::Error::other)
+            .and_then(|r| r);
+            match taken {
+                Ok(lease) => session.lease = Some(lease.for_workspace(&session.workspace)),
+                Err(e) => self.events.try_emit(Event::Warning {
+                    message: lease_warning(&e),
+                }),
+            }
+        }
         for w in start.config_warnings {
             self.events.try_emit(Event::Warning { message: w });
         }
