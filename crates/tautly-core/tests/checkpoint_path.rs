@@ -2,6 +2,7 @@
 //! change the process's `PATH`, so they live in a binary of their own and run one at a
 //! time (under [`PATH_LOCK`], each on its own runtime).
 
+use std::ffi::OsStr;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command as Process;
@@ -99,11 +100,17 @@ fn repo(git: &Path) -> tempfile::TempDir {
 
 /// Run `body` with `PATH` set to `path`, alone, on a runtime of its own.
 fn with_path<T>(path: &Path, body: impl std::future::Future<Output = T>) -> T {
+    with_env("PATH", path.as_os_str(), body)
+}
+
+/// Run `body` with the environment variable `key` set to `value`, alone, on a runtime of
+/// its own.
+fn with_env<T>(key: &str, value: &OsStr, body: impl std::future::Future<Output = T>) -> T {
     let _alone = PATH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let saved = std::env::var_os("PATH");
+    let saved = std::env::var_os(key);
     // SAFETY: the tests of this binary hold PATH_LOCK while they read or change the
     // environment, and no other thread of this process uses it meanwhile.
-    unsafe { std::env::set_var("PATH", path) };
+    unsafe { std::env::set_var(key, value) };
     let out = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -112,8 +119,8 @@ fn with_path<T>(path: &Path, body: impl std::future::Future<Output = T>) -> T {
     // SAFETY: as above.
     unsafe {
         match saved {
-            Some(p) => std::env::set_var("PATH", p),
-            None => std::env::remove_var("PATH"),
+            Some(v) => std::env::set_var(key, v),
+            None => std::env::remove_var(key),
         }
     }
     out
@@ -344,4 +351,96 @@ fn old_git_in_a_partial_clone_warns_once_and_logs_one_skip() {
     assert_eq!(skips, ["unsafe_partial_clone"]);
     assert_eq!(taken, 0);
     assert!(!marker.exists(), "the promisor remote's command ran");
+}
+
+/// The user's excludes file (`core.excludesFile` of the global configuration) as it was
+/// at the turn's start decides what undo keeps, and the rules are kept in the data home,
+/// never in the repository.
+#[test]
+fn undo_uses_the_global_excludes_file_of_the_turns_start() {
+    let git = real_git();
+    let repo = repo(&git);
+    let root = repo.path().canonicalize().unwrap();
+    std::fs::write(root.join(".secret"), "S\n").unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let user = tempfile::tempdir().unwrap();
+    let ignore = user.path().join("ignore");
+    std::fs::write(&ignore, ".secret\n").unwrap();
+    let global = user.path().join("gitconfig");
+    std::fs::write(
+        &global,
+        format!("[core]\n\texcludesFile = {}\n", ignore.display()),
+    )
+    .unwrap();
+    let answer = with_env("GIT_CONFIG_GLOBAL", global.as_os_str(), async {
+        let (engine, mut events) = engine(
+            &root,
+            home.path(),
+            vec![
+                bash_step(
+                    "b1",
+                    "touch ready && while [ ! -e go ]; do sleep 0.02; done \
+                     && printf 'changed\\n' > a.txt",
+                ),
+                text_step("done"),
+            ],
+        );
+        engine
+            .send(Command::SendMessage { text: "go".into() })
+            .await
+            .unwrap();
+        let began = Instant::now();
+        while !root.join("ready").exists() {
+            assert!(began.elapsed() < WAIT, "the command did not start");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        // Emptied while the command runs (after its checkpoint).
+        std::fs::write(&ignore, "").unwrap();
+        std::fs::write(root.join("go"), "").unwrap();
+        while !matches!(next(&mut events).await, Event::TurnFinished { .. }) {}
+        engine
+            .send(Command::Undo {
+                turn: None,
+                dry_run: false,
+            })
+            .await
+            .unwrap();
+        let answer = loop {
+            let ev = next(&mut events).await;
+            if matches!(ev, Event::Undone { .. } | Event::Error { .. }) {
+                break ev;
+            }
+        };
+        stop(engine, events).await;
+        answer
+    });
+    let Event::Undone {
+        restored,
+        mut deleted,
+        note,
+        ..
+    } = answer
+    else {
+        panic!("{answer:?}")
+    };
+    deleted.sort();
+    assert_eq!(restored, ["a.txt"]);
+    assert_eq!(deleted, ["go", "ready"]);
+    assert!(note.unwrap_or_default().contains(".secret"));
+    assert_eq!(
+        std::fs::read_to_string(root.join(".secret"))
+            .ok()
+            .as_deref(),
+        Some("S\n")
+    );
+    // No checkpoint commit carries the rules.
+    let objects = Process::new(&git)
+        .current_dir(&root)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .args(["cat-file", "--batch-all-objects", "--batch"])
+        .output()
+        .unwrap()
+        .stdout;
+    let has = |needle: &[u8]| objects.windows(needle.len()).any(|w| w == needle);
+    assert!(!has(b"tautly-excludes") && !has(b"2e7365637265740a"));
 }

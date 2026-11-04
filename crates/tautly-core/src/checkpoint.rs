@@ -30,6 +30,11 @@
 //! the deadline (`timeout_ms` for a snapshot), when the call is dropped (a cancel) or by
 //! the session's process-group registry.
 //!
+//! Nothing but the work tree's own files goes into a checkpoint: the exclude rules it was
+//! taken with (which undo reads back) are kept in the session data home
+//! ([`with_excludes_store`](Checkpointer::with_excludes_store)), since a mirror push
+//! publishes `refs/tautly/` (session start warns about such remotes).
+//!
 //! An unchanged tree reuses the previous checkpoint (same `n` and commit), and so does a
 //! [`Checkpointer::snapshot`] whose write generation did not move and whose caller's
 //! watcher saw no change, without running git at all.
@@ -45,6 +50,9 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
+mod excludes_store;
+
+use self::excludes_store::ExcludesStore;
 use crate::config::CheckpointConfig;
 use crate::record::SessionRecord;
 use crate::session::{EventSink, Log, Session};
@@ -153,6 +161,29 @@ impl Skip {
         matches!(self, Skip::UnsafePartialClone | Skip::GitDirSymlink)
     }
 
+    /// Git failed because an object it needs is missing (or a fetch of one was refused):
+    /// a damaged repository, or a partial clone that lacks it. It will not heal by itself.
+    pub fn is_missing_object(&self) -> bool {
+        let Skip::Git(why) = self else {
+            return false;
+        };
+        let why = why.to_ascii_lowercase();
+        [
+            "unable to read",
+            "missing blob",
+            "missing tree",
+            "missing object",
+            "bad object",
+            "not a valid object",
+            "lazy fetching disabled",
+            "could not fetch",
+            "from promisor remote",
+        ]
+        .iter()
+        .any(|m| why.contains(m))
+            || (why.contains("transport '") && why.contains("not allowed"))
+    }
+
     /// The reason a `CheckpointSkipped` record gives (`cancelled` is the other one).
     pub fn code(&self) -> &'static str {
         match self {
@@ -169,6 +200,16 @@ impl Skip {
 /// The warning shown for a skipped checkpoint.
 pub fn skip_warning(skip: &Skip) -> String {
     format!("checkpoint skipped: {skip}")
+}
+
+/// The warning for remotes a push to would publish checkpoint refs to.
+fn publishing_warning(remotes: &[String]) -> String {
+    let names: Vec<String> = remotes.iter().map(|r| format!("{r:?}")).collect();
+    format!(
+        "a push to remote {} would publish the checkpoint refs under {REF_PREFIX}/ \
+         (mirror, or a push refspec that covers them), with the untracked files they hold",
+        names.join(", ")
+    )
 }
 
 /// The ref of checkpoint `name` (a number, or `undo-<n>`) of `session`.
@@ -281,13 +322,9 @@ type GitVersion = tokio::sync::OnceCell<Option<(u32, u32)>>;
 /// The first git release that honours `GIT_NO_LAZY_FETCH`.
 const LAZY_FETCH_OFF_SINCE: (u32, u32) = (2, 44);
 
-/// Most bytes of exclude rules (the user's excludes file and `info/exclude`) kept with a
+/// Most bytes of exclude rules (the user's excludes file and `info/exclude`) kept for a
 /// checkpoint; above it, undo falls back to the rules as they are then.
 const MAX_EXCLUDES: u64 = 256 * 1024;
-
-/// The trailer of a checkpoint's commit message that holds the exclude rules (hex) as
-/// they were when it was taken.
-const EXCLUDES_TRAILER: &str = "tautly-excludes: ";
 
 /// What one read of the configuration (every scope, includes followed) gives.
 #[derive(Debug, Default)]
@@ -295,11 +332,9 @@ struct RepoConfig {
     /// `-c` settings that switch off every filter driver and every protocol the
     /// configuration allows.
     overrides: Vec<String>,
-    /// `extensions.partialClone` or a promisor remote is set: missing objects would be
-    /// fetched (lazily) from a remote.
+    /// `extensions.partialClone`, a promisor remote or a remote's partial-clone filter is
+    /// set: missing objects would be fetched (lazily) from a remote.
     partial_clone: bool,
-    /// `core.excludesFile`, when set.
-    excludes_file: Option<PathBuf>,
 }
 
 impl<'a> Git<'a> {
@@ -380,7 +415,7 @@ impl<'a> Git<'a> {
     }
 
     async fn read_config(&self, deadline: Instant) -> Result<RepoConfig, Fail> {
-        let wanted = r"^(filter\..+|protocol\..+\.allow|core\.excludesfile|extensions\.partialclone|remote\..+\.promisor)$";
+        let wanted = r"^(filter\..+|protocol\..+\.allow|extensions\.partialclone|remote\..+\.(promisor|partialclonefilter))$";
         let out = match self
             .exec(
                 &["config", "-z", "--get-regexp", wanted],
@@ -396,6 +431,38 @@ impl<'a> Git<'a> {
             Err(e) => return Err(e),
         };
         parse_config(&out)
+    }
+
+    /// The user's excludes file: `core.excludesFile` of the global configuration (its
+    /// includes followed), else `$XDG_CONFIG_HOME/git/ignore` (`~/.config/git/ignore`).
+    /// Never a value the repository's own configuration sets: that would let a repository
+    /// name any file of the user's to be read. The system configuration is not read by
+    /// any checkpoint git call (`GIT_CONFIG_NOSYSTEM`). Err: it could not be told.
+    async fn user_excludes_file(&self, deadline: Instant) -> Result<Option<PathBuf>, Fail> {
+        let args = [
+            "config",
+            "--global",
+            "--includes",
+            "-z",
+            "--get",
+            "core.excludesfile",
+        ];
+        let configured = match self.run(&args, None, deadline).await {
+            Ok(out) => {
+                let value = String::from_utf8_lossy(&out);
+                let value = value.trim_end_matches('\0');
+                (!value.is_empty()).then(|| expand_home(value))
+            }
+            // Not set.
+            Err(Fail::Exit { code: Some(1), .. }) => None,
+            Err(e) => return Err(e),
+        };
+        Ok(
+            configured.or_else(|| match std::env::var_os("XDG_CONFIG_HOME") {
+                Some(xdg) if !xdg.is_empty() => Some(PathBuf::from(xdg).join("git/ignore")),
+                _ => std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config/git/ignore")),
+            }),
+        )
     }
 
     /// Run `git [hardening] [extra] <args>` (with `input` on stdin) until `deadline`.
@@ -682,12 +749,11 @@ fn parse_config(out: &[u8]) -> Result<RepoConfig, Fail> {
                 return Err(unusable("protocol", name));
             }
             protocols.insert(name.to_string());
-        } else if key == "core.excludesfile" {
-            config.excludes_file = value
-                .filter(|v| !v.is_empty())
-                .map(|v| expand_home(v.as_ref()));
         } else if key == "extensions.partialclone" {
             config.partial_clone |= value.is_none_or(|v| !v.is_empty());
+        } else if key.ends_with(".partialclonefilter") {
+            // `remote.<name>.partialclonefilter` alone makes `<name>` a promisor remote.
+            config.partial_clone = true;
         } else if key.starts_with("remote.") {
             // `remote.<name>.promisor`: anything but a false boolean counts.
             let off = value.is_some_and(|v| {
@@ -714,13 +780,49 @@ fn parse_config(out: &[u8]) -> Result<RepoConfig, Fail> {
     Ok(config)
 }
 
-/// `(major, minor)` of `git version 2.44.0 (…)`.
+/// Whether a push refspec's source can name a checkpoint ref (`refs/tautly/…`, or
+/// `tautly/…`, which git expands to it): a glob whose fixed start is compatible with it,
+/// or a ref below it. A negative refspec (`^…`) and the matching one (`:`) cannot.
+fn pushes_checkpoints(refspec: &str) -> bool {
+    let spec = refspec.trim();
+    let spec = spec.strip_prefix('+').unwrap_or(spec);
+    if spec.starts_with('^') {
+        return false;
+    }
+    let src = spec.split_once(':').map_or(spec, |(src, _)| src);
+    if src.is_empty() {
+        return false;
+    }
+    let names = ["refs/tautly/", "tautly/"];
+    match src.split_once('*') {
+        Some((start, _)) => names
+            .iter()
+            .any(|n| n.starts_with(start) || start.starts_with(n)),
+        None => names.iter().any(|n| src.starts_with(n)),
+    }
+}
+
+/// `(major, minor)` of `git version 2.44.0 (…)`. A release candidate (`2.44.0.rc1`,
+/// `2.44.0-rc1`) comes before its release: `2.44.0-rc1` gives `(2, 43)`.
 fn parse_version(text: &str) -> Option<(u32, u32)> {
     let number = text.trim().strip_prefix("git version ")?;
-    let mut parts = number.split(|c: char| !c.is_ascii_digit());
-    let major = parts.next()?.parse().ok()?;
-    let minor = parts.next()?.parse().ok()?;
-    Some((major, minor))
+    let number = number.split_whitespace().next()?;
+    let mut parts = number.split(['.', '-']);
+    let digits = |p: &str| -> Option<u32> {
+        (!p.is_empty() && p.bytes().all(|b| b.is_ascii_digit())).then(|| p.parse().ok())?
+    };
+    let major = digits(parts.next()?)?;
+    let minor = parts
+        .next()
+        .and_then(|p| digits(p.split(|c: char| !c.is_ascii_digit()).next()?))?;
+    let candidate = parts.take(2).any(|p| p.starts_with("rc"));
+    if !candidate {
+        Some((major, minor))
+    } else if minor > 0 {
+        Some((major, minor - 1))
+    } else {
+        Some((major.checked_sub(1)?, u32::MAX))
+    }
 }
 
 /// A configured path with a leading `~/` expanded (as git does; `~user/` is left).
@@ -728,18 +830,6 @@ fn expand_home(path: &str) -> PathBuf {
     match (path.strip_prefix("~/"), std::env::var_os("HOME")) {
         (Some(rest), Some(home)) => PathBuf::from(home).join(rest),
         _ => PathBuf::from(path),
-    }
-}
-
-/// The user's excludes file: `core.excludesFile`, else `$XDG_CONFIG_HOME/git/ignore`
-/// (`~/.config/git/ignore`).
-fn user_excludes_file(configured: Option<&Path>) -> Option<PathBuf> {
-    if let Some(p) = configured {
-        return Some(p.to_path_buf());
-    }
-    match std::env::var_os("XDG_CONFIG_HOME").filter(|v| !v.is_empty()) {
-        Some(xdg) => Some(PathBuf::from(xdg).join("git/ignore")),
-        None => std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config/git/ignore")),
     }
 }
 
@@ -752,53 +842,31 @@ fn common_dir(git_dir: &Path) -> PathBuf {
     }
 }
 
-/// A regular file's bytes, up to `limit` (none: missing, not a regular file, or longer;
-/// a FIFO or device is never opened).
+/// A regular file's bytes, up to `limit` (none: missing). Err: a symbolic link (never
+/// followed: `O_NOFOLLOW`), not a regular file (a FIFO is opened without blocking and
+/// never read), longer than `limit`, or unreadable.
 fn read_regular(path: &Path, limit: u64) -> Result<Option<Vec<u8>>, ()> {
     use std::io::Read;
-    match std::fs::metadata(path) {
+    use std::os::unix::fs::OpenOptionsExt;
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(path)
+    {
+        Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(_) => return Err(()),
-        Ok(m) if !m.is_file() => return Err(()),
-        Ok(m) if m.len() > limit => return Err(()),
-        Ok(_) => {}
+    };
+    match file.metadata() {
+        Ok(m) if m.is_file() && m.len() <= limit => {}
+        _ => return Err(()),
     }
     let mut bytes = Vec::new();
-    std::fs::File::open(path)
-        .and_then(|f| f.take(limit + 1).read_to_end(&mut bytes))
-        .map_err(drop)?;
+    file.take(limit + 1).read_to_end(&mut bytes).map_err(drop)?;
     if bytes.len() as u64 > limit {
         return Err(());
     }
     Ok(Some(bytes))
-}
-
-fn hex(bytes: &[u8]) -> String {
-    use std::fmt::Write;
-    bytes.iter().fold(String::new(), |mut s, b| {
-        let _ = write!(s, "{b:02x}");
-        s
-    })
-}
-
-fn unhex(text: &str) -> Option<Vec<u8>> {
-    text.as_bytes()
-        .chunks(2)
-        .map(|pair| match pair {
-            [hi, lo] => u8::from_str_radix(std::str::from_utf8(&[*hi, *lo]).ok()?, 16).ok(),
-            _ => None,
-        })
-        .collect()
-}
-
-/// The exclude rules a checkpoint's commit message keeps (none: it keeps none).
-fn excludes_in_message(commit: &[u8]) -> Option<Vec<u8>> {
-    let text = std::str::from_utf8(commit).ok()?;
-    let (_, message) = text.split_once("\n\n")?;
-    message
-        .lines()
-        .find_map(|l| l.strip_prefix(EXCLUDES_TRAILER))
-        .and_then(|h| unhex(h.trim()))
 }
 
 fn bytes_to_os(b: &[u8]) -> OsString {
@@ -925,6 +993,9 @@ pub struct Checkpointer {
     next: u32,
     last: Option<Last>,
     version: GitVersion,
+    /// Where each checkpoint's exclude rules are kept (none: not kept, and undo uses the
+    /// rules as they are then).
+    excludes: Option<ExcludesStore>,
 }
 
 impl Checkpointer {
@@ -958,7 +1029,16 @@ impl Checkpointer {
             next: 1,
             last: None,
             version: GitVersion::new(),
+            excludes: None,
         })
+    }
+
+    /// Keep each checkpoint's exclude rules (the user's excludes file and the
+    /// repository's `info/exclude` as they are when it is taken) in `dir`, a private
+    /// directory of the session data home (never the repository), for undo to read back.
+    pub fn with_excludes_store(mut self, dir: PathBuf) -> Self {
+        self.excludes = Some(ExcludesStore::new(dir));
+        self
     }
 
     /// Run this git program instead of the one on `PATH`.
@@ -1156,18 +1236,19 @@ impl Checkpointer {
             .as_ref()
             .map(|l| l.r.commit.clone())
             .or_else(|| now.head.as_ref().map(|(c, _)| c.clone()));
-        // The exclude rules go with the tree: undo decides what was ignored at the
-        // checkpoint with them (see `ignored_under`).
-        let mut message = format!("tautly checkpoint ({})\n", self.session);
-        if let Some(rules) = &now.excludes {
-            message.push_str(&format!("\n{EXCLUDES_TRAILER}{}\n", hex(rules)));
-        }
+        let message = format!("tautly checkpoint ({})\n", self.session);
         let mut args = vec!["commit-tree", "--no-gpg-sign", now.tree.as_str()];
         if let Some(p) = &parent {
             args.extend(["-p", p.as_str()]);
         }
         let out = git.run(&args, Some(message.into_bytes()), deadline).await?;
         let commit = String::from_utf8_lossy(&out).trim().to_string();
+        // The exclude rules go with the checkpoint, outside the repository: undo decides
+        // what was ignored at the checkpoint with them (see `ignored_under`).
+        let excludes = match (&now.excludes, &self.excludes) {
+            (Some(rules), Some(store)) => store.put(&commit, rules).is_ok().then(|| rules.clone()),
+            _ => None,
+        };
         // A number already taken (a backup of an earlier run, an old log) moves on.
         let mut n = self.next;
         let refname = loop {
@@ -1198,7 +1279,7 @@ impl Checkpointer {
             self.last = Some(Last {
                 r: made.clone(),
                 write_gen: None,
-                excludes: Some(now.excludes.clone()),
+                excludes: Some(excludes),
             });
         }
         Ok(made)
@@ -1235,21 +1316,30 @@ impl Checkpointer {
         })
     }
 
-    /// The exclude rules outside the work tree now: the user's excludes file, then the
-    /// repository's `info/exclude` (later rules win, as in git). None when one cannot be
-    /// read or they are longer than [`MAX_EXCLUDES`].
+    /// The exclude rules outside the work tree now: the user's excludes file (see
+    /// [`Git::user_excludes_file`]), then the repository's `info/exclude` (later rules
+    /// win, as in git). Neither is read through a symbolic link. None when no store keeps
+    /// them, when one cannot be read (or `info` is a symbolic link), or when they are
+    /// longer than [`MAX_EXCLUDES`].
     async fn excludes_now(
         &self,
         git: &Git<'_>,
         deadline: Instant,
     ) -> Result<Option<Vec<u8>>, Skip> {
-        let config = git.config(deadline).await?;
-        let sources = [
-            user_excludes_file(config.excludes_file.as_deref()),
-            Some(common_dir(&self.git_dir).join("info/exclude")),
-        ];
+        if self.excludes.is_none() {
+            return Ok(None);
+        }
+        let user = match git.user_excludes_file(deadline).await {
+            Ok(path) => path,
+            Err(Fail::Exit { .. } | Fail::Io(_)) => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        let info = common_dir(&self.git_dir).join("info");
+        if std::fs::symlink_metadata(&info).is_ok_and(|m| m.file_type().is_symlink()) {
+            return Ok(None);
+        }
         let mut rules = Vec::new();
-        for path in sources.into_iter().flatten() {
+        for path in [user, Some(info.join("exclude"))].into_iter().flatten() {
             match read_regular(&self.root.join(path), MAX_EXCLUDES) {
                 Ok(Some(bytes)) => {
                     rules.extend(bytes);
@@ -1296,6 +1386,62 @@ impl Checkpointer {
             return Err(Skip::TooManyUntracked { files, bytes });
         }
         Ok(())
+    }
+
+    /// The remotes a push to would publish this repository's checkpoint refs to (and the
+    /// untracked files they hold): `remote.<name>.mirror` set, or a push refspec that can
+    /// name a ref below `refs/tautly/` ([`pushes_checkpoints`]). Empty when the
+    /// configuration cannot be read.
+    pub async fn publishing_remotes(&self) -> Vec<String> {
+        let git = Git {
+            index: None,
+            ..self.git()
+        };
+        let out = match git
+            .run(
+                &[
+                    "config",
+                    "-z",
+                    "--get-regexp",
+                    r"^remote\..+\.(mirror|push)$",
+                ],
+                None,
+                Self::housekeeping_deadline(),
+            )
+            .await
+        {
+            Ok(out) => out,
+            Err(_) => return Vec::new(),
+        };
+        let mut remotes = std::collections::BTreeSet::new();
+        for entry in out.split(|&b| b == 0).filter(|e| !e.is_empty()) {
+            let text = String::from_utf8_lossy(entry);
+            // A key without a value has no LF.
+            let (key, value) = match text.split_once('\n') {
+                Some((k, v)) => (k, Some(v)),
+                None => (text.as_ref(), None),
+            };
+            let Some((name, var)) = key
+                .strip_prefix("remote.")
+                .and_then(|rest| rest.rsplit_once('.'))
+            else {
+                continue;
+            };
+            let publishes = match var {
+                // A boolean: no value is true, an empty one false.
+                "mirror" => value.is_none_or(|v| {
+                    !matches!(
+                        v.trim().to_ascii_lowercase().as_str(),
+                        "" | "false" | "no" | "off" | "0"
+                    )
+                }),
+                _ => value.is_some_and(pushes_checkpoints),
+            };
+            if publishes {
+                remotes.insert(name.to_string());
+            }
+        }
+        remotes.into_iter().collect()
     }
 
     /// Whether the repository has every one of these commits.
@@ -1405,7 +1551,7 @@ impl Checkpointer {
 
     /// Which of `paths` (root-relative) the ignore rules of checkpoint `tree` ignore: its
     /// `.gitignore` files, with the repository's `info/exclude` and the user's excludes
-    /// file as they were when it was taken (kept in its commit message). The rules are
+    /// file as they were when it was taken (kept in the excludes store). The rules are
     /// written to a scratch directory that stands in for the work tree (`check-ignore
     /// --no-index`), so the work tree is not touched: the kept exclude rules go first in
     /// its top `.gitignore` (so they take precedence over the exclude files as they are
@@ -1434,11 +1580,7 @@ impl Checkpointer {
             index: None,
             ..self.git()
         };
-        let kept = match git.run(&["cat-file", "commit", tree], None, deadline).await {
-            Ok(commit) => excludes_in_message(&commit),
-            Err(Fail::Exit { .. }) => None,
-            Err(e) => return Err(e.into()),
-        };
+        let kept = self.excludes.as_ref().and_then(|store| store.get(tree));
         if let Some(rules_then) = &kept {
             std::fs::write(rules.join(".gitignore"), rules_then).map_err(disk)?;
         }
@@ -1705,9 +1847,12 @@ pub(crate) struct GitCheckpoints {
     /// The last skip warned about in this user turn: the same reason is not repeated
     /// before every command.
     warned: Option<(u32, String)>,
-    /// A permanent skip happened ([`Skip::is_permanent`]): no checkpoint is taken (or
-    /// logged) for the rest of the session.
+    /// A permanent skip happened ([`Skip::is_permanent`]), or a missing object failed a
+    /// checkpoint twice: no checkpoint is taken (or logged) for the rest of the session.
     off: bool,
+    /// A missing object has failed a checkpoint ([`Skip::is_missing_object`]) and been
+    /// warned about.
+    missing_object: bool,
 }
 
 impl GitCheckpoints {
@@ -1717,6 +1862,7 @@ impl GitCheckpoints {
             fs_events: None,
             warned: None,
             off: false,
+            missing_object: false,
         }))
     }
 }
@@ -1798,11 +1944,27 @@ impl CheckpointJob {
             },
             Some(Err(skip)) => {
                 st.off = skip.is_permanent();
-                let shown = skip.to_string();
-                let fresh = st.warned.as_ref() != Some(&(turn, shown.clone()));
-                st.warned = Some((turn, shown));
-                if fresh {
-                    self.events.warn(skip_warning(&skip)).await;
+                if skip.is_missing_object() {
+                    // It recurs: off for the session, without another warning.
+                    if st.missing_object {
+                        st.off = true;
+                    } else {
+                        st.missing_object = true;
+                        self.events
+                            .warn(format!(
+                                "{} (an object git needs is missing; if it happens again, \
+                                 checkpoints are off for this session)",
+                                skip_warning(&skip)
+                            ))
+                            .await;
+                    }
+                } else {
+                    let shown = skip.to_string();
+                    let fresh = st.warned.as_ref() != Some(&(turn, shown.clone()));
+                    st.warned = Some((turn, shown));
+                    if fresh {
+                        self.events.warn(skip_warning(&skip)).await;
+                    }
                 }
                 SessionRecord::CheckpointSkipped {
                     reason: skip.code().into(),
@@ -1871,7 +2033,8 @@ impl Session {
     /// included) comes after it; a turn's tool calls wait for it
     /// ([`settle_start_checkpoint`](Self::settle_start_checkpoint)). When none can be
     /// taken (no git, `.git` a symbolic link), a warning and a `CheckpointSkipped` record
-    /// instead.
+    /// instead. A remote a push to would publish the checkpoint refs to (see
+    /// [`Checkpointer::publishing_remotes`]) is warned about first, once.
     pub(crate) async fn begin_checkpoints(&mut self) {
         if let StartCheckpoint::Skipped(skip) = std::mem::take(&mut self.start_checkpoint) {
             self.warn(skip_warning(&skip)).await;
@@ -1889,6 +2052,10 @@ impl Session {
         let job = self.checkpoint_job(self.last_step());
         let mut st = shared.lock_owned().await;
         self.start_checkpoint = StartCheckpoint::Running(tokio::spawn(async move {
+            let remotes = st.cp.publishing_remotes().await;
+            if !remotes.is_empty() {
+                job.events.warn(publishing_warning(&remotes)).await;
+            }
             job.run(&mut st, Point::Start, None).await;
         }));
     }
@@ -2003,7 +2170,7 @@ mod tests {
     fn config_read_switches_off_filters_and_protocols() {
         let out = b"filter.lfs.clean\ngit-lfs clean\0filter.a.b.smudge\nx\0\
 protocol.ext.allow\nalways\0protocol.my.proto.allow\nuser\0\
-core.excludesfile\n~/ignore\0remote.origin.promisor\nfalse\0";
+remote.origin.promisor\nfalse\0";
         let config = parse_config(out).unwrap();
         let settings: Vec<&str> = config
             .overrides
@@ -2022,13 +2189,12 @@ core.excludesfile\n~/ignore\0remote.origin.promisor\nfalse\0";
             "{settings:?}"
         );
         assert!(!config.partial_clone);
-        let home = std::env::var_os("HOME").unwrap();
-        assert_eq!(config.excludes_file, Some(Path::new(&home).join("ignore")));
         // A promisor remote (a key without a value is true) or the extension.
         for out in [
             &b"remote.origin.promisor\0"[..],
             b"remote.o.promisor\nyes\0",
             b"extensions.partialclone\norigin\0",
+            b"remote.origin.partialclonefilter\nblob:none\0",
         ] {
             assert!(parse_config(out).unwrap().partial_clone);
         }
@@ -2044,19 +2210,37 @@ core.excludesfile\n~/ignore\0remote.origin.promisor\nfalse\0";
         assert_eq!(parse_version("git version 2.43.0.windows.1"), Some((2, 43)));
         assert_eq!(parse_version("git version 3.0"), Some((3, 0)));
         assert_eq!(parse_version("something else"), None);
+        // A release candidate comes before its release.
+        assert!(parse_version("git version 2.44.0.rc0").unwrap() < (2, 44));
+        assert!(parse_version("git version 2.44.0-rc2").unwrap() < (2, 44));
+        assert!(parse_version("git version 3.0.0.rc1").unwrap() < (3, 0));
+        assert_eq!(parse_version("git version 2.44.1.windows.1"), Some((2, 44)));
     }
 
     #[test]
-    fn excludes_round_trip_through_a_commit_message() {
-        let rules = b".env\n!keep\n\xff\n".to_vec();
-        let commit = format!(
-            "tree abc\nauthor a <a> 1 +0000\n\ntautly checkpoint (s)\n\n{EXCLUDES_TRAILER}{}\n",
-            hex(&rules)
-        );
-        assert_eq!(excludes_in_message(commit.as_bytes()), Some(rules));
-        let empty = format!("tree abc\n\nmsg\n\n{EXCLUDES_TRAILER}\n");
-        assert_eq!(excludes_in_message(empty.as_bytes()), Some(Vec::new()));
-        assert_eq!(excludes_in_message(b"tree abc\n\nmsg\n"), None);
+    fn push_refspecs_that_can_publish_checkpoints() {
+        for spec in [
+            "+refs/*:refs/*",
+            "refs/*",
+            "refs/tautly/*:refs/tautly/*",
+            "+refs/tautly/checkpoints/s/1:refs/x",
+            "refs/t*:refs/t*",
+            "tautly/checkpoints/s/1",
+            "*:*",
+        ] {
+            assert!(pushes_checkpoints(spec), "{spec:?}");
+        }
+        for spec in [
+            "refs/heads/main:refs/heads/main",
+            "+refs/heads/*:refs/heads/*",
+            ":",
+            "^refs/tautly/*",
+            "refs/tags/*",
+            "HEAD",
+            "",
+        ] {
+            assert!(!pushes_checkpoints(spec), "{spec:?}");
+        }
     }
 
     #[test]

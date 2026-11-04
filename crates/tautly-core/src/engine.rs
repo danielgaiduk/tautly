@@ -267,7 +267,15 @@ impl EngineBuilder {
                 )
             })
             .flatten()
-            .map(|cp| GitCheckpoints::shared(cp.with_process_groups(groups.clone())));
+            .map(|cp| {
+                // Each checkpoint's exclude rules are kept next to the project's session
+                // logs (owner-only), shared by its sessions (resumes and forks read them).
+                let cp = match session_path.parent() {
+                    Some(dir) => cp.with_excludes_store(dir.join("checkpoint-excludes")),
+                    None => cp,
+                };
+                GitCheckpoints::shared(cp.with_process_groups(groups.clone()))
+            });
         // Checkpoints are on in a git work tree, yet none can be taken: `.git` is a
         // symbolic link (to a repository that may not be this one's), or no git to run.
         let start_checkpoint = if !config.checkpoints.enabled || checkpoints.is_some() {

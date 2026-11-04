@@ -1458,6 +1458,15 @@ async fn old_git_takes_no_checkpoint_of_a_partial_clone() {
         .with_git(&old);
     assert_eq!(cp.snapshot(0, true).await, Err(Skip::UnsafePartialClone));
 
+    // So is a remote with a partial-clone filter alone.
+    let filter_only = Repo::with(&[("a.txt", "a\n")]);
+    filter_only.git(&["config", "remote.origin.partialclonefilter", "blob:none"]);
+    filter_only.git(&["config", "remote.origin.url", "https://example.invalid/r"]);
+    let mut cp = filter_only
+        .checkpointer(CheckpointConfig::default())
+        .with_git(&old);
+    assert_eq!(cp.snapshot(0, true).await, Err(Skip::UnsafePartialClone));
+
     // Git 2.44 honours GIT_NO_LAZY_FETCH: a partial clone gets its checkpoints.
     let complete = Repo::with(&[("a.txt", "a\n"), ("sub/x.txt", "x\n")]);
     promisor(&complete, &marker, false);
@@ -1479,13 +1488,10 @@ async fn old_git_takes_no_checkpoint_of_a_partial_clone() {
 async fn undo_uses_the_excludes_of_the_turns_start() {
     let repo = Repo::with(&[("tracked.txt", "orig\n")]);
     repo.write(".env", "SECRET=1\n");
-    repo.write(".secret", "S\n");
-    // Ignored only by the repository's exclude file and the user's excludes file.
+    // Ignored only by the repository's exclude file (the user's excludes file, from the
+    // global configuration, is covered in `checkpoint_path.rs`).
     std::fs::write(repo.path(".git/info/exclude"), ".env\n").unwrap();
-    let global = repo.home.path().join("excludes");
-    std::fs::write(&global, ".secret\n").unwrap();
-    repo.git(&["config", "core.excludesFile", global.to_str().unwrap()]);
-    // Both are emptied while the turn's command runs (after its checkpoint).
+    // It is emptied while the turn's command runs (after its checkpoint).
     let mock = MockProvider::new(vec![
         tools_step(vec![bash(
             "b1",
@@ -1502,7 +1508,6 @@ async fn undo_uses_the_excludes_of_the_turns_start() {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     std::fs::write(repo.path(".git/info/exclude"), "").unwrap();
-    std::fs::write(&global, "").unwrap();
     repo.write("go", "");
     run.until(|e| matches!(e, Event::TurnFinished { .. })).await;
     let answer = run.undo(None, false).await;
@@ -1520,10 +1525,223 @@ async fn undo_uses_the_excludes_of_the_turns_start() {
     assert_eq!(restored, ["tracked.txt"]);
     assert_eq!(deleted, ["go", "ready"]);
     let note = note.unwrap();
-    assert!(note.contains(".env") && note.contains(".secret"), "{note}");
+    assert!(note.contains(".env"), "{note}");
     assert_eq!(repo.read(".env").as_deref(), Some("SECRET=1\n"));
-    assert_eq!(repo.read(".secret").as_deref(), Some("S\n"));
     assert_eq!(repo.read("tracked.txt").as_deref(), Some("orig\n"));
+    // The rules were kept in the data home (owner-only), not in the repository.
+    assert!(!all_objects(repo.git_cmd(&[])).contains(&b"tautly-excludes"[..]));
+    let kept: Vec<PathBuf> = walk(repo.home.path())
+        .into_iter()
+        .filter(|p| {
+            p.components()
+                .any(|c| c.as_os_str() == "checkpoint-excludes")
+        })
+        .collect();
+    assert!(!kept.is_empty(), "no exclude rules were kept");
+    for p in &kept {
+        let mode = std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "{}", p.display());
+    }
+}
+
+/// Every object, with its content, of the repository `git` (a git command without
+/// arguments yet) runs in.
+fn all_objects(mut git: Process) -> Contents {
+    let out = git
+        .args(["cat-file", "--batch-all-objects", "--batch"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    Contents(out.stdout)
+}
+
+/// Bytes searched for a needle.
+struct Contents(Vec<u8>);
+
+impl Contents {
+    fn contains(&self, needle: &[u8]) -> bool {
+        self.0.windows(needle.len()).any(|w| w == needle)
+    }
+}
+
+/// A plain (`git`, no hardening) command on the bare repository at `dir`.
+fn bare_git(dir: &Path) -> Process {
+    let mut cmd = Process::new("git");
+    cmd.env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .arg(format!("--git-dir={}", dir.display()));
+    cmd
+}
+
+#[tokio::test]
+async fn excludes_snapshot_never_copies_a_file_into_the_repository() {
+    let secret = b"aws_secret_access_key = SUPERSECRET123";
+    let hex: String = secret.iter().map(|b| format!("{b:02x}")).collect();
+    for variant in ["repository core.excludesFile", "info/exclude symlink"] {
+        let repo = Repo::with(&[("a.txt", "a\n")]);
+        let outside = tempfile::tempdir().unwrap();
+        let file = outside.path().join("credentials");
+        std::fs::write(&file, [&secret[..], b"\n"].concat()).unwrap();
+        if variant.starts_with("repository") {
+            repo.git(&["config", "core.excludesFile", file.to_str().unwrap()]);
+        } else {
+            let exclude = repo.path(".git/info/exclude");
+            let _ = std::fs::remove_file(&exclude);
+            std::os::unix::fs::symlink(&file, &exclude).unwrap();
+        }
+        // The repository's own remote mirrors every ref.
+        let bare = tempfile::tempdir().unwrap();
+        let remote = bare.path().canonicalize().unwrap();
+        assert!(
+            bare_git(&remote)
+                .args(["init", "-q", "--bare"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        repo.git(&["config", "remote.origin.url", remote.to_str().unwrap()]);
+        repo.git(&["config", "remote.origin.mirror", "true"]);
+        let mock = MockProvider::new(vec![
+            tools_step(vec![bash("b1", "printf 'b\\n' > a.txt && touch new.txt")]),
+            text_step("done"),
+        ]);
+        let mut run = start(repo.builder(config(), &mock));
+        run.turn_with("go").await;
+        let answer = run.undo(None, false).await;
+        run.stop().await;
+        assert!(
+            matches!(answer, Event::Undone { .. }),
+            "{variant}: {answer:?}"
+        );
+        assert!(
+            !repo.refs("refs/tautly/").is_empty(),
+            "{variant}: no checkpoint"
+        );
+        let objects = all_objects(repo.git_cmd(&[]));
+        assert!(
+            !objects.contains(secret),
+            "{variant}: the file is in an object"
+        );
+        assert!(
+            !objects.contains(hex.as_bytes()),
+            "{variant}: the file is in an object"
+        );
+        // The user's ordinary push publishes the checkpoint refs, never the file.
+        assert!(repo.git_ok(&["push", "-q", "origin"]));
+        let pushed = all_objects(bare_git(&remote));
+        assert!(
+            !pushed.contains(secret) && !pushed.contains(hex.as_bytes()),
+            "{variant}"
+        );
+        // Nor is it copied into the data home.
+        for p in walk(repo.home.path()) {
+            let bytes = Contents(std::fs::read(&p).unwrap());
+            assert!(
+                !bytes.contains(secret),
+                "{variant}: copied to {}",
+                p.display()
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_remote_that_would_push_checkpoints_is_warned_about_at_session_start() {
+    // The repository's settings, and the remote warned about.
+    type Case<'a> = (&'a [(&'a str, &'a str)], Option<&'a str>);
+    let cases: [Case; 5] = [
+        (
+            &[
+                ("remote.origin.url", "/nowhere"),
+                ("remote.origin.mirror", "true"),
+            ],
+            Some("origin"),
+        ),
+        (
+            &[
+                ("remote.backup.url", "/nowhere"),
+                ("remote.backup.push", "+refs/*:refs/*"),
+            ],
+            Some("backup"),
+        ),
+        (
+            &[
+                ("remote.up.url", "/nowhere"),
+                (
+                    "remote.up.push",
+                    "refs/tautly/checkpoints/*:refs/tautly/checkpoints/*",
+                ),
+            ],
+            Some("up"),
+        ),
+        (
+            &[
+                ("remote.origin.url", "/nowhere"),
+                ("remote.origin.mirror", "false"),
+                ("remote.origin.push", "refs/heads/main:refs/heads/main"),
+            ],
+            None,
+        ),
+        (&[], None),
+    ];
+    for (settings, remote) in cases {
+        let repo = Repo::with(&[("a.txt", "a\n")]);
+        for (key, value) in settings {
+            repo.git(&["config", key, value]);
+        }
+        let mock = MockProvider::new(vec![
+            tools_step(vec![bash("b1", "printf 'b\\n' > a.txt")]),
+            text_step("done"),
+        ]);
+        let mut run = start(repo.builder(config(), &mock));
+        let mut events = run.turn_with("one").await;
+        events.extend(run.turn_with("two").await);
+        run.stop().await;
+        let warned: Vec<String> = warnings(&events)
+            .into_iter()
+            .filter(|w| w.contains("refs/tautly/"))
+            .collect();
+        match remote {
+            Some(name) => {
+                assert_eq!(warned.len(), 1, "{settings:?}: {warned:?}");
+                assert!(warned[0].contains(&format!("\"{name}\"")), "{warned:?}");
+            }
+            None => assert!(warned.is_empty(), "{settings:?}: {warned:?}"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_missing_object_turns_checkpoints_off_when_it_recurs() {
+    let repo = Repo::with(&[("a.txt", "a\n"), ("sub/x.txt", "x\n")]);
+    let sub = repo.git(&["rev-parse", "HEAD:sub"]);
+    std::fs::remove_file(repo.path(&format!(".git/objects/{}/{}", &sub[..2], &sub[2..]))).unwrap();
+    let mock = MockProvider::new(vec![
+        tools_step(vec![bash("b1", "printf 'b\\n' > a.txt")]),
+        text_step("first"),
+        tools_step(vec![bash("b2", "printf 'c\\n' > a.txt")]),
+        text_step("second"),
+    ]);
+    let mut run = start(repo.builder(config(), &mock));
+    let mut events = run.turn_with("one").await;
+    events.extend(run.turn_with("two").await);
+    let (_, path) = run.engine.current_session();
+    run.stop().await;
+    let skipped: Vec<String> = warnings(&events)
+        .into_iter()
+        .filter(|w| w.starts_with("checkpoint skipped"))
+        .collect();
+    assert_eq!(skipped.len(), 1, "{skipped:?}");
+    let recs = records_at(&path);
+    let reasons: Vec<String> = recs
+        .iter()
+        .filter_map(|r| match r {
+            SessionRecord::CheckpointSkipped { reason, .. } => Some(reason.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(reasons, ["git_failed", "git_failed"]);
+    assert!(checkpoints(&recs).is_empty());
 }
 
 #[tokio::test]
