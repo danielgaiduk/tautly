@@ -32,7 +32,7 @@ got_targets=$(jq -c '[.artifacts[] | select(.kind == "executable-zip") | .target
 [ "$got_targets" = "$want_targets" ] || fail "targets: want $want_targets, got $got_targets"
 
 # Installers: the shell script and the Homebrew formula, nothing else.
-want_installers='["tautly-cli-installer.sh","tautly.rb"]'
+want_installers='["tautly-installer.sh","tautly.rb"]'
 got_installers=$(jq -c '[.artifacts[] | select(.kind == "installer") | .name] | sort' <<<"$plan")
 [ "$got_installers" = "$want_installers" ] || fail "installers: want $want_installers, got $got_installers"
 
@@ -46,8 +46,8 @@ jq -e '
 
 # binstall: expand the pkg-url template for each target and compare it with the planned download URL.
 meta=$(cargo metadata --no-deps --format-version 1 --offline) || fail "cargo metadata failed"
-binstall=$(jq -c '.packages[] | select(.name == "tautly-cli") | {name, version, repository, binstall: .metadata.binstall}' <<<"$meta")
-[ -n "$binstall" ] || fail "package tautly-cli not found"
+binstall=$(jq -c '.packages[] | select(.name == "tautly") | {name, version, repository, binstall: .metadata.binstall}' <<<"$meta")
+[ -n "$binstall" ] || fail "package tautly not found"
 pkg_name=$(jq -r .name <<<"$binstall")
 version=$(jq -r .version <<<"$binstall")
 repo=$(jq -r '.repository | rtrimstr("/")' <<<"$binstall")
@@ -83,7 +83,7 @@ done
 
 # Static Linux: keyring must use the pure-Rust Secret Service (zbus), not libdbus or OpenSSL.
 for target in x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
-    tree=$(cargo tree -p tautly-cli --target "$target" -e normal --prefix none --offline 2>/dev/null) ||
+    tree=$(cargo tree -p tautly --target "$target" -e normal --prefix none --offline 2>/dev/null) ||
         fail "cargo tree failed for $target"
     if grep -Eq '^(dbus-secret-service|libdbus-sys|openssl-sys|openssl) ' <<<"$tree"; then
         fail "$target links libdbus or OpenSSL; keyring needs async-secret-service + crypto-rust"

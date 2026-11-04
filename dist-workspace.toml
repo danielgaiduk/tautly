@@ -22,9 +22,6 @@ pr-run-mode = "skip"
 # HOMEBREW_TAP_TOKEN, and replace OWNER (see docs/release.md).
 tap = "OWNER/homebrew-tap"
 publish-jobs = ["homebrew"]
-# The package is `tautly-cli`, so archives and the shell installer are named after it; the
-# formula (and so `brew install`) is `tautly`.
-formula = "tautly"
 display-name = "Tautly"
 
 # Linux binaries are static (musl). The keychain backend is keyring's pure-Rust Secret Service

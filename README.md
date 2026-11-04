@@ -13,14 +13,14 @@ nothing is published until the first `v*` tag).
 brew install OWNER/tap/tautly
 
 # Shell installer (installs to $CARGO_HOME/bin)
-curl --proto '=https' --tlsv1.2 -LsSf https://github.com/OWNER/tautly/releases/latest/download/tautly-cli-installer.sh | sh
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/OWNER/tautly/releases/latest/download/tautly-installer.sh | sh
 
 # cargo-binstall
-cargo binstall --git https://github.com/OWNER/tautly tautly-cli
+cargo binstall --git https://github.com/OWNER/tautly tautly
 
 # From source
-cargo install --path crates/tautly-cli
+cargo install --path crates/tautly-cli  # the package is `tautly`
 ```
 
-Each release also carries `tautly-cli-<target>.tar.xz` archives with `.sha256` checksums. macOS
+Each release also carries `tautly-<target>.tar.xz` archives with `.sha256` checksums. macOS
 binaries are not yet signed or notarised.

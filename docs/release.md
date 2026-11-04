@@ -8,16 +8,16 @@ that file by hand: change `dist-workspace.toml`, run `dist generate`, commit bot
 
 | Artifact | Notes |
 |---|---|
-| `tautly-cli-<target>.tar.xz` + `.sha256` | targets: `aarch64-apple-darwin`, `x86_64-apple-darwin`, `x86_64-unknown-linux-musl` (static), `aarch64-unknown-linux-musl` (static); the binary is `tautly` |
-| `tautly-cli-installer.sh` | `curl \| sh` installer; installs to `$CARGO_HOME/bin` |
+| `tautly-<target>.tar.xz` + `.sha256` | targets: `aarch64-apple-darwin`, `x86_64-apple-darwin`, `x86_64-unknown-linux-musl` (static), `aarch64-unknown-linux-musl` (static); the binary is `tautly` |
+| `tautly-installer.sh` | `curl \| sh` installer; installs to `$CARGO_HOME/bin` |
 | `tautly.rb` | Homebrew formula, pushed to the tap `<owner>/homebrew-tap` |
 | `sha256.sum`, `source.tar.gz` | unified checksums, source archive |
 
-The archives carry the package's name (`tautly-cli`), because cargo-dist names artifacts after the
-Cargo package. `cargo binstall tautly-cli` finds them through `[package.metadata.binstall]` in
-`crates/tautly-cli/Cargo.toml`; binstall's registry lookup needs the crate on crates.io (publishing
-is not part of these steps), `cargo binstall --git https://github.com/<owner>/tautly tautly-cli` does
-not. macOS binaries are not signed or notarised (post-v1); neither curl nor Homebrew sets the
+The Cargo package is named `tautly` (its directory is `crates/tautly-cli`), and cargo-dist names
+artifacts after the package. `cargo binstall tautly` finds the archives through
+`[package.metadata.binstall]` in `crates/tautly-cli/Cargo.toml`; binstall's registry lookup needs the
+crate on crates.io (publishing is not part of these steps), `cargo binstall --git
+https://github.com/<owner>/tautly tautly` does not. macOS binaries are not signed or notarised (post-v1); neither curl nor Homebrew sets the
 quarantine flag.
 
 Runners: macOS targets build on `macos-14`, `x86_64-unknown-linux-musl` on `ubuntu-latest` with
