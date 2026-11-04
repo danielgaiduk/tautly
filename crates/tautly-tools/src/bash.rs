@@ -279,8 +279,13 @@ impl Tool for BashTool {
                 ("TERM".into(), "dumb".into()),
             ],
             // Inherited values that would change how the shell runs the command
-            // (`cd` targets, startup files, options, tracing hooks) behind the policy.
-            env_remove: SHELL_STATE_ENV.iter().map(|v| v.to_string()).collect(),
+            // (`cd` targets, startup files, options, tracing hooks) behind the policy, and
+            // the session's provider API keys (see `ToolCx::with_env_remove`).
+            env_remove: SHELL_STATE_ENV
+                .iter()
+                .map(|v| v.to_string())
+                .chain(cx.env_remove().iter().cloned())
+                .collect(),
             // Its own group, so cancel and shutdown can end everything it started. What
             // leaves the group (setsid, job control, daemonizers) is not reached; see
             // `procs` for the list and the mitigations.

@@ -416,20 +416,27 @@ fn git_head_read_from_files_for_branch_detached_packed_refs_and_worktree() {
     assert_eq!(git_head(&junk), None);
 
     // A worktree: a `.git` file names its git dir, whose `commondir` leads to the
-    // branches; once with an absolute and once with a relative `gitdir:`.
+    // branches, and whose `gitdir` names the `.git` file back; once with an absolute and
+    // once with relative links (git's `worktree.useRelativePaths`).
     let main = t.join("main");
     fake_repo(&main, SHA_A);
     write(&main.join(".git/refs/heads/feature"), &format!("{SHA_E}\n"));
-    for (name, gitdir) in [
+    for (name, gitdir, back) in [
         (
             "wt-abs",
             main.join(".git/worktrees/wt-abs").display().to_string(),
+            t.join("wt-abs/.git").display().to_string(),
         ),
-        ("wt-rel", "../main/.git/worktrees/wt-rel".to_string()),
+        (
+            "wt-rel",
+            "../main/.git/worktrees/wt-rel".to_string(),
+            "../../../../wt-rel/.git".to_string(),
+        ),
     ] {
         let wt_git = main.join(".git/worktrees").join(name);
         write(&wt_git.join("HEAD"), "ref: refs/heads/feature\n");
         write(&wt_git.join("commondir"), "../..\n");
+        write(&wt_git.join("gitdir"), &format!("{back}\n"));
         let wt = t.join(name);
         write(&wt.join(".git"), &format!("gitdir: {gitdir}\n"));
         assert_eq!(git_head(&wt).as_deref(), Some(SHA_E), "{name}");
@@ -623,4 +630,157 @@ fn fork_copy_keeps_records_verbatim_with_their_original_t() {
         SessionWriter::<Msg>::create_in(data.path(), project.path(), HeaderInit::default())
             .unwrap();
     assert_eq!(long.copy_from(&parent_path, 10).unwrap(), 3);
+}
+
+/// Review B-I2 (probe P2): a checkout that arrived as an archive with its `.git` must not
+/// take another project's id (which keys its session logs and private memory episodes)
+/// by naming that project's git directory. A `.git` file or `commondir` counts only when
+/// git's own links name this work tree back.
+#[test]
+fn git_pointers_without_a_back_link_do_not_take_another_projects_id() {
+    let top = tempfile::tempdir().unwrap();
+    let t = top.path().canonicalize().unwrap();
+    let victim = t.join("victim");
+    fake_repo(&victim, SHA_A);
+    // A real linked worktree of the victim, at `t/real`.
+    let real_git = victim.join(".git/worktrees/real");
+    write(&real_git.join("HEAD"), "ref: refs/heads/main\n");
+    write(&real_git.join("commondir"), "../..\n");
+    write(
+        &real_git.join("gitdir"),
+        &format!("{}\n", t.join("real/.git").display()),
+    );
+    write(
+        &t.join("real/.git"),
+        &format!("gitdir: {}\n", real_git.display()),
+    );
+    let victim_id = paths::project_id(&victim);
+    assert_eq!(paths::project_id(&t.join("real")), victim_id);
+    assert_eq!(git_head(&t.join("real")).as_deref(), Some(SHA_A));
+
+    // P2: a `.git` directory whose `commondir` names the victim's.
+    let p2 = t.join("p2");
+    write(&p2.join(".git/HEAD"), "ref: refs/heads/main\n");
+    write(&p2.join(".git/commondir"), "../../victim/.git\n");
+    // A `.git` file naming the victim's git directory itself.
+    let direct = t.join("direct");
+    write(&direct.join(".git"), "gitdir: ../victim/.git\n");
+    // A `.git` file naming the victim's real worktree (whose back-link names `t/real`).
+    let borrowed = t.join("borrowed");
+    write(
+        &borrowed.join(".git"),
+        &format!("gitdir: {}\n", real_git.display()),
+    );
+    // A git directory of its own that names this `.git` back, but whose `commondir` is
+    // the victim's (it is not one of the victim's worktrees).
+    let forged = t.join("forged");
+    let fake = forged.join("fake/worktrees/w");
+    write(&forged.join(".git"), "gitdir: fake/worktrees/w\n");
+    write(&fake.join("HEAD"), "ref: refs/heads/main\n");
+    write(
+        &fake.join("gitdir"),
+        &format!("{}\n", forged.join(".git").display()),
+    );
+    write(&fake.join("commondir"), "../../../../victim/.git\n");
+    // A `.git` symbolic link to the victim's.
+    let linked = t.join("linked");
+    fs::create_dir(&linked).unwrap();
+    std::os::unix::fs::symlink(victim.join(".git"), linked.join(".git")).unwrap();
+
+    for root in [&p2, &direct, &borrowed, &forged, &linked] {
+        let id = paths::project_id(root);
+        assert_ne!(id, victim_id, "{}", root.display());
+        assert_eq!(id, paths::project_hash(root), "{}", root.display());
+        // Nor is the victim's head read as this tree's.
+        assert_eq!(git_head(root), None, "{}", root.display());
+    }
+    // The two hostile checkouts of P2's kind cannot share one id either.
+    assert_ne!(paths::project_id(&p2), paths::project_id(&direct));
+}
+
+/// A submodule's `.git` file names `<super>/.git/modules/<name>`, which has no `gitdir`
+/// back-link: its `core.worktree` names the submodule's work tree instead.
+#[test]
+fn submodule_git_dir_is_trusted_through_core_worktree() {
+    let top = tempfile::tempdir().unwrap();
+    let t = top.path().canonicalize().unwrap();
+    let sup = t.join("super");
+    fake_repo(&sup, SHA_A);
+    let module = sup.join(".git/modules/sub");
+    write(&module.join("HEAD"), &format!("{SHA_B}\n"));
+    write(
+        &module.join("config"),
+        "[core]\n\trepositoryformatversion = 0\n\tbare = false\n\tworktree = ../../../sub\n\
+         [remote \"origin\"]\n\turl = /elsewhere\n",
+    );
+    let sub = sup.join("sub");
+    write(&sub.join(".git"), "gitdir: ../.git/modules/sub\n");
+    assert_eq!(git_head(&sub).as_deref(), Some(SHA_B));
+    assert_ne!(paths::project_id(&sub), paths::project_id(&sup));
+
+    // Another checkout naming the same module dir is not its work tree.
+    let other = t.join("other");
+    write(
+        &other.join(".git"),
+        &format!("gitdir: {}\n", module.display()),
+    );
+    assert_eq!(git_head(&other), None);
+    assert_eq!(paths::project_id(&other), paths::project_hash(&other));
+    // Nor does a `worktree` key of another section count.
+    write(
+        &module.join("config"),
+        "[core]\n\tbare = false\n[remote \"x\"]\n\tworktree = ../../../sub\n",
+    );
+    assert_eq!(git_head(&sub), None);
+}
+
+/// Worktrees (absolute and relative links) and submodules made by git itself keep their
+/// ids and heads.
+#[test]
+fn real_git_worktrees_and_submodules_are_trusted() {
+    let top = tempfile::tempdir().unwrap();
+    let t = top.path().canonicalize().unwrap();
+    let lib = t.join("lib");
+    fs::create_dir(&lib).unwrap();
+    git(&lib, &["init", "-q"]);
+    write(&lib.join("a.txt"), "a\n");
+    git(&lib, &["add", "-A"]);
+    git(&lib, &["commit", "-q", "-m", "one"]);
+    let head = git(&lib, &["rev-parse", "HEAD"]);
+    for (name, relative) in [("wt", "false"), ("wt-rel", "true")] {
+        let wt = t.join(name);
+        let setting = format!("worktree.useRelativePaths={relative}");
+        git(
+            &lib,
+            &[
+                "-c",
+                &setting,
+                "worktree",
+                "add",
+                "-q",
+                "--detach",
+                wt.to_str().unwrap(),
+            ],
+        );
+        assert_eq!(paths::project_id(&wt), paths::project_id(&lib), "{name}");
+        assert_eq!(git_head(&wt).as_deref(), Some(head.as_str()), "{name}");
+    }
+    let sup = t.join("super");
+    fs::create_dir(&sup).unwrap();
+    git(&sup, &["init", "-q"]);
+    git(
+        &sup,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            "-q",
+            "../lib",
+            "sub",
+        ],
+    );
+    let sub = sup.join("sub");
+    assert_eq!(git_head(&sub).as_deref(), Some(head.as_str()));
+    assert_ne!(paths::project_id(&sub), paths::project_hash(&sub));
 }

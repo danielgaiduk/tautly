@@ -127,6 +127,72 @@ async fn spawn_runs_in_cwd_with_env() {
     assert_eq!(out.trim(), "bar");
 }
 
+/// Review N2: a bare program name is looked up on the child's `PATH` with the rule git
+/// already followed (absolute entries outside the root only), so `PATH=bin:...` or an
+/// empty entry cannot make a user-trusted MCP server run a program the repository ships.
+#[tokio::test]
+async fn spawn_never_runs_a_bare_name_from_the_work_tree() {
+    use std::os::unix::fs::PermissionsExt;
+    use tautly_sandbox::SpawnSpec;
+    use tokio::io::AsyncReadExt;
+    let (t, sb) = sandbox();
+    let tools = tempfile::tempdir().unwrap();
+    let script = |path: &Path, says: &str| {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, format!("#!/bin/sh\necho {says}\n")).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    };
+    script(&t.path().join("bin/mytool"), "REPO");
+    script(&t.path().join("mytool"), "REPO");
+    script(&tools.path().join("mytool"), "OUTSIDE");
+    let run = |path: String| {
+        let sb = sb.clone();
+        async move {
+            let mut child = sb
+                .spawn(SpawnSpec {
+                    argv: vec!["mytool".into()],
+                    cwd: ".".into(),
+                    env: vec![("PATH".into(), path)],
+                    env_remove: vec![],
+                    new_process_group: true,
+                })
+                .await?;
+            let mut out = String::new();
+            child
+                .stdout
+                .take()
+                .unwrap()
+                .read_to_string(&mut out)
+                .await
+                .unwrap();
+            Ok::<_, SandboxError>(out.trim().to_string())
+        }
+    };
+    let o = tools.path().display();
+    for path in [format!("bin:{o}"), format!(":{o}")] {
+        assert_eq!(run(path.clone()).await.unwrap(), "OUTSIDE", "PATH={path}");
+    }
+    // Only the repository's: a clear error, nothing run.
+    let err = run(format!("bin::{}", t.path().join("bin").display()))
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("mytool not found on PATH outside the work tree"),
+        "{err}"
+    );
+    // It names what was skipped (review S2-M7): an in-repository toolchain is the usual
+    // cause.
+    let skipped = t.path().canonicalize().unwrap().join("bin/mytool");
+    assert!(
+        err.to_string().contains(&format!(
+            "skipped {} inside the work tree",
+            skipped.display()
+        )),
+        "{err}"
+    );
+}
+
 #[tokio::test]
 async fn write_atomic_new_file_gets_umask_default_mode() {
     use std::os::unix::fs::MetadataExt;
@@ -185,14 +251,78 @@ async fn spill_is_content_addressed_relative_and_gitignored() {
     assert_ne!(sb.spill(b"other").await.unwrap(), rel);
 }
 
+/// Review B-M1: a repository that commits its own `.tautly/tmp/.gitignore` (empty, or
+/// with other rules) must not un-ignore the spill store, whose files hold full command
+/// output: it is rewritten to `*`.
 #[tokio::test]
-async fn spill_keeps_existing_gitignore() {
+async fn spill_rewrites_a_gitignore_that_is_not_ignore_all() {
+    // Including whitespace git does not strip: leading spaces, tabs, NBSP (review S2-I2).
+    for committed in [
+        "",
+        "custom\n",
+        "!*\n",
+        "*\n!spill/\n",
+        "  *  \n",
+        " *\n",
+        "\t*\n",
+        "*\t\n",
+        "\u{a0}*\n",
+        "*\u{a0}\n",
+    ] {
+        let (t, sb) = sandbox();
+        std::fs::create_dir_all(t.path().join(".tautly/tmp")).unwrap();
+        std::fs::write(t.path().join(".tautly/tmp/.gitignore"), committed).unwrap();
+        sb.spill(b"x").await.unwrap();
+        let gi = std::fs::read_to_string(t.path().join(".tautly/tmp/.gitignore")).unwrap();
+        assert_eq!(gi, "*", "{committed:?}");
+    }
+}
+
+/// Review N5: a file that already ignores everything (`*` with a newline, comments, blank
+/// lines: what an editor writes) is left alone, so a tracked one never shows as modified;
+/// and the file is checked at every spill, so one replaced mid-session (a checkout) is
+/// put back before the next spill file is written.
+#[tokio::test]
+async fn spill_gitignore_is_checked_every_time_and_tolerates_formatting() {
+    for kept in ["*\n", "# tautly scratch\n*\n\n", "*  \n", "*\r\n"] {
+        let (t, sb) = sandbox();
+        std::fs::create_dir_all(t.path().join(".tautly/tmp")).unwrap();
+        std::fs::write(t.path().join(".tautly/tmp/.gitignore"), kept).unwrap();
+        sb.spill(b"x").await.unwrap();
+        let gi = std::fs::read_to_string(t.path().join(".tautly/tmp/.gitignore")).unwrap();
+        assert_eq!(gi, kept, "{kept:?}");
+    }
     let (t, sb) = sandbox();
-    std::fs::create_dir_all(t.path().join(".tautly/tmp")).unwrap();
-    std::fs::write(t.path().join(".tautly/tmp/.gitignore"), "custom\n").unwrap();
-    sb.spill(b"x").await.unwrap();
+    sb.spill(b"one").await.unwrap();
+    std::fs::write(t.path().join(".tautly/tmp/.gitignore"), "").unwrap();
+    sb.spill(b"two").await.unwrap();
     let gi = std::fs::read_to_string(t.path().join(".tautly/tmp/.gitignore")).unwrap();
-    assert_eq!(gi, "custom\n");
+    assert_eq!(gi, "*");
+    // Also when the content is already spilled (nothing new is written, but the file
+    // is exposed all the same).
+    std::fs::write(t.path().join(".tautly/tmp/.gitignore"), "!*\n").unwrap();
+    sb.spill(b"two").await.unwrap();
+    let gi = std::fs::read_to_string(t.path().join(".tautly/tmp/.gitignore")).unwrap();
+    assert_eq!(gi, "*");
+}
+
+/// A `.tautly/tmp/.gitignore` that is a symbolic link (to a file of the repository, or
+/// dangling) is neither written through nor trusted: nothing is spilled.
+#[tokio::test]
+async fn spill_refuses_a_gitignore_that_is_a_link() {
+    let (t, sb) = sandbox();
+    std::fs::write(t.path().join("README.md"), "readme\n").unwrap();
+    std::fs::create_dir_all(t.path().join(".tautly/tmp")).unwrap();
+    std::os::unix::fs::symlink("../../README.md", t.path().join(".tautly/tmp/.gitignore")).unwrap();
+    assert!(sb.spill(b"x").await.is_err());
+    assert_eq!(
+        std::fs::read_to_string(t.path().join("README.md")).unwrap(),
+        "readme\n"
+    );
+    std::fs::remove_file(t.path().join(".tautly/tmp/.gitignore")).unwrap();
+    std::os::unix::fs::symlink("../../NEW.md", t.path().join(".tautly/tmp/.gitignore")).unwrap();
+    assert!(sb.spill(b"y").await.is_err());
+    assert!(!t.path().join("NEW.md").exists());
 }
 
 #[tokio::test]

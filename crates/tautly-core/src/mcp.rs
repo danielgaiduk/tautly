@@ -23,7 +23,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use tautly_mcp::approvals::key;
+use tautly_mcp::approvals::approval_key;
 use tautly_mcp::config::parse_mcp_json;
 use tautly_mcp::names::{MAX_SERVER_NAME, is_valid_server_name, sanitize};
 use tautly_mcp::{
@@ -103,8 +103,104 @@ impl McpSetup {
     }
 }
 
-/// The default provider key variables plus every configured `api_key_env`: the variables no
-/// MCP server's environment may carry.
+/// Set in every stdio server's environment (review S2-I1): a Python that honours it
+/// (3.8 and later, without `-E`/`-I`) then writes and reads bytecode only below this
+/// private directory, not a repository `__pycache__`, whose hash-based `.pyc` files
+/// would otherwise run instead of the source the approval key covers. The key also
+/// covers hash-based bytecode, and a command line that can drop the variable is never
+/// remembered (review S3-I1, `tautly_mcp::approvals`).
+const PYCACHE_VAR: &str = "PYTHONPYCACHEPREFIX";
+/// The private bytecode cache in the data home.
+const PYCACHE_DIR: &str = "mcp-pycache";
+
+/// `<data home>/mcp-pycache`, created owner-only (0700) when missing. It is then checked
+/// (review S3-M2): a real directory (not a link, which is never followed), owned by the
+/// current user, mode 0700, outside the canonical `root`. Anything else gets one
+/// warning, and the run uses a fresh 0700 temporary directory instead, which lives as
+/// long as the returned guard.
+fn private_pycache(
+    data_home: &Path,
+    root: &Path,
+    events: &EventSink,
+) -> (PathBuf, Option<tempfile::TempDir>) {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = data_home.join(PYCACHE_DIR);
+    let problem = match check_private_pycache(&dir, root) {
+        Ok(()) => return (dir, None),
+        Err(problem) => problem,
+    };
+    let fresh = tempfile::Builder::new()
+        .prefix("tautly-mcp-pycache.")
+        .permissions(std::fs::Permissions::from_mode(0o700))
+        .tempdir()
+        .ok();
+    let instead = match &fresh {
+        Some(t) => format!("a temporary one, {}, serves this run", t.path().display()),
+        None => "no temporary directory could be made either, so Python servers use \
+                 their default bytecode cache"
+            .to_string(),
+    };
+    events.try_emit(Event::Warning {
+        message: format!(
+            "the private Python bytecode cache {} is not used: {problem}; {instead}",
+            dir.display()
+        ),
+    });
+    match fresh {
+        Some(t) => (t.path().to_path_buf(), Some(t)),
+        None => (dir, None),
+    }
+}
+
+/// Make `dir` (0700) when missing and check it (see [`private_pycache`]); the problem
+/// otherwise.
+fn check_private_pycache(dir: &Path, root: &Path) -> Result<(), String> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+    if dir.symlink_metadata().is_err() {
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)
+            .map_err(|e| format!("it could not be made: {e}"))?;
+    }
+    let meta = dir
+        .symlink_metadata()
+        .map_err(|e| format!("it cannot be read: {e}"))?;
+    if !meta.is_dir() {
+        return Err(if meta.file_type().is_symlink() {
+            "it is a symbolic link".to_string()
+        } else {
+            "it is not a directory".to_string()
+        });
+    }
+    // SAFETY: `geteuid` takes no arguments and cannot fail.
+    let me = unsafe { libc::geteuid() };
+    if meta.uid() != me {
+        return Err(format!("it is owned by uid {}, not {me}", meta.uid()));
+    }
+    if meta.permissions().mode() & 0o777 != 0o700 {
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+            .map_err(|e| format!("its mode could not be set to 0700: {e}"))?;
+        let mode = dir.symlink_metadata().map_err(|e| e.to_string())?.mode() & 0o777;
+        if mode != 0o700 {
+            return Err(format!("its mode is {mode:o}, not 0700"));
+        }
+    }
+    let canonical = dir
+        .canonicalize()
+        .map_err(|e| format!("it cannot be resolved: {e}"))?;
+    let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    if canonical.starts_with(&root) {
+        return Err(format!(
+            "it lies inside the workspace {}, which the servers' own code can write",
+            root.display()
+        ));
+    }
+    Ok(())
+}
+
+/// The default provider key variables plus every configured `api_key_env`: stripped from
+/// MCP servers and from bash commands.
 pub fn provider_key_vars(config: &Config) -> Vec<String> {
     let p = &config.providers;
     let mut vars: Vec<String> = PROVIDER_KEY_VARS.iter().map(|s| s.to_string()).collect();
@@ -143,6 +239,10 @@ pub struct PlannedServer {
     pub approval: Approval,
     /// The approval key of a repository server ([`tautly_mcp::approvals::key`]).
     pub key: Option<String>,
+    /// An approval may be remembered (false: a file its command line names cannot be
+    /// hashed, so it is approved for the run only; see
+    /// [`tautly_mcp::approvals::ApprovalKey`]).
+    pub rememberable: bool,
 }
 
 /// The servers of a session, by name, and what was noticed on the way (shadowed servers,
@@ -263,17 +363,35 @@ pub async fn plan_servers(
             source,
             approval: Approval::Trusted,
             key: None,
+            rememberable: false,
         });
     }
     if !repo.is_empty() {
         let path = data_home.join(APPROVALS_FILE);
-        let store = tokio::task::spawn_blocking(move || ApprovalStore::open(&path))
-            .await
-            .ok();
-        let root = sandbox.root();
-        for (name, spec, source) in repo {
-            let k = key(root, &name, &spec);
-            let approval = if store.as_ref().is_some_and(|s| s.is_approved(&k)) {
+        let root = sandbox.root().to_path_buf();
+        // Keys read the files the command lines name (bounded), so off the async threads.
+        let keyed = tokio::task::spawn_blocking(move || {
+            let keyed: Vec<_> = repo
+                .into_iter()
+                .map(|(name, spec, source)| {
+                    let k = approval_key(&root, &name, &spec);
+                    (name, spec, source, k)
+                })
+                .collect();
+            (ApprovalStore::open(&path), keyed)
+        })
+        .await;
+        let Ok((store, keyed)) = keyed else {
+            plan.warnings.push(
+                "repository-declared MCP servers not started: their approvals could not be \
+                 checked"
+                    .into(),
+            );
+            plan.servers.sort_by(|a, b| a.name.cmp(&b.name));
+            return plan;
+        };
+        for (name, spec, source, k) in keyed {
+            let approval = if k.rememberable && store.is_approved(&k.key) {
                 Approval::Remembered
             } else if approve_mcp {
                 Approval::ThisRun
@@ -285,7 +403,8 @@ pub async fn plan_servers(
                 spec,
                 source,
                 approval,
-                key: Some(k),
+                key: Some(k.key),
+                rememberable: k.rememberable,
             });
         }
     }
@@ -309,6 +428,9 @@ pub(crate) struct McpSession {
     /// The statuses the client has been sent; any other is sent at the next turn start.
     told: Arc<Mutex<Told>>,
     tasks: Vec<JoinHandle<()>>,
+    /// The per-run bytecode cache directory, when the data home's could not be used
+    /// (removed with the session).
+    _pycache: Option<tempfile::TempDir>,
 }
 
 impl Drop for McpSession {
@@ -360,6 +482,21 @@ impl McpSession {
         if plan.servers.is_empty() {
             return None;
         }
+        // A server's own `PYTHONPYCACHEPREFIX` is replaced by the private one: said once
+        // per server.
+        for s in &plan.servers {
+            if let ServerSpec::Stdio { env, .. } = &s.spec
+                && env.contains_key(PYCACHE_VAR)
+            {
+                events.try_emit(Event::Warning {
+                    message: format!(
+                        "MCP server `{}` sets {PYCACHE_VAR}; tautly replaces it with its own \
+                         private bytecode cache, so a repository `__pycache__` is not read",
+                        printable(&s.name)
+                    ),
+                });
+            }
+        }
         let root = sandbox.root().to_path_buf();
         let store_path = setup.data_home.join(APPROVALS_FILE);
         let mut start = Vec::new();
@@ -368,15 +505,26 @@ impl McpSession {
         for s in plan.servers {
             match (s.approval, s.key) {
                 (Approval::Pending, Some(k)) if approvals.is_interactive() => {
-                    ask.push((s.name, s.spec, s.source, k));
+                    ask.push((s.name, s.spec, s.source, k, s.rememberable));
                 }
                 (Approval::Pending, _) => skip.push((s.name, s.source)),
                 _ => start.push((s.name, s.spec, s.source)),
             }
         }
 
+        let (pycache, pycache_tmp) = private_pycache(&setup.data_home, &root, &events);
         let hub = Arc::new(
-            McpHub::start(start, Arc::clone(&sandbox), &setup.config, &setup.strip_env).await,
+            McpHub::start_with_env(
+                start,
+                Arc::clone(&sandbox),
+                &setup.config,
+                &setup.strip_env,
+                &[(
+                    PYCACHE_VAR.to_string(),
+                    pycache.to_string_lossy().into_owned(),
+                )],
+            )
+            .await,
         );
         let told: Arc<Mutex<Told>> = Arc::default();
         let mut session = McpSession {
@@ -386,6 +534,7 @@ impl McpSession {
             pending: Arc::default(),
             told: Arc::clone(&told),
             tasks: vec![tokio::spawn(report(Arc::clone(&hub), events.clone(), told))],
+            _pycache: pycache_tmp,
         };
         for (name, source) in skip {
             hub.note(
@@ -399,13 +548,20 @@ impl McpSession {
                 ),
             );
         }
-        for (name, spec, source, k) in ask {
+        for (name, spec, source, k, rememberable) in ask {
             let Some((request_id, rx)) = approvals.open() else {
                 continue;
             };
             hub.note(&name, source, McpState::AwaitingApproval, None);
             // What runs once approved is this `spec`, exactly as shown and keyed.
-            let launch = spec.launch(source);
+            let mut launch = spec.launch(source);
+            if !rememberable {
+                launch.push_str(
+                    " (approved for this run only: a file its command line names cannot be \
+                     hashed, or the command line can switch the private bytecode cache \
+                     off)",
+                );
+            }
             owner
                 .log_approval(SessionRecord::ApprovalRequested {
                     request_id: request_id.clone(),
@@ -434,6 +590,7 @@ impl McpSession {
                 let verdict = rx.await.unwrap_or(Verdict::Denied { reason: None });
                 lock(&pending).retain(|(id, _)| *id != request_id);
                 match verdict {
+                    Verdict::Approved if !rememberable => hub.add(name, spec, source),
                     Verdict::Approved => {
                         let (n, r) = (name.clone(), root.clone());
                         let saved = tokio::task::spawn_blocking(move || {

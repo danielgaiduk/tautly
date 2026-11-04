@@ -40,13 +40,41 @@ impl LocalSandbox {
 }
 
 impl LocalSandbox {
-    /// Create `.tautly/tmp` with a `.gitignore` of `*` (unless one exists) and the spill
-    /// directory. Done once, and again only if the directory disappears.
-    async fn prepare_spill_dir(&self) -> Result<(), SandboxError> {
+    /// Make sure `.tautly/tmp/.gitignore` ignores everything: checked at every spill, since
+    /// a checkout can replace it mid-session (git treats an ignored file as expendable).
+    ///
+    /// A `.gitignore` that says anything else (empty, `!*`, other rules) would un-ignore the
+    /// spill files, which hold full command output, so `git add -A` would take them: it is
+    /// rewritten to `*`. One whose rules (lines that are not blank or `#` comments) are
+    /// all exactly `*` is left as it is, so a tracked one never shows as modified. One that
+    /// is not a regular file (a symbolic link, which would be written through, or a FIFO)
+    /// refuses the spill.
+    async fn ensure_spill_ignore(&self) -> Result<(), SandboxError> {
+        const MAX_IGNORE: u64 = 4096;
         let ignore = Path::new(".tautly/tmp/.gitignore");
-        if !tokio::fs::try_exists(self.resolve(ignore)?).await? {
+        let path = self.resolve(ignore)?;
+        self.guard_protected_target(ignore, &path)?;
+        let rewrite = match tokio::fs::symlink_metadata(self.root.join(ignore)).await {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+            Err(e) => return Err(e.into()),
+            Ok(m) if m.is_file() => {
+                m.len() > MAX_IGNORE
+                    || !ignores_everything(&tokio::fs::read(self.root.join(ignore)).await?)
+            }
+            Ok(_) => {
+                return Err(SandboxError::Denied(
+                    ".tautly/tmp/.gitignore is not a regular file: output is not spilled".into(),
+                ));
+            }
+        };
+        if rewrite {
             self.write_atomic(ignore, b"*", None).await?;
         }
+        Ok(())
+    }
+
+    /// Create the spill directory. Done once, and again only if it disappears.
+    async fn prepare_spill_dir(&self) -> Result<(), SandboxError> {
         let dir = Path::new(SPILL_DIR);
         let path = self.resolve(dir)?;
         self.guard_protected_target(dir, &path)?;
@@ -89,7 +117,35 @@ impl LocalSandbox {
             .split_first()
             .ok_or_else(|| SandboxError::Denied("empty argv".into()))?;
         let cwd = self.resolve(&spec.cwd)?;
-        let mut cmd = Command::new(prog);
+        // A bare name is looked up here, not by the OS: on the child's `PATH`, absolute
+        // entries outside the root only (`which_outside`), so a relative or empty entry
+        // cannot run a program the repository ships. It keeps its bare name as arg0.
+        let mut cmd = if prog.contains('/') {
+            Command::new(prog)
+        } else {
+            let path = match spec.env.iter().rev().find(|(k, _)| k == "PATH") {
+                Some((_, v)) => Some(std::ffi::OsString::from(v)),
+                None if spec.env_remove.iter().any(|k| k == "PATH") => None,
+                None => std::env::var_os("PATH"),
+            };
+            let found = match path.as_deref() {
+                Some(p) => crate::path_search::which_outside_or_skipped(prog, p, &self.root),
+                None => Err(None),
+            };
+            let found = found.map_err(|skipped| {
+                let why = match skipped {
+                    Some(p) => format!(" (skipped {} inside the work tree)", p.display()),
+                    None => String::new(),
+                };
+                SandboxError::Io(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("{prog} not found on PATH outside the work tree{why}"),
+                ))
+            })?;
+            let mut cmd = Command::new(found);
+            cmd.arg0(prog);
+            cmd
+        };
         cmd.args(args)
             .current_dir(cwd)
             .envs(spec.env.iter().map(|(k, v)| (k, v)))
@@ -105,6 +161,29 @@ impl LocalSandbox {
         }
         Ok(cmd.spawn()?)
     }
+}
+
+/// Whether a `.gitignore` holds only `*` rules (at least one), besides empty lines and
+/// `#` comments, read as git reads it: each line loses one trailing `\r` and its trailing
+/// unescaped spaces, nothing else. Leading whitespace, tabs and other spaces (NBSP) are
+/// part of the pattern for git, so `" *"` or `"*\t"` is not `*` and does not ignore the
+/// spill files.
+fn ignores_everything(text: &[u8]) -> bool {
+    let Ok(text) = std::str::from_utf8(text) else {
+        return false;
+    };
+    let mut rules = text
+        .split('\n')
+        .map(|line| {
+            let mut line = line.strip_suffix('\r').unwrap_or(line);
+            while line.ends_with(' ') && !line.ends_with("\\ ") {
+                line = &line[..line.len() - 1];
+            }
+            line
+        })
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .peekable();
+    rules.peek().is_some() && rules.all(|l| l == "*")
 }
 
 #[async_trait]
@@ -211,6 +290,7 @@ impl Sandbox for LocalSandbox {
         let rel = Path::new(SPILL_DIR).join(format!("{}.txt", &hash[..16]));
         let path = self.resolve(&rel)?;
         self.guard_protected_target(&rel, &path)?;
+        self.ensure_spill_ignore().await?;
         let len = bytes.len() as u64;
         if tokio::fs::metadata(&path)
             .await

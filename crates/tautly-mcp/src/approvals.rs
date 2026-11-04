@@ -3,7 +3,8 @@
 //!
 //! An approval is keyed by [`key`]: the canonical workspace root, the server name and
 //! what decides what runs (transport, command line or URL, working directory, variable
-//! and header names and values). Any change to those asks again.
+//! and header names and values, and the content of the files a stdio command line names
+//! inside the root). Any change to those asks again.
 
 use std::collections::BTreeMap;
 use std::io::{self, Read, Write};
@@ -28,12 +29,32 @@ static WRITERS: Mutex<()> = Mutex::new(());
 /// The approval key of server `name`, declared by the repository at `root` as `spec`:
 /// lowercase blake3 hex of the canonical root, the name, the transport, the argv (or the
 /// URL), the working directory, the sorted variable (or header) names, and a hash of the
-/// sorted `(name, value)` pairs.
+/// sorted `(name, value)` pairs; for a stdio server also what the files its command line
+/// runs inside the root hold (see `launch_files`). Reads those files (bounded).
 ///
 /// Only repository servers have keys (the user's and the client's own servers need no
 /// approval). Their values are repository content, not the user's secrets, and they decide
 /// what runs (`NODE_OPTIONS`, `LD_PRELOAD`, `PATH`), so a changed value asks again.
 pub fn key(root: &Path, name: &str, spec: &ServerSpec) -> String {
+    approval_key(root, name, spec).key
+}
+
+/// An approval key, and whether an approval under it may be remembered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApprovalKey {
+    pub key: String,
+    /// False when a file the command line names could not be hashed (too big,
+    /// unreadable, not a regular file), or when the command line can drop the private
+    /// bytecode cache the engine forces on it (`python -E`, `env -u PYTHONPYCACHEPREFIX`;
+    /// see `launch_files::can_drop_pycache_prefix`): the key then holds a value no other
+    /// call produces, so a stored approval could never match. Such a server is approved
+    /// for the run only, and nothing is written to the approvals file.
+    pub rememberable: bool,
+}
+
+/// [`key`], with whether it may be remembered.
+pub fn approval_key(root: &Path, name: &str, spec: &ServerSpec) -> ApprovalKey {
+    let mut rememberable = true;
     let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
     let pairs_hash = |m: &BTreeMap<String, String>| {
         let pairs: Vec<(&String, &String)> = m.iter().collect();
@@ -47,13 +68,35 @@ pub fn key(root: &Path, name: &str, spec: &ServerSpec) -> String {
             args,
             env,
             cwd,
-        } => serde_json::json!({
-            "transport": "stdio",
-            "argv": std::iter::once(command).chain(args).collect::<Vec<_>>(),
-            "cwd": cwd.as_ref().map(|c| c.to_string_lossy().into_owned()),
-            "env": env.keys().collect::<Vec<_>>(),
-            "env_values": pairs_hash(env),
-        }),
+        } => {
+            let argv: Vec<&String> = std::iter::once(command).chain(args).collect();
+            // Variable values name files like argv words do (`NODE_OPTIONS=--require
+            // ./x.js`, `PYTHONPATH=.`).
+            let words: Vec<&String> = argv.iter().copied().chain(env.values()).collect();
+            let base = match cwd {
+                Some(c) => root.join(c),
+                None => root.clone(),
+            };
+            // A command line that can run its Python without the private bytecode cache
+            // the engine forces (`python -E`, `env -u PYTHONPYCACHEPREFIX`, `-X
+            // pycache_prefix=`; a flag may sit in a variable the shell expands) is asked
+            // about at every start: the key then matches nothing stored.
+            let droppable = crate::launch_files::can_drop_pycache_prefix(&words);
+            rememberable &= !droppable;
+            serde_json::json!({
+                "transport": "stdio",
+                "argv": argv,
+                "cwd": cwd.as_ref().map(|c| c.to_string_lossy().into_owned()),
+                "env": env.keys().collect::<Vec<_>>(),
+                "env_values": pairs_hash(env),
+                "files": crate::launch_files::files_named(&root, &base, &words, &mut rememberable),
+                "pycache_prefix": if droppable {
+                    serde_json::json!({ "droppable": crate::launch_files::nonce() })
+                } else {
+                    serde_json::json!("forced")
+                },
+            })
+        }
         ServerSpec::Http { url, headers } => serde_json::json!({
             "transport": "http",
             "url": url.as_str(),
@@ -66,9 +109,10 @@ pub fn key(root: &Path, name: &str, spec: &ServerSpec) -> String {
         "name": name,
         "launch": launch,
     });
-    blake3::hash(input.to_string().as_bytes())
+    let key = blake3::hash(input.to_string().as_bytes())
         .to_hex()
-        .to_string()
+        .to_string();
+    ApprovalKey { key, rememberable }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

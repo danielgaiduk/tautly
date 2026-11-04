@@ -53,6 +53,11 @@ const NOTE_SKIPPED: &str =
 /// because the ignore rules at the turn's start ignore them (they may have been there).
 const NOTE_KEPT: &str = "kept (ignored before the turn)";
 
+/// Largest file undo reads from the work tree (to compare it and to log what it held).
+/// A larger one is compared by a streaming hash, and what it held is not logged.
+const MAX_DISK_READ: u64 = 64 * 1024 * 1024;
+const NOTE_LARGE: &str = "prior content over 64 MiB not kept in the session log";
+
 /// What an undo did (with `dry_run`: would do). Paths are absolute.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UndoReport {
@@ -425,6 +430,13 @@ enum Disk {
     Absent,
     /// A regular file and its permission bits.
     File { bytes: Vec<u8>, mode: u32 },
+    /// A regular file over the read limit: its streaming blake3, permission bits and
+    /// absolute path, never its bytes (its prior content is not kept in the log).
+    Large {
+        hash: blake3::Hash,
+        mode: u32,
+        path: PathBuf,
+    },
     /// A symbolic link and its target.
     Link(Vec<u8>),
     /// A directory or another kind of file: never written over.
@@ -436,12 +448,14 @@ impl Disk {
         *self != Disk::Absent
     }
 
-    /// Its tree entry's mode and content, for a file or link.
-    fn entry(&self) -> Option<(&'static str, &[u8])> {
+    /// Its tree entry's mode, for a file or link.
+    fn tree_mode(&self) -> Option<&'static str> {
         match self {
-            Disk::File { bytes, mode } if mode & 0o100 != 0 => Some(("100755", bytes)),
-            Disk::File { bytes, .. } => Some(("100644", bytes)),
-            Disk::Link(target) => Some(("120000", target)),
+            Disk::File { mode, .. } | Disk::Large { mode, .. } if mode & 0o100 != 0 => {
+                Some("100755")
+            }
+            Disk::File { .. } | Disk::Large { .. } => Some("100644"),
+            Disk::Link(_) => Some("120000"),
             Disk::Absent | Disk::Other => None,
         }
     }
@@ -451,8 +465,18 @@ impl Disk {
     fn logged(&self) -> (Option<&[u8]>, Option<u32>) {
         match self {
             Disk::File { bytes, mode } => (Some(bytes), Some(*mode)),
+            Disk::Large { mode, .. } => (None, Some(*mode)),
             Disk::Link(target) => (Some(target), Some(0o120000)),
             Disk::Absent | Disk::Other => (None, None),
+        }
+    }
+
+    /// Its blake3 hex, for a regular file.
+    fn file_hash(&self) -> Option<(String, u32)> {
+        match self {
+            Disk::File { bytes, mode } => Some((blake3::hash(bytes).to_hex().to_string(), *mode)),
+            Disk::Large { hash, mode, .. } => Some((hash.to_hex().to_string(), *mode)),
+            _ => None,
         }
     }
 
@@ -461,6 +485,9 @@ impl Disk {
         match (self, pre) {
             (Disk::Absent, None) => true,
             (Disk::File { bytes, mode: m }, Some(pre)) => bytes == pre && Some(*m) == mode,
+            (Disk::Large { hash, mode: m, .. }, Some(pre)) => {
+                blake3::hash(pre) == *hash && Some(*m) == mode
+            }
             _ => false,
         }
     }
@@ -574,7 +601,7 @@ impl GitUndo<'_> {
             if trees.since_start.get(&rel).is_some_and(Change::is_gitlink) {
                 continue;
             }
-            let disk = read_disk(&root, &rel).await?;
+            let disk = read_disk(&root, &rel, MAX_DISK_READ).await?;
             let sides = trees.sides(&rel);
             let back = match pre_edit.get(&rel) {
                 Some(b) => b.clone(),
@@ -590,10 +617,21 @@ impl GitUndo<'_> {
             let (tree_target, tree_left) = match &sides {
                 None => (true, true),
                 Some((start, end, now)) => {
-                    let here = match (now, disk.entry()) {
+                    let here = match (now, disk.tree_mode()) {
                         (Some(_), _) | (None, None) => now.clone(),
-                        (None, Some((mode, bytes))) => {
-                            let id = self.cp.blob_id(bytes.to_vec(), deadline).await?;
+                        (None, Some(mode)) => {
+                            let id = match &disk {
+                                Disk::File { bytes, .. } => {
+                                    self.cp.blob_id(bytes.clone(), deadline).await?
+                                }
+                                Disk::Link(target) => {
+                                    self.cp.blob_id(target.clone(), deadline).await?
+                                }
+                                Disk::Large { path, .. } => {
+                                    self.cp.blob_id_of_file(path, deadline).await?
+                                }
+                                Disk::Absent | Disk::Other => unreachable!("no tree mode"),
+                            };
                             Some((mode.to_string(), id))
                         }
                     };
@@ -616,10 +654,11 @@ impl GitUndo<'_> {
                 // The turn's tools wrote it last: what they wrote, in the mode they kept.
                 Some((post, tip_mode, false)) => match &disk {
                     Disk::Absent => post.is_none(),
-                    Disk::File { bytes, mode } => {
-                        let hash = blake3::hash(bytes).to_hex().to_string();
-                        post.as_deref() == Some(hash.as_str())
-                            && (tip_mode.is_none() || *tip_mode == Some(*mode))
+                    Disk::File { .. } | Disk::Large { .. } => {
+                        disk.file_hash().is_some_and(|(hash, mode)| {
+                            post.as_deref() == Some(hash.as_str())
+                                && (tip_mode.is_none() || *tip_mode == Some(mode))
+                        })
                     }
                     Disk::Link(_) | Disk::Other => false,
                 },
@@ -657,6 +696,16 @@ impl GitUndo<'_> {
         }
         if !kept.is_empty() {
             notes.push(format!("{NOTE_KEPT}: {}", list(&kept)));
+        }
+        let large: Vec<PathBuf> = planned
+            .iter()
+            .map(|p| (&p.rel, &p.disk))
+            .chain(already.iter().map(|(rel, disk)| (rel, disk)))
+            .filter(|(_, d)| matches!(d, Disk::Large { .. }))
+            .map(|(rel, _)| rel.clone())
+            .collect();
+        if !large.is_empty() {
+            notes.push(format!("{NOTE_LARGE}: {}", list(&large)));
         }
         let mut report = UndoReport {
             turn: self.turn,
@@ -715,7 +764,10 @@ impl GitUndo<'_> {
                 Back::Blob { pre, mode } => (pre.clone(), pre.as_ref().and(*mode)),
                 Back::Checkpoint { present: false } => (None, None),
                 Back::Checkpoint { present: true } => {
-                    let disk = read_disk(&root, &p.rel).await?;
+                    // Written already, so it must be logged whatever its size: what
+                    // the checkpoint held (bounded by its untracked-file limits for
+                    // untracked files), not what a command left behind.
+                    let disk = read_disk(&root, &p.rel, u64::MAX).await?;
                     let (bytes, mode) = disk.logged();
                     (bytes.map(|b| log.blob(b)).transpose()?, mode)
                 }
@@ -859,8 +911,10 @@ fn rel_path(root: &Path, rel: &Path) -> Result<RelPath, UndoError> {
 }
 
 /// What is at `rel` below `root` now, as git sees it: no symbolic link is followed, and a
-/// path below a link or a file is absent.
-async fn read_disk(root: &Path, rel: &Path) -> Result<Disk, UndoError> {
+/// path below a link or a file is absent. A regular file longer than `limit` bytes is
+/// hashed as it is read ([`Disk::Large`]) rather than read whole into memory (a command
+/// can leave a multi-GB file behind).
+async fn read_disk(root: &Path, rel: &Path, limit: u64) -> Result<Disk, UndoError> {
     use std::os::unix::ffi::OsStringExt;
     use std::os::unix::fs::MetadataExt;
     let full = root.join(rel);
@@ -896,9 +950,14 @@ async fn read_disk(root: &Path, rel: &Path) -> Result<Disk, UndoError> {
             return Ok(if kind.is_symlink() {
                 Disk::Link(std::fs::read_link(&at)?.into_os_string().into_vec())
             } else if kind.is_file() {
-                Disk::File {
-                    bytes: std::fs::read(&at)?,
-                    mode: meta.mode() & 0o7777,
+                let mode = meta.mode() & 0o7777;
+                match read_capped(&at, meta.len(), limit)? {
+                    Ok(bytes) => Disk::File { bytes, mode },
+                    Err(hash) => Disk::Large {
+                        hash,
+                        mode,
+                        path: at.clone(),
+                    },
                 }
             } else {
                 Disk::Other
@@ -1321,5 +1380,81 @@ impl Session {
             hint,
         })
         .await;
+    }
+}
+
+/// The bytes of the regular file at `path` (`len` long when looked at), or (`Err`) the
+/// blake3 of its content when it is longer than `limit`: read in pieces, never held whole.
+fn read_capped(
+    path: &Path,
+    len: u64,
+    limit: u64,
+) -> std::io::Result<Result<Vec<u8>, blake3::Hash>> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path)?;
+    // Sized from the length seen, so reading never doubles the buffer past the limit.
+    let size = len.min(limit.saturating_add(1));
+    let mut bytes = Vec::with_capacity(usize::try_from(size).unwrap_or(0));
+    (&mut file)
+        .take(limit.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 <= limit {
+        return Ok(Ok(bytes));
+    }
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&bytes);
+    drop(bytes);
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(Err(hasher.finalize()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Review B-M6/N8: a file over the limit is hashed as it is read, never held whole.
+    #[tokio::test]
+    async fn read_disk_hashes_a_file_over_the_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::write(root.join("small"), b"0123456789").unwrap();
+        std::fs::write(root.join("big"), b"0123456789A").unwrap();
+        match read_disk(&root, Path::new("small"), 10).await.unwrap() {
+            Disk::File { bytes, .. } => assert_eq!(bytes, b"0123456789"),
+            other => panic!("{other:?}"),
+        }
+        match read_disk(&root, Path::new("big"), 10).await.unwrap() {
+            Disk::Large { hash, path, .. } => {
+                assert_eq!(hash, blake3::hash(b"0123456789A"));
+                assert_eq!(path, root.join("big"));
+            }
+            other => panic!("{other:?}"),
+        }
+        let large = read_disk(&root, Path::new("big"), 10).await.unwrap();
+        assert!(large.is(Some(b"0123456789A"), Some(0o644)));
+        assert!(!large.is(Some(b"0123456789B"), Some(0o644)));
+        assert_eq!(large.logged(), (None, Some(0o644)));
+        // No limit (what was just written must be logged).
+        assert!(matches!(
+            read_disk(&root, Path::new("big"), u64::MAX).await.unwrap(),
+            Disk::File { .. }
+        ));
+        // Links and absent paths are not files: no limit applies.
+        std::os::unix::fs::symlink("big", root.join("link")).unwrap();
+        assert!(matches!(
+            read_disk(&root, Path::new("link"), 1).await.unwrap(),
+            Disk::Link(_)
+        ));
+        assert_eq!(
+            read_disk(&root, Path::new("none"), 1).await.unwrap(),
+            Disk::Absent
+        );
     }
 }

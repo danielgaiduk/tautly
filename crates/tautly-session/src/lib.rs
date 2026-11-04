@@ -35,7 +35,7 @@ pub mod paths;
 
 pub use blobs::BlobRef;
 pub use error::{Error, Result};
-pub use git::git_head;
+pub use git::{GitDirs, git_dirs_at, git_head};
 pub use reader::{SessionReader, SessionSummary, list, list_here, list_here_in, list_in};
 pub use record::{Entry, GitState, Header, HeaderInit, Origin, SCHEMA_VERSION};
 pub use relpath::{ConfineError, RelPath};

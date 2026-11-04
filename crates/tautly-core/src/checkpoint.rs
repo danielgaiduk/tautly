@@ -10,7 +10,9 @@
 //!    rehash files whose stat data changed;
 //! 2. `ls-files --others --exclude-standard`, to skip the snapshot when untracked files
 //!    exceed the limits;
-//! 3. `add -A`, `write-tree`, `commit-tree -p <previous checkpoint or HEAD>`, `update-ref`.
+//! 3. `add -A` (then `rm --cached` of the spill store `.tautly/tmp`, whatever the ignore
+//!    rules say), `write-tree`, `commit-tree -p <previous checkpoint or HEAD>`,
+//!    `update-ref`.
 //!
 //! The user's index, HEAD, branches, stash and ignored files are never read or written:
 //! only objects and `refs/tautly/` change, except on an explicit restore, which writes the
@@ -78,6 +80,9 @@ const EMPTY_TREES: [&str; 2] = [
 ];
 /// A gitlink (submodule) entry's mode: never restored.
 const GITLINK: &str = "160000";
+/// Tautly's scratch directory in the work tree (the spill store): left out of every
+/// checkpoint.
+const SPILL_STORE: &str = ".tautly/tmp";
 
 /// A checkpoint taken (or reused).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -122,6 +127,22 @@ pub enum Skip {
     /// repository it points at.
     #[error("the work tree's .git is a symbolic link (checkpoints are off for this session)")]
     GitDirSymlink,
+    /// Reading the repository's git configuration did not finish in
+    /// [`CONFIG_READ_TIMEOUT`] for the second snapshot in a row: an include that never ends
+    /// (a FIFO), which every later git call would wait on too.
+    #[error(
+        "reading the repository's git configuration took too long (an include that never \
+         ends?); checkpoints are off for this session"
+    )]
+    ConfigTimeout,
+    /// The root's `.git` names a git directory (a `.git` file, or a `commondir`) that
+    /// git's own links do not confirm belongs to this work tree
+    /// ([`tautly_session::git_dirs_at`]): checkpoints could write to another repository.
+    #[error(
+        "the work tree's .git names a repository that does not name it back \
+         (checkpoints are off for this session)"
+    )]
+    GitDirUnverified,
 }
 
 /// What a restore changes (with `dry_run`: would change), as absolute paths.
@@ -151,11 +172,12 @@ impl From<Skip> for CheckpointError {
     fn from(s: Skip) -> Self {
         match s {
             Skip::NoGit => CheckpointError::NoGit,
-            Skip::Timeout => CheckpointError::Timeout,
+            Skip::Timeout | Skip::ConfigTimeout => CheckpointError::Timeout,
             Skip::Git(why) => CheckpointError::Git(why),
             other @ (Skip::TooManyUntracked { .. }
             | Skip::UnsafePartialClone
-            | Skip::GitDirSymlink) => CheckpointError::Invalid(other.to_string()),
+            | Skip::GitDirSymlink
+            | Skip::GitDirUnverified) => CheckpointError::Invalid(other.to_string()),
         }
     }
 }
@@ -163,7 +185,13 @@ impl From<Skip> for CheckpointError {
 impl Skip {
     /// It holds for the rest of the session: said once, and no checkpoint is tried again.
     pub fn is_permanent(&self) -> bool {
-        matches!(self, Skip::UnsafePartialClone | Skip::GitDirSymlink)
+        matches!(
+            self,
+            Skip::UnsafePartialClone
+                | Skip::GitDirSymlink
+                | Skip::GitDirUnverified
+                | Skip::ConfigTimeout
+        )
     }
 
     /// Git failed because an object it needs is missing (or a fetch of one was refused):
@@ -194,10 +222,12 @@ impl Skip {
         match self {
             Skip::NoGit => "no_git",
             Skip::Timeout => "timeout",
+            Skip::ConfigTimeout => "config_timeout",
             Skip::TooManyUntracked { .. } => "too_many_untracked",
             Skip::Git(_) => "git_failed",
             Skip::UnsafePartialClone => "unsafe_partial_clone",
             Skip::GitDirSymlink => "git_dir_symlink",
+            Skip::GitDirUnverified => "git_dir_unverified",
         }
     }
 }
@@ -227,6 +257,9 @@ pub fn ref_name(session: &str, name: &str) -> String {
 enum Fail {
     NoGit,
     Timeout,
+    /// The configuration read ([`Git::read_config`]) did not finish in
+    /// [`CONFIG_READ_TIMEOUT`].
+    ConfigTimeout,
     /// It ran and exited non-zero (`code`; none: killed by a signal).
     Exit {
         code: Option<i32>,
@@ -244,6 +277,7 @@ impl From<Fail> for Skip {
             Fail::NoGit => Skip::NoGit,
             Fail::UnsafePartialClone => Skip::UnsafePartialClone,
             Fail::Timeout => Skip::Timeout,
+            Fail::ConfigTimeout => Skip::ConfigTimeout,
             Fail::Exit { stderr, code } => Skip::Git(if stderr.is_empty() {
                 format!("exit status {code:?}")
             } else {
@@ -319,10 +353,20 @@ struct Git<'a> {
     /// The git program's version (`(major, minor)`; none: unknown), asked once per
     /// checkpointer (session).
     version: &'a GitVersion,
+    /// Variables removed from git's environment besides [`ENV_REMOVED`]: the provider key
+    /// variables, so no child tautly starts in the work tree sees a provider key.
+    env_strip: &'a [String],
 }
 
 /// The cell a checkpointer keeps its git's version in.
 type GitVersion = tokio::sync::OnceCell<Option<(u32, u32)>>;
+
+/// Longest a read of the repository's configuration may take, whatever the operation's
+/// deadline: an `include.path` naming a FIFO blocks every git call, and each would wait
+/// out its whole deadline (60 s for a restore). Below the default snapshot timeout, so
+/// that case turns checkpoints off for the session ([`Skip::ConfigTimeout`]) instead of
+/// costing every command the full timeout.
+const CONFIG_READ_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// The first git release that honours `GIT_NO_LAZY_FETCH`.
 const LAZY_FETCH_OFF_SINCE: (u32, u32) = (2, 44);
@@ -362,6 +406,7 @@ impl<'a> Git<'a> {
             groups,
             config: tokio::sync::OnceCell::new(),
             version,
+            env_strip: &[],
         }
     }
 
@@ -419,20 +464,24 @@ impl<'a> Git<'a> {
             .await
     }
 
+    /// Within [`CONFIG_READ_TIMEOUT`] as well as `deadline`; running out of the former is
+    /// [`Fail::ConfigTimeout`].
     async fn read_config(&self, deadline: Instant) -> Result<RepoConfig, Fail> {
         let wanted = r"^(filter\..+|protocol\..+\.allow|extensions\.partialclone|remote\..+\.(promisor|partialclonefilter))$";
+        let cap = Instant::now() + CONFIG_READ_TIMEOUT;
         let out = match self
             .exec(
                 &["config", "-z", "--get-regexp", wanted],
                 &[],
                 None,
-                deadline,
+                deadline.min(cap),
             )
             .await
         {
             Ok(out) => out,
             // Nothing matched.
             Err(Fail::Exit { code: Some(1), .. }) => return Ok(RepoConfig::default()),
+            Err(Fail::Timeout) if cap <= deadline => return Err(Fail::ConfigTimeout),
             Err(e) => return Err(e),
         };
         parse_config(&out)
@@ -517,6 +566,7 @@ impl<'a> Git<'a> {
             ));
         }
         let mut env_remove: Vec<String> = ENV_REMOVED.map(String::from).to_vec();
+        env_remove.extend(self.env_strip.iter().cloned());
         // `check-ignore` takes no pathspec magic, literal included (it is given absolute
         // paths, which have none).
         if args.first() == Some(&"check-ignore") {
@@ -851,6 +901,15 @@ fn expand_home(path: &str) -> PathBuf {
     }
 }
 
+/// The provider key variables no git call inherits, before the configured ones
+/// ([`Checkpointer::with_env_remove`]).
+fn default_env_strip() -> Vec<String> {
+    tautly_mcp::PROVIDER_KEY_VARS
+        .iter()
+        .map(|v| v.to_string())
+        .collect()
+}
+
 /// The repository's common directory (where `info/exclude` is): the one a linked
 /// worktree's `commondir` names, else the repository itself.
 fn common_dir(git_dir: &Path) -> PathBuf {
@@ -1015,6 +1074,10 @@ pub struct Checkpointer {
     /// Where each checkpoint's exclude rules are kept (none: not kept, and undo uses the
     /// rules as they are then).
     excludes: Option<ExcludesStore>,
+    /// Snapshots in a row whose configuration read ran out of [`CONFIG_READ_TIMEOUT`].
+    config_timeouts: u32,
+    /// Variables no git call inherits: the provider key variables.
+    env_strip: Vec<String>,
 }
 
 impl Checkpointer {
@@ -1029,7 +1092,7 @@ impl Checkpointer {
         cfg: CheckpointConfig,
     ) -> Option<Checkpointer> {
         let git_dir = git_dir(&root)?;
-        let program = git_on_path()?;
+        let program = git_on_path(&root)?;
         let tmp = tempfile::Builder::new()
             .prefix("tautly-checkpoint-")
             .tempdir()
@@ -1049,6 +1112,8 @@ impl Checkpointer {
             last: None,
             version: GitVersion::new(),
             excludes: None,
+            config_timeouts: 0,
+            env_strip: default_env_strip(),
         })
     }
 
@@ -1063,6 +1128,17 @@ impl Checkpointer {
     /// The directory of the store keeping each checkpoint's exclude rules, if any.
     pub fn excludes_dir(&self) -> Option<&Path> {
         self.excludes.as_ref().map(ExcludesStore::dir)
+    }
+
+    /// Also keep `vars` (the session's provider key variables: the defaults plus every
+    /// configured `api_key_env`) from every git call.
+    pub fn with_env_remove(mut self, vars: Vec<String>) -> Self {
+        for v in vars {
+            if !self.env_strip.contains(&v) {
+                self.env_strip.push(v);
+            }
+        }
+        self
     }
 
     /// Run this git program instead of the one on `PATH`.
@@ -1143,15 +1219,18 @@ impl Checkpointer {
     }
 
     fn git(&self) -> Git<'_> {
-        Git::new(
-            self.sb.as_ref(),
-            &self.root,
-            &self.git_dir,
-            &self.program,
-            Some(&self.index),
-            self.groups.as_ref(),
-            &self.version,
-        )
+        Git {
+            env_strip: &self.env_strip,
+            ..Git::new(
+                self.sb.as_ref(),
+                &self.root,
+                &self.git_dir,
+                &self.program,
+                Some(&self.index),
+                self.groups.as_ref(),
+                &self.version,
+            )
+        }
     }
 
     fn deadline(&self) -> Instant {
@@ -1226,7 +1305,28 @@ impl Checkpointer {
         Instant::now() + HOUSEKEEPING_TIMEOUT
     }
 
+    /// [`Checkpointer::take_once`], with a configuration read that runs out of its cap
+    /// counted: the first time is an ordinary [`Skip::Timeout`] (a slow network or synced
+    /// filesystem may recover), the second in a row [`Skip::ConfigTimeout`], which turns
+    /// checkpoints off for the session.
     async fn take(&mut self, backup: bool) -> Result<CheckpointRef, Skip> {
+        match self.take_once(backup).await {
+            Err(Skip::ConfigTimeout) => {
+                self.config_timeouts += 1;
+                Err(if self.config_timeouts >= 2 {
+                    Skip::ConfigTimeout
+                } else {
+                    Skip::Timeout
+                })
+            }
+            other => {
+                self.config_timeouts = 0;
+                other
+            }
+        }
+    }
+
+    async fn take_once(&mut self, backup: bool) -> Result<CheckpointRef, Skip> {
         let deadline = self.deadline();
         let now = self.tree_now(true, deadline).await?;
         // The same tree, kept with the same exclude rules (which undo reads back).
@@ -1332,6 +1432,20 @@ impl Checkpointer {
             self.check_untracked(&git, deadline).await?;
         }
         git.run(&["add", "-A"], None, deadline).await?;
+        // The spill store (full command output) never goes in, whatever the repository's
+        // ignore rules say: a committed `.tautly/tmp/.gitignore` can un-ignore it, which
+        // no exclude rule of ours could outrank.
+        let spill = [
+            "rm",
+            "--cached",
+            "-r",
+            "-f",
+            "-q",
+            "--ignore-unmatch",
+            "--",
+            SPILL_STORE,
+        ];
+        git.run(&spill, None, deadline).await?;
         let tree = git.text(&["write-tree"], deadline).await?;
         Ok(TreeNow {
             tree,
@@ -1696,6 +1810,28 @@ impl Checkpointer {
         Ok(String::from_utf8_lossy(&out).trim().to_string())
     }
 
+    /// The blob id of the regular file at `path` (absolute, inside the root) as it is, read
+    /// by git without filters: for a file too large to hold in memory.
+    pub(crate) async fn blob_id_of_file(
+        &self,
+        path: &Path,
+        deadline: Instant,
+    ) -> Result<String, CheckpointError> {
+        let git = Git {
+            index: None,
+            ..self.git()
+        };
+        let path = path.to_string_lossy();
+        let out = git
+            .run(
+                &["hash-object", "--no-filters", "--", &path],
+                None,
+                deadline,
+            )
+            .await?;
+        Ok(String::from_utf8_lossy(&out).trim().to_string())
+    }
+
     /// Give `child_session` refs of its own (`refs/tautly/checkpoints/<child>/<n>`) for
     /// these checkpoints (`(n, commit)`) its log copied from this session's, so deleting
     /// or pruning the parent never breaks the branch.
@@ -1758,15 +1894,12 @@ fn plain_relative(p: &Path) -> bool {
         .all(|c| matches!(c, std::path::Component::Normal(_)))
 }
 
-/// The first executable `git` on `PATH`.
-pub(crate) fn git_on_path() -> Option<PathBuf> {
-    use std::os::unix::fs::PermissionsExt;
-    let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path)
-        .map(|dir| dir.join("git"))
-        .find(|p| {
-            std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-        })
+/// The first executable `git` on `PATH` that the work tree at `root` cannot have put
+/// there ([`tautly_sandbox::which_outside`], the rule every program tautly starts by a
+/// bare name follows): absolute entries outside the root only. Returned as found, links
+/// not resolved, so a shim that dispatches on its name still sees `git`.
+pub(crate) fn git_on_path(root: &Path) -> Option<PathBuf> {
+    tautly_sandbox::which_outside("git", &std::env::var_os("PATH")?, root)
 }
 
 /// Whether the root's `.git` is a symbolic link. Checkpoints are then not taken: they
@@ -1776,21 +1909,40 @@ pub(crate) fn dot_git_is_link(root: &Path) -> bool {
 }
 
 /// The repository of the work tree at `root`: its `.git` directory, or the directory a
-/// `.git` file (`gitdir: <path>`, a linked worktree or submodule) names. None when `root`
-/// has neither (a `.git` symbolic link is neither: see [`dot_git_is_link`]). Every git call names it (`--git-dir`) with the root as the work tree, so
-/// neither the environment nor `core.worktree` can point git elsewhere.
+/// `.git` file (`gitdir: <path>`, a linked worktree or submodule) names, only when git's
+/// own links confirm it belongs to this work tree ([`tautly_session::git_dirs_at`]; a
+/// `.git` directory with a `commondir` never does). None otherwise: a checkout that
+/// arrived with its `.git` must not get checkpoints written to (or pruned from) another
+/// repository; [`dot_git_unverified`] tells that case apart. A `.git` symbolic link is
+/// never followed (see [`dot_git_is_link`]). Every git call names it (`--git-dir`) with
+/// the root as the work tree, so neither the environment nor `core.worktree` can point git
+/// elsewhere.
+///
+/// Nor when the common directory's `refs`, `refs/tautly`, `refs/tautly/checkpoints`, a
+/// session directory below it, `packed-refs` or `objects` is a symbolic link: checkpoints
+/// would write (and prune, or delete with a session) refs and objects in whatever
+/// repository it leads to; git rewrites `packed-refs` through a link when it deletes a
+/// ref. (`objects/info/alternates` is left alone: reading another repository's objects is
+/// how `clone --shared` works, and nothing is written there.)
 pub(crate) fn git_dir(root: &Path) -> Option<PathBuf> {
-    let dot = root.join(".git");
-    let meta = std::fs::symlink_metadata(&dot).ok()?;
-    if meta.is_dir() {
-        return Some(dot);
-    }
-    if !meta.is_file() {
-        return None;
-    }
-    let text = std::fs::read_to_string(&dot).ok()?;
-    let named = text.lines().next()?.strip_prefix("gitdir:")?.trim();
-    (!named.is_empty()).then(|| root.join(named))
+    let dirs = tautly_session::git_dirs_at(&root.join(".git"))?;
+    let is_link = |p: &Path| std::fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_symlink());
+    let sessions = dirs.common_dir.join(REF_PREFIX);
+    let linked = ["refs", "refs/tautly", REF_PREFIX, "packed-refs", "objects"]
+        .iter()
+        .any(|p| is_link(&dirs.common_dir.join(p)))
+        || std::fs::read_dir(&sessions).is_ok_and(|entries| {
+            entries
+                .filter_map(Result::ok)
+                .any(|e| e.file_type().is_ok_and(|t| t.is_symlink()))
+        });
+    (!linked).then_some(dirs.git_dir)
+}
+
+/// Whether the root has a `.git` (not a symbolic link) that [`git_dir`] does not accept.
+pub(crate) fn dot_git_unverified(root: &Path) -> bool {
+    std::fs::symlink_metadata(root.join(".git")).is_ok_and(|m| !m.file_type().is_symlink())
+        && git_dir(root).is_none()
 }
 
 /// Run `f` with git from `PATH` on the repository at `root`, for the free functions.
@@ -1799,12 +1951,17 @@ async fn with_plain_git<T>(
     root: &Path,
     f: impl AsyncFnOnce(&Git<'_>) -> Result<T, CheckpointError>,
 ) -> Result<T, CheckpointError> {
-    let program = git_on_path().ok_or(CheckpointError::NoGit)?;
+    let program = git_on_path(root).ok_or(CheckpointError::NoGit)?;
     let git_dir = git_dir(root).ok_or_else(|| {
         CheckpointError::Invalid(format!("{} is not a git work tree", root.display()))
     })?;
     let version = GitVersion::new();
-    let git = Git::new(sb, root, &git_dir, &program, None, None, &version);
+    // The default provider key variables (the free functions have no configuration).
+    let strip = default_env_strip();
+    let git = Git {
+        env_strip: &strip,
+        ..Git::new(sb, root, &git_dir, &program, None, None, &version)
+    };
     f(&git).await
 }
 
@@ -2213,21 +2370,26 @@ mod tests {
     }
 
     #[test]
-    fn git_dir_follows_a_dot_git_file() {
+    fn git_dir_needs_a_dot_git_git_names_back() {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(git_dir(dir.path()), None);
-        std::fs::write(
-            dir.path().join(".git"),
+        assert!(!dot_git_unverified(dir.path()));
+        // Pointers nothing names back (see `tautly_session::git_dirs_at`).
+        for pointer in [
             "gitdir: ../main/.git/worktrees/w\n",
-        )
-        .unwrap();
-        assert_eq!(
-            git_dir(dir.path()),
-            Some(dir.path().join("../main/.git/worktrees/w"))
-        );
-        std::fs::write(dir.path().join(".git"), "gitdir: /abs/repo.git\n").unwrap();
-        assert_eq!(git_dir(dir.path()), Some(PathBuf::from("/abs/repo.git")));
-        std::fs::write(dir.path().join(".git"), "not a pointer\n").unwrap();
+            "gitdir: /abs/repo.git\n",
+            "not a pointer\n",
+        ] {
+            std::fs::write(dir.path().join(".git"), pointer).unwrap();
+            assert_eq!(git_dir(dir.path()), None, "{pointer}");
+            assert!(dot_git_unverified(dir.path()), "{pointer}");
+        }
+        std::fs::remove_file(dir.path().join(".git")).unwrap();
+        std::fs::create_dir(dir.path().join(".git")).unwrap();
+        std::fs::write(dir.path().join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+        let real = dir.path().canonicalize().unwrap().join(".git");
+        assert_eq!(git_dir(dir.path()), Some(real));
+        std::fs::write(dir.path().join(".git/commondir"), "/elsewhere/.git\n").unwrap();
         assert_eq!(git_dir(dir.path()), None);
     }
 
