@@ -1,5 +1,5 @@
 //! The `tautly` binary end to end on a scripted provider (`--mock-script`, feature
-//! `mock`): `cargo test -p tautly-cli --features mock`. Each run is in a scratch work tree
+//! `mock`): `cargo test -p tautly --features mock`. Each run is in a scratch work tree
 //! with its own `TAUTLY_HOME`, so no real configuration, key or session is touched.
 
 use std::io::{BufRead as _, Write as _};

@@ -1,10 +1,12 @@
 [package]
-name = "tautly-cli"
+name = "tautly"
 description = "The `tautly` command: one-shot (`-p`), JSON-RPC (`--rpc`) and utility commands"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 
 [[bin]]
 name = "tautly"
@@ -32,3 +34,12 @@ wiremock.workspace = true
 [[test]]
 name = "mock_cli"
 required-features = ["mock"]
+
+# `cargo binstall tautly` downloads the cargo-dist archive of the host (or the nearest musl)
+# target from the GitHub release instead of building (spec 7.11.3). The names match what
+# `dist plan` produces (`tautly-<target>.tar.xz`, binary at the archive's
+# `tautly-<target>/tautly`); scripts/check-dist-plan.sh keeps the two in step.
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-{ target }{ archive-suffix }"
+bin-dir = "{ name }-{ target }/{ bin }{ binary-ext }"
+pkg-fmt = "txz"
