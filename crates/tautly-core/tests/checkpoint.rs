@@ -870,6 +870,62 @@ async fn undo_reverts_bash_side_effects() {
     );
 }
 
+/// Review N8: a file over the 64 MiB undo read limit that the turn created is still
+/// undone. It is compared by a streaming hash, and its prior content is not kept in the
+/// log (`from_blob` none, with its mode), which the note says.
+#[tokio::test]
+async fn undo_handles_a_file_over_the_read_limit() {
+    let repo = Repo::with(&[("a.txt", "a\n")]);
+    let mut cfg = config();
+    // Hashing 65 MiB into the object store takes a while under load.
+    cfg.checkpoints.timeout_ms = 60_000;
+    let mock = MockProvider::new(vec![
+        tools_step(vec![bash(
+            "b1",
+            "head -c 68157440 /dev/zero > big.bin && printf 'b\\n' > a.txt",
+        )]),
+        text_step("done"),
+    ]);
+    let mut run = start(repo.builder(cfg, &mock));
+    run.turn_with("make it").await;
+    assert!(repo.path("big.bin").exists());
+    let answer = run.undo(None, false).await;
+    let (_, path) = run.engine.current_session();
+    run.stop().await;
+    let Event::Undone {
+        restored,
+        deleted,
+        note,
+        ..
+    } = answer
+    else {
+        panic!("{answer:?}")
+    };
+    assert_eq!(restored, ["a.txt"]);
+    assert_eq!(deleted, ["big.bin"]);
+    let note = note.unwrap_or_default();
+    assert!(
+        note.contains("over 64 MiB") && note.contains("big.bin"),
+        "{note}"
+    );
+    assert!(!repo.path("big.bin").exists());
+    assert_eq!(repo.read("a.txt").as_deref(), Some("a\n"));
+    let files = records_at(&path)
+        .into_iter()
+        .find_map(|r| match r {
+            SessionRecord::Undone { files, .. } => Some(files),
+            _ => None,
+        })
+        .expect("an Undone record");
+    let big = files
+        .iter()
+        .find(|f| f.path.as_str() == "big.bin")
+        .expect("big.bin logged");
+    assert_eq!(big.from_blob, None);
+    assert!(big.from_mode.is_some());
+    assert_eq!(big.to, None);
+}
+
 #[tokio::test]
 async fn undo_combines_preimages_and_checkpoints_in_reverse() {
     let repo = Repo::with(&[("A.txt", "a0\n"), ("B.txt", "b0\n")]);

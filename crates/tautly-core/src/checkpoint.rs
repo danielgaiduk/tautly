@@ -1810,6 +1810,28 @@ impl Checkpointer {
         Ok(String::from_utf8_lossy(&out).trim().to_string())
     }
 
+    /// The blob id of the regular file at `path` (absolute, inside the root) as it is, read
+    /// by git without filters: for a file too large to hold in memory.
+    pub(crate) async fn blob_id_of_file(
+        &self,
+        path: &Path,
+        deadline: Instant,
+    ) -> Result<String, CheckpointError> {
+        let git = Git {
+            index: None,
+            ..self.git()
+        };
+        let path = path.to_string_lossy();
+        let out = git
+            .run(
+                &["hash-object", "--no-filters", "--", &path],
+                None,
+                deadline,
+            )
+            .await?;
+        Ok(String::from_utf8_lossy(&out).trim().to_string())
+    }
+
     /// Give `child_session` refs of its own (`refs/tautly/checkpoints/<child>/<n>`) for
     /// these checkpoints (`(n, commit)`) its log copied from this session's, so deleting
     /// or pruning the parent never breaks the branch.
