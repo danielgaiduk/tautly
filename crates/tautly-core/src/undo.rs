@@ -949,7 +949,7 @@ async fn read_disk(root: &Path, rel: &Path, limit: u64) -> Result<Disk, UndoErro
                 Disk::Link(std::fs::read_link(&at)?.into_os_string().into_vec())
             } else if kind.is_file() {
                 let mode = meta.mode() & 0o7777;
-                match read_capped(&at, limit)? {
+                match read_capped(&at, meta.len(), limit)? {
                     Ok(bytes) => Disk::File { bytes, mode },
                     Err(hash) => Disk::Large {
                         hash,
@@ -1357,12 +1357,18 @@ impl Session {
     }
 }
 
-/// The bytes of the regular file at `path`, or (`Err`) the blake3 of its content when it
-/// is longer than `limit`: read in pieces, never held whole.
-fn read_capped(path: &Path, limit: u64) -> std::io::Result<Result<Vec<u8>, blake3::Hash>> {
+/// The bytes of the regular file at `path` (`len` long when looked at), or (`Err`) the
+/// blake3 of its content when it is longer than `limit`: read in pieces, never held whole.
+fn read_capped(
+    path: &Path,
+    len: u64,
+    limit: u64,
+) -> std::io::Result<Result<Vec<u8>, blake3::Hash>> {
     use std::io::Read;
     let mut file = std::fs::File::open(path)?;
-    let mut bytes = Vec::new();
+    // Sized from the length seen, so reading never doubles the buffer past the limit.
+    let size = len.min(limit.saturating_add(1));
+    let mut bytes = Vec::with_capacity(usize::try_from(size).unwrap_or(0));
     (&mut file)
         .take(limit.saturating_add(1))
         .read_to_end(&mut bytes)?;

@@ -1053,8 +1053,6 @@ async fn changed_env_value_asks_again() {
     run.shutdown().await;
 }
 
-/// Review B-I1: the approval covers the script the command line names. The same command
-/// line with the script rewritten (a PR branch) asks again instead of starting.
 /// Review S2-I1: every stdio server runs with `PYTHONPYCACHEPREFIX` set to a private
 /// directory in the data home (0700), so a Python server never loads a bytecode file the
 /// repository put in a `__pycache__` the approval key does not cover. A server that sets
@@ -1132,6 +1130,8 @@ async fn unhashable_server_is_approved_for_this_run_only() {
     assert!(!saved.contains("\"echo\""), "{saved}");
 }
 
+/// Review B-I1: the approval covers the script the command line names. The same command
+/// line with the script rewritten (a PR branch) asks again instead of starting.
 #[tokio::test]
 async fn rewritten_server_script_asks_again() {
     let fx = Fx::new();
