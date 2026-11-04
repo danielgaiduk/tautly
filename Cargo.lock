@@ -3032,7 +3032,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "tautly-cli"
+name = "tautly"
 version = "0.1.0"
 dependencies = [
  "anyhow",
