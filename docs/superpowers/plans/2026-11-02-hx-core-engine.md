@@ -1039,6 +1039,8 @@ proptest! { #[test] fn apply_then_inverse_restores(text in "[a-z\\n]{1,200}", ..
 
 ### Task 31: CLI utility commands
 
+**Checkpoint 4 note (binding):** this task owns the CLI parts deferred from Tasks 45 and 47: `tautly mcp list` (via `plan_servers` + `McpHub` status), `tautly mcp import [--from PATH]` (via `parse_mcp_json` + `import_into_toml`, comments preserved), `tautly undo [--turn N] [--dry-run]` (via `undo::undo` with the session's checkpointer and excludes store) and `tautly sessions delete <id>` (via `sessions::delete`, also pruning checkpoint refs and the excludes store). `--approve-mcp` and `--no-checkpoints` already exist (Task 29). Tests from the Task 45 report's CLI checklist and Task 47's brief.
+
 **v1 scope note (binding, user-approved 2026-11-03):**
 - Expose `fn sessions::list(project: &Path, limit: usize) -> Vec<SessionSummary>`, with `struct SessionSummary { id: String, started: SystemTime, first_prompt: String /* first line, ≤ 60 chars */, cost_usd: Option<f64> }`, for the REPL's `/resume` (Task 30).
 - `tautly undo` switches to user-turn numbering and gains checkpoint restores in Task 47; `tautly sessions delete` is added there too.
@@ -1282,6 +1284,8 @@ Tasks 39–47 follow the order in **Execution Order**. Each task's new `Event`/`
 - [ ] **Step 5: Commit** `git commit -m "feat(core,cli): turn receipts, savings estimates, stats and receipt commands"`
 
 ### Task 40: Zero-config first run, `tautly auth add`, `tautly doctor` (execute after Task 39)
+
+**Checkpoint 4 note (binding):** this task owns the `doctor` MCP check deferred from Task 45: every repository server whose approval is pending is a warning (test `doctor_reports_pending_repo_mcp_approval_as_warn`).
 
 **Files:**
 - Create: `crates/tautly-core/src/detect.rs`, `crates/tautly-cli/src/cmd/{auth.rs,doctor.rs}`
