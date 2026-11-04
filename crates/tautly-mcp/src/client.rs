@@ -249,6 +249,8 @@ struct Inner {
     sb: Arc<dyn Sandbox>,
     cfg: McpConfig,
     strip_env: Vec<String>,
+    /// Set in every stdio server's environment, over the server's own `env`.
+    set_env: Vec<(String, String)>,
     connect_timeout: Duration,
     state: Mutex<HubState>,
     changes: watch::Sender<u64>,
@@ -568,7 +570,12 @@ impl Inner {
                     .spawn_stdio(SpawnSpec {
                         argv: argv.clone(),
                         cwd: cwd.clone().unwrap_or_else(|| PathBuf::from(".")),
-                        env: env.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+                        env: env
+                            .iter()
+                            .map(|(k, v)| (k.clone(), v.clone()))
+                            // Over the server's own values: `set_env` wins.
+                            .chain(self.set_env.iter().cloned())
+                            .collect(),
                         // Removed after `env` is applied: no server sees a provider key.
                         env_remove: self.strip_env.clone(),
                         new_process_group: true,
@@ -875,12 +882,36 @@ impl McpHub {
         McpHub::start_with_connect_timeout(servers, sb, cfg, strip_env, CONNECT_TIMEOUT).await
     }
 
+    /// [`McpHub::start`], with `set_env` set in every stdio server's environment over the
+    /// server's own `env` (the engine sets `PYTHONPYCACHEPREFIX` to a private directory,
+    /// so a Python server never reads the repository's `__pycache__`).
+    pub async fn start_with_env(
+        servers: Vec<(String, ServerSpec, ServerSource)>,
+        sb: Arc<dyn Sandbox>,
+        cfg: &McpConfig,
+        strip_env: &[String],
+        set_env: &[(String, String)],
+    ) -> McpHub {
+        McpHub::build(servers, sb, cfg, strip_env, set_env, CONNECT_TIMEOUT)
+    }
+
     /// [`McpHub::start`] with another limit on connecting (default 120 s).
     pub async fn start_with_connect_timeout(
         servers: Vec<(String, ServerSpec, ServerSource)>,
         sb: Arc<dyn Sandbox>,
         cfg: &McpConfig,
         strip_env: &[String],
+        connect_timeout: Duration,
+    ) -> McpHub {
+        McpHub::build(servers, sb, cfg, strip_env, &[], connect_timeout)
+    }
+
+    fn build(
+        servers: Vec<(String, ServerSpec, ServerSource)>,
+        sb: Arc<dyn Sandbox>,
+        cfg: &McpConfig,
+        strip_env: &[String],
+        set_env: &[(String, String)],
         connect_timeout: Duration,
     ) -> McpHub {
         let (changes, _) = watch::channel(0);
@@ -892,6 +923,7 @@ impl McpHub {
                     ..cfg.clone()
                 },
                 strip_env: strip_env.to_vec(),
+                set_env: set_env.to_vec(),
                 connect_timeout,
                 state: Mutex::default(),
                 changes,

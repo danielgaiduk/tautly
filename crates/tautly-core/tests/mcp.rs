@@ -1055,6 +1055,49 @@ async fn changed_env_value_asks_again() {
 
 /// Review B-I1: the approval covers the script the command line names. The same command
 /// line with the script rewritten (a PR branch) asks again instead of starting.
+/// Review S2-I1: every stdio server runs with `PYTHONPYCACHEPREFIX` set to a private
+/// directory in the data home (0700), so a Python server never loads a bytecode file the
+/// repository put in a `__pycache__` the approval key does not cover. A server that sets
+/// it itself is overridden, with a warning.
+#[tokio::test]
+async fn stdio_servers_get_a_private_pycache_prefix() {
+    use std::os::unix::fs::PermissionsExt;
+    let fx = Fx::new();
+    let seen = fx.path("seen.txt");
+    fx.write(
+        ".tautly/config.toml",
+        &format!(
+            "[mcp.servers.echo]\ncommand = \"/bin/sh\"\nargs = [\"-c\", {}]\n\
+             env = {{ PYTHONPYCACHEPREFIX = \"repo-cache\" }}\n",
+            toml_str(&format!(
+                "printenv PYTHONPYCACHEPREFIX > '{}'; exec '{}' stdio",
+                seen.display(),
+                fixture()
+            ))
+        ),
+    );
+    let (cfg, _) = fx.loaded(Mode::Ask);
+    let k = key(&fx.root(), "echo", &cfg.project_mcp_servers["echo"]);
+    fx.approvals().approve(&k, &fx.root(), "echo").unwrap();
+    let mock = MockProvider::new(vec![]);
+    let mut run = start(fx.builder(cfg, &mock));
+    let events = run.until_state("echo", McpState::Ready).await;
+    run.shutdown().await;
+    let warned: Vec<&String> = events
+        .iter()
+        .filter_map(|e| match e {
+            Event::Warning { message } if message.contains("PYTHONPYCACHEPREFIX") => Some(message),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(warned.len(), 1, "{events:?}");
+    let private = fx.home.path().join("mcp-pycache");
+    let got = std::fs::read_to_string(&seen).unwrap();
+    assert_eq!(got.trim(), private.to_str().unwrap());
+    let mode = std::fs::metadata(&private).unwrap().permissions().mode();
+    assert_eq!(mode & 0o777, 0o700, "{mode:o}");
+}
+
 /// Review N9: a server whose command line names a file that cannot be hashed (here over
 /// the 1 MiB limit) can never match a remembered approval, so approving it is for this run
 /// only: the prompt says so and nothing is written to the approvals file.

@@ -355,6 +355,9 @@ fn launch_shapes_key_the_code_they_run() {
         ("pre.js", stdio("node", &["-r./pre.js", "main.js"], &[])),
         ("pkg/__main__.py", stdio("python3", &["-m", "pkg"], &[])),
         ("tool.py", stdio("python3", &["-m", "tool"], &[])),
+        // A sourceless module (review S2-I1), and one in a package.
+        ("srcless.pyc", stdio("python3", &["-m", "srcless"], &[])),
+        ("pk2/m.pyc", stdio("python3", &["-m", "pk2.m"], &[])),
         ("a/b/c.py", stdio("python3", &["-m", "a.b.c"], &[])),
         ("index.js", stdio("node", &["."], &[])),
         ("dist/index.js", stdio("node", &["dist"], &[])),

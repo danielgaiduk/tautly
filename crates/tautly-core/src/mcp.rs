@@ -102,6 +102,35 @@ impl McpSetup {
     }
 }
 
+/// Set in every stdio server's environment (review S2-I1): Python then writes and reads
+/// bytecode only below this private directory, never a repository `__pycache__`, whose
+/// hash-based `.pyc` files would otherwise run instead of the source the approval key
+/// covers.
+const PYCACHE_VAR: &str = "PYTHONPYCACHEPREFIX";
+/// The private bytecode cache in the data home.
+const PYCACHE_DIR: &str = "mcp-pycache";
+
+/// `<data home>/mcp-pycache`, created owner-only (0700) when missing; a warning when it
+/// cannot be (Python then creates it, or caches nothing).
+fn private_pycache(data_home: &Path, events: &EventSink) -> PathBuf {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    let dir = data_home.join(PYCACHE_DIR);
+    let made = std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&dir)
+        .and_then(|()| std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)));
+    if let Err(e) = made {
+        events.try_emit(Event::Warning {
+            message: format!(
+                "the private Python bytecode cache {} could not be made: {e}",
+                dir.display()
+            ),
+        });
+    }
+    dir
+}
+
 /// The default provider key variables plus every configured `api_key_env`: stripped from
 /// MCP servers and from bash commands.
 pub(crate) fn provider_key_vars(config: &Config) -> Vec<String> {
@@ -382,6 +411,21 @@ impl McpSession {
         if plan.servers.is_empty() {
             return None;
         }
+        // A server's own `PYTHONPYCACHEPREFIX` is replaced by the private one: said once
+        // per server.
+        for s in &plan.servers {
+            if let ServerSpec::Stdio { env, .. } = &s.spec
+                && env.contains_key(PYCACHE_VAR)
+            {
+                events.try_emit(Event::Warning {
+                    message: format!(
+                        "MCP server `{}` sets {PYCACHE_VAR}; tautly replaces it with its own \
+                         private bytecode cache, so a repository `__pycache__` is never read",
+                        printable(&s.name)
+                    ),
+                });
+            }
+        }
         let root = sandbox.root().to_path_buf();
         let store_path = setup.data_home.join(APPROVALS_FILE);
         let mut start = Vec::new();
@@ -397,8 +441,19 @@ impl McpSession {
             }
         }
 
+        let pycache = private_pycache(&setup.data_home, &events);
         let hub = Arc::new(
-            McpHub::start(start, Arc::clone(&sandbox), &setup.config, &setup.strip_env).await,
+            McpHub::start_with_env(
+                start,
+                Arc::clone(&sandbox),
+                &setup.config,
+                &setup.strip_env,
+                &[(
+                    PYCACHE_VAR.to_string(),
+                    pycache.to_string_lossy().into_owned(),
+                )],
+            )
+            .await,
         );
         let told: Arc<Mutex<Told>> = Arc::default();
         let mut session = McpSession {

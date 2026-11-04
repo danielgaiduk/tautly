@@ -152,13 +152,15 @@ fn short_flag_value(token: &str) -> Option<&str> {
     (flag.is_ascii_alphabetic() && !value.is_empty()).then_some(value)
 }
 
-/// `module` (`a.b`) as the directory `a/b` and the file `a/b.py`.
+/// `module` (`a.b`) as the directory `a/b` and the files `a/b.py` and `a/b.pyc`.
 fn module_paths(word: usize, module: &str, out: &mut Vec<(usize, String)>) {
     let path = module.replace('.', "/");
     if path.is_empty() {
         return;
     }
     out.push((word, format!("{path}.py")));
+    // A sourceless module: bytecode imported where no source is.
+    out.push((word, format!("{path}.pyc")));
     out.push((word, path));
 }
 
