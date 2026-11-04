@@ -606,6 +606,46 @@ async fn resume_restores_budget_spend_and_set_budget() {
     run.stop().await;
 }
 
+/// Review C M11: a cut at step N leaves out an undo done after it, as `state_at(N)` (the
+/// files before that undo) does: the rebuilt context is told nothing is stale.
+#[tokio::test]
+async fn a_cut_before_a_later_undo_leaves_the_undo_out() {
+    let fx = Fx::new();
+    let mut cfg = config(Mode::Ask);
+    cfg.permissions.mode = Mode::AutoEdit;
+    let mock = MockProvider::new(vec![
+        tools_step(vec![call(
+            "w1",
+            "write",
+            json!({"path": "a.txt", "content": "one\n"}),
+        )]),
+        text_step("written"),
+    ]);
+    let mut run = start(fx.builder(cfg, &mock));
+    run.turn_with("write it").await;
+    let path = run.engine.session_path().to_path_buf();
+    let before = rebuild_at(&path, None);
+    let last = before.context.next_turn() - 1;
+    run.send(Command::Undo {
+        turn: Some(1),
+        dry_run: false,
+    })
+    .await;
+    run.until(|e| matches!(e, Event::Undone { .. } | Event::Error { .. }))
+        .await;
+    run.stop().await;
+    assert!(
+        records_at(&path)
+            .iter()
+            .any(|r| matches!(r, SessionRecord::Undone { .. }))
+    );
+    let stale = |r: &Rebuilt| r.context.state.files.values().any(|n| n.maybe_stale);
+    assert!(!stale(&before));
+    // At the tip the undo is part of the state; cut at the turn's last step, it is not.
+    assert!(stale(&rebuild_at(&path, None)));
+    assert!(!stale(&rebuild_at(&path, Some(last))));
+}
+
 /// Review C M4: records of a type this version does not know are skipped, and the rebuild
 /// says so once.
 #[tokio::test]

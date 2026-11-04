@@ -36,7 +36,9 @@
 //! it (live, they reach the next step start, or the turn's end); a fork's branch closes a
 //! cut turn with `TurnEnd{cancelled}`, which applies them in the same place. For the same
 //! reason what happened between turns after step `n` (commands such as `Pin` and
-//! `SetBudget`, a switch, a manual compaction) is in it, in any order, as at the tip.
+//! `SetBudget`, a switch, a manual compaction) is in it, in any order, as at the tip, up
+//! to an undo: the cut ends before an `Undone` after step `n`, since the files at step `n`
+//! (spec 7.12.1 `state_at`) are the ones before that undo.
 //!
 //! The read tracker is not rebuilt from the log (what it remembers lives in spill files):
 //! a resumed session starts with no re-read baselines, so a re-read returns the full
@@ -424,8 +426,10 @@ impl Replay<'_> {
             | SessionRecord::Undone { .. }) => {
                 self.close_step();
                 // An epoch at the start of a step past the cut; one between turns (or
-                // before the first) is part of the cut.
-                if self.running && self.beyond() {
+                // before the first) is part of the cut. An undo past the cut is not: the
+                // files at the cut (`state_at`) are the ones before it.
+                let undo = matches!(rec, SessionRecord::Undone { .. });
+                if (self.running || undo) && self.beyond() {
                     return Flow::Stop;
                 }
                 self.apply_pending();
