@@ -8,17 +8,19 @@
 //!   every session has shut down).
 //! - `tautly` alone, on a terminal, runs the daily-driver REPL (spec 7.11.8): messages,
 //!   approvals (`y`, `n`, `a` for this session), slash commands, a receipt after each turn.
+//! - `tautly acp` serves the Agent Client Protocol to an editor on stdin/stdout (spec
+//!   7.11.9) until the editor disconnects (exit 0), or SIGTERM / SIGHUP (143 / 129).
 //! - `tautly auth add <provider>` stores an API key in the OS keychain; `tautly doctor`
 //!   checks the setup (spec 7.11.2).
 //!
 //! `tautly prompt|sessions|models|undo|memory|index|mcp ...` are utility commands
 //! (`cmd`): they read or change what sessions leave behind and exit.
 //!
-//! Flags shared by `-p`, `--rpc` and the REPL: `--approve auto-edit|yolo` (headless `ask` is
-//! otherwise denied), `--approve-memory`, `--approve-mcp`, `--model ID`, `--budget-usd N`
-//! (a session budget, sent before the first message), `--continue` / `--resume ID`,
-//! `--no-checkpoints`. Command-line flags are trusted: they override every configuration
-//! file (spec 2.2).
+//! Flags shared by `-p`, `--rpc`, `acp` (written before it) and the REPL: `--approve
+//! auto-edit|yolo` (headless `ask` is otherwise denied), `--approve-memory`,
+//! `--approve-mcp`, `--model ID`, `--budget-usd N` (a session budget, sent before the
+//! first message), `--continue` / `--resume ID` (not with `acp`), `--no-checkpoints`.
+//! Command-line flags are trusted: they override every configuration file (spec 2.2).
 //!
 //! When no configuration layer or flag names a model, the provider is detected (spec
 //! 7.11.2): the first key in the environment or the keychain, else a local Ollama. The
@@ -33,6 +35,8 @@ use std::time::Duration;
 
 use anyhow::{Context as _, anyhow, bail};
 use clap::{CommandFactory as _, Parser, Subcommand, ValueEnum};
+use tautly_acp::{Bridge, ModelChoices, ModelLister, shared_factory};
+use tautly_core::EngineError;
 use tautly_core::detect::{
     Detected, KeyVars, OllamaProbe, detect_with, setup_hint_with, wants_detection,
 };
@@ -138,6 +142,9 @@ enum Sub {
     /// Check the configuration, model, keys, network, data directory, sandbox, git, code
     /// index and MCP servers.
     Doctor(cmd::doctor::DoctorArgs),
+    /// Serve the Agent Client Protocol on stdin and stdout, for editors (Zed: an
+    /// `agent_servers` entry running `tautly acp`).
+    Acp,
     #[command(flatten)]
     Util(cmd::Command),
 }
@@ -332,12 +339,26 @@ impl Settings {
         interactive: bool,
         workspace: Option<Arc<tautly_core::Workspace>>,
     ) -> anyhow::Result<(Engine, mpsc::Receiver<Event>)> {
+        self.build_with(root, resume, interactive, workspace, Vec::new())
+    }
+
+    /// [`build`](Self::build) with MCP servers the client passed (an editor over ACP),
+    /// trusted like the user's own.
+    fn build_with(
+        &self,
+        root: &Path,
+        resume: Option<String>,
+        interactive: bool,
+        workspace: Option<Arc<tautly_core::Workspace>>,
+        client_mcp: Vec<(String, tautly_core::ServerSpec)>,
+    ) -> anyhow::Result<(Engine, mpsc::Receiver<Event>)> {
         let mut loaded = Config::load(root, self.overrides.clone())?;
         self.detect_model(&mut loaded)?;
         let mut builder = EngineBuilder {
             resume,
             interactive,
             workspace,
+            client_mcp,
             approve_mcp: self.approve_mcp,
             data_home: Some(self.data_home.clone()),
             #[cfg(feature = "mock")]
@@ -427,8 +448,10 @@ fn main() -> ExitCode {
 }
 
 async fn run(mut cli: Cli) -> anyhow::Result<i32> {
-    if let Some(Sub::Util(command)) = cli.command.take() {
-        return cmd::run(command, &cli).await;
+    match cli.command.take() {
+        Some(Sub::Util(command)) => return cmd::run(command, &cli).await,
+        Some(Sub::Acp) => return acp(&cli).await,
+        _ => {}
     }
     if cli.prompt.is_none() && !cli.rpc {
         if !repl::wanted() {
@@ -519,6 +542,55 @@ async fn rpc(
             0 => Ok(0),
             code => Ok(code),
         },
+        Err(e) => {
+            eprintln!("tautly: {e}");
+            Ok(1)
+        }
+    }
+}
+
+/// `tautly acp` (spec 7.11.9): editors drive sessions over the Agent Client Protocol.
+/// Every session is interactive (the editor answers approvals), on the git top level of
+/// the editor's `cwd`, sharing one workspace per root; stdout carries only protocol
+/// frames. Exits 0 at the end of input, or 143 / 129 after SIGTERM / SIGHUP.
+async fn acp(cli: &Cli) -> anyhow::Result<i32> {
+    let settings = Settings::new(cli)?;
+    let workspaces = Workspaces::new(settings.data_home.clone());
+    let models: ModelLister = {
+        let settings = settings.clone();
+        Arc::new(move |root: &Path| {
+            let mut loaded = Config::load(root, settings.overrides.clone()).ok()?;
+            settings.detect_model(&mut loaded).ok()?;
+            let current = loaded.config.model.as_str().to_string();
+            let available = repl::model_lister(loaded.config, settings.secrets.clone())();
+            Some(ModelChoices { current, available })
+        })
+    };
+    let start = cli.start_commands();
+    let factory = shared_factory(workspaces, move |root, resume, mcp, workspace| {
+        let (engine, events) = settings
+            .build_with(&root, resume, true, Some(workspace), mcp)
+            .map_err(|e| EngineError::Provider(format!("{e:#}")))?;
+        // Called on the blocking pool, inside the runtime.
+        let handle = tokio::runtime::Handle::current();
+        for cmd in start.clone() {
+            let _ = handle.block_on(engine.send(cmd));
+        }
+        Ok((engine, events))
+    });
+    let signalled = Arc::new(AtomicI32::new(0));
+    let terminated = terminated()?;
+    let stop = {
+        let signalled = Arc::clone(&signalled);
+        async move { signalled.store(terminated.await, Ordering::SeqCst) }
+    };
+    let served = Bridge::new(factory)
+        .models(models)
+        .stop_on(stop)
+        .serve(tokio::io::stdin(), tokio::io::stdout())
+        .await;
+    match served {
+        Ok(()) => Ok(signalled.load(Ordering::SeqCst)),
         Err(e) => {
             eprintln!("tautly: {e}");
             Ok(1)

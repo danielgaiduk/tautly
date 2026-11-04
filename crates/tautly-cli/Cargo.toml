@@ -19,6 +19,7 @@ mock = ["dep:tautly-provider"]
 [dependencies]
 tautly-core = { path = "../tautly-core" }
 tautly-rpc = { path = "../tautly-rpc" }
+tautly-acp = { path = "../tautly-acp" }
 tautly-tui = { path = "../tautly-tui" }
 tautly-provider = { path = "../tautly-provider", optional = true }
 # `tautly doctor`: the code index's state and where its database lives.
