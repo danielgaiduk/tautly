@@ -111,6 +111,7 @@ impl Outcome {
         let name = match scope {
             BudgetScope::Turn => "turn",
             BudgetScope::Session => "session",
+            BudgetScope::Unknown => "unknown",
         };
         Outcome::refused(ToolResult::error(format!(
             "not run: the {name} budget is exhausted"
@@ -326,12 +327,26 @@ impl Session {
     }
 
     /// `(mtime, len)` of `p`, or None when it is missing or does not answer quickly (a file
-    /// system that hangs is what got the write abandoned).
-    async fn quick_meta(&self, p: &std::path::Path) -> Option<(std::time::SystemTime, u64)> {
-        let meta = tokio::time::timeout(Duration::from_millis(100), self.sandbox.metadata(p));
-        match meta.await {
-            Ok(Ok(m)) => Some((m.mtime, m.len)),
-            _ => None,
+    /// system that hangs is what got the write abandoned). A probe that did not answer
+    /// keeps running and is waited on again next time: at most one per path is in flight.
+    async fn quick_meta(&mut self, p: &Path) -> Option<(std::time::SystemTime, u64)> {
+        let mut probe = match self.lost_write_probes.remove(p) {
+            Some(still_running) if !still_running.is_finished() => still_running,
+            // A probe that answered after its wait is stale: ask again.
+            _ => {
+                let (sandbox, path) = (Arc::clone(&self.sandbox), p.to_path_buf());
+                tokio::spawn(async move {
+                    let m = sandbox.metadata(&path).await.ok()?;
+                    Some((m.mtime, m.len))
+                })
+            }
+        };
+        match tokio::time::timeout(Duration::from_millis(100), &mut probe).await {
+            Ok(answer) => answer.ok().flatten(),
+            Err(_) => {
+                self.lost_write_probes.insert(p.to_path_buf(), probe);
+                None
+            }
         }
     }
 

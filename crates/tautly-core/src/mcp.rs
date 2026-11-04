@@ -39,6 +39,7 @@ use crate::approvals::{Approvals, Verdict};
 use crate::checkpoint::Point;
 use crate::config::Config;
 use crate::protocol::Event;
+use crate::record::{ApprovalKind, SessionRecord};
 use crate::session::{EventSink, Session};
 
 /// Every MCP tool's name starts with this (`mcp__<server>__<tool>`).
@@ -318,13 +319,16 @@ impl Drop for McpSession {
 
 impl McpSession {
     /// Decide which servers start, ask about or skip repository ones, and start the rest
-    /// in the background. None when MCP is off or no server is declared.
+    /// in the background, for session `owner`. None when MCP is off or no server is
+    /// declared. Each question is logged (`ApprovalRequested`) before it is shown; its
+    /// answer is the logged `Approve`/`Deny` command.
     pub async fn start(
         setup: McpSetup,
-        sandbox: Arc<dyn Sandbox>,
-        events: EventSink,
+        owner: &Session,
         approvals: Approvals,
     ) -> Option<McpSession> {
+        let sandbox = Arc::clone(&owner.sandbox);
+        let events = owner.events.clone();
         let planned = tokio::time::timeout(
             PLAN_TIMEOUT,
             plan_servers(
@@ -399,11 +403,23 @@ impl McpSession {
             };
             hub.note(&name, source, McpState::AwaitingApproval, None);
             // What runs once approved is this `spec`, exactly as shown and keyed.
+            let launch = spec.launch(source);
+            owner
+                .log_approval(SessionRecord::ApprovalRequested {
+                    request_id: request_id.clone(),
+                    kind: ApprovalKind::McpServer,
+                    call_id: None,
+                    reason: format!(
+                        "repository-declared MCP server `{}` ({source}) wants to start: {launch}",
+                        printable(&name)
+                    ),
+                })
+                .await;
             let request = Event::McpServerApprovalRequested {
                 request_id: request_id.clone(),
                 server: printable(&name),
                 source: source.as_str().to_string(),
-                launch: spec.launch(source),
+                launch,
             };
             lock(&session.pending).push((request_id.clone(), request.clone()));
             // Sent again at each user-turn start while unanswered, so a full channel now

@@ -125,6 +125,30 @@ fn applied_effect_json_shape_is_stable() {
 }
 
 #[test]
+fn a_shown_kind_from_a_newer_version_reads_as_unknown() {
+    for v in [
+        json!({"type": "folded", "lines": 3}),
+        json!({"type": "folded"}),
+    ] {
+        assert_eq!(
+            serde_json::from_value::<Shown>(v.clone()).unwrap(),
+            Shown::Unknown,
+            "{v}"
+        );
+    }
+    for s in [
+        Shown::Full,
+        Shown::Partial,
+        Shown::Unchanged { since: 2 },
+        Shown::Diff { since: 3 },
+        Shown::Unknown,
+    ] {
+        let v = serde_json::to_value(s).unwrap();
+        assert_eq!(serde_json::from_value::<Shown>(v).unwrap(), s);
+    }
+}
+
+#[test]
 fn hashes_serialize_as_lowercase_hex() {
     let v = serde_json::to_value(&effects()[0]).unwrap();
     let h = v["file_hash"].as_str().unwrap();

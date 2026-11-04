@@ -102,34 +102,42 @@ impl SignalRouter {
 
     /// Act on one signal. Never waits: a command is handed over with `try_send`, and an
     /// engine whose command channel is full counts as stuck, so the next signal escalates.
+    /// An engine whose channel is closed (its actor stopped, a handle still alive) is
+    /// dead: with no other engine the signal escalates at once.
     pub async fn deliver(&self, sig: Signal) {
         let mut st = self.lock();
-        let alive: Vec<_> = st
-            .engines
-            .iter()
-            .filter_map(|e| e.commands.upgrade())
-            .collect();
+        let live = |e: &Registered| e.commands.upgrade().filter(|tx| !tx.is_closed());
+        let alive: Vec<_> = st.engines.iter().filter_map(live).collect();
         if st.shutdown_sent || alive.is_empty() {
-            for e in &st.engines {
-                e.groups.kill_all_now();
-            }
-            st.engines.clear();
-            drop(st);
-            (self.escalate)(sig);
-            return;
+            return self.escalate(st, sig);
         }
-        st.engines.retain(|e| e.commands.upgrade().is_some());
+        st.engines.retain(|e| live(e).is_some());
         let cmd = st.policy.command(sig, Instant::now());
-        let mut stuck = false;
+        let (mut stuck, mut taken) = (false, false);
         for tx in alive {
-            // A closed channel (stopped meanwhile) is skipped; a full one is stuck.
-            if let Err(mpsc::error::TrySendError::Full(_)) = tx.try_send(cmd.clone()) {
-                stuck = true;
+            match tx.try_send(cmd.clone()) {
+                Ok(()) => taken = true,
+                Err(mpsc::error::TrySendError::Full(_)) => stuck = true,
+                // Stopped meanwhile.
+                Err(mpsc::error::TrySendError::Closed(_)) => {}
             }
+        }
+        if !taken && !stuck {
+            return self.escalate(st, sig);
         }
         if cmd == Command::Shutdown || stuck {
             st.shutdown_sent = true;
         }
+    }
+
+    /// Kill every engine's process groups, forget the engines and run the escalation.
+    fn escalate(&self, mut st: std::sync::MutexGuard<'_, RouterState>, sig: Signal) {
+        for e in &st.engines {
+            e.groups.kill_all_now();
+        }
+        st.engines.clear();
+        drop(st);
+        (self.escalate)(sig);
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, RouterState> {
@@ -137,8 +145,11 @@ impl SignalRouter {
     }
 }
 
+/// A router and its listener task.
+type Installed = Option<(Arc<SignalRouter>, JoinHandle<()>)>;
+
 /// The process-wide router behind [`install_signal_handlers`], and its listener task.
-static INSTALLED: Mutex<Option<(Arc<SignalRouter>, JoinHandle<()>)>> = Mutex::new(None);
+static INSTALLED: Mutex<Installed> = Mutex::new(None);
 
 /// Install the process-wide SIGINT, SIGTERM and SIGHUP listener and route signals to
 /// `engine` as well. Must be called inside a Tokio runtime.
@@ -153,21 +164,39 @@ static INSTALLED: Mutex<Option<(Arc<SignalRouter>, JoinHandle<()>)>> = Mutex::ne
 /// `std::process::exit` before an engine's event stream has closed: that skips the
 /// session's shutdown, including the end of its process groups.
 pub fn install_signal_handlers(engine: &Engine) -> std::io::Result<()> {
-    let mut installed = INSTALLED.lock().unwrap_or_else(PoisonError::into_inner);
+    install_into(&INSTALLED, listen, |router| router.add(engine))
+}
+
+/// [`install_signal_handlers`] on `slot`: start the listener with `listen` unless it runs,
+/// then `register` the engine with the router.
+fn install_into(
+    slot: &Mutex<Installed>,
+    listen: impl FnOnce(&Arc<SignalRouter>) -> std::io::Result<JoinHandle<()>>,
+    register: impl FnOnce(&SignalRouter),
+) -> std::io::Result<()> {
+    let mut installed = slot.lock().unwrap_or_else(PoisonError::into_inner);
     let router = match installed.take() {
         Some((router, listener)) if !listener.is_finished() => {
             *installed = Some((Arc::clone(&router), listener));
             router
         }
-        // Never started, or its runtime is gone: start it here.
+        // Never started, or its runtime is gone: start it here. If that fails, the
+        // earlier router stays (with its engines) for the next call to try again.
         earlier => {
-            let router = earlier.map_or_else(|| SignalRouter::new(die_by), |(r, _)| r);
-            let listener = listen(&router)?;
-            *installed = Some((Arc::clone(&router), listener));
+            let router = earlier
+                .as_ref()
+                .map_or_else(|| SignalRouter::new(die_by), |(r, _)| Arc::clone(r));
+            match listen(&router) {
+                Ok(listener) => *installed = Some((Arc::clone(&router), listener)),
+                Err(e) => {
+                    *installed = earlier;
+                    return Err(e);
+                }
+            }
             router
         }
     };
-    router.add(engine);
+    register(&router);
     Ok(())
 }
 
@@ -268,6 +297,71 @@ mod tests {
         // The command could not be handed over: the next signal ends the process.
         assert!(quick(Signal::Interrupt).await);
         assert_eq!(*escalated.lock().unwrap(), [Signal::Interrupt]);
+    }
+
+    fn recording_router() -> (Arc<SignalRouter>, Arc<Mutex<Vec<Signal>>>) {
+        let escalated = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&escalated);
+        let router = SignalRouter::new(move |sig| seen.lock().unwrap().push(sig));
+        (router, escalated)
+    }
+
+    #[tokio::test]
+    async fn an_engine_whose_channel_is_closed_counts_as_dead() {
+        let (router, escalated) = recording_router();
+        // The engine's actor has stopped, but a sender (its handle) is still alive.
+        let (tx, rx) = mpsc::channel(4);
+        drop(rx);
+        router.add_channel(tx.downgrade(), ProcessGroups::default());
+        // Nobody can take the command: the signal ends the process at once.
+        router.deliver(Signal::Interrupt).await;
+        assert_eq!(*escalated.lock().unwrap(), [Signal::Interrupt]);
+
+        // Beside a live engine, a closed one is dropped and the live one gets the command.
+        let (router, escalated) = recording_router();
+        let (dead, dead_rx) = mpsc::channel(4);
+        drop(dead_rx);
+        let (live, mut live_rx) = mpsc::channel(4);
+        router.add_channel(dead.downgrade(), ProcessGroups::default());
+        router.add_channel(live.downgrade(), ProcessGroups::default());
+        router.deliver(Signal::Interrupt).await;
+        assert_eq!(live_rx.try_recv().unwrap(), Command::Cancel);
+        assert!(escalated.lock().unwrap().is_empty());
+        assert_eq!(router.lock().engines.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_listener_that_cannot_restart_keeps_the_earlier_engines() {
+        let (router, _) = recording_router();
+        let (tx, mut rx) = mpsc::channel(4);
+        router.add_channel(tx.downgrade(), ProcessGroups::default());
+        // The listener's runtime is gone (its task finished).
+        let finished = tokio::spawn(async {});
+        while !finished.is_finished() {
+            tokio::task::yield_now().await;
+        }
+        let slot = Mutex::new(Some((Arc::clone(&router), finished)));
+        let failed = install_into(
+            &slot,
+            |_| Err(std::io::Error::other("no signals here")),
+            |_| panic!("registered although the listener did not start"),
+        );
+        assert!(failed.is_err());
+        // The next install starts the listener on the same router, its engines kept.
+        let mut restarted_on = None;
+        install_into(
+            &slot,
+            |r| {
+                restarted_on = Some(Arc::clone(r));
+                Ok(tokio::spawn(std::future::pending()))
+            },
+            |_| {},
+        )
+        .unwrap();
+        let restarted_on = restarted_on.expect("the listener was started again");
+        assert!(Arc::ptr_eq(&restarted_on, &router));
+        restarted_on.deliver(Signal::Interrupt).await;
+        assert_eq!(rx.try_recv().unwrap(), Command::Cancel);
     }
 
     #[test]

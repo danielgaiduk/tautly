@@ -44,11 +44,17 @@ pub(crate) fn clean_tags(raw: impl IntoIterator<Item = String>) -> Vec<String> {
 
 /// The `[[...]]` links of `body` in order: each link's inner text with its byte range
 /// (inside the brackets). A link spans one line; in `[[a [[b]]` the link is the inner one.
+/// Like Obsidian, a `[[` inside a fenced code block or an inline code span opens none.
 fn links(body: &str) -> impl Iterator<Item = (std::ops::Range<usize>, &str)> {
+    let code = code_spans(body);
     let mut at = 0;
     std::iter::from_fn(move || {
         loop {
             let open = at + body[at..].find("[[")?;
+            if let Some(span) = code.iter().find(|s| s.contains(&open)) {
+                at = span.end;
+                continue;
+            }
             let start = open + 2;
             let close = start + body[start..].find("]]")?;
             let inner = &body[start..close];
@@ -62,6 +68,77 @@ fn links(body: &str) -> impl Iterator<Item = (std::ops::Range<usize>, &str)> {
             }
         }
     })
+}
+
+/// The byte ranges of `body`'s code, in order: fenced blocks (a line of at least three
+/// backticks or tildes, indented at most three spaces, up to a line of at least as many of
+/// the same, or the end), and inline spans outside them (a run of backticks up to the
+/// next run of the same length on that line).
+fn code_spans(body: &str) -> Vec<std::ops::Range<usize>> {
+    let mut out = Vec::new();
+    // The open fence: its character, length and start.
+    let mut fence: Option<(u8, usize, usize)> = None;
+    let mut pos = 0;
+    for line in body.split_inclusive('\n') {
+        let start = pos;
+        pos += line.len();
+        let text = line.trim_start_matches(' ');
+        let indent = line.len() - text.len();
+        let run = |c: u8| text.bytes().take_while(|&b| b == c).count();
+        match fence {
+            Some((c, n, from)) => {
+                let closing = run(c);
+                if indent <= 3 && closing >= n && text[closing..].trim().is_empty() {
+                    out.push(from..pos);
+                    fence = None;
+                }
+            }
+            None => match b"`~".iter().copied().find(|&c| indent <= 3 && run(c) >= 3) {
+                Some(c) => fence = Some((c, run(c), start)),
+                None => inline_code(line, start, &mut out),
+            },
+        }
+    }
+    if let Some((_, _, from)) = fence {
+        out.push(from..body.len());
+    }
+    out
+}
+
+/// The inline code spans of one `line` (starting at byte `base` of the body) into `out`.
+fn inline_code(line: &str, base: usize, out: &mut Vec<std::ops::Range<usize>>) {
+    let b = line.as_bytes();
+    let ticks = |i: usize| b[i..].iter().take_while(|&&c| c == b'`').count();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] != b'`' {
+            i += 1;
+            continue;
+        }
+        let n = ticks(i);
+        let mut j = i + n;
+        let mut end = None;
+        while j < b.len() {
+            if b[j] == b'`' {
+                let m = ticks(j);
+                if m == n {
+                    end = Some(j + m);
+                    break;
+                }
+                j += m;
+            } else {
+                j += 1;
+            }
+        }
+        match end {
+            Some(end) => {
+                out.push(base + i..base + end);
+                i = end;
+            }
+            // Unmatched: literal backticks.
+            None => i += n,
+        }
+    }
 }
 
 /// A link's inner text as its target (trimmed), the `#heading` or `^block` after it, and
@@ -206,6 +283,20 @@ mod tests {
         assert_eq!(file_slug("***"), "entry");
         assert_eq!(file_slug(&"ab ".repeat(100)).chars().count(), 59);
         assert!(is_entry_file("a.md") && !is_entry_file(".a.md") && !is_entry_file(".md"));
+    }
+
+    #[test]
+    fn links_in_code_are_not_links() {
+        let body = "See [[A]].\n```rust\nlet x = [[A]];\n```\n  ~~~~\n[[A]]\n~~~~~\nnot ``code with ` and [[A]]`` but `[[A]]`, then [[A|kept]].\n````\n[[A]] unclosed";
+        let resolve = |t: &str| (t == "A").then(|| ("a-file".to_string(), "Title A".to_string()));
+        assert_eq!(
+            link_by_file_name(body, resolve),
+            "See [[a-file|Title A]].\n```rust\nlet x = [[A]];\n```\n  ~~~~\n[[A]]\n~~~~~\nnot ``code with ` and [[A]]`` but `[[A]]`, then [[a-file|kept]].\n````\n[[A]] unclosed"
+        );
+        assert_eq!(parse_links("`[[B]]` [[C]]\n```\n[[D]]\n```"), ["C"]);
+        // A lone backtick opens no span; a shorter fence does not close a longer one.
+        assert_eq!(parse_links("a ` [[E]]"), ["E"]);
+        assert_eq!(parse_links("````\n```\n[[F]]\n````\n[[G]]"), ["G"]);
     }
 
     #[test]

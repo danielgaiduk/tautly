@@ -1216,21 +1216,52 @@ async fn refs_older_than_keep_days_pruned_at_engine_start() {
         ["refs/heads/old-branch"]
     );
 
-    // Directly: what is pruned is counted.
+    // Directly: what is pruned is counted, and the exclude rules kept for it go too.
+    let store = run_store(&repo);
+    let kept = entries(&store);
+    assert!(!kept.is_empty(), "the session kept no exclude rules");
     dated_ref(&repo, "refs/tautly/checkpoints/old/2", 30);
+    let old = repo.git(&["rev-parse", "refs/tautly/checkpoints/old/2"]);
+    std::fs::copy(store.join(&kept[0]), store.join(&old)).unwrap();
     let sb = repo.sandbox();
     assert_eq!(
-        checkpoint::prune(sb.as_ref(), &repo.root(), 14)
+        checkpoint::prune(sb.as_ref(), &repo.root(), 14, Some(&store))
             .await
             .unwrap(),
         1
     );
+    assert_eq!(entries(&store), kept);
     assert_eq!(
-        checkpoint::prune(sb.as_ref(), &repo.root(), 1)
+        checkpoint::prune(sb.as_ref(), &repo.root(), 1, Some(&store))
             .await
             .unwrap(),
         1
     );
+}
+
+/// The exclude-rules store of the project's sessions (the only project of `repo`'s home).
+fn run_store(repo: &Repo) -> PathBuf {
+    walk(repo.home.path())
+        .into_iter()
+        .find_map(|p| {
+            p.ancestors()
+                .find(|a| a.file_name().is_some_and(|n| n == checkpoint::EXCLUDES_DIR))
+                .map(Path::to_path_buf)
+        })
+        .expect("an exclude-rules store")
+}
+
+/// The checkpoint entries (object ids) of the store at `dir`, sorted.
+fn entries(dir: &Path) -> Vec<String> {
+    let mut out: Vec<String> = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| matches!(n.len(), 40 | 64) && n.bytes().all(|b| b.is_ascii_hexdigit()))
+        .collect();
+    out.sort();
+    out
 }
 
 #[tokio::test]
@@ -1254,12 +1285,19 @@ async fn sessions_delete_removes_log_and_refs_keeps_shared_blobs() {
             .is_empty()
     );
 
+    let store = path.parent().unwrap().join(checkpoint::EXCLUDES_DIR);
+    assert!(
+        !entries(&store).is_empty(),
+        "the session kept no exclude rules"
+    );
     let sb = repo.sandbox();
     let deleted = sessions::delete(repo.home.path(), sb.as_ref(), &id)
         .await
         .unwrap();
     assert_eq!(deleted.log, path);
     assert!(deleted.refs >= 2);
+    // The exclude rules kept for its checkpoints went with their refs.
+    assert_eq!(entries(&store), Vec::<String>::new());
     assert!(!path.exists());
     assert!(
         repo.refs(&format!("refs/tautly/checkpoints/{id}/"))
@@ -1311,11 +1349,15 @@ async fn adopted_refs_survive_parent_delete() {
         repo.refs(&format!("refs/tautly/checkpoints/{parent}/"))
             .is_empty()
     );
-    // Every checkpoint the branch copied has a ref of the branch's own.
+    // Every checkpoint the branch copied has a ref of the branch's own, and keeps the
+    // exclude rules it was taken with.
+    let store = child_path.parent().unwrap().join(checkpoint::EXCLUDES_DIR);
+    let kept = entries(&store);
     for (n, commit, _) in checkpoints(&records_at(&child_path)) {
         let name = format!("refs/tautly/checkpoints/{child}/{n}");
         assert_eq!(repo.git(&["rev-parse", &name]), commit);
         assert!(repo.git_ok(&["cat-file", "-e", &format!("{commit}^{{commit}}")]));
+        assert!(kept.contains(&commit), "{commit} lost its rules: {kept:?}");
     }
 }
 

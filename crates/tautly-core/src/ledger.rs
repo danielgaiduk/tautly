@@ -2,7 +2,7 @@
 //! processes, at `<data home>/ledger.sqlite`.
 
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, params};
@@ -319,6 +319,13 @@ fn unix_ms(t: SystemTime) -> i64 {
 /// Rows queued for the writer; past this a row is dropped (and said once).
 const PENDING_ROWS: usize = 1000;
 
+/// What the writer is sent.
+enum Msg {
+    Row(Row),
+    /// Answer once every row queued before it is written (or failed).
+    Flush(tokio::sync::oneshot::Sender<()>),
+}
+
 /// One row on its way to the ledger.
 pub(crate) struct Row {
     pub session: String,
@@ -331,11 +338,25 @@ pub(crate) struct Row {
 /// A session's way to the ledger. Rows go to a background writer that opens the ledger
 /// (off the start path) and writes them in order, so recording never waits on the file:
 /// not at start, not on the cancel path, not while another process holds the lock. A
-/// failed write loses only that row; the writer goes on.
+/// failed write loses only that row; the writer goes on. At shutdown
+/// [`flush`](CostLedger::flush) waits a bounded time for the queue to drain.
 pub(crate) struct CostLedger {
-    tx: std::sync::mpsc::SyncSender<Row>,
+    tx: std::sync::mpsc::SyncSender<Msg>,
     /// Taken by [`CostLedger::start`].
-    pending: Mutex<Option<(std::sync::mpsc::Receiver<Row>, PathBuf)>>,
+    pending: Mutex<Option<(std::sync::mpsc::Receiver<Msg>, PathBuf)>>,
+    /// Where the writer's warnings go; emptied by [`flush`](CostLedger::flush) (and on
+    /// drop), so a writer stuck on the file never holds the event stream open.
+    sink: Arc<Mutex<Option<EventSink>>>,
+}
+
+impl Drop for CostLedger {
+    fn drop(&mut self) {
+        lock(&self.sink).take();
+    }
+}
+
+fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 impl CostLedger {
@@ -344,22 +365,24 @@ impl CostLedger {
         CostLedger {
             tx,
             pending: Mutex::new(Some((rx, path))),
+            sink: Arc::default(),
         }
     }
 
     /// Start the writer (once; inside a Tokio runtime). What the user should be told (the
     /// ledger moved aside, unavailable, rows lost) goes to `events`.
     pub fn start(&self, events: EventSink) {
-        let Some((rx, path)) = self
-            .pending
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .take()
-        else {
+        let Some((rx, path)) = lock(&self.pending).take() else {
             return;
         };
+        *lock(&self.sink) = Some(events);
+        let sink = Arc::clone(&self.sink);
         tokio::task::spawn_blocking(move || {
-            let warn = |message: String| events.try_emit(Event::Warning { message });
+            let warn = |message: String| {
+                if let Some(events) = lock(&sink).as_ref() {
+                    events.try_emit(Event::Warning { message });
+                }
+            };
             let ledger = match Ledger::open_recovering(&path) {
                 Ok((ledger, notes)) => {
                     notes.into_iter().for_each(warn);
@@ -375,7 +398,14 @@ impl CostLedger {
             };
             let mut reported = false;
             // Ends when the session (the sender) is gone and every queued row is written.
-            while let Ok(row) = rx.recv() {
+            while let Ok(msg) = rx.recv() {
+                let row = match msg {
+                    Msg::Row(row) => row,
+                    Msg::Flush(done) => {
+                        let _ = done.send(());
+                        continue;
+                    }
+                };
                 if let Err(e) = write(&ledger, &row)
                     && !std::mem::replace(&mut reported, true)
                 {
@@ -391,12 +421,42 @@ impl CostLedger {
     /// Queue one row; never waits. An error says it was dropped (the writer is too far
     /// behind). After the ledger turned out unavailable, rows are dropped silently.
     pub fn record(&self, row: Row) -> std::result::Result<(), String> {
-        match self.tx.try_send(row) {
+        match self.tx.try_send(Msg::Row(row)) {
             Ok(()) | Err(std::sync::mpsc::TrySendError::Disconnected(_)) => Ok(()),
             Err(std::sync::mpsc::TrySendError::Full(_)) => Err(format!(
                 "{PENDING_ROWS} rows are waiting for the cost ledger, so this one was dropped"
             )),
         }
+    }
+}
+
+impl CostLedger {
+    /// Wait up to `within` for the rows queued so far to be written; then the writer's
+    /// warnings stop (it goes on writing in the background if it is still stuck).
+    pub async fn flush(&self, within: Duration) {
+        let started = lock(&self.pending).is_none();
+        if started {
+            let deadline = tokio::time::Instant::now() + within;
+            let (done, written) = tokio::sync::oneshot::channel();
+            let mut msg = Msg::Flush(done);
+            // Behind the queued rows; a full queue is retried until the deadline.
+            let queued = loop {
+                match self.tx.try_send(msg) {
+                    Ok(()) => break true,
+                    Err(std::sync::mpsc::TrySendError::Full(m))
+                        if tokio::time::Instant::now() < deadline =>
+                    {
+                        msg = m;
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    Err(_) => break false,
+                }
+            };
+            if queued {
+                let _ = tokio::time::timeout_at(deadline, written).await;
+            }
+        }
+        lock(&self.sink).take();
     }
 }
 

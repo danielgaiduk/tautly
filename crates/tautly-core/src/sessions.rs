@@ -64,7 +64,8 @@ pub async fn delete(
     // Held until the log is gone, so no engine opens it meanwhile.
     let lock = lock_if_idle(&log, id)?;
     let refs = if std::fs::symlink_metadata(root.join(".git")).is_ok() {
-        checkpoint::delete_session_refs(sandbox, &root, id).await?
+        let excludes = log.parent().map(|d| d.join(checkpoint::EXCLUDES_DIR));
+        checkpoint::delete_session_refs(sandbox, &root, id, excludes.as_deref()).await?
     } else {
         0
     };

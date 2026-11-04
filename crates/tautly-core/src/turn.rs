@@ -142,6 +142,8 @@ impl Response {
             ProviderEvent::DiscardedUsage(u) => self.discarded.push(*u),
             ProviderEvent::Quota(q) => self.quota = Some(q.clone()),
             ProviderEvent::Done { stop } => self.stop = Some(stop.clone()),
+            // Read back from a newer log: nothing this version can rebuild from it.
+            ProviderEvent::Unknown => return,
         }
         match (self.logged.last_mut(), ev) {
             (Some(ProviderEvent::TextDelta(a)), ProviderEvent::TextDelta(b))

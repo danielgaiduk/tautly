@@ -6,13 +6,18 @@
 //! them, once however many checkpoints share them. Directories are 0700, files 0600, and
 //! every file is written to a temporary name first and renamed into place.
 
+use std::collections::HashSet;
 use std::fs;
 use std::io::Write;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, SystemTime};
 
 static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Rules files younger than this are never pruned: their entry may be on its way.
+const RULES_GRACE: Duration = Duration::from_secs(600);
 
 pub(crate) struct ExcludesStore {
     dir: PathBuf,
@@ -38,6 +43,53 @@ impl ExcludesStore {
             write_atomically(&kept, &file, rules)?;
         }
         write_atomically(&self.dir, &self.dir.join(commit), digest.as_bytes())
+    }
+
+    /// The store's directory.
+    pub(crate) fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    /// Remove the entry of every checkpoint not in `keep` that `drop(commit, modified)`
+    /// selects, then the rules no entry names any more, except rules written in the last
+    /// [`RULES_GRACE`] (a `put` in flight writes its rules before its entry). How many
+    /// entries were removed; what cannot be read or removed is left.
+    pub(crate) fn prune(
+        &self,
+        keep: &HashSet<String>,
+        drop: impl Fn(&str, SystemTime) -> bool,
+    ) -> u32 {
+        let modified = |p: &Path| fs::metadata(p).and_then(|m| m.modified()).ok();
+        let mut removed = 0;
+        let mut named = HashSet::new();
+        for entry in fs::read_dir(&self.dir).into_iter().flatten().flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if !is_object_id(&name) {
+                continue;
+            }
+            let path = entry.path();
+            let gone = !keep.contains(&name)
+                && modified(&path).is_some_and(|m| drop(&name, m))
+                && fs::remove_file(&path).is_ok();
+            if gone {
+                removed += 1;
+            } else if let Ok(digest) = fs::read_to_string(&path) {
+                named.insert(digest);
+            }
+        }
+        let rules = self.dir.join("rules");
+        let settled = SystemTime::now() - RULES_GRACE;
+        for entry in fs::read_dir(&rules).into_iter().flatten().flatten() {
+            let path = entry.path();
+            let digest = entry.file_name().to_string_lossy().into_owned();
+            if digest.len() == 64
+                && !named.contains(&digest)
+                && modified(&path).is_some_and(|m| m < settled)
+            {
+                let _ = fs::remove_file(&path);
+            }
+        }
+        removed
     }
 
     /// The rules kept for checkpoint `commit` (none: none kept, or damaged).
@@ -137,6 +189,49 @@ mod tests {
         // Empty rules are rules too.
         store.put(&"d".repeat(40), b"").unwrap();
         assert_eq!(store.get(&"d".repeat(40)), Some(Vec::new()));
+    }
+
+    /// Set `path`'s modification time to `ago` before now.
+    fn age(path: &std::path::Path, ago: Duration) {
+        let f = std::fs::File::options().write(true).open(path).unwrap();
+        f.set_modified(SystemTime::now() - ago).unwrap();
+    }
+
+    #[test]
+    fn prune_removes_dropped_entries_and_rules_nobody_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ExcludesStore::new(dir.path().join("x"));
+        let [c1, c2, c3, c4, c5] = ["1", "2", "3", "4", "5"].map(|d| d.repeat(40));
+        store.put(&c1, b"shared\n").unwrap();
+        store.put(&c2, b"shared\n").unwrap();
+        store.put(&c3, b"only c3\n").unwrap();
+        store.put(&c4, b"only c4\n").unwrap();
+        let day = Duration::from_secs(24 * 3600);
+        for p in files(dir.path()) {
+            age(&p, day);
+        }
+        // A put in flight: its rules are written, its entry not yet.
+        store.put(&c5, b"in flight\n").unwrap();
+        std::fs::remove_file(store.dir().join(&c5)).unwrap();
+
+        let keep: HashSet<String> = [c2.clone()].into();
+        let dropped = [&c1, &c2, &c3];
+        let removed = store.prune(&keep, |c, modified| {
+            assert!(modified <= SystemTime::now() - day + Duration::from_secs(60));
+            dropped.iter().any(|d| *d == c)
+        });
+        assert_eq!(removed, 2);
+        assert_eq!(store.get(&c1), None);
+        assert_eq!(store.get(&c2).as_deref(), Some(&b"shared\n"[..]));
+        assert_eq!(store.get(&c3), None);
+        assert_eq!(store.get(&c4).as_deref(), Some(&b"only c4\n"[..]));
+        let rules: Vec<Vec<u8>> = files(&store.dir().join("rules"))
+            .iter()
+            .map(|p| std::fs::read(p).unwrap())
+            .collect();
+        assert!(!rules.contains(&b"only c3\n".to_vec()), "{rules:?}");
+        assert!(rules.contains(&b"in flight\n".to_vec()), "{rules:?}");
+        assert_eq!(rules.len(), 3, "{rules:?}");
     }
 
     #[test]
