@@ -2,8 +2,9 @@
 //! `mock`): `cargo test -p tautly-cli --features mock`. Each run is in a scratch work tree
 //! with its own `TAUTLY_HOME`, so no real configuration, key or session is touched.
 
-use std::io::Write as _;
-use std::process::{Command, Output, Stdio};
+use std::io::{BufRead as _, Write as _};
+use std::process::{Child, Command, ExitStatus, Output, Stdio};
+use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -187,4 +188,116 @@ fn rpc_mode_serves_json_rpc_on_stdio() {
         .map(|m| m["params"]["event"]["text"].as_str().unwrap())
         .collect();
     assert_eq!(said, "over rpc");
+}
+
+/// Send `signal` (`TERM`, `INT`) to the child.
+fn kill(child: &Child, signal: &str) {
+    let status = Command::new("kill")
+        .args([&format!("-{signal}"), &child.id().to_string()])
+        .status()
+        .unwrap();
+    assert!(status.success());
+}
+
+/// Wait for the child to exit, killing it if it takes longer than 20 s.
+fn wait_exit(child: &mut Child) -> ExitStatus {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            return status;
+        }
+        if Instant::now() > deadline {
+            let _ = child.kill();
+            panic!("tautly did not exit");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Read JSON lines from `out` until one matches `pred`.
+fn read_until(out: &mut impl std::io::BufRead, pred: impl Fn(&Value) -> bool) -> Vec<Value> {
+    let mut seen = Vec::new();
+    loop {
+        let mut line = String::new();
+        let n = out.read_line(&mut line).unwrap();
+        assert!(n > 0, "output ended early: {seen:?}");
+        let msg: Value = serde_json::from_str(&line).unwrap();
+        let done = pred(&msg);
+        seen.push(msg);
+        if done {
+            return seen;
+        }
+    }
+}
+
+#[test]
+fn a_signal_during_a_prompt_exits_with_its_code() {
+    // SIGTERM is 143 (128 + 15); Ctrl-C (SIGINT) cancels the turn: 130.
+    for (signal, code) in [("TERM", 143), ("INT", 130)] {
+        let s = Scratch::new();
+        let script = s.script(
+            "s.json",
+            json!([[
+                {"tool_call": {"id": "b1", "name": "bash",
+                               "input_json": json!({"command": "sleep 30"}).to_string()}},
+                {"done": {"stop": "tool_use"}}
+            ], text("never")]),
+        );
+        let mut child = s
+            .command(&[
+                "-p",
+                "wait",
+                "--output",
+                "json",
+                "--approve",
+                "yolo",
+                "--mock-script",
+                &script,
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut stdout = std::io::BufReader::new(child.stdout.take().unwrap());
+        read_until(&mut stdout, |e| e["type"] == "tool_started");
+        kill(&child, signal);
+        let status = wait_exit(&mut child);
+        assert_eq!(status.code(), Some(code), "SIG{signal}: {status:?}");
+    }
+}
+
+#[test]
+fn rpc_mode_ends_on_sigterm() {
+    let s = Scratch::new();
+    let script = s.script("s.json", json!([text("unused")]));
+    let mut child = s
+        .command(&["--rpc", "--mock-script", &script])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = std::io::BufReader::new(child.stdout.take().unwrap());
+    let init = json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}});
+    writeln!(stdin, "{init}").unwrap();
+    let seen = read_until(&mut stdout, |m| m["id"] == 1);
+    let sid = seen.last().unwrap()["result"]["session_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    // The client keeps its end open: the signal alone ends the server, after the session.
+    kill(&child, "TERM");
+    let status = wait_exit(&mut child);
+    assert_eq!(status.code(), Some(143), "{status:?}");
+    let rest: Vec<Value> = stdout
+        .lines()
+        .map(|l| serde_json::from_str(&l.unwrap()).unwrap())
+        .collect();
+    assert!(
+        rest.iter()
+            .all(|m| m["params"]["session_id"] == sid.as_str()),
+        "{rest:?}"
+    );
+    drop(stdin);
 }

@@ -46,7 +46,7 @@ pub use protocol::{
     BudgetScope, Command, DiffFile, DiffStatus, EffectView, ErrorKind, Event, FinishReason,
     MAX_REPLACED_SHOWN, McpState, PROTOCOL_VERSION, ToolMetaView, UsageRole,
 };
-pub use provider_setup::{ProviderFactory, ProviderSetupError, provider_label};
+pub use provider_setup::{ProviderFactory, ProviderSetupError, known_provider, provider_label};
 pub use record::SessionRecord;
 pub use signals::{Signal, SignalPolicy, SignalRouter, handle_signals, install_signal_handlers};
 pub use workspace::{Workspace, Workspaces};

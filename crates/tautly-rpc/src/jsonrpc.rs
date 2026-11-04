@@ -92,11 +92,12 @@ impl Incoming {
 }
 
 /// Parse one line. On failure, the id to answer with (null when none could be read) and
-/// the error.
-pub fn parse(line: &[u8]) -> Result<Incoming, (Value, Error)> {
+/// the error; no id at all for a malformed *notification* (an object with a string
+/// `method` and no `id`), which JSON-RPC never answers.
+pub fn parse(line: &[u8]) -> Result<Incoming, (Option<Value>, Error)> {
     let value: Value = serde_json::from_slice(line).map_err(|e| {
         (
-            Value::Null,
+            Some(Value::Null),
             Error::new(PARSE_ERROR, format!("parse error: {e}")),
         )
     })?;
@@ -106,36 +107,39 @@ pub fn parse(line: &[u8]) -> Result<Incoming, (Value, Error)> {
         } else {
             "a request must be a JSON object"
         };
-        return Err((Value::Null, Error::new(INVALID_REQUEST, what)));
+        return Err((Some(Value::Null), Error::new(INVALID_REQUEST, what)));
     };
     let id = match obj.remove("id") {
         None => None,
         Some(id @ (Value::String(_) | Value::Number(_) | Value::Null)) => Some(id),
         Some(_) => {
             return Err((
-                Value::Null,
+                Some(Value::Null),
                 Error::new(INVALID_REQUEST, "`id` must be a string, a number or null"),
             ));
         }
     };
-    let invalid = |msg: &str| {
-        (
-            id.clone().unwrap_or(Value::Null),
-            Error::new(INVALID_REQUEST, msg),
-        )
+    let method = match obj.remove("method") {
+        Some(Value::String(method)) => method,
+        _ => {
+            // Without a method it is no notification, so it is answered.
+            let id = id.unwrap_or(Value::Null);
+            return Err((
+                Some(id),
+                Error::new(INVALID_REQUEST, "`method` must be a string"),
+            ));
+        }
     };
+    // From here on, a message without an id is a notification: never answered.
     if obj.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
-        return Err(invalid("`jsonrpc` must be \"2.0\""));
+        return Err((id, Error::new(INVALID_REQUEST, "`jsonrpc` must be \"2.0\"")));
     }
-    let Some(Value::String(method)) = obj.remove("method") else {
-        return Err(invalid("`method` must be a string"));
-    };
     let params = match obj.remove("params") {
         None | Some(Value::Null) => Value::Object(Map::new()),
         Some(p @ Value::Object(_)) => p,
         Some(_) => {
             return Err((
-                id.unwrap_or(Value::Null),
+                id,
                 Error::new(INVALID_PARAMS, "`params` must be an object (by name)"),
             ));
         }
@@ -225,20 +229,37 @@ mod tests {
         assert_eq!(note.params(), &json!({"a": 1}));
 
         let code = |line: &[u8]| parse(line).unwrap_err();
+        assert_eq!(code(b"{nope"), (Some(Value::Null), code(b"{nope").1));
         assert_eq!(code(b"{nope").1.code, PARSE_ERROR);
         assert_eq!(code(b"[1]").1.code, INVALID_REQUEST);
         let (id, err) = code(br#"{"jsonrpc":"1.0","id":"x","method":"m"}"#);
-        assert_eq!((id, err.code), (json!("x"), INVALID_REQUEST));
+        assert_eq!((id, err.code), (Some(json!("x")), INVALID_REQUEST));
         assert_eq!(
-            code(br#"{"jsonrpc":"2.0","id":1,"method":"m","params":[1]}"#)
-                .1
-                .code,
-            INVALID_PARAMS
+            code(br#"{"jsonrpc":"2.0","id":1,"method":"m","params":[1]}"#),
+            (
+                Some(json!(1)),
+                Error::new(INVALID_PARAMS, "`params` must be an object (by name)")
+            )
         );
         assert_eq!(
             code(br#"{"jsonrpc":"2.0","id":{},"method":"m"}"#).1.code,
             INVALID_REQUEST
         );
+        // Not even a malformed notification is answered.
+        for note in [
+            &br#"{"jsonrpc":"2.0","method":"m","params":[1]}"#[..],
+            br#"{"jsonrpc":"1.0","method":"m"}"#,
+            br#"{"method":"m","params":"x"}"#,
+        ] {
+            let (id, err) = code(note);
+            assert_eq!(id, None, "{}: {err:?}", String::from_utf8_lossy(note));
+        }
+        // Without a string `method` it is no notification: answered with id null.
+        assert_eq!(
+            code(br#"{"jsonrpc":"2.0","method":1}"#).0,
+            Some(Value::Null)
+        );
+        assert_eq!(code(br#"{"jsonrpc":"2.0"}"#).0, Some(Value::Null));
     }
 
     #[tokio::test]

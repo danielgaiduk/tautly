@@ -4,11 +4,10 @@
 //!
 //! The session is headless (the caller builds it so): `ask` resolves to deny unless
 //! `--approve` raised the mode, memory proposals are rejected unless `--approve-memory`,
-//! and nothing ever waits for input.
+//! and nothing ever waits for input. In text mode, what the user should know about those
+//! refusals goes to stderr, so stdout stays the model's text.
 
-use std::io::Write as _;
-
-use tautly_core::{Command, Engine, Event, FinishReason};
+use tautly_core::{Command, Engine, Event, FinishReason, McpState};
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc;
 
@@ -18,7 +17,9 @@ pub enum OutputFormat {
     /// Every event, one JSON object per line (the protocol's `Event`), until the session
     /// has shut down.
     Json,
-    /// The model's text only, ending with a newline; errors go to stderr.
+    /// The model's text only, ending with a newline. Errors, warnings, headless refusals
+    /// (a tool call denied or blocked) and MCP servers skipped or failed go to stderr, one
+    /// `tautly: ...` line each.
     Text,
 }
 
@@ -40,13 +41,27 @@ pub fn exit_code(reason: FinishReason) -> i32 {
 /// starts. If `out` cannot be written, the turn is cancelled.
 pub async fn run_oneshot(
     engine: Engine,
-    mut events: mpsc::Receiver<Event>,
+    events: mpsc::Receiver<Event>,
     prompt: String,
     output: OutputFormat,
     out: impl AsyncWrite + Unpin,
 ) -> i32 {
+    run_oneshot_to(engine, events, prompt, output, out, tokio::io::stderr()).await
+}
+
+/// [`run_oneshot`] with the text mode's diagnostics written to `err` instead of the
+/// process's stderr.
+pub async fn run_oneshot_to(
+    engine: Engine,
+    mut events: mpsc::Receiver<Event>,
+    prompt: String,
+    output: OutputFormat,
+    out: impl AsyncWrite + Unpin,
+    err: impl AsyncWrite + Unpin,
+) -> i32 {
     let mut out = Printer {
         out,
+        err,
         output,
         broken: false,
         last_text: None,
@@ -82,9 +97,7 @@ pub async fn run_oneshot(
     let _ = engine.send(Command::Shutdown).await;
     drop(engine);
     while let Some(ev) = events.recv().await {
-        if output == OutputFormat::Json {
-            out.print(&ev).await;
-        } else if let Event::Error { .. } = ev {
+        if !matches!(ev, Event::TextDelta { .. }) {
             out.print(&ev).await;
         }
     }
@@ -92,8 +105,10 @@ pub async fn run_oneshot(
     code.unwrap_or(1)
 }
 
-struct Printer<W> {
+struct Printer<W, E> {
     out: W,
+    /// Diagnostics (text output).
+    err: E,
     output: OutputFormat,
     /// A write failed: nothing more is written.
     broken: bool,
@@ -101,7 +116,7 @@ struct Printer<W> {
     last_text: Option<char>,
 }
 
-impl<W: AsyncWrite + Unpin> Printer<W> {
+impl<W: AsyncWrite + Unpin, E: AsyncWrite + Unpin> Printer<W, E> {
     async fn print(&mut self, ev: &Event) {
         match self.output {
             OutputFormat::Json => {
@@ -118,14 +133,14 @@ impl<W: AsyncWrite + Unpin> Printer<W> {
                     }
                     self.write(text.as_bytes()).await;
                 }
-                Event::Error { message, hint, .. } => {
-                    let hint = hint
-                        .as_deref()
-                        .map(|h| format!(" ({h})"))
-                        .unwrap_or_default();
-                    let _ = writeln!(std::io::stderr(), "tautly: {message}{hint}");
+                ev => {
+                    if let Some(line) = diagnostic(ev) {
+                        let line = format!("tautly: {line}\n");
+                        // Diagnostics are best effort: a closed stderr changes nothing.
+                        let _ = self.err.write_all(line.as_bytes()).await;
+                        let _ = self.err.flush().await;
+                    }
                 }
-                _ => {}
             },
         }
     }
@@ -147,5 +162,50 @@ impl<W: AsyncWrite + Unpin> Printer<W> {
         if !self.broken {
             let _ = self.out.flush().await;
         }
+    }
+}
+
+/// What text output tells the user on stderr about `ev`, if anything: errors, warnings
+/// (a rejected memory proposal names `--approve-memory`), tool calls refused headless or
+/// blocked (`--approve`), and MCP servers skipped (`--approve-mcp`) or failed.
+fn diagnostic(ev: &Event) -> Option<String> {
+    let first_line = |text: &str| text.lines().next().unwrap_or("").trim().to_string();
+    match ev {
+        Event::Error { message, hint, .. } => Some(match hint {
+            Some(hint) => format!("{message} ({hint})"),
+            None => message.clone(),
+        }),
+        Event::Warning { message } => Some(format!("warning: {message}")),
+        Event::ToolFinished {
+            tool,
+            output,
+            blocked: true,
+            ..
+        } => Some(format!("{tool} blocked: {}", first_line(output))),
+        Event::ToolFinished {
+            tool,
+            output,
+            is_error: true,
+            ..
+        } => output
+            .strip_prefix("denied:")
+            .map(|why| format!("{tool} denied: {}", first_line(why))),
+        Event::McpServerStatus {
+            server,
+            state,
+            message: Some(message),
+            ..
+        } => {
+            let state = match state {
+                McpState::Skipped => "skipped",
+                McpState::Failed => "failed",
+                _ => return None,
+            };
+            Some(format!(
+                "MCP server {server} {state}: {}",
+                first_line(message)
+            ))
+        }
+        _ => None,
     }
 }

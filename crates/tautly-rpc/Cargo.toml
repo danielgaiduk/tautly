@@ -8,7 +8,7 @@ license.workspace = true
 
 [dependencies]
 tautly-core = { path = "../tautly-core" }
-tokio.workspace = true
+tokio = { workspace = true, features = ["io-std"] }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

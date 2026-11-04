@@ -2,17 +2,21 @@
 //!
 //! - `tautly -p PROMPT [--output text|json]` runs one prompt headless and exits with a
 //!   code from how the turn ended (0 completed, 1 error, 2 budget / max_turns / timeout,
-//!   130 cancelled).
-//! - `tautly --rpc` serves the JSON-RPC protocol on stdin/stdout.
+//!   130 cancelled by Ctrl-C); after SIGTERM or SIGHUP, 128 + the signal (143, 129).
+//! - `tautly --rpc` serves the JSON-RPC protocol on stdin/stdout until the client sends
+//!   `shutdown` or disconnects (exit 0), or SIGTERM / SIGHUP arrives (143 / 129, after
+//!   every session has shut down).
 //!
 //! Flags shared by both: `--approve auto-edit|yolo` (headless `ask` is otherwise denied),
 //! `--approve-memory`, `--approve-mcp`, `--model ID`, `--budget-usd N` (a session budget,
 //! sent before the first message), `--continue` / `--resume ID`, `--no-checkpoints`.
 //! Command-line flags are trusted: they override every configuration file (spec 2.2).
 
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context as _, bail};
@@ -23,6 +27,7 @@ use tautly_core::{
 };
 use tautly_rpc::{EngineFactory, OutputFormat, Server, run_oneshot};
 use tokio::io::BufReader;
+use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::mpsc;
 
 /// How long, after the sessions have shut down, background work may hold up the exit.
@@ -34,7 +39,7 @@ const EXIT_GRACE: Duration = Duration::from_secs(2);
     version,
     about = "A token-efficient AI coding agent",
     after_help = "Exit codes with -p: 0 completed, 1 error, 2 budget/max turns/timeout, \
-                  130 cancelled."
+                  130 cancelled (Ctrl-C), 143 SIGTERM, 129 SIGHUP."
 )]
 struct Cli {
     /// Run PROMPT as one headless turn, print what happens and exit.
@@ -117,21 +122,26 @@ fn parse_usd(s: &str) -> Result<f64, String> {
     }
 }
 
-/// A model id must name one of the providers Tautly has an adapter for.
+/// A model id must name one of the providers Tautly has an adapter for (core decides).
 fn check_model(id: &str) -> Result<(), String> {
-    let (provider, model) = id.split_once('/').unwrap_or((id, ""));
-    let known = matches!(provider, "anthropic" | "openai" | "google")
-        || provider
-            .strip_prefix("compat:")
-            .is_some_and(|name| !name.is_empty());
-    if known && !model.is_empty() {
-        Ok(())
-    } else {
-        Err(format!(
-            "`{id}` is not a model id: use <provider>/<model> with provider anthropic, openai, \
-             google or compat:<name>"
-        ))
-    }
+    tautly_core::known_provider(&ModelId::from(id)).map_err(|e| format!("{e}: {}", e.hint()))
+}
+
+/// The first SIGTERM or SIGHUP, as the exit code it means (128 + its number). The signals
+/// are watched from this call on (alongside the engines' own handlers, which shut the
+/// sessions down).
+fn terminated() -> std::io::Result<impl Future<Output = i32> + Send + 'static> {
+    const SIGHUP: i32 = 1;
+    const SIGTERM: i32 = 15;
+    let mut term = signal(SignalKind::terminate())?;
+    let mut hup = signal(SignalKind::hangup())?;
+    Ok(async move {
+        tokio::select! {
+            Some(()) = term.recv() => 128 + SIGTERM,
+            Some(()) = hup.recv() => 128 + SIGHUP,
+            else => std::future::pending().await,
+        }
+    })
 }
 
 impl Cli {
@@ -297,7 +307,15 @@ async fn oneshot(
         Some(Output::Json) => OutputFormat::Json,
         Some(Output::Text) | None => OutputFormat::Text,
     };
-    Ok(run_oneshot(engine, events, prompt, output, tokio::io::stdout()).await)
+    // SIGTERM / SIGHUP shut the session down (the turn ends as cancelled); the exit code
+    // still says which signal it was.
+    let terminated = tokio::spawn(terminated()?);
+    let code = run_oneshot(engine, events, prompt, output, tokio::io::stdout()).await;
+    if terminated.is_finished() {
+        return Ok(terminated.await.unwrap_or(code));
+    }
+    terminated.abort();
+    Ok(code)
 }
 
 async fn rpc(
@@ -317,13 +335,25 @@ async fn rpc(
             )
             .map_err(|e| format!("{e:#}").into())
     });
+    // SIGTERM / SIGHUP: the engines' handlers shut the sessions down, and the server stops
+    // as on a disconnect, exiting with the signal's code once they have.
+    let signalled = Arc::new(AtomicI32::new(0));
+    let terminated = terminated()?;
+    let stop = {
+        let signalled = Arc::clone(&signalled);
+        async move { signalled.store(terminated.await, Ordering::SeqCst) }
+    };
     let served = Server::new(factory, workspaces, root)
         .resume(resume)
         .start_commands(cli.start_commands())
+        .stop_on(stop)
         .serve(BufReader::new(tokio::io::stdin()), tokio::io::stdout())
         .await;
     match served {
-        Ok(()) => Ok(0),
+        Ok(()) => match signalled.load(Ordering::SeqCst) {
+            0 => Ok(0),
+            code => Ok(code),
+        },
         Err(e) => {
             eprintln!("tautly: {e}");
             Ok(1)

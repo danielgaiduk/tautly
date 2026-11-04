@@ -6,7 +6,7 @@ use common::*;
 use serde_json::{Value, json};
 use tautly_core::{CliOverrides, EngineBuilder, FinishReason, Mode};
 use tautly_provider::{MockProvider, MockTurn, ProviderError};
-use tautly_rpc::{OutputFormat, exit_code, run_oneshot};
+use tautly_rpc::{OutputFormat, exit_code, run_oneshot, run_oneshot_to};
 
 /// Run `prompt` through `run_oneshot`; the exit code and what it wrote.
 async fn oneshot(fx: &Fx, b: EngineBuilder, prompt: &str, output: OutputFormat) -> (i32, String) {
@@ -115,6 +115,111 @@ async fn oneshot_text_prints_text_only() {
     .await;
     assert_eq!(code, 0);
     assert_eq!(out, "Hello, world.\n");
+}
+
+/// Run `prompt` through `run_oneshot_to`; the exit code, stdout and stderr.
+async fn oneshot_split(
+    fx: &Fx,
+    b: EngineBuilder,
+    prompt: &str,
+    output: OutputFormat,
+) -> (i32, String, String) {
+    let (engine, events) = fx.build(b);
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    let code = tokio::time::timeout(
+        WAIT,
+        run_oneshot_to(
+            engine,
+            events,
+            prompt.to_string(),
+            output,
+            &mut out,
+            &mut err,
+        ),
+    )
+    .await
+    .expect("the one-shot run did not end");
+    (
+        code,
+        String::from_utf8(out).unwrap(),
+        String::from_utf8(err).unwrap(),
+    )
+}
+
+#[tokio::test]
+async fn oneshot_text_reports_headless_refusals_on_stderr() {
+    let script = || {
+        MockProvider::new(vec![
+            tools_step(vec![
+                call("w1", "write", json!({"path": "out.txt", "content": "x"})),
+                call(
+                    "m1",
+                    "remember",
+                    json!({"title": "Use pnpm", "kind": "convention",
+                           "body": "Run pnpm install, never npm."}),
+                ),
+            ]),
+            text_step("could not write"),
+        ])
+    };
+    let fixture = || {
+        let fx = Fx::new();
+        // A repository-declared MCP server nobody approved: skipped headless.
+        fx.write(
+            ".tautly/config.toml",
+            "[mcp.servers.echo]\ncommand = \"/nonexistent/echo-server\"\n",
+        );
+        fx
+    };
+    let fx = fixture();
+    let mock = script();
+    let cfg = config_with(CliOverrides::default(), fx.dir.path());
+    let b = EngineBuilder {
+        workspace: Some(fx.ready_workspace().await),
+        ..fx.builder(cfg, &mock)
+    };
+    let (code, out, err) = oneshot_split(&fx, b, "write", OutputFormat::Text).await;
+    assert_eq!(code, 0, "{err}");
+    // Stdout stays the model's text only.
+    assert_eq!(out, "could not write\n", "{err}");
+    let lines: Vec<&str> = err.lines().collect();
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.starts_with("tautly: write denied: ") && l.contains("--approve auto-edit")),
+        "{err}"
+    );
+    assert!(
+        !lines.iter().any(|l| l.contains("denied: denied:")),
+        "{err}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.starts_with("tautly: warning: ") && l.contains("--approve-memory")),
+        "{err}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.starts_with("tautly: MCP server echo skipped: ")
+                && l.contains("--approve-mcp")),
+        "{err}"
+    );
+    assert!(!fx.exists("out.txt"));
+
+    // As JSON, everything is in the event stream and stderr stays empty.
+    let fx = fixture();
+    let mock = script();
+    let cfg = config_with(CliOverrides::default(), fx.dir.path());
+    let b = EngineBuilder {
+        workspace: Some(fx.ready_workspace().await),
+        ..fx.builder(cfg, &mock)
+    };
+    let (code, out, err) = oneshot_split(&fx, b, "write", OutputFormat::Json).await;
+    assert_eq!(code, 0, "{out}");
+    assert_eq!(err, "");
+    assert!(!warnings(&events(&out)).is_empty(), "{out}");
 }
 
 #[tokio::test]

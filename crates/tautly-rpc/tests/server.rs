@@ -7,13 +7,13 @@ use std::time::Duration;
 
 use common::*;
 use serde_json::{Value, json};
-use tautly_core::{BudgetScope, Command, Mode, ModelId};
+use tautly_core::{BudgetScope, Command, EngineBuilder, Mode, ModelId, Signal, SignalRouter};
 use tautly_provider::{MockProvider, MockTurn, ProviderError};
 use tautly_rpc::jsonrpc::{
-    INVALID_PARAMS, METHOD_NOT_FOUND, NOT_INITIALIZED, PARSE_ERROR, UNKNOWN_SESSION,
-    UNSUPPORTED_PROTOCOL,
+    INVALID_PARAMS, INVALID_REQUEST, METHOD_NOT_FOUND, NOT_INITIALIZED, PARSE_ERROR,
+    UNKNOWN_SESSION, UNSUPPORTED_PROTOCOL,
 };
-use tautly_rpc::{RpcError, Server, command_for, serve};
+use tautly_rpc::{EngineFactory, RpcError, Server, command_for, serve};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, DuplexStream, Lines};
 use tokio::task::JoinHandle;
 
@@ -110,13 +110,21 @@ impl Client {
             .unwrap_or_else(|| panic!("{method} did not fail: {resp}"))
     }
 
+    /// Keep a notification: an `event` as (session id, event), a `session/closed` as
+    /// (session id, `{"type": "session/closed"}`).
     fn keep(&mut self, msg: Value) {
-        assert_eq!(msg["method"], "event", "{msg}");
         let sid = msg["params"]["session_id"]
             .as_str()
-            .unwrap_or_else(|| panic!("event without session_id: {msg}"))
+            .unwrap_or_else(|| panic!("notification without session_id: {msg}"))
             .to_string();
-        self.events.push((sid, msg["params"]["event"].clone()));
+        match msg["method"].as_str() {
+            Some("event") => self.events.push((sid, msg["params"]["event"].clone())),
+            Some("session/closed") => {
+                assert_eq!(msg["params"].as_object().unwrap().len(), 1, "{msg}");
+                self.events.push((sid, json!({"type": "session/closed"})));
+            }
+            _ => panic!("unexpected notification {msg}"),
+        }
     }
 
     /// The first event (kept or new) that matches; it and the kept events before it are
@@ -221,11 +229,15 @@ async fn rejects_major_version_mismatch() {
     );
     assert_eq!(c.err("session/list", json!({})).await, NOT_INITIALIZED);
     // Garbage versions are refused too.
-    assert_eq!(
-        c.err("initialize", json!({"protocol": "one"})).await,
-        UNSUPPORTED_PROTOCOL
-    );
-    let result = c.ok("initialize", json!({"protocol": "1.0"})).await;
+    for bad in ["one", "2.0.0", "1.0.0.0", "1..0", "1.0.x", ""] {
+        assert_eq!(
+            c.err("initialize", json!({"protocol": bad})).await,
+            UNSUPPORTED_PROTOCOL,
+            "{bad}"
+        );
+    }
+    // `major.minor.patch` is a version too; the patch is ignored.
+    let result = c.ok("initialize", json!({"protocol": "1.0.3"})).await;
     assert_eq!(result["protocol"], "1.0");
     c.disconnect().await;
 }
@@ -427,6 +439,9 @@ async fn malformed_json_line_returns_parse_error_and_continues() {
     // A notification is never answered, even when it fails.
     c.send_line(r#"{"jsonrpc":"2.0","method":"frobnicate"}"#)
         .await;
+    c.send_line(r#"{"jsonrpc":"2.0","method":"cancel","params":[1]}"#)
+        .await;
+    c.send_line(r#"{"jsonrpc":"1.0","method":"cancel"}"#).await;
     // A line far over the limit is refused, and reading goes on.
     let huge = format!(
         r#"{{"jsonrpc":"2.0","id":99,"method":"x","params":{{"t":"{}"}}}}"#,
@@ -435,7 +450,7 @@ async fn malformed_json_line_returns_parse_error_and_continues() {
     c.send_line(&huge).await;
     let resp = c.read().await.unwrap();
     assert_eq!(resp["id"], Value::Null, "{resp}");
-    assert!(resp["error"]["code"].is_i64(), "{resp}");
+    assert_eq!(resp["error"]["code"], INVALID_REQUEST, "{resp}");
     let result = c.ok("initialize", json!({"protocol": "1.0"})).await;
     assert_eq!(result["protocol"], "1.0");
     assert_eq!(c.err("frobnicate", json!({})).await, METHOD_NOT_FOUND);
@@ -942,6 +957,8 @@ async fn a_fork_moves_the_session_id() {
     c.ok("send_message", json!({"text": "hello"})).await;
     c.until_type(&parent, "turn_finished").await;
     c.ok("fork", json!({"label": "b"})).await;
+    // The old id still reaches the session, before and after the move is announced.
+    c.ok("cancel", json!({"session_id": parent})).await;
     // Announced under the old id, naming the new one.
     let seen = c
         .until(|s, e| {
@@ -961,12 +978,20 @@ async fn a_fork_moves_the_session_id() {
     let events = c.until_type(&branch, "turn_finished").await;
     assert_eq!(text_of(&events, &branch), "two");
     let listed = c.ok("session/list", json!({})).await;
+    assert_eq!(listed["sessions"].as_array().unwrap().len(), 1, "{listed}");
     assert_eq!(listed["sessions"][0]["session_id"], branch.as_str());
+    // The old id stays an alias of the session until it closes.
+    c.ok("cancel", json!({"session_id": parent})).await;
+    c.ok("cancel", json!({})).await;
+    c.ok("session/close", json!({"session_id": parent})).await;
+    assert_eq!(
+        c.err("cancel", json!({"session_id": branch})).await,
+        UNKNOWN_SESSION
+    );
     assert_eq!(
         c.err("cancel", json!({"session_id": parent})).await,
         UNKNOWN_SESSION
     );
-    c.ok("cancel", json!({})).await;
     c.ok("shutdown", json!({})).await;
     c.finish().await;
 }
@@ -997,6 +1022,207 @@ async fn start_commands_reach_every_new_session_first() {
     c.ok("send_message", json!({"text": "hello"})).await;
     let events = c.until_type(&sid, "turn_finished").await;
     assert_eq!(events.last().unwrap().1["reason"], "budget", "{events:?}");
+    c.ok("shutdown", json!({})).await;
+    c.finish().await;
+}
+
+#[tokio::test]
+async fn a_session_that_ends_by_itself_is_removed_and_announced() {
+    let fx = Fx::new();
+    let (f, _) = factory(
+        &fx,
+        config(Mode::Ask),
+        vec![MockProvider::new(vec![text_step("one")])],
+        false,
+    );
+    // Signals reach the engines as they do in `tautly --rpc`, not through the server.
+    let router = SignalRouter::new(|sig| panic!("escalated on {sig:?}"));
+    let routed = Arc::clone(&router);
+    let f: EngineFactory = Arc::new(move |spec| {
+        let (engine, events) = f(spec)?;
+        routed.add(&engine);
+        Ok((engine, events))
+    });
+    let mut c = Client::start(Server::new(f, fx.workspaces(), fx.dir.path()));
+    let sid = c.ok("initialize", json!({})).await["session_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    c.ok("send_message", json!({"text": "hello"})).await;
+    c.until_type(&sid, "turn_finished").await;
+
+    router.deliver(Signal::Terminate).await;
+    let seen = c.until_type(&sid, "session/closed").await;
+    assert!(
+        seen.iter().all(|(s, _)| s == &sid),
+        "another session's events: {seen:?}"
+    );
+    // Gone from the server: not listed, not the default any more.
+    let listed = c.ok("session/list", json!({})).await;
+    assert!(
+        listed["sessions"].as_array().unwrap().is_empty(),
+        "{listed}"
+    );
+    assert_eq!(
+        c.err("send_message", json!({"text": "again"})).await,
+        UNKNOWN_SESSION
+    );
+    assert_eq!(
+        c.err("session/close", json!({"session_id": sid})).await,
+        UNKNOWN_SESSION
+    );
+    // The server goes on: a new session opens, and closing it is not announced again.
+    let root = fx.root().to_string_lossy().into_owned();
+    let other = c.ok("session/new", json!({"root": root})).await["session_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    c.ok("session/close", json!({"session_id": other})).await;
+    c.ok("shutdown", json!({})).await;
+    c.finish().await;
+    assert!(
+        !c.events.iter().any(|(_, e)| e["type"] == "session/closed"),
+        "{:?}",
+        c.events
+    );
+    assert!(
+        c.raw.iter().filter(|l| l.contains("session/closed")).all(
+            |l| serde_json::from_str::<Value>(l).unwrap()
+                == json!({"jsonrpc": "2.0", "method": "session/closed",
+                          "params": {"session_id": sid}})
+        ),
+        "{:?}",
+        c.raw
+    );
+}
+
+#[tokio::test]
+async fn the_stop_future_ends_the_server_like_a_disconnect() {
+    let fx = Fx::new();
+    let (f, _) = factory(&fx, config(Mode::Ask), vec![write_then_done()], false);
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let server = Server::new(f, fx.workspaces(), fx.dir.path()).stop_on(async move {
+        let _ = stopped.await;
+    });
+    let mut c = Client::start(server);
+    let sid = c
+        .ok(
+            "initialize",
+            json!({"protocol": "1.0", "client": {"interactive": true}}),
+        )
+        .await["session_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    c.ok("send_message", json!({"text": "write it"})).await;
+    c.until_type(&sid, "tool_approval_requested").await;
+    // SIGTERM, say: the pending request is denied, the session drained, the server ends
+    // with the client's input still open.
+    stop.send(()).unwrap();
+    c.finish().await;
+    let events = std::mem::take(&mut c.events);
+    let finished = events_of(&events, &sid)
+        .find(|e| e["type"] == "tool_finished")
+        .unwrap_or_else(|| panic!("the call was never answered: {events:?}"));
+    assert_eq!(finished["is_error"], true, "{finished}");
+    assert!(!fx.exists("approved.txt"));
+    assert!(c.input.is_some());
+}
+
+#[tokio::test]
+async fn shutdown_does_not_wait_for_a_session_still_being_built() {
+    let fx = Fx::new();
+    let (f, _) = factory(&fx, config(Mode::Ask), vec![], false);
+    // A build that waits, as on a keychain dialog, until released (or the test ends).
+    let (release, gate) = std::sync::mpsc::channel::<()>();
+    let gate = Arc::new(std::sync::Mutex::new(gate));
+    let (entered_tx, entered) = std::sync::mpsc::channel::<()>();
+    let entered_tx = std::sync::Mutex::new(entered_tx);
+    let blocking: EngineFactory = Arc::new(move |spec| {
+        let _ = entered_tx.lock().unwrap().send(());
+        let _ = gate.lock().unwrap().recv();
+        f(spec)
+    });
+    let mut c = Client::start(Server::new(blocking, fx.workspaces(), fx.dir.path()));
+    c.ok("initialize", json!({"session": false})).await;
+    let root = fx.root().to_string_lossy().into_owned();
+    let new_id = c.request("session/new", json!({"root": root})).await;
+    let deadline = tokio::time::Instant::now() + WAIT;
+    while entered.try_recv().is_err() {
+        assert!(tokio::time::Instant::now() < deadline, "never built");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let shutdown_id = c.request("shutdown", json!({})).await;
+    let quick = Duration::from_secs(5);
+    let mut answers = Vec::new();
+    tokio::time::timeout(quick, async {
+        while let Some(msg) = c.read().await {
+            answers.push(msg);
+        }
+    })
+    .await
+    .expect("shutdown waited for the session being built");
+    tokio::time::timeout(quick, &mut c.server)
+        .await
+        .expect("the server did not stop")
+        .unwrap()
+        .unwrap();
+    let answer = |id: &Value| answers.iter().find(|m| &m["id"] == id).cloned();
+    assert_eq!(
+        answer(&shutdown_id).expect("shutdown unanswered")["result"],
+        Value::Null
+    );
+    if let Some(resp) = answer(&new_id) {
+        assert!(resp["error"]["code"].is_i64(), "{resp}");
+    }
+    // The build finishes later; its session is shut down on its own.
+    release.send(()).unwrap();
+}
+
+#[tokio::test]
+async fn prebuilt_engine_refuses_no_default_session() {
+    // `session: false` would leave the prebuilt session unserved: refused.
+    let fx = Fx::new();
+    let mock = MockProvider::new(vec![]);
+    let (engine, events) = fx.build(fx.builder(config(Mode::Ask), &mock));
+    let mut c =
+        Client::spawn(move |input, output| tokio::spawn(serve(engine, events, input, output)));
+    assert_eq!(
+        c.err("initialize", json!({"session": false})).await,
+        INVALID_PARAMS
+    );
+    c.ok("initialize", json!({})).await;
+    c.disconnect().await;
+}
+
+#[tokio::test]
+async fn prebuilt_engine_is_shut_down_without_initialize() {
+    // A client that leaves before `initialize`: the session is still shut down, and done
+    // with by the time `serve` returns (its log is free to resume at once).
+    let fx = Fx::new();
+    let mock = MockProvider::new(vec![]);
+    let (engine, events) = fx.build(fx.builder(config(Mode::Ask), &mock));
+    let id = engine.session_id().to_string();
+    let mut c =
+        Client::spawn(move |input, output| tokio::spawn(serve(engine, events, input, output)));
+    c.disconnect().await;
+    let resumed = EngineBuilder {
+        resume: Some(id.clone()),
+        ..fx.builder(config(Mode::Ask), &mock)
+    }
+    .build();
+    let (engine, mut events) = resumed.unwrap_or_else(|e| panic!("still in use: {e}"));
+    engine.send(Command::Shutdown).await.unwrap();
+    drop(engine);
+    while events.recv().await.is_some() {}
+}
+
+#[tokio::test]
+async fn semver_style_protocol_versions_are_accepted() {
+    let fx = Fx::new();
+    let mut c = single(&fx, config(Mode::Ask), MockProvider::new(vec![]));
+    let result = c.ok("initialize", json!({"protocol": "1.0.0"})).await;
+    assert_eq!(result["protocol"], "1.0");
     c.ok("shutdown", json!({})).await;
     c.finish().await;
 }

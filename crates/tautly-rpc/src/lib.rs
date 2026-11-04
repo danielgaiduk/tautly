@@ -7,7 +7,7 @@ pub mod jsonrpc;
 pub mod oneshot;
 pub mod server;
 
-pub use oneshot::{OutputFormat, exit_code, run_oneshot};
+pub use oneshot::{OutputFormat, exit_code, run_oneshot, run_oneshot_to};
 pub use server::{EngineFactory, FactoryError, Server, SessionSpec, command_for, serve};
 
 /// What ends a server with an error.

@@ -16,4 +16,7 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace
+      # The `tautly` binary end to end on a scripted provider (`--mock-script`).
+      - run: cargo test -p tautly-cli --features mock
       - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo clippy -p tautly-cli --all-targets --features mock -- -D warnings

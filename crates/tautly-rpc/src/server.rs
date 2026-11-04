@@ -4,15 +4,16 @@
 //! # Methods
 //!
 //! - `initialize {protocol?, client?: {interactive, name, version}, session?}` must come
-//!   first. It refuses a protocol whose major version is not 1 and returns
-//!   `{protocol: "1.0", session_id}`. The session is the *default session*, opened on the
-//!   server's root (resuming the session the server was told to); `session: false` opens
-//!   none (`session_id: null`), for clients that open their own. With
-//!   `client.interactive: true`, every session of the connection asks: `ask` emits
-//!   `ToolApprovalRequested{request_id}` and waits for `approve`/`deny`, memory proposals
-//!   wait for `approve_memory`/`reject_memory`. Otherwise the headless rules apply (`ask`
-//!   resolves to deny, proposals are rejected unless the session's configuration
-//!   approves them), and nothing ever waits for input.
+//!   first. It refuses a protocol whose major version is not 1 (`"1"`, `"1.4"` and
+//!   `"1.0.3"` are all 1) and returns `{protocol: "1.0", session_id}`. The session is the
+//!   *default session*, opened on the server's root (resuming the session the server was
+//!   told to); `session: false` opens none (`session_id: null`), for clients that open
+//!   their own (refused by the single-session form). With `client.interactive: true`,
+//!   every session of the connection asks: `ask` emits `ToolApprovalRequested{request_id}`
+//!   and waits for `approve`/`deny`, memory proposals wait for
+//!   `approve_memory`/`reject_memory`. Otherwise the headless rules apply (`ask` resolves
+//!   to deny, proposals are rejected unless the session's configuration approves them),
+//!   and nothing ever waits for input.
 //! - The engine commands, by their wire names, with the command's fields as params:
 //!   `send_message`, `approve`, `deny`, `cancel`, `set_budget`, `compact`, `uncompact`,
 //!   `pin`, `unpin`, `approve_memory`, `reject_memory`, `consolidate_memory`, `fork`,
@@ -29,19 +30,25 @@
 //! - `shutdown` shuts every session down, answers `null` once their events are out, and
 //!   ends the server.
 //!
-//! Pending approval requests are denied when a session shuts down, so a client that sends
-//! `shutdown` or disconnects (end of input) leaves nothing waiting. A session that forks
-//! (`fork`) announces the branch with `session_changed` under its old id and goes by the
-//! branch's id afterwards.
+//! A session that stops by itself (a signal, a crash) is taken out of the server after its
+//! last event and announced with a `session/closed {session_id}` notification. Pending
+//! approval requests are denied when a session shuts down, so a client that sends
+//! `shutdown` or disconnects (end of input), or a stop future that fires
+//! ([`Server::stop_on`]), leaves nothing waiting. A session that forks (`fork`) announces
+//! the branch with `session_changed` under its old id and goes by the branch's id
+//! afterwards; the old id stays an alias of it until it closes, so a command sent with it
+//! right after `fork` reaches the session whether or not the move has been seen.
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use serde_json::{Value, json};
 use tautly_core::{Command, Engine, Event, PROTOCOL_VERSION, Workspace, Workspaces};
 use tokio::io::{AsyncBufRead, AsyncWrite, AsyncWriteExt};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::{JoinHandle, JoinSet};
 
 use crate::RpcError;
@@ -132,6 +139,7 @@ pub async fn serve(
         resume: None,
         start_commands: Vec::new(),
         prebuilt: Some((engine, events)),
+        stop: None,
     }
     .serve(stdin, stdout)
     .await
@@ -144,6 +152,7 @@ pub struct Server {
     resume: Option<String>,
     start_commands: Vec<Command>,
     prebuilt: Option<(Engine, mpsc::Receiver<Event>)>,
+    stop: Option<Pin<Box<dyn Future<Output = ()> + Send>>>,
 }
 
 impl Server {
@@ -156,6 +165,7 @@ impl Server {
             resume: None,
             start_commands: Vec::new(),
             prebuilt: None,
+            stop: None,
         }
     }
 
@@ -171,8 +181,17 @@ impl Server {
         self
     }
 
-    /// Serve until `shutdown` or the end of `input` (a disconnect); every session is shut
-    /// down (its pending approvals denied) and its events written before this returns.
+    /// Stop serving when `stop` completes, as on a disconnect (`tautly --rpc`: SIGTERM,
+    /// SIGHUP).
+    pub fn stop_on(mut self, stop: impl Future<Output = ()> + Send + 'static) -> Server {
+        self.stop = Some(Box::pin(stop));
+        self
+    }
+
+    /// Serve until `shutdown`, the end of `input` (a disconnect) or the stop future; every
+    /// session is shut down (its pending approvals denied) and its events written before
+    /// this returns (a session still being built is not waited for: it is shut down
+    /// whenever its build ends).
     /// An error only when `input` cannot be read (the sessions are shut down all the same).
     pub async fn serve(
         self,
@@ -181,12 +200,16 @@ impl Server {
     ) -> Result<(), RpcError> {
         let (out, lines) = mpsc::channel(OUTPUT_CAPACITY);
         let mut writer = tokio::spawn(write_lines(lines, output));
+        let mut stop = self
+            .stop
+            .unwrap_or_else(|| Box::pin(std::future::pending()));
         let mut conn = Conn {
             shared: Arc::new(Shared {
                 factory: self.factory,
                 start_commands: self.start_commands,
                 out,
                 state: Mutex::default(),
+                closed: watch::Sender::new(false),
             }),
             root: self.root,
             resume: self.resume,
@@ -206,6 +229,7 @@ impl Server {
                     writer_done = true;
                     break;
                 }
+                () = &mut stop => break,
             };
             match read {
                 Ok(Line::Eof) => break,
@@ -227,9 +251,7 @@ impl Server {
                         continue;
                     }
                     match jsonrpc::parse(&line) {
-                        Err((id, err)) => {
-                            conn.shared.send(jsonrpc::error_response(&id, &err)).await;
-                        }
+                        Err((id, err)) => conn.shared.reply(id.as_ref(), Err(err)).await,
                         Ok(msg) => {
                             if conn.handle(msg).await == Flow::Stop {
                                 break;
@@ -260,12 +282,15 @@ struct Shared {
     start_commands: Vec<Command>,
     out: mpsc::Sender<String>,
     state: Mutex<State>,
+    /// Set once the server closes: a build still running is no longer waited for.
+    closed: watch::Sender<bool>,
 }
 
 #[derive(Default)]
 struct State {
     sessions: HashMap<u64, Slot>,
-    /// Current session id to slot.
+    /// Session ids to slots: each session's current id, and the ids it had before a fork
+    /// (aliases until it closes, unless a later session takes the id).
     ids: HashMap<String, u64>,
     default: Option<u64>,
     next: u64,
@@ -303,7 +328,9 @@ impl Shared {
     }
 
     /// Open a session (on the blocking pool) and hand it the start commands. Returns the
-    /// engine, its events and the root of its work tree.
+    /// engine, its events and the root of its work tree. If the server closes before the
+    /// build ends (it may wait on a keychain dialog), it is not waited for: an error is
+    /// returned, and the session is shut down whenever the build finishes.
     async fn open(
         &self,
         root: PathBuf,
@@ -316,7 +343,7 @@ impl Shared {
                 "this server serves one session and cannot open others",
             ));
         };
-        let opened = tokio::task::spawn_blocking(move || -> Result<_, FactoryError> {
+        let mut build = tokio::task::spawn_blocking(move || -> Result<_, FactoryError> {
             let workspace = workspaces.get(&root)?;
             let session_root = workspace.root().to_path_buf();
             let (engine, events) = factory(SessionSpec {
@@ -326,8 +353,19 @@ impl Shared {
                 workspace,
             })?;
             Ok((engine, events, session_root))
-        })
-        .await
+        });
+        let mut closed = self.closed.subscribe();
+        let opened = tokio::select! {
+            joined = &mut build => joined,
+            _ = closed.wait_for(|closed| *closed) => {
+                tokio::spawn(async move {
+                    if let Ok(Ok((engine, events, _))) = build.await {
+                        shut_down(engine, events).await;
+                    }
+                });
+                return Err(Error::new(SESSION_FAILED, "the server is shutting down"));
+            }
+        }
         .map_err(|e| Error::new(SESSION_FAILED, format!("cannot open the session: {e}")))?;
         let (engine, events, root) = opened
             .map_err(|e| Error::new(SESSION_FAILED, format!("cannot open the session: {e}")))?;
@@ -410,18 +448,26 @@ impl Shared {
         Ok(Arc::clone(&st.sessions[&key].engine))
     }
 
-    /// Take session `id` out of the server (it can no longer be addressed).
+    /// Take session `id` (its current id or an alias) out of the server: none of its ids
+    /// can be addressed any more.
     fn remove(&self, id: &str) -> Option<Slot> {
+        let key = *self.lock().ids.get(id)?;
+        self.remove_key(key)
+    }
+
+    fn remove_key(&self, key: u64) -> Option<Slot> {
         let mut st = self.lock();
-        let key = st.ids.remove(id)?;
+        let slot = st.sessions.remove(&key)?;
+        st.ids.retain(|_, k| *k != key);
         if st.default == Some(key) {
             st.default = None;
         }
-        st.sessions.remove(&key)
+        Some(slot)
     }
 
     /// Stop new sessions and take every open one out.
     fn remove_all(&self) -> Vec<Slot> {
+        self.closed.send_replace(true);
         let mut st = self.lock();
         st.closing = true;
         st.ids.clear();
@@ -431,16 +477,18 @@ impl Shared {
         slots.into_iter().map(|(_, slot)| slot).collect()
     }
 
-    /// A session forked: it goes by `new` from now on.
-    fn renamed(&self, key: u64, old: &str, new: &str) {
+    /// A session forked: it goes by `new` from now on, and its old id stays an alias.
+    fn renamed(&self, key: u64, new: &str) {
         let mut st = self.lock();
-        if st.ids.get(old) == Some(&key) {
-            st.ids.remove(old);
-        }
         if let Some(slot) = st.sessions.get_mut(&key) {
             slot.id = new.to_string();
             st.ids.insert(new.to_string(), key);
         }
+    }
+
+    /// Whether a session open here goes by `id` now (aliases aside).
+    fn is_open(&self, id: &str) -> bool {
+        self.lock().sessions.values().any(|s| s.id == id)
     }
 }
 
@@ -466,7 +514,9 @@ async fn shut_down(engine: Engine, mut events: mpsc::Receiver<Event>) {
 /// Write session `key`'s events as notifications, once `go` fires (or is dropped), until
 /// its event stream ends. A `session_changed` naming another id (a fork) is sent under the
 /// old id; later events carry the new one. If the output is gone, events are still read
-/// (and dropped), so the session never waits on a client that left.
+/// (and dropped), so the session never waits on a client that left. A session whose
+/// stream ends while it is still open here (it stopped by itself: a signal, a crash) is
+/// taken out and announced with `session/closed {session_id}`, after its last event.
 async fn forward(
     shared: Arc<Shared>,
     key: u64,
@@ -482,7 +532,15 @@ async fn forward(
             Some(ev) => ev,
             None => match events.recv().await {
                 Some(ev) => ev,
-                None => return,
+                None => {
+                    if shared.remove_key(key).is_some() {
+                        let params = json!({ "session_id": id });
+                        shared
+                            .send(jsonrpc::notification("session/closed", params))
+                            .await;
+                    }
+                    return;
+                }
             },
         };
         let renamed = match &ev {
@@ -491,7 +549,7 @@ async fn forward(
         };
         // Routed by the new id before the client can learn it.
         if let Some(new) = &renamed {
-            shared.renamed(key, &id, new);
+            shared.renamed(key, new);
         }
         let event = serde_json::to_value(&ev).unwrap_or_else(
             |e| json!({"type": "warning", "message": format!("an event could not be sent: {e}")}),
@@ -641,6 +699,12 @@ impl Conn {
             Some(Value::Bool(b)) => *b,
             Some(_) => return Err(Error::new(INVALID_PARAMS, "`session` must be a boolean")),
         };
+        if !open_default && self.prebuilt.is_some() {
+            return Err(Error::new(
+                INVALID_PARAMS,
+                "this server serves one session: `session: false` would leave it unserved",
+            ));
+        }
         self.interactive = interactive;
         let version = format!("{}.{}", PROTOCOL_VERSION.0, PROTOCOL_VERSION.1);
         if !open_default {
@@ -674,18 +738,27 @@ impl Conn {
         Ok(Value::Null)
     }
 
-    /// Shut every session down and wait for the requests in flight (a session that
-    /// finishes opening meanwhile is shut down at once), until all their events are out.
+    /// Shut every session down, the prebuilt one too if it was never served, and wait
+    /// for the requests in flight (a session that finishes opening meanwhile is shut down
+    /// at once; a build still running is not waited for), until all their events are out.
     async fn close_all(&mut self) {
         let slots = self.shared.remove_all();
+        let prebuilt = self.prebuilt.take();
         let tasks = &mut self.tasks;
-        tokio::join!(close(slots), async {
-            while tasks.join_next().await.is_some() {}
-        });
+        tokio::join!(
+            close(slots),
+            async { while tasks.join_next().await.is_some() {} },
+            async {
+                if let Some((engine, events)) = prebuilt {
+                    shut_down(engine, events).await;
+                }
+            }
+        );
     }
 }
 
-/// `initialize`'s `protocol`: absent (this version), or `"<major>[.<minor>]"` with major 1.
+/// `initialize`'s `protocol`: absent (this version), or `"<major>[.<minor>[.<patch>]]"`
+/// with major 1 (minor and patch are not checked: minor versions are compatible).
 fn check_protocol(protocol: Option<&Value>) -> Result<(), Error> {
     let supported = format!("{}.{}", PROTOCOL_VERSION.0, PROTOCOL_VERSION.1);
     let refuse = |what: String| {
@@ -696,12 +769,14 @@ fn check_protocol(protocol: Option<&Value>) -> Result<(), Error> {
         Some(Value::String(s)) => s.as_str(),
         Some(other) => return refuse(format!("`protocol` must be a version string, not {other}")),
     };
-    let mut parts = text.split('.');
-    let major = parts.next().and_then(|m| m.parse::<u32>().ok());
-    let minor_ok = parts.next().is_none_or(|m| m.parse::<u32>().is_ok()) && parts.next().is_none();
+    let numbers: Option<Vec<u32>> = text.split('.').map(|p| p.parse::<u32>().ok()).collect();
+    let major = match numbers {
+        Some(n) if n.len() <= 3 => n.first().copied(),
+        _ => None,
+    };
     match major {
-        Some(major) if minor_ok && major == PROTOCOL_VERSION.0 => Ok(()),
-        Some(_) if minor_ok => refuse(format!(
+        Some(major) if major == PROTOCOL_VERSION.0 => Ok(()),
+        Some(_) => refuse(format!(
             "protocol {text} is not supported: this server speaks {supported}"
         )),
         _ => refuse(format!("`{text}` is not a protocol version")),
@@ -747,7 +822,7 @@ async fn session_new(
             Ok((json!({ "session_id": sid }), go))
         }
         (None, Some(fork)) => {
-            if shared.lock().ids.contains_key(&fork.session_id) {
+            if shared.is_open(&fork.session_id) {
                 return Err(Error::new(
                     SESSION_FAILED,
                     format!(
