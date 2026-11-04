@@ -2106,6 +2106,25 @@ async fn git_dir_with_linked_refs_or_objects_takes_no_checkpoint() {
                 link(r.path(".git/objects"), vgit.join("objects"));
             }),
         ),
+        // Review S2-M8: a session directory below `refs/tautly/checkpoints`, and
+        // `packed-refs` (git rewrites it through the link when deleting a ref).
+        (
+            "session dir",
+            Box::new(|r: &Repo| {
+                std::fs::create_dir_all(r.path(".git/refs/tautly/checkpoints")).unwrap();
+                link(
+                    r.path(".git/refs/tautly/checkpoints/old"),
+                    vgit.join("refs/tautly/checkpoints/old"),
+                );
+            }),
+        ),
+        (
+            "packed-refs",
+            Box::new(|r: &Repo| {
+                let _ = std::fs::remove_file(r.path(".git/packed-refs"));
+                link(r.path(".git/packed-refs"), vgit.join("packed-refs"));
+            }),
+        ),
     ];
     for (name, make) in layouts {
         let hostile = Repo::with(&[("a.txt", "a\n")]);

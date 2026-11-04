@@ -1918,18 +1918,23 @@ pub(crate) fn dot_git_is_link(root: &Path) -> bool {
 /// the root as the work tree, so neither the environment nor `core.worktree` can point git
 /// elsewhere.
 ///
-/// Nor when the common directory's `refs`, `refs/tautly`, `refs/tautly/checkpoints` or
-/// `objects` is a symbolic link: checkpoints would write (and prune) refs and objects in
-/// whatever repository it leads to. (`objects/info/alternates` is left alone: reading
-/// another repository's objects is how `clone --shared` works, and nothing is written
-/// there.)
+/// Nor when the common directory's `refs`, `refs/tautly`, `refs/tautly/checkpoints`, a
+/// session directory below it, `packed-refs` or `objects` is a symbolic link: checkpoints
+/// would write (and prune, or delete with a session) refs and objects in whatever
+/// repository it leads to; git rewrites `packed-refs` through a link when it deletes a
+/// ref. (`objects/info/alternates` is left alone: reading another repository's objects is
+/// how `clone --shared` works, and nothing is written there.)
 pub(crate) fn git_dir(root: &Path) -> Option<PathBuf> {
     let dirs = tautly_session::git_dirs_at(&root.join(".git"))?;
-    let linked = ["refs", "refs/tautly", "refs/tautly/checkpoints", "objects"]
+    let is_link = |p: &Path| std::fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_symlink());
+    let sessions = dirs.common_dir.join(REF_PREFIX);
+    let linked = ["refs", "refs/tautly", REF_PREFIX, "packed-refs", "objects"]
         .iter()
-        .any(|p| {
-            std::fs::symlink_metadata(dirs.common_dir.join(p))
-                .is_ok_and(|m| m.file_type().is_symlink())
+        .any(|p| is_link(&dirs.common_dir.join(p)))
+        || std::fs::read_dir(&sessions).is_ok_and(|entries| {
+            entries
+                .filter_map(Result::ok)
+                .any(|e| e.file_type().is_ok_and(|t| t.is_symlink()))
         });
     (!linked).then_some(dirs.git_dir)
 }
