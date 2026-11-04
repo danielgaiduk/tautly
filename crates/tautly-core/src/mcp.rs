@@ -102,33 +102,100 @@ impl McpSetup {
     }
 }
 
-/// Set in every stdio server's environment (review S2-I1): Python then writes and reads
-/// bytecode only below this private directory, never a repository `__pycache__`, whose
-/// hash-based `.pyc` files would otherwise run instead of the source the approval key
-/// covers.
+/// Set in every stdio server's environment (review S2-I1): a Python that honours it
+/// (3.8 and later, without `-E`/`-I`) then writes and reads bytecode only below this
+/// private directory, not a repository `__pycache__`, whose hash-based `.pyc` files
+/// would otherwise run instead of the source the approval key covers. The key also
+/// covers hash-based bytecode, and a command line that can drop the variable is never
+/// remembered (review S3-I1, `tautly_mcp::approvals`).
 const PYCACHE_VAR: &str = "PYTHONPYCACHEPREFIX";
 /// The private bytecode cache in the data home.
 const PYCACHE_DIR: &str = "mcp-pycache";
 
-/// `<data home>/mcp-pycache`, created owner-only (0700) when missing; a warning when it
-/// cannot be (Python then creates it, or caches nothing).
-fn private_pycache(data_home: &Path, events: &EventSink) -> PathBuf {
-    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+/// `<data home>/mcp-pycache`, created owner-only (0700) when missing. It is then checked
+/// (review S3-M2): a real directory (not a link, which is never followed), owned by the
+/// current user, mode 0700, outside the canonical `root`. Anything else gets one
+/// warning, and the run uses a fresh 0700 temporary directory instead, which lives as
+/// long as the returned guard.
+fn private_pycache(
+    data_home: &Path,
+    root: &Path,
+    events: &EventSink,
+) -> (PathBuf, Option<tempfile::TempDir>) {
+    use std::os::unix::fs::PermissionsExt;
     let dir = data_home.join(PYCACHE_DIR);
-    let made = std::fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(&dir)
-        .and_then(|()| std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)));
-    if let Err(e) = made {
-        events.try_emit(Event::Warning {
-            message: format!(
-                "the private Python bytecode cache {} could not be made: {e}",
-                dir.display()
-            ),
+    let problem = match check_private_pycache(&dir, root) {
+        Ok(()) => return (dir, None),
+        Err(problem) => problem,
+    };
+    let fresh = tempfile::Builder::new()
+        .prefix("tautly-mcp-pycache.")
+        .permissions(std::fs::Permissions::from_mode(0o700))
+        .tempdir()
+        .ok();
+    let instead = match &fresh {
+        Some(t) => format!("a temporary one, {}, serves this run", t.path().display()),
+        None => "no temporary directory could be made either, so Python servers use \
+                 their default bytecode cache"
+            .to_string(),
+    };
+    events.try_emit(Event::Warning {
+        message: format!(
+            "the private Python bytecode cache {} is not used: {problem}; {instead}",
+            dir.display()
+        ),
+    });
+    match fresh {
+        Some(t) => (t.path().to_path_buf(), Some(t)),
+        None => (dir, None),
+    }
+}
+
+/// Make `dir` (0700) when missing and check it (see [`private_pycache`]); the problem
+/// otherwise.
+fn check_private_pycache(dir: &Path, root: &Path) -> Result<(), String> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+    if dir.symlink_metadata().is_err() {
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)
+            .map_err(|e| format!("it could not be made: {e}"))?;
+    }
+    let meta = dir
+        .symlink_metadata()
+        .map_err(|e| format!("it cannot be read: {e}"))?;
+    if !meta.is_dir() {
+        return Err(if meta.file_type().is_symlink() {
+            "it is a symbolic link".to_string()
+        } else {
+            "it is not a directory".to_string()
         });
     }
-    dir
+    // SAFETY: `geteuid` takes no arguments and cannot fail.
+    let me = unsafe { libc::geteuid() };
+    if meta.uid() != me {
+        return Err(format!("it is owned by uid {}, not {me}", meta.uid()));
+    }
+    if meta.permissions().mode() & 0o777 != 0o700 {
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+            .map_err(|e| format!("its mode could not be set to 0700: {e}"))?;
+        let mode = dir.symlink_metadata().map_err(|e| e.to_string())?.mode() & 0o777;
+        if mode != 0o700 {
+            return Err(format!("its mode is {mode:o}, not 0700"));
+        }
+    }
+    let canonical = dir
+        .canonicalize()
+        .map_err(|e| format!("it cannot be resolved: {e}"))?;
+    let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    if canonical.starts_with(&root) {
+        return Err(format!(
+            "it lies inside the workspace {}, which the servers' own code can write",
+            root.display()
+        ));
+    }
+    Ok(())
 }
 
 /// The default provider key variables plus every configured `api_key_env`: stripped from
@@ -360,6 +427,9 @@ pub(crate) struct McpSession {
     /// The statuses the client has been sent; any other is sent at the next turn start.
     told: Arc<Mutex<Told>>,
     tasks: Vec<JoinHandle<()>>,
+    /// The per-run bytecode cache directory, when the data home's could not be used
+    /// (removed with the session).
+    _pycache: Option<tempfile::TempDir>,
 }
 
 impl Drop for McpSession {
@@ -420,7 +490,7 @@ impl McpSession {
                 events.try_emit(Event::Warning {
                     message: format!(
                         "MCP server `{}` sets {PYCACHE_VAR}; tautly replaces it with its own \
-                         private bytecode cache, so a repository `__pycache__` is never read",
+                         private bytecode cache, so a repository `__pycache__` is not read",
                         printable(&s.name)
                     ),
                 });
@@ -441,7 +511,7 @@ impl McpSession {
             }
         }
 
-        let pycache = private_pycache(&setup.data_home, &events);
+        let (pycache, pycache_tmp) = private_pycache(&setup.data_home, &root, &events);
         let hub = Arc::new(
             McpHub::start_with_env(
                 start,
@@ -463,6 +533,7 @@ impl McpSession {
             pending: Arc::default(),
             told: Arc::clone(&told),
             tasks: vec![tokio::spawn(report(Arc::clone(&hub), events.clone(), told))],
+            _pycache: pycache_tmp,
         };
         for (name, source) in skip {
             hub.note(
@@ -486,7 +557,8 @@ impl McpSession {
             if !rememberable {
                 launch.push_str(
                     " (approved for this run only: a file its command line names cannot be \
-                     hashed)",
+                     hashed, or the command line can switch the private bytecode cache \
+                     off)",
                 );
             }
             owner

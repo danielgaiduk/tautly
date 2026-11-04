@@ -884,7 +884,7 @@ impl McpHub {
 
     /// [`McpHub::start`], with `set_env` set in every stdio server's environment over the
     /// server's own `env` (the engine sets `PYTHONPYCACHEPREFIX` to a private directory,
-    /// so a Python server never reads the repository's `__pycache__`).
+    /// so a Python server that honours it does not read the repository's `__pycache__`).
     pub async fn start_with_env(
         servers: Vec<(String, ServerSpec, ServerSource)>,
         sb: Arc<dyn Sandbox>,

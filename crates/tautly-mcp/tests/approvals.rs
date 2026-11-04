@@ -3,7 +3,7 @@
 
 use std::collections::BTreeMap;
 use std::os::unix::fs::PermissionsExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use tautly_mcp::approvals::key;
 use tautly_mcp::{APPROVALS_FILE, ApprovalStore, ServerSpec};
@@ -380,7 +380,7 @@ fn launch_shapes_key_the_code_they_run() {
         ("bin/srv.js", stdio("node", &["--import=./bin/srv.js"], &[])),
         // Review S2-M1: combined option letters ending in `m`, and parent packages.
         ("tool.py", stdio("python3", &["-um", "tool"], &[])),
-        ("tool.py", stdio("python3", &["-Im", "tool"], &[])),
+        ("tool.py", stdio("python3", &["-Pm", "tool"], &[])),
         ("tool.py", stdio("python3", &["-umtool"], &[])),
         ("pq/__init__.py", stdio("python3", &["-m", "pq.sub"], &[])),
         (
@@ -403,7 +403,34 @@ fn launch_shapes_key_the_code_they_run() {
         ("bunfig.toml", stdio("bun", &["run", "mcp"], &[])),
         (".cargo/config.toml", stdio("cargo", &["run"], &[])),
         ("deno.jsonc", stdio("deno", &["task", "mcp"], &[])),
+        // Review S3-M1: `-m` inside one shell word takes the next token of that word.
+        ("tool.py", stdio("sh", &["-c", "python3 -m tool"], &[])),
+        ("tool.py", stdio("sh", &["-c", "python3 -um tool"], &[])),
+        (
+            "pkg/__main__.py",
+            stdio("sh", &["-c", "exec python3 -O -m pkg"], &[]),
+        ),
+        // Review S3-M3: a variable's value names files like an argv word does.
+        (
+            "x.js",
+            stdio(
+                "node",
+                &["server.js"],
+                &[("NODE_OPTIONS", "--require ./x.js")],
+            ),
+        ),
+        (
+            "sitecustomize.py",
+            stdio("python3", &["-m", "pkg"], &[("PYTHONPATH", ".")]),
+        ),
+        (
+            "vendor/py/lib/site.py",
+            stdio("python3", &["-m", "pkg"], &[("PYTHONHOME", "vendor/py")]),
+        ),
     ];
+    // Review S3-I1: argv that can switch the private bytecode cache off (`-E`, `-Em`,
+    // `-sE`, `exec python3 -E` in a shell word) is never remembered, so no key of it is
+    // stable: see `argv_that_can_drop_the_bytecode_prefix_is_never_remembered`.
     for (file, spec) in &cases {
         write(file, "v1");
         let before = k(spec);
@@ -416,7 +443,8 @@ fn launch_shapes_key_the_code_they_run() {
         );
     }
 
-    // A directory's skipped parts (and tautly's own scratch output) do not count.
+    // A directory's skipped parts (and tautly's own scratch output) do not count; nor
+    // does the timestamp-checked bytecode Python itself writes to a `__pycache__`.
     let spec = stdio("node", &["."], &[]);
     let before = k(&spec);
     for skipped in [
@@ -424,12 +452,30 @@ fn launch_shapes_key_the_code_they_run() {
         "node_modules/x/index.js",
         "target/debug/x",
         ".venv/lib/x.py",
-        "pkg/__pycache__/x.pyc",
         ".tautly/tmp/spill/0123.txt",
     ] {
         write(skipped, "changes every run");
         assert_eq!(before, k(&spec), "{skipped}");
     }
+    write_pyc(
+        &repo,
+        "pkg/__pycache__/x.cpython-39.pyc",
+        0,
+        b"timestamp v1",
+    );
+    assert_eq!(before, k(&spec), "a timestamp pyc");
+    write_pyc(
+        &repo,
+        "pkg/__pycache__/x.cpython-39.pyc",
+        0,
+        b"timestamp v2",
+    );
+    assert_eq!(before, k(&spec), "a rewritten timestamp pyc");
+    write(
+        "pkg/__pycache__/notes.txt",
+        "not bytecode, which Python never reads here",
+    );
+    assert_eq!(before, k(&spec), "a non-pyc file in a cache");
     // A directory over the bounds can never be remembered: it asks at every start.
     write("dist/huge.bin", &"x".repeat(1024 * 1024 + 1));
     let spec = stdio("node", &["dist"], &[]);
@@ -455,4 +501,190 @@ fn launch_shapes_key_the_code_they_run() {
     std::os::unix::fs::symlink("evil.js", repo.join("dist/lib.js")).unwrap();
     write("dist/m\nm", "same");
     assert_ne!(a, k(&spec));
+}
+
+/// A `.pyc` at `rel` below `repo` with the given flags word (0: timestamp-checked, as
+/// Python writes them; non-zero: hash-based, which only a tool writes) and some body.
+fn write_pyc(repo: &Path, rel: &str, flags: u32, body: &[u8]) {
+    let p = repo.join(rel);
+    std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+    let mut bytes = vec![0x61, 0x0d, 0x0d, 0x0a]; // a CPython magic number
+    bytes.extend_from_slice(&flags.to_le_bytes());
+    bytes.extend_from_slice(&[0; 8]); // mtime and size, or the source hash
+    bytes.extend_from_slice(body);
+    std::fs::write(p, bytes).unwrap();
+}
+
+/// Review S3-I1 (a): hash-based bytecode in a `__pycache__` is keyed, for the module a
+/// `-m` names, for its parent packages and in every directory walked; the timestamp
+/// bytecode Python writes is not, so its own cache does not ask again.
+#[test]
+fn hash_based_bytecode_is_keyed() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().canonicalize().unwrap();
+    let write = |rel: &str, text: &str| {
+        let p = repo.join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, text).unwrap();
+    };
+    let k = |spec: &ServerSpec| key(&repo, "s", spec);
+    write("pkg/__init__.py", "");
+    write("pkg/__main__.py", "print('BENIGN')");
+    write("tool.py", "print('BENIGN')");
+    write("pq/__init__.py", "");
+    write("pq/sub.py", "print('BENIGN')");
+    write("app/index.js", "// v1");
+    let cases: Vec<(&str, ServerSpec)> = vec![
+        // The module run, in a package and at the top level.
+        (
+            "pkg/__pycache__/__main__.cpython-313.pyc",
+            stdio("python3", &["-m", "pkg"], &[]),
+        ),
+        (
+            "__pycache__/tool.cpython-313.pyc",
+            stdio("python3", &["-m", "tool"], &[]),
+        ),
+        // The parent package's `__init__`, which runs first.
+        (
+            "pq/__pycache__/__init__.cpython-313.pyc",
+            stdio("python3", &["-m", "pq.sub"], &[]),
+        ),
+        // An optimized variant, and a `-m` inside a shell word.
+        (
+            "pkg/__pycache__/__main__.cpython-313.opt-1.pyc",
+            stdio("sh", &["-c", "exec python3 -O -m pkg"], &[]),
+        ),
+        // Below a named directory.
+        (
+            "app/lib/__pycache__/x.cpython-313.pyc",
+            stdio("node", &["app"], &[]),
+        ),
+    ];
+    for (pyc, spec) in &cases {
+        let before = k(spec);
+        assert_eq!(before, k(spec), "{pyc}: stable");
+        // Python's own cache: not keyed, however it changes.
+        write_pyc(&repo, pyc, 0, b"timestamp v1");
+        assert_eq!(before, k(spec), "{pyc}: a timestamp pyc");
+        write_pyc(&repo, pyc, 0, b"timestamp v2");
+        assert_eq!(before, k(spec), "{pyc}: a rewritten timestamp pyc");
+        // Hash-based (checked, 3, or unchecked, 1): keyed, like the source.
+        write_pyc(&repo, pyc, 1, b"unchecked v1");
+        let unchecked = k(spec);
+        assert_ne!(before, unchecked, "{pyc}: an unchecked-hash pyc asks again");
+        assert_eq!(unchecked, k(spec), "{pyc}: stable with the pyc");
+        write_pyc(&repo, pyc, 1, b"unchecked v2");
+        assert_ne!(unchecked, k(spec), "{pyc}: a rewritten unchecked-hash pyc");
+        write_pyc(&repo, pyc, 3, b"checked v1");
+        assert_ne!(before, k(spec), "{pyc}: a checked-hash pyc asks again");
+        std::fs::remove_file(repo.join(pyc)).unwrap();
+        assert_eq!(before, k(spec), "{pyc}: removed");
+    }
+    // Hash-based bytecode reached through a link counts (Python reads it); a dangling
+    // link, which an import passes over, adds nothing.
+    let spec = stdio("python3", &["-m", "pkg"], &[]);
+    let before = k(&spec);
+    let link = repo.join("pkg/__pycache__/__main__.cpython-313.pyc");
+    std::os::unix::fs::symlink("../../elsewhere.bin", &link).unwrap();
+    assert_eq!(before, k(&spec), "a dangling link");
+    write_pyc(&repo, "elsewhere.bin", 1, b"unchecked, via a link");
+    assert_ne!(before, k(&spec), "an unchecked-hash pyc through a link");
+    std::fs::remove_file(&link).unwrap();
+    assert_eq!(before, k(&spec));
+    // Every case above may be remembered: no bound was hit.
+    for (_, spec) in &cases {
+        assert!(tautly_mcp::approvals::approval_key(&repo, "s", spec).rememberable);
+    }
+}
+
+/// Review S3-I1 (b): a command line that can drop the forced `PYTHONPYCACHEPREFIX` in
+/// the server (Python's `-E`/`-I`, `env -i`/`-u`, `unset`, or naming the variable) is
+/// never remembered: the key matches nothing stored, and asks at every start.
+#[test]
+fn argv_that_can_drop_the_bytecode_prefix_is_never_remembered() {
+    use tautly_mcp::approvals::approval_key;
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().canonicalize().unwrap();
+    let never: Vec<ServerSpec> = vec![
+        stdio("python3", &["-E", "-m", "pkg"], &[]),
+        stdio("python3", &["-Em", "pkg"], &[]),
+        stdio("python3", &["-sE", "-m", "pkg"], &[]),
+        stdio("python3", &["-I", "-m", "pkg"], &[]),
+        stdio("python3", &["-Im", "pkg"], &[]),
+        stdio("python", &["-E", "server.py"], &[]),
+        stdio("sh", &["-c", "exec python3 -E -m pkg"], &[]),
+        stdio(
+            "/usr/bin/env",
+            &["-u", "PYTHONPYCACHEPREFIX", "python3", "-m", "pkg"],
+            &[],
+        ),
+        stdio("env", &["-i", "python3", "-m", "pkg"], &[]),
+        stdio("env", &["-iS", "python3 -m pkg"], &[]),
+        stdio(
+            "env",
+            &["--ignore-environment", "python3", "-m", "pkg"],
+            &[],
+        ),
+        stdio(
+            "env",
+            &["--unset=PYTHONPYCACHEPREFIX", "python3", "-m", "pkg"],
+            &[],
+        ),
+        stdio(
+            "sh",
+            &["-c", "env -u PYTHONPYCACHEPREFIX python3 -m pkg"],
+            &[],
+        ),
+        stdio(
+            "sh",
+            &["-c", "unset PYTHONPYCACHEPREFIX; exec python3 -m pkg"],
+            &[],
+        ),
+        stdio(
+            "sh",
+            &["-c", "PYTHONPYCACHEPREFIX= exec python3 -m pkg"],
+            &[],
+        ),
+        stdio(
+            "env",
+            &["PYTHONPYCACHEPREFIX=/tmp/x", "python3", "-m", "pkg"],
+            &[],
+        ),
+    ];
+    for spec in &never {
+        let k = approval_key(&repo, "s", spec);
+        assert!(!k.rememberable, "{spec:?}");
+        assert_ne!(k.key, approval_key(&repo, "s", spec).key, "{spec:?}");
+    }
+    // Ordinary command lines, including Python's other flags, `-i` and `-u` where no
+    // `env` runs, and variables of other names, are remembered.
+    let remembered: Vec<ServerSpec> = vec![
+        stdio("python3", &["-m", "pkg"], &[]),
+        stdio("python3", &["-u", "-m", "pkg"], &[]),
+        stdio("python3", &["-um", "pkg"], &[]),
+        stdio("python3", &["-i", "server.py"], &[]),
+        stdio("python3", &["-X", "dev", "-m", "pkg"], &[]),
+        stdio("python3", &["--version"], &[]),
+        stdio("env", &["FOO=bar", "python3", "-m", "pkg"], &[]),
+        stdio(
+            "env",
+            &["PYTHONUNBUFFERED=1", "python3", "-u", "-m", "pkg"],
+            &[],
+        ),
+        stdio("env", &["-S", "python3 -u -m pkg"], &[]),
+        stdio("sh", &["-c", "exec python3 -m pkg"], &[]),
+        stdio(
+            "sh",
+            &["-c", "exec python3 -c 'import srv; srv.main()'"],
+            &[],
+        ),
+        stdio("sh", &["-c", "exec python3 -u -i server.py"], &[]),
+        stdio("node", &["-e", "1"], &[]),
+        stdio("node", &["--env-file=.env", "server.js"], &[]),
+    ];
+    for spec in &remembered {
+        let k = approval_key(&repo, "s", spec);
+        assert!(k.rememberable, "{spec:?}");
+        assert_eq!(k.key, approval_key(&repo, "s", spec).key, "{spec:?}");
+    }
 }

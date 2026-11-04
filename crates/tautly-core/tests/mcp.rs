@@ -300,6 +300,9 @@ async fn repo_server_not_spawned_without_approval() {
     let (cfg, _) = fx.loaded(Mode::Ask);
     assert!(cfg.mcp.servers.is_empty());
     assert!(cfg.project_mcp_servers.contains_key("echo"));
+    // The key as planned: the pid file, which a variable's value names inside the root,
+    // does not exist yet (once the server writes it, the key changes: review S3-M3).
+    let k = key(&fx.root(), "echo", &cfg.project_mcp_servers["echo"]);
     let mock = MockProvider::new(vec![]);
     let mut run = start(EngineBuilder {
         interactive: true,
@@ -331,7 +334,6 @@ async fn repo_server_not_spawned_without_approval() {
     run.until_state("echo", McpState::Ready).await;
     let started = pids(&pid_file);
     assert_eq!(started.len(), 2);
-    let k = key(&fx.root(), "echo", &cfg.project_mcp_servers["echo"]);
     assert!(fx.approvals().is_approved(&k));
 
     // Shutdown kills the server and its process group.
@@ -1053,6 +1055,16 @@ async fn changed_env_value_asks_again() {
     run.shutdown().await;
 }
 
+/// The `PYTHONPYCACHEPREFIX` a server saw, from the environment it dumped to `seen`
+/// (the command line must not name the variable: such a server is never remembered).
+fn pycache_prefix_seen(seen: &Path) -> String {
+    let dump = std::fs::read_to_string(seen).unwrap();
+    dump.lines()
+        .find_map(|l| l.strip_prefix("PYTHONPYCACHEPREFIX="))
+        .unwrap_or_else(|| panic!("no PYTHONPYCACHEPREFIX in {dump}"))
+        .to_string()
+}
+
 /// Review S2-I1: every stdio server runs with `PYTHONPYCACHEPREFIX` set to a private
 /// directory in the data home (0700), so a Python server never loads a bytecode file the
 /// repository put in a `__pycache__` the approval key does not cover. A server that sets
@@ -1068,7 +1080,7 @@ async fn stdio_servers_get_a_private_pycache_prefix() {
             "[mcp.servers.echo]\ncommand = \"/bin/sh\"\nargs = [\"-c\", {}]\n\
              env = {{ PYTHONPYCACHEPREFIX = \"repo-cache\" }}\n",
             toml_str(&format!(
-                "printenv PYTHONPYCACHEPREFIX > '{}'; exec '{}' stdio",
+                "env > '{}'; exec '{}' stdio",
                 seen.display(),
                 fixture()
             ))
@@ -1090,10 +1102,64 @@ async fn stdio_servers_get_a_private_pycache_prefix() {
         .collect();
     assert_eq!(warned.len(), 1, "{events:?}");
     let private = fx.home.path().join("mcp-pycache");
-    let got = std::fs::read_to_string(&seen).unwrap();
-    assert_eq!(got.trim(), private.to_str().unwrap());
+    assert_eq!(pycache_prefix_seen(&seen), private.to_str().unwrap());
     let mode = std::fs::metadata(&private).unwrap().permissions().mode();
     assert_eq!(mode & 0o777, 0o700, "{mode:o}");
+}
+
+/// Review S3-M2: the private bytecode directory must be a real directory of the current
+/// user, mode 0700, outside the root. Here a link stands at its path: it is not followed
+/// (its target keeps its mode), a warning says so, and the server gets a fresh 0700
+/// directory for this run instead.
+#[tokio::test]
+async fn a_bad_private_pycache_dir_is_replaced_for_the_run() {
+    use std::os::unix::fs::PermissionsExt;
+    let fx = Fx::new();
+    let seen = fx.path("seen.txt");
+    let target = fx.path("elsewhere");
+    std::fs::create_dir_all(&target).unwrap();
+    std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let private = fx.home.path().join("mcp-pycache");
+    std::os::unix::fs::symlink(&target, &private).unwrap();
+    fx.write(
+        ".tautly/config.toml",
+        &format!(
+            "[mcp.servers.echo]\ncommand = \"/bin/sh\"\nargs = [\"-c\", {}]\n",
+            toml_str(&format!(
+                "env > '{}'; exec '{}' stdio",
+                seen.display(),
+                fixture()
+            ))
+        ),
+    );
+    let (cfg, _) = fx.loaded(Mode::Ask);
+    let k = key(&fx.root(), "echo", &cfg.project_mcp_servers["echo"]);
+    fx.approvals().approve(&k, &fx.root(), "echo").unwrap();
+    let mock = MockProvider::new(vec![]);
+    let mut run = start(fx.builder(cfg, &mock));
+    let events = run.until_state("echo", McpState::Ready).await;
+    let got = PathBuf::from(pycache_prefix_seen(&seen));
+    let warned: Vec<&String> = events
+        .iter()
+        .filter_map(|e| match e {
+            Event::Warning { message } if message.contains("bytecode cache") => Some(message),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(warned.len(), 1, "{events:?}");
+    assert_ne!(got, private, "{got:?}");
+    assert_ne!(got, target.canonicalize().unwrap(), "{got:?}");
+    let meta = got.symlink_metadata().unwrap();
+    assert!(meta.is_dir(), "{got:?}");
+    assert_eq!(meta.permissions().mode() & 0o777, 0o700);
+    assert!(!got.starts_with(fx.root()), "{got:?}");
+    // The link's target was not touched.
+    let mode = std::fs::metadata(&target).unwrap().permissions().mode();
+    assert_eq!(mode & 0o777, 0o755, "{mode:o}");
+    assert!(private.symlink_metadata().unwrap().file_type().is_symlink());
+    run.shutdown().await;
+    // The replacement lasts for the run only.
+    assert!(!got.exists(), "{got:?}");
 }
 
 /// Review N9: a server whose command line names a file that cannot be hashed (here over

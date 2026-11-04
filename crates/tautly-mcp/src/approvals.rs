@@ -44,9 +44,11 @@ pub fn key(root: &Path, name: &str, spec: &ServerSpec) -> String {
 pub struct ApprovalKey {
     pub key: String,
     /// False when a file the command line names could not be hashed (too big,
-    /// unreadable, not a regular file): the key then holds a value no other call
-    /// produces, so a stored approval could never match. Such a server is approved for
-    /// the run only, and nothing is written to the approvals file.
+    /// unreadable, not a regular file), or when the command line can drop the private
+    /// bytecode cache the engine forces on it (`python -E`, `env -u PYTHONPYCACHEPREFIX`;
+    /// see `launch_files::can_drop_pycache_prefix`): the key then holds a value no other
+    /// call produces, so a stored approval could never match. Such a server is approved
+    /// for the run only, and nothing is written to the approvals file.
     pub rememberable: bool,
 }
 
@@ -68,17 +70,30 @@ pub fn approval_key(root: &Path, name: &str, spec: &ServerSpec) -> ApprovalKey {
             cwd,
         } => {
             let argv: Vec<&String> = std::iter::once(command).chain(args).collect();
+            // Variable values name files like argv words do (`NODE_OPTIONS=--require
+            // ./x.js`, `PYTHONPATH=.`).
+            let words: Vec<&String> = argv.iter().copied().chain(env.values()).collect();
             let base = match cwd {
                 Some(c) => root.join(c),
                 None => root.clone(),
             };
+            // A command line that can run its Python without the private bytecode cache
+            // the engine forces (`python -E`, `env -u PYTHONPYCACHEPREFIX`) is asked
+            // about at every start: the key then matches nothing stored.
+            let droppable = crate::launch_files::can_drop_pycache_prefix(&argv);
+            rememberable &= !droppable;
             serde_json::json!({
                 "transport": "stdio",
                 "argv": argv,
                 "cwd": cwd.as_ref().map(|c| c.to_string_lossy().into_owned()),
                 "env": env.keys().collect::<Vec<_>>(),
                 "env_values": pairs_hash(env),
-                "files": crate::launch_files::files_named(&root, &base, &argv, &mut rememberable),
+                "files": crate::launch_files::files_named(&root, &base, &words, &mut rememberable),
+                "pycache_prefix": if droppable {
+                    serde_json::json!({ "droppable": crate::launch_files::nonce() })
+                } else {
+                    serde_json::json!("forced")
+                },
             })
         }
         ServerSpec::Http { url, headers } => serde_json::json!({

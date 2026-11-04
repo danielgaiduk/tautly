@@ -1,9 +1,10 @@
 //! Review S2-I1 (probe `pyc.sh`): a repository can ship a hash-based ("unchecked") `.pyc`
-//! in a `__pycache__` the approval key skips, and `python -m pkg` runs it instead of the
-//! keyed source. The engine sets `PYTHONPYCACHEPREFIX` to a private directory for every
-//! stdio server (`tautly-core/tests/mcp.rs::stdio_servers_get_a_private_pycache_prefix`,
-//! `env.rs`); this shows that the prefix is what stops the hostile bytecode. Skipped
-//! without a `python3`.
+//! in a `__pycache__`, and `python -m pkg` runs it instead of the keyed source. The
+//! engine sets `PYTHONPYCACHEPREFIX` to a private directory for every stdio server
+//! (`tautly-core/tests/mcp.rs::stdio_servers_get_a_private_pycache_prefix`, `env.rs`);
+//! this shows that the prefix is what stops the hostile bytecode from running. Since
+//! review S3-I1 the key also covers such bytecode (`approvals.rs::hash_based_bytecode_is_keyed`),
+//! for command lines that drop the prefix. Skipped without a `python3`.
 
 use std::path::Path;
 use std::process::Command;
