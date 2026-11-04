@@ -730,3 +730,149 @@ fn telemetry_enabled_warns_and_is_ignored() {
     assert!(!loaded.config.telemetry.enabled);
     assert!(!loaded.warnings.iter().any(|w| w == TELEMETRY_WARNING));
 }
+
+// ---- the configured key variables (review I1) ----
+
+#[test]
+fn detection_reads_the_configured_key_variable_like_the_session() {
+    use tautly_core::ProviderSetupError;
+    use tautly_core::detect::{KeyVars, setup_hint_with};
+
+    let f = Fixture::new();
+    f.user("[providers.anthropic]\napi_key_env = \"WORK_KEY\"\n");
+    let loaded = f.load(CliOverrides::default());
+    let vars = KeyVars::from_config(&loaded.config);
+    assert_eq!(vars.native[0], ("anthropic", "WORK_KEY".to_string()));
+    assert_eq!(vars.native[1], ("openai", "OPENAI_API_KEY".to_string()));
+    let catalog = Arc::new(loaded.config.effective_catalog());
+
+    // (a) Only the configured variable is set: detected from it, and the session finds it.
+    let only_work = env_of(&[("WORK_KEY", "k")]);
+    let choice = resolve_model(&loaded, &only_work, &NoStore, &NoProbe).unwrap();
+    let ModelChoice::Detected(d) = choice else {
+        panic!("expected detection, got {choice:?}");
+    };
+    assert_eq!(d.model, id("anthropic/claude-sonnet-5-5"));
+    assert_eq!(d.source, KeySource::Env("WORK_KEY".into()));
+    assert!(d.startup_line().contains("(from WORK_KEY)"));
+    provider_for_with(
+        &loaded.config,
+        &d.model,
+        Arc::clone(&catalog),
+        &only_work,
+        &NoStore,
+    )
+    .map(|_| ())
+    .unwrap();
+
+    // (b) Only the default variable is set while a custom one is configured: the session
+    // would not read it, so detection does not pick Anthropic from it either.
+    let only_default = env_of(&[("ANTHROPIC_API_KEY", "k")]);
+    let choice = resolve_model(
+        &loaded,
+        &only_default,
+        &FakeStore::default(),
+        &FakeProbe::default(),
+    )
+    .unwrap();
+    assert_eq!(choice, ModelChoice::NotFound);
+    let err = provider_for_with(
+        &loaded.config,
+        &id("anthropic/claude-sonnet-5-5"),
+        catalog,
+        &only_default,
+        &FakeStore::default(),
+    )
+    .err()
+    .unwrap();
+    assert!(
+        matches!(err, ProviderSetupError::MissingKey { .. }),
+        "{err}"
+    );
+    assert!(err.to_string().contains("WORK_KEY"), "{err}");
+
+    // The hint names the variables that count.
+    let hint = setup_hint_with(&vars);
+    assert!(hint.contains("WORK_KEY"), "{hint}");
+    assert!(!hint.contains("ANTHROPIC_API_KEY"), "{hint}");
+    for var in [
+        "OPENAI_API_KEY",
+        "GEMINI_API_KEY",
+        "OPENROUTER_API_KEY",
+        "tautly auth add",
+    ] {
+        assert!(hint.contains(var), "{var}: {hint}");
+    }
+}
+
+#[test]
+fn openrouter_uses_the_variable_of_its_effective_entry() {
+    use tautly_core::detect::KeyVars;
+
+    assert_eq!(
+        KeyVars::from_config(&Config::default())
+            .openrouter
+            .as_deref(),
+        Some("OPENROUTER_API_KEY")
+    );
+
+    let custom = Fixture::new();
+    custom.user(
+        "[[providers.compat]]\nname = \"openrouter\"\nbase_url = \"https://openrouter.ai/api/v1\"\n\
+         api_key_env = \"OR_WORK\"\n",
+    );
+    let loaded = custom.load(CliOverrides::default());
+    assert_eq!(
+        KeyVars::from_config(&loaded.config).openrouter.as_deref(),
+        Some("OR_WORK")
+    );
+    let choice = resolve_model(
+        &loaded,
+        &env_of(&[("OR_WORK", "k")]),
+        &FakeStore::default(),
+        &NoProbe,
+    )
+    .unwrap();
+    let ModelChoice::Detected(d) = choice else {
+        panic!("expected detection, got {choice:?}");
+    };
+    assert_eq!(d.provider, "compat:openrouter");
+    assert_eq!(d.source, KeySource::Env("OR_WORK".into()));
+    let choice = resolve_model(
+        &loaded,
+        &env_of(&[("OPENROUTER_API_KEY", "k")]),
+        &FakeStore::default(),
+        &FakeProbe::default(),
+    )
+    .unwrap();
+    assert_eq!(choice, ModelChoice::NotFound);
+
+    // A user entry with no variable: no environment step for OpenRouter.
+    let keyless = Fixture::new();
+    keyless.user(
+        "[[providers.compat]]\nname = \"openrouter\"\nbase_url = \"https://openrouter.ai/api/v1\"\n",
+    );
+    let loaded = keyless.load(CliOverrides::default());
+    assert_eq!(KeyVars::from_config(&loaded.config).openrouter, None);
+    let choice = resolve_model(
+        &loaded,
+        &env_of(&[("OPENROUTER_API_KEY", "k")]),
+        &FakeStore::default(),
+        &FakeProbe::default(),
+    )
+    .unwrap();
+    assert_eq!(choice, ModelChoice::NotFound);
+}
+
+#[test]
+fn a_project_cannot_change_the_key_variables() {
+    use tautly_core::detect::KeyVars;
+
+    let f = Fixture::new();
+    f.project(
+        "[providers.anthropic]\napi_key_env = \"REPO_VAR\"\n\n[[providers.compat]]\n\
+         name = \"openrouter\"\nbase_url = \"https://evil.example/v1\"\napi_key_env = \"REPO_OR\"\n",
+    );
+    let loaded = f.load(CliOverrides::default());
+    assert_eq!(KeyVars::from_config(&loaded.config), KeyVars::default());
+}

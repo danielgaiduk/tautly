@@ -74,7 +74,8 @@ async fn doctor_healthy_exits_0() {
         ("ok", "keys", "anthropic: environment (ANTHROPIC_API_KEY)"),
         ("info", "keys", "openai: none"),
         ("ok", "keychain", "available (test secret store)"),
-        ("ok", "network", "anthropic: key accepted (HTTP 200)"),
+        ("ok", "network", "anthropic (127.0.0.1:"),
+        ("ok", "network", "): key accepted (HTTP 200)"),
         ("ok", "data home", ""),
         ("ok", "sandbox", "root "),
         ("info", "sandbox", "no OS isolation in v1"),
@@ -101,9 +102,12 @@ async fn doctor_rejected_key_fails_exit_1() {
     let out = run(cmd).await;
     let text = stdout(&out);
     assert_eq!(out.status.code(), Some(1), "{text}");
+    let host = server.address().to_string();
     assert_eq!(
         lines(&text, "fail", "network"),
-        ["fail  network: anthropic: key rejected (HTTP 401)"],
+        [format!(
+            "fail  network: anthropic ({host}): key rejected (HTTP 401)"
+        )],
         "{text}"
     );
 }
@@ -265,4 +269,102 @@ async fn doctor_json_shape() {
         }
     }
     insta::assert_json_snapshot!(v);
+}
+
+// ---- review I2: the index check only reads ----
+
+#[tokio::test(flavor = "multi_thread")]
+async fn doctor_reads_a_present_index_without_changing_it() {
+    use std::sync::Arc;
+
+    let s = Scratch::new();
+    std::fs::write(s.work.path().join("a.rs"), "fn a() {}\n").unwrap();
+    std::fs::write(s.work.path().join("b.rs"), "fn b() {}\n").unwrap();
+    let root = s.work.path().canonicalize().unwrap();
+    let db = s
+        .home
+        .path()
+        .join("index")
+        .join(format!("{}.db", tautly_session::paths::project_hash(&root)));
+    let sandbox = Arc::new(tautly_sandbox::LocalSandbox::new(root.clone()).unwrap());
+    let index = tautly_index::Index::open(&db, sandbox).unwrap();
+    index.refresh().await.unwrap();
+    drop(index);
+    let before = std::fs::read(&db).unwrap();
+    let modified = std::fs::metadata(&db).unwrap().modified().unwrap();
+
+    // A session in the middle of a refresh holds the write lock: a reader is not held up
+    // (opening the index for writing would wait for it, then fail).
+    let mut writer = rusqlite::Connection::open(&db).unwrap();
+    let tx = writer
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .unwrap();
+    let mut cmd = s.command(&["doctor", "--offline"]);
+    cmd.env("ANTHROPIC_API_KEY", ANTHROPIC_KEY);
+    let start = std::time::Instant::now();
+    let out = run(cmd).await;
+    let took = start.elapsed();
+    tx.rollback().unwrap();
+    drop(writer);
+    assert!(took < std::time::Duration::from_secs(3), "took {took:?}");
+    let text = stdout(&out);
+    assert_eq!(out.status.code(), Some(0), "{text}");
+    let index = lines(&text, "ok", "index");
+    assert_eq!(index.len(), 1, "{text}");
+    assert!(index[0].contains("present, 2 files"), "{text}");
+    assert_eq!(
+        std::fs::read(&db).unwrap(),
+        before,
+        "the index is unchanged"
+    );
+    assert_eq!(
+        std::fs::metadata(&db).unwrap().modified().unwrap(),
+        modified
+    );
+}
+
+// ---- review M6: a project cannot redirect the keyed request ----
+
+#[tokio::test(flavor = "multi_thread")]
+async fn doctor_ignores_a_project_base_url() {
+    let user = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .and(header("x-api-key", ANTHROPIC_KEY))
+        .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+        .expect(1)
+        .mount(&user)
+        .await;
+    let repo = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+        .expect(0)
+        .mount(&repo)
+        .await;
+    let s = Scratch::new();
+    anthropic_on(&s, &user);
+    s.project_config(&format!(
+        "[providers.anthropic]\nbase_url = \"{}\"\napi_key_env = \"ANTHROPIC_API_KEY\"\n",
+        repo.uri()
+    ));
+    let mut cmd = s.command(&["doctor"]);
+    cmd.env("ANTHROPIC_API_KEY", ANTHROPIC_KEY);
+    let out = run(cmd).await;
+    let text = stdout(&out);
+    assert_eq!(out.status.code(), Some(0), "{text}");
+    assert!(
+        lines(&text, "warn", "config")
+            .iter()
+            .any(|l| l.contains("ignored `providers`")),
+        "{text}"
+    );
+    let host = user.address().to_string();
+    assert!(
+        lines(&text, "ok", "network")
+            .iter()
+            .any(|l| l.contains(&format!("anthropic ({host})"))),
+        "{text}"
+    );
+    user.verify().await;
+    repo.verify().await;
 }

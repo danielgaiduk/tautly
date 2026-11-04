@@ -151,3 +151,199 @@ async fn a_keychain_key_is_detected_and_used_for_the_session() {
     );
     assert!(!err.contains("key-from-keychain") && !stdout(&out).contains("key-from-keychain"));
 }
+
+// ---- the configured key variable (review I1): detection, the session and doctor agree ----
+
+#[tokio::test(flavor = "multi_thread")]
+async fn only_the_configured_key_variable_set_is_detected_and_used() {
+    use wiremock::matchers::{header, method};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(header("x-api-key", "work-key"))
+        .respond_with(ResponseTemplate::new(400).set_body_string("{\"error\":{}}"))
+        .expect(1..)
+        .mount(&server)
+        .await;
+    let s = Scratch::new();
+    s.user_config(&format!(
+        "[providers.anthropic]\napi_key_env = \"WORK_KEY\"\nbase_url = \"{}\"\n",
+        server.uri()
+    ));
+    let mut cmd = s.command(&["-p", "hi", "--output", "json"]);
+    cmd.env("WORK_KEY", "work-key");
+    let out = tokio::task::spawn_blocking(move || cmd.output().unwrap())
+        .await
+        .unwrap();
+    let err = stderr(&out);
+    assert!(
+        err.starts_with("using anthropic/claude-sonnet-5-5 (from WORK_KEY)"),
+        "{err}"
+    );
+
+    let mut cmd = s.command(&["doctor", "--offline"]);
+    cmd.env("WORK_KEY", "work-key");
+    let out = tokio::task::spawn_blocking(move || cmd.output().unwrap())
+        .await
+        .unwrap();
+    let text = stdout(&out);
+    assert_eq!(out.status.code(), Some(0), "{text}");
+    assert!(
+        text.contains("ok    model: anthropic/claude-sonnet-5-5 (detected from WORK_KEY)"),
+        "{text}"
+    );
+    assert!(
+        text.contains("ok    keys: anthropic: environment (WORK_KEY)"),
+        "{text}"
+    );
+}
+
+#[test]
+fn only_the_default_variable_set_while_another_is_configured_finds_nothing() {
+    let s = Scratch::new();
+    s.user_config("[providers.anthropic]\napi_key_env = \"WORK_KEY\"\n");
+    let mut cmd = s.command(&["-p", "hi"]);
+    cmd.env("ANTHROPIC_API_KEY", "default-key");
+    let out = cmd.output().unwrap();
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    let err = stderr(&out);
+    assert!(err.contains("no model provider found"), "{err}");
+    assert!(err.contains("set WORK_KEY, OPENAI_API_KEY"), "{err}");
+    assert!(!err.contains("ANTHROPIC_API_KEY"), "{err}");
+    assert!(!err.contains("using "), "{err}");
+
+    // doctor says the same.
+    let mut cmd = s.command(&["doctor", "--offline"]);
+    cmd.env("ANTHROPIC_API_KEY", "default-key");
+    let out = cmd.output().unwrap();
+    let text = stdout(&out);
+    assert_eq!(out.status.code(), Some(1), "{text}");
+    assert!(text.contains("info  keys: anthropic: none"), "{text}");
+    let model: Vec<&str> = text
+        .lines()
+        .filter(|l| l.starts_with("fail  model: no model provider found"))
+        .collect();
+    assert_eq!(model.len(), 1, "{text}");
+    assert!(model[0].contains("WORK_KEY") && !model[0].contains("ANTHROPIC_API_KEY"));
+
+    // A configured model with the same setup: the missing-key error and its hint name
+    // the variable the session reads.
+    s.user_config("model = \"anthropic/claude-sonnet-5-5\"\n[providers.anthropic]\napi_key_env = \"WORK_KEY\"\n");
+    let mut cmd = s.command(&["-p", "hi"]);
+    cmd.env("ANTHROPIC_API_KEY", "default-key");
+    let out = cmd.output().unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let err = stderr(&out);
+    assert!(
+        err.contains("no API key for anthropic: set WORK_KEY"),
+        "{err}"
+    );
+    assert!(!err.contains("ANTHROPIC_API_KEY"), "{err}");
+}
+
+// ---- review M1: nothing found is not remembered ----
+
+#[test]
+fn rpc_detects_again_after_nothing_was_found() {
+    use std::io::{BufRead as _, Write as _};
+    use std::process::Stdio;
+
+    let s = Scratch::new();
+    // Google points nowhere reachable: opening a session sends no request.
+    s.user_config("[providers.google]\nbase_url = \"http://127.0.0.1:9\"\n");
+    let mut child = s
+        .command(&["--rpc"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut out = std::io::BufReader::new(child.stdout.take().unwrap());
+    let root = s.work.path().to_string_lossy().into_owned();
+    let mut answer = |id: u64, method: &str, params: Value| -> Value {
+        let msg = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
+        writeln!(stdin, "{msg}").unwrap();
+        loop {
+            let mut line = String::new();
+            assert!(out.read_line(&mut line).unwrap() > 0, "output ended");
+            let msg: Value = serde_json::from_str(&line).unwrap();
+            if msg["id"] == id {
+                return msg;
+            }
+        }
+    };
+    let init = answer(
+        1,
+        "initialize",
+        json!({"protocol": "1.0", "session": false}),
+    );
+    assert!(init["result"].is_object(), "{init}");
+    let first = answer(2, "session/new", json!({"root": root}));
+    let message = first["error"]["message"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(message.contains("no model provider found"), "{first}");
+
+    // The user stores a key meanwhile (`tautly auth add google`).
+    s.store_secret("google", "key-from-keychain");
+    let second = answer(3, "session/new", json!({"root": root}));
+    assert!(second["result"]["session_id"].is_string(), "{second}");
+    let _ = answer(4, "shutdown", json!({}));
+    drop(stdin);
+    let done = child.wait_with_output().unwrap();
+    let err = stderr(&done);
+    assert_eq!(
+        err.matches("using google/gemini-3-pro (from the keychain)")
+            .count(),
+        1,
+        "{err}"
+    );
+}
+
+// ---- review M4: a side model of another provider uses the same keychain ----
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_side_model_of_another_provider_reads_the_selected_keychain() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(400).set_body_string("{\"error\":{}}"))
+        .mount(&server)
+        .await;
+    for (openai_key, usable) in [(true, true), (false, false)] {
+        let s = Scratch::new();
+        s.user_config(&format!(
+            "model = \"google/gemini-3-pro\"\n[routing]\nside_model = \"openai/gpt-5-mini\"\n\
+             [providers.google]\nbase_url = \"{uri}\"\n[providers.openai]\nbase_url = \"{uri}\"\n",
+            uri = server.uri()
+        ));
+        s.store_secret("google", "g-key");
+        if openai_key {
+            s.store_secret("openai", "o-key");
+        }
+        let mut cmd = s.command(&["-p", "hi", "--output", "json"]);
+        let out = tokio::task::spawn_blocking(move || cmd.output().unwrap())
+            .await
+            .unwrap();
+        let unusable = stdout(&out)
+            .lines()
+            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+            .any(|e| {
+                e["type"] == "warning"
+                    && e["message"]
+                        .as_str()
+                        .is_some_and(|m| m.contains("side model openai/gpt-5-mini cannot be used"))
+            });
+        assert_eq!(
+            !unusable,
+            usable,
+            "openai key stored: {openai_key}\n{}",
+            stdout(&out)
+        );
+    }
+}

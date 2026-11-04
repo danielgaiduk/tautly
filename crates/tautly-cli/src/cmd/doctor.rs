@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::json;
-use tautly_core::detect::{ModelChoice, OllamaProbe, resolve_model, setup_hint};
+use tautly_core::detect::{KeyVars, ModelChoice, OllamaProbe, resolve_model, setup_hint_with};
 use tautly_core::{
     Approval, AuthError, CliOverrides, Config, KEYCHAIN_SERVICE, LoadedConfig, ProviderEntry,
     SecretStore, Workspaces, plan_servers, provider_label, session_root,
@@ -32,7 +32,8 @@ pub struct DoctorArgs {
     /// Print the checks as one JSON object.
     #[arg(long)]
     pub json: bool,
-    /// Skip the network checks.
+    /// Skip contacting provider APIs (otherwise each provider with a key gets one GET of
+    /// its model list, at the host the line names).
     #[arg(long)]
     pub offline: bool,
 }
@@ -221,7 +222,10 @@ fn model_check(
             checks.push(check(
                 "model",
                 Level::Fail,
-                format!("no model provider found: {}", setup_hint()),
+                format!(
+                    "no model provider found: {}",
+                    setup_hint_with(&KeyVars::from_config(&loaded.config))
+                ),
             ));
             None
         }
@@ -424,8 +428,9 @@ async fn network_check(cx: &DoctorCx<'_>, keyed: &[Keyed], active: Option<&str>)
         .collect();
     let mut checks = Vec::new();
     for (k, request) in keyed.iter().zip(requests) {
-        let name = &k.provider;
-        let is_active = active == Some(name.as_str());
+        let is_active = active == Some(k.provider.as_str());
+        // Says where the key went: a user `base_url` or compat entry can name any host.
+        let name = format!("{} ({})", k.provider, host(&k.base_url));
         let trouble = if is_active { Level::Fail } else { Level::Warn };
         let result = match request.await {
             Ok(r) => r,
@@ -466,6 +471,20 @@ async fn network_check(cx: &DoctorCx<'_>, keyed: &[Keyed], active: Option<&str>)
         });
     }
     checks
+}
+
+/// The host (and port, if one is given) of `url`, for messages.
+fn host(url: &str) -> String {
+    reqwest::Url::parse(url)
+        .ok()
+        .and_then(|u| {
+            let host = u.host_str()?.to_string();
+            Some(match u.port() {
+                Some(port) => format!("{host}:{port}"),
+                None => host,
+            })
+        })
+        .unwrap_or_else(|| "unknown host".to_string())
 }
 
 /// `data home`: absolute and writable, else a fail.
@@ -584,32 +603,40 @@ fn index_check(data_home: &Path, root: &Path) -> Check {
     let db = data_home
         .join("index")
         .join(format!("{}.db", tautly_session::paths::project_hash(root)));
-    if !db.exists() {
-        return check(
+    // Read-only: no migration, no index building, no write lock (a session may be
+    // refreshing it right now). Whether that refresh is still going lives in the session's
+    // process; what is on disk is the last committed state.
+    match tautly_index::peek(&db) {
+        Ok(None) => check(
             "index",
             Level::Info,
             "not built yet (sessions build it in the background)",
-        );
-    }
-    let sandbox = match Workspaces::new(data_home).get(root) {
-        Ok(ws) => Arc::clone(ws.sandbox()),
-        Err(e) => return check("index", Level::Warn, e.to_string()),
-    };
-    match tautly_index::Index::open(&db, sandbox) {
-        // Whether a running session's refresh is still going lives in that process; what
-        // is on disk is the last refresh's result.
-        Ok(index) => {
-            let files = index.stats().files;
-            check(
-                "index",
-                Level::Ok,
-                format!(
-                    "present, {files} file{} (refreshed in the background when a session starts)",
-                    if files == 1 { "" } else { "s" }
-                ),
-            )
+        ),
+        Ok(Some(found)) => {
+            let files = found.files;
+            let plural = if files == 1 { "" } else { "s" };
+            if found.is_current() {
+                check(
+                    "index",
+                    Level::Ok,
+                    format!(
+                        "present, {files} file{plural} (refreshed in the background when a \
+                         session starts)"
+                    ),
+                )
+            } else {
+                check(
+                    "index",
+                    Level::Warn,
+                    format!(
+                        "present, {files} file{plural}, schema version {}: a session upgrades \
+                         or rebuilds it",
+                        found.schema_version
+                    ),
+                )
+            }
         }
-        Err(e) => check("index", Level::Warn, format!("cannot open the index: {e}")),
+        Err(e) => check("index", Level::Warn, format!("cannot read the index: {e}")),
     }
 }
 

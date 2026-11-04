@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use tautly_provider::{Catalog, ModelId, Tier};
 
 use crate::auth::{AuthError, KEYCHAIN_SERVICE, SecretStore};
-use crate::config::{LoadedConfig, OPENROUTER_KEY_ENV};
+use crate::config::{Config, LoadedConfig, OPENROUTER_KEY_ENV};
 use crate::provider_setup::provider_label;
 
 /// How long the Ollama probe may take.
@@ -253,24 +253,90 @@ pub fn resolve_model(
         return Ok(ModelChoice::Configured(loaded.config.model.clone()));
     }
     let catalog = loaded.config.effective_catalog();
-    Ok(match detect(env, store, probe, &catalog)? {
+    let vars = KeyVars::from_config(&loaded.config);
+    Ok(match detect_with(env, store, probe, &catalog, &vars)? {
         Some(d) => ModelChoice::Detected(d),
         None => ModelChoice::NotFound,
     })
 }
 
-/// The first provider with a key, in the order of spec 7.11.2: the environment variables
-/// `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`; the keychain accounts
-/// `anthropic`, `openai`, `google`; `OPENROUTER_API_KEY`, then the keychain account
-/// `compat:openrouter`; a local Ollama with a model installed. The keychain is read only
-/// when no environment key exists, and Ollama is probed only as the last resort. A
-/// keychain that cannot be asked counts as empty (and is not asked again); a non-unicode
-/// variable or a failing keychain is an error. This may block (keychain, probe).
+/// The environment variable detection reads for each provider: the one the session would
+/// read ([`crate::auth::api_key_with`]), so detection and the session agree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyVars {
+    /// `anthropic`, `openai`, `google` (in detection order) and each one's variable: the
+    /// configured `api_key_env`, else `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`,
+    /// `GEMINI_API_KEY`.
+    pub native: [(&'static str, String); 3],
+    /// The variable of the effective `openrouter` compat entry (`OPENROUTER_API_KEY` for
+    /// the built-in one); `None` when that entry names none, which skips the step.
+    pub openrouter: Option<String>,
+}
+
+impl Default for KeyVars {
+    /// The spec's variable names (no configuration).
+    fn default() -> Self {
+        KeyVars {
+            native: NATIVE.map(|(p, v)| (p, v.to_string())),
+            openrouter: Some(OPENROUTER_KEY_ENV.to_string()),
+        }
+    }
+}
+
+impl KeyVars {
+    /// The variables `config` makes the session read. `providers` is a user-only key, so
+    /// a project file cannot change them.
+    pub fn from_config(config: &Config) -> Self {
+        let p = &config.providers;
+        let entries = [&p.anthropic, &p.openai, &p.google];
+        let mut native = KeyVars::default().native;
+        for ((_, var), entry) in native.iter_mut().zip(entries) {
+            if let Some(configured) = entry.as_ref().and_then(|e| e.api_key_env.clone()) {
+                *var = configured;
+            }
+        }
+        let openrouter = config
+            .effective_compat()
+            .into_iter()
+            .find(|c| c.name == "openrouter")
+            .and_then(|c| c.api_key_env);
+        KeyVars { native, openrouter }
+    }
+
+    /// Every variable, in detection order.
+    fn all(&self) -> Vec<&str> {
+        self.native
+            .iter()
+            .map(|(_, v)| v.as_str())
+            .chain(self.openrouter.as_deref())
+            .collect()
+    }
+}
+
+/// [`detect_with`] with the spec's variable names ([`KeyVars::default`]).
 pub fn detect(
     env: &dyn Fn(&str) -> Option<OsString>,
     store: &dyn SecretStore,
     probe: &dyn OllamaProbe,
     catalog: &Catalog,
+) -> Result<Option<Detected>, AuthError> {
+    detect_with(env, store, probe, catalog, &KeyVars::default())
+}
+
+/// The first provider with a key, in the order of spec 7.11.2: the native providers'
+/// environment variables (`vars`; by default `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`,
+/// `GEMINI_API_KEY`); the keychain accounts `anthropic`, `openai`, `google`; OpenRouter's
+/// variable, then the keychain account `compat:openrouter`; a local Ollama with a model
+/// installed. The keychain is read only when no environment key exists, and Ollama is
+/// probed only as the last resort. A keychain that cannot be asked counts as empty (and is
+/// not asked again); a non-unicode variable or a failing keychain is an error. This may
+/// block (keychain, probe).
+pub fn detect_with(
+    env: &dyn Fn(&str) -> Option<OsString>,
+    store: &dyn SecretStore,
+    probe: &dyn OllamaProbe,
+    catalog: &Catalog,
+    vars: &KeyVars,
 ) -> Result<Option<Detected>, AuthError> {
     let found = |provider: &str, source: KeySource| {
         default_model(provider, catalog).map(|model| Detected {
@@ -280,9 +346,9 @@ pub fn detect(
             warning: None,
         })
     };
-    for (provider, var) in NATIVE {
+    for (provider, var) in &vars.native {
         if env_key(env, var)?
-            && let Some(d) = found(provider, KeySource::Env(var.to_string()))
+            && let Some(d) = found(provider, KeySource::Env(var.clone()))
         {
             return Ok(Some(d));
         }
@@ -298,8 +364,9 @@ pub fn detect(
             return Ok(Some(d));
         }
     }
-    if env_key(env, OPENROUTER_KEY_ENV)?
-        && let Some(d) = found(OPENROUTER, KeySource::Env(OPENROUTER_KEY_ENV.to_string()))
+    if let Some(var) = &vars.openrouter
+        && env_key(env, var)?
+        && let Some(d) = found(OPENROUTER, KeySource::Env(var.clone()))
     {
         return Ok(Some(d));
     }
@@ -400,13 +467,25 @@ pub fn ollama_model(installed: &[String], catalog: &Catalog) -> (ModelId, Option
     (ModelId::from(format!("{prefix}{first}")), Some(warning))
 }
 
-/// What to do when no provider is usable: the variables, `tautly auth add` and Ollama.
+/// [`setup_hint_with`] for the spec's variable names.
 pub fn setup_hint() -> String {
-    "set ANTHROPIC_API_KEY, OPENAI_API_KEY, GEMINI_API_KEY or OPENROUTER_API_KEY; or store a \
-     key with `tautly auth add <provider>` (anthropic, openai, google, openrouter or \
-     compat:<name>); or run Ollama on localhost:11434 with a model pulled. `tautly doctor` \
-     checks the setup"
-        .to_string()
+    setup_hint_with(&KeyVars::default())
+}
+
+/// What to do when no provider is usable: the variables detection and the session read
+/// (`vars`), `tautly auth add` and Ollama.
+pub fn setup_hint_with(vars: &KeyVars) -> String {
+    let all = vars.all();
+    let names = match all.split_last() {
+        Some((last, [])) => (*last).to_string(),
+        Some((last, rest)) => format!("{} or {last}", rest.join(", ")),
+        None => String::new(),
+    };
+    format!(
+        "set {names}; or store a key with `tautly auth add <provider>` (anthropic, openai, \
+         google, openrouter or compat:<name>); or run Ollama on localhost:11434 with a model \
+         pulled. `tautly doctor` checks the setup"
+    )
 }
 
 #[cfg(test)]

@@ -28,11 +28,12 @@ use std::time::Duration;
 
 use anyhow::{Context as _, anyhow, bail};
 use clap::{CommandFactory as _, Parser, Subcommand, ValueEnum};
-use tautly_core::detect::{Detected, OllamaProbe, detect, setup_hint, wants_detection};
+use tautly_core::detect::{
+    Detected, KeyVars, OllamaProbe, detect_with, setup_hint_with, wants_detection,
+};
 use tautly_core::{
     BudgetScope, CliOverrides, Command, Config, Engine, EngineBuilder, Event, LoadedConfig, Mode,
-    ModelId, ProviderFactory, ProviderSetupError, Workspaces, install_signal_handlers,
-    provider_for_with,
+    ModelId, ProviderSetupError, Workspaces, install_signal_handlers, provider_for_with,
 };
 use tautly_rpc::{EngineFactory, OutputFormat, Server, run_oneshot};
 use tokio::io::BufReader;
@@ -154,10 +155,13 @@ fn check_model(id: &str) -> Result<(), String> {
 }
 
 /// A provider that cannot be set up. A missing key gets the same hint as a first run that
-/// found no provider (spec 7.11.2).
-fn setup_error(e: ProviderSetupError) -> anyhow::Error {
+/// found no provider (spec 7.11.2), naming the variables `config` makes the session read.
+fn setup_error(e: ProviderSetupError, config: &Config) -> anyhow::Error {
     match e {
-        ProviderSetupError::MissingKey { .. } => anyhow!("{e}\nhint: {}", setup_hint()),
+        ProviderSetupError::MissingKey { .. } => {
+            let hint = setup_hint_with(&KeyVars::from_config(config));
+            anyhow!("{e}\nhint: {hint}")
+        }
         other => anyhow!("{other}: {}", other.hint()),
     }
 }
@@ -227,9 +231,10 @@ struct Settings {
     approve_mcp: bool,
     secrets: local::Secrets,
     probe: Arc<dyn OllamaProbe>,
-    /// What provider detection found, once a session needed it (spec 7.11.2): the same
-    /// for every session of the process, so it runs and is announced once.
-    detected: Arc<OnceLock<Result<Option<Detected>, String>>>,
+    /// What provider detection found, once it found something (spec 7.11.2): the same for
+    /// every later session of the process, so it is announced once. Nothing found, or an
+    /// error, is not kept: the next session detects again (after `tautly auth add`, say).
+    detected: Arc<OnceLock<Detected>>,
     #[cfg(feature = "mock")]
     provider: Option<Arc<dyn tautly_provider::Provider>>,
 }
@@ -266,33 +271,41 @@ impl Settings {
         false
     }
 
-    /// Set the model when no layer or flag names one and detection is on: detected once
-    /// per process and announced on stderr. Nothing found is an error with the setup
-    /// hint. This may read the keychain and wait for the Ollama probe (blocking).
+    /// Set the model when no layer or flag names one and detection is on, announcing it on
+    /// stderr the first time. Detection reads the key variables the configuration names
+    /// (as the session will). Nothing found is an error with the setup hint. This may read
+    /// the keychain and wait for the Ollama probe (blocking).
     fn detect_model(&self, loaded: &mut LoadedConfig) -> anyhow::Result<()> {
         if self.scripted() || !wants_detection(loaded) {
             return Ok(());
         }
-        let found = self.detected.get_or_init(|| {
-            let catalog = loaded.config.effective_catalog();
-            let found = detect(&local::env, &*self.secrets.store, &*self.probe, &catalog);
-            if let Ok(Some(d)) = &found {
-                eprintln!("{}", d.startup_line());
-                if let Some(w) = &d.warning {
-                    eprintln!("tautly: warning: {w}");
+        let vars = KeyVars::from_config(&loaded.config);
+        let found = match self.detected.get() {
+            Some(d) => d.clone(),
+            None => {
+                let catalog = loaded.config.effective_catalog();
+                let found = detect_with(
+                    &local::env,
+                    &*self.secrets.store,
+                    &*self.probe,
+                    &catalog,
+                    &vars,
+                )
+                .map_err(|e| anyhow!("provider detection failed: {e}"))?;
+                let Some(d) = found else {
+                    bail!("no model provider found\nhint: {}", setup_hint_with(&vars));
+                };
+                // Two sessions may detect at once; the first to finish announces.
+                if self.detected.set(d.clone()).is_ok() {
+                    eprintln!("{}", d.startup_line());
                 }
+                d
             }
-            found.map_err(|e| e.to_string())
-        });
-        match found {
-            Ok(Some(d)) => {
-                loaded.config.model = d.model.clone();
-                loaded.warnings.extend(d.warning.clone());
-                Ok(())
-            }
-            Ok(None) => Err(anyhow!("no model provider found\nhint: {}", setup_hint())),
-            Err(e) => Err(anyhow!("provider detection failed: {e}")),
-        }
+        };
+        loaded.config.model = found.model;
+        // An uncatalogued Ollama model: the session reports it as a warning.
+        loaded.warnings.extend(found.warning);
+        Ok(())
     }
 
     /// A session on `root` (this may block: configuration files, the keychain).
@@ -315,25 +328,22 @@ impl Settings {
             provider: self.provider.clone(),
             ..EngineBuilder::from_loaded(loaded, root)
         };
+        // Every provider the engine builds (side model, `SetModel`) reads this process's
+        // keychain (in tests, the file standing in for it).
+        builder.secret_store = Some(Arc::clone(&self.secrets.store));
         if !self.scripted() {
-            // The provider is set up here, with this process's keychain, so a missing key
-            // fails before the session starts and with the setup hint.
-            let config = builder.config.clone();
-            let catalog = Arc::new(config.effective_catalog());
-            let store = Arc::clone(&self.secrets.store);
+            // The main provider is set up here so a missing key fails before the session
+            // starts, with the setup hint.
+            let config = &builder.config;
             let provider = provider_for_with(
-                &config,
+                config,
                 &config.model,
-                Arc::clone(&catalog),
+                Arc::new(config.effective_catalog()),
                 &local::env,
-                &*store,
+                &*self.secrets.store,
             )
-            .map_err(setup_error)?;
-            let factory: ProviderFactory = Arc::new(move |model: &ModelId| {
-                provider_for_with(&config, model, Arc::clone(&catalog), &local::env, &*store)
-            });
+            .map_err(|e| setup_error(e, config))?;
             builder.provider = Some(provider);
-            builder.provider_factory = Some(factory);
         }
         let (engine, events) = builder.build()?;
         if let Err(e) = install_signal_handlers(&engine) {
