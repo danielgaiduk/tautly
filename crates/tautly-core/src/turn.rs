@@ -290,7 +290,7 @@ impl Session {
                 }
             })
         });
-        self.apply_startup().await;
+        self.apply_startup(&ctl.cancel).await;
         self.evidence = self.evidence.fresh();
         self.memory.note_task(&text);
         self.user_turn += 1;
@@ -301,7 +301,7 @@ impl Session {
         .await;
         self.emit(Event::TurnStarted).await;
         // The tool set changes only here, so the turn's requests share one prefix.
-        self.refresh_mcp_tools().await;
+        self.refresh_mcp_tools(&ctl.cancel).await;
         self.budgets
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -332,7 +332,8 @@ impl Session {
             })
             .await;
         } else {
-            self.git_checkpoint(Point::TurnEnd, self.last_step(), None)
+            // A cancel while it is taken abandons it (`CheckpointSkipped{cancelled}`).
+            self.git_checkpoint(Point::TurnEnd, self.last_step(), Some(&ctl.cancel))
                 .await;
         }
         self.log(SessionRecord::TurnEnd {
@@ -455,8 +456,9 @@ impl Session {
                 return FinishReason::Completed;
             }
             // The session-start checkpoint precedes the turn's first tool call in the log,
-            // and must not see its edits.
-            self.settle_start_checkpoint().await;
+            // and must not see its edits. A cancel stops the wait: every call is then
+            // answered `cancelled` without running, so the order no longer matters.
+            self.settle_start_checkpoint_or(&ctl.cancel).await;
             self.log_all(
                 resp.calls
                     .iter()

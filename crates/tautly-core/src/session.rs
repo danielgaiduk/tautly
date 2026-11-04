@@ -621,12 +621,22 @@ impl Session {
     }
 
     /// Before the first request: take the repo map and memory index if they are ready
-    /// within [`STARTUP_WAIT`], else run the session without them.
-    pub async fn apply_startup(&mut self) {
-        let Some(rx) = self.startup.as_mut().and_then(|s| s.prefix.take()) else {
+    /// within [`STARTUP_WAIT`], else run the session without them. A cancel (spec 8) stops
+    /// the wait and leaves them to the next turn's first request.
+    pub async fn apply_startup(&mut self, cancel: &CancellationToken) {
+        let Some(mut rx) = self.startup.as_mut().and_then(|s| s.prefix.take()) else {
             return;
         };
-        match tokio::time::timeout(STARTUP_WAIT, rx).await {
+        let ready = tokio::select! {
+            r = tokio::time::timeout(STARTUP_WAIT, &mut rx) => r,
+            () = cancel.cancelled() => {
+                if let Some(s) = self.startup.as_mut() {
+                    s.prefix = Some(rx);
+                }
+                return;
+            }
+        };
+        match ready {
             Ok(Ok(prefix)) => {
                 self.context.repo_map = prefix.repo_map;
                 if prefix.memory_live {

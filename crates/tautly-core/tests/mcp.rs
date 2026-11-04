@@ -1220,3 +1220,48 @@ async fn mcp_json_fifo_does_not_block_startup() {
     run.turn_with("hi").await;
     run.shutdown().await;
 }
+
+// ---------------------------------------------------------------------------------------
+// Cancel during the first turn's start-up wait
+
+#[tokio::test]
+async fn cancel_during_the_mcp_startup_wait_ends_the_turn_within_200ms() {
+    // Review probe P2: a server that never answers `initialize` holds the first user
+    // turn for up to the start-up timeout; `Cancel` must not wait for it.
+    let fx = Fx::new();
+    let mut cfg = config(Mode::Yolo);
+    cfg.mcp.servers.insert(
+        "slow".into(),
+        ServerSpec::Stdio {
+            command: "/bin/sleep".into(),
+            args: vec!["30".into()],
+            env: Default::default(),
+            cwd: None,
+        },
+    );
+    let mock = MockProvider::new(vec![text_step("never sent")]);
+    let mut run = start(fx.builder(cfg, &mock));
+    run.send(Command::SendMessage { text: "go".into() }).await;
+    run.until(|e| matches!(e, Event::TurnStarted)).await;
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let t0 = Instant::now();
+    run.send(Command::Cancel).await;
+    let events = run.until(|e| matches!(e, Event::TurnFinished { .. })).await;
+    let took = t0.elapsed();
+    assert!(
+        matches!(
+            events.last(),
+            Some(Event::TurnFinished {
+                reason: tautly_core::FinishReason::Cancelled,
+                ..
+            })
+        ),
+        "{events:?}"
+    );
+    assert!(
+        took < Duration::from_millis(250),
+        "TurnFinished {took:?} after Cancel"
+    );
+    assert!(mock.requests().is_empty());
+    run.shutdown().await;
+}

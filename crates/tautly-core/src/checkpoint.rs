@@ -2087,7 +2087,23 @@ impl Session {
             return;
         };
         let job = self.checkpoint_job(step);
-        let mut st = shared.lock().await;
+        // The lock may be held by the session-start checkpoint for seconds: a cancel stops
+        // waiting for it too.
+        let mut st = match cancel {
+            Some(c) => tokio::select! {
+                st = shared.lock() => st,
+                () = c.cancelled() => {
+                    job.log(SessionRecord::CheckpointSkipped {
+                        reason: "cancelled".into(),
+                        turn: job.turn,
+                        step,
+                    })
+                    .await;
+                    return;
+                }
+            },
+            None => shared.lock().await,
+        };
         job.run(&mut st, point, cancel).await;
     }
 
@@ -2129,6 +2145,24 @@ impl Session {
     pub(crate) async fn settle_start_checkpoint(&mut self) {
         if let StartCheckpoint::Running(job) = std::mem::take(&mut self.start_checkpoint) {
             let _ = job.await;
+        }
+    }
+
+    /// [`settle_start_checkpoint`](Self::settle_start_checkpoint), unless `cancel` fires
+    /// first (a turn's `Cancel` or `Shutdown`, spec 8): the checkpoint then goes on in the
+    /// background and is waited for later (or abandoned at shutdown). True when it is
+    /// settled.
+    pub(crate) async fn settle_start_checkpoint_or(&mut self, cancel: &CancellationToken) -> bool {
+        let StartCheckpoint::Running(job) = &mut self.start_checkpoint else {
+            return true;
+        };
+        tokio::select! {
+            biased;
+            _ = job => {
+                self.start_checkpoint = StartCheckpoint::Idle;
+                true
+            }
+            () = cancel.cancelled() => false,
         }
     }
 
