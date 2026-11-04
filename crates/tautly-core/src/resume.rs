@@ -99,8 +99,9 @@ pub struct Rebuilt {
     pub(crate) prefix: Option<SessionRecord>,
     /// Valid `SetBudget` commands, in order.
     pub(crate) budgets: Vec<(BudgetScope, Budget)>,
-    /// The usage of every logged response (and of the attempts discarded before it).
-    pub(crate) usage: Vec<RawUsage>,
+    /// The usage the log holds, with the model it was spent on: every complete response's
+    /// (and the attempts discarded before it), and every `Charged` record's.
+    pub(crate) usage: Vec<(ModelId, RawUsage)>,
     /// The last record that is part of the state: commands that change nothing (the
     /// `Fork` itself, a message whose turn has not started) are left out after it. None:
     /// no record is.
@@ -260,6 +261,8 @@ enum Flow {
 /// A step being rebuilt: its response so far and the results of its calls.
 struct OpenStep {
     number: u32,
+    /// The model of its `Request`.
+    model: ModelId,
     resp: Response,
     responded: bool,
     results: HashMap<String, Content>,
@@ -392,6 +395,7 @@ impl Replay<'_> {
                 });
                 self.step = Some(OpenStep {
                     number: next,
+                    model: model.clone(),
                     resp: Response::default(),
                     responded: false,
                     results: HashMap::new(),
@@ -415,6 +419,7 @@ impl Replay<'_> {
                 self.apply_pending();
                 self.mutation(rec);
             }
+            SessionRecord::Charged { model, usage, .. } => self.out.usage.push((model, usage)),
             SessionRecord::Checkpoint {
                 n, commit, tree, ..
             } => {
@@ -758,9 +763,10 @@ impl Replay<'_> {
             if let Some(status) = &step.status {
                 r.context.calibrate(status, &u);
             }
-            r.usage.push(u);
+            r.usage.push((step.model.clone(), u));
         }
-        r.usage.extend(resp.discarded.iter().copied());
+        r.usage
+            .extend(resp.discarded.iter().map(|u| (step.model.clone(), *u)));
         let assistant = Message {
             role: Role::Assistant,
             content: resp.content,
@@ -896,7 +902,7 @@ pub(crate) struct Resumed {
     /// The model the log ends on.
     model: Option<ModelId>,
     prefix: Option<SessionRecord>,
-    usage: Vec<RawUsage>,
+    usage: Vec<(ModelId, RawUsage)>,
     seen: HashMap<PathBuf, blake3::Hash>,
     warnings: Vec<String>,
     start_pins: bool,
@@ -1034,8 +1040,9 @@ impl Session {
     }
 
     /// Count what the session spent before against its budgets: the cost ledger's rows of
-    /// this session (discarded attempts included), else the usage in the log.
-    async fn restore_spend(&mut self, logged: Vec<RawUsage>) {
+    /// this session (discarded attempts included), else the usage in the log, each priced
+    /// by the model it was spent on.
+    async fn restore_spend(&mut self, logged: Vec<(ModelId, RawUsage)>) {
         let path = self.data_home.join(LEDGER_FILE);
         let id = self.session_id.clone();
         let totals = tokio::task::spawn_blocking(move || {
@@ -1060,17 +1067,18 @@ impl Session {
                 };
                 self.warn(format!(
                     "the cost ledger could not give this session's spend ({why}); it is \
-                     rebuilt from the session log, which lacks responses that broke off"
+                     rebuilt from the session log"
                 ))
                 .await;
                 let mut sum = RawUsage::default();
                 let mut usd = 0.0;
-                for u in &logged {
+                for (model, u) in &logged {
                     sum.input += u.input;
                     sum.output += u.output;
                     sum.cache_read += u.cache_read;
                     sum.cache_write += u.cache_write;
-                    usd += cost_usd(u, self.info.price.as_ref()).unwrap_or(0.0);
+                    let price = self.setup.catalog.get(model).price;
+                    usd += cost_usd(u, price.as_ref()).unwrap_or(0.0);
                 }
                 (sum, usd)
             }

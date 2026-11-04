@@ -13,12 +13,12 @@ use serde_json::Value;
 use tautly_context::MutationReason;
 use tautly_context::pinned::{PinSource, Pinned};
 use tautly_memory::MemoryChange;
-use tautly_provider::{ModelId, ProviderEvent};
+use tautly_provider::{ModelId, ProviderEvent, RawUsage};
 use tautly_session::{BlobRef, RelPath, SessionReader};
 use tautly_tools::{PersistedEffect, ToolMeta};
 
 use crate::evidence::TestEvidence;
-use crate::protocol::{Command, FinishReason};
+use crate::protocol::{Command, FinishReason, UsageRole};
 
 /// One line of a session log, in the order things happened.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -63,6 +63,19 @@ pub enum SessionRecord {
     /// are merged into one event each; a response that broke off mid-stream (and was sent
     /// again) is not logged.
     Provider(ProviderEvent),
+    /// Usage no logged response carries, as charged (ledger, budgets, `Usage`): a
+    /// side-model request (a compaction summary, a consolidation, an episode, a
+    /// `web_fetch` answer), or the main model's usage for a response that reported none,
+    /// broke off or was cancelled (estimated, or as reported), and what the retry wrapper
+    /// discarded for it. With the `Provider(Usage)` and `Provider(DiscardedUsage)` events
+    /// of complete responses (spent on their step's `Request.model`) it is the session's
+    /// whole spend, so resume and receipts can price it without the cost ledger.
+    Charged {
+        role: UsageRole,
+        model: ModelId,
+        usage: RawUsage,
+        estimated: bool,
+    },
     /// A tool call of the response before it. `args` is the input as it stands in the
     /// history: an empty object when the model's JSON did not parse.
     ToolCall {
@@ -325,6 +338,7 @@ const KNOWN_TYPES: &[&str] = &[
     "prefix_applied",
     "request",
     "provider",
+    "charged",
     "tool_call",
     "tool_result",
     "edit",
@@ -634,6 +648,12 @@ mod tests {
                 },
             },
             SessionRecord::Provider(ProviderEvent::TextDelta(String::new())),
+            SessionRecord::Charged {
+                role: UsageRole::Side,
+                model: ModelId::from("mock/small"),
+                usage: RawUsage::default(),
+                estimated: false,
+            },
             SessionRecord::ToolCall {
                 id: String::new(),
                 name: String::new(),

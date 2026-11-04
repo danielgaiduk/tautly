@@ -473,6 +473,92 @@ async fn compaction_summary_requested_from_side_model_not_main() {
     ));
 }
 
+/// The tokens and cost of the `Usage` events of `role`.
+fn spent(events: &[Event], role: UsageRole) -> (u64, f64) {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            Event::Usage {
+                role: r,
+                tokens_in,
+                tokens_out,
+                cost_usd,
+                ..
+            } if *r == role => Some((tokens_in + tokens_out, cost_usd.unwrap_or(0.0))),
+            _ => None,
+        })
+        .fold((0, 0.0), |(t, c), (t2, c2)| (t + t2, c + c2))
+}
+
+/// Make the cost ledger unusable: resume then restores the spend from the log alone.
+fn break_ledger(fx: &Fx) {
+    let ledger = fx.home.path().join("ledger.sqlite");
+    let _ = std::fs::remove_file(&ledger);
+    for ext in ["-wal", "-shm"] {
+        let mut p = ledger.clone().into_os_string();
+        p.push(ext);
+        let _ = std::fs::remove_file(PathBuf::from(p));
+    }
+    std::fs::create_dir(&ledger).unwrap();
+}
+
+/// Review C M2: side-model usage is in the session log (not only the ledger), and a
+/// resume without the ledger prices each logged usage by the model it was spent on.
+#[tokio::test]
+async fn a_resume_without_the_ledger_counts_side_usage_priced_by_its_own_model() {
+    let fx = compaction_fx();
+    let main = MockProvider::new(compaction_script());
+    let side = MockProvider::new(vec![text_step("SUMMARY-TEXT", usage(2000, 300))]);
+    let mut run = start(fx.builder(config(Some(SMALL_PRICE)), &main, &side));
+    let id = run.engine.session_id().to_string();
+    let events = run.turn_with(&long_prompt()).await;
+    assert_eq!(finish_reason(&events), FinishReason::Completed);
+    let (main_tokens, main_usd) = spent(&events, UsageRole::Main);
+    let (side_tokens, side_usd) = spent(&events, UsageRole::Side);
+    assert_eq!(side_tokens, 2300);
+    run.engine.send(Command::Shutdown).await.unwrap();
+    while run.events.recv().await.is_some() {}
+    break_ledger(&fx);
+
+    let resume = |mock: &MockProvider| EngineBuilder {
+        resume: Some(id.clone()),
+        ..fx.builder(config(Some(SMALL_PRICE)), mock, &MockProvider::new(vec![]))
+    };
+    let budget = |max_usd: Option<f64>, max_tokens: Option<u64>| Command::SetBudget {
+        scope: tautly_core::BudgetScope::Session,
+        max_usd,
+        max_tokens,
+    };
+    // Tokens: the main steps' alone are within the limit, with the side request's not.
+    let mock = MockProvider::new(vec![text_step("never sent", usage(1, 1))]);
+    let mut run = start(resume(&mock));
+    run.engine
+        .send(budget(None, Some(main_tokens + 1)))
+        .await
+        .unwrap();
+    let events = run.turn_with("again").await;
+    assert_eq!(finish_reason(&events), FinishReason::Budget, "{events:?}");
+    assert!(mock.requests().is_empty());
+    run.engine.send(Command::Shutdown).await.unwrap();
+    while run.events.recv().await.is_some() {}
+
+    // Cost: just above what was spent, each response at its own model's price (the side
+    // request priced as the main model would be past it).
+    let mock = MockProvider::new(vec![text_step("sent", usage(1, 1))]);
+    let mut run = start(resume(&mock));
+    let limit = (main_usd + side_usd) * 1.01;
+    run.engine.send(budget(Some(limit), None)).await.unwrap();
+    let events = run.turn_with("again").await;
+    assert_eq!(
+        finish_reason(&events),
+        FinishReason::Completed,
+        "{events:?}"
+    );
+    assert_eq!(mock.requests().len(), 1);
+    run.engine.send(Command::Shutdown).await.unwrap();
+    while run.events.recv().await.is_some() {}
+}
+
 #[tokio::test]
 async fn side_usage_priced_and_recorded_with_side_model_id() {
     let fx = compaction_fx();

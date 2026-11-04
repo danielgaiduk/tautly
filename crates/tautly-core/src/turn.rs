@@ -434,7 +434,7 @@ impl Session {
             match resp.usage {
                 Some(u) => {
                     self.context.calibrate(&status, &u);
-                    self.spend(UsageRole::Main, u, resp.quota.clone(), false)
+                    self.spend(UsageRole::Main, u, resp.quota.clone(), false, true)
                         .await;
                 }
                 // A server that sends no usage (one that ignores `include_usage`) is
@@ -567,8 +567,10 @@ impl Session {
                     Some(Err(e)) => break Ended::Failed(e),
                 }
             };
+            // A complete response's discarded attempts are in its logged events.
+            let logged = matches!(ended, Ended::Done);
             for u in std::mem::take(&mut resp.discarded) {
-                self.spend(UsageRole::Main, u, None, false).await;
+                self.spend(UsageRole::Main, u, None, false, logged).await;
             }
             let e = match ended {
                 Ended::Done => return Ok(resp.finish()),
@@ -826,13 +828,22 @@ impl Session {
     async fn spend_partial(&mut self, role: UsageRole, resp: &Response, est_input: u64) {
         let est_output = resp.streamed_tokens(&self.context.tokens);
         let (u, estimated) = partial_usage(resp.usage, est_input, est_output);
-        self.spend(role, u, resp.quota.clone(), estimated).await;
+        self.spend(role, u, resp.quota.clone(), estimated, false)
+            .await;
     }
 
-    /// Account for one response of the main model (see [`Session::charge`]).
-    async fn spend(&mut self, role: UsageRole, u: RawUsage, quota: Option<Quota>, estimated: bool) {
+    /// Account for one response of the main model (see [`Session::charge`]); `in_log`:
+    /// a logged response carries this usage.
+    async fn spend(
+        &mut self,
+        role: UsageRole,
+        u: RawUsage,
+        quota: Option<Quota>,
+        estimated: bool,
+        in_log: bool,
+    ) {
         let (model, price) = (self.model.clone(), self.info.price);
-        self.charge(role, &model, price.as_ref(), u, quota, estimated)
+        self.charge(role, &model, price.as_ref(), u, quota, estimated, in_log)
             .await;
     }
 
@@ -840,8 +851,16 @@ impl Session {
     /// main model's (spec 7.5). An unpriced side model costs `None`.
     async fn spend_side(&mut self, u: RawUsage, estimated: bool) {
         let (model, price) = (self.side.model.clone(), self.side.info.price);
-        self.charge(UsageRole::Side, &model, price.as_ref(), u, None, estimated)
-            .await;
+        self.charge(
+            UsageRole::Side,
+            &model,
+            price.as_ref(),
+            u,
+            None,
+            estimated,
+            false,
+        )
+        .await;
     }
 
     /// Account for the side-model requests tools made (`web_fetch` answers) since the last
@@ -880,8 +899,10 @@ impl Session {
         );
     }
 
-    /// Account for one provider response of `model`: queue its ledger row, emit `Usage`, then
-    /// count it against the budgets (whose 80% and exhausted warnings follow the `Usage`).
+    /// Account for one provider response of `model`: queue its ledger row, log it as
+    /// `Charged` unless a logged response carries it (`in_log`), emit `Usage`, then count it
+    /// against the budgets (whose 80% and exhausted warnings follow the `Usage`).
+    #[allow(clippy::too_many_arguments)]
     async fn charge(
         &mut self,
         role: UsageRole,
@@ -890,7 +911,17 @@ impl Session {
         u: RawUsage,
         quota: Option<Quota>,
         estimated: bool,
+        in_log: bool,
     ) {
+        if !in_log {
+            self.log(SessionRecord::Charged {
+                role,
+                model: model.clone(),
+                usage: u,
+                estimated,
+            })
+            .await;
+        }
         let cost = cost_usd(&u, price);
         // Queued for the background writer: never waits (not even on the cancel path).
         let row = Row {
