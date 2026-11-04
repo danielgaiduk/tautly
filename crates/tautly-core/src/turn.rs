@@ -8,7 +8,8 @@
 //! index riding on the same epoch, so the cached prefix breaks at most once.
 //!
 //! Every provider response's usage (main and side, including a response that broke off
-//! and was sent again) is written to the cost ledger, shown as `Usage` and counted against
+//! and was sent again, and estimated for a response that reported none) is written to
+//! the cost ledger, shown as `Usage` and counted against
 //! the budgets (`budget.rs`). The budgets are checked at every step start, before every
 //! request and at every tool boundary. The turn timeout (`turn_timeout_s`) cancels the
 //! turn like `Cancel` does, and the turn ends with `timeout`.
@@ -425,10 +426,18 @@ impl Session {
             )
             .await;
             self.context.note_request(sent_at, status.cached_prefix);
-            if let Some(u) = resp.usage {
-                self.context.calibrate(&status, &u);
-                self.spend(UsageRole::Main, u, resp.quota.clone(), false)
-                    .await;
+            match resp.usage {
+                Some(u) => {
+                    self.context.calibrate(&status, &u);
+                    self.spend(UsageRole::Main, u, resp.quota.clone(), false)
+                        .await;
+                }
+                // A server that sends no usage (one that ignores `include_usage`) is
+                // charged an estimate, as side requests are; never calibrated with.
+                None => {
+                    self.spend_partial(UsageRole::Main, &resp, u64::from(status.used))
+                        .await
+                }
             }
             self.emit(Event::context_status(&status)).await;
             steps += 1;

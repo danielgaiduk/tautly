@@ -296,7 +296,8 @@ impl Fx {
         }
     }
 
-    /// `(model, cost_usd, input, output)` of every ledger row, once there are `n`.
+    /// `(model, cost_usd, input, output)` of every ledger row of reported usage (the
+    /// estimates for the main steps that report none are left out), once there are `n`.
     async fn ledger_rows(&self, n: usize) -> Vec<(String, Option<f64>, u64, u64)> {
         let end = Instant::now() + WAIT;
         loop {
@@ -317,9 +318,9 @@ impl Fx {
         else {
             return Vec::new();
         };
-        let Ok(mut stmt) =
-            conn.prepare("SELECT model, cost_usd, input, output FROM usage ORDER BY id")
-        else {
+        let Ok(mut stmt) = conn.prepare(
+            "SELECT model, cost_usd, input, output FROM usage WHERE estimated = 0 ORDER BY id",
+        ) else {
             return Vec::new();
         };
         stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
@@ -532,44 +533,41 @@ async fn an_unpriced_side_model_has_no_cost_and_the_usd_budget_warns_once() {
 #[tokio::test]
 async fn side_usage_has_role_side_and_counts_toward_budget_and_ledger() {
     let fx = compaction_fx();
-    let main = MockProvider::new(compaction_script());
+    let mut script = compaction_script();
+    script.push(text_step("never sent", usage(1, 1)));
+    let main = MockProvider::new(script);
     let side = MockProvider::new(vec![text_step("SUMMARY-TEXT", usage(2000, 300))]);
-    let mut cfg = config(Some(SMALL_PRICE));
-    // The main model's steps report nothing but the last (110 tokens): only the side
-    // request's 2,300 tokens can take the session past 80% of 2,800.
-    cfg.budget.session = BudgetLimits {
-        max_usd: None,
-        max_tokens: Some(2800),
-    };
-    let mut run = start(fx.builder(cfg, &main, &side));
+    let mut run = start(fx.builder(config(Some(SMALL_PRICE)), &main, &side));
     let events = run.turn_with(&long_prompt()).await;
     assert_eq!(finish_reason(&events), FinishReason::Completed);
-
-    let usage_at = events
-        .iter()
-        .position(|e| {
-            matches!(
-                e,
+    let tokens = |role: UsageRole| -> u64 {
+        events
+            .iter()
+            .filter_map(|e| match e {
                 Event::Usage {
-                    role: UsageRole::Side,
+                    role: r,
+                    tokens_in,
+                    tokens_out,
                     ..
-                }
-            )
+                } if *r == role => Some(tokens_in + tokens_out),
+                _ => None,
+            })
+            .sum()
+    };
+    assert_eq!(tokens(UsageRole::Side), 2300);
+    // The main steps' tokens alone are within this limit; with the side request's they
+    // are past it, so the next turn sends nothing.
+    run.engine
+        .send(Command::SetBudget {
+            scope: tautly_core::BudgetScope::Session,
+            max_usd: None,
+            max_tokens: Some(tokens(UsageRole::Main) + 1),
         })
-        .expect("a Usage with role side");
-    let warn_at = events
-        .iter()
-        .position(|e| matches!(e, Event::Warning { message } if message.contains("session budget 82% used")))
-        .unwrap_or_else(|| panic!("no 80% warning: {:?}", warnings(&events)));
-    assert!(warn_at > usage_at, "{events:?}");
-    // The main response's own usage came after the warning.
-    assert!(events[warn_at..].iter().any(|e| matches!(
-        e,
-        Event::Usage {
-            role: UsageRole::Main,
-            ..
-        }
-    )));
+        .await
+        .unwrap();
+    let next = run.turn_with("again").await;
+    assert_eq!(finish_reason(&next), FinishReason::Budget, "{next:?}");
+    assert_eq!(main.requests().len(), 5);
     let rows = fx.ledger_rows(2).await;
     assert_eq!(rows.iter().filter(|r| r.0 == SMALL).count(), 1);
 }
