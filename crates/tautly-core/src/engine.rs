@@ -324,6 +324,7 @@ impl EngineBuilder {
             cost_ledger_reported: false,
             groups: groups.clone(),
             lost_write_paths: Default::default(),
+            lost_write_probes: Default::default(),
             evidence: EvidenceTracker::new(test_matcher),
             mcp: None,
             pre_exec: self.pre_exec.unwrap_or_else(|| Arc::new(NoPreExec)),

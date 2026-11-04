@@ -322,6 +322,8 @@ struct Hang {
     /// A write of `late.txt` never returns, but lands on disk this long after it began
     /// (like a blocking write that outlives its dropped future).
     late_write: Option<Duration>,
+    /// Calls of `metadata` on `hang.txt` (each one never returns).
+    hung_metadata: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl Hang {
@@ -331,6 +333,7 @@ impl Hang {
             stall_after_write: None,
             written: Default::default(),
             late_write: None,
+            hung_metadata: Arc::default(),
         }
     }
 }
@@ -355,6 +358,8 @@ impl Sandbox for Hang {
     }
     async fn metadata(&self, p: &Path) -> Result<FileMeta, SandboxError> {
         if hangs(p) {
+            self.hung_metadata
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             std::future::pending::<()>().await;
         }
         self.sb.metadata(p).await
@@ -544,6 +549,54 @@ async fn a_write_stuck_past_its_bound_is_abandoned_and_reported() {
             .iter()
             .any(|w| w.contains("hang.txt may have changed")),
         "{events:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_hung_path_is_probed_by_at_most_one_metadata_call_at_a_time() {
+    let fx = Fx::new();
+    fx.write("a.txt", "alpha\n");
+    let read = |id: &str| call(id, "read", json!({"path": "a.txt"}));
+    let mock = MockProvider::new(vec![
+        tools_step(
+            vec![call(
+                "w1",
+                "write",
+                json!({"path": "hang.txt", "content": "x"}),
+            )],
+            None,
+        ),
+        tools_step(vec![read("r1")], None),
+        tools_step(vec![read("r2")], None),
+        tools_step(vec![read("r3")], None),
+        text_step("ok", tokens(1, 1)),
+    ]);
+    let hang = Hang::new(LocalSandbox::new(fx.root()).unwrap());
+    let probes = Arc::clone(&hang.hung_metadata);
+    let sb: Arc<dyn Sandbox> = Arc::new(hang);
+    let mut run = start(EngineBuilder {
+        sandbox: Some(sb),
+        ..fx.builder(config(false), &mock)
+    });
+    run.say("go").await;
+    run.until(|e| matches!(e, Event::ToolStarted { .. })).await;
+    run.send(Command::Cancel).await;
+    let first = run.turn().await;
+    assert!(
+        warnings(&first)
+            .iter()
+            .any(|w| w.contains("hang.txt may have changed")),
+        "{first:?}"
+    );
+    let after_abandon = probes.load(std::sync::atomic::Ordering::SeqCst);
+    // Four step starts each check the path; the first probe never returned, so no other
+    // is started beside it (each would hold a blocking thread on a real hung mount).
+    let second = run.turn_with("again").await;
+    assert_eq!(finish_reason(&second), FinishReason::Completed);
+    assert_eq!(
+        probes.load(std::sync::atomic::Ordering::SeqCst),
+        after_abandon,
+        "{second:?}"
     );
 }
 

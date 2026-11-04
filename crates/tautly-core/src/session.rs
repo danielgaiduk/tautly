@@ -355,6 +355,10 @@ pub(crate) struct Session {
     /// Paths of writes abandoned at their bound, with `(mtime, len)` last seen: a blocking
     /// write may still land after its future was dropped.
     pub lost_write_paths: HashMap<PathBuf, Option<(SystemTime, u64)>>,
+    /// A metadata probe of a lost-write path that did not answer in time, still running:
+    /// the next check waits on it again instead of starting another (on a hung file
+    /// system each probe holds a blocking thread).
+    pub lost_write_probes: HashMap<PathBuf, JoinHandle<Option<(SystemTime, u64)>>>,
     /// The running turn's test evidence (spec 7.11.7); replaced at every turn start.
     pub evidence: EvidenceTracker,
     /// The session's MCP servers, once started (`mcp.rs`); their tools join `tools` at
