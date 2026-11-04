@@ -7,6 +7,7 @@
 //! failed (a refused undo, an unknown session, ...). Usage errors exit 2, as clap does.
 
 pub mod auth;
+mod bisect;
 pub mod doctor;
 mod fork;
 mod index;
@@ -73,6 +74,9 @@ pub enum Command {
     Receipt(receipt::Args),
     /// Play a session back from its log: no model is called and nothing runs.
     Replay(replay::Args),
+    /// Find the step at which a check started failing, by running it on past states in a
+    /// temporary worktree.
+    Bisect(bisect::Args),
 }
 
 /// Run `command`; the exit code.
@@ -90,6 +94,7 @@ pub async fn run(command: Command, cli: &Cli) -> anyhow::Result<i32> {
         Command::Stats(args) => stats::run(args, &env),
         Command::Receipt(args) => receipt::run(args, &env),
         Command::Replay(args) => replay::run(args, &env).await,
+        Command::Bisect(args) => bisect::run(args, &env, cli).await,
     }
 }
 

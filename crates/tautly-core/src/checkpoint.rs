@@ -2257,6 +2257,26 @@ pub(crate) async fn worktree_checkout(dir: &Path) -> Result<(), CheckpointError>
     .await
 }
 
+/// Move the linked worktree `dir` to `commit` (a bisect's next state, spec 7.12.7), in its
+/// own configuration's context: `checkout --detach --force <commit>` (what a run changed
+/// in tracked files goes), then `clean -f -d` (what a run left untracked goes; ignored
+/// files, such as build caches, stay). No hook, filter or fsmonitor runs.
+pub(crate) async fn worktree_move(dir: &Path, commit: &str) -> Result<(), CheckpointError> {
+    in_worktree(dir, async |git| {
+        let deadline = Checkpointer::housekeeping_deadline();
+        git.run(
+            &["checkout", "-q", "--detach", "--force", commit],
+            None,
+            deadline,
+        )
+        .await?;
+        git.run(&["clean", "-q", "-f", "-d"], None, deadline)
+            .await?;
+        Ok(())
+    })
+    .await
+}
+
 /// What the linked worktree `dir` holds besides its HEAD, in its own configuration's
 /// context: the paths changed (modified, deleted, untracked) and the ignored files
 /// (Tautly's own scratch directory `.tautly/tmp` aside). From `git status --porcelain`.
