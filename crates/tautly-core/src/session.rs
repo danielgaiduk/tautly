@@ -43,7 +43,8 @@ const SPILL_MAX_BYTES: u64 = 256 * 1024 * 1024;
 /// How long an event waits for room in the channel once the turn is cancelled (or for
 /// the actor's last words) before it is dropped.
 const SEND_GRACE: Duration = Duration::from_secs(1);
-/// How long a cancelled turn's `TurnFinished` (and the drop warning before it) waits.
+/// How long a cancelled turn's last events (`TurnReceipt`, `TurnFinished` and the drop
+/// warning before them) wait, all together.
 const FINISH_GRACE: Duration = Duration::from_secs(5);
 
 /// Where events go. A client that stopped listening is not an error, and a client that
@@ -51,9 +52,10 @@ const FINISH_GRACE: Duration = Duration::from_secs(5);
 ///
 /// - A sink [`bound`](EventSink::bound) to a turn waits on a full channel until the turn is
 ///   cancelled. After that one event may wait [`SEND_GRACE`]; once one has timed out the
-///   turn's sink is overflowing and every further event is dropped at once, except
-///   `TurnFinished`, which (with the drop warning just before it) waits [`FINISH_GRACE`]
-///   once, so a busy but reading client still learns that the turn ended.
+///   turn's sink is overflowing and every further event is dropped at once, except the
+///   turn's last two, `TurnReceipt` and `TurnFinished`, which (with the drop warning just
+///   before them) share one [`FINISH_GRACE`], so a busy but reading client still learns
+///   that the turn ended.
 /// - A [`replying`](EventSink::replying) sink (the session's while it answers a command
 ///   between turns) waits [`SEND_GRACE`] for room; once one has timed out every further
 ///   event of that answer is dropped at once.
@@ -69,6 +71,8 @@ pub(crate) struct EventSink {
     dropped: Arc<AtomicU64>,
     /// Set for the turn (or the answer) once a send timed out.
     overflowing: Arc<AtomicBool>,
+    /// The turn's [`FINISH_GRACE`] deadline, set by the first of its last events.
+    finish_by: Arc<Mutex<Option<tokio::time::Instant>>>,
 }
 
 impl EventSink {
@@ -79,6 +83,7 @@ impl EventSink {
             replying: false,
             dropped: Arc::default(),
             overflowing: Arc::default(),
+            finish_by: Arc::default(),
         }
     }
 
@@ -88,6 +93,7 @@ impl EventSink {
             cancel: Some(cancel),
             replying: false,
             overflowing: Arc::default(),
+            finish_by: Arc::default(),
             ..self.clone()
         }
     }
@@ -145,10 +151,14 @@ impl EventSink {
         }
     }
 
-    /// A cancelled turn's last event: the drop warning (if any), then `ev`, within one
-    /// [`FINISH_GRACE`].
+    /// One of a cancelled turn's last events: the drop warning (if any), then `ev`, within
+    /// the [`FINISH_GRACE`] the turn's first such event started.
     async fn finish(&self, ev: Event) {
-        let deadline = tokio::time::Instant::now() + FINISH_GRACE;
+        let deadline = *self
+            .finish_by
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get_or_insert_with(|| tokio::time::Instant::now() + FINISH_GRACE);
         let n = self.dropped.swap(0, Ordering::Relaxed);
         if n > 0 {
             match tokio::time::timeout_at(deadline, self.tx.reserve()).await {

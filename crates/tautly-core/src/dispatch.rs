@@ -619,7 +619,7 @@ impl Session {
             result.is_error,
             turn,
         );
-        if let Some(r) = &mut self.receipt {
+        if ran && let Some(r) = &mut self.receipt {
             r.tool(&result.meta);
         }
         let event = Event::ToolFinished {

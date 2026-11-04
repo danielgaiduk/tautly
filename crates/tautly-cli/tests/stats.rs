@@ -440,3 +440,62 @@ fn receipt_without_a_session_or_receipts_says_so() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+#[test]
+fn receipt_falls_back_to_the_newest_session_with_receipts() {
+    let s = Scratch::new();
+    let root = s.root();
+    let project = tautly_session::paths::project_id(&root);
+    let older = s.session("older", None);
+    let newest = s.session("newest, no turn finished yet", None);
+    s.ledger()
+        .record_receipt(
+            &older,
+            &project,
+            &root,
+            &receipt(1, "m/a", 1, 1, None, 1, [0; 4], false),
+        )
+        .unwrap();
+    let out = s.run(&["receipt"]);
+    assert_eq!(out.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stdout.contains(&older), "{stdout}");
+    assert!(
+        stderr.contains(&newest) && stderr.contains("no receipts yet"),
+        "{stderr}"
+    );
+    // Named explicitly, a session without receipts is still an error.
+    let out = s.run(&["receipt", "--session", &newest]);
+    assert_eq!(out.status.code(), Some(1));
+}
+
+#[test]
+fn receipt_cost_shows_the_priced_sum_when_a_turn_is_unpriced() {
+    let s = Scratch::new();
+    let root = s.root();
+    let project = tautly_session::paths::project_id(&root);
+    let id = s.session("x", None);
+    let l = s.ledger();
+    l.record_receipt(
+        &id,
+        &project,
+        &root,
+        &receipt(1, "m/a", 1, 1, Some(0.015), 1, [0; 4], false),
+    )
+    .unwrap();
+    l.record_receipt(
+        &id,
+        &project,
+        &root,
+        &receipt(2, "m/b", 1, 1, None, 1, [0; 4], false),
+    )
+    .unwrap();
+    let out = s.ok(&["receipt"]);
+    let cost = out
+        .lines()
+        .find(|l| l.starts_with("cost"))
+        .unwrap_or_else(|| panic!("{out}"));
+    assert!(cost.contains("$0.0150?"), "{out}");
+    assert!(out.contains("?:"), "a legend for `?`: {out}");
+}

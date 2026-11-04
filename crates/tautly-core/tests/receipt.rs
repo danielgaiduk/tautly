@@ -63,6 +63,7 @@ struct Receipt {
     steps: u32,
     tool_calls: u32,
     saved: Savings,
+    estimated: bool,
 }
 
 fn receipt(ev: &Event) -> Receipt {
@@ -80,8 +81,10 @@ fn receipt(ev: &Event) -> Receipt {
             steps,
             tool_calls,
             saved,
+            estimated,
             ..
         } => Receipt {
+            estimated: *estimated,
             turn: *turn,
             tokens_in: *tokens_in,
             tokens_out: *tokens_out,
@@ -108,10 +111,10 @@ fn close(a: f64, b: f64) -> bool {
 #[test]
 fn receipt_sums_main_and_side_and_reports_side_tokens() {
     let mut b = builder();
-    b.request(0);
+    b.request(2, 0);
     b.usage(UsageRole::Main, &usage(1000, 200, 300, 40), Some(0.01));
     b.usage(UsageRole::Side, &usage(500, 50, 10, 0), Some(0.002));
-    b.request(0);
+    b.request(3, 0);
     b.usage(UsageRole::Main, &usage(100, 20, 0, 0), Some(0.001));
     b.tool(&ToolMeta::default());
     let r = receipt(&b.finish(Some(&PRICE), Instant::now()));
@@ -145,12 +148,24 @@ fn cache_hit_ratio_formula() {
 fn context_gc_saving_counts_elided_tokens_per_later_request() {
     // GC frees 3,000 tokens before request 2 of 3: requests 2 and 3 each go without them.
     let mut b = builder();
-    b.request(0);
-    b.request(3000);
-    b.request(3000);
+    b.request(2, 0);
+    b.request(3, 3000);
+    b.request(4, 3000);
     let r = receipt(&b.finish(None, Instant::now()));
     assert_eq!(r.saved.context_gc, 6000);
     assert_eq!(r.steps, 3);
+}
+
+#[test]
+fn a_step_sent_again_counts_once_and_its_requests_each_count_gc() {
+    // Step 2 overflowed and was sent again after a compaction: one step, two requests.
+    let mut b = builder();
+    b.request(2, 1000);
+    b.request(2, 1000);
+    b.request(3, 1000);
+    let r = receipt(&b.finish(None, Instant::now()));
+    assert_eq!(r.steps, 2);
+    assert_eq!(r.saved.context_gc, 3000);
 }
 
 #[test]
@@ -193,11 +208,25 @@ fn cache_usd_formula_can_be_negative() {
 }
 
 #[test]
+fn cache_usd_counts_only_the_main_models_cache_tokens() {
+    // The side model's cache tokens are priced at its own rates, never the main model's:
+    // they are left out of `cache_usd` (and still counted in the token fields).
+    let mut b = builder();
+    b.usage(UsageRole::Main, &usage(500, 100, 1000, 0), None);
+    b.usage(UsageRole::Side, &usage(500, 100, 90_000, 70_000), None);
+    let r = receipt(&b.finish(Some(&PRICE), Instant::now()));
+    let expected = 1000.0 * (3.0 - 0.3) / 1e6;
+    assert!(close(r.saved.cache_usd.unwrap(), expected), "{r:?}");
+    assert_eq!((r.cache_read, r.cache_write), (91_000, 70_000));
+    assert_eq!(r.saved.cache_read_tokens, 91_000);
+}
+
+#[test]
 fn total_usd_prices_gc_at_cache_read_and_is_none_without_prices() {
     let run = |price: Option<&Price>| {
         let mut b = builder();
-        b.request(0);
-        b.request(10_000);
+        b.request(2, 0);
+        b.request(3, 10_000);
         b.tool(&saved_meta(SaveKind::Index, 40_000));
         b.tool(&saved_meta(SaveKind::DiffRead, 4_000));
         b.tool(&saved_meta(SaveKind::Filter, 4_000));
@@ -283,15 +312,20 @@ impl Fx {
         self.dir.path().canonicalize().unwrap()
     }
 
-    fn start(&self, cfg: Config, mock: &MockProvider) -> Run {
-        let (engine, events) = EngineBuilder {
+    fn builder(&self, cfg: Config, mock: &MockProvider) -> EngineBuilder {
+        EngineBuilder {
             provider: Some(Arc::new(mock.clone())),
             data_home: Some(self.home.path().to_path_buf()),
             ..EngineBuilder::new(cfg, self.dir.path())
         }
-        .build()
-        .unwrap();
-        Run { engine, events }
+    }
+
+    fn start(&self, cfg: Config, mock: &MockProvider) -> Run {
+        launch(self.builder(cfg, mock))
+    }
+
+    fn write(&self, rel: &str, text: &str) {
+        std::fs::write(self.dir.path().join(rel), text).unwrap();
     }
 
     fn ledger(&self) -> Ledger {
@@ -304,7 +338,20 @@ struct Run {
     events: mpsc::Receiver<Event>,
 }
 
+fn launch(b: EngineBuilder) -> Run {
+    let (engine, events) = b.build().unwrap();
+    Run { engine, events }
+}
+
 impl Run {
+    /// Shut down and wait for the event stream to close (the log is released).
+    async fn stop(mut self) {
+        self.send(Command::Shutdown).await;
+        let closed =
+            tokio::time::timeout(WAIT, async { while self.events.recv().await.is_some() {} }).await;
+        assert!(closed.is_ok(), "the engine did not stop");
+    }
+
     async fn send(&self, cmd: Command) {
         self.engine.send(cmd).await.unwrap();
     }
@@ -477,6 +524,212 @@ async fn receipt_row_written_to_ledger() {
     assert_eq!((row.steps, row.tool_calls, row.wall_ms), (2, 1, r.wall_ms));
     assert!(close(row.cost_usd.unwrap(), r.cost_usd.unwrap()));
     assert_eq!(row.saved, r.saved);
+}
+
+fn call(id: &str, name: &str, args: serde_json::Value) -> ProviderEvent {
+    ProviderEvent::ToolCall {
+        id: id.into(),
+        name: name.into(),
+        input_json: args.to_string(),
+    }
+}
+
+/// Four reads of small files, each its own step (enough history to compact).
+fn four_reads(fx: &Fx) -> Vec<MockTurn> {
+    (1..=4)
+        .map(|i| {
+            fx.write(&format!("f{i}.txt"), &format!("file {i}\n"));
+            tools_step(
+                vec![call(
+                    &format!("r{i}"),
+                    "read",
+                    json!({ "path": format!("f{i}.txt") }),
+                )],
+                usage(10, 1, 0, 0),
+            )
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn an_overflow_retry_is_one_step() {
+    let fx = Fx::new();
+    let mut script = four_reads(&fx);
+    script.push(text_step("first done", usage(10, 1, 0, 0)));
+    // The second turn's step overflows, is compacted and sent again: still one step.
+    script.push(MockTurn::Error(
+        tautly_provider::ProviderError::ContextOverflow("too long".into()),
+    ));
+    script.push(text_step("SUMMARY-ONE", usage(10, 1, 0, 0)));
+    script.push(text_step("second done", usage(10, 1, 0, 0)));
+    let mock = MockProvider::new(script);
+    let mut run = fx.start(config(100), &mock);
+    check_receipt(&run.turn_with("first").await, FinishReason::Completed);
+    let events = run.turn_with("second").await;
+    assert!(
+        events.iter().any(|e| matches!(e, Event::Compacted { .. })),
+        "{events:?}"
+    );
+    let r = check_receipt(&events, FinishReason::Completed);
+    assert_eq!(r.steps, 1, "{r:?}");
+}
+
+/// `tokens_freed` of the turn's one collection.
+fn freed(events: &[Event]) -> u64 {
+    let freed: Vec<u64> = events
+        .iter()
+        .filter_map(|e| match e {
+            Event::ContextCollected { tokens_freed, .. } => Some(u64::from(*tokens_freed)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(freed.len(), 1, "{events:?}");
+    assert!(freed[0] > 0);
+    freed[0]
+}
+
+#[tokio::test]
+async fn context_gc_counts_elisions_through_the_engine_and_across_a_resume() {
+    let fx = Fx::new();
+    let big: String = (0..400)
+        .map(|i| format!("line {i}: some filler text to make this file large\n"))
+        .collect();
+    fx.write("big.txt", &big);
+    // Request 2 re-reads the file, so request 3 starts with a collection that elides the
+    // first read: requests 3 and 4 each go without its tokens.
+    let mock = MockProvider::new(vec![
+        tools_step(
+            vec![call("r1", "read", json!({"path": "big.txt"}))],
+            usage(10, 1, 0, 0),
+        ),
+        tools_step(
+            vec![call("r2", "read", json!({"path": "big.txt", "full": true}))],
+            usage(10, 1, 0, 0),
+        ),
+        tools_step(vec![bash("b1", "true")], usage(10, 1, 0, 0)),
+        text_step("done", usage(10, 1, 0, 0)),
+    ]);
+    let mut run = fx.start(config(100), &mock);
+    let events = run.turn_with("go").await;
+    let freed = freed(&events);
+    let r = check_receipt(&events, FinishReason::Completed);
+    assert_eq!(r.steps, 4);
+    assert_eq!(r.saved.context_gc, 2 * freed, "{r:?}");
+    let id = run.engine.session_id().to_string();
+    run.stop().await;
+
+    // Resumed: the elided read is still out of the context at both requests.
+    let mock = MockProvider::new(vec![
+        tools_step(vec![bash("b2", "echo again")], usage(10, 1, 0, 0)),
+        text_step("done again", usage(10, 1, 0, 0)),
+    ]);
+    let mut run = launch(EngineBuilder {
+        resume: Some(id),
+        ..fx.builder(config(100), &mock)
+    });
+    let events = run.turn_with("again").await;
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, Event::ContextCollected { .. })),
+        "{events:?}"
+    );
+    let r = check_receipt(&events, FinishReason::Completed);
+    assert_eq!(r.turn, 2);
+    assert_eq!(r.saved.context_gc, 2 * freed, "{r:?}");
+}
+
+const MAIN: &str = "mock/main";
+const SMALL: &str = "mock/small";
+
+#[tokio::test]
+async fn side_and_estimated_usage_through_the_engine() {
+    let model = |id: &str, tier: &str, price: &str| {
+        format!(
+            "[models.\"{id}\"]\n{tier}context_window = 16000\nmax_output = 1000\n\
+             parallel_tools = true\nreasoning = \"none\"\ncache = \"none\"\nimages = false\n\
+             edit_format = \"str_replace\"\n[models.\"{id}\".price]\n{price}\n"
+        )
+    };
+    let catalog = format!(
+        "{}{}",
+        model(MAIN, "", PRICE_TOML),
+        model(
+            SMALL,
+            "tier = \"small\"\n",
+            "input = 1.0\noutput = 5.0\ncache_read = 0.1\ncache_write = 1.25"
+        )
+    );
+    let mut cfg = Config {
+        model: ModelId::from(MAIN),
+        catalog_overrides: Some(Catalog::from_toml(&catalog).unwrap()),
+        ..Config::default()
+    };
+    cfg.permissions.mode = Mode::Yolo;
+    let fx = Fx::new();
+    // The reads report no usage (charged as estimates); the long prompt makes the fifth
+    // step compact, with a summary from the side model.
+    let mut script: Vec<MockTurn> = four_reads(&fx)
+        .into_iter()
+        .map(|t| match t {
+            MockTurn::Events(evs) => MockTurn::Events(
+                evs.into_iter()
+                    .filter(|e| !matches!(e, ProviderEvent::Usage(_)))
+                    .collect(),
+            ),
+            other => other,
+        })
+        .collect();
+    script.push(text_step("done", usage(100, 10, 0, 0)));
+    let main = MockProvider::new(script);
+    let side = MockProvider::new(vec![text_step("SUMMARY-TEXT", usage(2000, 300, 0, 0))]);
+    let mut run = launch(EngineBuilder {
+        side_provider: Some(Arc::new(side.clone())),
+        ..fx.builder(cfg, &main)
+    });
+    let prompt = format!("PROMPT {}", "lorem ipsum dolor sit amet ".repeat(1500));
+    let events = run.turn_with(&prompt).await;
+    assert!(
+        events.iter().any(|e| matches!(e, Event::Compacted { .. })),
+        "{events:?}"
+    );
+    let r = check_receipt(&events, FinishReason::Completed);
+    assert_eq!(r.side_tokens, 2300, "{r:?}");
+    assert!(r.estimated, "the reads' usage was estimated");
+    // Each usage priced by its own model, summed.
+    let costs: Vec<(UsageRole, f64)> = events
+        .iter()
+        .filter_map(|e| match e {
+            Event::Usage { role, cost_usd, .. } => Some((*role, cost_usd.unwrap())),
+            _ => None,
+        })
+        .collect();
+    let side_cost: f64 = costs
+        .iter()
+        .filter(|(role, _)| *role == UsageRole::Side)
+        .map(|(_, c)| c)
+        .sum();
+    assert!(
+        close(side_cost, (2000.0 * 1.0 + 300.0 * 5.0) / 1e6),
+        "{costs:?}"
+    );
+    let total: f64 = costs.iter().map(|(_, c)| c).sum();
+    assert!(close(r.cost_usd.unwrap(), total), "{r:?} {costs:?}");
+}
+
+#[tokio::test]
+async fn tool_calls_count_only_calls_that_ran() {
+    let fx = Fx::new();
+    let mock = MockProvider::new(vec![
+        tools_step(
+            vec![bash("b1", "true"), call("x1", "no_such_tool", json!({}))],
+            usage(10, 1, 0, 0),
+        ),
+        text_step("done", usage(10, 1, 0, 0)),
+    ]);
+    let mut run = fx.start(config(100), &mock);
+    let r = check_receipt(&run.turn_with("go").await, FinishReason::Completed);
+    assert_eq!(r.tool_calls, 1, "{r:?}");
 }
 
 // ---- configuration -----------------------------------------------------------------------

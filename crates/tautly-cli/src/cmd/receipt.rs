@@ -25,28 +25,68 @@ pub struct Args {
     markdown: bool,
 }
 
+/// What `?` after an amount means.
+const UNPRICED_NOTE: &str =
+    "some turns used a model without a known price; the amount covers the priced ones";
+
 pub fn run(args: Args, env: &Env) -> anyhow::Result<i32> {
+    let ledger = open_ledger(env)?;
+    let receipts_of = |id: &str| -> anyhow::Result<Vec<StoredReceipt>> {
+        Ok(match &ledger {
+            Some(l) => l.session_receipts(id)?,
+            None => Vec::new(),
+        })
+    };
+    let no_receipts = |id: &str| {
+        anyhow::anyhow!(
+            "session {id} has no receipts (it has not finished a turn, ran before receipts \
+             were recorded, or the cost ledger was unavailable)"
+        )
+    };
     // `--last` only says the default out loud.
-    let session = match &args.session {
-        Some(id) => env.find_session(id)?,
-        None => match env.latest_session()? {
-            Some(s) => s,
-            None => bail!("no session in this work tree yet"),
-        },
+    let (session, receipts) = match &args.session {
+        Some(id) => {
+            let session = env.find_session(id)?;
+            let receipts = receipts_of(&session.id)?;
+            if receipts.is_empty() {
+                return Err(no_receipts(&session.id));
+            }
+            (session, receipts)
+        }
+        None => {
+            let Some(newest) = env.latest_session()? else {
+                bail!("no session in this work tree yet");
+            };
+            let receipts = receipts_of(&newest.id)?;
+            if receipts.is_empty() {
+                // A session that just started (or broke off in its first turn) has none
+                // yet: show the newest one that has.
+                let mut found = None;
+                for s in tautly_core::list_logs_here(&env.data_home, env.root())? {
+                    let r = receipts_of(&s.id)?;
+                    if !r.is_empty() {
+                        found = Some((s, r));
+                        break;
+                    }
+                }
+                let Some(found) = found else {
+                    return Err(no_receipts(&newest.id));
+                };
+                eprintln!(
+                    "tautly: the newest session {} has no receipts yet; showing {} (choose \
+                     one with --session ID)",
+                    newest.id, found.0.id
+                );
+                found
+            } else {
+                (newest, receipts)
+            }
+        }
     };
-    let receipts = match open_ledger(env)? {
-        Some(ledger) => ledger.session_receipts(&session.id)?,
-        None => Vec::new(),
-    };
-    if receipts.is_empty() {
-        bail!(
-            "session {} has no receipts (it ran before receipts were recorded, or the cost \
-             ledger was unavailable)",
-            session.id
-        );
-    }
     let evidence = last_evidence(&session)?;
-    let rows = rows(&Summary::of(&receipts), evidence.as_ref());
+    let summary = Summary::of(&receipts);
+    let rows = rows(&summary, evidence.as_ref());
+    let unpriced = summary.cost_usd.partial || summary.total_usd.partial;
     if args.markdown {
         println!("| Tautly receipt | |");
         println!("|---|---|");
@@ -55,13 +95,46 @@ pub fn run(args: Args, env: &Env) -> anyhow::Result<i32> {
         }
         println!();
         println!("est. = estimate (bytes / 4, against a plain harness with the same 30 KB cap)");
+        if unpriced {
+            println!("? = {UNPRICED_NOTE}");
+        }
     } else {
         println!("{:<14} {}", "session", session.id);
         for (label, value) in rows {
             println!("{:<14} {value}", label.to_lowercase());
         }
+        if unpriced {
+            println!("\n?: {UNPRICED_NOTE}");
+        }
     }
     Ok(0)
+}
+
+/// A sum of amounts some of which may be unknown (an unpriced model).
+#[derive(Default, Clone, Copy)]
+struct Priced {
+    /// The known amounts summed; `None` when none was known.
+    sum: Option<f64>,
+    /// Some amount was unknown.
+    partial: bool,
+}
+
+impl Priced {
+    fn add(&mut self, v: Option<f64>) {
+        match v {
+            Some(v) => self.sum = Some(self.sum.unwrap_or(0.0) + v),
+            None => self.partial = true,
+        }
+    }
+
+    /// The amount, with `?` when it covers only the priced part.
+    fn show(self) -> String {
+        let mut s = usd(self.sum);
+        if self.partial && self.sum.is_some() {
+            s.push('?');
+        }
+        s
+    }
 }
 
 /// A Markdown table cell: a `|` would end it.
@@ -94,26 +167,19 @@ struct Summary {
     cache_read: u64,
     cache_write: u64,
     side_tokens: u64,
-    cost_usd: Option<f64>,
+    cost_usd: Priced,
     estimated: bool,
     index: u64,
     diff_reads: u64,
     context_gc: u64,
     filters: u64,
-    cache_usd: Option<f64>,
-    total_usd: Option<f64>,
+    cache_usd: Priced,
+    total_usd: Priced,
 }
 
 impl Summary {
     fn of(receipts: &[StoredReceipt]) -> Summary {
-        // A sum of amounts is known only when every one is.
-        let add = |acc: Option<f64>, v: Option<f64>| acc.zip(v).map(|(a, b)| a + b);
-        let mut s = Summary {
-            cost_usd: Some(0.0),
-            cache_usd: Some(0.0),
-            total_usd: Some(0.0),
-            ..Summary::default()
-        };
+        let mut s = Summary::default();
         for r in receipts {
             s.models.insert(r.model.clone());
             s.turns += 1;
@@ -124,14 +190,14 @@ impl Summary {
             s.cache_read += r.cache_read;
             s.cache_write += r.cache_write;
             s.side_tokens += r.side_tokens;
-            s.cost_usd = add(s.cost_usd, r.cost_usd);
+            s.cost_usd.add(r.cost_usd);
             s.estimated |= r.estimated;
             s.index += r.saved.index;
             s.diff_reads += r.saved.diff_reads;
             s.context_gc += r.saved.context_gc;
             s.filters += r.saved.filters;
-            s.cache_usd = add(s.cache_usd, r.saved.cache_usd);
-            s.total_usd = add(s.total_usd, r.saved.total_usd);
+            s.cache_usd.add(r.saved.cache_usd);
+            s.total_usd.add(r.saved.total_usd);
         }
         s
     }
@@ -163,7 +229,7 @@ fn rows(s: &Summary, evidence: Option<&TestEvidence>) -> Vec<(&'static str, Stri
             "Cache hit",
             percent((seen > 0).then(|| s.cache_read as f64 / seen as f64)),
         ),
-        ("Cost", format!("{}{est}", usd(s.cost_usd))),
+        ("Cost", format!("{}{est}", s.cost_usd.show())),
         (
             "Saved (est.)",
             format!(
@@ -177,7 +243,11 @@ fn rows(s: &Summary, evidence: Option<&TestEvidence>) -> Vec<(&'static str, Stri
         ),
         (
             "Saved $ (est.)",
-            format!("{} (prompt cache {})", usd(s.total_usd), usd(s.cache_usd)),
+            format!(
+                "{} (prompt cache {})",
+                s.total_usd.show(),
+                s.cache_usd.show()
+            ),
         ),
         ("Last test", last_test(evidence)),
     ]

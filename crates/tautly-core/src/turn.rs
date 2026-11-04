@@ -26,6 +26,7 @@ use std::time::{Duration, Instant};
 
 use futures::StreamExt;
 use tautly_context::compact::DEFAULT_KEEP_RECENT;
+use tautly_context::gc;
 use tautly_context::schedule::{self, MutationReason};
 use tautly_context::{CompactError, ContextStatus, GcRecord, TokenEstimator, Turn};
 use tautly_provider::{
@@ -50,9 +51,6 @@ use crate::session::Session;
 
 /// A response that breaks off after content is sent again at most this many times.
 const MAX_REISSUES: u32 = 4;
-
-/// How a result elided by GC starts (`[elided: superseded at turn N]`, tautly-context).
-const ELIDED_STUB: &str = "[elided: superseded at turn ";
 
 /// What a turn task gets from the actor.
 pub(crate) struct TurnControl {
@@ -386,7 +384,7 @@ impl Session {
             .flat_map(|t| &t.messages)
             .flat_map(|m| &m.content)
             .filter_map(|c| match c {
-                Content::ToolResult { id, output, .. } if output.starts_with(ELIDED_STUB) => {
+                Content::ToolResult { id, output, .. } if gc::is_elided_stub(output) => {
                     Some(id.as_str())
                 }
                 _ => None,
@@ -441,7 +439,7 @@ impl Session {
             self.log_request(&req, turn).await;
             let elided = self.elided_out_of_context();
             if let Some(r) = &mut self.receipt {
-                r.request(elided);
+                r.request(turn, elided);
             }
             let sent_at = Instant::now();
             let retry_without_reasoning = std::mem::take(&mut self.reasoning_retry);

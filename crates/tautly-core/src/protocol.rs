@@ -269,8 +269,10 @@ pub enum Event {
     /// `TurnFinished` whatever the reason. Token fields sum the main and side roles;
     /// `side_tokens` is the side share (input + output). `cache_hit_ratio` is
     /// `cache_read / (tokens_in + cache_read)`, absent when both are 0. `wall_ms` runs
-    /// from `TurnStarted` to `TurnFinished`; `steps` counts provider requests. Every
-    /// number in `saved` is an estimate: clients label it "est.".
+    /// from `TurnStarted` to `TurnFinished`. `steps` counts distinct provider steps (a step
+    /// sent again after an overflow counts once); `tool_calls` counts the calls that ran
+    /// (not those refused, denied, blocked or cancelled first). Every number in `saved` is
+    /// an estimate: clients label it "est.".
     TurnReceipt {
         turn: u32,
         model: ModelId,
