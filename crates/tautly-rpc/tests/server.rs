@@ -1093,7 +1093,7 @@ async fn session_new_resumes_and_forks_a_closed_session() {
     .await;
     let events = c.until_type(&branch, "turn_finished").await;
     assert_eq!(text_of(&events, &branch), "forked answer");
-    // Worktree forks are not part of this protocol version yet.
+    // A worktree fork (spec 7.12.4) is refused outside git.
     c.ok("session/close", json!({"session_id": branch})).await;
     assert_ne!(
         c.err(

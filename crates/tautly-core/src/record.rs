@@ -216,6 +216,11 @@ pub enum SessionRecord {
         /// Every path it is about to write (the snapshot holds the rest of the tree too).
         #[serde(default)]
         paths: Vec<RelPath>,
+        /// Written by `tautly sessions restore-backup` itself (what it replaced), not by a
+        /// rewind or switch: a later `restore-backup` puts it back only when asked
+        /// (`--include-own`, Task 49 M-R3b).
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        restore_backup: bool,
     },
     /// The end of the restore a `RestoreBegun` started: whether the files are now the
     /// target's (`applied`), else whether they were put back (`rolled_back`).
@@ -312,6 +317,10 @@ pub struct BackupFile {
     /// tell a later human edit (Task 49 N10).
     #[serde(default)]
     pub wrote: Option<Wrote>,
+    /// The permission bits the restore wrote there (none: not known), so a later
+    /// mode-only change is told apart too (Task 49 M-R3c).
+    #[serde(default)]
+    pub wrote_mode: Option<u32>,
 }
 
 /// What a restore wrote at a path.
@@ -840,7 +849,9 @@ mod tests {
                     blob: Some(BlobRef::parse(&"b".repeat(64)).unwrap()),
                     mode: Some(0o644),
                     wrote: Some(Wrote::Absent),
+                    wrote_mode: Some(0o600),
                 }],
+                restore_backup: true,
             },
             SessionRecord::RestoreEnded {
                 applied: false,

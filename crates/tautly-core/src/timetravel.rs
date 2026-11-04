@@ -607,7 +607,11 @@ async fn blocking<T: Send + 'static>(
 /// How many records a rewind to step `at` copies: through the cut's last record, or for
 /// `at = 0` with nothing kept before the first step, the records before that step's first
 /// one (commands and set-up, which change nothing). None: nothing to copy.
-fn copy_count(reader: &SessionReader<SessionRecord>, at: u32, cut: &Rebuilt) -> Option<u64> {
+pub(crate) fn copy_count(
+    reader: &SessionReader<SessionRecord>,
+    at: u32,
+    cut: &Rebuilt,
+) -> Option<u64> {
     if let Some(end) = cut.end_offset {
         return Some(end + 1);
     }

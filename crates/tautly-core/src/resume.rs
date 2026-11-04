@@ -247,12 +247,18 @@ pub(crate) fn rebuild_with(
     // Pins of a turn the log ends in (or the cut closes) reach the context as its
     // leftovers would have.
     r.apply_pending();
-    if let Some((backup, paths, kept)) = r.restoring.take() {
+    if let Some((backup, paths, kept, own)) = r.restoring.take() {
         let id = &reader.header().session_id;
         let names: Vec<&str> = paths.iter().map(tautly_session::RelPath::as_str).collect();
         let list = names.join(" ");
         let restore_cmd = format!("`tautly sessions restore-backup {id}`");
         r.warn(match backup {
+            _ if own => format!(
+                "{restore_cmd} was cut off while it wrote {list}: running it again finishes \
+                 putting back the backup of the rewind or switch before it; with \
+                 --include-own it instead puts back what it replaced, which it kept in the \
+                 session log"
+            ),
             Some(b) => {
                 let mut text = format!(
                     "a rewind or switch was cut off while it wrote {list}; their content from \
@@ -337,9 +343,10 @@ struct Replay<'a> {
     logged_tools: Option<Vec<ToolSpec>>,
     /// Records of a type this version does not know, skipped.
     unknown: usize,
-    /// A rewind or switch began writing files and its end is not logged: the backup ref
-    /// it named, if any.
-    restoring: Option<(Option<String>, Vec<tautly_session::RelPath>, bool)>,
+    /// A rewind or switch (or `restore-backup`) began writing files and its end is not
+    /// logged: the backup ref it named, if any, the paths, whether the log kept files, and
+    /// whether `restore-backup` wrote it.
+    restoring: Option<(Option<String>, Vec<tautly_session::RelPath>, bool, bool)>,
 }
 
 impl Replay<'_> {
@@ -507,7 +514,8 @@ impl Replay<'_> {
                 backup_ref,
                 files,
                 paths,
-            } => self.restoring = Some((backup_ref, paths, !files.is_empty())),
+                restore_backup,
+            } => self.restoring = Some((backup_ref, paths, !files.is_empty(), restore_backup)),
             SessionRecord::RestoreEnded { .. } => self.restoring = None,
             SessionRecord::Unknown => self.unknown += 1,
         }

@@ -54,6 +54,20 @@ impl Drop for ExclusiveGuard {
     fn drop(&mut self) {
         // No other holder can hold it exclusively (that needs the gate): never waits.
         let _ = flock(&self.file, libc::LOCK_SH);
+        // Let go of the gate explicitly: a child forked by any thread of the process
+        // holds a copy of this descriptor until it execs, and only closing ours would
+        // leave the gate locked through it (Task 50 M1). The lock belongs to the open
+        // file description, which the copy shares, so this frees it for every copy.
+        let _ = flock(&self._gate, libc::LOCK_UN);
+    }
+}
+
+impl Drop for Lease {
+    fn drop(&mut self) {
+        // As for the gate: a forked copy of the descriptor must not keep the working tree
+        // leased once this engine is gone. An exclusive guard (which shares the file) never
+        // outlives the lease it came from.
+        let _ = flock(&self.file, libc::LOCK_UN);
     }
 }
 
@@ -174,6 +188,7 @@ impl Lease {
                 // The conversion may have dropped the shared lock: take it back (no one
                 // else can hold it exclusively while the gate is ours).
                 let _ = flock(&self.file, libc::LOCK_SH);
+                let _ = flock(&gate, libc::LOCK_UN);
                 if would_block(&e) {
                     Err(LeaseError::Busy)
                 } else {
@@ -228,5 +243,41 @@ mod tests {
         assert!(matches!(a.try_exclusive(), Err(LeaseError::Busy)));
         drop(gate);
         assert!(a.try_exclusive().is_ok());
+    }
+
+    /// A copy of `file`'s descriptor (as a forked child holds one until it execs): the same
+    /// open file description, so the same `flock` lock.
+    fn copy_of(file: &File) -> std::os::fd::OwnedFd {
+        use std::os::fd::FromRawFd;
+        // SAFETY: dup of a descriptor we own; the new one is owned by the result.
+        let fd = unsafe { libc::dup(file.as_raw_fd()) };
+        assert!(fd >= 0);
+        unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) }
+    }
+
+    #[test]
+    fn a_gate_let_go_is_free_while_a_forked_copy_lives() {
+        // Task 50 M1: a child forked by any thread of the process carries every open file
+        // until it execs; closing ours must not leave the gate locked through that copy.
+        let home = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let a = Lease::shared(home.path(), root.path()).unwrap();
+        let g = a.try_exclusive().unwrap();
+        let copy = copy_of(&g._gate);
+        drop(g);
+        assert!(a.try_exclusive().is_ok());
+        drop(copy);
+    }
+
+    #[test]
+    fn a_lease_dropped_is_free_while_a_forked_copy_lives() {
+        let home = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let gone = Lease::shared(home.path(), root.path()).unwrap();
+        let copy = copy_of(&gone.file);
+        drop(gone);
+        let b = Lease::shared(home.path(), root.path()).unwrap();
+        assert!(b.try_exclusive().is_ok());
+        drop(copy);
     }
 }

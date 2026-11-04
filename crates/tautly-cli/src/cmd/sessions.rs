@@ -46,11 +46,20 @@ pub enum Cmd {
         /// A file changed since the restore wrote it, to put back all the same.
         #[arg(long = "overwrite", value_name = "PATH")]
         overwrite: Vec<String>,
+        /// Undo an earlier restore-backup instead: put back what it replaced, which it
+        /// kept in the log (without this, its own backups are passed over).
+        #[arg(long)]
+        include_own: bool,
     },
-    /// Delete a session's log and its git checkpoint refs.
+    /// Delete a session's log and its git checkpoint refs (and a worktree fork's
+    /// worktree).
     Delete {
         /// The full session id.
         id: String,
+        /// Remove a fork's worktree even when it has modified, untracked or ignored files
+        /// (all of which go with it).
+        #[arg(long)]
+        force: bool,
     },
 }
 
@@ -66,13 +75,22 @@ pub async fn run(cmd: Cmd, env: &Env) -> anyhow::Result<i32> {
         Cmd::Show { id } => show(env, &id),
         Cmd::Tree => tree(env),
         Cmd::Export { id, format } => export(env, &id, format),
-        Cmd::Delete { id } => delete(env, &id).await,
+        Cmd::Delete { id, force } => delete(env, &id, force).await,
         Cmd::RestoreBackup {
             id,
             yes,
             force,
             overwrite,
-        } => restore_backup(env, &id, yes, force, overwrite).await,
+            include_own,
+        } => {
+            let opts = tautly_core::sessions::RestoreBackupOptions {
+                dry_run: true,
+                force,
+                overwrite,
+                include_own,
+            };
+            restore_backup(env, &id, yes, opts).await
+        }
     }
 }
 
@@ -332,16 +350,11 @@ async fn restore_backup(
     env: &Env,
     id: &str,
     yes: bool,
-    force: bool,
-    overwrite: Vec<String>,
+    mut opts: tautly_core::sessions::RestoreBackupOptions,
 ) -> anyhow::Result<i32> {
     use std::io::IsTerminal as _;
     let sb = env.workspace.sandbox().as_ref();
-    let mut opts = tautly_core::sessions::RestoreBackupOptions {
-        dry_run: true,
-        force,
-        overwrite,
-    };
+    opts.dry_run = true;
     let plan = tautly_core::sessions::restore_backup(&env.data_home, sb, id, &opts).await?;
     print_backup(&plan, true);
     if plan.written.is_empty() && plan.removed.is_empty() {
@@ -378,6 +391,21 @@ fn print_backup(done: &tautly_core::sessions::BackupRestored, dry_run: bool) {
                 .join(", ")
         }
     };
+    // Which backup this is (Task 49 M-R3b), said once, with the plan.
+    if dry_run && done.own {
+        println!(
+            "the backup an earlier restore-backup kept of what it replaced (--include-own): \
+             this undoes that run"
+        );
+    } else if dry_run {
+        println!("the backup of the last rewind or switch");
+    }
+    if dry_run && done.skipped_own {
+        println!(
+            "an earlier restore-backup's own backup is passed over, so this finishes \
+             putting back the rewind's or switch's; --include-own undoes that run instead"
+        );
+    }
     let (put, rm) = if dry_run {
         ("would put back", "would remove")
     } else {
@@ -413,15 +441,23 @@ fn print_backup(done: &tautly_core::sessions::BackupRestored, dry_run: bool) {
     }
 }
 
-async fn delete(env: &Env, id: &str) -> anyhow::Result<i32> {
+async fn delete(env: &Env, id: &str, force: bool) -> anyhow::Result<i32> {
     if id.is_empty() {
         bail!("give the session's id");
     }
-    let done =
-        tautly_core::sessions::delete(&env.data_home, env.workspace.sandbox().as_ref(), id).await?;
+    let sb = env.workspace.sandbox().as_ref();
+    let done = tautly_core::sessions::delete_with(&env.data_home, sb, id, force).await?;
+    let worktree = match &done.worktree {
+        Some(dir) => format!(
+            "; removed its worktree {}",
+            tautly_core::printable(&dir.display().to_string())
+        ),
+        None => String::new(),
+    };
     println!(
-        "deleted session {id} ({}); removed {} checkpoint ref{}",
-        done.log.display(),
+        "deleted session {} ({}); removed {} checkpoint ref{}{worktree}",
+        tautly_core::printable(id),
+        tautly_core::printable(&done.log.display().to_string()),
         done.refs,
         if done.refs == 1 { "" } else { "s" }
     );
