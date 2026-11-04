@@ -15,6 +15,7 @@ pub mod diff;
 mod dispatch;
 pub mod engine;
 pub mod evidence;
+pub mod lease;
 pub mod ledger;
 pub mod mcp;
 mod memory;
@@ -28,6 +29,8 @@ pub mod routing;
 mod session;
 pub mod sessions;
 pub mod signals;
+pub mod timetravel;
+pub mod tree;
 pub mod turn;
 pub mod undo;
 pub mod workspace;
@@ -44,6 +47,7 @@ pub use engine::{Engine, EngineBuilder, EngineError, session_root};
 pub use evidence::{
     DEFAULT_TEST_COMMANDS, EvidenceConfig, EvidenceTracker, TestEvidence, TestMatcher,
 };
+pub use lease::{ExclusiveGuard, Lease, LeaseError};
 pub use ledger::{GroupBy, Ledger, LedgerError, StatsRow, StoredReceipt, Totals};
 pub use mcp::{
     Approval, McpPlan, NoPreExec, PlannedServer, PreExecHook, plan_servers, provider_key_vars,
@@ -61,6 +65,8 @@ pub use signals::{
     Signal, SignalPolicy, SignalRouter, handle_signals, install_signal_handlers,
     install_termination_handlers,
 };
+pub use timetravel::{FileState, MaterializeReport, TtError};
+pub use tree::TreeNode;
 pub use workspace::{IndexLockError, Workspace, Workspaces};
 // Types that appear in `Event` and `Command`, re-exported so clients need no other crate.
 pub use tautly_context::{Breakdown, MutationReason};

@@ -296,6 +296,8 @@ impl Session {
         self.apply_startup(&ctl.cancel).await;
         self.evidence = self.evidence.fresh();
         self.memory.note_task(&text);
+        // The previous turn's files as it left them, before this turn changes anything.
+        self.settle_turn_end(&ctl.cancel).await;
         self.user_turn += 1;
         self.log(SessionRecord::TurnStart {
             turn: self.user_turn,
@@ -331,8 +333,10 @@ impl Session {
         let next = self.evidence.fresh();
         let evidence = std::mem::replace(&mut self.evidence, next).finish();
         // The work tree as the turn left it (spec 7.11.11), right before its `TurnEnd`. A
-        // cancelled turn ends at once: its last command's changes are then not covered.
-        if self.checkpoints.is_some() && ctl.cancel.is_cancelled() {
+        // cancelled turn ends at once; its end checkpoint is taken after it, once its
+        // commands have stopped (`recover_turn_end`).
+        let cancelled = self.checkpoints.is_some() && ctl.cancel.is_cancelled();
+        if cancelled {
             self.log(SessionRecord::CheckpointSkipped {
                 reason: "cancelled".into(),
                 turn: self.user_turn,
@@ -351,6 +355,9 @@ impl Session {
         })
         .await;
         self.checkpoint().await;
+        if cancelled {
+            self.recover_turn_end();
+        }
         self.emit_receipt().await;
         self.emit(Event::TurnFinished { reason, evidence }).await;
     }

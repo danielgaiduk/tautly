@@ -30,20 +30,27 @@ impl Sink for File {
     }
 }
 
-/// Take an exclusive, non-blocking advisory lock held until `file` is dropped.
+/// Take an exclusive, non-blocking advisory lock held until `file` is dropped. A lock
+/// that is busy is tried again a few times over ~50 ms first: a reader that only looks
+/// (the session tree's liveness probe holds a shared lock for an instant) must not make an
+/// open fail.
 fn lock_exclusive(file: &File, path: &Path) -> Result<()> {
     use std::os::fd::AsRawFd;
-    // SAFETY: plain syscall on a file descriptor owned by `file`.
-    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-    if rc == 0 {
-        return Ok(());
+    for attempt in 0..5 {
+        // SAFETY: plain syscall on a file descriptor owned by `file`.
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if rc == 0 {
+            return Ok(());
+        }
+        let err = io::Error::last_os_error();
+        if err.raw_os_error() != Some(libc::EWOULDBLOCK) {
+            return Err(err.into());
+        }
+        if attempt < 4 {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
     }
-    let err = io::Error::last_os_error();
-    if err.raw_os_error() == Some(libc::EWOULDBLOCK) {
-        Err(Error::AlreadyOpen(path.to_path_buf()))
-    } else {
-        Err(err.into())
-    }
+    Err(Error::AlreadyOpen(path.to_path_buf()))
 }
 
 /// Appends records to one session log.
@@ -331,6 +338,27 @@ mod tests {
             poisoned: AtomicBool::new(false),
             _record: PhantomData,
         }
+    }
+
+    #[test]
+    fn reopen_waits_out_a_brief_shared_lock() {
+        use std::os::fd::AsRawFd;
+        let home = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let w = SessionWriter::<String>::create_in(home.path(), root.path(), HeaderInit::default())
+            .unwrap();
+        let path = w.path().to_path_buf();
+        drop(w);
+        // A liveness probe: a shared lock held for an instant.
+        let probe = File::open(&path).unwrap();
+        // SAFETY: flock on a file descriptor we own.
+        assert_eq!(unsafe { libc::flock(probe.as_raw_fd(), libc::LOCK_SH) }, 0);
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(15));
+            drop(probe);
+        });
+        assert!(SessionWriter::<String>::reopen(&path).is_ok());
+        release.join().unwrap();
     }
 
     #[test]

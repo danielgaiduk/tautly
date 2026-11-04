@@ -423,6 +423,13 @@ where
                         .await?,
                 ));
             }
+            Slash::Rewind(at) => return self.rewind(at).await,
+            Slash::Tree => self.tree().await?,
+            Slash::Switch(which) => return self.switch(&which).await,
+            Slash::Label(label) => {
+                self.send(Command::Label { label }).await?;
+                return self.quiet().await;
+            }
             Slash::MemoryConsolidate => {
                 self.send(Command::ConsolidateMemory).await?;
                 return Ok(exit(
@@ -471,6 +478,128 @@ where
         })
         .await?;
         Ok(matches!(self.pump(answered).await?, Pumped::Exit))
+    }
+
+    /// `/rewind N`: the dry run, then (on `y`) the rewind; with conflicts, a second
+    /// question before they are overwritten.
+    async fn rewind(&mut self, at: u32) -> Result<bool, ReplError> {
+        let rewind = |dry_run, overwrite| Command::Rewind {
+            at,
+            label: None,
+            dry_run,
+            overwrite,
+        };
+        self.materialize(rewind, &format!("rewind to step {at}? [y]es [n]o "))
+            .await
+    }
+
+    /// `/switch <label|id|n>`: the branch it names (`n`: its line in `/tree`), its dry
+    /// run, then (on `y`) the switch.
+    async fn switch(&mut self, which: &str) -> Result<bool, ReplError> {
+        let nodes = self.tree_nodes().await;
+        let found = pick(&nodes, which);
+        let Some(node) = found else {
+            let text = format!("no single branch `{}` (see /tree)", printable(which));
+            self.print_line(&text).await?;
+            return Ok(false);
+        };
+        let (id, name) = (
+            node.session_id.clone(),
+            node.label
+                .clone()
+                .unwrap_or_else(|| node.session_id.chars().take(8).collect()),
+        );
+        let switch = |dry_run, overwrite| Command::Switch {
+            session_id: id.clone(),
+            dry_run,
+            overwrite,
+        };
+        let prompt = format!("switch to {}? [y]es [n]o ", printable(&name));
+        self.materialize(switch, &prompt).await
+    }
+
+    /// A rewind or switch: `cmd(dry_run, overwrite)`'s dry run, the question `prompt`, on
+    /// conflicts whether to overwrite them (a backup is kept), then the command itself.
+    async fn materialize(
+        &mut self,
+        cmd: impl Fn(bool, Vec<String>) -> Command,
+        prompt: &str,
+    ) -> Result<bool, ReplError> {
+        let answered = |e: &Event| {
+            matches!(
+                e,
+                Event::Rewound { .. } | Event::Switched { .. } | Event::Error { .. }
+            )
+        };
+        self.send(cmd(true, Vec::new())).await?;
+        let shown = match self.pump(answered).await? {
+            Pumped::Exit => return Ok(true),
+            Pumped::Done(ev) => ev,
+        };
+        let (Event::Rewound { report, .. } | Event::Switched { report, .. }) = *shown else {
+            return Ok(false);
+        };
+        if !report.blocked.is_empty() {
+            // Nothing can be written while they are in the way, whatever is answered.
+            let text = "not possible while something is in the way of those paths";
+            self.print_line(text).await?;
+            return Ok(false);
+        }
+        let (yes, exit) = self.ask_yes_no(prompt).await?;
+        if exit || !yes {
+            return Ok(exit);
+        }
+        if !report.conflicts.is_empty() {
+            let kept = match report.backup.as_deref() {
+                Some(_) => "backup kept".to_string(),
+                None => "no backup is kept".to_string(),
+            };
+            let question = format!(
+                "overwrite {} files you changed? ({kept}) [y]es [n]o ",
+                report.conflicts.len()
+            );
+            let (yes, exit) = self.ask_yes_no(&question).await?;
+            if exit || !yes {
+                return Ok(exit);
+            }
+        }
+        self.send(cmd(false, report.conflicts)).await?;
+        let done = match self.pump(answered).await? {
+            Pumped::Exit => return Ok(true),
+            Pumped::Done(ev) => ev,
+        };
+        let applied = matches!(
+            &*done,
+            Event::Rewound { report, .. } | Event::Switched { report, .. } if report.applied
+        );
+        if applied {
+            let moved = |e: &Event| matches!(e, Event::SessionChanged { .. } | Event::Error { .. });
+            return Ok(matches!(self.pump(moved).await?, Pumped::Exit));
+        }
+        Ok(false)
+    }
+
+    /// The project's sessions as a tree, the current one marked.
+    async fn tree_nodes(&self) -> Vec<tautly_core::TreeNode> {
+        let Some(home) = self.opts.data_home.clone() else {
+            return Vec::new();
+        };
+        let (root, current) = (self.root.clone(), self.engine.current_session().0);
+        tokio::task::spawn_blocking(move || {
+            tautly_core::tree::for_root(&home, &root, Some(&current)).unwrap_or_default()
+        })
+        .await
+        .unwrap_or_default()
+    }
+
+    /// `/tree`: one indented line per branch.
+    async fn tree(&mut self) -> Result<(), ReplError> {
+        let nodes = self.tree_nodes().await;
+        if nodes.is_empty() {
+            return self.print_line("no sessions in this project").await;
+        }
+        let text = tautly_core::tree::lines(&nodes).join("\n");
+        self.print_line(&text).await
     }
 
     /// `/model`: the current model, then the others whose provider has a key.
@@ -644,6 +773,30 @@ where
     }
 }
 
+/// The branch `/switch <which>` names: its label, its id, or a prefix of its id naming one
+/// branch alone, else its line number in `/tree` (so a label or id of digits is found).
+fn pick<'a>(nodes: &'a [tautly_core::TreeNode], which: &str) -> Option<&'a tautly_core::TreeNode> {
+    let one = |found: Vec<&'a tautly_core::TreeNode>| match found.as_slice() {
+        [one] => Some(*one),
+        _ => None,
+    };
+    one(nodes
+        .iter()
+        .filter(|n| n.label.as_deref() == Some(which))
+        .collect())
+    .or_else(|| nodes.iter().find(|n| n.session_id == which))
+    .or_else(|| {
+        one(nodes
+            .iter()
+            .filter(|n| !which.is_empty() && n.session_id.starts_with(which))
+            .collect())
+    })
+    .or_else(|| match which.parse::<usize>() {
+        Ok(n) if (1..=nodes.len()).contains(&n) => Some(&nodes[n - 1]),
+        _ => None,
+    })
+}
+
 fn approve_cmd(request_id: &str, session_rule: Option<String>) -> Command {
     Command::Approve {
         request_id: request_id.to_string(),
@@ -666,5 +819,45 @@ fn ago(d: Duration) -> String {
         60..3600 => format!("{}m ago", s / 60),
         3600..86_400 => format!("{}h ago", s / 3600),
         _ => format!("{}d ago", s / 86_400),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn node(id: &str, label: Option<&str>) -> tautly_core::TreeNode {
+        tautly_core::TreeNode {
+            session_id: id.into(),
+            parent: None,
+            label: label.map(str::to_string),
+            origin: tautly_core::Origin::User,
+            created: 0,
+            steps: 0,
+            last_prompt: String::new(),
+            cost_usd: None,
+            live: false,
+            current: false,
+        }
+    }
+
+    #[test]
+    fn switch_picks_label_then_id_then_line() {
+        let nodes = [
+            node("XAAA", None),
+            node("XBBB", Some("2")),
+            node("2024X", Some("main")),
+        ];
+        let id = |w: &str| pick(&nodes, w).map(|n| n.session_id.clone());
+        // A label of digits wins over the line number.
+        assert_eq!(id("2").as_deref(), Some("XBBB"));
+        assert_eq!(id("main").as_deref(), Some("2024X"));
+        // An id prefix of digits too.
+        assert_eq!(id("2024").as_deref(), Some("2024X"));
+        assert_eq!(id("XA").as_deref(), Some("XAAA"));
+        // A prefix naming two branches names none; a line number is the fallback.
+        assert_eq!(id("X"), None);
+        assert_eq!(id("1").as_deref(), Some("XAAA"));
+        assert_eq!(id("9"), None);
     }
 }

@@ -109,6 +109,11 @@ pub enum SessionRecord {
         post_image_blob: Option<BlobRef>,
         #[serde(alias = "turn")]
         step: u32,
+        /// Not a tool's change: a rewind's branch (outside git) asserting the content
+        /// it continues from (`pre_image` and `post_image_blob` the same, spec 7.12).
+        /// Turn diffs, undo and receipts leave it out.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        asserted: bool,
     },
     /// Writes whose outcome is unknown: abandoned at their bound after a cancel, or found
     /// changed later (the abandoned write landed). The files may hold anything; the write
@@ -200,6 +205,25 @@ pub enum SessionRecord {
     },
     /// The session is renamed; the last one wins over the header's label.
     Labeled { label: String },
+    /// A rewind or switch is about to write files (spec 7.12.2): the backup snapshot's
+    /// ref (with git checkpoints), and outside git each path's content before (`files`),
+    /// so a write cut off by a crash can be put back. A resume warns when no
+    /// `RestoreEnded` follows it.
+    RestoreBegun {
+        backup_ref: Option<String>,
+        #[serde(default)]
+        files: Vec<BackupFile>,
+        /// Every path it is about to write (the snapshot holds the rest of the tree too).
+        #[serde(default)]
+        paths: Vec<RelPath>,
+    },
+    /// The end of the restore a `RestoreBegun` started: whether the files are now the
+    /// target's (`applied`), else whether they were put back (`rolled_back`).
+    RestoreEnded {
+        applied: bool,
+        #[serde(default)]
+        rolled_back: bool,
+    },
     /// The session switched to `model` (`Command::SetModel`, spec 7.11.5); requests from
     /// here on go to it. The last one wins over the header's model.
     ModelSet { model: ModelId },
@@ -262,9 +286,42 @@ pub enum CheckpointPoint {
     /// Before a rewind or branch switch writes (spec 7.12; written by Task 49): the tip as
     /// it was.
     BeforeRestore,
+    /// At a user turn's start, before anything else, when the previous turn's end
+    /// checkpoint was skipped and could not be taken after it either (Task 49 N1).
+    TurnStart,
+    /// The files a rewind or switch materialized, as the branch continues from them
+    /// (spec 7.12; written by Task 49): exactly `state_at` of the step it branched at, or
+    /// the tip switched to. Older builds read it as `Unknown`.
+    Restored,
     /// A point this version does not know (read only).
     #[serde(other)]
     Unknown,
+}
+
+/// One file of a [`SessionRecord::RestoreBegun`]: its content before the restore wrote
+/// it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackupFile {
+    pub path: RelPath,
+    /// It existed (with `blob` none: it could not be kept, a link or over 64 MiB).
+    pub existed: bool,
+    pub blob: Option<BlobRef>,
+    #[serde(default)]
+    pub mode: Option<u32>,
+    /// What the restore wrote there (none: not known), so putting the backup back can
+    /// tell a later human edit (Task 49 N10).
+    #[serde(default)]
+    pub wrote: Option<Wrote>,
+}
+
+/// What a restore wrote at a path.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Wrote {
+    /// This content.
+    Blob(BlobRef),
+    /// It deleted the file.
+    Absent,
 }
 
 /// One file of an [`SessionRecord::Undone`].
@@ -366,6 +423,8 @@ const KNOWN_TYPES: &[&str] = &[
     "checkpoint",
     "checkpoint_skipped",
     "labeled",
+    "restore_begun",
+    "restore_ended",
     "model_set",
     "reasoning_stripped",
     "engine_error",
@@ -699,6 +758,7 @@ mod tests {
                 pre_image: None,
                 post_image_blob: Some(blob.clone()),
                 step: 1,
+                asserted: false,
             },
             SessionRecord::Undone {
                 turn: 1,
@@ -770,6 +830,21 @@ mod tests {
             },
             SessionRecord::Labeled {
                 label: "try-a".into(),
+            },
+            SessionRecord::RestoreBegun {
+                backup_ref: None,
+                paths: vec![rel("a")],
+                files: vec![BackupFile {
+                    path: rel("a"),
+                    existed: true,
+                    blob: Some(BlobRef::parse(&"b".repeat(64)).unwrap()),
+                    mode: Some(0o644),
+                    wrote: Some(Wrote::Absent),
+                }],
+            },
+            SessionRecord::RestoreEnded {
+                applied: false,
+                rolled_back: true,
             },
             SessionRecord::WritesLost {
                 paths: vec![rel("a.txt")],

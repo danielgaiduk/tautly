@@ -138,7 +138,10 @@ fn earliest_pre_images(
             SessionRecord::Command(Command::SendMessage { .. }) => messages += 1,
             SessionRecord::TurnEnd { .. } => ended += 1,
             SessionRecord::Edit {
-                path, pre_image, ..
+                path,
+                pre_image,
+                asserted: false,
+                ..
             } if turn.is_none_or(|t| t == ended + 1) => {
                 edits.push((PathBuf::from(path.as_str()), pre_image))
             }

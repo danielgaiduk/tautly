@@ -33,6 +33,7 @@ use tautly_tools::{AppliedEffect, DiffPreview, LineRange, Saved, Shown, ToolMeta
 
 use crate::evidence::TestEvidence;
 use crate::receipt::Savings;
+pub use crate::timetravel::MaterializeReport;
 
 /// `(major, minor)` of this protocol.
 pub const PROTOCOL_VERSION: (u32, u32) = (1, 0);
@@ -363,6 +364,23 @@ pub enum Event {
         backup_ref: Option<String>,
         note: Option<String>,
     },
+    /// The answer to [`Command::Rewind`] (spec 7.12.2): what materializing step `at`'s
+    /// files changed (with `report.dry_run`, would change; with conflicts not listed in
+    /// `overwrite`, nothing was written and `report.applied` is false). `branch` is the
+    /// new session the engine continues on when it was applied (then
+    /// [`Event::SessionChanged`] follows), else empty.
+    Rewound {
+        at: u32,
+        branch: String,
+        report: MaterializeReport,
+    },
+    /// The answer to [`Command::Switch`] (spec 7.12.3): `branch` is the session switched
+    /// to (or, without `report.applied`, the one that would be); [`Event::SessionChanged`]
+    /// follows when it was applied.
+    Switched {
+        branch: String,
+        report: MaterializeReport,
+    },
     /// An MCP server changed state; `tools` is how many of its tools are offered.
     McpServerStatus {
         server: String,
@@ -498,6 +516,37 @@ pub enum Command {
         turn: Option<u32>,
         #[serde(default)]
         dry_run: bool,
+    },
+    /// Rewind files and conversation to step `at` as a new branch (spec 7.12.2): a
+    /// checkpoint of the current tree is appended to this session first, then the branch
+    /// (`origin: rewind`, `label`) gets this log's records up to step `at`, and the files
+    /// become `state_at(at)`. A path that would change and whose content differs from what
+    /// the agent left is a conflict: unless every conflict is listed in `overwrite`,
+    /// nothing is written and no branch is made. A backup snapshot is taken before any
+    /// write. Refused while another live session uses the working tree. Waits for a
+    /// running turn to end. Answered with [`Event::Rewound`], or an `Error`.
+    Rewind {
+        at: u32,
+        #[serde(default)]
+        label: Option<String>,
+        #[serde(default)]
+        dry_run: bool,
+        #[serde(default)]
+        overwrite: Vec<String>,
+    },
+    /// Continue session `session_id` of this work tree instead (spec 7.12.3), with its tip
+    /// materialized in place under the same conflict rules, backup and lease as
+    /// [`Command::Rewind`]. Answered with [`Event::Switched`], or an `Error`.
+    Switch {
+        session_id: String,
+        #[serde(default)]
+        dry_run: bool,
+        #[serde(default)]
+        overwrite: Vec<String>,
+    },
+    /// Rename the current branch (a `Labeled` record).
+    Label {
+        label: String,
     },
     Shutdown,
     /// A command this version does not know (from a newer client, or read back from a

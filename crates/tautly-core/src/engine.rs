@@ -5,8 +5,8 @@
 //! and `Shutdown`; `Pin`/`Unpin` reach the turn at its next step start; everything else
 //! (further messages included) waits for the turn to end. Every command is logged as it
 //! arrives (one that arrives while a `SetModel` builds its provider, once the build ends;
-//! one other than `Cancel`, `Shutdown`, `Approve` and `Deny` that arrives while a `Fork`
-//! runs, once the fork ends, so it lands in the log it applies to).
+//! one other than `Cancel`, `Shutdown`, `Approve` and `Deny` that arrives while a `Fork`,
+//! `Rewind` or `Switch` runs, once it ends, so it lands in the log it applies to).
 //!
 //! MCP servers (`mcp.rs`) start in the background after session start; `Approve`/`Deny`
 //! also answer repository servers' approval requests. At shutdown the servers are stopped
@@ -57,6 +57,7 @@ use crate::budget::{Budget, Budgets};
 use crate::checkpoint::{self, Checkpointer, GitCheckpoints, Skip, StartCheckpoint};
 use crate::config::{Config, LoadedConfig};
 use crate::evidence::{EvidenceTracker, TestMatcher};
+use crate::lease::Lease;
 use crate::ledger::{CostLedger, LEDGER_FILE};
 use crate::mcp::{McpSession, McpSetup, NoPreExec, PreExecHook};
 use crate::memory::{MemoryMode, MemoryState};
@@ -76,6 +77,8 @@ pub const EVENT_CAPACITY: usize = 256;
 const COMMAND_CAPACITY: usize = 64;
 /// At shutdown, how long left-behind process groups get between SIGTERM and SIGKILL.
 const GROUP_GRACE: Duration = Duration::from_millis(500);
+/// Default [`EngineBuilder::lease_wait`].
+const LEASE_WAIT: Duration = Duration::from_secs(30);
 /// Longest a shutdown waits for the cost ledger to write the rows queued for it.
 const LEDGER_FLUSH: Duration = Duration::from_secs(1);
 
@@ -102,6 +105,8 @@ pub enum EngineError {
     },
     #[error("cannot resume the session: {0}")]
     Resume(#[from] resume::OpenError),
+    #[error("cannot lock the working tree (the working-tree lease): {0}")]
+    Lease(std::io::Error),
 }
 
 /// Everything a session needs; see [`EngineBuilder::build`].
@@ -151,6 +156,9 @@ pub struct EngineBuilder {
     /// Where API keys are looked up after the environment, for every provider the engine
     /// builds itself (main, side model, `SetModel`). Default: the OS keychain.
     pub secret_store: Option<Arc<dyn SecretStore>>,
+    /// How long the session waits at start for the working-tree lease while a rewind or
+    /// switch elsewhere holds it (spec 7.12.1); then it fails to start. Default 30 s.
+    pub lease_wait: Duration,
 }
 
 impl EngineBuilder {
@@ -171,6 +179,7 @@ impl EngineBuilder {
             client_mcp: Vec::new(),
             pre_exec: None,
             secret_store: None,
+            lease_wait: LEASE_WAIT,
         }
     }
 
@@ -254,6 +263,15 @@ impl EngineBuilder {
         });
         let mut config_warnings = self.config_warnings;
         config_warnings.extend(side_note);
+        // Held for the engine's life; rewind and switch take it exclusively.
+        // Not waited for here (this may run on an async worker): while a rewind elsewhere
+        // holds it exclusively, the actor takes it before its first command.
+        // An engine never runs without it: a lock file that cannot be opened fails the build.
+        let (lease, lease_pending) = match Lease::try_shared(&data_home, &root) {
+            Ok(Some(lease)) => (Some(lease.for_workspace(&workspace)), false),
+            Ok(None) => (None, true),
+            Err(e) => return Err(EngineError::Lease(e)),
+        };
         let init = HeaderInit {
             model: Some(config.model.as_str().to_string()),
             config_hash: Some(config.hash()),
@@ -365,6 +383,8 @@ impl EngineBuilder {
             header_init: init,
             receipt: None,
             gc_elided: Vec::new(),
+            lease,
+            end_recovery: None,
         };
         let current = Arc::new(Mutex::new((session_id.clone(), session_path.clone())));
         let actor = Actor {
@@ -387,6 +407,8 @@ impl EngineBuilder {
                 config_pins: config.pins.clone(),
                 resume: self.resume.is_some(),
                 mcp,
+                lease_pending,
+                lease_wait: self.lease_wait,
             },
         ));
         Ok((
@@ -516,6 +538,17 @@ enum Job {
         at: Option<u32>,
         label: Option<String>,
     },
+    Rewind {
+        at: u32,
+        label: Option<String>,
+        dry_run: bool,
+        overwrite: Vec<String>,
+    },
+    Switch {
+        session_id: String,
+        dry_run: bool,
+        overwrite: Vec<String>,
+    },
 }
 
 /// The task in flight (a turn or a compaction). It hands back the session and the inbox,
@@ -571,6 +604,11 @@ struct Start {
     /// The session is resumed: its context is rebuilt from the log first.
     resume: bool,
     mcp: McpSetup,
+    /// The working-tree lease was held exclusively elsewhere at build: taken (waiting up
+    /// to `lease_wait`, off the async workers) before anything else; else the session does
+    /// not start.
+    lease_pending: bool,
+    lease_wait: Duration,
 }
 
 /// The actor's task dropped without a shutdown (the runtime went away): no process group
@@ -592,13 +630,59 @@ impl Actor {
             session_id: self.session_id.clone(),
         });
         session.workspace.start();
+        // Commands sent while a resumed session sets up its model (a keychain prompt may
+        // hold it), or while the lease is waited for, are kept; a `Shutdown` among them
+        // abandons that.
+        let mut early = Vec::new();
+        // The lease first: nothing runs on the working tree without it. Tried in short
+        // slices (each off the async workers), so a `Shutdown` (or SIGTERM, which sends
+        // one) stops the wait at once.
+        let mut unleased = None;
+        if start.lease_pending {
+            let deadline = tokio::time::Instant::now() + start.lease_wait;
+            let stop = until_shutdown(&mut commands, &mut early);
+            tokio::pin!(stop);
+            loop {
+                let (home, root) = (session.data_home.clone(), session.root().to_path_buf());
+                let tried = tokio::task::spawn_blocking(move || Lease::try_shared(&home, &root))
+                    .await
+                    .map_err(std::io::Error::other)
+                    .and_then(|r| r);
+                match tried {
+                    Ok(Some(lease)) => {
+                        session.lease = Some(lease.for_workspace(&session.workspace));
+                        break;
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        unleased = Some(e.to_string());
+                        break;
+                    }
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    unleased = Some(format!(
+                        "a rewind or switch elsewhere held the working tree for over {}s",
+                        start.lease_wait.as_secs()
+                    ));
+                    break;
+                }
+                tokio::select! {
+                    () = &mut stop => {
+                        unleased = Some("the session was shut down while it waited".into());
+                        break;
+                    }
+                    () = tokio::time::sleep(Duration::from_millis(50)) => {}
+                }
+            }
+        }
         for w in start.config_warnings {
             self.events.try_emit(Event::Warning { message: w });
         }
-        // Commands sent while a resumed session sets up its model (a keychain prompt may
-        // hold it) are kept; a `Shutdown` among them abandons that.
-        let mut early = Vec::new();
-        let started = if start.resume {
+        let started = if let Some(why) = unleased {
+            Err(format!(
+                "the working-tree lease could not be had ({why}); this session does not start"
+            ))
+        } else if start.resume {
             session
                 .resume(
                     &start.config_pins,
@@ -613,12 +697,21 @@ impl Actor {
         let mut state = match started {
             Ok(()) => Some(session),
             Err(why) => {
+                let unleased = session.lease.is_none();
                 self.events
                     .send_or_drop(Event::Error {
                         kind: ErrorKind::Internal,
-                        message: format!("cannot resume the session: {why}"),
+                        message: if unleased {
+                            format!("cannot start the session: {why}")
+                        } else {
+                            format!("cannot resume the session: {why}")
+                        },
                         retryable: false,
-                        hint: Some("the session log may be damaged".into()),
+                        hint: Some(if unleased {
+                            "start it again once the other rewind or switch has finished".into()
+                        } else {
+                            "the session log may be damaged".into()
+                        }),
                     })
                     .await;
                 None
@@ -649,6 +742,26 @@ impl Actor {
                         Command::ConsolidateMemory => Job::Consolidate,
                         Command::Undo { turn, dry_run } => Job::Undo { turn, dry_run },
                         Command::Fork { at, label } => Job::Fork { at, label },
+                        Command::Rewind {
+                            at,
+                            label,
+                            dry_run,
+                            overwrite,
+                        } => Job::Rewind {
+                            at,
+                            label,
+                            dry_run,
+                            overwrite,
+                        },
+                        Command::Switch {
+                            session_id,
+                            dry_run,
+                            overwrite,
+                        } => Job::Switch {
+                            session_id,
+                            dry_run,
+                            overwrite,
+                        },
                         Command::SetModel { model } => {
                             match state.as_mut() {
                                 Some(s) => {
@@ -769,6 +882,7 @@ impl Actor {
             }
         }
         if let Some(s) = state.as_mut() {
+            s.finish_turn_end().await;
             s.abandon_start_checkpoint();
         }
         // MCP servers end with their process groups. (A session lost to a crashed turn
@@ -931,21 +1045,42 @@ impl Actor {
             approvals: self.approvals.clone(),
         };
         let turn = matches!(job, Job::Turn(_));
-        let fork = matches!(job, Job::Fork { .. });
+        // A fork, rewind or switch moves the log: what arrives meanwhile waits for it.
+        let fork = matches!(
+            job,
+            Job::Fork { .. } | Job::Rewind { .. } | Job::Switch { .. }
+        );
         let compact = matches!(job, Job::Compact);
         let current = Arc::clone(&self.current);
+        let moved = move |id: &str, path: &Path| {
+            *current.lock().unwrap_or_else(PoisonError::into_inner) =
+                (id.to_string(), path.to_path_buf());
+        };
         let handle = tokio::spawn(async move {
             match job {
                 Job::Turn(text) => session.run_turn(text, &mut ctl).await,
                 Job::Compact => session.compact_command(&ctl).await,
                 Job::Consolidate => session.consolidate_command(&ctl).await,
                 Job::Undo { turn, dry_run } => session.undo_job(turn, dry_run, &ctl).await,
-                Job::Fork { at, label } => {
-                    let on_branch = move |id: &str, path: &Path| {
-                        *current.lock().unwrap_or_else(PoisonError::into_inner) =
-                            (id.to_string(), path.to_path_buf());
-                    };
-                    session.fork_job(at, label, &ctl, on_branch).await
+                Job::Fork { at, label } => session.fork_job(at, label, &ctl, moved).await,
+                Job::Rewind {
+                    at,
+                    label,
+                    dry_run,
+                    overwrite,
+                } => {
+                    session
+                        .rewind_job(at, label, dry_run, overwrite, &ctl, moved)
+                        .await
+                }
+                Job::Switch {
+                    session_id,
+                    dry_run,
+                    overwrite,
+                } => {
+                    session
+                        .switch_job(session_id, dry_run, overwrite, &ctl, moved)
+                        .await
                 }
             }
             (session, ctl.inbox)
@@ -993,6 +1128,10 @@ impl Actor {
             | Command::RejectMemory { .. } => session.context_command(cmd).await,
             Command::Diff { turn } => session.diff(turn).await,
             Command::Uncompact => session.uncompact_command().await,
+            Command::Label { label } => {
+                session.log(SessionRecord::Labeled { label }).await;
+                session.checkpoint().await;
+            }
             other => {
                 let name = serde_json::to_value(&other)
                     .ok()

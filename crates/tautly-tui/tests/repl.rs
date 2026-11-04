@@ -1585,3 +1585,152 @@ async fn compact_on_a_lost_session_returns_to_the_prompt() {
     assert!(ran.out.contains("takes no more commands"), "{}", ran.out);
     assert_eq!(ran.prompts.len(), 4, "{:?}\n{}", ran.prompts, ran.out);
 }
+
+// ---------------------------------------------------------------------------------------
+// Time travel
+
+/// A scripted source that, on the line `!edit <path> <text>`, writes `<text>` (and a
+/// newline) to `<path>` under `root` before going on with the next line: a human edit
+/// between two commands.
+struct Editing {
+    inner: ScriptedSource,
+    root: PathBuf,
+}
+
+#[async_trait::async_trait]
+impl tautly_tui::LineSource for Editing {
+    async fn read_line(&mut self, prompt: &str) -> Result<Line, tautly_tui::ReplError> {
+        loop {
+            let line = self.inner.read_line(prompt).await?;
+            if let Line::Text(t) = &line
+                && let Some(rest) = t.strip_prefix("!edit ")
+            {
+                let (path, text) = rest.split_once(' ').unwrap();
+                std::fs::write(self.root.join(path), format!("{text}\n")).unwrap();
+                continue;
+            }
+            return Ok(line);
+        }
+    }
+}
+
+#[tokio::test]
+async fn repl_rewind_dry_run_then_apply_and_tree_switch_label() {
+    let fx = Fx::new();
+    std::fs::write(fx.root().join("a.txt"), "zero\n").unwrap();
+    let mock = MockProvider::new(vec![
+        step(vec![write_call("w1", "a.txt", "one\n")]),
+        text_step("wrote one"),
+        step(vec![write_call("w2", "a.txt", "two\n")]),
+        text_step("wrote two"),
+    ]);
+    let built = Built::default();
+    let f = factory(&fx, config(Mode::Yolo, true), &mock, None, &built);
+    let source = ScriptedSource::new(vec![
+        text("make one"),
+        text("make two"),
+        text("!edit a.txt human"),
+        text("/rewind 3"),
+        text("y"),
+        text("y"),
+        text("/tree"),
+        text("/label renamed"),
+        text("/switch 1"),
+        text("y"),
+        text("/tree"),
+    ]);
+    let prompts = source.prompts();
+    let buf = Buf::default();
+    let editing = Editing {
+        inner: source,
+        root: fx.root(),
+    };
+    tokio::time::timeout(
+        WAIT,
+        run_repl(
+            f,
+            editing,
+            buf.clone(),
+            futures::stream::pending(),
+            fx.opts(),
+        ),
+    )
+    .await
+    .expect("the REPL did not finish")
+    .expect("the REPL failed");
+    let out = buf.text();
+    let prompts = prompts.lock().unwrap().clone();
+
+    // The dry run listed the change and the conflict; both questions were asked.
+    assert!(
+        out.contains("rewind to step 3 would restore: a.txt"),
+        "{out}"
+    );
+    assert!(
+        out.contains("conflicts (changed since the agent left them): a.txt"),
+        "{out}"
+    );
+    assert!(
+        prompts.iter().any(|p| p.starts_with("rewind to step 3?")),
+        "{prompts:?}"
+    );
+    assert!(
+        prompts
+            .iter()
+            .any(|p| p.starts_with("overwrite 1 files you changed? (backup kept)")),
+        "{prompts:?}"
+    );
+    assert!(
+        prompts.iter().any(|p| p.starts_with("switch to ")),
+        "{prompts:?}"
+    );
+
+    // The first `/tree`: the branch is current, under its parent.
+    let a = {
+        let logs = built.logs.lock().unwrap();
+        SessionReader::<SessionRecord>::open(&logs[0])
+            .unwrap()
+            .header()
+            .session_id
+            .clone()
+    };
+    let tree_line = Regex::new(r"(?m)^  \* \S+  step 3 · rewind · \S+ · make one$").unwrap();
+    assert!(tree_line.is_match(&out), "{out}");
+    assert!(
+        out.contains(&format!("  {}  step 6 · user · ", &a[..8])),
+        "{out}"
+    );
+    // After the switch: the parent is current, the branch is labelled.
+    assert!(
+        out.contains(&format!("* {}  step 6 · user · ", &a[..8])),
+        "{out}"
+    );
+    assert!(out.contains("renamed  step 3 · rewind"), "{out}");
+    assert_eq!(
+        std::fs::read_to_string(fx.root().join("a.txt")).unwrap(),
+        "two\n"
+    );
+
+    let log_a = built.logs.lock().unwrap()[0].clone();
+    let got: Vec<Command> = logged_commands(&log_a)
+        .into_iter()
+        .filter(|c| matches!(c, Command::Rewind { .. }))
+        .collect();
+    assert_eq!(
+        got,
+        vec![
+            Command::Rewind {
+                at: 3,
+                label: None,
+                dry_run: true,
+                overwrite: vec![],
+            },
+            Command::Rewind {
+                at: 3,
+                label: None,
+                dry_run: false,
+                overwrite: vec!["a.txt".into()],
+            },
+        ]
+    );
+}

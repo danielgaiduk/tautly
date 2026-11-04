@@ -1,4 +1,4 @@
-//! `tautly sessions list|show|export|delete` (spec 6.5).
+//! `tautly sessions list|show|tree|export|restore-backup|delete` (spec 6.5, 7.12).
 
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
@@ -23,12 +23,29 @@ pub enum Cmd {
         /// The session id, or a prefix of it.
         id: String,
     },
+    /// The project's sessions as a tree of branches.
+    Tree,
     /// Print a session as its raw log (jsonl) or as a readable transcript (md).
     Export {
         /// The session id, or a prefix of it.
         id: String,
         #[arg(long, value_enum, default_value = "md")]
         format: Format,
+    },
+    /// Put back the files the session's last rewind or switch kept in its log before it
+    /// wrote them (after one was cut off).
+    RestoreBackup {
+        /// The full session id.
+        id: String,
+        /// Put it back without asking (needed when stdin is not a terminal).
+        #[arg(long)]
+        yes: bool,
+        /// Put it back although that rewind or switch finished.
+        #[arg(long)]
+        force: bool,
+        /// A file changed since the restore wrote it, to put back all the same.
+        #[arg(long = "overwrite", value_name = "PATH")]
+        overwrite: Vec<String>,
     },
     /// Delete a session's log and its git checkpoint refs.
     Delete {
@@ -47,8 +64,15 @@ pub async fn run(cmd: Cmd, env: &Env) -> anyhow::Result<i32> {
     match cmd {
         Cmd::List => list(env),
         Cmd::Show { id } => show(env, &id),
+        Cmd::Tree => tree(env),
         Cmd::Export { id, format } => export(env, &id, format),
         Cmd::Delete { id } => delete(env, &id).await,
+        Cmd::RestoreBackup {
+            id,
+            yes,
+            force,
+            overwrite,
+        } => restore_backup(env, &id, yes, force, overwrite).await,
     }
 }
 
@@ -72,6 +96,20 @@ fn list(env: &Env) -> anyhow::Result<i32> {
             utc(s.started),
             s.first_prompt
         );
+    }
+    Ok(0)
+}
+
+/// One indented line per branch, as `/tree` prints it (no session is current here).
+fn tree(env: &Env) -> anyhow::Result<i32> {
+    let nodes = tautly_core::tree::for_root(&env.data_home, env.root(), None)
+        .context("cannot list the sessions")?;
+    if nodes.is_empty() {
+        println!("no sessions in this project");
+        return Ok(0);
+    }
+    for line in tautly_core::tree::lines(&nodes) {
+        println!("{line}");
     }
     Ok(0)
 }
@@ -112,7 +150,11 @@ fn turns(reader: &SessionReader<SessionRecord>) -> anyhow::Result<Vec<Turn>> {
                     t.last_step = Some(step);
                 }
             }
-            SessionRecord::Edit { path, .. } => {
+            SessionRecord::Edit {
+                path,
+                asserted: false,
+                ..
+            } => {
                 if let Some(t) = turns.last_mut() {
                     t.files.insert(path.as_str().to_string());
                 }
@@ -258,7 +300,11 @@ fn markdown(reader: &SessionReader<SessionRecord>) -> anyhow::Result<String> {
                     let _ = writeln!(md, "      {line}");
                 }
             }
-            SessionRecord::Edit { path, .. } => {
+            SessionRecord::Edit {
+                path,
+                asserted: false,
+                ..
+            } => {
                 let _ = writeln!(md, "  edited `{}`", path.as_str());
             }
             SessionRecord::Undone { turn, .. } => {
@@ -278,6 +324,93 @@ fn markdown(reader: &SessionReader<SessionRecord>) -> anyhow::Result<String> {
     }
     flush(&mut md, &mut said);
     Ok(md)
+}
+
+/// `sessions restore-backup`: what would be put back first, then (after a y/N on a
+/// terminal, or with `--yes`) put back.
+async fn restore_backup(
+    env: &Env,
+    id: &str,
+    yes: bool,
+    force: bool,
+    overwrite: Vec<String>,
+) -> anyhow::Result<i32> {
+    use std::io::IsTerminal as _;
+    let sb = env.workspace.sandbox().as_ref();
+    let mut opts = tautly_core::sessions::RestoreBackupOptions {
+        dry_run: true,
+        force,
+        overwrite,
+    };
+    let plan = tautly_core::sessions::restore_backup(&env.data_home, sb, id, &opts).await?;
+    print_backup(&plan, true);
+    if plan.written.is_empty() && plan.removed.is_empty() {
+        return Ok(0);
+    }
+    if !yes {
+        if !std::io::stdin().is_terminal() {
+            println!("nothing was changed: run it again with --yes to put these back");
+            return Ok(1);
+        }
+        print!("put these back? [y/N] ");
+        std::io::stdout().flush()?;
+        let mut answer = String::new();
+        std::io::stdin().read_line(&mut answer)?;
+        if !matches!(answer.trim(), "y" | "Y" | "yes") {
+            println!("nothing was changed");
+            return Ok(1);
+        }
+    }
+    opts.dry_run = false;
+    let done = tautly_core::sessions::restore_backup(&env.data_home, sb, id, &opts).await?;
+    print_backup(&done, false);
+    Ok(0)
+}
+
+fn print_backup(done: &tautly_core::sessions::BackupRestored, dry_run: bool) {
+    let list = |v: &[String]| {
+        if v.is_empty() {
+            "nothing".to_string()
+        } else {
+            v.iter()
+                .map(|p| tautly_core::printable(p))
+                .collect::<Vec<_>>()
+                .join(", ")
+        }
+    };
+    let (put, rm) = if dry_run {
+        ("would put back", "would remove")
+    } else {
+        ("put back", "removed")
+    };
+    println!("{put}: {}", list(&done.written));
+    println!("{rm}: {}", list(&done.removed));
+    if !done.conflicts.is_empty() {
+        println!(
+            "left alone (changed since the restore wrote them; --overwrite <path> puts one \
+             back): {}",
+            list(&done.conflicts)
+        );
+    }
+    if !done.not_kept.is_empty() {
+        println!(
+            "not kept or not writable (a link, over 64 MiB, or a link above it): {}",
+            list(&done.not_kept)
+        );
+    }
+    if let Some(b) = &done.backup_ref {
+        let b = tautly_core::printable(b);
+        let paths = done
+            .paths
+            .iter()
+            .map(|p| tautly_core::printable(p))
+            .collect::<Vec<_>>()
+            .join(" ");
+        println!(
+            "the other files it wrote are in the snapshot {b}: `git diff {b} -- {paths}`, \
+             then `git restore --source {b} -- <path>` for each one to put back"
+        );
+    }
 }
 
 async fn delete(env: &Env, id: &str) -> anyhow::Result<i32> {

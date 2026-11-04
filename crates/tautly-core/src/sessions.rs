@@ -111,15 +111,22 @@ fn lock_if_idle(log: &Path, id: &str) -> Result<std::fs::File, DeleteError> {
         .read(true)
         .open(log)
         .map_err(io)?;
-    // SAFETY: flock on a file descriptor we own; no memory is shared.
-    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+    // A busy lock is tried again briefly: the session tree's liveness probe holds a shared
+    // lock for an instant.
+    for attempt in 0..5 {
+        // SAFETY: flock on a file descriptor we own; no memory is shared.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            return Ok(file);
+        }
         let err = std::io::Error::last_os_error();
-        return Err(match err.raw_os_error() {
-            Some(libc::EWOULDBLOCK) => DeleteError::Running(id.to_string()),
-            _ => io(err),
-        });
+        if err.raw_os_error() != Some(libc::EWOULDBLOCK) {
+            return Err(io(err));
+        }
+        if attempt < 4 {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
     }
-    Ok(file)
+    Err(DeleteError::Running(id.to_string()))
 }
 
 /// Longest [`SessionSummary::first_prompt`], in characters.
@@ -201,4 +208,254 @@ fn first_prompt(log: &Path) -> Option<String> {
         return Some(line.trim().chars().take(FIRST_PROMPT_CHARS).collect());
     }
     None
+}
+
+/// What [`restore_backup`] put back (with `dry_run`: would put back); root-relative.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BackupRestored {
+    /// Files written with their content from before the restore.
+    pub written: Vec<String>,
+    /// Files removed (they did not exist before it).
+    pub removed: Vec<String>,
+    /// Files changed since the restore wrote them (a human edit): left alone unless
+    /// listed in `overwrite`.
+    pub conflicts: Vec<String>,
+    /// Files whose content was not kept (a link, or over 64 MiB), or that cannot be written
+    /// (a link or a file is above them).
+    pub not_kept: Vec<String>,
+    /// The restore's snapshot, which holds the rest (git).
+    pub backup_ref: Option<String>,
+    /// Every path the restore was about to write.
+    pub paths: Vec<String>,
+}
+
+/// How [`restore_backup`] runs.
+#[derive(Debug, Clone, Default)]
+pub struct RestoreBackupOptions {
+    /// Change nothing; say what would change.
+    pub dry_run: bool,
+    /// Put the backup back although the restore finished (`RestoreEnded` is logged).
+    pub force: bool,
+    /// Conflicting paths (changed since the restore wrote them) to put back all the same.
+    pub overwrite: Vec<String>,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum BackupError {
+    #[error("no session {0} in this project")]
+    NotFound(String),
+    #[error("session {0} has no rewind or switch backup")]
+    NoBackup(String),
+    #[error(
+        "the last rewind or switch of session {0} finished ({1}); its backup is put back \
+         only with --force"
+    )]
+    Finished(String, &'static str),
+    #[error("cannot read or write the session: {0}")]
+    Session(#[from] tautly_session::Error),
+    #[error("{0}")]
+    Lease(#[from] crate::lease::LeaseError),
+    #[error("cannot lock the working tree: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("{path}: {source}")]
+    Disk {
+        path: String,
+        source: tautly_sandbox::SandboxError,
+    },
+    #[error("a path in the session log cannot be used here: {0}")]
+    Path(#[from] tautly_session::ConfineError),
+    #[error("{0}")]
+    Other(String),
+}
+
+/// Put back the files the last rewind or switch of session `id` kept in the session log
+/// before it wrote them (its `RestoreBegun` record; spec 7.12.2), through `sandbox`:
+/// `tautly sessions restore-backup <id>`. It never destroys a human edit:
+///
+/// - It is refused while any engine runs on the working tree (the lease), and when that
+///   restore finished (`RestoreEnded`), unless `force`.
+/// - A file whose content is no longer what the restore wrote there is a conflict, left
+///   alone unless listed in `overwrite`.
+/// - Before it writes, what it replaces is kept in the log as a `RestoreBegun` of its own
+///   (so this can be put back in turn), and a `RestoreEnded` follows.
+/// - A path with a link or a file above it, or that no longer resolves to itself, is never
+///   written.
+///
+/// A snapshot ref the record names holds the other files; it is returned, with the paths,
+/// to point the user at it. With `dry_run` nothing is written or logged.
+pub async fn restore_backup(
+    data_home: &Path,
+    sandbox: &dyn Sandbox,
+    id: &str,
+    opts: &RestoreBackupOptions,
+) -> Result<BackupRestored, BackupError> {
+    use crate::record::{BackupFile, Wrote};
+    use crate::undo::{Disk, MAX_DISK_READ, read_disk};
+    let root = sandbox.root().to_path_buf();
+    let lease = crate::lease::Lease::try_shared(data_home, &root)?
+        .ok_or(BackupError::Lease(crate::lease::LeaseError::Busy))?;
+    let _alone = lease.try_exclusive()?;
+    let log = tautly_session::list_here_in(data_home, &root)?
+        .into_iter()
+        .find(|s| s.id == id)
+        .map(|s| s.path)
+        .ok_or_else(|| BackupError::NotFound(id.to_string()))?;
+    let reader = tautly_session::SessionReader::<SessionRecord>::open(&log)?;
+    let mut last = None;
+    let mut ended = None;
+    for rec in reader.records() {
+        match rec?.1 {
+            SessionRecord::RestoreBegun {
+                backup_ref,
+                files,
+                paths,
+            } => {
+                last = Some((backup_ref, files, paths));
+                ended = None;
+            }
+            SessionRecord::RestoreEnded {
+                applied,
+                rolled_back,
+            } => {
+                ended = Some(if applied {
+                    "it was applied"
+                } else if rolled_back {
+                    "it was put back already"
+                } else {
+                    "it failed"
+                });
+            }
+            _ => {}
+        }
+    }
+    let (backup_ref, files, paths) = last.ok_or_else(|| BackupError::NoBackup(id.to_string()))?;
+    if let Some(how) = ended.filter(|_| !opts.force) {
+        return Err(BackupError::Finished(id.to_string(), how));
+    }
+    let mut done = BackupRestored {
+        backup_ref,
+        paths: paths.iter().map(|p| p.as_str().to_string()).collect(),
+        ..BackupRestored::default()
+    };
+    // What to put back, after checking each path against what the restore wrote.
+    let mut planned: Vec<(BackupFile, Disk)> = Vec::new();
+    for f in files {
+        f.path.resolve(&root)?;
+        let rel = PathBuf::from(f.path.as_str());
+        let name = f.path.as_str().to_string();
+        if f.existed && f.blob.is_none() {
+            done.not_kept.push(name);
+            continue;
+        }
+        if crate::timetravel::confined(sandbox, &root, &rel).is_err() {
+            done.not_kept.push(name);
+            continue;
+        }
+        let disk = read_disk(&root, &rel, MAX_DISK_READ)
+            .await
+            .map_err(|e| BackupError::Other(e.to_string()))?;
+        let b3 = |bytes: &[u8]| blake3::hash(bytes).to_hex().to_string();
+        let as_written = match (&f.wrote, &disk) {
+            (Some(Wrote::Absent), Disk::Absent) => true,
+            (Some(Wrote::Blob(b)), Disk::File { bytes, .. }) => b3(bytes) == b.as_str(),
+            (Some(Wrote::Blob(b)), Disk::Large { hash, .. }) => {
+                hash.to_hex().as_str() == b.as_str()
+            }
+            _ => false,
+        };
+        let back_already = match (&f.blob, &disk) {
+            (None, Disk::Absent) => true,
+            (Some(b), Disk::File { bytes, .. }) => b3(bytes) == b.as_str(),
+            _ => false,
+        };
+        if back_already {
+            continue;
+        }
+        if !as_written && !opts.overwrite.contains(&name) {
+            done.conflicts.push(name);
+            continue;
+        }
+        if matches!(disk, Disk::Large { .. } | Disk::Link(_) | Disk::Other) {
+            // What it would replace cannot be kept.
+            done.not_kept.push(name);
+            continue;
+        }
+        match f.existed {
+            true => done.written.push(name),
+            false => done.removed.push(name),
+        }
+        planned.push((f, disk));
+    }
+    if opts.dry_run || planned.is_empty() {
+        return Ok(done);
+    }
+    // What it replaces, kept first.
+    let mut writer = tautly_session::SessionWriter::<SessionRecord>::reopen(&log)?;
+    let mut kept = Vec::with_capacity(planned.len());
+    for (f, disk) in &planned {
+        let (existed, blob, mode) = match disk {
+            Disk::File { bytes, mode } => (true, Some(writer.blob(bytes)?), Some(*mode)),
+            _ => (false, None, None),
+        };
+        kept.push(BackupFile {
+            path: f.path.clone(),
+            existed,
+            blob,
+            mode,
+            wrote: Some(match &f.blob {
+                Some(b) => Wrote::Blob(b.clone()),
+                None => Wrote::Absent,
+            }),
+        });
+    }
+    writer.append(&SessionRecord::RestoreBegun {
+        backup_ref: None,
+        files: kept,
+        paths: planned.iter().map(|(f, _)| f.path.clone()).collect(),
+    })?;
+    writer.checkpoint()?;
+    let mut failed = None;
+    for (f, _) in &planned {
+        let rel = PathBuf::from(f.path.as_str());
+        let full = match crate::timetravel::confined(sandbox, &root, &rel) {
+            Ok(full) => full,
+            Err(e) => {
+                failed = Some(BackupError::Other(e.to_string()));
+                break;
+            }
+        };
+        let wrote = match &f.blob {
+            Some(blob) => match reader.read_blob(blob) {
+                Ok(bytes) => sandbox.write_atomic(&full, &bytes, f.mode).await,
+                Err(e) => {
+                    failed = Some(e.into());
+                    break;
+                }
+            },
+            None => match sandbox.remove_file(&full).await {
+                Err(tautly_sandbox::SandboxError::Io(e))
+                    if e.kind() == std::io::ErrorKind::NotFound =>
+                {
+                    Ok(())
+                }
+                other => other,
+            },
+        };
+        if let Err(source) = wrote {
+            failed = Some(BackupError::Disk {
+                path: full.display().to_string(),
+                source,
+            });
+            break;
+        }
+    }
+    writer.append(&SessionRecord::RestoreEnded {
+        applied: failed.is_none(),
+        rolled_back: false,
+    })?;
+    writer.checkpoint()?;
+    match failed {
+        Some(e) => Err(e),
+        None => Ok(done),
+    }
 }

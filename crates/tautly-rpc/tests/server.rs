@@ -348,6 +348,42 @@ fn methods_map_to_commands() {
                 dry_run: false,
             },
         ),
+        (
+            "rewind",
+            json!({"at": 3, "dry_run": true}),
+            Command::Rewind {
+                at: 3,
+                label: None,
+                dry_run: true,
+                overwrite: vec![],
+            },
+        ),
+        (
+            "rewind",
+            json!({"at": 2, "label": "b", "overwrite": ["a.txt"]}),
+            Command::Rewind {
+                at: 2,
+                label: Some("b".into()),
+                dry_run: false,
+                overwrite: vec!["a.txt".into()],
+            },
+        ),
+        (
+            "switch",
+            json!({"target": "01X", "session_id": "s1"}),
+            Command::Switch {
+                session_id: "01X".into(),
+                dry_run: false,
+                overwrite: vec![],
+            },
+        ),
+        (
+            "label",
+            json!({"label": "main"}),
+            Command::Label {
+                label: "main".into(),
+            },
+        ),
         ("shutdown", json!({}), Command::Shutdown),
         // A `type` among the params cannot turn one command into another.
         (
@@ -1464,6 +1500,89 @@ async fn semver_style_protocol_versions_are_accepted() {
     let mut c = single(&fx, config(Mode::Ask), MockProvider::new(vec![]));
     let result = c.ok("initialize", json!({"protocol": "1.0.0"})).await;
     assert_eq!(result["protocol"], "1.0");
+    c.ok("shutdown", json!({})).await;
+    c.finish().await;
+}
+
+#[tokio::test]
+async fn rpc_session_tree_and_rewind_methods() {
+    let fx = Fx::new();
+    fx.write("a.txt", "zero\n");
+    let mock = MockProvider::new(vec![
+        tools_step(vec![call(
+            "w1",
+            "write",
+            json!({"path": "a.txt", "content": "one\n"}),
+        )]),
+        text_step("first"),
+        tools_step(vec![call(
+            "w2",
+            "write",
+            json!({"path": "a.txt", "content": "two\n"}),
+        )]),
+        text_step("second"),
+    ]);
+    let mut c = single(&fx, config(Mode::Yolo), mock);
+    let a = c.ok("initialize", json!({})).await["session_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    for text in ["one", "two"] {
+        c.ok("send_message", json!({ "text": text })).await;
+        c.until_type(&a, "turn_finished").await;
+    }
+    // The dry run changes nothing.
+    c.ok("rewind", json!({"at": 3, "dry_run": true})).await;
+    let seen = c.until_type(&a, "rewound").await;
+    let dry = &seen.last().unwrap().1;
+    assert_eq!(dry["report"]["dry_run"], true, "{dry}");
+    assert_eq!(dry["report"]["applied"], false);
+    assert_eq!(dry["report"]["restored"], json!(["a.txt"]));
+    assert_eq!(
+        std::fs::read_to_string(fx.root().join("a.txt")).unwrap(),
+        "two\n"
+    );
+
+    c.ok("rewind", json!({"at": 3, "label": "try-b"})).await;
+    let seen = c.until_type(&a, "rewound").await;
+    let done = &seen.last().unwrap().1;
+    assert_eq!(done["report"]["applied"], true, "{done}");
+    let branch = done["branch"].as_str().unwrap().to_string();
+    c.until(|s, e| s == a && e["type"] == "session_changed")
+        .await;
+    assert_eq!(
+        std::fs::read_to_string(fx.root().join("a.txt")).unwrap(),
+        "one\n"
+    );
+    c.ok("label", json!({"label": "renamed"})).await;
+
+    let root = fx.root().to_string_lossy().into_owned();
+    let tree = c.ok("session/tree", json!({ "root": root })).await;
+    let nodes = tree["nodes"].as_array().unwrap();
+    assert_eq!(nodes.len(), 2, "{tree}");
+    assert_eq!(nodes[0]["session_id"], a.as_str());
+    assert_eq!(nodes[0]["origin"], "user");
+    assert_eq!(nodes[1]["session_id"], branch.as_str());
+    assert_eq!(nodes[1]["parent"], json!([a, 3]));
+    assert_eq!(nodes[1]["origin"], "rewind");
+    assert_eq!(nodes[1]["current"], true);
+    assert_eq!(nodes[1]["live"], true);
+    // The label lands in the log once the session flushes; switching back flushes it.
+    c.ok("switch", json!({ "target": a })).await;
+    let seen = c.until_type(&branch, "switched").await;
+    assert_eq!(seen.last().unwrap().1["report"]["applied"], true);
+    assert_eq!(
+        std::fs::read_to_string(fx.root().join("a.txt")).unwrap(),
+        "two\n"
+    );
+    let tree = c.ok("session/tree", json!({ "root": root })).await;
+    let nodes = tree["nodes"].as_array().unwrap();
+    assert_eq!(nodes[1]["label"], "renamed", "{tree}");
+    assert_eq!(nodes[0]["current"], true, "{tree}");
+    assert_eq!(
+        c.err("session/tree", json!({ "root": "relative" })).await,
+        INVALID_PARAMS
+    );
     c.ok("shutdown", json!({})).await;
     c.finish().await;
 }

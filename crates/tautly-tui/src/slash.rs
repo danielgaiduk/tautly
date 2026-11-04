@@ -17,6 +17,15 @@ pub enum Slash {
     Pin(String),
     Unpin(String),
     Fork,
+    /// `/rewind N`: show the dry run, ask, then rewind files and conversation to step N
+    /// as a new branch.
+    Rewind(u32),
+    /// `/tree`: the project's sessions as a tree.
+    Tree,
+    /// `/switch <label|id|n>`: show the dry run, ask, then continue that branch.
+    Switch(String),
+    /// `/label <name>`: rename the current branch.
+    Label(String),
     MemoryConsolidate,
     Help,
     /// Anything else (or a known command with arguments it does not take): the help is
@@ -36,6 +45,10 @@ commands:
   /pin <text>          keep <text> in the context
   /unpin <text>        remove that pin
   /fork                branch the conversation into a new session
+  /rewind N            rewind files and conversation to step N as a new branch
+  /tree                this project's sessions as a tree (* marks the current one)
+  /switch <label|id|n> continue another branch (n: its line in /tree), files included
+  /label <name>        rename the current branch
   /memory consolidate  propose merging and pruning project memory
   /help                this list
 keys: Ctrl+C cancels a turn (twice within 2 s exits), clears the line at the prompt;
@@ -65,6 +78,10 @@ pub fn parse(line: &str) -> Option<Slash> {
         ("pin", Some(t)) => Slash::Pin(t),
         ("unpin", Some(t)) => Slash::Unpin(t),
         ("fork", None) => Slash::Fork,
+        ("rewind", Some(a)) => a.parse::<u32>().map_or_else(|_| unknown(), Slash::Rewind),
+        ("tree", None) => Slash::Tree,
+        ("switch", Some(a)) => Slash::Switch(a),
+        ("label", Some(a)) => Slash::Label(a),
         ("memory", Some(a)) if a == "consolidate" => Slash::MemoryConsolidate,
         ("help", None) => Slash::Help,
         _ => unknown(),
@@ -88,9 +105,19 @@ mod tests {
             Some(Slash::Pin("use pnpm".into()))
         );
         assert_eq!(parse("/memory consolidate"), Some(Slash::MemoryConsolidate));
+        assert_eq!(parse("/rewind 3"), Some(Slash::Rewind(3)));
+        assert_eq!(parse("/rewind 0"), Some(Slash::Rewind(0)));
+        assert_eq!(parse("/tree"), Some(Slash::Tree));
+        assert_eq!(parse("/switch try-b"), Some(Slash::Switch("try-b".into())));
+        assert_eq!(parse("/label main"), Some(Slash::Label("main".into())));
         for bad in [
             "/diff x",
             "/diff 0",
+            "/rewind",
+            "/rewind x",
+            "/switch",
+            "/label",
+            "/tree x",
             "/pin",
             "/memory",
             "/cost now",

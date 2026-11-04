@@ -1661,8 +1661,8 @@ impl Checkpointer {
     /// [`backup`](Self::backup) first.
     ///
     /// Crate-internal: it has no conflict check (a file a human changed or created since
-    /// is overwritten or deleted), which rewind and switch (spec 7.12) add on top.
-    #[allow(dead_code)] // the building block of rewind and switch (spec 7.12)
+    /// is overwritten or deleted). Rewind and switch (spec 7.12), which check conflicts
+    /// themselves, use it to put a backup back when they fail half way.
     pub(crate) async fn restore(
         &self,
         commit: &str,
@@ -1830,6 +1830,156 @@ impl Checkpointer {
             )
             .await?;
         Ok(String::from_utf8_lossy(&out).trim().to_string())
+    }
+
+    /// The tree entries `(mode, object id)` of `paths` (root-relative) in tree-ish
+    /// `tree`; a path it does not have (or has as a directory) is left out.
+    pub(crate) async fn entries(
+        &self,
+        tree: &str,
+        paths: &[PathBuf],
+        deadline: Instant,
+    ) -> Result<std::collections::HashMap<PathBuf, (String, String)>, CheckpointError> {
+        let mut found = std::collections::HashMap::new();
+        let paths: Vec<&PathBuf> = paths.iter().filter(|p| plain_relative(p)).collect();
+        if paths.is_empty() {
+            return Ok(found);
+        }
+        let git = Git {
+            index: None,
+            ..self.git()
+        };
+        // Literal pathspecs (`GIT_LITERAL_PATHSPECS`), in bounded batches.
+        for chunk in paths.chunks(512) {
+            let names: Vec<String> = chunk
+                .iter()
+                .map(|p| p.to_string_lossy().into_owned())
+                .collect();
+            let mut args = vec!["ls-tree", "-z", "--full-tree", tree, "--"];
+            args.extend(names.iter().map(String::as_str));
+            let out = git.run(&args, None, deadline).await?;
+            for entry in out.split(|&b| b == 0).filter(|e| !e.is_empty()) {
+                let Some(tab) = entry.iter().position(|&b| b == b'\t') else {
+                    continue;
+                };
+                let meta = String::from_utf8_lossy(&entry[..tab]);
+                let [mode, kind, id] = meta.split(' ').collect::<Vec<_>>()[..] else {
+                    continue;
+                };
+                if kind != "blob" {
+                    continue;
+                }
+                let path = PathBuf::from(bytes_to_os(&entry[tab + 1..]));
+                found.insert(path, (mode.to_string(), id.to_string()));
+            }
+        }
+        Ok(found)
+    }
+
+    /// A commit (with no ref) of tree-ish `base` with `overlay` applied: each path
+    /// (root-relative) set to its content (none: removed). A path keeps its mode in `base`,
+    /// else takes the mode of the file now at it in the work tree (regular files only),
+    /// else `100644`. Built in an index of its own, so the session's snapshot index keeps
+    /// its stat data. Returns the commit and its tree, HEAD and whether the tree differs
+    /// from HEAD's.
+    pub(crate) async fn compose(
+        &self,
+        base: &str,
+        overlay: &[(PathBuf, Option<Vec<u8>>)],
+        deadline: Instant,
+    ) -> Result<CheckpointRef, CheckpointError> {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::PermissionsExt;
+        let index = self.tmp.path().join("compose-index");
+        let _ = std::fs::remove_file(&index);
+        let git = Git {
+            index: Some(&index),
+            ..self.git()
+        };
+        let plain = Git {
+            index: None,
+            ..self.git()
+        };
+        let made = async {
+            git.run(&["read-tree", base], None, deadline).await?;
+            let present: Vec<PathBuf> = overlay
+                .iter()
+                .filter(|(_, c)| c.is_some())
+                .map(|(p, _)| p.clone())
+                .collect();
+            let modes = self.entries(base, &present, deadline).await?;
+            let mut info = Vec::new();
+            for (path, content) in overlay {
+                if !plain_relative(path) {
+                    return Err(CheckpointError::Invalid(format!(
+                        "{} cannot be put in a tree",
+                        path.display()
+                    )));
+                }
+                let line = match content {
+                    Some(bytes) => {
+                        let id = plain
+                            .run(
+                                &["hash-object", "-w", "--no-filters", "--stdin"],
+                                Some(bytes.clone()),
+                                deadline,
+                            )
+                            .await?;
+                        let id = String::from_utf8_lossy(&id).trim().to_string();
+                        let mode = match modes.get(path) {
+                            Some((mode, _)) => mode.clone(),
+                            None => match std::fs::symlink_metadata(self.root.join(path)) {
+                                Ok(m) if m.is_file() && m.permissions().mode() & 0o100 != 0 => {
+                                    "100755".to_string()
+                                }
+                                _ => "100644".to_string(),
+                            },
+                        };
+                        format!("{mode} {id}\t")
+                    }
+                    None => format!("0 {}\t", "0".repeat(base.len())),
+                };
+                info.extend_from_slice(line.as_bytes());
+                info.extend_from_slice(path.as_os_str().as_bytes());
+                info.push(0);
+            }
+            if !info.is_empty() {
+                git.run(
+                    &["update-index", "-z", "--index-info"],
+                    Some(info),
+                    deadline,
+                )
+                .await?;
+            }
+            let tree = git.text(&["write-tree"], deadline).await?;
+            let message = format!("tautly checkpoint ({}, restored)\n", self.session);
+            let out = git
+                .run(
+                    &["commit-tree", "--no-gpg-sign", &tree, "-p", base],
+                    Some(message.into_bytes()),
+                    deadline,
+                )
+                .await?;
+            let commit = String::from_utf8_lossy(&out).trim().to_string();
+            let head = git.head(deadline).await?;
+            let now = TreeNow {
+                tree,
+                head,
+                excludes: None,
+            };
+            Ok(CheckpointRef {
+                n: 0,
+                commit,
+                refname: String::new(),
+                head: now.head.as_ref().map(|(c, _)| c.clone()),
+                dirty: now.dirty(),
+                tree: now.tree,
+                reused: false,
+            })
+        }
+        .await;
+        let _ = std::fs::remove_file(&index);
+        made
     }
 
     /// Give `child_session` refs of its own (`refs/tautly/checkpoints/<child>/<n>`) for
@@ -2101,6 +2251,11 @@ pub(crate) enum Point {
     /// At a user turn's end: reused without running git when the write generation did
     /// not move and the watcher saw no change.
     TurnEnd,
+    /// Before a rewind or branch switch writes: always a full snapshot.
+    BeforeRestore,
+    /// At a turn's start when the previous turn's end has no checkpoint: always a full
+    /// snapshot.
+    TurnStart,
 }
 
 impl Point {
@@ -2111,6 +2266,8 @@ impl Point {
             Point::ResumeStart => CheckpointPoint::ResumeStart,
             Point::BeforeExec => CheckpointPoint::BeforeExec,
             Point::TurnEnd => CheckpointPoint::TurnEnd,
+            Point::BeforeRestore => CheckpointPoint::BeforeRestore,
+            Point::TurnStart => CheckpointPoint::TurnStart,
         })
     }
 }
@@ -2145,16 +2302,24 @@ impl CheckpointJob {
     /// with a warning), holding the lock throughout, so the log has checkpoints in the
     /// order they were taken. A cancel abandons the snapshot (its processes are killed),
     /// logged as skipped.
-    async fn run(self, st: &mut GitCheckpoints, point: Point, cancel: Option<&CancellationToken>) {
+    async fn run(
+        self,
+        st: &mut GitCheckpoints,
+        point: Point,
+        cancel: Option<&CancellationToken>,
+    ) -> bool {
         if st.off {
-            return;
+            return false;
         }
         let watcher_changed = self.watcher.is_none() || self.watcher != st.fs_events;
         st.fs_events = self.watcher;
         let write_gen = self.write_gen;
         let snap = async {
             match point {
-                Point::SessionStart | Point::ResumeStart => st.cp.snapshot_now().await,
+                Point::SessionStart
+                | Point::ResumeStart
+                | Point::BeforeRestore
+                | Point::TurnStart => st.cp.snapshot_now().await,
                 Point::BeforeExec => st.cp.snapshot(write_gen, true).await,
                 Point::TurnEnd => st.cp.snapshot(write_gen, watcher_changed).await,
             }
@@ -2167,6 +2332,7 @@ impl CheckpointJob {
             None => Some(snap.await),
         };
         let (turn, step) = (self.turn, self.step);
+        let made = matches!(taken, Some(Ok(_)));
         let rec = match taken {
             Some(Ok(r)) => SessionRecord::Checkpoint {
                 n: r.n,
@@ -2220,6 +2386,7 @@ impl CheckpointJob {
             }
         };
         self.log(rec).await;
+        made
     }
 
     async fn log(&self, rec: SessionRecord) {
@@ -2282,6 +2449,45 @@ impl Session {
         job.run(&mut st, point, cancel).await;
     }
 
+    /// After a cancelled turn (whose end has a `CheckpointSkipped{cancelled}`): its end
+    /// checkpoint, taken in the background once its commands have stopped, so the files
+    /// as it left them are known before a human changes them (Task 49 N1). The next turn
+    /// waits for it ([`settle_turn_end`](Self::settle_turn_end)).
+    pub(crate) fn recover_turn_end(&mut self) {
+        let Some(shared) = self.checkpoints.clone() else {
+            return;
+        };
+        let job = self.checkpoint_job(self.last_step());
+        let log = job.log.clone();
+        self.end_recovery = Some(tokio::spawn(async move {
+            let mut st = shared.lock().await;
+            let taken = job.run(&mut st, Point::TurnEnd, None).await;
+            drop(st);
+            // Durable at once: no turn is running to flush it.
+            let _ = tokio::task::spawn_blocking(move || log.checkpoint()).await;
+            taken
+        }));
+    }
+
+    /// At a turn's start: wait for the previous turn's end checkpoint being recovered;
+    /// when none could be taken, take a `turn_start` one now, before anything else runs.
+    pub(crate) async fn settle_turn_end(&mut self, cancel: &CancellationToken) {
+        let Some(mut job) = self.end_recovery.take() else {
+            return;
+        };
+        let taken = tokio::select! {
+            r = &mut job => r.unwrap_or(false),
+            () = cancel.cancelled() => {
+                job.abort();
+                return;
+            }
+        };
+        if !taken {
+            self.git_checkpoint(Point::TurnStart, self.last_step(), Some(cancel))
+                .await;
+        }
+    }
+
     /// At session start (after init or resume): the session-start checkpoint, in the
     /// background, so neither MCP start nor the first command waits for it. It takes the
     /// checkpoint lock before this returns, so every later checkpoint (the first command's
@@ -2337,6 +2543,21 @@ impl Session {
                 true
             }
             () = cancel.cancelled() => false,
+        }
+    }
+
+    /// At shutdown: let a cancelled turn's end checkpoint still being taken finish, for at
+    /// most the snapshot bound (`timeout_ms`) and a margin; then it is abandoned (its git
+    /// is killed). The files as that turn left them are what tells a later human edit
+    /// apart.
+    pub(crate) async fn finish_turn_end(&mut self) {
+        let Some(mut job) = self.end_recovery.take() else {
+            return;
+        };
+        let bound = Duration::from_millis(self.setup.config.checkpoints.timeout_ms)
+            + Duration::from_secs(2);
+        if tokio::time::timeout(bound, &mut job).await.is_err() {
+            job.abort();
         }
     }
 

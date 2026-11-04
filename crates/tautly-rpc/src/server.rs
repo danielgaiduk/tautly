@@ -20,7 +20,9 @@
 //! - The engine commands, by their wire names, with the command's fields as params:
 //!   `send_message`, `approve`, `deny`, `cancel`, `set_budget`, `compact`, `uncompact`,
 //!   `pin`, `unpin`, `approve_memory`, `reject_memory`, `consolidate_memory`, `fork`,
-//!   `set_model`, `diff`, `undo` ([`command_for`]; a value this version does not know, such
+//!   `set_model`, `diff`, `undo`, `rewind`, `switch`, `label` ([`command_for`]; `switch`
+//!   names the session to switch to `target`, since `session_id` addresses the session
+//!   the command is for; a value this version does not know, such
 //!   as a `set_budget` scope, is `-32602`). Each takes an optional `session_id`:
 //!   without one, the default session (or the only open session). The result is `null`
 //!   once the session has the command; what it does arrives as events.
@@ -29,6 +31,12 @@
 //!   one root share a `Workspace` (code index, watcher, memory store: opened once, closed
 //!   with the last session). `fork` branches a session that is not open here (its log up
 //!   to step `at`) and opens the branch.
+//! - `session/tree {root, session_id?}` returns `{nodes}`: the sessions of the project
+//!   the work tree `root` (absolute) belongs to, as a tree in depth-first order (spec
+//!   7.12.3; each node `{session_id, parent: [id, step] | null, label, origin, created,
+//!   steps, last_prompt, cost_usd, live, current}`), `current` marking the session
+//!   `session_id` names (default: the default session) is on now. A session that rewinds
+//!   or switches announces it like a fork (below).
 //! - `session/list` returns `{sessions: [{session_id, root}]}`; `session/close
 //!   {session_id}` shuts one session down and answers once its last event is out.
 //! - `shutdown` shuts every session down, answers `null` once their events are out, and
@@ -101,6 +109,9 @@ const COMMAND_METHODS: &[&str] = &[
     "set_model",
     "diff",
     "undo",
+    "rewind",
+    "switch",
+    "label",
     "shutdown",
 ];
 
@@ -119,6 +130,13 @@ pub fn command_for(method: &str, params: &Value) -> Result<Command, Error> {
     }
     let mut fields = params.as_object().cloned().unwrap_or_default();
     fields.remove("session_id");
+    // `session_id` addresses the session, so `switch` names the session to switch to as
+    // `target` (the command's own `session_id`).
+    if method == "switch"
+        && let Some(target) = fields.remove("target")
+    {
+        fields.insert("session_id".into(), target);
+    }
     // Last, so a `type` among the params cannot name another command.
     fields.insert("type".into(), Value::String(method.to_string()));
     let command = serde_json::from_value(Value::Object(fields)).map_err(|e| {
@@ -738,6 +756,13 @@ impl Conn {
                 let result = Ok(json!({ "sessions": sessions }));
                 self.shared.reply(id.as_ref(), result).await;
             }
+            "session/tree" => {
+                let shared = Arc::clone(&self.shared);
+                self.tasks.spawn(async move {
+                    let result = session_tree(&shared, &params).await;
+                    shared.reply(id.as_ref(), result).await;
+                });
+            }
             "session/close" => {
                 let shared = Arc::clone(&self.shared);
                 let slot = match params.get("session_id") {
@@ -958,6 +983,39 @@ fn check_protocol(protocol: Option<&Value>) -> Result<(), Error> {
         )),
         _ => refuse(format!("`{text}` is not a protocol version")),
     }
+}
+
+/// `session/tree`: the project's sessions as a tree.
+async fn session_tree(shared: &Arc<Shared>, params: &Value) -> Result<Value, Error> {
+    let root = match params.get("root") {
+        Some(Value::String(r)) if Path::new(r).is_absolute() => PathBuf::from(r),
+        Some(Value::String(_)) => {
+            return Err(Error::new(
+                INVALID_PARAMS,
+                "`root` must be an absolute path",
+            ));
+        }
+        _ => return Err(Error::new(INVALID_PARAMS, "`root` (a path) is required")),
+    };
+    let current = match params.get("session_id") {
+        Some(Value::String(_)) | None | Some(Value::Null) => shared
+            .session_key(params)
+            .ok()
+            .map(|(_, engine)| engine.current_session().0),
+        Some(_) => return Err(Error::new(INVALID_PARAMS, "`session_id` must be a string")),
+    };
+    let data_home = match &shared.factory {
+        Some((_, workspaces)) => workspaces.data_home().to_path_buf(),
+        None => tautly_core::data_home()
+            .map_err(|e| Error::new(SESSION_FAILED, format!("no data directory: {e}")))?,
+    };
+    let nodes = tokio::task::spawn_blocking(move || {
+        tautly_core::tree::for_root(&data_home, &root, current.as_deref())
+    })
+    .await
+    .map_err(|e| Error::new(SESSION_FAILED, e.to_string()))?
+    .map_err(|e| Error::new(SESSION_FAILED, format!("cannot list the sessions: {e}")))?;
+    Ok(json!({ "nodes": nodes }))
 }
 
 /// `session/new`: the reply and the new session's go-ahead.

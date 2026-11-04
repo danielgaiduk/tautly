@@ -523,6 +523,16 @@ pub fn event(e: &Event, st: &mut RenderState, opts: &ReplOptions) -> Option<Stri
             }
             Some(st.line(out))
         }
+        Event::Rewound { at, report, .. } => {
+            Some(st.line(materialized(&format!("rewind to step {at}"), report)))
+        }
+        Event::Switched { branch, report } => {
+            let short: String = branch.chars().take(8).collect();
+            Some(st.line(materialized(
+                &format!("switch to {}", printable(&short)),
+                report,
+            )))
+        }
         Event::McpServerStatus {
             server,
             state,
@@ -541,6 +551,63 @@ pub fn event(e: &Event, st: &mut RenderState, opts: &ReplOptions) -> Option<Stri
         }
         _ => None,
     }
+}
+
+/// What a rewind or switch (`what`) did or would do: what it restores and deletes, the
+/// conflicts, the backup and the note. Paths are escaped.
+fn materialized(what: &str, r: &tautly_core::MaterializeReport) -> String {
+    let list = |v: &[String]| {
+        if v.is_empty() {
+            "nothing".to_string()
+        } else {
+            v.iter()
+                .map(|p| printable(p))
+                .collect::<Vec<_>>()
+                .join(", ")
+        }
+    };
+    let mut out = if r.applied {
+        format!(
+            "{what}: restored {}; deleted {}",
+            list(&r.restored),
+            list(&r.deleted)
+        )
+    } else if r.dry_run {
+        format!(
+            "{what} would restore: {}\n  and delete: {}",
+            list(&r.restored),
+            list(&r.deleted)
+        )
+    } else {
+        format!("{what} not done: nothing was changed")
+    };
+    if !r.conflicts.is_empty() {
+        let _ = write!(
+            out,
+            "\n  conflicts (changed since the agent left them): {}",
+            list(&r.conflicts)
+        );
+    }
+    if !r.blocked.is_empty() {
+        let _ = write!(
+            out,
+            "\n  blocked (a directory, link or file is in the way; never written): {}",
+            list(&r.blocked)
+        );
+    }
+    if let Some(b) = &r.backup_ref {
+        let _ = write!(out, "\n  snapshot before: {}", printable(b));
+    } else if r.dry_run && !(r.restored.is_empty() && r.deleted.is_empty()) {
+        let _ = match r.backup.as_deref() {
+            Some("log") => write!(out, "\n  backup: kept in the session log"),
+            Some(_) => write!(out, "\n  backup: a git snapshot"),
+            None => write!(out, "\n  backup: none (what it overwrites is not kept)"),
+        };
+    }
+    if let Some(n) = &r.note {
+        let _ = write!(out, "\n  note: {}", printable(n));
+    }
+    out
 }
 
 /// The receipt footer: `turn N · S steps · 12.4s · ctx <used>/<budget> tok · cache 86% ·
