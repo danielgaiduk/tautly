@@ -4,7 +4,9 @@
 //! While a turn runs, the actor still answers `Approve`/`Deny` (by request id), `Cancel`
 //! and `Shutdown`; `Pin`/`Unpin` reach the turn at its next step start; everything else
 //! (further messages included) waits for the turn to end. Every command is logged as it
-//! arrives (one that arrives while a `SetModel` builds its provider, once the build ends).
+//! arrives (one that arrives while a `SetModel` builds its provider, once the build ends;
+//! one other than `Cancel`, `Shutdown`, `Approve` and `Deny` that arrives while a `Fork`
+//! runs, once the fork ends, so it lands in the log it applies to).
 //!
 //! MCP servers (`mcp.rs`) start in the background after session start; `Approve`/`Deny`
 //! also answer repository servers' approval requests. At shutdown the servers are stopped
@@ -491,6 +493,8 @@ struct Running {
     inbox: mpsc::UnboundedSender<Command>,
     /// A user message's turn (its crash ends the turn); else a command's job.
     turn: bool,
+    /// A fork: commands other than [`Actor::urgent`] ones wait for its end.
+    fork: bool,
 }
 
 struct Actor {
@@ -592,6 +596,8 @@ impl Actor {
         };
         let mut running: Option<Running> = None;
         let mut queue: VecDeque<Command> = VecDeque::new();
+        // Commands that arrived while a fork ran, for after it.
+        let mut held: Vec<Command> = Vec::new();
         let mut stopping = false;
         for cmd in early {
             let lost = state.is_none();
@@ -654,6 +660,12 @@ impl Actor {
             tokio::select! {
                 cmd = commands.recv(), if !stopping => {
                     let cmd = cmd.unwrap_or(Command::Shutdown);
+                    // A fork moves the log to its branch when it ends: what applies after it
+                    // waits, unlogged, and is logged in the branch at the join.
+                    if running.as_ref().is_some_and(|r| r.fork) && !Self::urgent(&cmd) {
+                        held.push(cmd);
+                        continue;
+                    }
                     let lost = state.is_none() && running.is_none();
                     self.received(cmd, lost, running.as_ref(), &mut queue, &mut stopping)
                         .await;
@@ -671,6 +683,11 @@ impl Actor {
                             state = Some(s);
                         }
                         Err(e) => self.crashed(e, turn).await,
+                    }
+                    for cmd in std::mem::take(&mut held) {
+                        let lost = state.is_none();
+                        self.received(cmd, lost, None, &mut queue, &mut stopping)
+                            .await;
                     }
                 }
             }
@@ -807,6 +824,7 @@ impl Actor {
             approvals: self.approvals.clone(),
         };
         let turn = matches!(job, Job::Turn(_));
+        let fork = matches!(job, Job::Fork { .. });
         let current = Arc::clone(&self.current);
         let handle = tokio::spawn(async move {
             match job {
@@ -829,7 +847,16 @@ impl Actor {
             cancel,
             inbox: inbox_tx,
             turn,
+            fork,
         }
+    }
+
+    /// What is handled at once even while a fork runs: it stops the fork or answers it.
+    fn urgent(cmd: &Command) -> bool {
+        matches!(
+            cmd,
+            Command::Cancel | Command::Shutdown | Command::Approve { .. } | Command::Deny { .. }
+        )
     }
 
     fn resolve(&self, request_id: &str, verdict: Verdict) {

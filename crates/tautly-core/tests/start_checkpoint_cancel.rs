@@ -222,6 +222,54 @@ async fn shutdown_while_a_command_waits(git: &Path, cmd: Command) {
     );
 }
 
+fn pins(path: &Path) -> Vec<String> {
+    SessionReader::<SessionRecord>::open(path)
+        .unwrap()
+        .records()
+        .filter_map(|r| match r.unwrap().1 {
+            SessionRecord::Command(Command::Pin { text }) => Some(text),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Re-review N1: a command sent while a `Fork` job runs (here: waits for the start
+/// checkpoint) is logged in the branch it applies to, not in the parent.
+async fn a_pin_sent_during_a_fork_is_logged_in_the_branch(git: &Path) {
+    let (dir, home) = repo(git);
+    let mock = MockProvider::new(vec![]);
+    let mut run = Run::start(dir.path(), home.path(), &mock);
+    let parent = run.engine.session_path().to_path_buf();
+    run.engine
+        .send(Command::Pin {
+            text: "BEFORE".into(),
+        })
+        .await
+        .unwrap();
+    run.engine
+        .send(Command::Fork {
+            at: None,
+            label: None,
+        })
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    run.engine
+        .send(Command::Pin {
+            text: "DURING".into(),
+        })
+        .await
+        .unwrap();
+    let first = run.engine.session_id().to_string();
+    while !matches!(run.next().await, Event::SessionChanged { session_id } if session_id != first) {
+    }
+    let (_, branch) = run.engine.current_session();
+    assert_ne!(branch, parent);
+    run.records().await;
+    assert_eq!(pins(&parent), ["BEFORE"]);
+    assert_eq!(pins(&branch), ["BEFORE", "DURING"]);
+}
+
 #[test]
 fn cancel_while_the_session_start_checkpoint_is_taken_ends_the_turn_within_200ms() {
     let git = real_git();
@@ -259,6 +307,7 @@ fn cancel_while_the_session_start_checkpoint_is_taken_ends_the_turn_within_200ms
             },
         )
         .await;
+        a_pin_sent_during_a_fork_is_logged_in_the_branch(&git).await;
         shutdown_while_a_command_waits(
             &git,
             Command::Fork {
