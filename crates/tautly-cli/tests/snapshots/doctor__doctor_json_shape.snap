@@ -1,0 +1,84 @@
+---
+source: crates/tautly-cli/tests/doctor.rs
+expression: v
+---
+{
+  "checks": [
+    {
+      "detail": "loaded",
+      "level": "ok",
+      "name": "config"
+    },
+    {
+      "detail": "anthropic/claude-sonnet-5-5 (detected from ANTHROPIC_API_KEY)",
+      "level": "ok",
+      "name": "model"
+    },
+    {
+      "detail": "anthropic: environment (ANTHROPIC_API_KEY)",
+      "level": "ok",
+      "name": "keys"
+    },
+    {
+      "detail": "openai: none",
+      "level": "info",
+      "name": "keys"
+    },
+    {
+      "detail": "google: none",
+      "level": "info",
+      "name": "keys"
+    },
+    {
+      "detail": "compat:openrouter: none",
+      "level": "info",
+      "name": "keys"
+    },
+    {
+      "detail": "compat:ollama: none (none needed)",
+      "level": "info",
+      "name": "keys"
+    },
+    {
+      "detail": "available (test secret store)",
+      "level": "ok",
+      "name": "keychain"
+    },
+    {
+      "detail": "skipped (--offline)",
+      "level": "info",
+      "name": "network"
+    },
+    {
+      "detail": "[HOME] (writable)",
+      "level": "ok",
+      "name": "data home"
+    },
+    {
+      "detail": "root [WORK]",
+      "level": "ok",
+      "name": "sandbox"
+    },
+    {
+      "detail": "no OS isolation in v1: commands run as your user, gated by the permission policy",
+      "level": "info",
+      "name": "sandbox"
+    },
+    {
+      "detail": "[git version]",
+      "level": "ok",
+      "name": "git"
+    },
+    {
+      "detail": "not built yet (sessions build it in the background)",
+      "level": "info",
+      "name": "index"
+    },
+    {
+      "detail": "no servers configured",
+      "level": "info",
+      "name": "mcp"
+    }
+  ],
+  "ok": true
+}

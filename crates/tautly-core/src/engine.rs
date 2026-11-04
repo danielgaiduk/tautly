@@ -36,7 +36,7 @@ use std::time::Duration;
 
 use tautly_context::Context;
 use tautly_mcp::ServerSpec;
-use tautly_provider::{Catalog, Provider, Retrying};
+use tautly_provider::{ModelId, Provider, Retrying};
 use tautly_sandbox::{LocalSandbox, Policy, PolicyError, Sandbox, SandboxError};
 use tautly_session::{HeaderInit, SessionWriter};
 use tautly_tools::{ProcessGroups, ReadTracker, registry};
@@ -46,6 +46,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::approvals::{Approvals, Verdict};
 use crate::attempts::AttemptLedger;
+use crate::auth::{KeyringStore, SecretStore};
 use crate::budget::{Budget, Budgets};
 use crate::checkpoint::{self, Checkpointer, GitCheckpoints, Skip, StartCheckpoint};
 use crate::config::{Config, LoadedConfig};
@@ -55,7 +56,7 @@ use crate::mcp::{McpSession, McpSetup, NoPreExec, PreExecHook};
 use crate::memory::{MemoryMode, MemoryState};
 use crate::model_switch::ModelSetup;
 use crate::protocol::{BudgetScope, Command, ErrorKind, Event, FinishReason};
-use crate::provider_setup::{ProviderFactory, provider_for, provider_label};
+use crate::provider_setup::{ProviderFactory, provider_for_with, provider_label};
 use crate::record::SessionRecord;
 use crate::resume;
 use crate::routing::Side;
@@ -141,6 +142,9 @@ pub struct EngineBuilder {
     pub client_mcp: Vec<(String, ServerSpec)>,
     /// Runs before every stdio MCP call. Default: [`NoPreExec`].
     pub pre_exec: Option<Arc<dyn PreExecHook>>,
+    /// Where API keys are looked up after the environment, for every provider the engine
+    /// builds itself (main, side model, `SetModel`). Default: the OS keychain.
+    pub secret_store: Option<Arc<dyn SecretStore>>,
 }
 
 impl EngineBuilder {
@@ -160,6 +164,7 @@ impl EngineBuilder {
             approve_mcp: false,
             client_mcp: Vec::new(),
             pre_exec: None,
+            secret_store: None,
         }
     }
 
@@ -213,19 +218,34 @@ impl EngineBuilder {
         let policy = Policy::new(config.permissions.clone(), root.clone())?;
         let test_matcher =
             Arc::new(TestMatcher::new(&config.evidence).map_err(EngineError::Evidence)?);
-        let mut catalog = Catalog::builtin();
-        if let Some(overrides) = config.catalog_overrides.clone() {
-            catalog.merge(overrides);
-        }
-        let catalog = Arc::new(catalog);
+        let catalog = Arc::new(config.effective_catalog());
         let info = catalog.get(&config.model);
+        let store: Arc<dyn SecretStore> =
+            self.secret_store.unwrap_or_else(|| Arc::new(KeyringStore));
+        let env = |name: &str| std::env::var_os(name);
         let provider = match self.provider {
             Some(p) => p,
-            None => provider_for(&config, &config.model, Arc::clone(&catalog))
+            None => provider_for_with(&config, &config.model, Arc::clone(&catalog), &env, &*store)
                 .map_err(|e| EngineError::Provider(e.to_string()))?,
         };
         let provider: Arc<dyn Provider> = Arc::new(Retrying::new(provider));
-        let (side, side_note) = Side::resolve(&config, &catalog, &provider, self.side_provider);
+        let (side, side_note) =
+            Side::resolve_with(&config, &catalog, &provider, self.side_provider, |id| {
+                provider_for_with(&config, id, Arc::clone(&catalog), &env, &*store)
+            });
+        let provider_factory = self.provider_factory.unwrap_or_else(|| {
+            let (config, catalog, store) =
+                (config.clone(), Arc::clone(&catalog), Arc::clone(&store));
+            Arc::new(move |model: &ModelId| {
+                provider_for_with(
+                    &config,
+                    model,
+                    Arc::clone(&catalog),
+                    &|name| std::env::var_os(name),
+                    &*store,
+                )
+            })
+        });
         let mut config_warnings = self.config_warnings;
         config_warnings.extend(side_note);
         let init = HeaderInit {
@@ -299,7 +319,7 @@ impl EngineBuilder {
             sandbox,
             workspace,
             provider,
-            setup: ModelSetup::new(config.clone(), Arc::clone(&catalog), self.provider_factory),
+            setup: ModelSetup::new(config.clone(), Arc::clone(&catalog), Some(provider_factory)),
             reasoning_retry: false,
             model: config.model.clone(),
             info,

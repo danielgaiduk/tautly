@@ -9,6 +9,7 @@ pub mod auth;
 pub mod budget;
 pub mod checkpoint;
 pub mod config;
+pub mod detect;
 pub mod diff;
 mod dispatch;
 pub mod engine;
@@ -49,7 +50,9 @@ pub use protocol::{
     BudgetScope, Command, DiffFile, DiffStatus, EffectView, ErrorKind, Event, FinishReason,
     MAX_REPLACED_SHOWN, McpState, PROTOCOL_VERSION, ToolMetaView, UsageRole,
 };
-pub use provider_setup::{ProviderFactory, ProviderSetupError, known_provider, provider_label};
+pub use provider_setup::{
+    ProviderFactory, ProviderSetupError, known_provider, provider_for_with, provider_label,
+};
 pub use record::SessionRecord;
 pub use signals::{Signal, SignalPolicy, SignalRouter, handle_signals, install_signal_handlers};
 pub use workspace::{IndexLockError, Workspace, Workspaces};
@@ -66,7 +69,7 @@ pub use tautly_tools::DiffPreview;
 // `tautly-cli` depends on this crate alone.
 pub use tautly_context::prompt::system as system_prompt;
 pub use tautly_mcp::config::{import_into_toml, parse_mcp_json};
-pub use tautly_mcp::{McpHub, ServerStatus};
+pub use tautly_mcp::{McpHub, ServerStatus, printable};
 pub use tautly_provider::{Catalog, ModelInfo, Price};
 pub use tautly_session::{
     Error as LogError, Origin, SessionReader, SessionSummary as LogSummary,

@@ -17,7 +17,7 @@ use crate::tree::{SharedTree, Slot, TreeData};
 
 /// Version written by this build; bump and append a [`MIGRATIONS`] step when the schema
 /// changes.
-const SCHEMA_VERSION: i64 = 2;
+pub(crate) const SCHEMA_VERSION: i64 = 2;
 /// The oldest version a migration path exists from.
 const OLDEST_MIGRATABLE: i64 = 1;
 /// Version of everything derived from file content (symbols, references, trigrams).

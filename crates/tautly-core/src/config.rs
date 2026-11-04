@@ -34,6 +34,16 @@ const MAX_CONFIG_BYTES: u64 = 256 * 1024;
 /// Model used when no layer names one.
 pub const DEFAULT_MODEL: &str = "anthropic/claude-sonnet-5-5";
 
+/// The built-in `[[providers.compat]]` entry `openrouter` (spec 7.11.2).
+pub const OPENROUTER_URL: &str = "https://openrouter.ai/api/v1";
+/// Where the built-in `openrouter` entry finds its key.
+pub const OPENROUTER_KEY_ENV: &str = "OPENROUTER_API_KEY";
+/// The built-in `[[providers.compat]]` entry `ollama`: a local Ollama, no key.
+pub const OLLAMA_URL: &str = "http://localhost:11434/v1";
+
+/// What loading says when `[telemetry] enabled = true` (spec 2.4: reserved, ignored).
+pub const TELEMETRY_WARNING: &str = "[telemetry] OpenTelemetry export is post-v1; ignored";
+
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
     #[error("cannot read {}: {source}", path.display())]
@@ -209,15 +219,37 @@ impl Default for Config {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProvidersConfig {
     pub anthropic: Option<ProviderEntry>,
     pub openai: Option<ProviderEntry>,
     pub google: Option<ProviderEntry>,
-    /// OpenAI-compatible endpoints (`[[providers.compat]]`).
+    /// OpenAI-compatible endpoints (`[[providers.compat]]`). Built-in `openrouter` and
+    /// `ollama` entries are added unless these define those names
+    /// ([`Config::effective_compat`]).
     #[serde(default)]
     pub compat: Vec<CompatEntry>,
+    /// Detect a provider when no layer or flag names a model (spec 7.11.2; default on).
+    /// User layer and command line only, like every `providers` key.
+    #[serde(default = "default_auto_detect")]
+    pub auto_detect: bool,
+}
+
+impl Default for ProvidersConfig {
+    fn default() -> Self {
+        ProvidersConfig {
+            anthropic: None,
+            openai: None,
+            google: None,
+            compat: Vec::new(),
+            auto_detect: default_auto_detect(),
+        }
+    }
+}
+
+fn default_auto_detect() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -334,6 +366,10 @@ pub struct LoadedConfig {
     /// One line per setting the project file was not allowed to make, for the engine to
     /// report as `Event::Warning`.
     pub warnings: Vec<String>,
+    /// Whether a layer or flag named the model (else `config.model` is the default and
+    /// provider detection may choose another, spec 7.11.2). A project `model` the loader
+    /// dropped does not count.
+    pub model_explicit: bool,
 }
 
 impl Config {
@@ -347,6 +383,40 @@ impl Config {
             .and_then(|v| serde_json::to_vec(&v))
             .unwrap_or_default();
         blake3::hash(&canonical).to_hex().to_string()
+    }
+
+    /// The `[[providers.compat]]` entries plus the built-in `openrouter`
+    /// ([`OPENROUTER_URL`], key from [`OPENROUTER_KEY_ENV`]) and `ollama` ([`OLLAMA_URL`],
+    /// no key), each unless an entry of that name is configured.
+    pub fn effective_compat(&self) -> Vec<CompatEntry> {
+        let mut entries = self.providers.compat.clone();
+        let builtins = [
+            ("openrouter", OPENROUTER_URL, Some(OPENROUTER_KEY_ENV)),
+            ("ollama", OLLAMA_URL, None),
+        ];
+        for (name, url, key_env) in builtins {
+            if entries.iter().any(|c| c.name == name) {
+                continue;
+            }
+            let Ok(base_url) = Url::parse(url) else {
+                continue;
+            };
+            entries.push(CompatEntry {
+                name: name.to_string(),
+                base_url,
+                api_key_env: key_env.map(str::to_string),
+            });
+        }
+        entries
+    }
+
+    /// The built-in model catalog with `catalog_overrides` applied.
+    pub fn effective_catalog(&self) -> Catalog {
+        let mut catalog = Catalog::builtin();
+        if let Some(overrides) = self.catalog_overrides.clone() {
+            catalog.merge(overrides);
+        }
+        catalog
     }
 
     /// Defaults, then `<config home>/config.toml`, then `<root>/.tautly/config.toml`, then
@@ -461,6 +531,8 @@ impl Config {
                 .and_then(|cfg| cfg.check(Some(&path)))?;
             deep_merge(&mut merged, layer);
         }
+        // Defaults are not in `merged`: a `model` there came from a file (or the flag).
+        let model_explicit = merged.contains_key("model") || cli.model.is_some();
         deep_merge(&mut merged, cli_table(&cli));
 
         let mut cfg: Config = Value::Table(merged)
@@ -471,9 +543,13 @@ impl Config {
             })?;
         cfg.validate()?;
         cfg.project_mcp_servers = project_mcp_servers;
+        if cfg.telemetry.enabled {
+            warnings.push(TELEMETRY_WARNING.to_string());
+        }
         Ok(LoadedConfig {
             config: cfg,
             warnings,
+            model_explicit,
         })
     }
 

@@ -583,6 +583,62 @@ fn mcp_import_defaults_to_claude_json_and_will_not_trust_the_repository_unasked(
     assert_eq!(mode & 0o777, 0o600, "{mode:o}");
 }
 
+/// No byte of `bytes` can move the cursor, recolor the screen or end a line early: only
+/// printable characters, newlines and tabs.
+fn assert_no_control_bytes(what: &str, bytes: &[u8]) {
+    for (i, b) in bytes.iter().enumerate() {
+        assert!(
+            *b >= 0x20 || *b == b'\n' || *b == b'\t',
+            "{what} has control byte {b:#04x} at {i}: {:?}",
+            String::from_utf8_lossy(bytes)
+        );
+    }
+}
+
+#[test]
+fn mcp_import_escapes_control_characters_of_the_imported_file() {
+    let s = Scratch::new();
+    // Names from a file (repository content) that try to forge lines and redraw the
+    // terminal: new, already in the config, and an entry that is skipped.
+    let evil = "evil\u{1b}[2K\nforged: line\r";
+    let kept = "kept\u{1b}[31m\nforged: kept";
+    let sse = "sse\u{1b}]0;title\u{7}\nforged: skipped";
+    let doc = serde_json::json!({"mcpServers": {
+        evil: {"command": "x", "args": ["a\u{1b}[1m"]},
+        kept: {"command": "y"},
+        sse: {"type": "sse", "url": "https://example.com/sse"},
+    }});
+    std::fs::write(
+        s.config(),
+        format!("[mcp.servers.{}]\ncommand = \"mine\"\n", {
+            // A TOML key with the escape and a newline, as the library writes it.
+            let key = kept.replace('\u{1b}', "\\u001b").replace('\n', "\\n");
+            format!("\"{key}\"")
+        }),
+    )
+    .unwrap();
+    s.write("claude.json", &doc.to_string());
+
+    for out in [
+        s.run(&["mcp", "import", "--from", "claude.json"]),
+        // The refusal of an unasked, in-tree default prints the same names on stderr.
+        {
+            s.write(".mcp.json", &doc.to_string());
+            s.run(&["mcp", "import"])
+        },
+    ] {
+        assert_no_control_bytes("stdout", &out.stdout);
+        assert_no_control_bytes("stderr", &out.stderr);
+        let said = format!("{}{}", stdout(&out), stderr(&out));
+        // The text is there, escaped, and nothing starts a line of its own.
+        assert!(said.contains(r"\u{1b}"), "{said}");
+        assert!(
+            said.lines().all(|l| !l.trim_start().starts_with("forged")),
+            "{said}"
+        );
+    }
+}
+
 #[test]
 fn mcp_import_refuses_what_is_not_mcp_json() {
     let s = Scratch::new();

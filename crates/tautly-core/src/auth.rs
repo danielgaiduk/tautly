@@ -25,6 +25,15 @@ pub enum AuthError {
 pub trait SecretStore: Send + Sync {
     /// The secret stored for `service`/`account`; `Ok(None)` when there is none.
     fn get(&self, service: &str, account: &str) -> Result<Option<String>, AuthError>;
+
+    /// Store `secret` for `service`/`account`, replacing what was there. A store that
+    /// cannot be written (the default) answers [`AuthError::KeychainUnavailable`].
+    fn set(&self, service: &str, account: &str, secret: &str) -> Result<(), AuthError> {
+        let _ = (service, account, secret);
+        Err(AuthError::KeychainUnavailable(
+            "this secret store is read-only".into(),
+        ))
+    }
 }
 
 /// The operating system's keychain (macOS Keychain, Linux Secret Service).
@@ -37,6 +46,12 @@ impl SecretStore for KeyringStore {
             .map_err(|e| AuthError::Keychain(e.to_string()))?;
         from_keyring(entry.get_password())
     }
+
+    fn set(&self, service: &str, account: &str, secret: &str) -> Result<(), AuthError> {
+        let entry = keyring::Entry::new(service, account)
+            .map_err(|e| AuthError::Keychain(e.to_string()))?;
+        entry.set_password(secret).map_err(keyring_error)
+    }
 }
 
 /// "No such entry" is not an error. Neither is a keychain that cannot be asked (no Secret
@@ -46,10 +61,18 @@ fn from_keyring(result: Result<String, keyring::Error>) -> Result<Option<String>
     match result {
         Ok(secret) => Ok(Some(secret)),
         Err(keyring::Error::NoEntry) => Ok(None),
-        Err(e @ (keyring::Error::NoStorageAccess(_) | keyring::Error::PlatformFailure(_))) => {
-            Err(AuthError::KeychainUnavailable(e.to_string()))
+        Err(e) => Err(keyring_error(e)),
+    }
+}
+
+/// A keychain that cannot be asked (no Secret Service, access refused) is
+/// [`AuthError::KeychainUnavailable`]; any other failure is [`AuthError::Keychain`].
+fn keyring_error(e: keyring::Error) -> AuthError {
+    match e {
+        keyring::Error::NoStorageAccess(_) | keyring::Error::PlatformFailure(_) => {
+            AuthError::KeychainUnavailable(e.to_string())
         }
-        Err(e) => Err(AuthError::Keychain(e.to_string())),
+        e => AuthError::Keychain(e.to_string()),
     }
 }
 

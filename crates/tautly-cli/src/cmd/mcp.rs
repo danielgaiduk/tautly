@@ -11,7 +11,7 @@ use anyhow::{Context as _, anyhow, bail};
 use clap::Subcommand;
 use tautly_core::{
     Approval, CliOverrides, Config, McpHub, ServerSource, ServerSpec, ServerStatus,
-    import_into_toml, parse_mcp_json, plan_servers, provider_key_vars,
+    import_into_toml, parse_mcp_json, plan_servers, printable, provider_key_vars,
 };
 
 use super::Env;
@@ -153,8 +153,10 @@ fn import(from: Option<PathBuf>, env: &Env) -> anyhow::Result<i32> {
     let in_tree = is_inside(&path, env.root());
     let (servers, skipped) =
         parse_mcp_json(&text).map_err(|e| anyhow!("{}: {e}", path.display()))?;
+    // Names and messages come from the imported file, which may be repository content:
+    // control characters are escaped (`printable`) so that they cannot redraw the screen.
     for line in &skipped {
-        println!("{line}");
+        println!("{}", printable(line));
     }
     if servers.is_empty() {
         println!("no MCP servers to import in {}", path.display());
@@ -203,7 +205,13 @@ fn import(from: Option<PathBuf>, env: &Env) -> anyhow::Result<i32> {
         );
     }
     if !kept.is_empty() {
-        println!("already in the config, left alone: {}", kept.join(", "));
+        println!(
+            "already in the config, left alone: {}",
+            kept.iter()
+                .map(|k| printable(k))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
     }
     Ok(0)
 }
@@ -214,7 +222,13 @@ fn summary(servers: &BTreeMap<String, ServerSpec>, names: &[&str]) -> String {
     names
         .iter()
         .filter_map(|n| servers.get(*n).map(|spec| (n, spec)))
-        .map(|(name, spec)| format!("  {name}: {}\n", spec.launch(ServerSource::User)))
+        .map(|(name, spec)| {
+            format!(
+                "  {}: {}\n",
+                printable(name),
+                spec.launch(ServerSource::User)
+            )
+        })
         .collect()
 }
 

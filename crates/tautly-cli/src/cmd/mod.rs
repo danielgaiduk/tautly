@@ -5,6 +5,8 @@
 //! Output goes to stdout, problems to stderr; the exit code is 0, or 1 when the command
 //! failed (a refused undo, an unknown session, ...). Usage errors exit 2, as clap does.
 
+pub mod auth;
+pub mod doctor;
 mod index;
 mod mcp;
 mod memory;
