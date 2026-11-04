@@ -1973,6 +1973,82 @@ async fn config_include_that_never_ends_turns_checkpoints_off_once() {
     assert!(!repo.path(".git/refs/tautly").exists());
 }
 
+/// Review N3: a `.git` directory whose `refs` (or `refs/tautly`, `refs/tautly/checkpoints`,
+/// `objects`) is a symbolic link would make checkpoints write and delete refs in the
+/// repository it points at: no checkpoints, `git_dir_unverified`.
+#[tokio::test]
+async fn git_dir_with_linked_refs_or_objects_takes_no_checkpoint() {
+    let victim = Repo::with(&[("a.txt", "a\n")]);
+    let head = victim.git(&["rev-parse", "HEAD"]);
+    victim.git(&["update-ref", "refs/tautly/checkpoints/old/1", &head]);
+    let vgit = victim.path(".git");
+    let link = |from: PathBuf, to: PathBuf| std::os::unix::fs::symlink(to, from).unwrap();
+    let layouts: Vec<(&str, Box<dyn Fn(&Repo)>)> = vec![
+        (
+            "refs and objects",
+            Box::new(|r: &Repo| {
+                link(r.path(".git/refs"), vgit.join("refs"));
+                link(r.path(".git/objects"), vgit.join("objects"));
+            }),
+        ),
+        (
+            "refs/tautly",
+            Box::new(|r: &Repo| link(r.path(".git/refs/tautly"), vgit.join("refs/tautly"))),
+        ),
+        (
+            "refs/tautly/checkpoints",
+            Box::new(|r: &Repo| {
+                std::fs::create_dir_all(r.path(".git/refs/tautly")).unwrap();
+                link(
+                    r.path(".git/refs/tautly/checkpoints"),
+                    vgit.join("refs/tautly/checkpoints"),
+                );
+            }),
+        ),
+        (
+            "objects",
+            Box::new(|r: &Repo| {
+                std::fs::rename(r.path(".git/objects"), r.path("own-objects")).unwrap();
+                link(r.path(".git/objects"), vgit.join("objects"));
+            }),
+        ),
+    ];
+    for (name, make) in layouts {
+        let hostile = Repo::with(&[("a.txt", "a\n")]);
+        if name == "refs and objects" {
+            std::fs::remove_dir_all(hostile.path(".git/refs")).unwrap();
+            std::fs::remove_dir_all(hostile.path(".git/objects")).unwrap();
+        }
+        make(&hostile);
+        assert!(
+            Checkpointer::new(
+                hostile.sandbox(),
+                hostile.root(),
+                "s".into(),
+                CheckpointConfig::default()
+            )
+            .is_none(),
+            "{name}"
+        );
+        let mock = MockProvider::new(vec![
+            tools_step(vec![bash("b1", "printf 'b\\n' > a.txt")]),
+            text_step("first"),
+        ]);
+        let mut run = start(hostile.builder(config(), &mock));
+        let events = run.turn_with("one").await;
+        run.stop().await;
+        let skipped: Vec<String> = warnings(&events)
+            .into_iter()
+            .filter(|w| w.starts_with("checkpoint skipped"))
+            .collect();
+        assert_eq!(skipped, [skip_warning(&Skip::GitDirUnverified)], "{name}");
+    }
+    assert_eq!(
+        victim.refs("refs/tautly/"),
+        ["refs/tautly/checkpoints/old/1"]
+    );
+}
+
 /// A real linked worktree keeps its checkpoints (in the shared repository).
 #[tokio::test]
 async fn linked_worktree_still_takes_checkpoints() {

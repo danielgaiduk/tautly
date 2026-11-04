@@ -1840,8 +1840,21 @@ pub(crate) fn dot_git_is_link(root: &Path) -> bool {
 /// never followed (see [`dot_git_is_link`]). Every git call names it (`--git-dir`) with
 /// the root as the work tree, so neither the environment nor `core.worktree` can point git
 /// elsewhere.
+///
+/// Nor when the common directory's `refs`, `refs/tautly`, `refs/tautly/checkpoints` or
+/// `objects` is a symbolic link: checkpoints would write (and prune) refs and objects in
+/// whatever repository it leads to. (`objects/info/alternates` is left alone: reading
+/// another repository's objects is how `clone --shared` works, and nothing is written
+/// there.)
 pub(crate) fn git_dir(root: &Path) -> Option<PathBuf> {
-    tautly_session::git_dirs_at(&root.join(".git")).map(|d| d.git_dir)
+    let dirs = tautly_session::git_dirs_at(&root.join(".git"))?;
+    let linked = ["refs", "refs/tautly", "refs/tautly/checkpoints", "objects"]
+        .iter()
+        .any(|p| {
+            std::fs::symlink_metadata(dirs.common_dir.join(p))
+                .is_ok_and(|m| m.file_type().is_symlink())
+        });
+    (!linked).then_some(dirs.git_dir)
 }
 
 /// Whether the root has a `.git` (not a symbolic link) that [`git_dir`] does not accept.
