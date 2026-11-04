@@ -20,9 +20,11 @@
 //! - The engine commands, by their wire names, with the command's fields as params:
 //!   `send_message`, `approve`, `deny`, `cancel`, `set_budget`, `compact`, `uncompact`,
 //!   `pin`, `unpin`, `approve_memory`, `reject_memory`, `consolidate_memory`, `fork`,
-//!   `set_model`, `diff`, `undo`, `rewind`, `switch`, `label` ([`command_for`]; `switch`
-//!   names the session to switch to `target`, since `session_id` addresses the session
-//!   the command is for; a value this version does not know, such
+//!   `set_model`, `diff`, `undo`, `rewind`, `switch`, `label`, `replay` ([`command_for`];
+//!   `switch` names the session to switch to, and `replay` the session to play back,
+//!   `target`, since `session_id` addresses the session the command is for; `replay`
+//!   answers with `replayed` events and a `replay_finished`; a value this version does
+//!   not know, such
 //!   as a `set_budget` scope, is `-32602`). Each takes an optional `session_id`:
 //!   without one, the default session (or the only open session). The result is `null`
 //!   once the session has the command; what it does arrives as events.
@@ -119,6 +121,7 @@ const COMMAND_METHODS: &[&str] = &[
     "rewind",
     "switch",
     "label",
+    "replay",
     "shutdown",
 ];
 
@@ -137,9 +140,10 @@ pub fn command_for(method: &str, params: &Value) -> Result<Command, Error> {
     }
     let mut fields = params.as_object().cloned().unwrap_or_default();
     fields.remove("session_id");
-    // `session_id` addresses the session, so `switch` names the session to switch to as
-    // `target` (the command's own `session_id`).
-    if method == "switch"
+    // `session_id` addresses the session, so `switch` (the session to switch to) and
+    // `replay` (the session to play back) name theirs `target` (the command's own
+    // `session_id`).
+    if matches!(method, "switch" | "replay")
         && let Some(target) = fields.remove("target")
     {
         fields.insert("session_id".into(), target);

@@ -1734,3 +1734,85 @@ async fn repl_rewind_dry_run_then_apply_and_tree_switch_label() {
         ]
     );
 }
+
+// ---------------------------------------------------------------------------------------
+// Playback
+
+#[tokio::test]
+async fn replay_shows_the_session_without_asking_again() {
+    let fx = Fx::new();
+    let mock = MockProvider::new(vec![
+        step(vec![bash("b1", "echo hi")]),
+        text_step("all done"),
+    ]);
+    let ran = run(
+        &fx,
+        vec![text("do it"), text("y"), text("/replay")],
+        config(Mode::Ask, false),
+        &mock,
+    )
+    .await;
+    // Asked once, live; the replayed approval is shown, never asked.
+    let asks = ran.prompts.iter().filter(|p| p.contains("allow?")).count();
+    assert_eq!(asks, 1, "{:?}", ran.prompts);
+    assert!(ran.out.contains("> do it"), "{}", ran.out);
+    assert_eq!(count(&ran.out, "ok bash echo hi"), 2, "{}", ran.out);
+    assert_eq!(count(&ran.out, "all done"), 2, "{}", ran.out);
+    assert!(ran.out.contains("replay finished: "), "{}", ran.out);
+    // The replayed row has no start time, so no duration (the live one has one).
+    assert_eq!(
+        count(&ran.out, "ok bash echo hi · exit 0"),
+        1,
+        "{}",
+        ran.out
+    );
+}
+
+#[tokio::test]
+async fn a_replay_that_cannot_start_ends_before_the_prompt() {
+    let fx = Fx::new();
+    let mock = MockProvider::new(vec![]);
+    let ran = run(
+        &fx,
+        vec![text("/replay nope"), text("/cost")],
+        config(Mode::Ask, false),
+        &mock,
+    )
+    .await;
+    let error = ran
+        .out
+        .find("no session `nope`")
+        .unwrap_or_else(|| panic!("{}", ran.out));
+    let end = ran
+        .out
+        .find("replay finished: 0 events")
+        .unwrap_or_else(|| panic!("{}", ran.out));
+    let next = ran
+        .out
+        .find("no turn has finished")
+        .unwrap_or_else(|| panic!("{}", ran.out));
+    assert!(error < end && end < next, "{}", ran.out);
+}
+
+#[test]
+fn a_replayed_model_switch_does_not_change_the_model() {
+    let mut st = RenderState::default();
+    st.model = Some("mock/live".into());
+    let e = Event::Replayed {
+        offset: 3,
+        t_ms: 0,
+        event: Box::new(Event::ModelChanged {
+            model: ModelId::from("mock/old"),
+            provider: "mock".into(),
+        }),
+    };
+    let out = render::event(&e, &mut st, &plain()).unwrap();
+    assert!(out.contains("model: mock/old"), "{out}");
+    assert_eq!(st.model.as_deref(), Some("mock/live"));
+    let msg = Event::UserMessage {
+        text: "two\nlines\u{1b}[2J".into(),
+    };
+    let out = render::event(&msg, &mut st, &plain()).unwrap();
+    assert!(!out.contains('\u{1b}'), "{out:?}");
+    assert!(out.starts_with("> two\n  lines"), "{out:?}");
+}

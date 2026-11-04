@@ -41,3 +41,5 @@ insta.workspace = true
 ignore.workspace = true
 proptest.workspace = true
 wiremock.workspace = true
+# A paused clock for the playback pacing test.
+tokio = { workspace = true, features = ["test-util"] }

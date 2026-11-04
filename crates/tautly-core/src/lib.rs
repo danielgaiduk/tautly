@@ -25,6 +25,7 @@ pub mod protocol;
 mod provider_setup;
 pub mod receipt;
 pub mod record;
+pub mod replay;
 pub mod resume;
 pub mod routing;
 mod session;

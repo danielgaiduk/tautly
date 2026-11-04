@@ -16,6 +16,7 @@ mod memory;
 mod models;
 mod prompt;
 mod receipt;
+mod replay;
 mod sessions;
 mod stats;
 mod undo;
@@ -74,6 +75,8 @@ pub enum Command {
     /// Compare two to five sessions side by side (cost, steps, wall time, outcome, files),
     /// counted from their fork point when they share one.
     Compare(compare::Args),
+    /// Play a session back from its log: no model is called and nothing runs.
+    Replay(replay::Args),
 }
 
 /// Run `command`; the exit code.
@@ -91,6 +94,7 @@ pub async fn run(command: Command, cli: &Cli) -> anyhow::Result<i32> {
         Command::Stats(args) => stats::run(args, &env),
         Command::Receipt(args) => receipt::run(args, &env),
         Command::Compare(args) => compare::run(args, &env),
+        Command::Replay(args) => replay::run(args, &env).await,
     }
 }
 

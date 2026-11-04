@@ -311,5 +311,24 @@ expression: events
       "backup_ref": null,
       "note": null
     }
+  },
+  {
+    "type": "replayed",
+    "offset": 7,
+    "t_ms": 1793795696000,
+    "event": {
+      "type": "user_message",
+      "text": "fix the bug"
+    }
+  },
+  {
+    "type": "replay_finished",
+    "session_id": "01J0",
+    "events": 42,
+    "cancelled": false
+  },
+  {
+    "type": "user_message",
+    "text": "fix the bug"
   }
 ]

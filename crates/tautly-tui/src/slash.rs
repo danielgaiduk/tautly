@@ -26,6 +26,8 @@ pub enum Slash {
     Switch(String),
     /// `/label <name>`: rename the current branch.
     Label(String),
+    /// `/replay [id]`: play this session (or session id) back from its log.
+    Replay(Option<String>),
     MemoryConsolidate,
     Help,
     /// Anything else (or a known command with arguments it does not take): the help is
@@ -49,6 +51,7 @@ commands:
   /tree                this project's sessions as a tree (* marks the current one)
   /switch <label|id|n> continue another branch (n: its line in /tree), files included
   /label <name>        rename the current branch
+  /replay [id]         play this session (or another) back from its log; Ctrl+C stops
   /memory consolidate  propose merging and pruning project memory
   /help                this list
 keys: Ctrl+C cancels a turn (twice within 2 s exits), clears the line at the prompt;
@@ -82,6 +85,7 @@ pub fn parse(line: &str) -> Option<Slash> {
         ("tree", None) => Slash::Tree,
         ("switch", Some(a)) => Slash::Switch(a),
         ("label", Some(a)) => Slash::Label(a),
+        ("replay", a) => Slash::Replay(a),
         ("memory", Some(a)) if a == "consolidate" => Slash::MemoryConsolidate,
         ("help", None) => Slash::Help,
         _ => unknown(),
@@ -110,6 +114,11 @@ mod tests {
         assert_eq!(parse("/tree"), Some(Slash::Tree));
         assert_eq!(parse("/switch try-b"), Some(Slash::Switch("try-b".into())));
         assert_eq!(parse("/label main"), Some(Slash::Label("main".into())));
+        assert_eq!(parse("/replay"), Some(Slash::Replay(None)));
+        assert_eq!(
+            parse("/replay 01J"),
+            Some(Slash::Replay(Some("01J".into())))
+        );
         for bad in [
             "/diff x",
             "/diff 0",

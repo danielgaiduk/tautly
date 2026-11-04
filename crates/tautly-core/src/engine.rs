@@ -549,6 +549,11 @@ enum Job {
         dry_run: bool,
         overwrite: Vec<String>,
     },
+    Replay {
+        session_id: Option<String>,
+        speed: f32,
+        from_step: Option<u32>,
+    },
 }
 
 /// The task in flight (a turn or a compaction). It hands back the session and the inbox,
@@ -762,6 +767,15 @@ impl Actor {
                             dry_run,
                             overwrite,
                         },
+                        Command::Replay {
+                            session_id,
+                            speed,
+                            from_step,
+                        } => Job::Replay {
+                            session_id,
+                            speed,
+                            from_step,
+                        },
                         Command::SetModel { model } => {
                             match state.as_mut() {
                                 Some(s) => {
@@ -819,7 +833,11 @@ impl Actor {
                     let cmd = cmd.unwrap_or(Command::Shutdown);
                     // A fork moves the log to its branch when it ends: what applies after it
                     // waits, unlogged, and is logged in the branch at the join.
-                    if running.as_ref().is_some_and(|r| r.fork) && !Self::urgent(&cmd) {
+                    // A replay is refused at once (idle only), never held.
+                    if running.as_ref().is_some_and(|r| r.fork)
+                        && !Self::urgent(&cmd)
+                        && !matches!(cmd, Command::Replay { .. })
+                    {
                         if held.len() < COMMAND_CAPACITY {
                             held.push(cmd);
                         } else {
@@ -995,6 +1013,13 @@ impl Actor {
                     let _ = r.inbox.send(cmd);
                 }
             }
+            // A replay is a view of a log, never queued behind live work (spec 7.12.5).
+            Command::Replay { .. } if running.is_some() => self.events.try_emit(Event::Error {
+                kind: ErrorKind::Internal,
+                message: crate::replay::REPLAY_BUSY.into(),
+                retryable: false,
+                hint: None,
+            }),
             other => queue.push_back(other),
         }
     }
@@ -1082,6 +1107,11 @@ impl Actor {
                         .switch_job(session_id, dry_run, overwrite, &ctl, moved)
                         .await
                 }
+                Job::Replay {
+                    session_id,
+                    speed,
+                    from_step,
+                } => session.replay_job(session_id, speed, from_step, &ctl).await,
             }
             (session, ctl.inbox)
         });

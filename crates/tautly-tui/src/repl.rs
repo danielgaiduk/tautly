@@ -13,6 +13,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use futures::{FutureExt as _, Stream, StreamExt as _};
 use serde_json::Value;
+use tautly_core::replay::REPLAY_BUSY;
 use tautly_core::{Command, Engine, Event, ModelId, printable};
 use tokio::io::{AsyncWrite, AsyncWriteExt as _};
 use tokio::sync::mpsc;
@@ -429,6 +430,25 @@ where
             Slash::Label(label) => {
                 self.send(Command::Label { label }).await?;
                 return self.quiet().await;
+            }
+            Slash::Replay(session_id) => {
+                self.send(Command::Replay {
+                    session_id,
+                    speed: 1.0,
+                    from_step: None,
+                })
+                .await?;
+                // A Ctrl+C meanwhile cancels it (`pump`). Every replay ends with
+                // `ReplayFinished` (after its `Error`, when it cannot start), except one
+                // refused because something runs.
+                return Ok(exit(
+                    self.pump(|e| match e {
+                        Event::ReplayFinished { .. } => true,
+                        Event::Error { message, .. } => message == REPLAY_BUSY,
+                        _ => false,
+                    })
+                    .await?,
+                ));
             }
             Slash::MemoryConsolidate => {
                 self.send(Command::ConsolidateMemory).await?;
