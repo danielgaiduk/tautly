@@ -221,6 +221,7 @@ pub(crate) fn rebuild_with(
         pending: Vec::new(),
         results: HashMap::new(),
         logged_tools: None,
+        unknown: 0,
     };
     let mut stopped = false;
     for rec in reader.records() {
@@ -238,6 +239,15 @@ pub(crate) fn rebuild_with(
     // Pins of a turn the log ends in (or the cut closes) reach the context as its
     // leftovers would have.
     r.apply_pending();
+    if r.unknown > 0 {
+        let n = r.unknown;
+        r.warn(format!(
+            "{n} record{} written by a newer version {} skipped; the rebuilt context may \
+             differ from the one that version had",
+            if n == 1 { "" } else { "s" },
+            if n == 1 { "was" } else { "were" }
+        ));
+    }
     if !stopped {
         let last = r.out.context.next_turn() - 1;
         if let Some(at) = until.filter(|&at| at > last) {
@@ -291,6 +301,8 @@ struct Replay<'a> {
     /// The tools the last `PrefixApplied` logged (with a calibration): the requests after
     /// it were assembled with them. None: assembled from the registry (an older log).
     logged_tools: Option<Vec<ToolSpec>>,
+    /// Records of a type this version does not know, skipped.
+    unknown: usize,
 }
 
 impl Replay<'_> {
@@ -445,8 +457,8 @@ impl Replay<'_> {
             | SessionRecord::ApprovalRequested { .. }
             | SessionRecord::CheckpointSkipped { .. }
             | SessionRecord::Labeled { .. }
-            | SessionRecord::EngineError { .. }
-            | SessionRecord::Unknown => {}
+            | SessionRecord::EngineError { .. } => {}
+            SessionRecord::Unknown => self.unknown += 1,
         }
         Flow::Go
     }

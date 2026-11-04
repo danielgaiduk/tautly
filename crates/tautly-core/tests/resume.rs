@@ -606,6 +606,42 @@ async fn resume_restores_budget_spend_and_set_budget() {
     run.stop().await;
 }
 
+/// Review C M4: records of a type this version does not know are skipped, and the rebuild
+/// says so once.
+#[tokio::test]
+async fn a_rebuild_warns_once_about_records_of_a_newer_version() {
+    let fx = Fx::new();
+    let mock = MockProvider::new(vec![text_step("first")]);
+    let mut run = start(fx.builder(config(Mode::Ask), &mock));
+    run.turn_with("one").await;
+    let path = run.engine.session_path().to_path_buf();
+    run.stop().await;
+    let text = std::fs::read_to_string(&path).unwrap();
+    let last: Value = serde_json::from_str(text.lines().last().unwrap()).unwrap();
+    let (offset, t) = (last["offset"].as_u64().unwrap() + 1, last["t"].clone());
+    let mut appended = String::new();
+    for (i, data) in [
+        json!({"type": "tools_applied", "data": {"tools": []}}),
+        json!({"type": "hologram", "data": 1}),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let line = json!({"type": "record", "offset": offset + i as u64, "t": t, "data": data});
+        appended.push_str(&format!("{line}\n"));
+    }
+    std::fs::write(&path, format!("{text}{appended}")).unwrap();
+
+    let rebuilt = rebuild_at(&path, None);
+    let newer: Vec<&String> = rebuilt
+        .warnings
+        .iter()
+        .filter(|w| w.contains("newer version"))
+        .collect();
+    assert_eq!(newer.len(), 1, "{:?}", rebuilt.warnings);
+    assert!(newer[0].contains('2'), "{}", newer[0]);
+}
+
 #[tokio::test]
 async fn a_log_holding_values_from_a_newer_version_still_resumes() {
     let fx = Fx::new();
