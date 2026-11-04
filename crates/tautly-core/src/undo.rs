@@ -27,6 +27,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use tautly_sandbox::{Sandbox, SandboxError};
 use tautly_session::{BlobRef, ConfineError, RelPath, SessionReader, SessionWriter};
@@ -1243,30 +1244,34 @@ impl Session {
         // Make everything logged so far readable.
         self.checkpoint().await;
         let path = self.log.path();
-        let reader =
-            match tokio::task::spawn_blocking(move || SessionReader::<SessionRecord>::open(&path))
-                .await
-            {
-                Ok(Ok(r)) => r,
-                Ok(Err(e)) => return self.undo_failed(UndoError::Session(e)).await,
-                Err(e) => return self.undo_failed(UndoError::Log(e.to_string())).await,
-            };
-        let checkpoints = self.checkpoints.clone();
-        let mut guard = match &checkpoints {
-            Some(c) => Some(c.lock().await),
+        let guard = match &self.checkpoints {
+            Some(c) => Some(Arc::clone(c).lock_owned().await),
             None => None,
         };
-        let mut log = LiveLog(self.log.clone());
-        let result = undo_with(
-            &reader,
-            self.sandbox.as_ref(),
-            guard.as_deref_mut().map(|g| &mut g.cp),
-            turn,
-            dry_run,
-            (!dry_run).then_some(&mut log as &mut dyn UndoLog),
-        )
-        .await;
-        drop(guard);
+        let sandbox = Arc::clone(&self.sandbox);
+        let log = self.log.clone();
+        // The undo reads the whole log and its blobs, writes and fsyncs the log, and reads
+        // and writes files: all blocking I/O, so it runs off the async workers, on a
+        // runtime of its own for its git steps.
+        let result = tokio::task::spawn_blocking(move || {
+            let reader = SessionReader::<SessionRecord>::open(&path)?;
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| UndoError::Log(e.to_string()))?;
+            let mut guard = guard;
+            let mut log = LiveLog(log);
+            rt.block_on(undo_with(
+                &reader,
+                sandbox.as_ref(),
+                guard.as_deref_mut().map(|g| &mut g.cp),
+                turn,
+                dry_run,
+                (!dry_run).then_some(&mut log as &mut dyn UndoLog),
+            ))
+        })
+        .await
+        .unwrap_or_else(|e| Err(UndoError::Log(e.to_string())));
         match result {
             Ok(report) => {
                 if !report.dry_run {
