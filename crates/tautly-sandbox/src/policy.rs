@@ -10,7 +10,9 @@ use crate::effect::Effect;
 use crate::protected::{
     Resolved, argv_word_reason, normalize, path_reason, rebase, redirect_reason, resolve_links,
 };
+use crate::runners::{WRAPPERS, base};
 use crate::shell::{SimpleCommand, is_dangerous_env, parse_commands};
+use crate::shell_state::unwrap_prefixes;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -466,12 +468,15 @@ impl Policy {
     /// -> .env`). Any other rule matches the bare command or argv only, never a file name a
     /// redirect writes to.
     fn deny_hits(&self, r: &Rule, tool: &str, c: &SimpleCommand) -> bool {
-        let argv = c.argv.join(" ");
-        let bare = command_line(c);
+        let forms: Vec<String> = deny_argvs(&c.argv)
+            .into_iter()
+            .flat_map(|a| [a.join(" "), quoted_words(a)])
+            .chain(std::iter::once(command_line(c)))
+            .collect();
         let Some(red) = &r.redirect else {
-            return r.matches_str(tool, &argv) || r.matches_str(tool, &bare);
+            return forms.iter().any(|f| r.matches_str(tool, f));
         };
-        if !(red.command.is_match(&bare) || red.command.is_match(&argv)) {
+        if !forms.iter().any(|f| red.command.is_match(f)) {
             return false;
         }
         write_targets(c).iter().any(|t| {
@@ -694,9 +699,36 @@ fn command_line(c: &SimpleCommand) -> String {
     c.assignments
         .iter()
         .cloned()
-        .chain(c.argv.iter().map(|w| quote_word(w)))
+        .chain(std::iter::once(quoted_words(&c.argv)))
+        .filter(|s| !s.is_empty())
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// `argv` as one line, each word [quoted](quote_word).
+fn quoted_words(argv: &[String]) -> String {
+    argv.iter()
+        .map(|w| quote_word(w))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// The argv forms a deny rule is tried against: as written; with `builtin`, `command`
+/// and `time` prefixes removed ([`unwrap_prefixes`]); and, when the command starts with a
+/// wrapper that runs the rest of its argv (`sudo`, `env`, `nohup`, `nice`, `timeout`, …),
+/// every suffix starting at a non-option word, so `deny bash(git push*)` refuses
+/// `timeout 5 git push` and `env FOO=1 git push`. Deliberately broad (a deny rule may
+/// refuse an odd command, never miss a wrapped one); allow rules never use these forms.
+fn deny_argvs(argv: &[String]) -> Vec<&[String]> {
+    let mut out = vec![argv, unwrap_prefixes(argv)];
+    if argv.first().is_some_and(|w| WRAPPERS.contains(&base(w))) {
+        out.extend(
+            (1..argv.len())
+                .filter(|&i| !argv[i].starts_with('-'))
+                .map(|i| &argv[i..]),
+        );
+    }
+    out
 }
 
 /// `w` as a shell word: as it is, or in single quotes (a `'` written `'\''`) when it is

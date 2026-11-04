@@ -1622,3 +1622,78 @@ fn redirect_targets_are_judged_after_following_symlinks() {
         Decision::Allow
     );
 }
+
+// --- re-review 4 T30-N9: `[ a > f ]` truncates `f` ---
+#[test]
+fn single_bracket_test_redirects_cannot_touch_protected_or_denied_paths() {
+    let sh = exec("sh");
+    let yolo = p(Mode::Yolo);
+    for raw in [
+        "[ a > .git/hooks/pre-commit ]",
+        "[ a > Cargo.toml ]",
+        "[ a > .git/config ]",
+        "[ -f x ] && [ a > .git/HEAD ]",
+    ] {
+        assert!(asks(yolo.decide("bash", &sh, Some(raw))), "{raw}");
+    }
+    assert_eq!(yolo.decide("bash", &sh, Some("[ -f x ]")), Decision::Allow);
+    let deny = with_rules(Mode::Yolo, &[], &["bash(* > .env)"]);
+    assert!(!matches!(
+        deny.decide("bash", &sh, Some("[ a > .env ]")),
+        Decision::Allow
+    ));
+}
+
+// --- re-review 4 T30-N10: deny rules see through wrapper prefixes ---
+#[test]
+fn deny_rules_see_through_wrapper_prefixes() {
+    let sh = exec("sh");
+    let pol = with_rules(Mode::Yolo, &[], &["bash(git push*)"]);
+    for raw in [
+        "time git push",
+        "time -p git push",
+        "env git push",
+        "env FOO=1 git push --force",
+        "nohup git push",
+        "command git push",
+        "command -p git push",
+        "exec git push",
+        "nice git push",
+        "nice -n 5 git push",
+        "timeout 5 git push",
+        "timeout -k 1 5 git push",
+        "sudo git push",
+        "sudo -u root git push",
+        "builtin git push",
+        "sudo env FOO=1 nice git push",
+    ] {
+        assert!(
+            matches!(pol.decide("bash", &sh, Some(raw)), Decision::Deny { .. }),
+            "{raw}"
+        );
+    }
+    for raw in ["git status", "time git status", "env git status"] {
+        assert_eq!(pol.decide("bash", &sh, Some(raw)), Decision::Allow, "{raw}");
+    }
+    // Allow rules are not widened.
+    let allow = with_rules(Mode::Ask, &["bash(cargo test)"], &[]);
+    assert!(asks(allow.decide("bash", &sh, Some("time cargo test"))));
+}
+
+// --- re-review 4 T30-N11: `0<&3` ---
+#[test]
+fn exact_deny_rule_is_not_dodged_by_a_descriptor_number() {
+    let sh = exec("sh");
+    let pol = with_rules(Mode::Yolo, &[], &["bash(git push)"]);
+    for raw in [
+        "git push",
+        "git push 0<&3",
+        "git push 0>&2",
+        "git push 1>&2",
+    ] {
+        assert!(
+            matches!(pol.decide("bash", &sh, Some(raw)), Decision::Deny { .. }),
+            "{raw}"
+        );
+    }
+}

@@ -252,6 +252,17 @@ fn walk(
         "command" => walk_command(node, src, out, cx, depth),
         "declaration_command" | "unset_command" => walk_declaration(node, src, out, cx, depth),
         "test_command" => {
+            // `[ … ]` is the ordinary `[` command, so `>` and `<` inside it are redirects
+            // (`[ a > Z ]` truncates `Z`); only `[[ … ]]` compares. The grammar reads both
+            // as comparisons, so a single-bracket test holding one fails closed.
+            let single = node.child(0).is_some_and(|c| text(c, src) == "[");
+            if single && holds_redirect(node, src) {
+                return Err(Unparseable(
+                    "redirect inside `[ … ]`: the `[` command, unlike `[[ … ]]`, redirects on \
+                     `>` and `<`"
+                        .into(),
+                ));
+            }
             cx.push(
                 out,
                 SimpleCommand {
@@ -424,6 +435,9 @@ fn walk_command(
                 collect_redirects(child, src, &mut redirects, &mut extra, cx, depth)?
             }
             "comment" => {}
+            // `cmd 0<&3`: a digit-only word glued to a redirect operator is its
+            // descriptor in bash; the grammar may leave it as a word before the redirect.
+            _ if child.is_named() && is_glued_descriptor(child, src) => {}
             _ if child.is_named() => {
                 argv.push(unquote(child, src));
                 rest.push(child);
@@ -757,6 +771,32 @@ const WORDS: &[&str] = &[
     "brace_expression",
     "concatenation",
 ];
+
+/// Whether `node`'s subtree holds a `<` or `>` token (any operator starting with one:
+/// `>=` inside `[ … ]` is a redirect to `=`) or a redirect node.
+fn holds_redirect(node: Node, src: &[u8]) -> bool {
+    let redirect = if node.is_named() {
+        matches!(
+            node.kind(),
+            "file_redirect" | "heredoc_redirect" | "herestring_redirect" | "redirected_statement"
+        )
+    } else {
+        text(node, src).starts_with(['<', '>'])
+    };
+    let mut cur = node.walk();
+    redirect || node.children(&mut cur).any(|c| holds_redirect(c, src))
+}
+
+/// Whether a command's word is a redirect descriptor: all digits and glued to a `<` or `>`
+/// that follows it (`0<&3`), but not to a process substitution (`0<(cmd)` keeps the `0`).
+fn is_glued_descriptor(node: Node, src: &[u8]) -> bool {
+    let t = text(node, src);
+    let after = &src[node.end_byte()..];
+    !t.is_empty()
+        && t.bytes().all(|b| b.is_ascii_digit())
+        && (after.starts_with(b"<") || after.starts_with(b">"))
+        && !(after.starts_with(b"<(") || after.starts_with(b">("))
+}
 
 /// A word the grammar filed under a redirect (`cmd > f a`, `cmd >&- a`, `cmd <<EOF a`):
 /// bash passes it to the command, where the rules could not see it. Refuse (fail closed).

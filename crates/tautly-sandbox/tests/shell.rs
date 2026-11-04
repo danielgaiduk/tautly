@@ -1190,6 +1190,9 @@ fn every_word_reaches_argv_or_a_target_or_the_input_is_unparseable() {
         "cmd $(cmd2 >&- ZZMARK)",
         "cmd <(cmd2 <<EOF ZZMARK\nx\nEOF\n)",
         "[[ -f x ]] >&- ZZMARK",
+        "[ a > ZZMARK ]",
+        "[ ZZMARK > Z ]",
+        "cmd 0<&ZZMARK",
         "export A=1 >&- ZZMARK",
         "! cmd >&- ZZMARK",
     ];
@@ -1214,4 +1217,47 @@ fn every_word_reaches_argv_or_a_target_or_the_input_is_unparseable() {
     ] {
         assert!(parse_commands(s).is_ok(), "{s}");
     }
+}
+
+// ---- Task 30 re-review 4, N9: `[ … ]` is the `[` command, so `>` inside is a redirect ----
+
+#[test]
+fn single_bracket_tests_holding_a_redirect_are_unparseable() {
+    for s in [
+        "[ a > Z ]",
+        "[ a < Z ]",
+        "[ a >= b ]",
+        "[ 2>f ]",
+        "[ a > .git/config ]",
+        "[ -f x ] && [ a > Z ]",
+        "if [ a > Z ]; then :; fi",
+    ] {
+        assert!(parse_commands(s).is_err(), "{s}");
+    }
+    for s in ["[ -f x ]", "[ \"$a\" = \"$b\" ]", "[ a ]", "[ 1 -eq 1 ]"] {
+        assert_eq!(parse_commands(s).unwrap()[0].argv, ["[["], "{s}");
+    }
+    // A redirect on the whole test is seen; `[[ … ]]` compares.
+    let c = parse_commands("[ a ] > Z").unwrap();
+    assert!(c[0].redirects.iter().any(|r| r.target == "Z" && r.write));
+    assert_eq!(parse_commands("[[ a > b ]]").unwrap()[0].argv, ["[["]);
+}
+
+// ---- Task 30 re-review 4, N11: a descriptor glued to `<&` / `>&` is not a word ----
+
+#[test]
+fn leading_descriptor_of_a_redirect_is_not_an_argv_word() {
+    assert_eq!(
+        parse_commands("git push 0<&3").unwrap()[0].argv,
+        ["git", "push"]
+    );
+    assert_eq!(parse_commands("cmd 0>&3").unwrap()[0].argv, ["cmd"]);
+    assert_eq!(parse_commands("cmd 1>&2").unwrap()[0].argv, ["cmd"]);
+    assert_eq!(parse_commands("cmd 10>&1").unwrap()[0].argv, ["cmd"]);
+    let c = parse_commands("cmd 0>f").unwrap();
+    assert_eq!(c[0].argv, ["cmd"]);
+    assert!(c[0].redirects.iter().any(|r| r.target == "f" && r.write));
+    // With a space the number is an argument, as in bash.
+    assert_eq!(parse_commands("cmd 0 <&3").unwrap()[0].argv, ["cmd", "0"]);
+    assert_eq!(parse_commands("cmd 0").unwrap()[0].argv, ["cmd", "0"]);
 }
