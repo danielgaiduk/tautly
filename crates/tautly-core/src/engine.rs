@@ -273,7 +273,7 @@ impl EngineBuilder {
                 // Each checkpoint's exclude rules are kept next to the project's session
                 // logs (owner-only), shared by its sessions (resumes and forks read them).
                 let cp = match session_path.parent() {
-                    Some(dir) => cp.with_excludes_store(dir.join("checkpoint-excludes")),
+                    Some(dir) => cp.with_excludes_store(dir.join(checkpoint::EXCLUDES_DIR)),
                     None => cp,
                 };
                 GitCheckpoints::shared(cp.with_process_groups(groups.clone()))
@@ -378,8 +378,9 @@ fn prune_checkpoints(session: &Session) {
         let st = shared.lock().await;
         let keep_days = st.cp.config().keep_days;
         let root = sandbox.root().to_path_buf();
+        let excludes = st.cp.excludes_dir().map(Path::to_path_buf);
         // Best effort: what is not pruned now is at the next start.
-        let _ = checkpoint::prune(sandbox.as_ref(), &root, keep_days).await;
+        let _ = checkpoint::prune(sandbox.as_ref(), &root, keep_days, excludes.as_deref()).await;
         drop(st);
     });
 }

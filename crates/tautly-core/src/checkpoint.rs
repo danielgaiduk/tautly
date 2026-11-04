@@ -39,6 +39,7 @@
 //! [`Checkpointer::snapshot`] whose write generation did not move and whose caller's
 //! watcher saw no change, without running git at all.
 
+use std::collections::HashSet;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -56,6 +57,10 @@ use self::excludes_store::ExcludesStore;
 use crate::config::CheckpointConfig;
 use crate::record::SessionRecord;
 use crate::session::{EventSink, Log, Session};
+
+/// The directory, next to a project's session logs, where each checkpoint's exclude
+/// rules are kept ([`Checkpointer::with_excludes_store`]).
+pub const EXCLUDES_DIR: &str = "checkpoint-excludes";
 
 /// Every checkpoint ref is below this.
 pub const REF_PREFIX: &str = "refs/tautly/checkpoints";
@@ -651,13 +656,13 @@ impl<'a> Git<'a> {
             .map(drop)
     }
 
-    /// Every ref below `prefix`, with its commit's committer date (unix seconds).
-    async fn refs(&self, prefix: &str, deadline: Instant) -> Result<Vec<(String, u64)>, Fail> {
+    /// Every ref below `prefix`.
+    async fn refs(&self, prefix: &str, deadline: Instant) -> Result<Vec<RefInfo>, Fail> {
         let out = self
             .run(
                 &[
                     "for-each-ref",
-                    "--format=%(refname)%00%(committerdate:unix)",
+                    "--format=%(refname)%00%(committerdate:unix)%00%(objectname)",
                     prefix,
                 ],
                 None,
@@ -667,11 +672,24 @@ impl<'a> Git<'a> {
         Ok(String::from_utf8_lossy(&out)
             .lines()
             .filter_map(|l| {
-                let (name, date) = l.split_once('\0')?;
-                Some((name.to_string(), date.trim().parse().unwrap_or(0)))
+                let mut fields = l.split('\0');
+                let (name, date, commit) = (fields.next()?, fields.next()?, fields.next()?);
+                Some(RefInfo {
+                    name: name.to_string(),
+                    date: date.trim().parse().unwrap_or(0),
+                    commit: commit.trim().to_string(),
+                })
             })
             .collect())
     }
+}
+
+/// One ref of [`Git::refs`]: its name, its commit, and that commit's committer date (unix
+/// seconds).
+struct RefInfo {
+    name: String,
+    date: u64,
+    commit: String,
 }
 
 /// One entry of a tree diff: the path, and each side's `(mode, object id)` (none: absent).
@@ -1040,6 +1058,11 @@ impl Checkpointer {
     pub fn with_excludes_store(mut self, dir: PathBuf) -> Self {
         self.excludes = Some(ExcludesStore::new(dir));
         self
+    }
+
+    /// The directory of the store keeping each checkpoint's exclude rules, if any.
+    pub fn excludes_dir(&self) -> Option<&Path> {
+        self.excludes.as_ref().map(ExcludesStore::dir)
     }
 
     /// Run this git program instead of the one on `PATH`.
@@ -1786,45 +1809,80 @@ async fn with_plain_git<T>(
 }
 
 /// Delete every checkpoint ref (of any session of the repository at `root`) whose commit
-/// is older than `keep_days`; returns how many. Run at engine start; `git gc` is never run,
-/// so the objects stay until git's own housekeeping.
-pub async fn prune(sb: &dyn Sandbox, root: &Path, keep_days: u32) -> Result<u32, CheckpointError> {
+/// is older than `keep_days`; returns how many. The exclude rules kept for them in the
+/// store at `excludes` go too (and entries of that age no ref names). Run at engine start;
+/// `git gc` is never run, so the objects stay until git's own housekeeping.
+pub async fn prune(
+    sb: &dyn Sandbox,
+    root: &Path,
+    keep_days: u32,
+    excludes: Option<&Path>,
+) -> Result<u32, CheckpointError> {
     with_plain_git(sb, root, async |git| {
         let deadline = Checkpointer::housekeeping_deadline();
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |d| d.as_secs());
         let cutoff = now.saturating_sub(u64::from(keep_days) * 24 * 3600);
-        let old: Vec<String> = git
+        let (old, kept): (Vec<_>, Vec<_>) = git
             .refs(&format!("{REF_PREFIX}/"), deadline)
             .await?
             .into_iter()
-            .filter(|(_, date)| *date < cutoff)
-            .map(|(name, _)| name)
-            .collect();
-        delete_refs(git, &old, deadline).await
+            .partition(|r| r.date < cutoff);
+        let names: Vec<String> = old.iter().map(|r| r.name.clone()).collect();
+        let n = delete_refs(git, &names, deadline).await?;
+        if let Some(dir) = excludes {
+            let gone: HashSet<String> = old.into_iter().map(|r| r.commit).collect();
+            let keep = kept.into_iter().map(|r| r.commit).collect();
+            let cutoff = UNIX_EPOCH + Duration::from_secs(cutoff);
+            // Also entries that old whose ref was never made (a put before a failed one).
+            forget_excludes(dir, keep, move |c, modified| {
+                gone.contains(c) || modified < cutoff
+            })
+            .await;
+        }
+        Ok(n)
     })
     .await
 }
 
+/// [`ExcludesStore::prune`] on the store at `dir`, off the async workers.
+async fn forget_excludes(
+    dir: &Path,
+    keep: HashSet<String>,
+    drop: impl Fn(&str, SystemTime) -> bool + Send + 'static,
+) {
+    let store = ExcludesStore::new(dir.to_path_buf());
+    let _ = tokio::task::spawn_blocking(move || store.prune(&keep, drop)).await;
+}
+
 /// Delete session `session`'s checkpoint refs in the repository at `root` (`tautly
-/// sessions delete`); returns how many. The objects (and the session blobs) are shared
-/// and kept.
+/// sessions delete`), and the exclude rules kept for them in the store at `excludes`
+/// unless another ref (a branch's) names the same commit; returns how many refs. The
+/// objects (and the session blobs) are shared and kept.
 pub async fn delete_session_refs(
     sb: &dyn Sandbox,
     root: &Path,
     session: &str,
+    excludes: Option<&Path>,
 ) -> Result<u32, CheckpointError> {
     check_session(session)?;
     with_plain_git(sb, root, async |git| {
         let deadline = Checkpointer::housekeeping_deadline();
-        let names: Vec<String> = git
-            .refs(&format!("{REF_PREFIX}/{session}/"), deadline)
+        let own = format!("{REF_PREFIX}/{session}/");
+        let (mine, others): (Vec<_>, Vec<_>) = git
+            .refs(&format!("{REF_PREFIX}/"), deadline)
             .await?
             .into_iter()
-            .map(|(name, _)| name)
-            .collect();
-        delete_refs(git, &names, deadline).await
+            .partition(|r| r.name.starts_with(&own));
+        let names: Vec<String> = mine.iter().map(|r| r.name.clone()).collect();
+        let n = delete_refs(git, &names, deadline).await?;
+        if let Some(dir) = excludes {
+            let gone: HashSet<String> = mine.into_iter().map(|r| r.commit).collect();
+            let keep = others.into_iter().map(|r| r.commit).collect();
+            forget_excludes(dir, keep, move |c, _| gone.contains(c)).await;
+        }
+        Ok(n)
     })
     .await
 }
