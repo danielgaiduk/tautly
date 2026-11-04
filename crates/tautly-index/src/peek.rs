@@ -1,6 +1,7 @@
-//! A strictly read-only look at an index database, for diagnostics (`tautly doctor`): no
-//! file or directory is created, no schema is migrated, no index is built and no write
-//! lock is taken, so it never gets in the way of a session refreshing the same index.
+//! A strictly read-only look at an index database, for diagnostics (`tautly doctor`): the
+//! database file is never written (SQLite may leave empty `-wal`/`-shm` side files), no schema
+//! is migrated, no index is built and no write lock is taken, so it never gets in the way of a
+//! session refreshing the same index.
 
 use std::path::Path;
 use std::time::Duration;
