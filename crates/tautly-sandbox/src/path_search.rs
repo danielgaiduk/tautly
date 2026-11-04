@@ -14,22 +14,51 @@ use std::path::{Path, PathBuf};
 /// multi-call shim that dispatches on its name (a `git` link to `mise`) keeps working;
 /// what it resolves to was checked.
 pub fn which_outside(name: &str, path: &OsStr, root: &Path) -> Option<PathBuf> {
-    use std::os::unix::fs::PermissionsExt;
+    which_outside_or_skipped(name, path, root).ok()
+}
+
+/// [`which_outside`], or (`Err`) the first executable `name` it skipped because it lies in
+/// the work tree (an empty or relative entry is taken against the root, where the program
+/// would run), for an error that says why nothing was found: an in-repository toolchain
+/// (an activated `.venv/bin`, a direnv profile) is the usual cause.
+pub fn which_outside_or_skipped(
+    name: &str,
+    path: &OsStr,
+    root: &Path,
+) -> Result<PathBuf, Option<PathBuf>> {
     let real_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
     let inside = |p: &Path| p.starts_with(root) || p.starts_with(&real_root);
-    std::env::split_paths(path)
-        .filter(|dir| dir.is_absolute() && !inside(dir))
-        .filter_map(|dir| {
-            let real_dir = dir.canonicalize().ok()?;
-            let candidate = dir.join(name);
-            let real = candidate.canonicalize().ok()?;
-            let usable = !inside(&real_dir)
-                && !inside(&real)
-                && std::fs::metadata(&real)
-                    .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0);
-            usable.then_some(candidate)
-        })
-        .next()
+    let mut skipped = None;
+    for dir in std::env::split_paths(path) {
+        let candidate = dir.join(name);
+        let real_dir = dir.canonicalize().ok();
+        let real = candidate.canonicalize().ok();
+        let in_tree = !dir.is_absolute()
+            || inside(&dir)
+            || real_dir.as_deref().is_some_and(inside)
+            || real.as_deref().is_some_and(inside);
+        if in_tree {
+            if skipped.is_none() {
+                let at = if dir.is_absolute() {
+                    candidate
+                } else {
+                    real_root.join(&dir).join(name)
+                };
+                skipped = at.canonicalize().ok().filter(|r| executable(r)).map(|_| at);
+            }
+            continue;
+        }
+        if real.as_deref().is_some_and(executable) {
+            return Ok(candidate);
+        }
+    }
+    Err(skipped)
+}
+
+/// A regular file with an execute bit (links followed).
+fn executable(p: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
 }
 
 #[cfg(test)]

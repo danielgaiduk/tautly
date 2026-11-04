@@ -128,15 +128,20 @@ impl LocalSandbox {
                 None if spec.env_remove.iter().any(|k| k == "PATH") => None,
                 None => std::env::var_os("PATH"),
             };
-            let found = path
-                .as_deref()
-                .and_then(|p| crate::which_outside(prog, p, &self.root))
-                .ok_or_else(|| {
-                    SandboxError::Io(std::io::Error::new(
-                        std::io::ErrorKind::NotFound,
-                        format!("{prog} not found on PATH outside the work tree"),
-                    ))
-                })?;
+            let found = match path.as_deref() {
+                Some(p) => crate::path_search::which_outside_or_skipped(prog, p, &self.root),
+                None => Err(None),
+            };
+            let found = found.map_err(|skipped| {
+                let why = match skipped {
+                    Some(p) => format!(" (skipped {} inside the work tree)", p.display()),
+                    None => String::new(),
+                };
+                SandboxError::Io(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("{prog} not found on PATH outside the work tree{why}"),
+                ))
+            })?;
             let mut cmd = Command::new(found);
             cmd.arg0(prog);
             cmd

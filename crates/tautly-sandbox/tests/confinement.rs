@@ -181,6 +181,16 @@ async fn spawn_never_runs_a_bare_name_from_the_work_tree() {
             .contains("mytool not found on PATH outside the work tree"),
         "{err}"
     );
+    // It names what was skipped (review S2-M7): an in-repository toolchain is the usual
+    // cause.
+    let skipped = t.path().canonicalize().unwrap().join("bin/mytool");
+    assert!(
+        err.to_string().contains(&format!(
+            "skipped {} inside the work tree",
+            skipped.display()
+        )),
+        "{err}"
+    );
 }
 
 #[tokio::test]
