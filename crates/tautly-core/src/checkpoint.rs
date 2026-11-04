@@ -2023,7 +2023,7 @@ pub(crate) async fn remove(sb: &dyn Sandbox, path: &Path) -> Result<(), Checkpoi
 
 /// A session id usable in a ref name and as a ref prefix: no `/`, `.`, wildcard or
 /// control characters.
-fn check_session(session: &str) -> Result<(), CheckpointError> {
+pub(crate) fn check_session(session: &str) -> Result<(), CheckpointError> {
     let ok = !session.is_empty()
         && session.len() <= 64
         && session

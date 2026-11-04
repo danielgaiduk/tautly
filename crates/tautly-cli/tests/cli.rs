@@ -151,6 +151,7 @@ fn help_lists_the_commands() {
         .unwrap_or_default();
     for command in [
         "prompt", "sessions", "models", "undo", "memory", "index", "mcp", "stats", "receipt",
+        "compare",
     ] {
         assert!(
             commands
