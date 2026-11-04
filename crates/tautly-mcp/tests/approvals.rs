@@ -336,3 +336,83 @@ fn rewritten_script_inside_the_root_asks_again() {
     let spec = stdio("npx", &["-y", "@scope/server@1.2.3", "--port=8080"], &[]);
     assert_eq!(k(&spec), k(&spec));
 }
+
+/// Review N1 (ruled scope): the launch shapes whose entry code a word does not name as a
+/// file exactly still key that code: directories (recursively), `python -m`, attached
+/// short flags, `sh -c` strings, and runner manifests.
+#[test]
+fn launch_shapes_key_the_code_they_run() {
+    use tautly_mcp::approvals::approval_key;
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().canonicalize().unwrap();
+    let write = |rel: &str, text: &str| {
+        let p = repo.join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, text).unwrap();
+    };
+    let k = |spec: &ServerSpec| key(&repo, "s", spec);
+    let cases: Vec<(&str, ServerSpec)> = vec![
+        ("pre.js", stdio("node", &["-r./pre.js", "main.js"], &[])),
+        ("pkg/__main__.py", stdio("python3", &["-m", "pkg"], &[])),
+        ("tool.py", stdio("python3", &["-m", "tool"], &[])),
+        ("a/b/c.py", stdio("python3", &["-m", "a.b.c"], &[])),
+        ("index.js", stdio("node", &["."], &[])),
+        ("dist/index.js", stdio("node", &["dist"], &[])),
+        ("dist/deep/lib.js", stdio("node", &["dist"], &[])),
+        (
+            "srv/main.js",
+            stdio("sh", &["-c", "cd srv && node main.js"], &[]),
+        ),
+        (
+            "run.sh",
+            stdio("bash", &["-c", "./run.sh --stdio|tee x"], &[]),
+        ),
+        ("package.json", stdio("npm", &["run", "mcp"], &[])),
+        ("package.json", stdio("npx", &["-y", "tsx", "x.ts"], &[])),
+        ("pyproject.toml", stdio("uv", &["run", "server"], &[])),
+        ("Makefile", stdio("make", &["serve"], &[])),
+        ("Cargo.toml", stdio("cargo", &["run"], &[])),
+        ("justfile", stdio("just", &["mcp"], &[])),
+        ("deno.json", stdio("deno", &["task", "mcp"], &[])),
+        ("bin/srv.js", stdio("node", &["--import=./bin/srv.js"], &[])),
+    ];
+    for (file, spec) in &cases {
+        write(file, "v1");
+        let before = k(spec);
+        assert_eq!(before, k(spec), "{file}: stable");
+        write(file, "v2: rewritten");
+        assert_ne!(
+            before,
+            k(spec),
+            "{file} in {spec:?}: a rewritten file asks again"
+        );
+    }
+
+    // A directory's skipped parts (and tautly's own scratch output) do not count.
+    let spec = stdio("node", &["."], &[]);
+    let before = k(&spec);
+    for skipped in [
+        ".git/HEAD",
+        "node_modules/x/index.js",
+        "target/debug/x",
+        ".venv/lib/x.py",
+        "pkg/__pycache__/x.pyc",
+        ".tautly/tmp/spill/0123.txt",
+    ] {
+        write(skipped, "changes every run");
+        assert_eq!(before, k(&spec), "{skipped}");
+    }
+    // A directory over the bounds can never be remembered: it asks at every start.
+    write("dist/huge.bin", &"x".repeat(1024 * 1024 + 1));
+    let spec = stdio("node", &["dist"], &[]);
+    assert!(!approval_key(&repo, "s", &spec).rememberable);
+    assert_ne!(k(&spec), k(&spec));
+    // A link inside a named directory is keyed by its target, not followed.
+    std::fs::remove_file(repo.join("dist/huge.bin")).unwrap();
+    std::os::unix::fs::symlink("/etc/hosts", repo.join("dist/link")).unwrap();
+    let before = k(&spec);
+    std::fs::remove_file(repo.join("dist/link")).unwrap();
+    std::os::unix::fs::symlink("/etc/passwd", repo.join("dist/link")).unwrap();
+    assert_ne!(before, k(&spec));
+    assert!(approval_key(&repo, "s", &spec).rememberable);
+}
