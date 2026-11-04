@@ -28,6 +28,8 @@ pub type ProviderFactory =
 pub enum ProviderSetupError {
     #[error("unknown provider `{provider}` in model {model}")]
     UnknownProvider { provider: String, model: ModelId },
+    #[error("`{model}` is not a model id: it names no model after the provider")]
+    InvalidModelId { model: ModelId },
     #[error("no [[providers.compat]] entry named `{name}` for model {model}")]
     NoCompatEntry { name: String, model: ModelId },
     /// `provider` is `anthropic`, `openai`, `google` or `compat:<name>`; `how` says where
@@ -50,7 +52,8 @@ impl ProviderSetupError {
     /// What the user can do about it, for `Error.hint`.
     pub fn hint(&self) -> String {
         match self {
-            ProviderSetupError::UnknownProvider { .. } => {
+            ProviderSetupError::UnknownProvider { .. }
+            | ProviderSetupError::InvalidModelId { .. } => {
                 "use a model id of the form <provider>/<model> with provider anthropic, openai, \
                  google or compat:<name>"
                     .to_string()
@@ -82,6 +85,33 @@ pub fn provider_label(model: &ModelId) -> String {
     }
 }
 
+/// Whether `model` names a provider Tautly has an adapter for: `<provider>/<model>` with
+/// provider `anthropic`, `openai`, `google` or `compat:<name>`, and a model after the `/`.
+/// No configuration is read: a `compat:<name>` still needs its `[[providers.compat]]`
+/// entry when the session starts.
+pub fn known_provider(model: &ModelId) -> Result<(), ProviderSetupError> {
+    let head = model.as_str().split('/').next().unwrap_or("");
+    let known = match model.provider() {
+        "anthropic" | "openai" | "google" => !head.contains(':'),
+        "compat" => head
+            .strip_prefix("compat:")
+            .is_some_and(|name| !name.is_empty()),
+        _ => false,
+    };
+    if !known {
+        return Err(ProviderSetupError::UnknownProvider {
+            provider: head.to_string(),
+            model: model.clone(),
+        });
+    }
+    if !model.as_str().contains('/') || model.model().is_empty() {
+        return Err(ProviderSetupError::InvalidModelId {
+            model: model.clone(),
+        });
+    }
+    Ok(())
+}
+
 /// The adapter for `model`'s provider with its API key (environment, then keychain).
 /// This may read the keychain, which can block.
 pub(crate) fn provider_for(
@@ -89,6 +119,7 @@ pub(crate) fn provider_for(
     model: &ModelId,
     catalog: Arc<Catalog>,
 ) -> Result<Arc<dyn Provider>, ProviderSetupError> {
+    known_provider(model)?;
     let head = model.as_str().split('/').next().unwrap_or("");
     let (name, entry) = match model.provider() {
         "compat" => {
@@ -177,6 +208,42 @@ fn key_hint(provider: &str, entry: &ProviderEntry) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn known_providers_are_the_adapters() {
+        for ok in [
+            "anthropic/claude-sonnet-5-5",
+            "openai/gpt-5",
+            "google/gemini-3-pro",
+            "compat:local/qwen3",
+        ] {
+            assert_eq!(known_provider(&ModelId::from(ok)), Ok(()), "{ok}");
+        }
+        for bad in [
+            "gpt-5",
+            "foo/bar",
+            "compat:/x",
+            "compat/x",
+            "anthropic/",
+            "/x",
+            "",
+        ] {
+            let err = known_provider(&ModelId::from(bad)).unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    ProviderSetupError::UnknownProvider { .. }
+                        | ProviderSetupError::InvalidModelId { .. }
+                ),
+                "{bad}: {err}"
+            );
+            assert!(err.hint().contains("<provider>/<model>"), "{bad}");
+        }
+        assert!(matches!(
+            known_provider(&ModelId::from("anthropic/")),
+            Err(ProviderSetupError::InvalidModelId { .. })
+        ));
+    }
 
     // Only paths that fail before any key lookup: tests never touch the real keychain.
     #[test]

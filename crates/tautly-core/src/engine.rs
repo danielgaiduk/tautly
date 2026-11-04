@@ -388,6 +388,13 @@ fn prune_checkpoints(session: &Session) {
     });
 }
 
+/// The root a session started in `start` runs on, as [`EngineBuilder::build`] picks it:
+/// the git top level above `start` (canonical), else `start` itself. Sessions on the same
+/// root share one [`Workspace`] (spec 3.4).
+pub fn session_root(start: &Path) -> Result<PathBuf, EngineError> {
+    Ok(sandbox_root(start)?)
+}
+
 /// The git top level above `start` (a `.git` directory or file), else `start` itself.
 fn sandbox_root(start: &Path) -> Result<PathBuf, SandboxError> {
     let start = start.canonicalize()?;

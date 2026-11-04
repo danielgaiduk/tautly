@@ -1,5 +1,5 @@
 //! Session store operations outside a running engine (spec 6.5): `tautly sessions
-//! delete`.
+//! delete`, and the session `--continue` picks.
 
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use tautly_sandbox::Sandbox;
 
 use crate::checkpoint::{self, CheckpointError};
+use crate::engine::EngineError;
 
 /// What [`delete`] removed.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -77,6 +78,15 @@ pub async fn delete(
     let _ = std::fs::remove_file(log.with_extension("last-request.json"));
     drop(lock);
     Ok(Deleted { log, refs })
+}
+
+/// The newest session that ran in the work tree a session started in `start` runs on
+/// ([`session_root`](crate::session_root)): what `--continue` resumes. None when there is
+/// none.
+pub fn latest_here(data_home: &Path, start: &Path) -> Result<Option<String>, EngineError> {
+    let root = crate::session_root(start)?;
+    let here = tautly_session::list_here_in(data_home, &root)?;
+    Ok(here.into_iter().next().map(|s| s.id))
 }
 
 /// The log, opened and locked exclusively (as an engine's writer does); refused when it is
