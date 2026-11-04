@@ -51,6 +51,9 @@ const NOTE_SKIPPED: &str =
 /// because the ignore rules at the turn's start ignore them (they may have been there).
 const NOTE_KEPT: &str = "kept (ignored before the turn)";
 
+/// Largest file undo reads from the work tree (to compare it and to log what it held).
+const MAX_DISK_READ: u64 = 64 * 1024 * 1024;
+
 /// What an undo did (with `dry_run`: would do). Paths are absolute.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UndoReport {
@@ -572,7 +575,7 @@ impl GitUndo<'_> {
             if trees.since_start.get(&rel).is_some_and(Change::is_gitlink) {
                 continue;
             }
-            let disk = read_disk(&root, &rel).await?;
+            let disk = read_disk(&root, &rel, MAX_DISK_READ).await?;
             let sides = trees.sides(&rel);
             let back = match pre_edit.get(&rel) {
                 Some(b) => b.clone(),
@@ -713,7 +716,10 @@ impl GitUndo<'_> {
                 Back::Blob { pre, mode } => (pre.clone(), pre.as_ref().and(*mode)),
                 Back::Checkpoint { present: false } => (None, None),
                 Back::Checkpoint { present: true } => {
-                    let disk = read_disk(&root, &p.rel).await?;
+                    // Written already, so it must be logged whatever its size: what
+                    // the checkpoint held (bounded by its untracked-file limits for
+                    // untracked files), not what a command left behind.
+                    let disk = read_disk(&root, &p.rel, u64::MAX).await?;
                     let (bytes, mode) = disk.logged();
                     (bytes.map(|b| log.blob(b)).transpose()?, mode)
                 }
@@ -857,8 +863,10 @@ fn rel_path(root: &Path, rel: &Path) -> Result<RelPath, UndoError> {
 }
 
 /// What is at `rel` below `root` now, as git sees it: no symbolic link is followed, and a
-/// path below a link or a file is absent.
-async fn read_disk(root: &Path, rel: &Path) -> Result<Disk, UndoError> {
+/// path below a link or a file is absent. A regular file longer than `limit` bytes is an
+/// error rather than read whole into memory (a command can leave a multi-GB file behind):
+/// nothing has been written when it is read, so the undo changes nothing.
+async fn read_disk(root: &Path, rel: &Path, limit: u64) -> Result<Disk, UndoError> {
     use std::os::unix::ffi::OsStringExt;
     use std::os::unix::fs::MetadataExt;
     let full = root.join(rel);
@@ -895,7 +903,7 @@ async fn read_disk(root: &Path, rel: &Path) -> Result<Disk, UndoError> {
                 Disk::Link(std::fs::read_link(&at)?.into_os_string().into_vec())
             } else if kind.is_file() {
                 Disk::File {
-                    bytes: std::fs::read(&at)?,
+                    bytes: read_capped(&at, meta.len(), limit)?,
                     mode: meta.mode() & 0o7777,
                 }
             } else {
@@ -1295,5 +1303,64 @@ impl Session {
             hint,
         })
         .await;
+    }
+}
+
+/// The bytes of the regular file at `path` (`len` long when looked at), refused when it is
+/// (or has grown) longer than `limit`.
+fn read_capped(path: &Path, len: u64, limit: u64) -> std::io::Result<Vec<u8>> {
+    use std::io::Read;
+    let too_big = |len: u64| {
+        std::io::Error::other(format!(
+            "a file of {len} bytes is over the {limit} bytes undo reads; nothing was \
+             changed (restore it with git from the turn's checkpoint)"
+        ))
+    };
+    if len > limit {
+        return Err(too_big(len));
+    }
+    let mut bytes = Vec::with_capacity(usize::try_from(len).unwrap_or(0));
+    std::fs::File::open(path)?
+        .take(limit.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > limit {
+        return Err(too_big(bytes.len() as u64));
+    }
+    Ok(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Review B-M6: a file over the limit is refused, not read whole into memory.
+    #[tokio::test]
+    async fn read_disk_refuses_a_file_over_the_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::write(root.join("small"), b"0123456789").unwrap();
+        std::fs::write(root.join("big"), b"0123456789A").unwrap();
+        match read_disk(&root, Path::new("small"), 10).await.unwrap() {
+            Disk::File { bytes, .. } => assert_eq!(bytes, b"0123456789"),
+            other => panic!("{other:?}"),
+        }
+        let err = read_disk(&root, Path::new("big"), 10).await.unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("big") && text.contains("11 bytes"), "{text}");
+        // No limit (what was just written must be logged).
+        assert!(matches!(
+            read_disk(&root, Path::new("big"), u64::MAX).await.unwrap(),
+            Disk::File { .. }
+        ));
+        // Links and absent paths are not files: no limit applies.
+        std::os::unix::fs::symlink("big", root.join("link")).unwrap();
+        assert!(matches!(
+            read_disk(&root, Path::new("link"), 1).await.unwrap(),
+            Disk::Link(_)
+        ));
+        assert_eq!(
+            read_disk(&root, Path::new("none"), 1).await.unwrap(),
+            Disk::Absent
+        );
     }
 }
