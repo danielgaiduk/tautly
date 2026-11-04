@@ -23,6 +23,8 @@ const PYCACHE: &str = "__pycache__";
 /// The variable that moves a Python server's bytecode cache out of the repository
 /// (`tautly-core` sets it); a command line that can drop it is never remembered.
 const PYCACHE_VAR: &str = "PYTHONPYCACHEPREFIX";
+/// Python's `-X pycache_prefix=…`, which overrides the variable.
+const PYCACHE_OPTION: &str = "pycache_prefix";
 /// Commands that run what a manifest in their working directory says.
 const RUNNERS: &[&str] = &[
     "npm", "npx", "pnpm", "yarn", "bun", "uv", "uvx", "poetry", "make", "cargo", "just", "deno",
@@ -136,22 +138,38 @@ pub(crate) fn files_named(
     entries
 }
 
-/// Whether the command line `argv` can run its Python without the `PYTHONPYCACHEPREFIX`
-/// the engine sets (review S3-I1), so that a repository `__pycache__` is read after all:
-/// an option cluster with `E` or `I` (`-E`, `-Em`, `-sE`, `-I`; whatever the command, so
-/// `grep -E` in a shell string counts too), `env` with `-i`/`-u` (in a cluster) or
-/// `--ignore-environment` among the options right after it, a shell `exec -c`, `unset`,
-/// or any token naming the variable (`env -u PYTHONPYCACHEPREFIX`, `PYTHONPYCACHEPREFIX=`,
-/// `PYTHONPYCACHEPREFIX=./x`). Tokens are split as for [`files_named`]. Such a server is
-/// asked about at every start (its timestamp bytecode could then match too).
-pub(crate) fn can_drop_pycache_prefix(argv: &[&String]) -> bool {
+/// Whether the `words` (the command line, then the server's variable values, which a
+/// shell string can splice in) can run their Python without the `PYTHONPYCACHEPREFIX`
+/// the engine sets, or with another one (reviews S3-I1, S4-I1), so that a repository
+/// `__pycache__` is read after all: an option cluster with `E` or `I` (`-E`, `-Em`,
+/// `-sE`, `-I`; whatever the command, so `grep -E` in a shell string counts too), `env`
+/// with `-i`, `-u`, a lone `-` or a prefix of `--ignore-environment` among the options
+/// right after it (across the values of `-P`, `-C` and `--chdir`), a shell `exec -c`,
+/// `unset`, any token naming the variable (`env -u PYTHONPYCACHEPREFIX`,
+/// `PYTHONPYCACHEPREFIX=`, `PYTHONPYCACHEPREFIX=./x`), or any token containing
+/// `pycache_prefix` (`-X pycache_prefix=/`, `-Xpycache_prefix=/`). Quotes are removed
+/// and tokens are split as for [`files_named`]: shell strings are read lexically, as
+/// well as that allows. Such a server is asked about at every start (its timestamp
+/// bytecode could then match too).
+pub(crate) fn can_drop_pycache_prefix(words: &[&String]) -> bool {
     // `env` or `exec` while its own options may still follow (they end at the first
     // token that is not one, as both commands parse them).
     let mut after: Option<&str> = None;
-    for word in argv {
-        for token in tokens(word) {
-            if token.contains(PYCACHE_VAR) || token == "unset" {
+    // The next token is the value of an `env` option (`-P dir`, `-C dir`, `--chdir dir`),
+    // not the command.
+    let mut value = false;
+    for word in words {
+        // Quotes are removed, not split on: `-"E"` is `-E` to the shell.
+        let bare: String = word
+            .chars()
+            .filter(|c| !matches!(c, '\'' | '"' | '`'))
+            .collect();
+        for token in tokens(&bare) {
+            if token.contains(PYCACHE_VAR) || token.contains(PYCACHE_OPTION) || token == "unset" {
                 return true;
+            }
+            if std::mem::take(&mut value) {
+                continue;
             }
             match token.strip_prefix('-') {
                 Some(cluster) if !cluster.starts_with('-') => {
@@ -160,15 +178,20 @@ pub(crate) fn can_drop_pycache_prefix(argv: &[&String]) -> bool {
                         .take_while(char::is_ascii_alphabetic)
                         .collect();
                     if flags.contains(['E', 'I'])
-                        || (after == Some("env") && flags.contains(['i', 'u']))
+                        || (after == Some("env")
+                            && (flags.contains(['i', 'u']) || cluster.is_empty()))
                         || (after == Some("exec") && flags.contains('c'))
                     {
                         return true;
                     }
+                    value = after == Some("env") && matches!(cluster, "P" | "C");
                 }
                 Some(long) => {
-                    if after == Some("env") && long == "-ignore-environment" {
-                        return true;
+                    if after == Some("env") {
+                        if long.len() > 1 && "-ignore-environment".starts_with(long) {
+                            return true;
+                        }
+                        value = long == "-chdir";
                     }
                 }
                 None => {
@@ -404,6 +427,13 @@ fn hash_dir(root: &Path, dir: &Path, budget: &mut Budget) -> Option<String> {
             }
             let (tag, value): (&[u8], Vec<u8>) = if kind.is_symlink() {
                 let target = std::fs::read_link(&path).ok()?;
+                // A linked `__pycache__` is read through by Python (review S4-M2): the
+                // directory it resolves to is walked as a cache too, wherever it lies
+                // (a cache walk lists only `.pyc` files, so a loop cannot form).
+                if is_cache(&name) && path.metadata().is_ok_and(|m| m.is_dir()) {
+                    budget.files = budget.files.checked_sub(1)?;
+                    subdirs.push((path.clone(), entry.clone(), true));
+                }
                 (b"link", target.as_os_str().as_bytes().to_vec())
             } else {
                 (b"file", hash_file(&path, budget)?.into_bytes())

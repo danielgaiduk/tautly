@@ -78,9 +78,10 @@ pub fn approval_key(root: &Path, name: &str, spec: &ServerSpec) -> ApprovalKey {
                 None => root.clone(),
             };
             // A command line that can run its Python without the private bytecode cache
-            // the engine forces (`python -E`, `env -u PYTHONPYCACHEPREFIX`) is asked
+            // the engine forces (`python -E`, `env -u PYTHONPYCACHEPREFIX`, `-X
+            // pycache_prefix=`; a flag may sit in a variable the shell expands) is asked
             // about at every start: the key then matches nothing stored.
-            let droppable = crate::launch_files::can_drop_pycache_prefix(&argv);
+            let droppable = crate::launch_files::can_drop_pycache_prefix(&words);
             rememberable &= !droppable;
             serde_json::json!({
                 "transport": "stdio",

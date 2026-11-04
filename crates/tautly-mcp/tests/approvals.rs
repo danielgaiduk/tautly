@@ -591,6 +591,35 @@ fn hash_based_bytecode_is_keyed() {
     assert_ne!(before, k(&spec), "an unchecked-hash pyc through a link");
     std::fs::remove_file(&link).unwrap();
     assert_eq!(before, k(&spec));
+    // Review S4-M2: a `__pycache__` that is a link to a directory below a walked tree
+    // is walked as a cache too (Python follows it), wherever it points.
+    let spec = stdio("node", &["app"], &[]);
+    std::fs::create_dir_all(repo.join("node_modules/c")).unwrap();
+    std::fs::create_dir_all(repo.join("app/vendor")).unwrap();
+    std::os::unix::fs::symlink("../../node_modules/c", repo.join("app/vendor/__pycache__"))
+        .unwrap();
+    let before = k(&spec);
+    assert_eq!(before, k(&spec));
+    write_pyc(
+        &repo,
+        "node_modules/c/helper.cpython-313.pyc",
+        0,
+        b"timestamp",
+    );
+    assert_eq!(before, k(&spec), "a timestamp pyc behind a linked cache");
+    write_pyc(
+        &repo,
+        "node_modules/c/helper.cpython-313.pyc",
+        1,
+        b"unchecked",
+    );
+    assert_ne!(
+        before,
+        k(&spec),
+        "an unchecked-hash pyc behind a linked cache"
+    );
+    std::fs::remove_file(repo.join("node_modules/c/helper.cpython-313.pyc")).unwrap();
+    assert_eq!(before, k(&spec));
     // Every case above may be remembered: no bound was hit.
     for (_, spec) in &cases {
         assert!(tautly_mcp::approvals::approval_key(&repo, "s", spec).rememberable);
@@ -650,6 +679,34 @@ fn argv_that_can_drop_the_bytecode_prefix_is_never_remembered() {
             &["PYTHONPYCACHEPREFIX=/tmp/x", "python3", "-m", "pkg"],
             &[],
         ),
+        // Review S4-I1: `-X pycache_prefix` overrides the variable.
+        stdio("python3", &["-X", "pycache_prefix=/", "-m", "tool"], &[]),
+        stdio("python3", &["-Xpycache_prefix=/"], &[]),
+        stdio(
+            "sh",
+            &["-c", "exec python3 -X pycache_prefix=/ -m tool"],
+            &[],
+        ),
+        stdio("python3", &["-X", "pycache_prefix=/", "-m", "a.b"], &[]),
+        // Review S4-M1: other spellings of `env -i`, env's options with a value, a
+        // flag held in a variable, and shell quotes.
+        stdio("env", &["-", "python3", "-m", "pkg"], &[]),
+        stdio("env", &["--ignore-env", "python3", "-m", "pkg"], &[]),
+        stdio("env", &["--i", "python3", "-m", "pkg"], &[]),
+        stdio(
+            "env",
+            &["-P", "/usr/bin", "-i", "python3", "-m", "pkg"],
+            &[],
+        ),
+        stdio("env", &["-C", "/tmp", "-i", "python3", "-m", "pkg"], &[]),
+        stdio(
+            "env",
+            &["--chdir", "/tmp", "-", "python3", "-m", "pkg"],
+            &[],
+        ),
+        stdio("sh", &["-c", "exec python3 $F -m tool"], &[("F", "-E")]),
+        stdio("sh", &["-c", "exec python3 -\"E\" -m tool"], &[]),
+        stdio("sh", &["-c", "exec python3 -'E' -m tool"], &[]),
     ];
     for spec in &never {
         let k = approval_key(&repo, "s", spec);
@@ -681,6 +738,12 @@ fn argv_that_can_drop_the_bytecode_prefix_is_never_remembered() {
         stdio("sh", &["-c", "exec python3 -u -i server.py"], &[]),
         stdio("node", &["-e", "1"], &[]),
         stdio("node", &["--env-file=.env", "server.js"], &[]),
+        stdio(
+            "env",
+            &["-P", "/usr/bin", "python3", "-u", "-m", "pkg"],
+            &[],
+        ),
+        stdio("python3", &["-X", "dev", "-m", "pkg"], &[("F", "-u")]),
     ];
     for spec in &remembered {
         let k = approval_key(&repo, "s", spec);
