@@ -632,6 +632,21 @@ mod tests {
             old,
             SessionRecord::PrefixApplied { tools: None, .. }
         ));
+        let lost: SessionRecord =
+            serde_json::from_str(r#"{"type":"writes_lost","data":{"paths":[]}}"#).unwrap();
+        assert!(matches!(
+            lost,
+            SessionRecord::WritesLost { late: false, .. }
+        ));
+        let checkpoint: SessionRecord = serde_json::from_str(
+            r#"{"type":"checkpoint","data":{"n":1,"commit":"c","tree":"t","head":null,
+                "dirty":false,"turn":1,"step":2}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            checkpoint,
+            SessionRecord::Checkpoint { point: None, .. }
+        ));
     }
 
     #[test]

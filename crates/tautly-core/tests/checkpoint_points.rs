@@ -197,18 +197,21 @@ struct Boundary {
 /// The files at the end of provider step `n`, by log offset: the first `Checkpoint` after
 /// the last record of step `n` (its `Request`, `Provider`, `ToolCall`, `ToolResult` and
 /// `Edit` records; checkpoints are never a step's last record), the `Edit`s between to
-/// revert, and whether the result is partial: a `CheckpointSkipped` between, or a
-/// `ResumeStart` checkpoint (the turn's end was never checkpointed: a crash), or none at
-/// all.
+/// revert, and whether the result is partial: a `CheckpointSkipped` between, a
+/// `ResumeStart` checkpoint (the turn's end was never checkpointed: a crash), one whose
+/// point is none or unknown without a `TurnEnd` checkpoint of the step's turn before it,
+/// or none at all.
 fn boundary(recs: &[SessionRecord], n: u32) -> Option<Boundary> {
     let mut step = None;
     let mut last = None;
+    let mut user_turn = None;
     for (i, r) in recs.iter().enumerate() {
         match r {
-            SessionRecord::Request { step: s, .. } => {
+            SessionRecord::Request { step: s, turn, .. } => {
                 step = Some(*s);
                 if *s == n {
                     last = Some(i);
+                    user_turn = Some(*turn);
                 }
             }
             SessionRecord::TurnStart { .. } | SessionRecord::TurnEnd { .. } => step = None,
@@ -223,20 +226,33 @@ fn boundary(recs: &[SessionRecord], n: u32) -> Option<Boundary> {
             _ => {}
         }
     }
+    let last = last?;
+    let turn_end_seen = recs[..last].iter().any(|r| {
+        matches!(r, SessionRecord::Checkpoint {
+            point: Some(CheckpointPoint::TurnEnd),
+            turn,
+            ..
+        } if Some(*turn) == user_turn)
+    });
     let mut reverts = Vec::new();
     let mut partial = false;
-    for r in &recs[last? + 1..] {
+    for r in &recs[last + 1..] {
         match r {
             SessionRecord::Edit {
                 path, pre_image, ..
             } => reverts.push((path.clone(), pre_image.clone())),
             SessionRecord::CheckpointSkipped { .. } => partial = true,
             SessionRecord::Checkpoint { commit, point, .. } => {
+                // Spec 7.12.1: a resume's start checkpoint is partial, and so is one whose
+                // point is not known (an older or newer build wrote it) unless a turn-end
+                // checkpoint of the step's turn came before it.
+                let unsure =
+                    matches!(point, None | Some(CheckpointPoint::Unknown)) && !turn_end_seen;
                 return Some(Boundary {
                     commit: commit.clone(),
                     point: *point,
                     reverts,
-                    partial: partial || *point == Some(CheckpointPoint::ResumeStart),
+                    partial: partial || *point == Some(CheckpointPoint::ResumeStart) || unsure,
                 });
             }
             _ => {}
@@ -401,6 +417,32 @@ async fn after_a_crash_the_resume_checkpoint_is_partial() {
         file_at(&repo, &log, &b, "a.txt").as_deref(),
         Some("human\n")
     );
+
+    // Re-review 2 M2: the same log as an older build (no `point`) or a newer one (a point
+    // this build does not know) wrote it. Nothing says that checkpoint is not a resume's,
+    // and the step's turn has no `turn_end` checkpoint before it: partial.
+    for point in [None, Some(json!("from_the_future"))] {
+        let text = std::fs::read_to_string(&log).unwrap();
+        let mut lines = text.lines();
+        let mut out = vec![lines.next().unwrap().to_string()];
+        for l in lines {
+            let mut v: Value = serde_json::from_str(l).unwrap();
+            if v["data"]["type"] == "checkpoint" {
+                let data = v["data"]["data"].as_object_mut().unwrap();
+                match &point {
+                    None => drop(data.remove("point")),
+                    Some(p) => drop(data.insert("point".into(), p.clone())),
+                }
+            }
+            out.push(v.to_string());
+        }
+        let rewritten = log.with_extension("rewritten.jsonl");
+        std::fs::write(&rewritten, out.join("\n") + "\n").unwrap();
+        let b = boundary(&records(&rewritten), 2).unwrap();
+        let expected = point.as_ref().map(|_| CheckpointPoint::Unknown);
+        assert_eq!(b.point, expected, "{b:?}");
+        assert!(b.partial, "{point:?}: {b:?}");
+    }
 }
 
 #[tokio::test]

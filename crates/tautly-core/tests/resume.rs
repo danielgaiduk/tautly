@@ -1423,6 +1423,38 @@ async fn a_manual_compact_or_uncompact_makes_the_next_epoch_cold() {
     }
 }
 
+/// Re-review 2 M3: a `Compact` that changes nothing breaks no prefix, so the next epoch
+/// stays warm and a pin sent meanwhile waits in the state tail.
+#[tokio::test]
+async fn a_compact_that_changes_nothing_keeps_the_next_epoch_warm() {
+    let fx = Fx::new();
+    let mut cfg = config(Mode::Ask);
+    cfg.catalog_overrides = Some(warm_cache_catalog());
+    let mock = MockProvider::new(vec![text_step("first done"), text_step("second done")]);
+    let mut run = start(fx.builder(cfg, &mock));
+    run.turn_with("first").await;
+    run.send(Command::Compact).await;
+    run.until(
+        |e| matches!(e, Event::Warning { message } if message.contains("nothing to compact")),
+    )
+    .await;
+    run.send(Command::Pin {
+        text: "PIN-AFTER".into(),
+    })
+    .await;
+    run.turn_with("second").await;
+    let path = run.engine.session_path().to_path_buf();
+    run.stop().await;
+    let recs = records_at(&path);
+    let before = before_last_request(&recs);
+    assert!(
+        !before
+            .iter()
+            .any(|r| matches!(r, SessionRecord::PinsFolded)),
+        "{before:?}"
+    );
+}
+
 /// Review A M6: the overflow retry's compaction breaks the cached prefix outside the
 /// epoch; the retried step's epoch takes the pending pins with it, so it breaks once.
 #[tokio::test]

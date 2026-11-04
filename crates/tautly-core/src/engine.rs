@@ -691,7 +691,16 @@ impl Actor {
                     // A fork moves the log to its branch when it ends: what applies after it
                     // waits, unlogged, and is logged in the branch at the join.
                     if running.as_ref().is_some_and(|r| r.fork) && !Self::urgent(&cmd) {
-                        held.push(cmd);
+                        if held.len() < COMMAND_CAPACITY {
+                            held.push(cmd);
+                        } else {
+                            self.events.try_emit(Event::Warning {
+                                message: format!(
+                                    "a command was dropped: more than {COMMAND_CAPACITY} \
+                                     arrived while a fork runs"
+                                ),
+                            });
+                        }
                         continue;
                     }
                     let lost = state.is_none() && running.is_none();
@@ -712,10 +721,28 @@ impl Actor {
                         }
                         Err(e) => self.crashed(e, turn).await,
                     }
-                    for cmd in std::mem::take(&mut held) {
-                        let lost = state.is_none();
-                        self.received(cmd, lost, None, &mut queue, &mut stopping)
+                    let held = std::mem::take(&mut held);
+                    if stopping && !held.is_empty() {
+                        // Logged as they arrived would have been, but never run.
+                        let n = held.len();
+                        let recs: Vec<SessionRecord> =
+                            held.into_iter().map(SessionRecord::Command).collect();
+                        self.with_log(move |l| recs.iter().try_for_each(|r| l.append(r)))
                             .await;
+                        self.events.try_emit(Event::Warning {
+                            message: format!(
+                                "{n} command{} sent during the fork {} not run: the session \
+                                 is shutting down",
+                                if n == 1 { "" } else { "s" },
+                                if n == 1 { "was" } else { "were" }
+                            ),
+                        });
+                    } else {
+                        for cmd in held {
+                            let lost = state.is_none();
+                            self.received(cmd, lost, None, &mut queue, &mut stopping)
+                                .await;
+                        }
                     }
                 }
             }

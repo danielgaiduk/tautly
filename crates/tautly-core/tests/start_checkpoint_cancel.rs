@@ -158,7 +158,10 @@ async fn before_the_first_tool_call(git: &Path) {
         text("never sent"),
     ]);
     let mut run = Run::start(dir.path(), home.path(), &mock);
-    let (took, reason) = run.cancel_at(|e| matches!(e, Event::TurnStarted)).await;
+    // The response is in (its status follows it) and the step waits before its calls.
+    let (took, reason) = run
+        .cancel_at(|e| matches!(e, Event::ContextStatus { .. }))
+        .await;
     assert_eq!(reason, FinishReason::Cancelled);
     assert!(
         took < Duration::from_millis(250),
@@ -270,6 +273,52 @@ async fn a_pin_sent_during_a_fork_is_logged_in_the_branch(git: &Path) {
     assert_eq!(pins(&branch), ["BEFORE", "DURING"]);
 }
 
+/// Re-review 2 M1: commands held while a fork runs are bounded (a warning for each one
+/// dropped past the bound), and those a `Shutdown` leaves unrun are said once.
+async fn commands_held_during_a_fork_are_bounded_and_unrun_ones_said(git: &Path) {
+    let (dir, home) = repo(git);
+    let mock = MockProvider::new(vec![]);
+    let mut run = Run::start(dir.path(), home.path(), &mock);
+    run.engine
+        .send(Command::Pin {
+            text: "BEFORE".into(),
+        })
+        .await
+        .unwrap();
+    run.engine
+        .send(Command::Fork {
+            at: None,
+            label: None,
+        })
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    for i in 0..70 {
+        run.engine
+            .send(Command::Pin {
+                text: format!("P{i}"),
+            })
+            .await
+            .unwrap();
+    }
+    run.engine.send(Command::Shutdown).await.unwrap();
+    let mut events = Vec::new();
+    while let Some(ev) = tokio::time::timeout(WAIT, run.events.recv())
+        .await
+        .expect("the engine did not stop")
+    {
+        events.push(ev);
+    }
+    let warned = |s: &str| {
+        events
+            .iter()
+            .filter(|e| matches!(e, Event::Warning { message } if message.contains(s)))
+            .count()
+    };
+    assert_eq!(warned("while a fork runs"), 6, "{events:?}");
+    assert_eq!(warned("not run"), 1, "{events:?}");
+}
+
 #[test]
 fn cancel_while_the_session_start_checkpoint_is_taken_ends_the_turn_within_200ms() {
     let git = real_git();
@@ -308,6 +357,7 @@ fn cancel_while_the_session_start_checkpoint_is_taken_ends_the_turn_within_200ms
         )
         .await;
         a_pin_sent_during_a_fork_is_logged_in_the_branch(&git).await;
+        commands_held_during_a_fork_are_bounded_and_unrun_ones_said(&git).await;
         shutdown_while_a_command_waits(
             &git,
             Command::Fork {
