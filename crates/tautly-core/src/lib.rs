@@ -34,6 +34,7 @@ pub mod tree;
 pub mod turn;
 pub mod undo;
 pub mod workspace;
+pub mod worktree;
 
 pub use auth::{AuthError, KEYCHAIN_SERVICE, KeyLookup, KeyringStore, SecretStore, api_key};
 pub use budget::{Budget, BudgetState};

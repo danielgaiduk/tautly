@@ -18,6 +18,8 @@ pub struct Deleted {
     pub log: PathBuf,
     /// How many checkpoint refs.
     pub refs: u32,
+    /// The worktree of a worktree fork, removed with it.
+    pub worktree: Option<PathBuf>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -35,19 +37,53 @@ pub enum DeleteError {
     },
     #[error("cannot delete the session's checkpoint refs: {0}")]
     Checkpoint(#[from] CheckpointError),
+    /// Not a `#[source]`: the message says it (review M4).
+    #[error("cannot remove the fork's worktree: {0}")]
+    Worktree(crate::worktree::WtError),
+    #[error(
+        "this is run inside the fork's own worktree {}: run it from another worktree of \
+         the repository (the main one, say), since it removes {}",
+        .0.display(),
+        .0.display()
+    )]
+    InsideWorktree(PathBuf),
+    #[error(
+        "another live session uses the fork's worktree {}; close it first",
+        .0.display()
+    )]
+    WorktreeBusy(PathBuf),
+}
+
+impl From<crate::worktree::WtError> for DeleteError {
+    fn from(e: crate::worktree::WtError) -> Self {
+        DeleteError::Worktree(e)
+    }
 }
 
 /// Delete session `id` of the project the sandbox root belongs to (`tautly sessions
-/// delete <id>`): its checkpoint refs (`refs/tautly/checkpoints/<id>/`, when the root is in
-/// a git work tree), then its log and last-request file. Blobs are shared by the project's
-/// sessions and kept (blob garbage collection is post-v1); so are its branches, whose logs
-/// hold their own copies and whose checkpoints have refs of their own. A session an engine
-/// holds open is refused. (Removing a worktree fork's worktree, spec 7.12.4, comes with
-/// those forks.)
+/// delete <id>`): [`delete_with`] without `force`.
 pub async fn delete(
     data_home: &Path,
     sandbox: &dyn Sandbox,
     id: &str,
+) -> Result<Deleted, DeleteError> {
+    delete_with(data_home, sandbox, id, false).await
+}
+
+/// Delete session `id` of the project the sandbox root belongs to: the worktree of a
+/// worktree fork (spec 7.12.4; [`crate::worktree::remove`], which refuses one with
+/// modified, untracked or ignored files unless `force`; refused from inside that worktree,
+/// and while a live session holds its working-tree lease), its checkpoint refs (`refs/tautly/checkpoints/<id>/`,
+/// when the root is in a git work tree), then its log and last-request file. Blobs are
+/// shared by the project's sessions and kept (blob garbage collection is post-v1); so are
+/// its branches, whose logs hold their own copies and whose checkpoints have refs of their
+/// own. A session an engine holds open is refused; so is a dirty fork worktree without
+/// `force`, and then nothing is deleted.
+pub async fn delete_with(
+    data_home: &Path,
+    sandbox: &dyn Sandbox,
+    id: &str,
+    force: bool,
 ) -> Result<Deleted, DeleteError> {
     let root = sandbox.root().to_path_buf();
     let found = {
@@ -66,6 +102,36 @@ pub async fn delete(
         .ok_or_else(|| DeleteError::NotFound(id.to_string()))?;
     // Held until the log is gone, so no engine opens it meanwhile.
     let lock = lock_if_idle(&log, id)?;
+    // A worktree fork's worktree goes first: a dirty one refuses the whole deletion.
+    let header = tautly_session::SessionReader::<SessionRecord>::open(&log)?
+        .header()
+        .clone();
+    let fork = header.origin == tautly_session::Origin::WhatIf;
+    if fork && header.root == root {
+        // It could not remove the worktree it runs in (review I1).
+        return Err(DeleteError::InsideWorktree(root));
+    }
+    let worktree = (fork && header.root.exists()).then_some(header.root);
+    if let Some(dir) = &worktree {
+        // Not while a live session uses it (review I2): its working-tree lease, held
+        // exclusively for the removal.
+        let busy = || DeleteError::WorktreeBusy(dir.clone());
+        let lease = crate::lease::Lease::try_shared(data_home, dir)
+            .map_err(|source| DeleteError::Io {
+                path: dir.clone(),
+                source,
+            })?
+            .ok_or_else(busy)?;
+        let _alone = lease.try_exclusive().map_err(|e| match e {
+            crate::lease::LeaseError::Busy => busy(),
+            crate::lease::LeaseError::Io(source) => DeleteError::Io {
+                path: dir.clone(),
+                source,
+            },
+        })?;
+        let start = fork_start(&log)?;
+        crate::worktree::remove(sandbox, &root, dir, start.as_deref(), force).await?;
+    }
     // Only a repository checkpoints would have written to (see `checkpoint::git_dir`).
     let refs = if checkpoint::git_dir(&root).is_some() {
         let excludes = log.parent().map(|d| d.join(checkpoint::EXCLUDES_DIR));
@@ -79,7 +145,30 @@ pub async fn delete(
     })?;
     let _ = std::fs::remove_file(log.with_extension("last-request.json"));
     drop(lock);
-    Ok(Deleted { log, refs })
+    Ok(Deleted {
+        log,
+        refs,
+        worktree,
+    })
+}
+
+/// The commit a worktree fork's worktree began at: the `restored` checkpoint its log wrote
+/// after `Forked` (none: not found).
+fn fork_start(log: &Path) -> Result<Option<String>, DeleteError> {
+    let reader = tautly_session::SessionReader::<SessionRecord>::open(log)?;
+    let mut forked = false;
+    for rec in reader.records() {
+        match rec?.1 {
+            SessionRecord::Forked => forked = true,
+            SessionRecord::Checkpoint {
+                commit,
+                point: Some(crate::record::CheckpointPoint::Restored),
+                ..
+            } if forked => return Ok(Some(commit)),
+            _ => {}
+        }
+    }
+    Ok(None)
 }
 
 /// The newest session that ran in the work tree a session started in `start` runs on
@@ -227,6 +316,12 @@ pub struct BackupRestored {
     pub backup_ref: Option<String>,
     /// Every path the restore was about to write.
     pub paths: Vec<String>,
+    /// The backup put back is one an earlier `restore-backup` kept of what it replaced
+    /// (`include_own`), not a rewind's or switch's.
+    pub own: bool,
+    /// Later backups an earlier `restore-backup` kept were passed over (without
+    /// `include_own`).
+    pub skipped_own: bool,
 }
 
 /// How [`restore_backup`] runs.
@@ -238,6 +333,10 @@ pub struct RestoreBackupOptions {
     pub force: bool,
     /// Conflicting paths (changed since the restore wrote them) to put back all the same.
     pub overwrite: Vec<String>,
+    /// Also consider the backups `restore-backup` itself kept (of what it replaced), so the
+    /// last one puts back what an earlier run wrote. Without it, those are passed over: a
+    /// run again after one was cut off finishes it instead of reversing it.
+    pub include_own: bool,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -274,10 +373,13 @@ pub enum BackupError {
 ///
 /// - It is refused while any engine runs on the working tree (the lease), and when that
 ///   restore finished (`RestoreEnded`), unless `force`.
-/// - A file whose content is no longer what the restore wrote there is a conflict, left
-///   alone unless listed in `overwrite`.
+/// - A file whose content or mode is no longer what the restore wrote there is a
+///   conflict, left alone unless listed in `overwrite`.
 /// - Before it writes, what it replaces is kept in the log as a `RestoreBegun` of its own
-///   (so this can be put back in turn), and a `RestoreEnded` follows.
+///   (marked `restore_backup`), and a `RestoreEnded` follows. Those are passed over unless
+///   `include_own`: run again (say after it was cut off), it goes on with the rewind's or
+///   switch's backup instead of reversing itself; with `include_own`, the last one puts
+///   back what the previous run replaced.
 /// - A path with a link or a file above it, or that no longer resolves to itself, is never
 ///   written.
 ///
@@ -303,20 +405,34 @@ pub async fn restore_backup(
     let reader = tautly_session::SessionReader::<SessionRecord>::open(&log)?;
     let mut last = None;
     let mut ended = None;
+    // The last `RestoreBegun` was passed over (its own, without `include_own`): the
+    // `RestoreEnded` that follows is that one's.
+    let mut passed = false;
+    let mut skipped_own = false;
     for rec in reader.records() {
         match rec?.1 {
+            SessionRecord::RestoreBegun {
+                restore_backup: true,
+                ..
+            } if !opts.include_own => {
+                passed = true;
+                skipped_own = true;
+            }
             SessionRecord::RestoreBegun {
                 backup_ref,
                 files,
                 paths,
+                restore_backup,
             } => {
-                last = Some((backup_ref, files, paths));
+                last = Some((backup_ref, files, paths, restore_backup));
                 ended = None;
+                passed = false;
+                skipped_own = false;
             }
             SessionRecord::RestoreEnded {
                 applied,
                 rolled_back,
-            } => {
+            } if !passed => {
                 ended = Some(if applied {
                     "it was applied"
                 } else if rolled_back {
@@ -328,13 +444,16 @@ pub async fn restore_backup(
             _ => {}
         }
     }
-    let (backup_ref, files, paths) = last.ok_or_else(|| BackupError::NoBackup(id.to_string()))?;
+    let (backup_ref, files, paths, own) =
+        last.ok_or_else(|| BackupError::NoBackup(id.to_string()))?;
     if let Some(how) = ended.filter(|_| !opts.force) {
         return Err(BackupError::Finished(id.to_string(), how));
     }
     let mut done = BackupRestored {
         backup_ref,
         paths: paths.iter().map(|p| p.as_str().to_string()).collect(),
+        own,
+        skipped_own,
         ..BackupRestored::default()
     };
     // What to put back, after checking each path against what the restore wrote.
@@ -355,11 +474,20 @@ pub async fn restore_backup(
             .await
             .map_err(|e| BackupError::Other(e.to_string()))?;
         let b3 = |bytes: &[u8]| blake3::hash(bytes).to_hex().to_string();
+        // The mode the restore left (Task 49 M-R3c): recorded, or for an older record, a
+        // file's own (a rewind writes a kept file's content over it with its mode).
+        let wrote_mode = f.wrote_mode.or(match &f.wrote {
+            Some(Wrote::Blob(_)) if f.existed && !own => f.mode,
+            _ => None,
+        });
+        let mode_kept = |m: &u32| wrote_mode.is_none_or(|w| w == *m);
         let as_written = match (&f.wrote, &disk) {
             (Some(Wrote::Absent), Disk::Absent) => true,
-            (Some(Wrote::Blob(b)), Disk::File { bytes, .. }) => b3(bytes) == b.as_str(),
-            (Some(Wrote::Blob(b)), Disk::Large { hash, .. }) => {
-                hash.to_hex().as_str() == b.as_str()
+            (Some(Wrote::Blob(b)), Disk::File { bytes, mode }) => {
+                b3(bytes) == b.as_str() && mode_kept(mode)
+            }
+            (Some(Wrote::Blob(b)), Disk::Large { hash, mode, .. }) => {
+                hash.to_hex().as_str() == b.as_str() && mode_kept(mode)
             }
             _ => false,
         };
@@ -406,12 +534,15 @@ pub async fn restore_backup(
                 Some(b) => Wrote::Blob(b.clone()),
                 None => Wrote::Absent,
             }),
+            // Written with the backup's mode, else over the file with its own.
+            wrote_mode: f.blob.as_ref().and(f.mode.or(mode)),
         });
     }
     writer.append(&SessionRecord::RestoreBegun {
         backup_ref: None,
         files: kept,
         paths: planned.iter().map(|(f, _)| f.path.clone()).collect(),
+        restore_backup: true,
     })?;
     writer.checkpoint()?;
     let mut failed = None;

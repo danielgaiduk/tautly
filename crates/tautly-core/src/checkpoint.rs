@@ -2194,6 +2194,204 @@ pub async fn delete_session_refs(
     .await
 }
 
+/// `git worktree add --no-checkout --detach <dir> <commit>` on the repository at `root` (a
+/// fork's own worktree, spec 7.12.4), with every setting a checkpoint's git runs with: no
+/// hook (a `post-checkout` one included), fsmonitor or transport runs. Nothing is checked
+/// out here: the configuration a checkout in the new worktree reads is the worktree's own
+/// (`includeIf "gitdir:…/worktrees/…"`, its `config.worktree`), which a call in the main
+/// repository's context does not see, so a filter defined there would run (review C1).
+/// [`worktree_checkout`] fills it. Only the new worktree's administrative files are
+/// written; the user's index, HEAD and work tree are not.
+pub(crate) async fn worktree_add(
+    sb: &dyn Sandbox,
+    root: &Path,
+    dir: &Path,
+    commit: &str,
+) -> Result<(), CheckpointError> {
+    let dir = dir.to_string_lossy();
+    with_plain_git(sb, root, async |git| {
+        let args = [
+            "worktree",
+            "add",
+            "--no-checkout",
+            "--detach",
+            "--",
+            &dir,
+            commit,
+        ];
+        git.run(&args, None, Checkpointer::housekeeping_deadline())
+            .await?;
+        Ok(())
+    })
+    .await
+}
+
+/// Run `f` with git rooted at the linked worktree `dir` (`--git-dir` its own
+/// administrative directory, whose back-link must name it; `--work-tree` it), so every
+/// filter driver its own configuration defines is found and switched off.
+async fn in_worktree<T>(
+    dir: &Path,
+    f: impl AsyncFnOnce(&Git<'_>) -> Result<T, CheckpointError>,
+) -> Result<T, CheckpointError> {
+    let sb = tautly_sandbox::LocalSandbox::new(dir.to_path_buf()).map_err(|e| {
+        CheckpointError::Disk {
+            path: dir.display().to_string(),
+            source: e,
+        }
+    })?;
+    with_plain_git(&sb, dir, f).await
+}
+
+/// Check out HEAD into the linked worktree `dir` made by [`worktree_add`] (`read-tree
+/// --reset -u HEAD`, its own index), in its own configuration's context.
+pub(crate) async fn worktree_checkout(dir: &Path) -> Result<(), CheckpointError> {
+    in_worktree(dir, async |git| {
+        git.run(
+            &["read-tree", "--reset", "-u", "HEAD"],
+            None,
+            Checkpointer::housekeeping_deadline(),
+        )
+        .await?;
+        Ok(())
+    })
+    .await
+}
+
+/// What the linked worktree `dir` holds besides its HEAD, in its own configuration's
+/// context: the paths changed (modified, deleted, untracked) and the ignored files
+/// (Tautly's own scratch directory `.tautly/tmp` aside). From `git status --porcelain`.
+pub(crate) async fn worktree_status(
+    dir: &Path,
+) -> Result<(Vec<String>, Vec<String>), CheckpointError> {
+    let out = in_worktree(dir, async |git| {
+        Ok(git
+            .run(
+                &[
+                    "status",
+                    "--porcelain=v1",
+                    "-z",
+                    "--untracked-files=all",
+                    "--ignored=matching",
+                    // No child in a submodule: it would read the submodule's own
+                    // configuration, whose filters are not switched off (re-review N1).
+                    // Populated submodules are refused apart ([`worktree_submodules`]).
+                    "--ignore-submodules=all",
+                ],
+                None,
+                Checkpointer::housekeeping_deadline(),
+            )
+            .await?)
+    })
+    .await?;
+    Ok(parse_status(&out))
+}
+
+/// The populated submodules of the linked worktree `dir`: each gitlink of its index
+/// (`ls-files -s`, mode 160000) whose path holds a `.git`, as git's own `worktree remove`
+/// refuses them (re-review N1). Read in the worktree's context; nothing runs in a submodule.
+pub(crate) async fn worktree_submodules(dir: &Path) -> Result<Vec<String>, CheckpointError> {
+    let out = in_worktree(dir, async |git| {
+        Ok(git
+            .run(
+                &["ls-files", "-s", "-z"],
+                None,
+                Checkpointer::housekeeping_deadline(),
+            )
+            .await?)
+    })
+    .await?;
+    let mut found = Vec::new();
+    for entry in out.split(|&b| b == 0).filter(|e| !e.is_empty()) {
+        let Some(tab) = entry.iter().position(|&b| b == b'\t') else {
+            continue;
+        };
+        if !entry.starts_with(GITLINK.as_bytes()) {
+            continue;
+        }
+        let path = String::from_utf8_lossy(&entry[tab + 1..]).into_owned();
+        if plain_relative(Path::new(&path))
+            && std::fs::symlink_metadata(dir.join(&path).join(".git")).is_ok()
+        {
+            found.push(path);
+        }
+    }
+    Ok(found)
+}
+
+/// Whether a branch or tag of the repository at `root` reaches `commit`.
+pub(crate) async fn reached_by_a_branch_or_tag(
+    sb: &dyn Sandbox,
+    root: &Path,
+    commit: &str,
+) -> Result<bool, CheckpointError> {
+    let contains = format!("--contains={commit}");
+    with_plain_git(sb, root, async |git| {
+        let out = git
+            .run(
+                &[
+                    "for-each-ref",
+                    "--count=1",
+                    "--format=%(refname)",
+                    &contains,
+                    "refs/heads",
+                    "refs/tags",
+                ],
+                None,
+                Checkpointer::housekeeping_deadline(),
+            )
+            .await?;
+        Ok(!out.iter().all(u8::is_ascii_whitespace))
+    })
+    .await
+}
+
+/// `git status --porcelain=v1 -z` output: the changed and the ignored paths.
+pub(crate) fn parse_status(out: &[u8]) -> (Vec<String>, Vec<String>) {
+    let (mut changed, mut ignored) = (Vec::new(), Vec::new());
+    let mut entries = out.split(|&b| b == 0).filter(|e| !e.is_empty());
+    while let Some(entry) = entries.next() {
+        if entry.len() < 4 {
+            continue;
+        }
+        let (code, path) = (
+            &entry[..2],
+            String::from_utf8_lossy(&entry[3..]).into_owned(),
+        );
+        // A rename or copy names its source next.
+        if matches!(code[0], b'R' | b'C') {
+            entries.next();
+        }
+        if code == b"!!" {
+            let scratch = SPILL_STORE.to_string() + "/";
+            if !path.starts_with(&scratch) && path != scratch {
+                ignored.push(path);
+            }
+        } else {
+            changed.push(path);
+        }
+    }
+    (changed, ignored)
+}
+
+/// `git worktree remove --force <dir>` on the repository at `root`, through the same
+/// hardened git. Always forced: git's own cleanliness check would run `status` in the
+/// worktree's context, which may define a filter; [`worktree_status`] is checked first
+/// instead (review C1).
+pub(crate) async fn worktree_remove(
+    sb: &dyn Sandbox,
+    root: &Path,
+    dir: &Path,
+) -> Result<(), CheckpointError> {
+    let dir = dir.to_string_lossy();
+    with_plain_git(sb, root, async |git| {
+        let args = ["worktree", "remove", "--force", "--", &dir];
+        git.run(&args, None, Checkpointer::housekeeping_deadline())
+            .await?;
+        Ok(())
+    })
+    .await
+}
+
 async fn delete_refs(
     git: &Git<'_>,
     names: &[String],

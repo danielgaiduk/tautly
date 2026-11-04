@@ -19,6 +19,21 @@ const WHY_DIR: &str = "a directory is in the way";
 const WHY_UNKEPT: &str =
     "the git snapshot cannot hold it and its content cannot be kept (a link, or over 64 MiB)";
 
+/// The permission bits a new file gets here (`0o666` less the umask), as the sandbox's
+/// `write_atomic` creates one: found by making a file the same way in the temporary
+/// directory (the umask is the process's; reading it with `umask(2)` would change it for
+/// every thread meanwhile). None when that cannot be done.
+fn new_file_mode() -> Option<u32> {
+    use std::os::unix::fs::PermissionsExt;
+    let probe = tempfile::Builder::new()
+        .prefix("tautly-mode-")
+        .permissions(std::fs::Permissions::from_mode(0o666))
+        .tempfile()
+        .ok()?;
+    let mode = probe.as_file().metadata().ok()?.permissions().mode() & 0o7777;
+    Some(mode)
+}
+
 /// The note of a materialize with git checkpoints.
 const NOTE_GIT: &str = "ignored files and submodules are not restored";
 
@@ -614,6 +629,7 @@ pub(crate) async fn materialize_inner(
         && !planned.is_empty()
     {
         let mut files = Vec::with_capacity(kept_in_log.len());
+        let new_mode = new_file_mode();
         for &i in &kept_in_log {
             let p = &planned[i];
             let path = RelPath::from_abs(&root, &root.join(&p.rel))
@@ -628,12 +644,20 @@ pub(crate) async fn materialize_inner(
                 Src::Absent => Some(Wrote::Absent),
                 Src::Base => None,
             };
+            // A blob is written over a file with that file's mode, else as a new file with
+            // the default mode, the umask respected (see `write`; Task 50 M6, N4).
+            let wrote_mode = match (&p.src, &p.disk) {
+                (Src::Blob(_), Disk::File { mode, .. }) => Some(*mode),
+                (Src::Blob(_), _) => new_mode,
+                _ => None,
+            };
             files.push(BackupFile {
                 path,
                 existed,
                 blob,
                 mode,
                 wrote,
+                wrote_mode,
             });
         }
         let paths = planned
@@ -647,6 +671,7 @@ pub(crate) async fn materialize_inner(
             backup_ref: report.backup_ref.clone(),
             files,
             paths,
+            restore_backup: false,
         })?;
     }
     let written = write(sb, cp.as_deref(), target, tbase.as_deref(), &planned).await;
@@ -745,6 +770,7 @@ async fn write(
             reader = Some(SessionReader::<SessionRecord>::open(&target.log)?);
         }
         let bytes = reader.as_ref().expect("opened").read_blob(b)?;
+        // Over a file with its mode, a new one with the default mode (`new_file_mode`).
         sb.write_atomic(&full, &bytes, None)
             .await
             .map_err(|source| TtError::Disk {
