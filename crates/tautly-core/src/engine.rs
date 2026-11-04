@@ -576,12 +576,7 @@ impl Actor {
         };
         // A log that cannot be rebuilt leaves nothing to run: every command is refused.
         let mut state = match started {
-            Ok(()) => {
-                session.begin_checkpoints(start.resume).await;
-                prune_checkpoints(&session);
-                session.mcp = McpSession::start(start.mcp, &session, self.approvals.clone()).await;
-                Some(session)
-            }
+            Ok(()) => Some(session),
             Err(why) => {
                 self.events
                     .send_or_drop(Event::Error {
@@ -603,6 +598,12 @@ impl Actor {
             let lost = state.is_none();
             self.received(cmd, lost, None, &mut queue, &mut stopping)
                 .await;
+        }
+        // Nothing more starts for a session that is already shutting down.
+        if let Some(s) = state.as_mut().filter(|_| !stopping) {
+            s.begin_checkpoints(start.resume).await;
+            prune_checkpoints(s);
+            s.mcp = McpSession::start(start.mcp, s, self.approvals.clone()).await;
         }
         loop {
             if running.is_none() && !stopping {

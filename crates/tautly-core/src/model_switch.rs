@@ -104,6 +104,14 @@ pub(crate) fn rejects_reasoning(e: &ProviderError) -> bool {
         .any(|w| msg.contains(w))
 }
 
+/// What [`Session::restore_model`] does when its `stop` fires first.
+pub(crate) enum Stopped {
+    /// The session is shutting down: nothing changes.
+    Leave,
+    /// The session goes on (a cancelled fork's branch): it stays on its own model.
+    Continue,
+}
+
 impl Session {
     /// `Command::SetModel`; see the module docs. `stop` resolves when the session is shutting
     /// down: if that happens before the provider is built, the switch is abandoned (the
@@ -223,18 +231,27 @@ impl Session {
     /// with `ModelChanged`. When that model cannot be used now (no key, say) the session
     /// stays on its own model, which is logged as a `ModelSet`, with a `Warning`; the next
     /// step start strips another provider's reasoning as after any switch. The provider
-    /// build may wait on a keychain prompt: `stop` (a `Shutdown`, or the fork's cancel)
-    /// abandons it, and the session stays on its own model the same way.
-    pub(crate) async fn restore_model(&mut self, model: ModelId, stop: impl Future<Output = ()>) {
+    /// build may wait on a keychain prompt: `stop` abandons it. A fork's cancel
+    /// (`Stopped::Continue`) leaves the branch on its own model the same way; a shutdown
+    /// (`Stopped::Leave`) changes and logs nothing, so the session resumes on `model` later.
+    pub(crate) async fn restore_model(
+        &mut self,
+        model: ModelId,
+        stop: impl Future<Output = ()>,
+        stopped: Stopped,
+    ) {
         if model == self.model {
             return;
         }
         let built = tokio::select! {
             biased;
             built = self.build_provider(&model) => built,
-            () = stop => Err(ProviderSetupError::Other(
-                "its setup was stopped (shutdown or cancel)".into(),
-            )),
+            () = stop => match stopped {
+                Stopped::Leave => return,
+                Stopped::Continue => Err(ProviderSetupError::Other(
+                    "its setup was cancelled".into(),
+                )),
+            },
         };
         match built {
             Ok((provider, side, side_note)) => {

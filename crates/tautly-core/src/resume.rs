@@ -75,6 +75,7 @@ use crate::budget::Budget;
 use crate::dispatch::signature;
 use crate::ledger::{LEDGER_FILE, Ledger};
 use crate::mcp::MCP_TOOL_PREFIX;
+use crate::model_switch::Stopped;
 use crate::protocol::{BudgetScope, Command, ErrorKind, Event, FinishReason};
 use crate::provider_setup::provider_label;
 use crate::record::SessionRecord;
@@ -982,7 +983,7 @@ impl Session {
         }
         let mut resumed = self.adopt(rebuilt);
         if let Some(model) = resumed.model.take() {
-            self.restore_model(model, stop).await;
+            self.restore_model(model, stop, Stopped::Leave).await;
         }
         self.resume_start(resumed, config_pins).await;
         self.show_pending_proposals().await;
@@ -1253,7 +1254,7 @@ impl Session {
             self.warn(format!("fork: {w}")).await;
         }
         if let Some(model) = resumed.model {
-            self.restore_model(model, stop).await;
+            self.restore_model(model, stop, Stopped::Continue).await;
         }
         Ok((id, path))
     }
