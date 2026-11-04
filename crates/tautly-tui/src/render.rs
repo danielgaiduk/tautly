@@ -549,6 +549,32 @@ pub fn event(e: &Event, st: &mut RenderState, opts: &ReplOptions) -> Option<Stri
             }
             Some(st.line(paint(DIM, &text)))
         }
+        Event::Replayed { event: logged, .. } => match &**logged {
+            // A logged switch is history: the session's model stays what it is.
+            Event::ModelChanged { model, provider } => Some(st.line(format!(
+                "model: {} ({})",
+                printable(model.as_str()),
+                printable(provider)
+            ))),
+            // Nothing replayed is answered: shown, never asked.
+            Event::Replayed { .. } => None,
+            inner => event(inner, st, opts),
+        },
+        Event::UserMessage { text } => {
+            let text = printable_multiline(text);
+            let text = text.strip_suffix('\n').unwrap_or(&text);
+            Some(st.line(paint(BOLD, &format!("> {}", text.replace('\n', "\n  ")))))
+        }
+        Event::ReplayFinished {
+            events, cancelled, ..
+        } => Some(st.line(paint(
+            DIM,
+            &if *cancelled {
+                format!("replay cancelled after {events} events")
+            } else {
+                format!("replay finished: {events} events")
+            },
+        ))),
         _ => None,
     }
 }

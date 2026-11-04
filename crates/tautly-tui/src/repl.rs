@@ -430,6 +430,19 @@ where
                 self.send(Command::Label { label }).await?;
                 return self.quiet().await;
             }
+            Slash::Replay(session_id) => {
+                self.send(Command::Replay {
+                    session_id,
+                    speed: 1.0,
+                    from_step: None,
+                })
+                .await?;
+                // A Ctrl+C meanwhile cancels it (`pump`).
+                return Ok(exit(
+                    self.pump(|e| matches!(e, Event::ReplayFinished { .. } | Event::Error { .. }))
+                        .await?,
+                ));
+            }
             Slash::MemoryConsolidate => {
                 self.send(Command::ConsolidateMemory).await?;
                 return Ok(exit(

@@ -549,6 +549,11 @@ enum Job {
         dry_run: bool,
         overwrite: Vec<String>,
     },
+    Replay {
+        session_id: Option<String>,
+        speed: f32,
+        from_step: Option<u32>,
+    },
 }
 
 /// The task in flight (a turn or a compaction). It hands back the session and the inbox,
@@ -761,6 +766,15 @@ impl Actor {
                             session_id,
                             dry_run,
                             overwrite,
+                        },
+                        Command::Replay {
+                            session_id,
+                            speed,
+                            from_step,
+                        } => Job::Replay {
+                            session_id,
+                            speed,
+                            from_step,
                         },
                         Command::SetModel { model } => {
                             match state.as_mut() {
@@ -995,6 +1009,13 @@ impl Actor {
                     let _ = r.inbox.send(cmd);
                 }
             }
+            // A replay is a view of a log, never queued behind live work (spec 7.12.5).
+            Command::Replay { .. } if running.is_some() => self.events.try_emit(Event::Error {
+                kind: ErrorKind::Internal,
+                message: "replay needs an idle session".into(),
+                retryable: false,
+                hint: None,
+            }),
             other => queue.push_back(other),
         }
     }
@@ -1082,6 +1103,11 @@ impl Actor {
                         .switch_job(session_id, dry_run, overwrite, &ctl, moved)
                         .await
                 }
+                Job::Replay {
+                    session_id,
+                    speed,
+                    from_step,
+                } => session.replay_job(session_id, speed, from_step, &ctl).await,
             }
             (session, ctl.inbox)
         });

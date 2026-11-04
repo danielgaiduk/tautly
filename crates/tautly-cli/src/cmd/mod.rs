@@ -14,6 +14,7 @@ mod memory;
 mod models;
 mod prompt;
 mod receipt;
+mod replay;
 mod sessions;
 mod stats;
 mod undo;
@@ -66,6 +67,8 @@ pub enum Command {
     Stats(stats::Args),
     /// One session's turns, spend and savings estimates (the latest by default).
     Receipt(receipt::Args),
+    /// Play a session back from its log: no model is called and nothing runs.
+    Replay(replay::Args),
 }
 
 /// Run `command`; the exit code.
@@ -81,6 +84,7 @@ pub async fn run(command: Command, cli: &Cli) -> anyhow::Result<i32> {
         Command::Mcp { cmd } => mcp::run(cmd, &env).await,
         Command::Stats(args) => stats::run(args, &env),
         Command::Receipt(args) => receipt::run(args, &env),
+        Command::Replay(args) => replay::run(args, &env).await,
     }
 }
 

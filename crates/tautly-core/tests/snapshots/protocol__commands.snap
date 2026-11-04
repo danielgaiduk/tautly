@@ -120,6 +120,18 @@ expression: every_command()
     "label": "main"
   },
   {
+    "type": "replay",
+    "session_id": null,
+    "speed": 1.0,
+    "from_step": null
+  },
+  {
+    "type": "replay",
+    "session_id": "01J0",
+    "speed": 0.0,
+    "from_step": 4
+  },
+  {
     "type": "shutdown"
   }
 ]

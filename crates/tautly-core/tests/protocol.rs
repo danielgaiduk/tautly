@@ -263,6 +263,21 @@ fn every_event() -> Vec<Event> {
                 ..MaterializeReport::default()
             },
         },
+        Event::Replayed {
+            offset: 7,
+            t_ms: 1_793_795_696_000,
+            event: Box::new(Event::UserMessage {
+                text: "fix the bug".into(),
+            }),
+        },
+        Event::ReplayFinished {
+            session_id: "01J0".into(),
+            events: 42,
+            cancelled: false,
+        },
+        Event::UserMessage {
+            text: "fix the bug".into(),
+        },
     ];
     for e in &events {
         match e {
@@ -292,6 +307,9 @@ fn every_event() -> Vec<Event> {
             | Event::Undone { .. }
             | Event::Rewound { .. }
             | Event::Switched { .. }
+            | Event::Replayed { .. }
+            | Event::ReplayFinished { .. }
+            | Event::UserMessage { .. }
             | Event::Unknown => {}
         }
     }
@@ -382,6 +400,16 @@ fn every_command() -> Vec<Command> {
         Command::Label {
             label: "main".into(),
         },
+        Command::Replay {
+            session_id: None,
+            speed: 1.0,
+            from_step: None,
+        },
+        Command::Replay {
+            session_id: Some("01J0".into()),
+            speed: 0.0,
+            from_step: Some(4),
+        },
         Command::Shutdown,
     ];
     for c in &commands {
@@ -405,6 +433,7 @@ fn every_command() -> Vec<Command> {
             | Command::Rewind { .. }
             | Command::Switch { .. }
             | Command::Label { .. }
+            | Command::Replay { .. }
             | Command::Shutdown
             | Command::Unknown => {}
         }
@@ -430,10 +459,13 @@ fn event_json_shape_is_stable() {
     unique.sort();
     unique.dedup();
     assert_eq!(unique.len(), events.len(), "{types:?}");
-    for e in events
-        .iter()
-        .filter(|e| !matches!(e, Event::SessionChanged { .. }))
-    {
+    // `replay_finished` names the session it replayed, not the one it is sent on.
+    for e in events.iter().filter(|e| {
+        !matches!(
+            e,
+            Event::SessionChanged { .. } | Event::ReplayFinished { .. }
+        )
+    }) {
         assert!(serde_json::to_value(e).unwrap().get("session_id").is_none());
     }
     insta::assert_json_snapshot!("events", events);
