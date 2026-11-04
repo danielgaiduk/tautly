@@ -1,30 +1,40 @@
 //! `tautly bisect <session> --test "<cmd>" [--good N] [--bad M] [--timeout 600] [--yes]
 //! [--json]` (spec 7.12.7): the step at which a check started failing. The check runs on
-//! the files of past step boundaries in one temporary git worktree (removed at the end);
-//! the work tree of the current directory is never touched.
+//! the files of past step boundaries in one temporary git worktree (removed at the end).
+//! Tautly writes nothing in the work tree of the current directory; the check itself is
+//! not confined (v1 has no OS isolation) and runs the files of past states.
 //!
-//! - Before anything runs it prints the command, the range and the most runs it can take,
-//!   and asks y/N on a terminal; elsewhere it needs `--yes`. A deny rule of the policy
-//!   that matches the command refuses it (exit 1). Nothing logged in a session counts as
-//!   approval: the policy is the current configuration's, with no session rules.
+//! - Before anything runs it prints the command, the range (and where each endpoint came
+//!   from) and the most runs it can take, and asks y/N on a terminal; elsewhere it needs
+//!   `--yes`. A deny rule of the policy that matches the command refuses it (exit 1).
+//!   Nothing logged in a session counts as approval: the policy is the current
+//!   configuration's, with no session rules.
 //! - Exit 0 is good, 125 skip, any other code bad; a run past `--timeout` seconds (at most
-//!   600) is killed with its process group and skipped. Ctrl-C (or SIGTERM) kills the run
-//!   in progress and stops (exit 130).
+//!   600) is killed with its process group and skipped. Ctrl-C, SIGTERM or SIGHUP kills
+//!   the run in progress, removes the worktree and stops, exiting 128 + the signal (130,
+//!   143, 129).
 //! - The endpoints are verified first: a good step that does not pass or a bad step that
-//!   does not fail exits 2.
+//!   does not fail exits 2, with the last lines of that run's output. An endpoint the
+//!   session's own logged runs chose falls back to the default one first.
 //! - It prints the first failing step, its user turn, its tool calls and up to 300
-//!   characters of its assistant text (with `--json`, one object with the same).
+//!   characters of its assistant text (with `--json`, one object with the same on stdout;
+//!   everything else then goes to stderr).
 
 use std::io::{IsTerminal as _, Write as _};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::Duration;
 
 use anyhow::Context as _;
 use clap::Args as ClapArgs;
 use serde_json::json;
 use tautly_core::bisect::{
-    self, BashRunner, BisectError, BisectOutcome, BisectPlan, CancellationToken, Decision,
+    self, BashRunner, BisectError, BisectOutcome, BisectPlan, CancellationToken, Decision, Endpoint,
 };
-use tautly_core::{Config, SessionReader, SessionRecord, printable, provider_key_vars};
+use tautly_core::{
+    Config, SessionReader, SessionRecord, printable, printable_multiline, provider_key_vars,
+};
+use tokio::signal::unix::{Signal, SignalKind, signal};
 
 use super::Env;
 use crate::Cli;
@@ -57,7 +67,28 @@ pub struct Args {
     json: bool,
 }
 
+/// Where what is not the result goes: stderr with `--json` (stdout is the result only),
+/// else stdout.
+struct Say {
+    json: bool,
+}
+
+impl Say {
+    fn out(&self, text: &str) -> std::io::Result<()> {
+        if self.json {
+            let mut err = std::io::stderr();
+            err.write_all(text.as_bytes())?;
+            err.flush()
+        } else {
+            let mut out = std::io::stdout();
+            out.write_all(text.as_bytes())?;
+            out.flush()
+        }
+    }
+}
+
 pub async fn run(args: Args, env: &Env, cli: &Cli) -> anyhow::Result<i32> {
+    let say = Say { json: args.json };
     let session = env.find_session(&args.session)?;
     let (log, test, good, bad) = (session.path.clone(), args.test.clone(), args.good, args.bad);
     let plan = tokio::task::spawn_blocking(move || -> anyhow::Result<BisectPlan> {
@@ -79,29 +110,26 @@ pub async fn run(args: Args, env: &Env, cli: &Cli) -> anyhow::Result<i32> {
         Decision::Ask { reason } => Some(reason),
         Decision::Allow => None,
     };
-    let said = summary(&plan, args.timeout, ask.as_deref());
-    // With --json, stdout is the result only.
-    if args.json {
-        eprint!("{said}");
-    } else {
-        print!("{said}");
-    }
+    say.out(&summary(&plan, args.timeout, ask.as_deref()))?;
     if !args.yes {
         if !std::io::stdin().is_terminal() {
-            println!("nothing was run: run it again with --yes to run the check");
+            say.out("nothing was run: run it again with --yes to run the check\n")?;
             return Ok(1);
         }
-        print!("run it? [y/N] ");
-        std::io::stdout().flush()?;
+        say.out("run it? [y/N] ")?;
         let mut answer = String::new();
         std::io::stdin().read_line(&mut answer)?;
         if !matches!(answer.trim(), "y" | "Y" | "yes") {
-            println!("nothing was run");
+            say.out("nothing was run\n")?;
             return Ok(1);
         }
     }
     let cancel = CancellationToken::new();
-    let watcher = tokio::spawn(cancel_on_signal(cancel.clone()));
+    let caught = Arc::new(AtomicI32::new(0));
+    // Watched from here on, so no signal can end the process with a check still running
+    // and the worktree still registered.
+    let signals = Signals::new()?;
+    let watcher = tokio::spawn(signals.cancel(cancel.clone(), Arc::clone(&caught)));
     let runner = BashRunner::new(provider_key_vars(&config), cancel);
     let done = bisect::run(
         &plan,
@@ -113,6 +141,9 @@ pub async fn run(args: Args, env: &Env, cli: &Cli) -> anyhow::Result<i32> {
     watcher.abort();
     match done {
         Ok(out) => {
+            for note in &out.notes {
+                say.out(&format!("note: {}\n", printable(note)))?;
+            }
             if args.json {
                 println!("{}", as_json(&plan, &out));
             } else {
@@ -122,43 +153,74 @@ pub async fn run(args: Args, env: &Env, cli: &Cli) -> anyhow::Result<i32> {
         }
         Err(e @ BisectError::EndpointMismatch { .. }) => {
             eprintln!("tautly: {}", printable(&e.to_string()));
+            if let BisectError::EndpointMismatch {
+                output: Some(output),
+                ..
+            } = &e
+                && !output.is_empty()
+            {
+                eprintln!("the last lines of that run's output:");
+                eprintln!("{}", printable_multiline(output));
+            }
             Ok(2)
         }
         Err(BisectError::Cancelled) => {
             eprintln!("tautly: bisect cancelled; its worktree was removed");
-            Ok(130)
+            Ok(128 + caught.load(Ordering::SeqCst).max(0))
         }
         Err(e) => Err(e.into()),
     }
 }
 
-/// Cancel `cancel` on Ctrl-C or SIGTERM.
-async fn cancel_on_signal(cancel: CancellationToken) {
-    use tokio::signal::unix::{SignalKind, signal};
-    let mut term = signal(SignalKind::terminate()).ok();
-    let terminated = async {
-        match term.as_mut() {
-            Some(t) => {
-                t.recv().await;
-            }
-            None => std::future::pending().await,
-        }
-    };
-    tokio::select! {
-        _ = tokio::signal::ctrl_c() => {}
-        () = terminated => {}
+const SIGHUP: i32 = 1;
+const SIGINT: i32 = 2;
+const SIGTERM: i32 = 15;
+
+/// Ctrl-C, SIGTERM and SIGHUP, watched from when this is made.
+struct Signals {
+    int: Signal,
+    term: Signal,
+    hup: Signal,
+}
+
+impl Signals {
+    fn new() -> std::io::Result<Signals> {
+        Ok(Signals {
+            int: signal(SignalKind::interrupt())?,
+            term: signal(SignalKind::terminate())?,
+            hup: signal(SignalKind::hangup())?,
+        })
     }
-    cancel.cancel();
+
+    /// On the first of them: keep its number in `caught`, then cancel `cancel`.
+    async fn cancel(mut self, cancel: CancellationToken, caught: Arc<AtomicI32>) {
+        let n = tokio::select! {
+            Some(()) = self.int.recv() => SIGINT,
+            Some(()) = self.term.recv() => SIGTERM,
+            Some(()) = self.hup.recv() => SIGHUP,
+            else => return,
+        };
+        caught.store(n, Ordering::SeqCst);
+        cancel.cancel();
+    }
 }
 
 /// What will run, before it does.
 fn summary(plan: &BisectPlan, timeout: u64, ask: Option<&str>) -> String {
+    let from = |e: Endpoint| match e {
+        Endpoint::Given => "",
+        Endpoint::Default => ", the default",
+        Endpoint::Logged => ", from the session's logged runs of the command",
+    };
     let mut s = format!(
-        "bisect session {}: `{}` on steps {} (good) to {} (bad), {} step{} between\n",
+        "bisect session {}: `{}` from step {} (good{}) to step {} (bad{}), {} step{} \
+         between\n",
         printable(&plan.session),
         printable(&plan.test),
         plan.good,
+        from(plan.good_from),
         plan.bad,
+        from(plan.bad_from),
         plan.candidates.len(),
         if plan.candidates.len() == 1 { "" } else { "s" },
     );
@@ -170,10 +232,14 @@ fn summary(plan: &BisectPlan, timeout: u64, ask: Option<&str>) -> String {
     }
     s.push_str(&format!(
         "  at most {} runs (about {} without skips), each at most {timeout}s, in a \
-         temporary worktree; this work tree is not touched\n",
+         temporary worktree\n",
         plan.max_runs(),
         plan.expected_runs()
     ));
+    s.push_str(
+        "  tautly writes nothing in this work tree, but the check is not confined (no OS \
+         isolation): it runs the files of past states, which can write anywhere you can\n",
+    );
     if let Some(reason) = ask {
         s.push_str(&format!(
             "  the policy asks before this command: {}\n",
@@ -238,5 +304,6 @@ fn as_json(plan: &BisectPlan, out: &BisectOutcome) -> serde_json::Value {
         "skipped": out.skipped,
         "last_good": out.last_good,
         "uncertain": out.uncertain,
+        "notes": out.notes,
     })
 }

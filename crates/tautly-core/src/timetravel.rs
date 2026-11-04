@@ -316,7 +316,67 @@ pub(crate) fn befores(rec: &SessionRecord) -> Vec<(RelPath, Option<BlobRef>)> {
 /// reverted; see the module docs for when it is partial. A step past the log's last is
 /// [`TtError::NoSuchStep`]. Blocking I/O (the log).
 pub fn state_at(reader: &SessionReader<SessionRecord>, at: u32) -> Result<FileState, TtError> {
-    let w = walk(reader)?;
+    Boundaries::new(reader)?.state(at, true)
+}
+
+/// A log walked once, for the files at many of its step boundaries ([`state_at`] per
+/// boundary would read the whole log each time; a bisect plans over every boundary).
+pub(crate) struct Boundaries {
+    w: Walked,
+    log: PathBuf,
+    /// Each step's last record (an index into the records).
+    last_of: std::collections::HashMap<u32, usize>,
+    /// Each user turn's first `turn_end` checkpoint (an index into the records).
+    first_turn_end: std::collections::HashMap<u32, usize>,
+}
+
+impl Boundaries {
+    /// Read the log once. Blocking I/O.
+    pub(crate) fn new(reader: &SessionReader<SessionRecord>) -> Result<Boundaries, TtError> {
+        let w = walk(reader)?;
+        let mut last_of = std::collections::HashMap::new();
+        let mut first_turn_end = std::collections::HashMap::new();
+        for (i, (owner, (_, rec))) in w.owner.iter().zip(&w.recs).enumerate() {
+            if let Some((s, _)) = owner {
+                last_of.insert(*s, i);
+            }
+            if let SessionRecord::Checkpoint {
+                point: Some(CheckpointPoint::TurnEnd),
+                turn,
+                ..
+            } = rec
+            {
+                first_turn_end.entry(*turn).or_insert(i);
+            }
+        }
+        Ok(Boundaries {
+            w,
+            log: reader.path().to_path_buf(),
+            last_of,
+            first_turn_end,
+        })
+    }
+
+    /// The log's last step.
+    pub(crate) fn last_step(&self) -> u32 {
+        self.w.last_step
+    }
+
+    /// The log's records, with their offsets.
+    pub(crate) fn records(&self) -> &[(u64, SessionRecord)] {
+        &self.w.recs
+    }
+
+    /// [`state_at`] of step `at`. Without `later`, the state leaves out what tools wrote
+    /// after its checkpoint, which only an in-place materialize needs (for ignored files)
+    /// and which reads the rest of the log.
+    pub(crate) fn state(&self, at: u32, later: bool) -> Result<FileState, TtError> {
+        state_in(self, at, later)
+    }
+}
+
+fn state_in(b: &Boundaries, at: u32, later: bool) -> Result<FileState, TtError> {
+    let w = &b.w;
     let no_step = || TtError::NoSuchStep {
         at,
         last: w.last_step,
@@ -324,27 +384,15 @@ pub fn state_at(reader: &SessionReader<SessionRecord>, at: u32) -> Result<FileSt
     if at > w.last_step {
         return Err(no_step());
     }
-    let mut state = FileState::new(reader.path());
+    let mut state = FileState::new(&b.log);
     let (start, turn) = if at == 0 {
         (0, None)
     } else {
-        let last = w
-            .owner
-            .iter()
-            .rposition(|o| o.is_some_and(|(s, _)| s == at))
-            .ok_or_else(no_step)?;
+        let last = *b.last_of.get(&at).ok_or_else(no_step)?;
         state.after = Some(w.recs[last].0);
         (last + 1, w.owner[last].map(|(_, t)| t))
     };
-    let turn_end_seen = turn.is_some_and(|t| {
-        w.recs[..start].iter().any(|(_, r)| {
-            matches!(r, SessionRecord::Checkpoint {
-                point: Some(CheckpointPoint::TurnEnd),
-                turn,
-                ..
-            } if *turn == t)
-        })
-    });
+    let turn_end_seen = turn.is_some_and(|t| b.first_turn_end.get(&t).is_some_and(|&i| i < start));
     let mut reverts = Vec::new();
     let (mut skipped, mut lost) = (false, false);
     let mut chosen = None;
@@ -396,12 +444,14 @@ pub fn state_at(reader: &SessionReader<SessionRecord>, at: u32) -> Result<FileSt
     }
     state.base = Some(commit.clone());
     state.partial = (!notes.is_empty()).then(|| notes.join("; "));
-    state.later = earliest(
-        w.recs[i + 1..]
-            .iter()
-            .flat_map(|(_, r)| befores(r))
-            .collect(),
-    );
+    if later {
+        state.later = earliest(
+            w.recs[i + 1..]
+                .iter()
+                .flat_map(|(_, r)| befores(r))
+                .collect(),
+        );
+    }
     Ok(state)
 }
 

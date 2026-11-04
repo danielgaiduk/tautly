@@ -186,7 +186,22 @@ fn asks_unless_yes() {
     assert!(said.contains("./check.sh"), "{said}");
     assert!(said.contains("at most 5 runs"), "{said}");
     assert!(said.contains("--yes"), "{said}");
+    // The default mode asks before commands: the summary says the policy would ask.
+    assert!(
+        said.contains("the policy asks before this command"),
+        "{said}"
+    );
+    // It does not claim the check is confined.
+    assert!(said.contains("the check is not confined"), "{said}");
     assert!(s.worktrees().is_empty(), "{:?}", s.worktrees());
+
+    // With --json, stdout stays empty when nothing ran: the summary and the refusal go to
+    // stderr.
+    let out = s.run(&["bisect", &id, "--test", "./check.sh", "--json"]);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    assert_eq!(stdout(&out), "");
+    assert!(stderr(&out).contains("at most 5 runs"), "{}", stderr(&out));
+    assert!(stderr(&out).contains("--yes"), "{}", stderr(&out));
 
     // With --yes it runs, and names the step, its turn and its calls.
     let out = s.run(&["bisect", &id, "--test", "./check.sh", "--yes"]);
@@ -223,8 +238,26 @@ fn endpoint_mismatch_exits_2() {
     let out = s.run(&["bisect", &id, "--test", "./check.sh", "--yes"]);
     assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
     let said = stderr(&out);
-    assert!(said.contains("step 4"), "{said}");
+    assert!(said.contains("step 4 (bad step, the default)"), "{said}");
+    assert!(said.contains("--good and --bad"), "{said}");
     assert!(s.worktrees().is_empty(), "{:?}", s.worktrees());
+    // The run's last lines are shown.
+    let out = s.run(&[
+        "bisect",
+        &id,
+        "--test",
+        "echo checking; echo it broke >&2; exit 3",
+        "--yes",
+    ]);
+    assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+    let said = stderr(&out);
+    assert!(said.contains("step 0 (good step, the default)"), "{said}");
+    assert!(
+        said.contains("the last lines of that run's output"),
+        "{said}"
+    );
+    assert!(said.contains("it broke"), "{said}");
+    assert!(said.contains("exit code: 3"), "{said}");
     // A range that does not exist is an error too (exit 1).
     let out = s.run(&[
         "bisect",
@@ -251,4 +284,76 @@ fn deny_rule_refuses() {
     let said = stderr(&out);
     assert!(said.contains("bash(./check.sh*)"), "{said}");
     assert!(s.worktrees().is_empty(), "{:?}", s.worktrees());
+}
+
+/// Whether process `pid` exists (a zombie counts).
+fn alive(pid: i32) -> bool {
+    // SAFETY: signal 0 only checks that the process exists.
+    unsafe { libc::kill(pid, 0) == 0 }
+}
+
+#[test]
+fn signals_kill_the_check_and_clean_up() {
+    for (sig, code) in [
+        (libc::SIGHUP, 129),
+        (libc::SIGTERM, 143),
+        (libc::SIGINT, 130),
+    ] {
+        let s = Scratch::new();
+        let id = s.session(true);
+        let pid_file = s.home.path().join("check.pid");
+        // The check records its pid, then waits far longer than the test.
+        let test = format!("echo $$ > '{}'; exec sleep 40", pid_file.display());
+        let mut child = s
+            .command(&["bisect", &id, "--test", &test, "--yes"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let started = std::time::Instant::now();
+        let pid = loop {
+            if let Some(pid) = std::fs::read_to_string(&pid_file)
+                .ok()
+                .and_then(|t| t.trim().parse::<i32>().ok())
+            {
+                break pid;
+            }
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(30),
+                "the check never started"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        };
+        assert!(alive(pid));
+        assert!(!s.worktrees().is_empty(), "the check runs in its worktree");
+        // SAFETY: a signal to the child this test started.
+        unsafe { libc::kill(i32::try_from(child.id()).unwrap(), sig) };
+        let waited = std::time::Instant::now();
+        while child.try_wait().unwrap().is_none() {
+            if waited.elapsed() > std::time::Duration::from_secs(20) {
+                let _ = child.kill();
+                panic!("tautly did not stop after signal {sig}");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let out = child.wait_with_output().unwrap();
+        assert_eq!(
+            out.status.code(),
+            Some(code),
+            "signal {sig}: {}",
+            stderr(&out)
+        );
+        assert!(stderr(&out).contains("cancelled"), "{}", stderr(&out));
+        // The check is gone, and so is everything the bisect made.
+        let gone = std::time::Instant::now();
+        while alive(pid) && gone.elapsed() < std::time::Duration::from_secs(5) {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(!alive(pid), "signal {sig}: the check survived");
+        assert!(
+            s.worktrees().is_empty(),
+            "signal {sig}: {:?}",
+            s.worktrees()
+        );
+    }
 }

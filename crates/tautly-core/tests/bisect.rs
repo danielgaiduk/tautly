@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use serde_json::{Value, json};
-use tautly_core::bisect::{self, BashRunner, BisectError, TestRunner, Verdict};
+use tautly_core::bisect::{self, BashRunner, BisectError, Endpoint, TestRunner, Verdict};
 use tautly_core::{Command, Config, EngineBuilder, Event, SessionRecord};
 use tautly_provider::{Catalog, MockProvider, MockTurn, ModelId, ProviderEvent, StopReason};
 use tautly_sandbox::{LocalSandbox, Mode};
@@ -586,7 +586,9 @@ async fn endpoint_mismatch_exits_2() {
             BisectError::EndpointMismatch {
                 step: 0,
                 expected: Verdict::Good,
-                got: Verdict::Bad
+                got: Verdict::Bad,
+                from: Endpoint::Default,
+                ..
             }
         ),
         "{e:?}"
@@ -600,11 +602,54 @@ async fn endpoint_mismatch_exits_2() {
             BisectError::EndpointMismatch {
                 step: 5,
                 expected: Verdict::Bad,
-                got: Verdict::Good
+                got: Verdict::Good,
+                from: Endpoint::Default,
+                ..
             }
         ),
         "{e:?}"
     );
+    // The error names the endpoint's origin and carries the run's last lines.
+    let runner = BashRunner::new(Vec::new(), CancellationToken::new());
+    let mut noisy = plan.clone();
+    noisy.test = "for i in 1 2 3 4 5 6 7 8 9 10 11 12; do echo line $i; done; echo boom; \
+                  exit 1"
+        .into();
+    let e = bisect::run(&noisy, &repo.sandbox(), &runner, TIMEOUT)
+        .await
+        .unwrap_err();
+    assert!(
+        e.to_string().contains("step 0 (good step, the default)"),
+        "{e}"
+    );
+    let BisectError::EndpointMismatch {
+        output: Some(output),
+        ..
+    } = &e
+    else {
+        panic!("{e:?}")
+    };
+    assert!(output.contains("boom"), "{output}");
+    assert!(output.contains("exit code: 1"), "{output}");
+    assert!(
+        !output.contains("line 1\n"),
+        "only the last lines: {output}"
+    );
+    // A check that is not there fails (exit 127), and the output says why.
+    let mut absent = plan.clone();
+    absent.test = "./no-such-check.sh".into();
+    let e = bisect::run(&absent, &repo.sandbox(), &runner, TIMEOUT)
+        .await
+        .unwrap_err();
+    let BisectError::EndpointMismatch {
+        got: Verdict::Bad,
+        output: Some(output),
+        ..
+    } = &e
+    else {
+        panic!("{e:?}")
+    };
+    assert!(output.contains("no-such-check.sh"), "{output}");
     repo.assert_no_leftovers();
 }
 
@@ -726,26 +771,223 @@ async fn worktree_removed_on_success_and_error() {
     assert_eq!(probe.runs.lock().unwrap().len(), 1);
     repo.assert_no_leftovers();
 
-    // What a crashed bisect left (a worktree no live bisect holds) goes at the next one.
-    let project = reader(&log).header().project.clone();
-    let stale = repo
+    // A panicking runner: the worktree goes too, and the panic goes on.
+    struct Panics;
+    #[async_trait]
+    impl TestRunner for Panics {
+        async fn run(&self, _: &Path, _: &str, _: Duration) -> Verdict {
+            panic!("the runner broke");
+        }
+    }
+    let (sb, p) = (repo.sandbox(), plan.clone());
+    let joined = tokio::spawn(async move { bisect::run(&p, &sb, &Panics, TIMEOUT).await }).await;
+    assert!(joined.unwrap_err().is_panic());
+    repo.assert_no_leftovers();
+
+    // What a crashed bisect left (its marked worktree, its lock nobody holds) goes at the
+    // next one.
+    let base = repo
         .home()
         .join("worktrees")
-        .join(&project)
-        .join("bisect-01STALE");
-    std::fs::create_dir_all(stale.parent().unwrap()).unwrap();
+        .join(reader(&log).header().project.clone());
+    let crashed = crashed_bisect(&repo, &base, "01JBXZ3QK8R9T0V5W6X7Y8Z9AB");
+    std::fs::write(crashed.join("junk.txt"), "x").unwrap();
+    assert_eq!(repo.leftovers().0.len(), 1);
+    let out = bisect::run(&plan, &repo.sandbox(), &Probe::default(), TIMEOUT).await;
+    assert!(out.is_ok(), "{out:?}");
+    repo.assert_no_leftovers();
+
+    // An orphaned lock (a crash before the worktree was made) and a marked entry whose
+    // directory is already gone go too.
+    std::fs::write(base.join("bisect-01JBXZ3QK8R9T0V5W6X7Y8Z9AC.lock"), "").unwrap();
+    let gone = crashed_bisect(&repo, &base, "01JBXZ3QK8R9T0V5W6X7Y8Z9AD");
+    std::fs::remove_dir_all(&gone).unwrap();
+    assert_eq!(repo.leftovers().0.len(), 1);
+    let out = bisect::run(&plan, &repo.sandbox(), &Probe::default(), TIMEOUT).await;
+    assert!(out.is_ok(), "{out:?}");
+    repo.assert_no_leftovers();
+}
+
+/// What a bisect that crashed mid-run leaves under `base`: its worktree `bisect-<ulid>`
+/// (with the marker in its administrative directory) and its lock file, held by nobody.
+fn crashed_bisect(repo: &Repo, base: &Path, ulid: &str) -> PathBuf {
+    let dir = base.join(format!("bisect-{ulid}"));
+    std::fs::create_dir_all(base).unwrap();
+    std::fs::write(base.join(format!("bisect-{ulid}.lock")), "").unwrap();
     repo.git(&[
         "worktree",
         "add",
         "-q",
         "--detach",
-        stale.to_str().unwrap(),
+        dir.to_str().unwrap(),
         "HEAD",
     ])
     .unwrap();
-    std::fs::write(stale.join("junk.txt"), "x").unwrap();
-    assert_eq!(repo.leftovers().0.len(), 1);
+    let admin = std::fs::read_to_string(dir.join(".git")).unwrap();
+    let admin = PathBuf::from(admin.trim().strip_prefix("gitdir: ").unwrap());
+    std::fs::write(admin.join(bisect::MARKER), "").unwrap();
+    dir
+}
+
+#[tokio::test]
+async fn sweep_leaves_worktrees_it_did_not_make() {
+    let repo = Repo::new();
+    let log = repo.session(edit_breaks_at_3()).await;
+    let plan = bisect::plan(&reader(&log), "./check.sh", None, None).unwrap();
+    let base = repo
+        .home()
+        .join("worktrees")
+        .join(reader(&log).header().project.clone());
+    std::fs::create_dir_all(&base).unwrap();
+
+    // The user's own worktree named like a bisect's, with work in it.
+    let mine = base.join("bisect-mine");
+    repo.git(&[
+        "worktree",
+        "add",
+        "-q",
+        "--detach",
+        mine.to_str().unwrap(),
+        "HEAD",
+    ])
+    .unwrap();
+    std::fs::write(mine.join("work.txt"), "mine").unwrap();
+    // A fork (Task 50) placed there with --dir, with work in it.
+    let fork = tautly_core::worktree::fork_to_worktree(
+        Arc::new(repo.sandbox()),
+        &repo.home(),
+        &log,
+        tautly_core::worktree::ForkRequest {
+            at: Some(2),
+            dir: Some(base.join("bisect-fork")),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    std::fs::write(fork.worktree.join("work.txt"), "fork").unwrap();
+    // A worktree with a bisect's name and a lock nobody holds, but no marker: not
+    // provably a bisect's, so it stays with its lock.
+    let unmarked = base.join("bisect-01JBXZ3QK8R9T0V5W6X7Y8Z9AE");
+    std::fs::write(base.join("bisect-01JBXZ3QK8R9T0V5W6X7Y8Z9AE.lock"), "").unwrap();
+    repo.git(&[
+        "worktree",
+        "add",
+        "-q",
+        "--detach",
+        unmarked.to_str().unwrap(),
+        "HEAD",
+    ])
+    .unwrap();
+    // A marked bisect worktree whose lock is held: a live bisect's.
+    let live = crashed_bisect(&repo, &base, "01JBXZ3QK8R9T0V5W6X7Y8Z9AF");
+    let held = std::fs::OpenOptions::new()
+        .write(true)
+        .open(base.join("bisect-01JBXZ3QK8R9T0V5W6X7Y8Z9AF.lock"))
+        .unwrap();
+    // SAFETY: flock on a descriptor this test owns.
+    assert_eq!(
+        unsafe { libc::flock(std::os::fd::AsRawFd::as_raw_fd(&held), libc::LOCK_EX) },
+        0
+    );
+
     let out = bisect::run(&plan, &repo.sandbox(), &Probe::default(), TIMEOUT).await;
     assert!(out.is_ok(), "{out:?}");
+
+    assert_eq!(
+        std::fs::read_to_string(mine.join("work.txt")).unwrap(),
+        "mine"
+    );
+    assert_eq!(
+        std::fs::read_to_string(fork.worktree.join("work.txt")).unwrap(),
+        "fork"
+    );
+    assert!(unmarked.join(".git").exists());
+    assert!(base.join("bisect-01JBXZ3QK8R9T0V5W6X7Y8Z9AE.lock").exists());
+    assert!(live.join(".git").exists());
+    // Git still knows all four.
+    assert_eq!(repo.leftovers().0.len(), 4, "{:?}", repo.leftovers());
+    drop(held);
+}
+
+#[tokio::test]
+async fn a_logged_endpoint_that_does_not_hold_falls_back() {
+    let repo = Repo::new();
+    // As in the pre-pass test: logged runs pass at boundary 3 and fail at 5.
+    let log = repo
+        .session(vec![
+            tools_step(vec![write("w1", "p.txt", "p\n")]),
+            tools_step(vec![write("w2", "q.txt", "q\n")]),
+            tools_step(vec![bash("b1", "./check.sh")]),
+            tools_step(vec![write("w3", "a.txt", "bad\n")]),
+            tools_step(vec![bash("b2", "./check.sh")]),
+            tools_step(vec![write("w4", "r.txt", "r\n")]),
+            text_step("done"),
+        ])
+        .await;
+    let plan = bisect::plan(&reader(&log), "./check.sh", None, None).unwrap();
+    assert_eq!((plan.good, plan.bad), (3, 5));
+    assert_eq!(
+        (plan.good_from, plan.bad_from),
+        (Endpoint::Logged, Endpoint::Logged)
+    );
+    // At most every exact boundary from the defaults, each once.
+    assert_eq!(plan.max_runs(), 9);
+    // Now the check also fails once q.txt is there (step 3): the logged good step 3 does
+    // not hold, and the default 0 is used.
+    struct Strict;
+    #[async_trait]
+    impl TestRunner for Strict {
+        async fn run(&self, dir: &Path, _: &str, _: Duration) -> Verdict {
+            let a = std::fs::read_to_string(dir.join("a.txt")).unwrap();
+            if a.contains("bad") || dir.join("q.txt").exists() {
+                Verdict::Bad
+            } else {
+                Verdict::Good
+            }
+        }
+    }
+    let out = bisect::run(&plan, &repo.sandbox(), &Strict, TIMEOUT)
+        .await
+        .unwrap();
+    assert_eq!(out.first_bad, Some(3));
+    assert_eq!(out.last_good, 2);
+    assert_eq!(out.notes.len(), 1, "{:?}", out.notes);
+    assert!(out.notes[0].contains("good step 3"), "{:?}", out.notes);
+    assert!(out.notes[0].contains("step 0"), "{:?}", out.notes);
     repo.assert_no_leftovers();
+}
+
+#[tokio::test]
+async fn a_checkpoint_without_a_known_point_is_partial() {
+    for point in [Value::Null, json!("from_a_newer_version")] {
+        let repo = Repo::new();
+        let log = repo.session(edit_breaks_at_3()).await;
+        // The turn's end checkpoint, as a build without `point` (or a newer one) wrote it.
+        let text = std::fs::read_to_string(&log).unwrap();
+        let mut lines: Vec<Value> = text
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        let end = lines
+            .iter_mut()
+            .rev()
+            .find(|l| l["data"]["type"] == "checkpoint")
+            .unwrap();
+        assert_eq!(end["data"]["data"]["point"], "turn_end");
+        end["data"]["data"]["point"] = point.clone();
+        let out: String = lines.iter().map(|l| format!("{l}\n")).collect();
+        std::fs::write(&log, out).unwrap();
+        // Every boundary after step 1 reads that checkpoint: the tip is partial.
+        let e = bisect::plan(&reader(&log), "./check.sh", None, None).unwrap_err();
+        assert!(
+            matches!(e, BisectError::Partial { step: 5, .. }),
+            "{point}: {e:?}"
+        );
+        let e = bisect::plan(&reader(&log), "./check.sh", Some(0), Some(2)).unwrap_err();
+        assert!(
+            matches!(e, BisectError::Partial { step: 2, .. }),
+            "{point}: {e:?}"
+        );
+    }
 }
