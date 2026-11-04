@@ -94,28 +94,28 @@ fn diff_content_has_old_and_new_text_up_to_256_kb() {
 fn titles_name_the_target() {
     assert_eq!(
         tool_title("read", &json!({"path": "src/a.rs"})),
-        "read: src/a.rs"
+        "read: `src/a.rs`"
     );
     assert_eq!(
         tool_title("bash", &json!({"command": "cargo test\necho done"})),
-        "bash: cargo test"
+        "bash: `cargo test`"
     );
     assert_eq!(
         tool_title("grep", &json!({"pattern": "fn main"})),
-        "grep: fn main"
+        "grep: `fn main`"
     );
     assert_eq!(
         tool_title("web_fetch", &json!({"url": "https://example.com"})),
-        "web_fetch: https://example.com"
+        "web_fetch: `https://example.com`"
     );
     assert_eq!(
         tool_title("recall", &json!({"query": "auth"})),
-        "recall: auth"
+        "recall: `auth`"
     );
     assert_eq!(tool_title("state", &json!({})), "state");
     let long = tool_title("bash", &json!({"command": "x".repeat(200)}));
-    assert!(long.chars().count() <= "bash: ".len() + 81, "{long}");
-    assert!(long.ends_with('…'));
+    assert!(long.chars().count() <= "bash: ``".len() + 81, "{long}");
+    assert!(long.ends_with("…`"));
 }
 
 #[test]
@@ -332,7 +332,7 @@ fn fenced_and_single_line_escape_and_cannot_be_closed_early() {
     // Titles are single lines.
     assert_eq!(
         tool_title("bash", &json!({"command": "x\u{1b}[2K\ry"})),
-        r"bash: x\u{1b}[2K\ry"
+        r"bash: `x\u{1b}[2K\ry`"
     );
     // Diff texts keep lines and tabs, escape the rest.
     let Some(ToolCallContent::Diff { new_text, .. }) =
@@ -424,4 +424,41 @@ fn only_an_object_advertises_notices() {
         assert!(!init(json!({"session": {"notices": no}})).notices(), "{no}");
     }
     assert!(!init(json!({})).notices());
+}
+
+// --- re-review fixes (Task 46 fix round 2) ---
+
+/// N2: a title's target is an inline code span longer than any backtick run in it, so
+/// markdown in it (a comment, a link, emphasis, backticks) shows literally.
+#[test]
+fn title_targets_are_markdown_safe_code_spans() {
+    assert_eq!(
+        tool_title(
+            "bash",
+            &json!({"command": "ls <!-- ; rm -rf ~ --> [ok](x) `a`"})
+        ),
+        "bash: `` ls <!-- ; rm -rf ~ --> [ok](x) `a` ``"
+    );
+    assert_eq!(
+        tool_title("bash", &json!({"command": "`x`"})),
+        "bash: `` `x` ``"
+    );
+    assert_eq!(
+        tool_title("bash", &json!({"command": "a ``` b"})),
+        "bash: ````a ``` b````"
+    );
+}
+
+/// N3: long runs of spaces or tabs in approval text show as a marker.
+#[test]
+fn approval_text_marks_long_blank_runs() {
+    let cmd = format!("echo safe{}; rm -rf ~", " ".repeat(200));
+    let t = map::approval_text(&cmd);
+    assert!(t.contains("echo safe␠×200; rm -rf ~"), "{t}");
+    let t = map::approval_text(&format!("a{}b        c", "\t".repeat(9)));
+    assert!(t.contains("a⇥×9b        c"), "eight or fewer stay: {t}");
+    assert!(
+        map::call_text("bash", &json!({"command": cmd})).contains("␠×200"),
+        "commands in approvals"
+    );
 }

@@ -1321,7 +1321,7 @@ async fn ask_tool(
             Some((truncated, text)) => (!truncated)
                 .then(|| map::preview_diffs(&root, &text))
                 .flatten()
-                .unwrap_or_else(|| vec![ToolCallContent::text(map::fenced(&text))]),
+                .unwrap_or_else(|| vec![ToolCallContent::text(map::approval_text(&text))]),
             // No diff: the whole call, every line of a command, escaped and fenced.
             None => vec![ToolCallContent::text(map::call_text(&t, &a))],
         };
@@ -1588,7 +1588,9 @@ async fn ask_undo(conn: &Conn, s: &Session, turn: u32, list: String) {
         tool_call_id: format!("undo:{turn}"),
         title: Some(format!("Undo turn {turn}")),
         kind: Some(crate::schema::ToolKind::Edit),
-        content: Some(vec![ToolCallContent::text(map::fenced(list.trim_start()))]),
+        content: Some(vec![ToolCallContent::text(map::approval_text(
+            list.trim_start(),
+        ))]),
         ..ToolCallUpdate::default()
     };
     let params = json!({

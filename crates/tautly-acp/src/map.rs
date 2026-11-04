@@ -83,14 +83,34 @@ const TARGET_KEYS: &[&str] = &[
     "path", "command", "pattern", "url", "query", "name", "title", "text",
 ];
 
-/// `<tool>: <target>`, the target being the call's path, command, pattern, URL or query
-/// (first line, at most 80 characters); just the tool when it has none. Escaped as a
-/// single line ([`single_line`]).
+/// ``<tool>: `<target>` ``, the target being the call's path, command, pattern, URL or
+/// query (first line, at most 80 characters); just the tool when it has none. Escaped as
+/// a single line ([`single_line`]), and the target in an inline code span with more
+/// backticks than any run in it, so a client that renders titles as markdown shows it
+/// literally (no comment, link or emphasis syntax in it takes effect).
 pub fn tool_title(tool: &str, args: &Value) -> String {
-    printable(&raw_title(tool, args))
+    let tool = printable(tool);
+    match title_target(args) {
+        None => tool,
+        Some(t) => format!("{tool}: {}", code_span(&printable(&t))),
+    }
 }
 
-fn raw_title(tool: &str, args: &Value) -> String {
+/// `text` (one line) as an inline code span.
+fn code_span(text: &str) -> String {
+    let fence = "`".repeat(longest_backtick_run(text) + 1);
+    // A span that starts or ends with a backtick needs a space inside each end (which
+    // CommonMark strips).
+    let pad = if text.starts_with('`') || text.ends_with('`') {
+        " "
+    } else {
+        ""
+    };
+    format!("{fence}{pad}{text}{pad}{fence}")
+}
+
+/// The first line of the call's target argument, cut to [`MAX_TITLE_TARGET`] characters.
+fn title_target(args: &Value) -> Option<String> {
     let target = TARGET_KEYS
         .iter()
         .find_map(|k| args.get(*k).and_then(Value::as_str))
@@ -100,15 +120,13 @@ fn raw_title(tool: &str, args: &Value) -> String {
                 .unwrap_or("")
                 .trim()
         })
-        .filter(|t| !t.is_empty());
-    match target {
-        None => tool.to_string(),
-        Some(t) if t.chars().count() > MAX_TITLE_TARGET => {
-            let cut: String = t.chars().take(MAX_TITLE_TARGET).collect();
-            format!("{tool}: {cut}…")
-        }
-        Some(t) => format!("{tool}: {t}"),
-    }
+        .filter(|t| !t.is_empty())?;
+    Some(if target.chars().count() > MAX_TITLE_TARGET {
+        let cut: String = target.chars().take(MAX_TITLE_TARGET).collect();
+        format!("{cut}…")
+    } else {
+        target.to_string()
+    })
 }
 
 /// The files a call names (its `path` argument), absolute under `root`.
@@ -142,12 +160,44 @@ pub fn output_content(output: &str) -> ToolCallContent {
 }
 
 /// What an approval shows of a call that has no diff: the whole command (every line) or
-/// the arguments as JSON, escaped and fenced.
+/// the arguments as JSON, as [`approval_text`].
 pub fn call_text(tool: &str, args: &Value) -> String {
     match args.get("command").and_then(Value::as_str) {
-        Some(c) if tool == "bash" => fenced(c),
-        _ => fenced(&serde_json::to_string_pretty(args).unwrap_or_default()),
+        Some(c) if tool == "bash" => approval_text(c),
+        _ => approval_text(&serde_json::to_string_pretty(args).unwrap_or_default()),
     }
+}
+
+/// Runs of spaces or tabs longer than this show as a marker in approval text.
+pub const MAX_BLANK_RUN: usize = 8;
+
+/// Text the user approves (a command, a launch line, a memory body), [`fenced`], with
+/// each run of more than [`MAX_BLANK_RUN`] spaces or tabs shown as `␠×N` / `⇥×N`, so
+/// padding cannot push the rest of a line out of view in a client that does not wrap.
+pub fn approval_text(text: &str) -> String {
+    fenced(&mark_blank_runs(text))
+}
+
+fn mark_blank_runs(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != ' ' && c != '\t' {
+            out.push(c);
+            continue;
+        }
+        let mut n = 1;
+        while chars.peek() == Some(&c) {
+            chars.next();
+            n += 1;
+        }
+        if n > MAX_BLANK_RUN {
+            out.push_str(&format!("{}×{n}", if c == ' ' { '␠' } else { '⇥' }));
+        } else {
+            (0..n).for_each(|_| out.push(c));
+        }
+    }
+    out
 }
 
 /// The text of a user message from prompt blocks: text blocks joined, embedded text

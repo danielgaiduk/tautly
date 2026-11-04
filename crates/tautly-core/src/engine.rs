@@ -669,7 +669,10 @@ impl Actor {
                                         break;
                                     }
                                 }
-                                None => self.lost(),
+                                None => {
+                                    self.lost();
+                                    self.switch_refused(&model);
+                                }
                             }
                             continue;
                         }
@@ -689,7 +692,7 @@ impl Actor {
                         None => {
                             self.lost();
                             if matches!(job, Job::Compact) {
-                                self.compact_failed();
+                                self.compact_failed().await;
                             }
                         }
                     }
@@ -735,7 +738,7 @@ impl Actor {
                         Err(e) => {
                             self.crashed(e, turn).await;
                             if compact {
-                                self.compact_failed();
+                                self.compact_failed().await;
                             }
                         }
                     }
@@ -829,8 +832,16 @@ impl Actor {
                 self.approvals.deny_all("the session is shutting down");
                 self.shutdown.cancel();
             }
-            // After a crashed turn every command gets the same answer.
-            _ if lost => self.lost(),
+            // After a crashed turn every command gets the same answer, plus the answer a
+            // client waits for: a `Compact` its end, a `SetModel` its refusal.
+            _ if lost => {
+                self.lost();
+                match cmd {
+                    Command::Compact => self.compact_failed().await,
+                    Command::SetModel { model } => self.switch_refused(&model),
+                    _ => {}
+                }
+            }
             Command::Unknown => self.events.try_emit(Event::Error {
                 kind: ErrorKind::Internal,
                 message: "this engine does not know this command (sent by a newer client?); \
@@ -1060,11 +1071,27 @@ impl Actor {
         });
     }
 
-    /// The end of a `Compact` that could not run (or crashed): nothing applied.
-    fn compact_failed(&self) {
-        self.events.try_emit(Event::CompactFinished {
-            applied: false,
-            tokens_freed: 0,
+    /// The answer to a `SetModel` a lost session cannot run: the refusal a client waiting
+    /// for the switch recognises (`cannot switch to <model>:`, as `set_model` words it).
+    fn switch_refused(&self, model: &ModelId) {
+        self.events.try_emit(Event::Error {
+            kind: ErrorKind::ProviderFatal,
+            message: format!(
+                "cannot switch to {model}: the session stopped after an internal error"
+            ),
+            retryable: false,
+            hint: Some("resume the session to continue".into()),
         });
+    }
+
+    /// The end of a `Compact` that could not run (or crashed): nothing applied. Waits for
+    /// room like a turn's `TurnFinished` (the client waits for it).
+    async fn compact_failed(&self) {
+        self.events
+            .emit_last(Event::CompactFinished {
+                applied: false,
+                tokens_freed: 0,
+            })
+            .await;
     }
 }

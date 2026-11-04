@@ -9,13 +9,13 @@
 //! Text in these requests is the model's or the repository's. It is escaped before it
 //! goes out (spec 3.4): single-line fields (titles, names, rules) with every control and
 //! invisible character as a visible escape, multi-line text (commands, launch lines,
-//! memory bodies) escaped and fenced ([`map::fenced`]), so a client that renders markdown
-//! shows it whole and literally.
+//! memory bodies) escaped and fenced, with long blank runs marked ([`map::approval_text`]),
+//! so a client that renders markdown shows it whole and literally.
 
 use serde_json::{Value, json};
 use tautly_core::{Command, MemoryChange};
 
-use crate::map::{fenced, single_line};
+use crate::map::{approval_text, single_line};
 use crate::schema::{
     PermissionOption, PermissionOptionKind, PermissionOutcome, PermissionResponse, ToolCallContent,
     ToolCallUpdate, ToolKind,
@@ -148,7 +148,7 @@ pub fn mcp_request(
             single_line(source)
         )),
         kind: Some(ToolKind::Execute),
-        content: Some(vec![ToolCallContent::text(fenced(launch))]),
+        content: Some(vec![ToolCallContent::text(approval_text(launch))]),
         ..ToolCallUpdate::default()
     };
     params(session_id, call, yes_no_options())
@@ -180,7 +180,7 @@ pub fn memory_request(session_id: &str, proposal_id: &str, change: &MemoryChange
         tool_call_id: format!("memory:{proposal_id}"),
         title: Some(title),
         kind: Some(ToolKind::Think),
-        content: Some(vec![ToolCallContent::text(fenced(&text))]),
+        content: Some(vec![ToolCallContent::text(approval_text(&text))]),
         ..ToolCallUpdate::default()
     };
     params(session_id, call, yes_no_options())

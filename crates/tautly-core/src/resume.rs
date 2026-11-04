@@ -1305,8 +1305,7 @@ impl Session {
         self.events = unbound;
         // Its end, whatever happened (sent even after a cancel: the client waits for it).
         self.events
-            .replying()
-            .emit(Event::CompactFinished {
+            .emit_last(Event::CompactFinished {
                 applied: after.is_some(),
                 tokens_freed: after.map_or(0, |a| before.saturating_sub(a)),
             })

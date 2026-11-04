@@ -251,7 +251,9 @@ pub enum Event {
     /// The end of a [`Command::Compact`], sent exactly once per command, last: `applied`
     /// when it collected or compacted anything (else it was cancelled, had nothing to do
     /// or failed, said by a `Warning` or `Error` before this), `tokens_freed` the context
-    /// tokens it freed.
+    /// tokens it freed. Also sent after the `Error` answering a `Compact` that a lost
+    /// session (a crashed turn) cannot run. Like `TurnFinished`, it waits a bounded time
+    /// (5 s) for a client that is behind, then is dropped.
     CompactFinished {
         applied: bool,
         tokens_freed: u32,

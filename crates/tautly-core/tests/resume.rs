@@ -1779,6 +1779,53 @@ async fn replies_to_commands_wait_for_a_client_that_is_behind() {
     run.stop().await;
 }
 
+/// Task 46 re-review N1: after a crashed turn the session is lost, yet a `Compact` still
+/// ends with `CompactFinished` and a `SetModel` with its `cannot switch to` refusal, so a
+/// client waiting for either is answered.
+#[tokio::test]
+async fn a_lost_session_still_answers_compact_and_set_model() {
+    let fx = Fx::new();
+    let mock = MockProvider::new(vec![text_step("never")]);
+    let provider = Arc::new(PanicsOn {
+        mock: mock.clone(),
+        n: 0,
+        seen: Default::default(),
+    });
+    let mut run = start(EngineBuilder {
+        provider: Some(provider),
+        ..fx.builder(config(Mode::Ask), &mock)
+    });
+    run.say("crash").await;
+    run.until(|e| matches!(e, Event::TurnFinished { .. })).await;
+    run.send(Command::Compact).await;
+    let events = run
+        .until(|e| matches!(e, Event::CompactFinished { .. }))
+        .await;
+    assert!(
+        events.iter().any(
+            |e| matches!(e, Event::Error { message, .. } if message.contains("takes no more commands"))
+        ),
+        "{events:?}"
+    );
+    assert!(matches!(
+        events.last(),
+        Some(Event::CompactFinished {
+            applied: false,
+            tokens_freed: 0
+        })
+    ));
+    run.send(Command::SetModel {
+        model: ModelId::from("mock/other"),
+    })
+    .await;
+    run.until(|e| {
+        matches!(e, Event::Error { kind: tautly_core::ErrorKind::ProviderFatal, message, .. }
+            if message.starts_with("cannot switch to mock/other:"))
+    })
+    .await;
+    run.stop().await;
+}
+
 /// Review A probe P7: a panic in a `Compact` job is no turn's end.
 #[tokio::test]
 async fn a_panic_in_a_compaction_job_logs_no_turn_end() {

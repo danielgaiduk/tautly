@@ -219,7 +219,7 @@ async fn session_load_replays_messages_and_tool_calls() {
     assert_eq!(calls[0]["toolCallId"], "r1");
     assert_eq!(calls[0]["status"], "completed");
     assert_eq!(calls[0]["kind"], "read");
-    assert_eq!(calls[0]["title"], "read: a.txt");
+    assert_eq!(calls[0]["title"], "read: `a.txt`");
     assert!(
         calls[0]["content"].to_string().contains("alpha"),
         "{}",
@@ -308,7 +308,7 @@ async fn tool_call_lifecycle_pending_in_progress_completed_with_kind_title_locat
     assert_eq!(call["toolCallId"], "r1");
     assert_eq!(call["status"], "pending");
     assert_eq!(call["kind"], "read");
-    assert_eq!(call["title"], "read: a.txt");
+    assert_eq!(call["title"], "read: `a.txt`");
     assert_eq!(
         call["locations"],
         json!([{"path": fx.root().join("a.txt")}])
@@ -478,7 +478,7 @@ async fn ask_maps_to_request_permission_with_preview_diff() {
     let req = &asked[0];
     assert_eq!(req["sessionId"], json!(id));
     assert_eq!(req["toolCall"]["toolCallId"], "e1");
-    assert_eq!(req["toolCall"]["title"], "edit: src/lib.rs");
+    assert_eq!(req["toolCall"]["title"], "edit: `src/lib.rs`");
     assert_eq!(req["toolCall"]["kind"], "edit");
     let options: Vec<(String, String)> = req["options"]
         .as_array()
@@ -846,7 +846,8 @@ async fn approval_text_is_escaped_and_fenced() {
             "{t:?}"
         );
     }
-    assert!(title.starts_with("bash: echo ```x```"), "{title}");
+    assert!(title.starts_with("bash: ````echo ```x```"), "{title}");
+    assert!(title.ends_with("````"), "{title}");
     // The tool call's title is escaped the same way.
     let call = &acp.updates_of("tool_call")[0];
     assert_eq!(call["title"], req["toolCall"]["title"]);

@@ -178,6 +178,18 @@ impl EventSink {
         }
     }
 
+    /// The last event of a command's answer that a client waits for (`CompactFinished`):
+    /// like a turn's `TurnFinished`, it waits up to its own [`FINISH_GRACE`] for room (with
+    /// the drop warning before it), so a busy but reading client still learns the end.
+    pub async fn emit_last(&self, ev: Event) {
+        EventSink {
+            finish_by: Arc::default(),
+            ..self.clone()
+        }
+        .finish(ev)
+        .await;
+    }
+
     /// Send within [`SEND_GRACE`], else drop and count.
     pub async fn send_or_drop(&self, ev: Event) {
         if let Err(mpsc::error::SendTimeoutError::Timeout(_)) =
