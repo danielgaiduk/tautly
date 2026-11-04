@@ -746,6 +746,11 @@ impl Session {
         for p in &rec.forgotten_paths {
             self.reads.forget_path(p);
         }
+        // A blob that cannot be written poisons the log (every later write fails, and the
+        // failure is reported once): the record is then left out like everything after it,
+        // and a resume rebuilds the state at the failure. The session goes on in memory,
+        // compacted, as it does after any log failure; keeping the history uncompacted
+        // would only make every later compaction fail too.
         let mut blobs = Vec::with_capacity(rec.removed_turns.len());
         for t in &rec.removed_turns {
             match self.blob(&serde_json::to_vec(t).unwrap_or_default()).await {
