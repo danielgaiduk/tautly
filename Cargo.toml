@@ -7,6 +7,11 @@ edition = "2024"
 rust-version = "1.90"
 license = "Apache-2.0"
 version = "0.1.0"
+# TODO(release): replace OWNER with the GitHub account or organisation that hosts the
+# repository (see docs/release.md). cargo-dist derives the release URLs, the installer's
+# download base and the Homebrew tap owner from this URL.
+repository = "https://github.com/OWNER/tautly"
+homepage = "https://github.com/OWNER/tautly"
 
 [workspace.dependencies]
 async-trait = "0.1"
@@ -67,3 +72,7 @@ clap = { version = "4.5", features = ["derive"] }
 anyhow = "1"
 # YAML frontmatter of memory entries: panic-free parser with input budgets (hostile repos).
 serde-saphyr = { version = "2.1", default-features = false, features = ["deserialize"] }
+
+# Release builds made by cargo-dist (`dist build`); see dist-workspace.toml.
+[profile.dist]
+inherits = "release"

@@ -20,3 +20,31 @@ jobs:
       - run: cargo test -p tautly-cli --features mock
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo clippy -p tautly-cli --all-targets --features mock -- -D warnings
+
+  # The release plan (cargo-dist) matches spec 7.11.3: four targets, shell + Homebrew installers,
+  # sha256 checksums, binstall names, release.yml in sync with dist-workspace.toml.
+  dist-plan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      # Keep the version in step with `cargo-dist-version` in dist-workspace.toml.
+      - run: curl --proto '=https' --tlsv1.2 -LsSf https://github.com/axodotdev/cargo-dist/releases/download/v0.34.0/cargo-dist-installer.sh | sh
+      - run: bash scripts/check-dist-plan.sh
+
+  # The Linux release binary is static: the keychain backend (keyring's pure-Rust Secret Service)
+  # must link on musl. If this job cannot be made green, the release falls back to the -gnu
+  # targets (see the comment in dist-workspace.toml).
+  musl-static:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - run: cargo build --release --target x86_64-unknown-linux-musl -p tautly-cli
+      # Newer `file` reports a static-pie executable as "static-pie linked".
+      - run: file target/x86_64-unknown-linux-musl/release/tautly | grep -Eq 'statically linked|static-pie linked'
+      - run: ./target/x86_64-unknown-linux-musl/release/tautly --version
