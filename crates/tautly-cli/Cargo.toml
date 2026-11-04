@@ -1,6 +1,6 @@
 [package]
 name = "tautly-cli"
-description = "The `tautly` command: one-shot (`-p`) and JSON-RPC (`--rpc`) modes"
+description = "The `tautly` command: one-shot (`-p`), JSON-RPC (`--rpc`) and utility commands"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -20,12 +20,14 @@ tautly-rpc = { path = "../tautly-rpc" }
 tautly-provider = { path = "../tautly-provider", optional = true }
 anyhow.workspace = true
 clap.workspace = true
+reqwest.workspace = true
 serde_json.workspace = true
 tokio = { workspace = true, features = ["io-std", "signal"] }
 
 [dev-dependencies]
 tempfile.workspace = true
 serde_json.workspace = true
+wiremock.workspace = true
 
 [[test]]
 name = "mock_cli"

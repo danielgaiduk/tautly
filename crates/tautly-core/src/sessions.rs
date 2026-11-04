@@ -3,11 +3,13 @@
 
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use tautly_sandbox::Sandbox;
 
 use crate::checkpoint::{self, CheckpointError};
 use crate::engine::EngineError;
+use crate::record::SessionRecord;
 
 /// What [`delete`] removed.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -108,4 +110,84 @@ fn lock_if_idle(log: &Path, id: &str) -> Result<std::fs::File, DeleteError> {
         });
     }
     Ok(file)
+}
+
+/// Longest [`SessionSummary::first_prompt`], in characters.
+pub const FIRST_PROMPT_CHARS: usize = 60;
+
+/// One session of a work tree, as `/resume` lists it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SessionSummary {
+    pub id: String,
+    /// When the session started.
+    pub started: SystemTime,
+    /// The first line of the first user message, at most [`FIRST_PROMPT_CHARS`] characters
+    /// (empty: the session never got a message).
+    pub first_prompt: String,
+    /// What the session cost, from the cost ledger (none: no priced request).
+    pub cost_usd: Option<f64>,
+}
+
+/// The newest `limit` sessions that ran in the work tree `project` is in (the ones
+/// `--continue` and `/resume` may open; another worktree's sessions are not listed), under
+/// [`tautly_session::paths::data_home`]. Sessions that cannot be read are left out; so is
+/// everything when the data directory cannot be found. Blocking file I/O.
+pub fn list(project: &Path, limit: usize) -> Vec<SessionSummary> {
+    match tautly_session::paths::data_home() {
+        Ok(home) => list_in(&home, project, limit),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// [`list`] with an explicit data home.
+pub fn list_in(data_home: &Path, project: &Path, limit: usize) -> Vec<SessionSummary> {
+    let Ok(root) = crate::session_root(project) else {
+        return Vec::new();
+    };
+    let Ok(found) = tautly_session::list_here_in(data_home, &root) else {
+        return Vec::new();
+    };
+    // Not created by a listing: a data home that never ran a session has no ledger.
+    let ledger_file = data_home.join(crate::ledger::LEDGER_FILE);
+    let ledger = ledger_file
+        .exists()
+        .then(|| crate::Ledger::open(&ledger_file).ok())
+        .flatten();
+    found
+        .into_iter()
+        .take(limit)
+        .map(|s| {
+            let cost_usd = ledger
+                .as_ref()
+                .and_then(|l| l.session_totals(&s.id).ok())
+                .filter(|t| t.requests > t.unpriced)
+                .map(|t| t.usd);
+            SessionSummary {
+                first_prompt: first_prompt(&s.path),
+                id: s.id,
+                started: s.created,
+                cost_usd,
+            }
+        })
+        .collect()
+}
+
+/// The first line of the log's first user message, cut to [`FIRST_PROMPT_CHARS`].
+fn first_prompt(log: &Path) -> String {
+    let Ok(reader) = tautly_session::SessionReader::<SessionRecord>::open(log) else {
+        return String::new();
+    };
+    for rec in reader.records() {
+        let Ok((_, rec)) = rec else {
+            break;
+        };
+        let text = match rec {
+            SessionRecord::TurnStart { text, .. } => text,
+            SessionRecord::Command(crate::Command::SendMessage { text }) => text,
+            _ => continue,
+        };
+        let line = text.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
+        return line.trim().chars().take(FIRST_PROMPT_CHARS).collect();
+    }
+    String::new()
 }

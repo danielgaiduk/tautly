@@ -435,6 +435,15 @@ impl Config {
                 }
                 (Err(e), _) => return Err(e),
             };
+            // The user's model catalog file (`tautly models update`) sits next to the user
+            // file; the user file's own `[catalog_overrides]` win over it.
+            let layer = if trust == Trust::User {
+                let mut layer = layer.unwrap_or_default();
+                add_models_file(&mut layer, &path.with_file_name(MODELS_FILE), &mut warnings);
+                (!layer.is_empty()).then_some(layer)
+            } else {
+                layer
+            };
             let Some(mut layer) = layer else {
                 continue;
             };
@@ -938,6 +947,39 @@ fn retain_known(
             ignore(&format!("{scope}.{key}"), "unknown setting");
         }
     }
+}
+
+/// The models file next to the user config file: `[models."provider/model"]` entries, as
+/// `tautly models update` writes them.
+pub const MODELS_FILE: &str = "models.toml";
+
+/// Put the entries of the models file at `path` under `layer`'s `[catalog_overrides]` (the
+/// layer's own entries win). A file that cannot be read, or whose entries are not catalog
+/// entries, is skipped with a warning: `tautly models update` rewrites it.
+fn add_models_file(layer: &mut Table, path: &Path, warnings: &mut Vec<String>) {
+    let models = match read_layer(path, true) {
+        Ok(Some(t)) => t,
+        Ok(None) => return,
+        Err(e) => {
+            warnings.push(format!("model catalog file not read: {e}"));
+            return;
+        }
+    };
+    if models.is_empty() {
+        return;
+    }
+    if Value::Table(models.clone()).try_into::<Catalog>().is_err() {
+        warnings.push(format!(
+            "{}: model catalog file not read: its entries are not valid catalog entries",
+            path.display()
+        ));
+        return;
+    }
+    let mut overrides = models;
+    if let Some(Value::Table(own)) = layer.remove("catalog_overrides") {
+        deep_merge(&mut overrides, own);
+    }
+    layer.insert("catalog_overrides".into(), Value::Table(overrides));
 }
 
 /// The built-in catalog with the trusted layers' overrides applied.

@@ -67,10 +67,7 @@ impl Workspace {
     async fn open(&self) -> Opened {
         let mut warnings = Vec::new();
         let root = self.sandbox.root().to_path_buf();
-        let db = self
-            .data_home
-            .join("index")
-            .join(format!("{}.db", tautly_session::paths::project_hash(&root)));
+        let db = self.index_db();
         let sb = Arc::clone(&self.sandbox);
         let index = match tokio::task::spawn_blocking(move || Index::open(&db, sb)).await {
             Ok(Ok(index)) => Some(Arc::new(index)),
@@ -144,6 +141,14 @@ impl Workspace {
 
     pub fn root(&self) -> &Path {
         self.sandbox.root()
+    }
+
+    /// The code index's database file (`tautly index rebuild` removes it).
+    pub fn index_db(&self) -> PathBuf {
+        self.data_home.join("index").join(format!(
+            "{}.db",
+            tautly_session::paths::project_hash(self.sandbox.root())
+        ))
     }
 
     pub fn sandbox(&self) -> &Arc<dyn Sandbox> {

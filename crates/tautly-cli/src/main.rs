@@ -7,10 +7,15 @@
 //!   `shutdown` or disconnects (exit 0), or SIGTERM / SIGHUP arrives (143 / 129, after
 //!   every session has shut down).
 //!
-//! Flags shared by both: `--approve auto-edit|yolo` (headless `ask` is otherwise denied),
+//! `tautly prompt|sessions|models|undo|memory|index|mcp ...` are utility commands
+//! (`cmd`): they read or change what sessions leave behind and exit.
+//!
+//! Flags shared by `-p` and `--rpc`: `--approve auto-edit|yolo` (headless `ask` is otherwise denied),
 //! `--approve-memory`, `--approve-mcp`, `--model ID`, `--budget-usd N` (a session budget,
 //! sent before the first message), `--continue` / `--resume ID`, `--no-checkpoints`.
 //! Command-line flags are trusted: they override every configuration file (spec 2.2).
+
+mod cmd;
 
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -42,6 +47,9 @@ const EXIT_GRACE: Duration = Duration::from_secs(2);
                   130 cancelled (Ctrl-C), 143 SIGTERM, 129 SIGHUP."
 )]
 struct Cli {
+    #[command(subcommand)]
+    command: Option<cmd::Command>,
+
     /// Run PROMPT as one headless turn, print what happens and exit.
     #[arg(
         short = 'p',
@@ -243,6 +251,16 @@ impl Settings {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
+    if cli.command.is_some()
+        && (cli.prompt.is_some() || cli.rpc || cli.continue_latest || cli.resume.is_some())
+    {
+        Cli::command()
+            .error(
+                clap::error::ErrorKind::ArgumentConflict,
+                "-p, --rpc, --continue and --resume do not go with a command",
+            )
+            .exit();
+    }
     if cli.output.is_some() && cli.prompt.is_none() {
         Cli::command()
             .error(
@@ -274,7 +292,10 @@ fn main() -> ExitCode {
     ExitCode::from(u8::try_from(code).unwrap_or(1))
 }
 
-async fn run(cli: Cli) -> anyhow::Result<i32> {
+async fn run(mut cli: Cli) -> anyhow::Result<i32> {
+    if let Some(command) = cli.command.take() {
+        return cmd::run(command, &cli).await;
+    }
     if cli.prompt.is_none() && !cli.rpc {
         eprintln!(
             "tautly: the interactive REPL is not available yet; use -p PROMPT or --rpc \
