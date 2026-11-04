@@ -65,5 +65,7 @@ webpki-roots = "1"
 # The `tautly` binary: argument parsing and errors (anyhow only in tautly-cli).
 clap = { version = "4.5", features = ["derive"] }
 anyhow = "1"
+# `tautly auth add`: hidden input from the terminal.
+rpassword = "7"
 # YAML frontmatter of memory entries: panic-free parser with input budgets (hostile repos).
 serde-saphyr = { version = "2.1", default-features = false, features = ["deserialize"] }
