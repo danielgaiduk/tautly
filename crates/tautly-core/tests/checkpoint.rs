@@ -311,6 +311,32 @@ fn executable(path: &Path, text: &str) {
 
 // ----------------------------------------------------------------------- snapshots
 
+/// Review N7: checkpoint git does not inherit the session's provider key variables (the
+/// configured ones given with `with_env_remove`; `HOME` stands in for one, since setting a
+/// real key in this process would race the other tests).
+#[tokio::test]
+async fn checkpoint_git_does_not_see_provider_key_variables() {
+    let repo = Repo::with(&[("a.txt", "a\n")]);
+    let log = repo.home.path().join("env.log");
+    let shim = repo.home.path().join("git");
+    executable(
+        &shim,
+        &format!(
+            "#!/bin/sh\necho \"home=${{HOME-unset}}\" >> '{}'\nHOME=/tmp exec git \"$@\"\n",
+            log.display()
+        ),
+    );
+    let mut cp = repo
+        .checkpointer(CheckpointConfig::default())
+        .with_git(&shim)
+        .with_env_remove(vec!["HOME".into()]);
+    repo.write("b.txt", "b\n");
+    cp.snapshot_now().await.unwrap();
+    let seen = std::fs::read_to_string(&log).unwrap();
+    assert!(!seen.is_empty());
+    assert!(seen.lines().all(|l| l == "home=unset"), "{seen}");
+}
+
 #[tokio::test]
 async fn checkpoint_leaves_index_head_stash_and_branches_untouched() {
     let repo = Repo::with(&[("a.txt", "a\n"), ("b.txt", "b\n")]);

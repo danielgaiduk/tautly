@@ -353,6 +353,9 @@ struct Git<'a> {
     /// The git program's version (`(major, minor)`; none: unknown), asked once per
     /// checkpointer (session).
     version: &'a GitVersion,
+    /// Variables removed from git's environment besides [`ENV_REMOVED`]: the provider key
+    /// variables, so no child tautly starts in the work tree sees a provider key.
+    env_strip: &'a [String],
 }
 
 /// The cell a checkpointer keeps its git's version in.
@@ -403,6 +406,7 @@ impl<'a> Git<'a> {
             groups,
             config: tokio::sync::OnceCell::new(),
             version,
+            env_strip: &[],
         }
     }
 
@@ -562,6 +566,7 @@ impl<'a> Git<'a> {
             ));
         }
         let mut env_remove: Vec<String> = ENV_REMOVED.map(String::from).to_vec();
+        env_remove.extend(self.env_strip.iter().cloned());
         // `check-ignore` takes no pathspec magic, literal included (it is given absolute
         // paths, which have none).
         if args.first() == Some(&"check-ignore") {
@@ -896,6 +901,15 @@ fn expand_home(path: &str) -> PathBuf {
     }
 }
 
+/// The provider key variables no git call inherits, before the configured ones
+/// ([`Checkpointer::with_env_remove`]).
+fn default_env_strip() -> Vec<String> {
+    tautly_mcp::PROVIDER_KEY_VARS
+        .iter()
+        .map(|v| v.to_string())
+        .collect()
+}
+
 /// The repository's common directory (where `info/exclude` is): the one a linked
 /// worktree's `commondir` names, else the repository itself.
 fn common_dir(git_dir: &Path) -> PathBuf {
@@ -1062,6 +1076,8 @@ pub struct Checkpointer {
     excludes: Option<ExcludesStore>,
     /// Snapshots in a row whose configuration read ran out of [`CONFIG_READ_TIMEOUT`].
     config_timeouts: u32,
+    /// Variables no git call inherits: the provider key variables.
+    env_strip: Vec<String>,
 }
 
 impl Checkpointer {
@@ -1097,6 +1113,7 @@ impl Checkpointer {
             version: GitVersion::new(),
             excludes: None,
             config_timeouts: 0,
+            env_strip: default_env_strip(),
         })
     }
 
@@ -1111,6 +1128,17 @@ impl Checkpointer {
     /// The directory of the store keeping each checkpoint's exclude rules, if any.
     pub fn excludes_dir(&self) -> Option<&Path> {
         self.excludes.as_ref().map(ExcludesStore::dir)
+    }
+
+    /// Also keep `vars` (the session's provider key variables: the defaults plus every
+    /// configured `api_key_env`) from every git call.
+    pub fn with_env_remove(mut self, vars: Vec<String>) -> Self {
+        for v in vars {
+            if !self.env_strip.contains(&v) {
+                self.env_strip.push(v);
+            }
+        }
+        self
     }
 
     /// Run this git program instead of the one on `PATH`.
@@ -1191,15 +1219,18 @@ impl Checkpointer {
     }
 
     fn git(&self) -> Git<'_> {
-        Git::new(
-            self.sb.as_ref(),
-            &self.root,
-            &self.git_dir,
-            &self.program,
-            Some(&self.index),
-            self.groups.as_ref(),
-            &self.version,
-        )
+        Git {
+            env_strip: &self.env_strip,
+            ..Git::new(
+                self.sb.as_ref(),
+                &self.root,
+                &self.git_dir,
+                &self.program,
+                Some(&self.index),
+                self.groups.as_ref(),
+                &self.version,
+            )
+        }
     }
 
     fn deadline(&self) -> Instant {
@@ -1898,7 +1929,12 @@ async fn with_plain_git<T>(
         CheckpointError::Invalid(format!("{} is not a git work tree", root.display()))
     })?;
     let version = GitVersion::new();
-    let git = Git::new(sb, root, &git_dir, &program, None, None, &version);
+    // The default provider key variables (the free functions have no configuration).
+    let strip = default_env_strip();
+    let git = Git {
+        env_strip: &strip,
+        ..Git::new(sb, root, &git_dir, &program, None, None, &version)
+    };
     f(&git).await
 }
 

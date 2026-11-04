@@ -276,6 +276,7 @@ impl EngineBuilder {
                     Some(dir) => cp.with_excludes_store(dir.join(checkpoint::EXCLUDES_DIR)),
                     None => cp,
                 };
+                let cp = cp.with_env_remove(crate::mcp::provider_key_vars(&config));
                 GitCheckpoints::shared(cp.with_process_groups(groups.clone()))
             });
         // Checkpoints are on in a git work tree, yet none can be taken: `.git` is a
