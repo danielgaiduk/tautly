@@ -833,7 +833,11 @@ impl Actor {
                     let cmd = cmd.unwrap_or(Command::Shutdown);
                     // A fork moves the log to its branch when it ends: what applies after it
                     // waits, unlogged, and is logged in the branch at the join.
-                    if running.as_ref().is_some_and(|r| r.fork) && !Self::urgent(&cmd) {
+                    // A replay is refused at once (idle only), never held.
+                    if running.as_ref().is_some_and(|r| r.fork)
+                        && !Self::urgent(&cmd)
+                        && !matches!(cmd, Command::Replay { .. })
+                    {
                         if held.len() < COMMAND_CAPACITY {
                             held.push(cmd);
                         } else {
@@ -1012,7 +1016,7 @@ impl Actor {
             // A replay is a view of a log, never queued behind live work (spec 7.12.5).
             Command::Replay { .. } if running.is_some() => self.events.try_emit(Event::Error {
                 kind: ErrorKind::Internal,
-                message: "replay needs an idle session".into(),
+                message: crate::replay::REPLAY_BUSY.into(),
                 retryable: false,
                 hint: None,
             }),

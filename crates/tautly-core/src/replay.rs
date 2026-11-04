@@ -41,6 +41,7 @@ use tautly_mcp::printable;
 use tautly_provider::{Catalog, ModelId, ProviderEvent, Quota, RawUsage, cost_usd};
 use tautly_session::{Entry, RelPath, SessionReader};
 use tautly_tools::PersistedEffect;
+use tokio::sync::mpsc;
 
 use crate::protocol::{EffectView, ErrorKind, Event, ToolMetaView, UsageRole};
 use crate::provider_setup::provider_label;
@@ -55,6 +56,9 @@ pub type Replayed = (u64, u64, Event);
 
 /// The longest pause between two replayed events.
 pub const MAX_GAP: Duration = Duration::from_secs(2);
+
+/// The `Error` a `Replay` gets while anything runs (it gets no `ReplayFinished`).
+pub const REPLAY_BUSY: &str = "replay needs an idle session";
 
 /// What replayed approval request and memory proposal ids start with: no live id does, so
 /// an `Approve` or `ApproveMemory` naming one is never taken for consent.
@@ -80,6 +84,7 @@ pub fn events(reader: &SessionReader<SessionRecord>, from_step: Option<u32>) -> 
         last: (0, 0),
         out: VecDeque::new(),
         done: false,
+        truncated: false,
     }
 }
 
@@ -121,9 +126,17 @@ pub struct Events<'a> {
     last: (u64, u64),
     out: VecDeque<Replayed>,
     done: bool,
+    /// The stream ended on a record that could not be read.
+    truncated: bool,
 }
 
 impl Events<'_> {
+    /// The stream ended early, on a record that could not be read (a warning said so):
+    /// the rest of the log was not replayed.
+    pub fn truncated(&self) -> bool {
+        self.truncated
+    }
+
     /// Price each charge at its model's price in `catalog` (the configuration's
     /// `effective_catalog`). Without it, `Usage.cost_usd` is none.
     pub fn priced(mut self, catalog: Catalog) -> Self {
@@ -204,9 +217,12 @@ impl Events<'_> {
         }
     }
 
-    /// The events of one record (other than a provider event).
-    fn record(&mut self, rec: SessionRecord) -> Vec<Event> {
+    /// The events of one record (other than a provider event). A record before
+    /// `from_step` (`shown` false) only updates what later ones need (call names, the
+    /// model): nothing of it is read from the blob store or resolved.
+    fn record(&mut self, rec: SessionRecord, shown: bool) -> Vec<Event> {
         match rec {
+            SessionRecord::ToolResult { .. } if !shown => Vec::new(),
             SessionRecord::TurnStart { text, .. } => {
                 vec![Event::UserMessage { text }, Event::TurnStarted]
             }
@@ -361,6 +377,7 @@ impl Events<'_> {
         let entry = match self.entries.next() {
             Some(Ok(e)) => e,
             Some(Err(e)) => {
+                self.truncated = true;
                 self.end_response();
                 let (offset, t) = self.last;
                 self.out.push_back((
@@ -387,7 +404,7 @@ impl Events<'_> {
             return true;
         }
         self.end_response();
-        let evs = self.record(entry.rec);
+        let evs = self.record(entry.rec, shown);
         if shown {
             self.out.extend(evs.into_iter().map(|ev| (at.0, at.1, ev)));
         }
@@ -414,7 +431,22 @@ fn find(data_home: &Path, root: &Path, id: &str) -> Result<(String, PathBuf), St
     }
 }
 
-/// Read session `id`'s replayed events (default: `current`'s). Blocking I/O.
+/// Replayed events the log reader may be ahead of the client by: what a replay holds in
+/// memory is this many events, whatever the log's size.
+pub const STREAM_BOUND: usize = 64;
+
+/// What the log reader sends the replay job.
+enum Read {
+    /// The replay starts: the session's full id.
+    Start(String),
+    /// It cannot start.
+    Refused(String),
+    Item(Box<Replayed>),
+}
+
+/// Read session `id`'s replayed events (default: `current`'s) into `tx`, one at a time:
+/// first `Start` (or `Refused`), then each event. Stops when the receiver is gone (the
+/// replay was cancelled). Blocking I/O.
 fn read(
     data_home: &Path,
     root: &Path,
@@ -422,21 +454,40 @@ fn read(
     current: (String, PathBuf),
     from_step: Option<u32>,
     catalog: Catalog,
-) -> Result<(String, Vec<Replayed>), String> {
-    let (id, path) = match id {
-        None => current,
-        Some(id) => find(data_home, root, id)?,
+    tx: &mpsc::Sender<Read>,
+) {
+    let opened = (|| {
+        let (id, path) = match id {
+            None => current,
+            Some(id) => find(data_home, root, id)?,
+        };
+        let reader = SessionReader::<SessionRecord>::open(&path)
+            .map_err(|e| format!("cannot read session {id}: {e}"))?;
+        if let Some(at) = from_step {
+            let last = step_at_offset(&reader, u64::MAX);
+            if at > last {
+                return Err(TtError::NoSuchStep { at, last }.to_string());
+            }
+        }
+        Ok((id, reader))
+    })();
+    let reader = match opened {
+        Ok((id, reader)) => {
+            if tx.blocking_send(Read::Start(id)).is_err() {
+                return;
+            }
+            reader
+        }
+        Err(why) => {
+            let _ = tx.blocking_send(Read::Refused(why));
+            return;
+        }
     };
-    let reader = SessionReader::<SessionRecord>::open(&path)
-        .map_err(|e| format!("cannot read session {id}: {e}"))?;
-    if let Some(at) = from_step {
-        let last = step_at_offset(&reader, u64::MAX);
-        if at > last {
-            return Err(TtError::NoSuchStep { at, last }.to_string());
+    for item in events(&reader, from_step).priced(catalog) {
+        if tx.blocking_send(Read::Item(Box::new(item))).is_err() {
+            return;
         }
     }
-    let evs = events(&reader, from_step).priced(catalog).collect();
-    Ok((id, evs))
 }
 
 impl Session {
@@ -472,7 +523,11 @@ impl Session {
         let current = (self.session_id.clone(), self.log.path());
         let (home, root) = (self.data_home.clone(), self.root().to_path_buf());
         let catalog = (*self.setup.catalog).clone();
-        let reading = tokio::task::spawn_blocking(move || {
+        // Streamed through a bounded channel: memory stays bounded however large the log
+        // (or however often its records name one big blob), and the first event goes out
+        // before the rest is read. Dropping `rx` (a cancel) stops the reader.
+        let (tx, mut rx) = mpsc::channel(STREAM_BOUND);
+        tokio::task::spawn_blocking(move || {
             read(
                 &home,
                 &root,
@@ -480,26 +535,40 @@ impl Session {
                 current,
                 from_step,
                 catalog,
+                &tx,
             )
         });
-        let read = tokio::select! {
+        let first = tokio::select! {
             biased;
             () = ctl.cancel.cancelled() => return sink.emit_last(finish(shown, 0, true)).await,
-            r = reading => r.unwrap_or_else(|e| Err(format!("the log reader stopped: {e}"))),
+            r = rx.recv() => r,
         };
-        let items = match read {
-            Ok((id, items)) => {
-                shown = id;
-                items
-            }
-            Err(why) => {
+        match first {
+            Some(Read::Start(id)) => shown = id,
+            other => {
+                let why = match other {
+                    Some(Read::Refused(why)) => why,
+                    _ => "the log reader stopped".to_string(),
+                };
                 sink.emit(replay_error(&format!("cannot replay: {why}")))
                     .await;
                 return sink.emit_last(finish(shown, 0, false)).await;
             }
-        };
+        }
         let (mut sent, mut cancelled, mut prev) = (0u32, false, None);
-        for (offset, t_ms, event) in items {
+        loop {
+            let next = tokio::select! {
+                biased;
+                () = ctl.cancel.cancelled() => {
+                    cancelled = true;
+                    break;
+                }
+                r = rx.recv() => r,
+            };
+            let Some(Read::Item(item)) = next else {
+                break;
+            };
+            let (offset, t_ms, event) = *item;
             if let Some(p) = prev {
                 let gap = delay(p, t_ms, speed);
                 if !gap.is_zero() {
@@ -523,6 +592,7 @@ impl Session {
             .await;
             sent = sent.saturating_add(1);
         }
+        drop(rx);
         sink.emit_last(finish(shown, sent, cancelled)).await;
     }
 }

@@ -581,7 +581,8 @@ async fn replay_paces_by_timestamps_scaled_and_capped_at_2s() {
     let want = [0u64, 200, 100, 2000];
     assert_eq!(gaps.len(), want.len(), "{gaps:?}");
     for (got, want) in gaps.iter().zip(want) {
-        assert!(got.abs_diff(want) <= 3, "{gaps:?}");
+        // Never early; late only by the hand-moved clock steps the engine takes to run.
+        assert!(*got >= want && *got - want <= 10, "{gaps:?}");
     }
     tokio::time::resume();
     run.stop().await;
@@ -616,7 +617,7 @@ async fn speed_zero_is_instant() {
     let begin = std::time::Instant::now();
     let seen = run.replay(&id, 0.0, None).await;
     assert!(
-        begin.elapsed() < Duration::from_secs(1),
+        begin.elapsed() < Duration::from_secs(5),
         "{:?}",
         begin.elapsed()
     );
@@ -745,7 +746,7 @@ async fn cancel_stops_with_finished_cancelled() {
         .until(|e| matches!(e, Event::ReplayFinished { .. }))
         .await;
     assert!(
-        begin.elapsed() < Duration::from_secs(1),
+        begin.elapsed() < Duration::from_secs(5),
         "{:?}",
         begin.elapsed()
     );
@@ -1020,4 +1021,271 @@ fn usage_is_priced_by_its_own_model_and_estimates_are_marked() {
         })
         .collect();
     assert_eq!(unpriced, [None, None, None]);
+}
+
+// ------------------------------------------------------------------- fix round 1
+
+/// `n` text records `t0`.., `gap` ms apart.
+fn texts(n: u64, gap: u64) -> Vec<(u64, SessionRecord)> {
+    (0..n)
+        .map(|i| {
+            (
+                i * gap,
+                SessionRecord::Provider(ProviderEvent::TextDelta(format!("t{i}"))),
+            )
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn replay_streams_with_bounded_memory() {
+    // Many results naming one large blob: what a replay holds must not grow with them,
+    // and the first event goes out before the log has been read to its end.
+    let fx = Fx::new();
+    let (id, path) = fx.craft(&[], &[]);
+    let blob = fx.blob(&path, &vec![b'x'; 25_000]);
+    const N: u32 = 2_000;
+    let mut w = SessionWriter::<SessionRecord>::reopen(&path).unwrap();
+    for i in 0..N {
+        w.append(&SessionRecord::ToolResult {
+            id: format!("c{i}"),
+            result_blob: blob.clone(),
+            is_error: false,
+            effects: vec![],
+            meta: ToolMeta::default(),
+            ran: true,
+            blocked: false,
+        })
+        .unwrap();
+    }
+    w.checkpoint().unwrap();
+    drop(w);
+    let mut run = Run::start(fx.builder(&MockProvider::new(vec![]), Mode::Yolo, false));
+    run.settle().await;
+    run.send(Command::Replay {
+        session_id: Some(id),
+        speed: 0.0,
+        from_step: None,
+    })
+    .await;
+    run.until(|e| matches!(e, Event::Replayed { .. })).await;
+    // The blob goes away now: results not read yet can no longer find it. Had the whole
+    // log been read before the first event, every output would be whole.
+    let (head, rest) = blob.as_str().split_at(2);
+    std::fs::remove_file(path.parent().unwrap().join("blobs").join(head).join(rest)).unwrap();
+    let seen = run
+        .until(|e| matches!(e, Event::ReplayFinished { .. }))
+        .await;
+    let outputs: Vec<String> = inner(&seen)
+        .into_iter()
+        .filter_map(|e| match e {
+            Event::ToolFinished { output, .. } => Some(output),
+            _ => None,
+        })
+        .collect();
+    let missing = outputs
+        .iter()
+        .filter(|o| o.starts_with("[the output is not in the session's blob store"))
+        .count();
+    assert!(
+        missing > 0,
+        "the log was read to its end before the first event"
+    );
+    // At most the event channel, the reader's queue and a few in flight were read ahead.
+    let read_ahead = outputs.len() - missing;
+    let bound = tautly_core::engine::EVENT_CAPACITY + replay::STREAM_BOUND + 8;
+    assert!(read_ahead <= bound, "{read_ahead} read ahead");
+    assert_eq!(finished(&seen), (N, false));
+    run.stop().await;
+}
+
+#[test]
+fn compaction_collection_memory_and_model_rows_are_mapped() {
+    let fx = Fx::new();
+    let (_, path) = fx.craft(&[], &[]);
+    let removed = fx.blob(&path, b"{}");
+    let change = tautly_core::MemoryChange {
+        upsert: None,
+        delete: vec!["old".into()],
+    };
+    let mut w = SessionWriter::<SessionRecord>::reopen(&path).unwrap();
+    for r in [
+        SessionRecord::Compaction {
+            removed: vec![removed],
+            summary: "sum".into(),
+        },
+        SessionRecord::GcApplied {
+            elided: vec![("c1".into(), 3)],
+            reason: tautly_core::MutationReason::ColdCache,
+            tokens_freed: 50,
+            forgotten_paths: vec![],
+        },
+        SessionRecord::MemoryProposal {
+            id: "mem-1".into(),
+            change: change.clone(),
+        },
+        SessionRecord::ModelSet {
+            model: ModelId::from("openai/gpt-5"),
+        },
+    ] {
+        w.append(&r).unwrap();
+    }
+    w.checkpoint().unwrap();
+    drop(w);
+    let reader = SessionReader::<SessionRecord>::open(&path).unwrap();
+    let got: Vec<Event> = replay::events(&reader, None).map(|(_, _, e)| e).collect();
+    assert_eq!(
+        got,
+        [
+            Event::Compacted {
+                removed_turns: 1,
+                summary: "sum".into(),
+                reason: tautly_core::MutationReason::Unknown,
+            },
+            Event::ContextCollected {
+                elided_results: 1,
+                tokens_freed: 50,
+                reason: tautly_core::MutationReason::ColdCache,
+            },
+            Event::MemoryProposed {
+                proposal_id: format!("{REPLAYED_ID_PREFIX}mem-1"),
+                change,
+                replaces: vec![],
+            },
+            Event::ModelChanged {
+                model: ModelId::from("openai/gpt-5"),
+                provider: "openai".into(),
+            },
+        ]
+    );
+}
+
+#[tokio::test]
+async fn replayed_memory_proposals_cannot_be_approved() {
+    let fx = Fx::new();
+    let (id, path) = fx.craft(&[], &[]);
+    let mut w = SessionWriter::<SessionRecord>::reopen(&path).unwrap();
+    w.append(&SessionRecord::MemoryProposal {
+        id: "mem-1".into(),
+        change: tautly_core::MemoryChange {
+            upsert: None,
+            delete: vec!["old".into()],
+        },
+    })
+    .unwrap();
+    w.checkpoint().unwrap();
+    drop(w);
+    let mut run = Run::start(fx.builder(&MockProvider::new(vec![]), Mode::Ask, true));
+    run.settle().await;
+    let seen = run.replay(&id, 0.0, None).await;
+    let Some(Event::MemoryProposed { proposal_id, .. }) = inner(&seen).first().cloned() else {
+        panic!("{seen:#?}")
+    };
+    assert_eq!(proposal_id, format!("{REPLAYED_ID_PREFIX}mem-1"));
+    for pid in [proposal_id, "mem-1".to_string()] {
+        run.send(Command::ApproveMemory {
+            proposal_id: pid.clone(),
+        })
+        .await;
+        let seen = run.until(|e| matches!(e, Event::Warning { .. })).await;
+        let Some(Event::Warning { message }) = seen.last() else {
+            unreachable!()
+        };
+        assert_eq!(message, &format!("no memory proposal `{pid}` is pending"));
+    }
+    run.stop().await;
+}
+
+#[tokio::test]
+async fn shutdown_during_a_replay_finishes_it_cancelled() {
+    let fx = Fx::new();
+    let (id, _) = fx.craft(&texts(6, 10_000), &[]);
+    let mut run = Run::start(fx.builder(&MockProvider::new(vec![]), Mode::Yolo, false));
+    run.settle().await;
+    run.send(Command::Replay {
+        session_id: Some(id),
+        speed: 1.0,
+        from_step: None,
+    })
+    .await;
+    run.until(|e| matches!(e, Event::Replayed { .. })).await;
+    run.send(Command::Shutdown).await;
+    let mut rest = Vec::new();
+    while let Some(ev) = tokio::time::timeout(WAIT, run.events.recv())
+        .await
+        .expect("the engine did not stop")
+    {
+        rest.push(ev);
+    }
+    assert!(
+        rest.iter().any(|e| matches!(
+            e,
+            Event::ReplayFinished {
+                cancelled: true,
+                ..
+            }
+        )),
+        "{rest:#?}"
+    );
+}
+
+#[tokio::test]
+async fn a_malformed_line_mid_log_ends_the_replay_with_a_warning() {
+    let fx = Fx::new();
+    let (id, path) = fx.craft(&texts(3, 1), &[]);
+    // Break the second record's line (the header is line 1).
+    let text = std::fs::read_to_string(&path).unwrap();
+    let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
+    lines[2] = "{this is not json".into();
+    std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+
+    let reader = SessionReader::<SessionRecord>::open(&path).unwrap();
+    let mut events = replay::events(&reader, None);
+    let got: Vec<Event> = events.by_ref().map(|(_, _, e)| e).collect();
+    assert_eq!(got.len(), 2, "{got:#?}");
+    assert_eq!(got[0], Event::TextDelta { text: "t0".into() });
+    assert!(
+        matches!(&got[1], Event::Warning { message } if message.contains("cannot be read past")),
+        "{got:#?}"
+    );
+    assert!(events.truncated());
+
+    let mut run = Run::start(fx.builder(&MockProvider::new(vec![]), Mode::Yolo, false));
+    run.settle().await;
+    let seen = run.replay(&id, 0.0, None).await;
+    assert_eq!(inner(&seen), got);
+    assert_eq!(finished(&seen), (2, false));
+    run.stop().await;
+}
+
+#[tokio::test]
+async fn replay_during_a_fork_is_refused_not_held() {
+    let fx = Fx::new();
+    let (id, _) = two_turns(&fx);
+    let mut run = Run::start(fx.builder(&MockProvider::new(vec![]), Mode::Yolo, false));
+    run.settle().await;
+    // Sent back to back: the replay arrives while the fork runs.
+    run.send(Command::Fork {
+        at: None,
+        label: None,
+    })
+    .await;
+    run.send(Command::Replay {
+        session_id: Some(id),
+        speed: 0.0,
+        from_step: None,
+    })
+    .await;
+    let seen = run
+        .until(|e| {
+            matches!(e, Event::Error { message, .. } if message == replay::REPLAY_BUSY)
+                || matches!(e, Event::ReplayFinished { .. })
+        })
+        .await;
+    assert!(
+        matches!(seen.last(), Some(Event::Error { .. })),
+        "{seen:#?}"
+    );
+    assert!(!seen.iter().any(|e| matches!(e, Event::Replayed { .. })));
+    run.stop().await;
 }

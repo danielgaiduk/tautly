@@ -4,7 +4,8 @@
 //!
 //! Text output is the REPL's rendering (everything escaped for the terminal); `json`
 //! prints the replayed events, one JSON object per line. Each pause is the logged gap
-//! divided by `--speed` (default 1), at most 2 s; `--speed 0` prints at once.
+//! divided by `--speed` (default 1), at most 2 s; `--speed 0` prints at once. A log that
+//! cannot be read to its end (a corrupt record) exits 1 after what could be replayed.
 
 use std::io::Write as _;
 
@@ -68,7 +69,8 @@ pub async fn run(args: Args, env: &Env) -> anyhow::Result<i32> {
     let mut st = RenderState::default();
     let mut stdout = std::io::stdout();
     let mut prev = None;
-    for (offset, t_ms, event) in replay::events(&reader, args.from_step).priced(catalog) {
+    let mut events = replay::events(&reader, args.from_step).priced(catalog);
+    for (offset, t_ms, event) in events.by_ref() {
         if let Some(p) = prev {
             let gap = replay::delay(p, t_ms, args.speed);
             if !gap.is_zero() {
@@ -95,5 +97,10 @@ pub async fn run(args: Args, env: &Env) -> anyhow::Result<i32> {
         stdout.write_all(st.break_line().as_bytes())?;
     }
     stdout.flush()?;
+    // The log broke off (its warning was the last event): not a complete replay.
+    if events.truncated() {
+        eprintln!("tautly: the session log could not be read to its end");
+        return Ok(1);
+    }
     Ok(0)
 }

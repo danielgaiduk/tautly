@@ -13,6 +13,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use futures::{FutureExt as _, Stream, StreamExt as _};
 use serde_json::Value;
+use tautly_core::replay::REPLAY_BUSY;
 use tautly_core::{Command, Engine, Event, ModelId, printable};
 use tokio::io::{AsyncWrite, AsyncWriteExt as _};
 use tokio::sync::mpsc;
@@ -437,10 +438,16 @@ where
                     from_step: None,
                 })
                 .await?;
-                // A Ctrl+C meanwhile cancels it (`pump`).
+                // A Ctrl+C meanwhile cancels it (`pump`). Every replay ends with
+                // `ReplayFinished` (after its `Error`, when it cannot start), except one
+                // refused because something runs.
                 return Ok(exit(
-                    self.pump(|e| matches!(e, Event::ReplayFinished { .. } | Event::Error { .. }))
-                        .await?,
+                    self.pump(|e| match e {
+                        Event::ReplayFinished { .. } => true,
+                        Event::Error { message, .. } => message == REPLAY_BUSY,
+                        _ => false,
+                    })
+                    .await?,
                 ));
             }
             Slash::MemoryConsolidate => {

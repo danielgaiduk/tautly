@@ -309,16 +309,20 @@ pub fn event(e: &Event, st: &mut RenderState, opts: &ReplOptions) -> Option<Stri
                 "cancelled" => DIM,
                 _ => YELLOW,
             };
-            let secs = pending.as_ref().and_then(|p| p.started).map_or(0.0, |t| {
-                (st.clock)().saturating_duration_since(t).as_secs_f64()
-            });
+            // No start time (a replay, or a call that never started): no duration.
+            let secs = pending
+                .as_ref()
+                .and_then(|p| p.started)
+                .map(|t| (st.clock)().saturating_duration_since(t).as_secs_f64());
             let shown = pending.as_ref().map_or("", |p| p.target.as_str());
             let mut row = format!("{} {}", paint(colour, status), printable(tool));
             if !shown.is_empty() {
                 row.push(' ');
                 row.push_str(shown);
             }
-            let _ = write!(row, " {secs:.1}s");
+            if let Some(secs) = secs {
+                let _ = write!(row, " {secs:.1}s");
+            }
             let mut notes = Vec::new();
             if let Some(code) = meta.exit_code {
                 notes.push(format!("exit {code}"));

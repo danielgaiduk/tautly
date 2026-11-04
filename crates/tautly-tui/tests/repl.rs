@@ -1759,6 +1759,39 @@ async fn replay_shows_the_session_without_asking_again() {
     assert_eq!(count(&ran.out, "ok bash echo hi"), 2, "{}", ran.out);
     assert_eq!(count(&ran.out, "all done"), 2, "{}", ran.out);
     assert!(ran.out.contains("replay finished: "), "{}", ran.out);
+    // The replayed row has no start time, so no duration (the live one has one).
+    assert_eq!(
+        count(&ran.out, "ok bash echo hi · exit 0"),
+        1,
+        "{}",
+        ran.out
+    );
+}
+
+#[tokio::test]
+async fn a_replay_that_cannot_start_ends_before_the_prompt() {
+    let fx = Fx::new();
+    let mock = MockProvider::new(vec![]);
+    let ran = run(
+        &fx,
+        vec![text("/replay nope"), text("/cost")],
+        config(Mode::Ask, false),
+        &mock,
+    )
+    .await;
+    let error = ran
+        .out
+        .find("no session `nope`")
+        .unwrap_or_else(|| panic!("{}", ran.out));
+    let end = ran
+        .out
+        .find("replay finished: 0 events")
+        .unwrap_or_else(|| panic!("{}", ran.out));
+    let next = ran
+        .out
+        .find("no turn has finished")
+        .unwrap_or_else(|| panic!("{}", ran.out));
+    assert!(error < end && end < next, "{}", ran.out);
 }
 
 #[test]

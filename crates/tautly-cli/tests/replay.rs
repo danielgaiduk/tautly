@@ -156,3 +156,27 @@ fn cli_replay_refuses_unknown_sessions_and_bad_steps() {
     let out = s.run(&["replay", &id, "--speed", "-1"]);
     assert_eq!(out.status.code(), Some(2));
 }
+
+#[test]
+fn cli_replay_of_a_log_broken_mid_way_exits_1() {
+    let s = Scratch::new();
+    let id = s.session();
+    let path = std::fs::read_dir(s.home.path().join("sessions"))
+        .unwrap()
+        .map(|p| p.unwrap().path().join(format!("{id}.jsonl")))
+        .find(|p| p.exists())
+        .unwrap();
+    // The second record (the text) is broken; the header is line 1.
+    let text = std::fs::read_to_string(&path).unwrap();
+    let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
+    lines[2] = "{broken".into();
+    std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+    let out = s.run(&["replay", &id, "--speed", "0", "--output", "json"]);
+    assert_eq!(out.status.code(), Some(1));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // What could be read was replayed, then the warning.
+    assert!(stdout.contains("user_message"), "{stdout}");
+    assert!(stdout.contains("cannot be read past"), "{stdout}");
+    assert!(!stdout.contains("tool_finished"), "{stdout}");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("could not be read to its end"));
+}
