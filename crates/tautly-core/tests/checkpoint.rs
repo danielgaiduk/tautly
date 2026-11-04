@@ -1828,3 +1828,79 @@ async fn dot_git_symlink_takes_no_checkpoint_and_says_so() {
     // Nothing was written to the repository the link points at.
     assert!(real.refs("refs/tautly/").is_empty());
 }
+
+/// Review B-I2, probe P2: a checkout whose `.git` names another repository's git
+/// directories (a `commondir` in a `.git` directory, or a `.git` file) without git's
+/// back-link takes no checkpoints there, and engine-start pruning does not touch that
+/// repository's refs.
+#[tokio::test]
+async fn git_dir_another_repository_does_not_name_back_takes_no_checkpoint() {
+    let victim = Repo::with(&[("a.txt", "a\n")]);
+    let head = victim.git(&["rev-parse", "HEAD"]);
+    victim.git(&["update-ref", "refs/tautly/checkpoints/old/1", &head]);
+    let victim_git = victim.path(".git");
+    let p2 = Repo::bare_dir();
+    p2.write(".git/HEAD", "ref: refs/heads/main\n");
+    p2.write(".git/commondir", &format!("{}\n", victim_git.display()));
+    let file = Repo::bare_dir();
+    file.write(".git", &format!("gitdir: {}\n", victim_git.display()));
+    for hostile in [&p2, &file] {
+        hostile.write("a.txt", "a\n");
+        assert!(
+            Checkpointer::new(
+                hostile.sandbox(),
+                hostile.root(),
+                "s".into(),
+                CheckpointConfig::default()
+            )
+            .is_none()
+        );
+        let sb = hostile.sandbox();
+        assert!(
+            checkpoint::prune(sb.as_ref(), &hostile.root(), 0, None)
+                .await
+                .is_err()
+        );
+        let mock = MockProvider::new(vec![
+            tools_step(vec![bash("b1", "printf 'b\\n' > a.txt")]),
+            text_step("first"),
+        ]);
+        let mut run = start(hostile.builder(config(), &mock));
+        let events = run.turn_with("one").await;
+        let (_, path) = run.engine.current_session();
+        run.stop().await;
+        let skipped: Vec<String> = warnings(&events)
+            .into_iter()
+            .filter(|w| w.starts_with("checkpoint skipped"))
+            .collect();
+        assert_eq!(skipped, [skip_warning(&Skip::GitDirUnverified)]);
+        let reasons: Vec<String> = records_at(&path)
+            .into_iter()
+            .filter_map(|r| match r {
+                SessionRecord::CheckpointSkipped { reason, .. } => Some(reason),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(reasons, ["git_dir_unverified"]);
+    }
+    // The victim's refs are as they were: nothing added, nothing pruned.
+    assert_eq!(
+        victim.refs("refs/tautly/"),
+        ["refs/tautly/checkpoints/old/1"]
+    );
+}
+
+/// A real linked worktree keeps its checkpoints (in the shared repository).
+#[tokio::test]
+async fn linked_worktree_still_takes_checkpoints() {
+    let main = Repo::with(&[("a.txt", "a\n")]);
+    let top = tempfile::tempdir().unwrap();
+    let wt = top.path().canonicalize().unwrap().join("wt");
+    main.git(&["worktree", "add", "-q", "--detach", wt.to_str().unwrap()]);
+    let sb: Arc<dyn Sandbox> = Arc::new(LocalSandbox::new(wt.clone()).unwrap());
+    let mut cp = Checkpointer::new(sb, wt.clone(), "w".into(), CheckpointConfig::default())
+        .expect("a linked worktree has a checkpointer");
+    std::fs::write(wt.join("b.txt"), "b\n").unwrap();
+    cp.snapshot_now().await.unwrap();
+    assert_eq!(main.refs("refs/tautly/"), ["refs/tautly/checkpoints/w/1"]);
+}

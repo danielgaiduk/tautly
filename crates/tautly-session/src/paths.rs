@@ -54,6 +54,11 @@ pub fn project_hash(root: &Path) -> String {
 /// `GIT_CEILING_DIRECTORIES`): a directory that is not itself a repository but lies inside
 /// one (for example under a home directory kept in git) shares that repository's id.
 /// Listings span such directories; [`list_here`](crate::list_here) keeps one root's.
+///
+/// A `.git` file or `commondir` counts only when git's own back-link confirms it
+/// ([`git_dirs_at`](crate::git_dirs_at)): a checkout that arrived with a `.git` naming
+/// another repository's directories gets its root's hash, not that project's id (and so
+/// not its session logs or memory episodes).
 pub fn project_id(root: &Path) -> String {
     project_id_with(root, crate::git::dirs(root).as_ref())
 }

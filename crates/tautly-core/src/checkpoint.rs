@@ -122,6 +122,14 @@ pub enum Skip {
     /// repository it points at.
     #[error("the work tree's .git is a symbolic link (checkpoints are off for this session)")]
     GitDirSymlink,
+    /// The root's `.git` names a git directory (a `.git` file, or a `commondir`) that
+    /// git's own links do not confirm belongs to this work tree
+    /// ([`tautly_session::git_dirs_at`]): checkpoints could write to another repository.
+    #[error(
+        "the work tree's .git names a repository that does not name it back \
+         (checkpoints are off for this session)"
+    )]
+    GitDirUnverified,
 }
 
 /// What a restore changes (with `dry_run`: would change), as absolute paths.
@@ -155,7 +163,8 @@ impl From<Skip> for CheckpointError {
             Skip::Git(why) => CheckpointError::Git(why),
             other @ (Skip::TooManyUntracked { .. }
             | Skip::UnsafePartialClone
-            | Skip::GitDirSymlink) => CheckpointError::Invalid(other.to_string()),
+            | Skip::GitDirSymlink
+            | Skip::GitDirUnverified) => CheckpointError::Invalid(other.to_string()),
         }
     }
 }
@@ -163,7 +172,10 @@ impl From<Skip> for CheckpointError {
 impl Skip {
     /// It holds for the rest of the session: said once, and no checkpoint is tried again.
     pub fn is_permanent(&self) -> bool {
-        matches!(self, Skip::UnsafePartialClone | Skip::GitDirSymlink)
+        matches!(
+            self,
+            Skip::UnsafePartialClone | Skip::GitDirSymlink | Skip::GitDirUnverified
+        )
     }
 
     /// Git failed because an object it needs is missing (or a fetch of one was refused):
@@ -198,6 +210,7 @@ impl Skip {
             Skip::Git(_) => "git_failed",
             Skip::UnsafePartialClone => "unsafe_partial_clone",
             Skip::GitDirSymlink => "git_dir_symlink",
+            Skip::GitDirUnverified => "git_dir_unverified",
         }
     }
 }
@@ -1793,21 +1806,22 @@ pub(crate) fn dot_git_is_link(root: &Path) -> bool {
 }
 
 /// The repository of the work tree at `root`: its `.git` directory, or the directory a
-/// `.git` file (`gitdir: <path>`, a linked worktree or submodule) names. None when `root`
-/// has neither (a `.git` symbolic link is neither: see [`dot_git_is_link`]). Every git call names it (`--git-dir`) with the root as the work tree, so
-/// neither the environment nor `core.worktree` can point git elsewhere.
+/// `.git` file (`gitdir: <path>`, a linked worktree or submodule) names, only when git's
+/// own links confirm it belongs to this work tree ([`tautly_session::git_dirs_at`]; a
+/// `.git` directory with a `commondir` never does). None otherwise: a checkout that
+/// arrived with its `.git` must not get checkpoints written to (or pruned from) another
+/// repository; [`dot_git_unverified`] tells that case apart. A `.git` symbolic link is
+/// never followed (see [`dot_git_is_link`]). Every git call names it (`--git-dir`) with
+/// the root as the work tree, so neither the environment nor `core.worktree` can point git
+/// elsewhere.
 pub(crate) fn git_dir(root: &Path) -> Option<PathBuf> {
-    let dot = root.join(".git");
-    let meta = std::fs::symlink_metadata(&dot).ok()?;
-    if meta.is_dir() {
-        return Some(dot);
-    }
-    if !meta.is_file() {
-        return None;
-    }
-    let text = std::fs::read_to_string(&dot).ok()?;
-    let named = text.lines().next()?.strip_prefix("gitdir:")?.trim();
-    (!named.is_empty()).then(|| root.join(named))
+    tautly_session::git_dirs_at(&root.join(".git")).map(|d| d.git_dir)
+}
+
+/// Whether the root has a `.git` (not a symbolic link) that [`git_dir`] does not accept.
+pub(crate) fn dot_git_unverified(root: &Path) -> bool {
+    std::fs::symlink_metadata(root.join(".git")).is_ok_and(|m| !m.file_type().is_symlink())
+        && git_dir(root).is_none()
 }
 
 /// Run `f` with git from `PATH` on the repository at `root`, for the free functions.
@@ -2179,21 +2193,26 @@ mod tests {
     }
 
     #[test]
-    fn git_dir_follows_a_dot_git_file() {
+    fn git_dir_needs_a_dot_git_git_names_back() {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(git_dir(dir.path()), None);
-        std::fs::write(
-            dir.path().join(".git"),
+        assert!(!dot_git_unverified(dir.path()));
+        // Pointers nothing names back (see `tautly_session::git_dirs_at`).
+        for pointer in [
             "gitdir: ../main/.git/worktrees/w\n",
-        )
-        .unwrap();
-        assert_eq!(
-            git_dir(dir.path()),
-            Some(dir.path().join("../main/.git/worktrees/w"))
-        );
-        std::fs::write(dir.path().join(".git"), "gitdir: /abs/repo.git\n").unwrap();
-        assert_eq!(git_dir(dir.path()), Some(PathBuf::from("/abs/repo.git")));
-        std::fs::write(dir.path().join(".git"), "not a pointer\n").unwrap();
+            "gitdir: /abs/repo.git\n",
+            "not a pointer\n",
+        ] {
+            std::fs::write(dir.path().join(".git"), pointer).unwrap();
+            assert_eq!(git_dir(dir.path()), None, "{pointer}");
+            assert!(dot_git_unverified(dir.path()), "{pointer}");
+        }
+        std::fs::remove_file(dir.path().join(".git")).unwrap();
+        std::fs::create_dir(dir.path().join(".git")).unwrap();
+        std::fs::write(dir.path().join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+        let real = dir.path().canonicalize().unwrap().join(".git");
+        assert_eq!(git_dir(dir.path()), Some(real));
+        std::fs::write(dir.path().join(".git/commondir"), "/elsewhere/.git\n").unwrap();
         assert_eq!(git_dir(dir.path()), None);
     }
 

@@ -279,11 +279,14 @@ impl EngineBuilder {
                 GitCheckpoints::shared(cp.with_process_groups(groups.clone()))
             });
         // Checkpoints are on in a git work tree, yet none can be taken: `.git` is a
-        // symbolic link (to a repository that may not be this one's), or no git to run.
+        // symbolic link (to a repository that may not be this one's), names a repository
+        // that does not name it back, or no git to run.
         let start_checkpoint = if !config.checkpoints.enabled || checkpoints.is_some() {
             StartCheckpoint::Idle
         } else if checkpoint::dot_git_is_link(&root) {
             StartCheckpoint::Skipped(Skip::GitDirSymlink)
+        } else if checkpoint::dot_git_unverified(&root) {
+            StartCheckpoint::Skipped(Skip::GitDirUnverified)
         } else if checkpoint::git_dir(&root).is_some() && checkpoint::git_on_path(&root).is_none() {
             StartCheckpoint::Skipped(Skip::NoGit)
         } else {
