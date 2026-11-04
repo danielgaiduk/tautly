@@ -9,6 +9,7 @@ pub mod auth;
 pub mod budget;
 pub mod checkpoint;
 pub mod config;
+pub mod detect;
 pub mod diff;
 mod dispatch;
 pub mod engine;
@@ -34,28 +35,43 @@ pub use budget::{Budget, BudgetState};
 pub use checkpoint::{CheckpointError, CheckpointRef, Checkpointer, RestorePlan, Skip};
 pub use config::{
     BudgetConfig, BudgetLimits, CheckpointConfig, CliOverrides, CompatEntry, Config, ConfigError,
-    LoadedConfig, ProviderEntry, ProvidersConfig, RoutingConfig, TelemetryConfig, config_home,
+    LoadedConfig, MODELS_FILE, ProviderEntry, ProvidersConfig, RoutingConfig, TelemetryConfig,
+    config_home, parse_models_file,
 };
 pub use engine::{Engine, EngineBuilder, EngineError, session_root};
 pub use evidence::{
     DEFAULT_TEST_COMMANDS, EvidenceConfig, EvidenceTracker, TestEvidence, TestMatcher,
 };
 pub use ledger::{Ledger, LedgerError, Totals};
-pub use mcp::{Approval, McpPlan, NoPreExec, PlannedServer, PreExecHook, plan_servers};
+pub use mcp::{
+    Approval, McpPlan, NoPreExec, PlannedServer, PreExecHook, plan_servers, provider_key_vars,
+};
 pub use protocol::{
     BudgetScope, Command, DiffFile, DiffStatus, EffectView, ErrorKind, Event, FinishReason,
     MAX_REPLACED_SHOWN, McpState, PROTOCOL_VERSION, ToolMetaView, UsageRole,
 };
-pub use provider_setup::{ProviderFactory, ProviderSetupError, known_provider, provider_label};
+pub use provider_setup::{
+    ProviderFactory, ProviderSetupError, known_provider, provider_for_with, provider_label,
+};
 pub use record::SessionRecord;
 pub use signals::{Signal, SignalPolicy, SignalRouter, handle_signals, install_signal_handlers};
-pub use workspace::{Workspace, Workspaces};
+pub use workspace::{IndexLockError, Workspace, Workspaces};
 // Types that appear in `Event` and `Command`, re-exported so clients need no other crate.
 pub use tautly_context::{Breakdown, MutationReason};
 pub use tautly_mcp::{McpConfig, ServerSource, ServerSpec};
 pub use tautly_memory::{MemAnchor, MemoryChange, MemoryEntry};
-pub use tautly_provider::{ModelId, Quota};
+pub use tautly_provider::{ModelId, ProviderEvent, Quota};
 // What a client needs to fill `CliOverrides` and to find the data directory.
 pub use tautly_sandbox::Mode;
 pub use tautly_session::paths::data_home;
 pub use tautly_tools::DiffPreview;
+// What the CLI's utility commands (`tautly prompt|sessions|models|mcp ...`) read, so that
+// `tautly-cli` depends on this crate alone.
+pub use tautly_context::prompt::system as system_prompt;
+pub use tautly_mcp::config::{import_into_toml, parse_mcp_json};
+pub use tautly_mcp::{McpHub, ServerStatus, printable, printable_multiline};
+pub use tautly_provider::{Catalog, ModelInfo, Price};
+pub use tautly_session::{
+    Error as LogError, Origin, SessionReader, SessionSummary as LogSummary,
+    list_here_in as list_logs_here, list_in as list_logs,
+};

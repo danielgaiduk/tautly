@@ -163,9 +163,12 @@ impl Fx {
         std::fs::write(self.dir.path().join(rel), text).unwrap();
     }
 
+    /// The mock serves the main model, the side model and every switch, so no test looks
+    /// up a key (the OS keychain can stall a lookup).
     fn builder(&self, cfg: Config, mock: &MockProvider) -> EngineBuilder {
         EngineBuilder {
             provider: Some(Arc::new(mock.clone())),
+            side_provider: Some(Arc::new(mock.clone())),
             provider_factory: Some(factory(mock)),
             data_home: Some(self.home.path().to_path_buf()),
             ..EngineBuilder::new(cfg, self.dir.path())
@@ -1224,6 +1227,106 @@ impl Run {
             tokio::time::timeout(WAIT, async { while self.events.recv().await.is_some() {} }).await;
         assert!(closed.is_ok(), "the engine did not stop");
     }
+}
+
+/// Re-review N2: a `Shutdown` sent while a resumed session restores its model (a keychain
+/// prompt nobody answers) stops it before the session-start checkpoint and MCP servers
+/// start.
+#[tokio::test]
+async fn a_shutdown_while_a_resumed_session_sets_up_its_model_starts_nothing() {
+    use std::sync::Mutex;
+    let fx = Fx::new();
+    // A git work tree, so checkpoints would be taken.
+    let git = std::process::Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(fx.dir.path())
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .status()
+        .unwrap();
+    assert!(git.success());
+    let mock = MockProvider::new(vec![reply("one")]);
+    let mut run = start(fx.builder(config("anthropic/a1"), &mock));
+    run.turn_with("one").await;
+    run.set_model("openai/o1").await;
+    let id = run.engine.session_id().to_string();
+    let path = run.engine.session_path().to_path_buf();
+    run.stop().await;
+    let logged = SessionReader::<SessionRecord>::open(&path)
+        .unwrap()
+        .records()
+        .count();
+
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let (entered_tx, release_rx) = (Mutex::new(entered_tx), Mutex::new(release_rx));
+    let built = mock.clone();
+    let slow: ProviderFactory = Arc::new(move |_: &ModelId| {
+        let _ = entered_tx.lock().unwrap().send(());
+        let _ = release_rx.lock().unwrap().recv();
+        Ok(Arc::new(built.clone()) as Arc<dyn Provider>)
+    });
+    let marker = fx.home.path().join("mcp-started");
+    let mut cfg = config("anthropic/a1");
+    cfg.mcp.servers.insert(
+        "probe".into(),
+        tautly_core::ServerSpec::Stdio {
+            command: "/bin/sh".into(),
+            args: vec![
+                "-c".into(),
+                format!("touch '{}'; sleep 30", marker.display()),
+            ],
+            env: Default::default(),
+            cwd: None,
+        },
+    );
+    let mut run = start(EngineBuilder {
+        provider_factory: Some(slow),
+        ..fx.resumed(cfg, &mock, &id)
+    });
+    tokio::task::spawn_blocking(move || entered_rx.recv_timeout(WAIT))
+        .await
+        .unwrap()
+        .expect("the resumed model was never set up");
+    run.send(Command::Shutdown).await;
+    let mut rest = Vec::new();
+    let closed = tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(ev) = run.events.recv().await {
+            rest.push(ev);
+        }
+    })
+    .await;
+    let _ = release_tx.send(());
+    assert!(closed.is_ok(), "shutdown waited for the model setup");
+    assert!(
+        !rest
+            .iter()
+            .any(|e| matches!(e, Event::McpServerStatus { .. })),
+        "{rest:?}"
+    );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!marker.exists(), "an MCP server was started");
+    let after: Vec<SessionRecord> = SessionReader::<SessionRecord>::open(&path)
+        .unwrap()
+        .records()
+        .skip(logged)
+        .map(|r| r.unwrap().1)
+        .collect();
+    assert!(
+        !after.iter().any(|r| matches!(
+            r,
+            SessionRecord::Checkpoint { .. } | SessionRecord::CheckpointSkipped { .. }
+        )),
+        "{after:?}"
+    );
+    assert!(after.contains(&SessionRecord::Command(Command::Shutdown)));
+    // Nor is the model it was on given up: a later resume is on it again.
+    assert!(
+        !after
+            .iter()
+            .any(|r| matches!(r, SessionRecord::ModelSet { .. })),
+        "{after:?}"
+    );
 }
 
 /// A session resumed after a switch is on the model it switched to, with that model's

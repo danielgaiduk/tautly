@@ -13,8 +13,9 @@
 //!
 //! Servers start in the background. The tool set changes only at a user-turn start
 //! (`Session::refresh_mcp_tools`): the first waits up to `startup_timeout_ms` for
-//! servers still starting; a server ready later, or a changed tool list, joins at the next
-//! one, with a warning that the cached prefix breaks once.
+//! servers still starting (a `Cancel` or `Shutdown` stops the wait); a server ready
+//! later, or a changed tool list, joins at the next one, with a warning that the cached
+//! prefix breaks once (that step's epoch is then forced cold).
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -200,7 +201,7 @@ fn check_private_pycache(dir: &Path, root: &Path) -> Result<(), String> {
 
 /// The default provider key variables plus every configured `api_key_env`: stripped from
 /// MCP servers and from bash commands.
-pub(crate) fn provider_key_vars(config: &Config) -> Vec<String> {
+pub fn provider_key_vars(config: &Config) -> Vec<String> {
     let p = &config.providers;
     let mut vars: Vec<String> = PROVIDER_KEY_VARS.iter().map(|s| s.to_string()).collect();
     let configured = [&p.anthropic, &p.openai, &p.google]
@@ -620,11 +621,18 @@ impl McpSession {
     }
 
     /// The MCP tools for a user turn that is starting, and whether it is the session's
-    /// first (which waits up to the start-up timeout for servers still starting).
-    pub async fn tools_for_turn(&mut self) -> (Vec<Arc<dyn Tool>>, bool) {
+    /// first (which waits up to the start-up timeout for servers still starting, unless
+    /// `cancel` fires first: then the tools ready by now).
+    pub async fn tools_for_turn(
+        &mut self,
+        cancel: &CancellationToken,
+    ) -> (Vec<Arc<dyn Tool>>, bool) {
         let first = !std::mem::replace(&mut self.waited, true);
         if first {
-            self.hub.wait_started(self.startup_timeout).await;
+            tokio::select! {
+                _ = self.hub.wait_started(self.startup_timeout) => {}
+                () = cancel.cancelled() => {}
+            }
         }
         (self.hub.ready_tools(), first)
     }
@@ -676,7 +684,7 @@ impl Session {
     /// offer the MCP tools that are ready now (the first turn waits for servers still
     /// starting). A different tool set than the last turn's is announced, since it breaks
     /// the cached prompt prefix once.
-    pub(crate) async fn refresh_mcp_tools(&mut self) {
+    pub(crate) async fn refresh_mcp_tools(&mut self, cancel: &CancellationToken) {
         let Some(told) = self.mcp.as_ref().map(McpSession::announcements) else {
             return;
         };
@@ -686,7 +694,7 @@ impl Session {
         let Some(mcp) = self.mcp.as_mut() else {
             return;
         };
-        let (extra, first) = mcp.tools_for_turn().await;
+        let (extra, first) = mcp.tools_for_turn(cancel).await;
         let tools = registry(&self.info.caps, extra);
         let specs: Vec<ToolSpec> = tools.iter().map(|t| t.spec(&self.info.caps)).collect();
         if specs != self.specs && !first {
@@ -704,6 +712,9 @@ impl Session {
                  new descriptions); the cached prompt prefix is rebuilt once for this turn"
             ))
             .await;
+            // Tools lead the prefix, so nothing cached survives: the step's epoch applies
+            // whatever is pending (pins, the memory index) in this same break (spec 7.7).
+            self.context.force_cold_epoch();
         }
         self.tools = tools;
         self.specs = specs;

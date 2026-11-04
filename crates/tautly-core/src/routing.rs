@@ -26,7 +26,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::Config;
-use crate::provider_setup::{ProviderSetupError, provider_for};
+use crate::provider_setup::ProviderSetupError;
 use crate::turn::partial_usage;
 
 /// What one side-model request billed.
@@ -258,21 +258,11 @@ impl Side {
 
     /// The side route of a session whose main provider is `main` (already wrapped in
     /// `Retrying`). `provider` serves the side model when the caller supplies one;
-    /// otherwise the main provider does if the side model has the same provider, and an
-    /// adapter built from the configuration (API key lookup, which may block) when not. If
-    /// none can be built the main model does side work, and the second value says so.
-    pub fn resolve(
-        config: &Config,
-        catalog: &Arc<Catalog>,
-        main: &Arc<dyn Provider>,
-        provider: Option<Arc<dyn Provider>>,
-    ) -> (Side, Option<String>) {
-        Side::resolve_with(config, catalog, main, provider, |id| {
-            provider_for(config, id, Arc::clone(catalog))
-        })
-    }
-
-    /// [`resolve`](Self::resolve) with `build` making the adapter for a side model of
+    /// otherwise the main provider does if the side model has the same provider, and
+    /// `build` makes an adapter (API key lookup, which may block) when not. If none can be
+    /// built the main model does side work, and the second value says so.
+    ///
+    /// `build` makes the adapter for a side model of
     /// another provider (`SetModel` passes its provider factory). It may block.
     pub fn resolve_with(
         config: &Config,

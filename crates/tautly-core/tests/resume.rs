@@ -235,11 +235,22 @@ impl Run {
     }
 
     /// Shut down and wait until the engine has stopped (its log is closed).
-    async fn stop(mut self) {
+    async fn stop(self) {
+        self.stop_events().await;
+    }
+
+    /// Shut down; the events until the stream closed.
+    async fn stop_events(mut self) -> Vec<Event> {
         self.send(Command::Shutdown).await;
-        let closed =
-            tokio::time::timeout(WAIT, async { while self.events.recv().await.is_some() {} }).await;
+        let mut out = Vec::new();
+        let closed = tokio::time::timeout(WAIT, async {
+            while let Some(ev) = self.events.recv().await {
+                out.push(ev);
+            }
+        })
+        .await;
         assert!(closed.is_ok(), "the engine did not stop");
+        out
     }
 }
 
@@ -593,6 +604,82 @@ async fn resume_restores_budget_spend_and_set_budget() {
     assert_eq!(finish_reason(&events), FinishReason::Budget, "{events:?}");
     assert_eq!(mock.requests().len(), 1);
     run.stop().await;
+}
+
+/// Review C M11: a cut at step N leaves out an undo done after it, as `state_at(N)` (the
+/// files before that undo) does: the rebuilt context is told nothing is stale.
+#[tokio::test]
+async fn a_cut_before_a_later_undo_leaves_the_undo_out() {
+    let fx = Fx::new();
+    let mut cfg = config(Mode::Ask);
+    cfg.permissions.mode = Mode::AutoEdit;
+    let mock = MockProvider::new(vec![
+        tools_step(vec![call(
+            "w1",
+            "write",
+            json!({"path": "a.txt", "content": "one\n"}),
+        )]),
+        text_step("written"),
+    ]);
+    let mut run = start(fx.builder(cfg, &mock));
+    run.turn_with("write it").await;
+    let path = run.engine.session_path().to_path_buf();
+    let before = rebuild_at(&path, None);
+    let last = before.context.next_turn() - 1;
+    run.send(Command::Undo {
+        turn: Some(1),
+        dry_run: false,
+    })
+    .await;
+    run.until(|e| matches!(e, Event::Undone { .. } | Event::Error { .. }))
+        .await;
+    run.stop().await;
+    assert!(
+        records_at(&path)
+            .iter()
+            .any(|r| matches!(r, SessionRecord::Undone { .. }))
+    );
+    let stale = |r: &Rebuilt| r.context.state.files.values().any(|n| n.maybe_stale);
+    assert!(!stale(&before));
+    // At the tip the undo is part of the state; cut at the turn's last step, it is not.
+    assert!(stale(&rebuild_at(&path, None)));
+    assert!(!stale(&rebuild_at(&path, Some(last))));
+}
+
+/// Review C M4: records of a type this version does not know are skipped, and the rebuild
+/// says so once.
+#[tokio::test]
+async fn a_rebuild_warns_once_about_records_of_a_newer_version() {
+    let fx = Fx::new();
+    let mock = MockProvider::new(vec![text_step("first")]);
+    let mut run = start(fx.builder(config(Mode::Ask), &mock));
+    run.turn_with("one").await;
+    let path = run.engine.session_path().to_path_buf();
+    run.stop().await;
+    let text = std::fs::read_to_string(&path).unwrap();
+    let last: Value = serde_json::from_str(text.lines().last().unwrap()).unwrap();
+    let (offset, t) = (last["offset"].as_u64().unwrap() + 1, last["t"].clone());
+    let mut appended = String::new();
+    for (i, data) in [
+        json!({"type": "tools_applied", "data": {"tools": []}}),
+        json!({"type": "hologram", "data": 1}),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let line = json!({"type": "record", "offset": offset + i as u64, "t": t, "data": data});
+        appended.push_str(&format!("{line}\n"));
+    }
+    std::fs::write(&path, format!("{text}{appended}")).unwrap();
+
+    let rebuilt = rebuild_at(&path, None);
+    let newer: Vec<&String> = rebuilt
+        .warnings
+        .iter()
+        .filter(|w| w.contains("newer version"))
+        .collect();
+    assert_eq!(newer.len(), 1, "{:?}", rebuilt.warnings);
+    assert!(newer[0].contains('2'), "{}", newer[0]);
 }
 
 #[tokio::test]
@@ -1240,6 +1327,187 @@ async fn context_overflow_compacts_and_retries_once() {
     assert_eq!(mock.requests().len(), before + 6);
 }
 
+/// The records between the last `TurnStart` and the `Request` after the last
+/// `Compaction`, by type.
+fn after_last_compaction(recs: &[SessionRecord]) -> Vec<&SessionRecord> {
+    let at = recs
+        .iter()
+        .rposition(|r| matches!(r, SessionRecord::Compaction { .. }))
+        .expect("a compaction");
+    recs[at + 1..]
+        .iter()
+        .take_while(|r| !matches!(r, SessionRecord::Request { .. }))
+        .collect()
+}
+
+/// A catalog with an explicit (warm) prompt cache and a window that never asks for
+/// threshold compaction.
+fn warm_cache_catalog() -> Catalog {
+    Catalog::from_toml(&format!(
+        r#"[models."{MODEL}"]
+context_window = 200000
+max_output = 8000
+parallel_tools = true
+reasoning = "none"
+cache = "explicit"
+images = false
+edit_format = "str_replace"
+"#
+    ))
+    .unwrap()
+}
+
+/// The records of the last turn before its first `Request`.
+fn before_last_request(recs: &[SessionRecord]) -> Vec<&SessionRecord> {
+    let at = recs
+        .iter()
+        .rposition(|r| matches!(r, SessionRecord::TurnStart { .. }))
+        .unwrap();
+    recs[at..]
+        .iter()
+        .take_while(|r| !matches!(r, SessionRecord::Request { .. }))
+        .collect()
+}
+
+/// Re-review N6: a manual `Compact` or `Uncompact` breaks the cached prefix between
+/// turns; the next step's epoch takes a pin sent after it along, so the prefix breaks
+/// once.
+#[tokio::test]
+async fn a_manual_compact_or_uncompact_makes_the_next_epoch_cold() {
+    for uncompact in [false, true] {
+        let fx = Fx::new();
+        let mut cfg = compaction_fixture(&fx);
+        cfg.catalog_overrides = Some(warm_cache_catalog());
+        let mut script = four_reads();
+        script.push(text_step("first done"));
+        script.push(text_step("SUMMARY-ONE"));
+        script.push(text_step("between"));
+        script.push(text_step("second done"));
+        let mock = MockProvider::new(script);
+        let mut run = start(fx.builder(cfg, &mock));
+        run.turn_with("first").await;
+        run.send(Command::Compact).await;
+        run.until(|e| matches!(e, Event::Compacted { .. })).await;
+        if uncompact {
+            // A request after the compaction warms the cache again.
+            run.turn_with("between").await;
+            run.send(Command::Uncompact).await;
+        }
+        run.send(Command::Pin {
+            text: "PIN-AFTER".into(),
+        })
+        .await;
+        let events = run.turn_with("second").await;
+        assert_eq!(
+            finish_reason(&events),
+            FinishReason::Completed,
+            "{events:?}"
+        );
+        let path = run.engine.session_path().to_path_buf();
+        run.stop().await;
+        let recs = records_at(&path);
+        if uncompact {
+            assert!(
+                recs.iter()
+                    .any(|r| matches!(r, SessionRecord::Uncompacted { .. })),
+                "{recs:?}"
+            );
+        }
+        let before = before_last_request(&recs);
+        assert!(
+            before
+                .iter()
+                .any(|r| matches!(r, SessionRecord::PinsFolded)),
+            "uncompact {uncompact}: {before:?}"
+        );
+    }
+}
+
+/// Re-review 2 M3: a `Compact` that changes nothing breaks no prefix, so the next epoch
+/// stays warm and a pin sent meanwhile waits in the state tail.
+#[tokio::test]
+async fn a_compact_that_changes_nothing_keeps_the_next_epoch_warm() {
+    let fx = Fx::new();
+    let mut cfg = config(Mode::Ask);
+    cfg.catalog_overrides = Some(warm_cache_catalog());
+    let mock = MockProvider::new(vec![text_step("first done"), text_step("second done")]);
+    let mut run = start(fx.builder(cfg, &mock));
+    run.turn_with("first").await;
+    run.send(Command::Compact).await;
+    run.until(
+        |e| matches!(e, Event::Warning { message } if message.contains("nothing to compact")),
+    )
+    .await;
+    run.send(Command::Pin {
+        text: "PIN-AFTER".into(),
+    })
+    .await;
+    run.turn_with("second").await;
+    let path = run.engine.session_path().to_path_buf();
+    run.stop().await;
+    let recs = records_at(&path);
+    let before = before_last_request(&recs);
+    assert!(
+        !before
+            .iter()
+            .any(|r| matches!(r, SessionRecord::PinsFolded)),
+        "{before:?}"
+    );
+}
+
+/// Review A M6: the overflow retry's compaction breaks the cached prefix outside the
+/// epoch; the retried step's epoch takes the pending pins with it, so it breaks once.
+#[tokio::test]
+async fn an_overflow_compaction_folds_pending_pins_into_the_same_prefix_break() {
+    let fx = Fx::new();
+    let mut cfg = compaction_fixture(&fx);
+    // A warm cache (and a window that never asks for threshold compaction).
+    cfg.catalog_overrides = Some(
+        Catalog::from_toml(&format!(
+            r#"[models."{MODEL}"]
+context_window = 200000
+max_output = 8000
+parallel_tools = true
+reasoning = "none"
+cache = "explicit"
+images = false
+edit_format = "str_replace"
+"#
+        ))
+        .unwrap(),
+    );
+    let mut script = four_reads();
+    script.push(text_step("first done"));
+    script.push(MockTurn::Error(ProviderError::ContextOverflow(
+        "too long".into(),
+    )));
+    script.push(text_step("SUMMARY-ONE"));
+    script.push(text_step("second done"));
+    let mock = MockProvider::new(script);
+    let mut run = start(fx.builder(cfg, &mock));
+    run.turn_with("first").await;
+    run.send(Command::Pin {
+        text: "PIN-AFTER-TURN-ONE".into(),
+    })
+    .await;
+    let events = run.turn_with("second").await;
+    assert_eq!(
+        finish_reason(&events),
+        FinishReason::Completed,
+        "{events:?}"
+    );
+    let path = run.engine.session_path().to_path_buf();
+    run.stop().await;
+    let recs = records_at(&path);
+    let between = after_last_compaction(&recs);
+    assert!(
+        between
+            .iter()
+            .any(|r| matches!(r, SessionRecord::PinsFolded)),
+        "{between:?}"
+    );
+}
+
 #[tokio::test]
 async fn uncompact_command_restores() {
     let fx = Fx::new();
@@ -1379,6 +1647,132 @@ async fn a_manual_compaction_can_be_cancelled() {
             .iter()
             .any(|r| matches!(r, SessionRecord::Compaction { .. }))
     );
+}
+
+/// A provider that panics on request `n` (0-based) and serves the mock otherwise: an
+/// engine bug in a job.
+struct PanicsOn {
+    mock: MockProvider,
+    n: usize,
+    seen: std::sync::atomic::AtomicUsize,
+}
+
+impl tautly_provider::Provider for PanicsOn {
+    fn name(&self) -> &str {
+        "mock"
+    }
+
+    fn stream(
+        &self,
+        req: CanonicalRequest,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> futures::stream::BoxStream<'static, Result<ProviderEvent, ProviderError>> {
+        let i = self.seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        assert_ne!(i, self.n, "probe: summary provider bug");
+        self.mock.stream(req, cancel)
+    }
+}
+
+/// Review A M3: the answer to a command the client asked for waits (a bounded time) for
+/// a client that is behind, instead of being dropped from a full channel.
+#[tokio::test]
+async fn replies_to_commands_wait_for_a_client_that_is_behind() {
+    let fx = Fx::new();
+    let mock = MockProvider::new(vec![text_step("one")]);
+    let mut run = start(fx.builder(config(Mode::Ask), &mock));
+    run.turn_with("one").await;
+    // Fill the event channel without reading it: each refused `SetBudget` is a warning.
+    for _ in 0..300 {
+        run.send(Command::SetBudget {
+            scope: BudgetScope::Session,
+            max_usd: Some(-1.0),
+            max_tokens: None,
+        })
+        .await;
+    }
+    run.send(Command::Undo {
+        turn: None,
+        dry_run: true,
+    })
+    .await;
+    run.send(Command::SetModel {
+        model: ModelId::from(MODEL),
+    })
+    .await;
+    run.send(Command::Compact).await;
+    run.send(Command::Uncompact).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let mut events = Vec::new();
+    let answered = |events: &[Event]| {
+        let warned = |s: &str| {
+            events
+                .iter()
+                .any(|e| matches!(e, Event::Warning { message } if message.contains(s)))
+        };
+        events.iter().any(|e| matches!(e, Event::Undone { .. }))
+            && events
+                .iter()
+                .any(|e| matches!(e, Event::ModelChanged { .. }))
+            && warned("nothing to compact")
+            && warned("nothing to restore")
+    };
+    let end = Instant::now() + Duration::from_secs(5);
+    while !answered(&events) && Instant::now() < end {
+        if let Ok(Some(ev)) =
+            tokio::time::timeout(Duration::from_millis(200), run.events.recv()).await
+        {
+            events.push(ev);
+        }
+    }
+    let tail: Vec<&Event> = events
+        .iter()
+        .filter(|e| !matches!(e, Event::Warning { message } if message.contains("SetBudget")))
+        .collect();
+    assert!(answered(&events), "{tail:?}");
+    run.stop().await;
+}
+
+/// Review A probe P7: a panic in a `Compact` job is no turn's end.
+#[tokio::test]
+async fn a_panic_in_a_compaction_job_logs_no_turn_end() {
+    let fx = Fx::new();
+    let mock = MockProvider::new((1..=3).map(|i| text_step(&format!("answer {i}"))).collect());
+    let provider = Arc::new(PanicsOn {
+        mock: mock.clone(),
+        n: 3,
+        seen: Default::default(),
+    });
+    let mut run = start(EngineBuilder {
+        provider: Some(provider),
+        ..fx.builder(config(Mode::Ask), &mock)
+    });
+    for i in 1..=3 {
+        run.turn_with(&format!("message {i}")).await;
+    }
+    run.send(Command::Compact).await;
+    let events = run
+        .until(|e| matches!(e, Event::Error { message, .. } if message.contains("panicked")))
+        .await;
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, Event::TurnFinished { .. })),
+        "{events:?}"
+    );
+    let path = run.engine.session_path().to_path_buf();
+    let rest = run.stop_events().await;
+    assert!(
+        !rest.iter().any(|e| matches!(e, Event::TurnFinished { .. })),
+        "{rest:?}"
+    );
+    let recs = records_at(&path);
+    let count = |f: fn(&SessionRecord) -> bool| recs.iter().filter(|r| f(r)).count();
+    assert_eq!(
+        count(|r| matches!(r, SessionRecord::TurnStart { .. })),
+        count(|r| matches!(r, SessionRecord::TurnEnd { .. })),
+        "{recs:?}"
+    );
+    assert_eq!(count(|r| matches!(r, SessionRecord::EngineError { .. })), 1);
 }
 
 // ------------------------------------------------------------------------------- undo

@@ -8,7 +8,8 @@
 //! index riding on the same epoch, so the cached prefix breaks at most once.
 //!
 //! Every provider response's usage (main and side, including a response that broke off
-//! and was sent again) is written to the cost ledger, shown as `Usage` and counted against
+//! and was sent again, and estimated for a response that reported none) is written to
+//! the cost ledger, shown as `Usage` and counted against
 //! the budgets (`budget.rs`). The budgets are checked at every step start, before every
 //! request and at every tool boundary. The turn timeout (`turn_timeout_s`) cancels the
 //! turn like `Cancel` does, and the turn ends with `timeout`.
@@ -41,7 +42,7 @@ use crate::memory::OVER_BUDGET_WARNING;
 use crate::model_switch::rejects_reasoning;
 use crate::protocol::{BudgetScope, Command, ErrorKind, Event, FinishReason, UsageRole};
 use crate::provider_setup::provider_label;
-use crate::record::SessionRecord;
+use crate::record::{CheckpointPoint, SessionRecord};
 use crate::routing::{Side, model_failed};
 use crate::session::Session;
 
@@ -289,7 +290,7 @@ impl Session {
                 }
             })
         });
-        self.apply_startup().await;
+        self.apply_startup(&ctl.cancel).await;
         self.evidence = self.evidence.fresh();
         self.memory.note_task(&text);
         self.user_turn += 1;
@@ -300,7 +301,7 @@ impl Session {
         .await;
         self.emit(Event::TurnStarted).await;
         // The tool set changes only here, so the turn's requests share one prefix.
-        self.refresh_mcp_tools().await;
+        self.refresh_mcp_tools(&ctl.cancel).await;
         self.budgets
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -328,10 +329,12 @@ impl Session {
                 reason: "cancelled".into(),
                 turn: self.user_turn,
                 step: self.last_step(),
+                point: Some(CheckpointPoint::TurnEnd),
             })
             .await;
         } else {
-            self.git_checkpoint(Point::TurnEnd, self.last_step(), None)
+            // A cancel while it is taken abandons it (`CheckpointSkipped{cancelled}`).
+            self.git_checkpoint(Point::TurnEnd, self.last_step(), Some(&ctl.cancel))
                 .await;
         }
         self.log(SessionRecord::TurnEnd {
@@ -405,6 +408,9 @@ impl Session {
                         self.warn(format!("{e}; compacting the context and retrying once"))
                             .await;
                         if self.compact(MutationReason::Forced, ctl).await {
+                            // The prefix broke outside the epoch: the retried step's epoch
+                            // takes the pending pins and memory index with it (spec 7.7).
+                            self.context.force_cold_epoch();
                             continue;
                         }
                         if ctl.cancel.is_cancelled() {
@@ -425,10 +431,18 @@ impl Session {
             )
             .await;
             self.context.note_request(sent_at, status.cached_prefix);
-            if let Some(u) = resp.usage {
-                self.context.calibrate(&status, &u);
-                self.spend(UsageRole::Main, u, resp.quota.clone(), false)
-                    .await;
+            match resp.usage {
+                Some(u) => {
+                    self.context.calibrate(&status, &u);
+                    self.spend(UsageRole::Main, u, resp.quota.clone(), false, true)
+                        .await;
+                }
+                // A server that sends no usage (one that ignores `include_usage`) is
+                // charged an estimate, as side requests are; never calibrated with.
+                None => {
+                    self.spend_partial(UsageRole::Main, &resp, u64::from(status.used))
+                        .await
+                }
             }
             self.emit(Event::context_status(&status)).await;
             steps += 1;
@@ -446,8 +460,9 @@ impl Session {
                 return FinishReason::Completed;
             }
             // The session-start checkpoint precedes the turn's first tool call in the log,
-            // and must not see its edits.
-            self.settle_start_checkpoint().await;
+            // and must not see its edits. A cancel stops the wait: every call is then
+            // answered `cancelled` without running, so the order no longer matters.
+            self.settle_start_checkpoint_or(&ctl.cancel).await;
             self.log_all(
                 resp.calls
                     .iter()
@@ -552,8 +567,10 @@ impl Session {
                     Some(Err(e)) => break Ended::Failed(e),
                 }
             };
+            // A complete response's discarded attempts are in its logged events.
+            let logged = matches!(ended, Ended::Done);
             for u in std::mem::take(&mut resp.discarded) {
-                self.spend(UsageRole::Main, u, None, false).await;
+                self.spend(UsageRole::Main, u, None, false, logged).await;
             }
             let e = match ended {
                 Ended::Done => return Ok(resp.finish()),
@@ -729,6 +746,11 @@ impl Session {
         for p in &rec.forgotten_paths {
             self.reads.forget_path(p);
         }
+        // A blob that cannot be written poisons the log (every later write fails, and the
+        // failure is reported once): the record is then left out like everything after it,
+        // and a resume rebuilds the state at the failure. The session goes on in memory,
+        // compacted, as it does after any log failure; keeping the history uncompacted
+        // would only make every later compaction fail too.
         let mut blobs = Vec::with_capacity(rec.removed_turns.len());
         for t in &rec.removed_turns {
             match self.blob(&serde_json::to_vec(t).unwrap_or_default()).await {
@@ -811,13 +833,22 @@ impl Session {
     async fn spend_partial(&mut self, role: UsageRole, resp: &Response, est_input: u64) {
         let est_output = resp.streamed_tokens(&self.context.tokens);
         let (u, estimated) = partial_usage(resp.usage, est_input, est_output);
-        self.spend(role, u, resp.quota.clone(), estimated).await;
+        self.spend(role, u, resp.quota.clone(), estimated, false)
+            .await;
     }
 
-    /// Account for one response of the main model (see [`Session::charge`]).
-    async fn spend(&mut self, role: UsageRole, u: RawUsage, quota: Option<Quota>, estimated: bool) {
+    /// Account for one response of the main model (see [`Session::charge`]); `in_log`:
+    /// a logged response carries this usage.
+    async fn spend(
+        &mut self,
+        role: UsageRole,
+        u: RawUsage,
+        quota: Option<Quota>,
+        estimated: bool,
+        in_log: bool,
+    ) {
         let (model, price) = (self.model.clone(), self.info.price);
-        self.charge(role, &model, price.as_ref(), u, quota, estimated)
+        self.charge(role, &model, price.as_ref(), u, quota, estimated, in_log)
             .await;
     }
 
@@ -825,8 +856,16 @@ impl Session {
     /// main model's (spec 7.5). An unpriced side model costs `None`.
     async fn spend_side(&mut self, u: RawUsage, estimated: bool) {
         let (model, price) = (self.side.model.clone(), self.side.info.price);
-        self.charge(UsageRole::Side, &model, price.as_ref(), u, None, estimated)
-            .await;
+        self.charge(
+            UsageRole::Side,
+            &model,
+            price.as_ref(),
+            u,
+            None,
+            estimated,
+            false,
+        )
+        .await;
     }
 
     /// Account for the side-model requests tools made (`web_fetch` answers) since the last
@@ -865,8 +904,10 @@ impl Session {
         );
     }
 
-    /// Account for one provider response of `model`: queue its ledger row, emit `Usage`, then
-    /// count it against the budgets (whose 80% and exhausted warnings follow the `Usage`).
+    /// Account for one provider response of `model`: queue its ledger row, log it as
+    /// `Charged` unless a logged response carries it (`in_log`), emit `Usage`, then count it
+    /// against the budgets (whose 80% and exhausted warnings follow the `Usage`).
+    #[allow(clippy::too_many_arguments)]
     async fn charge(
         &mut self,
         role: UsageRole,
@@ -875,7 +916,17 @@ impl Session {
         u: RawUsage,
         quota: Option<Quota>,
         estimated: bool,
+        in_log: bool,
     ) {
+        if !in_log {
+            self.log(SessionRecord::Charged {
+                role,
+                model: model.clone(),
+                usage: u,
+                estimated,
+            })
+            .await;
+        }
         let cost = cost_usd(&u, price);
         // Queued for the background writer: never waits (not even on the cancel path).
         let row = Row {

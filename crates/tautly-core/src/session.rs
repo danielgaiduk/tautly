@@ -53,6 +53,9 @@ const FINISH_GRACE: Duration = Duration::from_secs(5);
 ///   turn's sink is overflowing and every further event is dropped at once, except
 ///   `TurnFinished`, which (with the drop warning just before it) waits [`FINISH_GRACE`]
 ///   once, so a busy but reading client still learns that the turn ended.
+/// - A [`replying`](EventSink::replying) sink (the session's while it answers a command
+///   between turns) waits [`SEND_GRACE`] for room; once one has timed out every further
+///   event of that answer is dropped at once.
 /// - An unbound sink (the actor's, and the session's between turns) never waits.
 ///
 /// Dropped events are counted and announced with a warning when there is room.
@@ -60,8 +63,10 @@ const FINISH_GRACE: Duration = Duration::from_secs(5);
 pub(crate) struct EventSink {
     tx: mpsc::Sender<Event>,
     cancel: Option<CancellationToken>,
+    /// Waits [`SEND_GRACE`] on a full channel (an answer the client asked for).
+    replying: bool,
     dropped: Arc<AtomicU64>,
-    /// Set for the turn once a post-cancel send timed out.
+    /// Set for the turn (or the answer) once a send timed out.
     overflowing: Arc<AtomicBool>,
 }
 
@@ -70,6 +75,7 @@ impl EventSink {
         EventSink {
             tx,
             cancel: None,
+            replying: false,
             dropped: Arc::default(),
             overflowing: Arc::default(),
         }
@@ -79,6 +85,18 @@ impl EventSink {
     pub fn bound(&self, cancel: CancellationToken) -> Self {
         EventSink {
             cancel: Some(cancel),
+            replying: false,
+            overflowing: Arc::default(),
+            ..self.clone()
+        }
+    }
+
+    /// This sink, for the answer to a command the client sent (between turns, from the
+    /// actor): each event waits [`SEND_GRACE`] for room, until one times out.
+    pub fn replying(&self) -> Self {
+        EventSink {
+            cancel: None,
+            replying: true,
             overflowing: Arc::default(),
             ..self.clone()
         }
@@ -86,6 +104,16 @@ impl EventSink {
 
     pub async fn emit(&self, ev: Event) {
         let Some(cancel) = &self.cancel else {
+            if self.replying && !self.overflowing.load(Ordering::Relaxed) {
+                self.announce_dropped();
+                if let Err(mpsc::error::SendTimeoutError::Timeout(_)) =
+                    self.tx.send_timeout(ev, SEND_GRACE).await
+                {
+                    self.overflowing.store(true, Ordering::Relaxed);
+                    self.dropped.fetch_add(1, Ordering::Relaxed);
+                }
+                return;
+            }
             return self.try_emit(ev);
         };
         if !cancel.is_cancelled() {
@@ -347,7 +375,7 @@ pub(crate) struct Session {
     /// Wall-clock limit per user message.
     pub turn_timeout: Option<Duration>,
     /// Its background writer starts at [`Session::init`].
-    pub cost_ledger: CostLedger,
+    pub cost_ledger: Arc<CostLedger>,
     /// A dropped ledger row was reported; later ones are not.
     pub cost_ledger_reported: bool,
     /// The process groups this session's commands started (killed at shutdown).
@@ -444,11 +472,14 @@ impl Session {
         let pinned = pinned::render(&self.context.pinned);
         let agents_md = self.context.agents_md.clone();
         let repo_map = self.context.repo_map.clone();
-        let prefix_log = self.prefix_log.clone();
+        // A resumed session's check is for its first request only.
+        let mut prefix_log = self.prefix_log.clone();
+        self.prefix_log.check = false;
         let (turn, path) = (self.user_turn, self.last_request_path.clone());
         let logged = self
             .with_log(move |l| {
                 let prefix = prefix_log.due(agents_md.as_deref(), repo_map.as_deref(), &req);
+                let changed = prefix_log.changed(prefix.as_ref().map(|(rec, _)| rec));
                 if let Some((rec, texts)) = &prefix {
                     for t in texts {
                         l.blob(t.as_bytes())?;
@@ -465,11 +496,21 @@ impl Session {
                 };
                 write_private(&path, &bytes);
                 l.append(&rec)?;
-                Ok(prefix.map(|(rec, _)| rec))
+                Ok((prefix.map(|(rec, _)| rec), changed))
             })
             .await;
-        if let Some(Some(rec)) = logged {
+        let Some((rec, changed)) = logged else {
+            return;
+        };
+        if let Some(rec) = rec {
             self.prefix_log.logged(rec);
+        }
+        if let Some(what) = changed {
+            self.warn(format!(
+                "this version's {what} from the ones this session was logged with: the \
+                 provider's prompt cache is cold for this request"
+            ))
+            .await;
         }
     }
 
@@ -621,13 +662,17 @@ impl Session {
     }
 
     /// Before the first request: take the repo map and memory index if they are ready
-    /// within [`STARTUP_WAIT`], else run the session without them.
-    pub async fn apply_startup(&mut self) {
-        let Some(rx) = self.startup.as_mut().and_then(|s| s.prefix.take()) else {
+    /// within [`STARTUP_WAIT`], else run the session without them. A cancel (spec 8) stops
+    /// the wait and leaves them to the next turn's first request.
+    pub async fn apply_startup(&mut self, cancel: &CancellationToken) {
+        let Some(startup) = self.startup.as_mut() else {
             return;
         };
-        match tokio::time::timeout(STARTUP_WAIT, rx).await {
-            Ok(Ok(prefix)) => {
+        let Some(ready) = take_prefix(&mut startup.prefix, STARTUP_WAIT, cancel).await else {
+            return;
+        };
+        match ready {
+            Some(prefix) => {
                 self.context.repo_map = prefix.repo_map;
                 if prefix.memory_live {
                     self.memory.live = true;
@@ -637,7 +682,7 @@ impl Session {
                     }
                 }
             }
-            _ => {
+            None => {
                 self.warn(
                     "the code index is still building: this session runs without a repo map \
                      and memory index",
@@ -686,12 +731,34 @@ impl Session {
     }
 }
 
+/// Wait up to `wait` for the start-up prefix in `slot`: `Some(Some(prefix))` when it came,
+/// `Some(None)` when it did not in time (or its task ended), and `None` when `cancel`
+/// fired first, with the receiver put back in `slot` for the next turn. Nothing to wait
+/// for (`slot` empty): `None`.
+async fn take_prefix(
+    slot: &mut Option<oneshot::Receiver<Prefix>>,
+    wait: Duration,
+    cancel: &CancellationToken,
+) -> Option<Option<Prefix>> {
+    let mut rx = slot.take()?;
+    tokio::select! {
+        r = tokio::time::timeout(wait, &mut rx) => Some(r.ok().and_then(Result::ok)),
+        () = cancel.cancelled() => {
+            *slot = Some(rx);
+            None
+        }
+    }
+}
+
 /// The stable-prefix inputs last logged, to log `PrefixApplied` again only when they
 /// change (spec 6.5 H5). A record counts once [`logged`](Self::logged): one whose write
 /// failed is due again.
 #[derive(Clone, Default)]
 pub(crate) struct PrefixLog {
     last: Option<SessionRecord>,
+    /// The next request is compared with `last` (a resumed session's first request, H5):
+    /// a system prompt or tools that differ make the provider's cache cold.
+    check: bool,
 }
 
 impl PrefixLog {
@@ -707,22 +774,66 @@ impl PrefixLog {
             Some(Block::Text(t)) => t.as_str(),
             _ => "",
         };
+        let tools = serde_json::to_string(&req.tools).unwrap_or_default();
+        let tools_ref = blob_ref(tools.as_bytes());
         let rec = SessionRecord::PrefixApplied {
             agents_md: agents_md.map(|t| blob_ref(t.as_bytes())),
             repo_map: repo_map.map(|t| blob_ref(t.as_bytes())),
             system_prompt_hash: hex_hash(system.as_bytes()),
-            tools_hash: json_hash(&req.tools),
+            tools_hash: tools_ref.as_str().to_string(),
+            tools: Some(tools_ref),
         };
         if self.last.as_ref() == Some(&rec) {
             return None;
         }
-        let texts = [agents_md, repo_map].into_iter().flatten();
-        Some((rec, texts.map(str::to_string).collect()))
+        let mut texts: Vec<String> = [agents_md, repo_map]
+            .into_iter()
+            .flatten()
+            .map(str::to_string)
+            .collect();
+        texts.push(tools);
+        Some((rec, texts))
     }
 
     /// `rec` (from [`due`](Self::due)) is in the log.
     pub fn logged(&mut self, rec: SessionRecord) {
         self.last = Some(rec);
+    }
+
+    /// Compare the next request's prefix with the last logged one ([`changed`]).
+    ///
+    /// [`changed`]: Self::changed
+    pub fn check_next(&mut self) {
+        self.check = true;
+    }
+
+    /// What of the last logged prefix differs in `due` (a record [`due`](Self::due) gave
+    /// for the next request), if a check is armed; disarms it.
+    fn changed(&mut self, due: Option<&SessionRecord>) -> Option<&'static str> {
+        if !std::mem::take(&mut self.check) {
+            return None;
+        }
+        let (
+            Some(SessionRecord::PrefixApplied {
+                system_prompt_hash: system,
+                tools_hash: tools,
+                ..
+            }),
+            Some(SessionRecord::PrefixApplied {
+                system_prompt_hash: logged_system,
+                tools_hash: logged_tools,
+                ..
+            }),
+        ) = (due, &self.last)
+        else {
+            return None;
+        };
+        match (system != logged_system, tools != logged_tools) {
+            (true, true) => Some("system prompt and tools differ"),
+            (true, false) => Some("system prompt differs"),
+            (false, true) => Some("tools differ"),
+            (false, false) => None,
+        }
     }
 }
 
@@ -810,12 +921,14 @@ mod tests {
         let mut log = PrefixLog::default();
         let req = request("sys", "read");
         let (first, texts) = log.due(Some("agents"), None, &req).expect("first");
-        assert_eq!(texts, ["agents"]);
+        let tools_json = serde_json::to_string(&req.tools).unwrap();
+        assert_eq!(texts, ["agents".to_string(), tools_json.clone()]);
         let SessionRecord::PrefixApplied {
             agents_md,
             repo_map,
             system_prompt_hash,
             tools_hash,
+            tools,
         } = &first
         else {
             panic!("{first:?}")
@@ -823,7 +936,8 @@ mod tests {
         assert_eq!(agents_md.as_ref(), Some(&blob_ref(b"agents")));
         assert_eq!(*repo_map, None);
         assert_eq!(*system_prompt_hash, blake3::hash(b"sys").to_hex().as_str());
-        assert_eq!(tools_hash.len(), 64);
+        assert_eq!(*tools_hash, json_hash(&req.tools));
+        assert_eq!(tools.as_ref(), Some(&blob_ref(tools_json.as_bytes())));
         log.logged(first.clone());
         assert!(log.due(Some("agents"), None, &req).is_none());
         // Each input on its own makes it due again.
@@ -839,6 +953,54 @@ mod tests {
             log_if_due(&mut log, Some("agents"), None, &req),
             Some(first)
         );
+    }
+
+    /// Re-review N4: a cancel stops the start-up wait at once and keeps the receiver, so
+    /// the next turn's first request still takes the repo map.
+    #[tokio::test]
+    async fn a_cancelled_startup_wait_returns_at_once_and_keeps_the_prefix_for_later() {
+        let (tx, rx) = oneshot::channel();
+        let mut slot = Some(rx);
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let t0 = std::time::Instant::now();
+        assert!(
+            take_prefix(&mut slot, Duration::from_secs(30), &cancel)
+                .await
+                .is_none()
+        );
+        assert!(
+            t0.elapsed() < Duration::from_millis(20),
+            "{:?}",
+            t0.elapsed()
+        );
+        assert!(slot.is_some(), "the receiver is kept");
+        tx.send(Prefix {
+            repo_map: Some("MAP".into()),
+            memory_live: false,
+        })
+        .map_err(drop)
+        .unwrap();
+        let got = take_prefix(
+            &mut slot,
+            Duration::from_secs(30),
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("not cancelled")
+        .expect("ready");
+        assert_eq!(got.repo_map.as_deref(), Some("MAP"));
+        assert!(slot.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_startup_wait_that_runs_out_says_so() {
+        let (_tx, rx) = oneshot::channel::<Prefix>();
+        let mut slot = Some(rx);
+        let never = CancellationToken::new();
+        let got = take_prefix(&mut slot, Duration::from_millis(10), &never).await;
+        assert!(matches!(got, Some(None)));
+        assert!(slot.is_none());
     }
 
     #[test]

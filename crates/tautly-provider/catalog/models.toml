@@ -116,3 +116,99 @@ input = 0.5
 output = 3.0
 cache_read = 0.05
 cache_write = 0.0
+
+# OpenRouter (`compat:openrouter/<OpenRouter model id>`): the three native providers'
+# main-tier models at OpenRouter list prices, used when only an OpenRouter key exists
+# (spec 7.11.2). The OpenAI-compatible adapter sends no cache breakpoints or reasoning
+# settings, so these entries claim neither.
+
+[models."compat:openrouter/anthropic/claude-sonnet-5.5"]
+context_window = 200000
+max_output = 64000
+parallel_tools = true
+reasoning = "none"
+cache = "none"
+images = true
+edit_format = "str_replace"
+[models."compat:openrouter/anthropic/claude-sonnet-5.5".price]
+input = 3.0
+output = 15.0
+cache_read = 0.3
+cache_write = 3.75
+
+[models."compat:openrouter/openai/gpt-5"]
+context_window = 400000
+max_output = 128000
+parallel_tools = true
+reasoning = "none"
+cache = "automatic"
+images = true
+edit_format = "patch"
+[models."compat:openrouter/openai/gpt-5".price]
+input = 1.25
+output = 10.0
+cache_read = 0.125
+cache_write = 0.0
+
+[models."compat:openrouter/google/gemini-3-pro"]
+context_window = 1000000
+max_output = 64000
+parallel_tools = true
+reasoning = "none"
+cache = "automatic"
+images = true
+edit_format = "str_replace"
+[models."compat:openrouter/google/gemini-3-pro".price]
+input = 2.0
+output = 12.0
+cache_read = 0.2
+cache_write = 0.0
+
+# Common local Ollama models (`compat:ollama/<name:tag>`): unpriced (local), with the
+# conservative capabilities of an unknown model. Ollama's own default context is smaller
+# than the models allow unless `num_ctx` is raised, so the window stays at 32,000.
+
+[models."compat:ollama/qwen3-coder:30b"]
+context_window = 32000
+max_output = 4000
+parallel_tools = false
+reasoning = "none"
+cache = "none"
+images = false
+edit_format = "hashline"
+
+[models."compat:ollama/gpt-oss:20b"]
+context_window = 32000
+max_output = 4000
+parallel_tools = false
+reasoning = "none"
+cache = "none"
+images = false
+edit_format = "hashline"
+
+[models."compat:ollama/devstral:24b"]
+context_window = 32000
+max_output = 4000
+parallel_tools = false
+reasoning = "none"
+cache = "none"
+images = false
+edit_format = "hashline"
+
+[models."compat:ollama/qwen2.5-coder:7b"]
+context_window = 32000
+max_output = 4000
+parallel_tools = false
+reasoning = "none"
+cache = "none"
+images = false
+edit_format = "hashline"
+
+[models."compat:ollama/llama3.1:8b"]
+context_window = 32000
+max_output = 4000
+parallel_tools = false
+reasoning = "none"
+cache = "none"
+images = false
+edit_format = "hashline"

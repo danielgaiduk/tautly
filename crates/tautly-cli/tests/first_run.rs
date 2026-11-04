@@ -1,0 +1,349 @@
+//! Zero-config first run (spec 7.11.2) through the `tautly` binary: detection, the startup
+//! line and the setup hint. Feature `mock`: `cargo test -p tautly-cli --features mock`.
+
+mod common;
+
+use common::{Scratch, stderr, stdout};
+use serde_json::{Value, json};
+
+fn text(t: &str) -> Value {
+    json!([{"text_delta": t}, {"done": {"stop": "end_turn"}}])
+}
+
+#[test]
+fn mock_script_skips_detection() {
+    let s = Scratch::new();
+    // Reading this "keychain" fails: detection would end the run with an error.
+    std::fs::write(s.store_path(), "not json").unwrap();
+    let script = s.script(json!([text("Hello from the mock.")]));
+    let out = s.run(&["-p", "hi", "--mock-script", &script]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert_eq!(stdout(&out), "Hello from the mock.\n");
+    assert!(!stderr(&out).contains("using "), "{}", stderr(&out));
+}
+
+#[test]
+fn no_provider_found_exits_1_with_hint() {
+    let s = Scratch::new();
+    let out = s.run(&["-p", "hi"]);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    let err = stderr(&out);
+    for needle in [
+        "no model provider found",
+        "ANTHROPIC_API_KEY",
+        "OPENAI_API_KEY",
+        "GEMINI_API_KEY",
+        "OPENROUTER_API_KEY",
+        "tautly auth add",
+        "Ollama",
+    ] {
+        assert!(err.contains(needle), "{needle} missing from:\n{err}");
+    }
+    assert!(stdout(&out).is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn startup_line_on_stderr_not_stdout() {
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let sse = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hello\"}}]}\n\n\
+               data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n\
+               data: [DONE]\n\n";
+    Mock::given(method("POST"))
+        .and(path("/api/v1/chat/completions"))
+        .and(header("authorization", "Bearer sk-or-test"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(sse),
+        )
+        .expect(1..)
+        .mount(&server)
+        .await;
+
+    let s = Scratch::new();
+    // The built-in `openrouter` entry, pointed at the mock server.
+    s.user_config(&format!(
+        "[[providers.compat]]\nname = \"openrouter\"\nbase_url = \"{}/api/v1\"\n\
+         api_key_env = \"OPENROUTER_API_KEY\"\n",
+        server.uri()
+    ));
+    let mut cmd = s.command(&["-p", "hi", "--output", "json"]);
+    cmd.env("OPENROUTER_API_KEY", "sk-or-test");
+    let out = tokio::task::spawn_blocking(move || cmd.output().unwrap())
+        .await
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let err = stderr(&out);
+    assert!(
+        err.starts_with(
+            "using compat:openrouter/openai/gpt-5 (from OPENROUTER_API_KEY) · /model to switch \
+             · tautly doctor to check\n"
+        ),
+        "{err}"
+    );
+    let text = stdout(&out);
+    assert!(!text.contains("using "), "{text}");
+    let events: Vec<Value> = text
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap_or_else(|e| panic!("not JSON ({e}): {l}")))
+        .collect();
+    assert!(
+        events.iter().any(|e| e["type"] == "turn_finished"),
+        "{text}"
+    );
+    assert!(!text.contains("sk-or-test") && !err.contains("sk-or-test"));
+}
+
+#[test]
+fn configured_model_without_key_fails_with_same_hint() {
+    let s = Scratch::new();
+    s.user_config("model = \"openai/gpt-5\"\n");
+    let out = s.run(&["-p", "hi"]);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    let err = stderr(&out);
+    assert!(err.contains("no API key for openai"), "{err}");
+    for needle in [
+        "OPENAI_API_KEY",
+        "OPENROUTER_API_KEY",
+        "tautly auth add",
+        "Ollama",
+    ] {
+        assert!(err.contains(needle), "{needle} missing from:\n{err}");
+    }
+    assert!(
+        !err.contains("using "),
+        "a configured model is not announced: {err}"
+    );
+    assert!(stdout(&out).is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_keychain_key_is_detected_and_used_for_the_session() {
+    use wiremock::matchers::{header, method};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    // The session's provider gets its key from the same (file) keychain detection read:
+    // the request carries it. The server refuses the request, which ends the turn.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(header("x-goog-api-key", "key-from-keychain"))
+        .respond_with(ResponseTemplate::new(400).set_body_string("{\"error\":{}}"))
+        .expect(1..)
+        .mount(&server)
+        .await;
+    let s = Scratch::new();
+    s.store_secret("google", "key-from-keychain");
+    s.user_config(&format!(
+        "[providers.google]\nbase_url = \"{}\"\n",
+        server.uri()
+    ));
+    let mut cmd = s.command(&["-p", "hi", "--output", "json"]);
+    let out = tokio::task::spawn_blocking(move || cmd.output().unwrap())
+        .await
+        .unwrap();
+    let err = stderr(&out);
+    assert!(
+        err.starts_with("using google/gemini-3-pro (from the keychain)"),
+        "{err}"
+    );
+    assert!(!err.contains("key-from-keychain") && !stdout(&out).contains("key-from-keychain"));
+}
+
+// ---- the configured key variable (review I1): detection, the session and doctor agree ----
+
+#[tokio::test(flavor = "multi_thread")]
+async fn only_the_configured_key_variable_set_is_detected_and_used() {
+    use wiremock::matchers::{header, method};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(header("x-api-key", "work-key"))
+        .respond_with(ResponseTemplate::new(400).set_body_string("{\"error\":{}}"))
+        .expect(1..)
+        .mount(&server)
+        .await;
+    let s = Scratch::new();
+    s.user_config(&format!(
+        "[providers.anthropic]\napi_key_env = \"WORK_KEY\"\nbase_url = \"{}\"\n",
+        server.uri()
+    ));
+    let mut cmd = s.command(&["-p", "hi", "--output", "json"]);
+    cmd.env("WORK_KEY", "work-key");
+    let out = tokio::task::spawn_blocking(move || cmd.output().unwrap())
+        .await
+        .unwrap();
+    let err = stderr(&out);
+    assert!(
+        err.starts_with("using anthropic/claude-sonnet-5-5 (from WORK_KEY)"),
+        "{err}"
+    );
+
+    let mut cmd = s.command(&["doctor", "--offline"]);
+    cmd.env("WORK_KEY", "work-key");
+    let out = tokio::task::spawn_blocking(move || cmd.output().unwrap())
+        .await
+        .unwrap();
+    let text = stdout(&out);
+    assert_eq!(out.status.code(), Some(0), "{text}");
+    assert!(
+        text.contains("ok    model: anthropic/claude-sonnet-5-5 (detected from WORK_KEY)"),
+        "{text}"
+    );
+    assert!(
+        text.contains("ok    keys: anthropic: environment (WORK_KEY)"),
+        "{text}"
+    );
+}
+
+#[test]
+fn only_the_default_variable_set_while_another_is_configured_finds_nothing() {
+    let s = Scratch::new();
+    s.user_config("[providers.anthropic]\napi_key_env = \"WORK_KEY\"\n");
+    let mut cmd = s.command(&["-p", "hi"]);
+    cmd.env("ANTHROPIC_API_KEY", "default-key");
+    let out = cmd.output().unwrap();
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    let err = stderr(&out);
+    assert!(err.contains("no model provider found"), "{err}");
+    assert!(err.contains("set WORK_KEY, OPENAI_API_KEY"), "{err}");
+    assert!(!err.contains("ANTHROPIC_API_KEY"), "{err}");
+    assert!(!err.contains("using "), "{err}");
+
+    // doctor says the same.
+    let mut cmd = s.command(&["doctor", "--offline"]);
+    cmd.env("ANTHROPIC_API_KEY", "default-key");
+    let out = cmd.output().unwrap();
+    let text = stdout(&out);
+    assert_eq!(out.status.code(), Some(1), "{text}");
+    assert!(text.contains("info  keys: anthropic: none"), "{text}");
+    let model: Vec<&str> = text
+        .lines()
+        .filter(|l| l.starts_with("fail  model: no model provider found"))
+        .collect();
+    assert_eq!(model.len(), 1, "{text}");
+    assert!(model[0].contains("WORK_KEY") && !model[0].contains("ANTHROPIC_API_KEY"));
+
+    // A configured model with the same setup: the missing-key error and its hint name
+    // the variable the session reads.
+    s.user_config("model = \"anthropic/claude-sonnet-5-5\"\n[providers.anthropic]\napi_key_env = \"WORK_KEY\"\n");
+    let mut cmd = s.command(&["-p", "hi"]);
+    cmd.env("ANTHROPIC_API_KEY", "default-key");
+    let out = cmd.output().unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let err = stderr(&out);
+    assert!(
+        err.contains("no API key for anthropic: set WORK_KEY"),
+        "{err}"
+    );
+    assert!(!err.contains("ANTHROPIC_API_KEY"), "{err}");
+}
+
+// ---- review M1: nothing found is not remembered ----
+
+#[test]
+fn rpc_detects_again_after_nothing_was_found() {
+    use std::io::{BufRead as _, Write as _};
+    use std::process::Stdio;
+
+    let s = Scratch::new();
+    // Google points nowhere reachable: opening a session sends no request.
+    s.user_config("[providers.google]\nbase_url = \"http://127.0.0.1:9\"\n");
+    let mut child = s
+        .command(&["--rpc"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut out = std::io::BufReader::new(child.stdout.take().unwrap());
+    let root = s.work.path().to_string_lossy().into_owned();
+    let mut answer = |id: u64, method: &str, params: Value| -> Value {
+        let msg = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
+        writeln!(stdin, "{msg}").unwrap();
+        loop {
+            let mut line = String::new();
+            assert!(out.read_line(&mut line).unwrap() > 0, "output ended");
+            let msg: Value = serde_json::from_str(&line).unwrap();
+            if msg["id"] == id {
+                return msg;
+            }
+        }
+    };
+    let init = answer(
+        1,
+        "initialize",
+        json!({"protocol": "1.0", "session": false}),
+    );
+    assert!(init["result"].is_object(), "{init}");
+    let first = answer(2, "session/new", json!({"root": root}));
+    let message = first["error"]["message"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(message.contains("no model provider found"), "{first}");
+
+    // The user stores a key meanwhile (`tautly auth add google`).
+    s.store_secret("google", "key-from-keychain");
+    let second = answer(3, "session/new", json!({"root": root}));
+    assert!(second["result"]["session_id"].is_string(), "{second}");
+    let _ = answer(4, "shutdown", json!({}));
+    drop(stdin);
+    let done = child.wait_with_output().unwrap();
+    let err = stderr(&done);
+    assert_eq!(
+        err.matches("using google/gemini-3-pro (from the keychain)")
+            .count(),
+        1,
+        "{err}"
+    );
+}
+
+// ---- review M4: a side model of another provider uses the same keychain ----
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_side_model_of_another_provider_reads_the_selected_keychain() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(400).set_body_string("{\"error\":{}}"))
+        .mount(&server)
+        .await;
+    for (openai_key, usable) in [(true, true), (false, false)] {
+        let s = Scratch::new();
+        s.user_config(&format!(
+            "model = \"google/gemini-3-pro\"\n[routing]\nside_model = \"openai/gpt-5-mini\"\n\
+             [providers.google]\nbase_url = \"{uri}\"\n[providers.openai]\nbase_url = \"{uri}\"\n",
+            uri = server.uri()
+        ));
+        s.store_secret("google", "g-key");
+        if openai_key {
+            s.store_secret("openai", "o-key");
+        }
+        let mut cmd = s.command(&["-p", "hi", "--output", "json"]);
+        let out = tokio::task::spawn_blocking(move || cmd.output().unwrap())
+            .await
+            .unwrap();
+        let unusable = stdout(&out)
+            .lines()
+            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+            .any(|e| {
+                e["type"] == "warning"
+                    && e["message"]
+                        .as_str()
+                        .is_some_and(|m| m.contains("side model openai/gpt-5-mini cannot be used"))
+            });
+        assert_eq!(
+            !unusable,
+            usable,
+            "openai key stored: {openai_key}\n{}",
+            stdout(&out)
+        );
+    }
+}

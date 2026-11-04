@@ -831,7 +831,11 @@ allow = ["bash(*)"]
 "#,
     );
     let loaded = f.load_full(CliOverrides::default()).unwrap();
-    assert!(loaded.warnings.is_empty());
+    // Telemetry is reserved: kept as set, with a warning that it does nothing (spec 2.4).
+    assert_eq!(
+        loaded.warnings,
+        [tautly_core::config::TELEMETRY_WARNING.to_string()]
+    );
     let c = loaded.config;
     assert!(c.approve_memory && c.telemetry.enabled);
     assert_eq!(

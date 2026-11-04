@@ -34,6 +34,16 @@ const MAX_CONFIG_BYTES: u64 = 256 * 1024;
 /// Model used when no layer names one.
 pub const DEFAULT_MODEL: &str = "anthropic/claude-sonnet-5-5";
 
+/// The built-in `[[providers.compat]]` entry `openrouter` (spec 7.11.2).
+pub const OPENROUTER_URL: &str = "https://openrouter.ai/api/v1";
+/// Where the built-in `openrouter` entry finds its key.
+pub const OPENROUTER_KEY_ENV: &str = "OPENROUTER_API_KEY";
+/// The built-in `[[providers.compat]]` entry `ollama`: a local Ollama, no key.
+pub const OLLAMA_URL: &str = "http://localhost:11434/v1";
+
+/// What loading says when `[telemetry] enabled = true` (spec 2.4: reserved, ignored).
+pub const TELEMETRY_WARNING: &str = "[telemetry] OpenTelemetry export is post-v1; ignored";
+
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
     #[error("cannot read {}: {source}", path.display())]
@@ -209,15 +219,37 @@ impl Default for Config {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProvidersConfig {
     pub anthropic: Option<ProviderEntry>,
     pub openai: Option<ProviderEntry>,
     pub google: Option<ProviderEntry>,
-    /// OpenAI-compatible endpoints (`[[providers.compat]]`).
+    /// OpenAI-compatible endpoints (`[[providers.compat]]`). Built-in `openrouter` and
+    /// `ollama` entries are added unless these define those names
+    /// ([`Config::effective_compat`]).
     #[serde(default)]
     pub compat: Vec<CompatEntry>,
+    /// Detect a provider when no layer or flag names a model (spec 7.11.2; default on).
+    /// User layer and command line only, like every `providers` key.
+    #[serde(default = "default_auto_detect")]
+    pub auto_detect: bool,
+}
+
+impl Default for ProvidersConfig {
+    fn default() -> Self {
+        ProvidersConfig {
+            anthropic: None,
+            openai: None,
+            google: None,
+            compat: Vec::new(),
+            auto_detect: default_auto_detect(),
+        }
+    }
+}
+
+fn default_auto_detect() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -334,6 +366,10 @@ pub struct LoadedConfig {
     /// One line per setting the project file was not allowed to make, for the engine to
     /// report as `Event::Warning`.
     pub warnings: Vec<String>,
+    /// Whether a layer or flag named the model (else `config.model` is the default and
+    /// provider detection may choose another, spec 7.11.2). A project `model` the loader
+    /// dropped does not count.
+    pub model_explicit: bool,
 }
 
 impl Config {
@@ -347,6 +383,40 @@ impl Config {
             .and_then(|v| serde_json::to_vec(&v))
             .unwrap_or_default();
         blake3::hash(&canonical).to_hex().to_string()
+    }
+
+    /// The `[[providers.compat]]` entries plus the built-in `openrouter`
+    /// ([`OPENROUTER_URL`], key from [`OPENROUTER_KEY_ENV`]) and `ollama` ([`OLLAMA_URL`],
+    /// no key), each unless an entry of that name is configured.
+    pub fn effective_compat(&self) -> Vec<CompatEntry> {
+        let mut entries = self.providers.compat.clone();
+        let builtins = [
+            ("openrouter", OPENROUTER_URL, Some(OPENROUTER_KEY_ENV)),
+            ("ollama", OLLAMA_URL, None),
+        ];
+        for (name, url, key_env) in builtins {
+            if entries.iter().any(|c| c.name == name) {
+                continue;
+            }
+            let Ok(base_url) = Url::parse(url) else {
+                continue;
+            };
+            entries.push(CompatEntry {
+                name: name.to_string(),
+                base_url,
+                api_key_env: key_env.map(str::to_string),
+            });
+        }
+        entries
+    }
+
+    /// The built-in model catalog with `catalog_overrides` applied.
+    pub fn effective_catalog(&self) -> Catalog {
+        let mut catalog = Catalog::builtin();
+        if let Some(overrides) = self.catalog_overrides.clone() {
+            catalog.merge(overrides);
+        }
+        catalog
     }
 
     /// Defaults, then `<config home>/config.toml`, then `<root>/.tautly/config.toml`, then
@@ -435,6 +505,15 @@ impl Config {
                 }
                 (Err(e), _) => return Err(e),
             };
+            // The user's model catalog file (`tautly models update`) sits next to the user
+            // file; the user file's own `[catalog_overrides]` win over it.
+            let layer = if trust == Trust::User {
+                let mut layer = layer.unwrap_or_default();
+                add_models_file(&mut layer, &path.with_file_name(MODELS_FILE), &mut warnings);
+                (!layer.is_empty()).then_some(layer)
+            } else {
+                layer
+            };
             let Some(mut layer) = layer else {
                 continue;
             };
@@ -466,6 +545,8 @@ impl Config {
                 })?;
             deep_merge(&mut merged, layer);
         }
+        // Defaults are not in `merged`: a `model` there came from a file (or the flag).
+        let model_explicit = merged.contains_key("model") || cli.model.is_some();
         deep_merge(&mut merged, cli_table(&cli));
 
         let mut cfg: Config = Value::Table(merged)
@@ -476,9 +557,13 @@ impl Config {
             })?;
         cfg.validate()?;
         cfg.project_mcp_servers = project_mcp_servers;
+        if cfg.telemetry.enabled {
+            warnings.push(TELEMETRY_WARNING.to_string());
+        }
         Ok(LoadedConfig {
             config: cfg,
             warnings,
+            model_explicit,
         })
     }
 
@@ -1041,6 +1126,83 @@ fn retain_known(
             ignore(&format!("{scope}.{key}"), "unknown setting");
         }
     }
+}
+
+/// The models file next to the user config file: `[models."provider/model"]` entries, as
+/// `tautly models update` writes them. An entry of a built-in model may hold only some
+/// fields (`models update` writes the window, output limit, image support and prices): the
+/// rest comes from the built-in entry of the running version, so a later release's changes
+/// to a model's capabilities are not frozen out.
+pub const MODELS_FILE: &str = "models.toml";
+
+/// `models` with each entry of a built-in model laid over its current built-in entry,
+/// checked as a catalog.
+fn overlay_models(mut models: Table) -> Result<Table, String> {
+    if let Some(Value::Table(entries)) = models.get_mut("models") {
+        let builtin = match Value::try_from(Catalog::builtin()) {
+            Ok(Value::Table(mut t)) => match t.remove("models") {
+                Some(Value::Table(m)) => m,
+                _ => Table::new(),
+            },
+            _ => Table::new(),
+        };
+        for (id, entry) in entries.iter_mut() {
+            if let (Some(Value::Table(base)), Value::Table(over)) = (builtin.get(id), entry.clone())
+            {
+                let mut merged = base.clone();
+                deep_merge(&mut merged, over);
+                *entry = Value::Table(merged);
+            }
+        }
+    }
+    Value::Table(models.clone())
+        .try_into::<Catalog>()
+        .map_err(|e| e.to_string())?;
+    Ok(models)
+}
+
+/// The entries of a models file (`text`) as the configuration loader applies them: built-in
+/// models with their current built-in capabilities. A file with no entries is an empty
+/// catalog.
+pub fn parse_models_file(text: &str) -> Result<Catalog, String> {
+    let table: Table = toml::from_str(text).map_err(|e| e.to_string())?;
+    if table.is_empty() {
+        return Ok(Catalog::default());
+    }
+    Value::Table(overlay_models(table)?)
+        .try_into()
+        .map_err(|e: toml::de::Error| e.to_string())
+}
+
+/// Put the entries of the models file at `path` under `layer`'s `[catalog_overrides]` (the
+/// layer's own entries win). A file that cannot be read, or whose entries are not catalog
+/// entries, is skipped with a warning: `tautly models update` rewrites it.
+fn add_models_file(layer: &mut Table, path: &Path, warnings: &mut Vec<String>) {
+    let models = match read_layer(path, true) {
+        Ok(Some(t)) => t,
+        Ok(None) => return,
+        Err(e) => {
+            warnings.push(format!("model catalog file not read: {e}"));
+            return;
+        }
+    };
+    if models.is_empty() {
+        return;
+    }
+    let mut overrides = match overlay_models(models) {
+        Ok(t) => t,
+        Err(e) => {
+            warnings.push(format!(
+                "{}: model catalog file not read: its entries are not valid catalog entries ({e})",
+                path.display()
+            ));
+            return;
+        }
+    };
+    if let Some(Value::Table(own)) = layer.remove("catalog_overrides") {
+        deep_merge(&mut overrides, own);
+    }
+    layer.insert("catalog_overrides".into(), Value::Table(overrides));
 }
 
 /// The built-in catalog with the trusted layers' overrides applied.

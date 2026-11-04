@@ -13,9 +13,10 @@
 //!   ends mid-step) gets a synthetic `cancelled` result.
 //! - `GcApplied` (`reapply_gc`), `Compaction` (`reapply_compaction`), `PinsFolded`,
 //!   `MemoryIndexApplied`, `PrefixApplied` (AGENTS.md and the repo map as logged, never
-//!   read from disk again), `StartPins`, `Uncompacted` and `Undone` are redone where they
-//!   happened. Tool results are read back from their blobs; only references and the
-//!   latest compaction stay in memory.
+//!   read from disk again; with a calibration, the requests after it are assembled with
+//!   the tools it logged, MCP tools included), `StartPins`, `Uncompacted` and `Undone`
+//!   are redone where they happened. Tool results are read back from their blobs; only
+//!   references and the latest compaction stay in memory.
 //! - `Pin`/`Unpin` sent while a turn runs reach it at its next step start, as they did
 //!   live (at the step's first epoch record, its request, or the turn's end).
 //! - `Forked` (a branch's first own record) starts the spend over: the usage logged
@@ -35,7 +36,9 @@
 //! it (live, they reach the next step start, or the turn's end); a fork's branch closes a
 //! cut turn with `TurnEnd{cancelled}`, which applies them in the same place. For the same
 //! reason what happened between turns after step `n` (commands such as `Pin` and
-//! `SetBudget`, a switch, a manual compaction) is in it, in any order, as at the tip.
+//! `SetBudget`, a switch, a manual compaction) is in it, in any order, as at the tip, up
+//! to an undo: the cut ends before an `Undone` after step `n`, since the files at step `n`
+//! (spec 7.12.1 `state_at`) are the ones before that undo.
 //!
 //! The read tracker is not rebuilt from the log (what it remembers lives in spill files):
 //! a resumed session starts with no re-read baselines, so a re-read returns the full
@@ -72,7 +75,8 @@ use crate::budget::Budget;
 use crate::dispatch::signature;
 use crate::ledger::{LEDGER_FILE, Ledger};
 use crate::mcp::MCP_TOOL_PREFIX;
-use crate::protocol::{BudgetScope, Command, Event, FinishReason};
+use crate::model_switch::Stopped;
+use crate::protocol::{BudgetScope, Command, ErrorKind, Event, FinishReason};
 use crate::provider_setup::provider_label;
 use crate::record::SessionRecord;
 use crate::session::{PrefixLog, Session};
@@ -98,8 +102,9 @@ pub struct Rebuilt {
     pub(crate) prefix: Option<SessionRecord>,
     /// Valid `SetBudget` commands, in order.
     pub(crate) budgets: Vec<(BudgetScope, Budget)>,
-    /// The usage of every logged response (and of the attempts discarded before it).
-    pub(crate) usage: Vec<RawUsage>,
+    /// The usage the log holds, with the model it was spent on: every complete response's
+    /// (and the attempts discarded before it), and every `Charged` record's.
+    pub(crate) usage: Vec<(ModelId, RawUsage)>,
     /// The last record that is part of the state: commands that change nothing (the
     /// `Fork` itself, a message whose turn has not started) are left out after it. None:
     /// no record is.
@@ -218,6 +223,8 @@ pub(crate) fn rebuild_with(
         started: false,
         pending: Vec::new(),
         results: HashMap::new(),
+        logged_tools: None,
+        unknown: 0,
     };
     let mut stopped = false;
     for rec in reader.records() {
@@ -235,6 +242,15 @@ pub(crate) fn rebuild_with(
     // Pins of a turn the log ends in (or the cut closes) reach the context as its
     // leftovers would have.
     r.apply_pending();
+    if r.unknown > 0 {
+        let n = r.unknown;
+        r.warn(format!(
+            "{n} record{} written by a newer version {} skipped; the rebuilt context may \
+             differ from the one that version had",
+            if n == 1 { "" } else { "s" },
+            if n == 1 { "was" } else { "were" }
+        ));
+    }
     if !stopped {
         let last = r.out.context.next_turn() - 1;
         if let Some(at) = until.filter(|&at| at > last) {
@@ -258,6 +274,8 @@ enum Flow {
 /// A step being rebuilt: its response so far and the results of its calls.
 struct OpenStep {
     number: u32,
+    /// The model of its `Request`.
+    model: ModelId,
     resp: Response,
     responded: bool,
     results: HashMap<String, Content>,
@@ -283,6 +301,11 @@ struct Replay<'a> {
     pending: Vec<Command>,
     /// The result blob of every call, for an `Uncompacted` restore.
     results: HashMap<String, BlobRef>,
+    /// The tools the last `PrefixApplied` logged (with a calibration): the requests after
+    /// it were assembled with them. None: assembled from the registry (an older log).
+    logged_tools: Option<Vec<ToolSpec>>,
+    /// Records of a type this version does not know, skipped.
+    unknown: usize,
 }
 
 impl Replay<'_> {
@@ -382,10 +405,12 @@ impl Replay<'_> {
                         .assemblies
                         .entry(model.clone())
                         .or_insert_with(|| c.assembly(&model));
+                    let specs = self.logged_tools.as_ref().unwrap_or(specs);
                     self.out.context.assemble(caps, specs, &model).1
                 });
                 self.step = Some(OpenStep {
                     number: next,
+                    model: model.clone(),
                     resp: Response::default(),
                     responded: false,
                     results: HashMap::new(),
@@ -402,12 +427,33 @@ impl Replay<'_> {
             | SessionRecord::Undone { .. }) => {
                 self.close_step();
                 // An epoch at the start of a step past the cut; one between turns (or
-                // before the first) is part of the cut.
-                if self.running && self.beyond() {
+                // before the first) is part of the cut. An undo past the cut is not: the
+                // files at the cut (`state_at`) are the ones before it.
+                let undo = matches!(rec, SessionRecord::Undone { .. });
+                if (self.running || undo) && self.beyond() {
                     return Flow::Stop;
                 }
                 self.apply_pending();
                 self.mutation(rec);
+            }
+            SessionRecord::Charged { model, usage, .. } => self.out.usage.push((model, usage)),
+            // The files changed unseen: the write generation moves. One noticed at a
+            // step start (`late`) belongs to that step, like its epoch.
+            SessionRecord::WritesLost { paths, late } => {
+                if late {
+                    self.close_step();
+                    if self.running && self.beyond() {
+                        return Flow::Stop;
+                    }
+                }
+                for p in &paths {
+                    if let Ok(path) = p.resolve(&self.root) {
+                        self.out.seen.remove(&path);
+                    }
+                }
+                self.out
+                    .attempts
+                    .note_effects(&[AppliedEffect::Exec { may_write: true }]);
             }
             SessionRecord::Checkpoint {
                 n, commit, tree, ..
@@ -422,8 +468,8 @@ impl Replay<'_> {
             | SessionRecord::ApprovalRequested { .. }
             | SessionRecord::CheckpointSkipped { .. }
             | SessionRecord::Labeled { .. }
-            | SessionRecord::EngineError { .. }
-            | SessionRecord::Unknown => {}
+            | SessionRecord::EngineError { .. } => {}
+            SessionRecord::Unknown => self.unknown += 1,
         }
         Flow::Go
     }
@@ -506,16 +552,21 @@ impl Replay<'_> {
                 repo_map,
                 system_prompt_hash,
                 tools_hash,
+                tools,
             } => {
                 let agents_text = self.text(agents_md.as_ref(), "AGENTS.md");
                 let map_text = self.text(repo_map.as_ref(), "repo map");
                 self.ctx().agents_md = agents_text;
                 self.ctx().repo_map = map_text;
+                if self.calibration.is_some() {
+                    self.logged_tools = tools.as_ref().and_then(|b| self.tool_specs(b));
+                }
                 self.out.prefix = Some(SessionRecord::PrefixApplied {
                     agents_md,
                     repo_map,
                     system_prompt_hash,
                     tools_hash,
+                    tools,
                 });
             }
             SessionRecord::StartPins { pins } => {
@@ -600,6 +651,26 @@ impl Replay<'_> {
             Err(e) => {
                 self.warn(format!(
                     "the logged {what} could not be read ({e}); left out"
+                ));
+                None
+            }
+        }
+    }
+
+    /// The tool specs of a `PrefixApplied` blob (none: unreadable, which is said; the
+    /// requests are then assembled from the registry).
+    fn tool_specs(&mut self, blob: &BlobRef) -> Option<Vec<ToolSpec>> {
+        let parsed = self
+            .reader
+            .read_blob(blob)
+            .map_err(|e| e.to_string())
+            .and_then(|b| serde_json::from_slice::<Vec<ToolSpec>>(&b).map_err(|e| e.to_string()));
+        match parsed {
+            Ok(specs) => Some(specs),
+            Err(e) => {
+                self.warn(format!(
+                    "the logged tools could not be read ({e}); the estimate is rebuilt with \
+                     this version's"
                 ));
                 None
             }
@@ -727,9 +798,10 @@ impl Replay<'_> {
             if let Some(status) = &step.status {
                 r.context.calibrate(status, &u);
             }
-            r.usage.push(u);
+            r.usage.push((step.model.clone(), u));
         }
-        r.usage.extend(resp.discarded.iter().copied());
+        r.usage
+            .extend(resp.discarded.iter().map(|u| (step.model.clone(), *u)));
         let assistant = Message {
             role: Role::Assistant,
             content: resp.content,
@@ -865,7 +937,7 @@ pub(crate) struct Resumed {
     /// The model the log ends on.
     model: Option<ModelId>,
     prefix: Option<SessionRecord>,
-    usage: Vec<RawUsage>,
+    usage: Vec<(ModelId, RawUsage)>,
     seen: HashMap<PathBuf, blake3::Hash>,
     warnings: Vec<String>,
     start_pins: bool,
@@ -877,7 +949,11 @@ impl Session {
     /// and close a turn the log ends in (a crash) with its missing `TurnEnd` before
     /// anything else is written; then take the rebuilt state and restore the rest
     /// ([`resume_start`](Self::resume_start)). An error leaves the session unusable.
-    pub(crate) async fn resume(&mut self, config_pins: &[String]) -> Result<(), String> {
+    pub(crate) async fn resume(
+        &mut self,
+        config_pins: &[String],
+        stop: impl std::future::Future<Output = ()>,
+    ) -> Result<(), String> {
         let path = self.log.path();
         let log = self.log.clone();
         let calibration = self.calibration();
@@ -907,7 +983,7 @@ impl Session {
         }
         let mut resumed = self.adopt(rebuilt);
         if let Some(model) = resumed.model.take() {
-            self.restore_model(model).await;
+            self.restore_model(model, stop, Stopped::Leave).await;
         }
         self.resume_start(resumed, config_pins).await;
         self.show_pending_proposals().await;
@@ -974,19 +1050,20 @@ impl Session {
     }
 
     /// The rest of a resumed session's start: the spend so far, the stale-read guard of
-    /// files unchanged since, and a warning when this build's system prompt or tools
-    /// differ from the logged ones. AGENTS.md and the repo map are the logged ones; a
-    /// session that never sent a request starts up as a new one, keeping the start pins
-    /// it logged.
+    /// files unchanged since, and (at the first request, once the MCP tools have joined) a
+    /// warning when this build's system prompt or tools differ from the logged ones.
+    /// AGENTS.md and the repo map are the logged ones; a session that never sent a request
+    /// starts up as a new one, keeping the start pins it logged.
     async fn resume_start(&mut self, resumed: Resumed, config_pins: &[String]) {
         for w in resumed.warnings {
             self.warn(format!("resume: {w}")).await;
         }
         match &resumed.prefix {
             None => self.init_with(config_pins, resumed.start_pins).await,
-            Some(prefix) => {
+            Some(_) => {
                 self.start_housekeeping();
-                self.warn_if_prefix_changed(prefix).await;
+                // Compared at the first request, once the MCP tools have joined.
+                self.prefix_log.check_next();
                 // The logged index stands until the store is checked again (once the code
                 // index is ready), which an epoch then applies.
                 self.memory.live = true;
@@ -997,47 +1074,10 @@ impl Session {
         self.restore_guard(resumed.seen).await;
     }
 
-    async fn warn_if_prefix_changed(&self, logged: &SessionRecord) {
-        let (req, _) = self.assemble();
-        let due = PrefixLog::default().due(
-            self.context.agents_md.as_deref(),
-            self.context.repo_map.as_deref(),
-            &req,
-        );
-        let (
-            Some((
-                SessionRecord::PrefixApplied {
-                    system_prompt_hash: system,
-                    tools_hash: tools,
-                    ..
-                },
-                _,
-            )),
-            SessionRecord::PrefixApplied {
-                system_prompt_hash: logged_system,
-                tools_hash: logged_tools,
-                ..
-            },
-        ) = (due, logged)
-        else {
-            return;
-        };
-        let what = match (system != *logged_system, tools != *logged_tools) {
-            (true, true) => "system prompt and tools differ",
-            (true, false) => "system prompt differs",
-            (false, true) => "tools differ",
-            (false, false) => return,
-        };
-        self.warn(format!(
-            "this version's {what} from the ones this session was logged with: the \
-             provider's prompt cache will be cold for the next request"
-        ))
-        .await;
-    }
-
     /// Count what the session spent before against its budgets: the cost ledger's rows of
-    /// this session (discarded attempts included), else the usage in the log.
-    async fn restore_spend(&mut self, logged: Vec<RawUsage>) {
+    /// this session (discarded attempts included), else the usage in the log, each priced
+    /// by the model it was spent on.
+    async fn restore_spend(&mut self, logged: Vec<(ModelId, RawUsage)>) {
         let path = self.data_home.join(LEDGER_FILE);
         let id = self.session_id.clone();
         let totals = tokio::task::spawn_blocking(move || {
@@ -1062,17 +1102,18 @@ impl Session {
                 };
                 self.warn(format!(
                     "the cost ledger could not give this session's spend ({why}); it is \
-                     rebuilt from the session log, which lacks responses that broke off"
+                     rebuilt from the session log"
                 ))
                 .await;
                 let mut sum = RawUsage::default();
                 let mut usd = 0.0;
-                for u in &logged {
+                for (model, u) in &logged {
                     sum.input += u.input;
                     sum.output += u.output;
                     sum.cache_read += u.cache_read;
                     sum.cache_write += u.cache_write;
-                    usd += cost_usd(u, self.info.price.as_ref()).unwrap_or(0.0);
+                    let price = self.setup.catalog.get(model).price;
+                    usd += cost_usd(u, price.as_ref()).unwrap_or(0.0);
                 }
                 (sum, usd)
             }
@@ -1098,6 +1139,43 @@ impl Session {
         }
     }
 
+    /// `Command::Fork`, as a job the client can cancel while it waits for the
+    /// session-start checkpoint (the branch copies the log) and while the branch's model is
+    /// set up. Answered with `SessionChanged` (after `on_branch` is told the branch's id and
+    /// log) or an `Error`.
+    pub(crate) async fn fork_job(
+        &mut self,
+        at: Option<u32>,
+        label: Option<String>,
+        ctl: &TurnControl,
+        on_branch: impl FnOnce(&str, &std::path::Path),
+    ) {
+        let unbound = self.events.clone();
+        self.events = unbound.bound(ctl.cancel.clone());
+        let made =
+            if self.settle_start_checkpoint_or(&ctl.cancel).await && !ctl.cancel.is_cancelled() {
+                self.fork(at, label, ctl.cancel.cancelled()).await
+            } else {
+                Err("cancelled; no branch was made".to_string())
+            };
+        match made {
+            Ok((id, path)) => {
+                on_branch(&id, &path);
+                self.emit(Event::SessionChanged { session_id: id }).await;
+            }
+            Err(why) => {
+                self.emit(Event::Error {
+                    kind: ErrorKind::Internal,
+                    message: format!("fork: {why}"),
+                    retryable: false,
+                    hint: None,
+                })
+                .await;
+            }
+        }
+        self.events = unbound;
+    }
+
     /// `Command::Fork`: a new session whose log is this one's up to the end of step `at`
     /// (default: the tip), copied verbatim, with `origin: fork`, `label` and the parent
     /// `(id, offset of the step's end)`; the session continues on it with the context
@@ -1108,6 +1186,7 @@ impl Session {
         &mut self,
         at: Option<u32>,
         label: Option<String>,
+        stop: impl std::future::Future<Output = ()>,
     ) -> Result<(String, PathBuf), String> {
         self.checkpoint().await;
         let parent_path = self.log.path();
@@ -1175,7 +1254,7 @@ impl Session {
             self.warn(format!("fork: {w}")).await;
         }
         if let Some(model) = resumed.model {
-            self.restore_model(model).await;
+            self.restore_model(model, stop, Stopped::Continue).await;
         }
         Ok((id, path))
     }
@@ -1204,6 +1283,14 @@ impl Session {
     /// `Command::Compact` (between turns, as a task the user can cancel): collect and
     /// compact now, as one epoch, reason `manual`.
     pub(crate) async fn compact_command(&mut self, ctl: &TurnControl) {
+        // Its answer waits for room until the user cancels (as a turn's events do).
+        let unbound = self.events.clone();
+        self.events = unbound.bound(ctl.cancel.clone());
+        self.compact_now(ctl).await;
+        self.events = unbound;
+    }
+
+    async fn compact_now(&mut self, ctl: &TurnControl) {
         let mut applied = false;
         if let Some(rec) = self.context.collect(Some(MutationReason::Manual)) {
             self.collected(rec).await;
@@ -1227,6 +1314,8 @@ impl Session {
         if self.context.fold_session_pins() {
             self.log(SessionRecord::PinsFolded).await;
         }
+        // The cached prefix is gone: what is pending by the next step goes in its epoch.
+        self.context.force_cold_epoch();
         self.checkpoint().await;
         let (_, status) = self.assemble();
         self.emit(Event::context_status(&status)).await;
@@ -1303,6 +1392,8 @@ impl Session {
             restored,
         })
         .await;
+        // The cached prefix is gone: what is pending by the next step goes in its epoch.
+        self.context.force_cold_epoch();
         self.checkpoint().await;
         let (_, status) = self.assemble();
         self.emit(Event::context_status(&status)).await;
@@ -1370,6 +1461,111 @@ mod tests {
             }
         }
         out
+    }
+
+    /// The attempt ledger's write generation of a log holding `recs`.
+    fn generation_after(recs: &[SessionRecord]) -> u64 {
+        generation_at(recs, None)
+    }
+
+    /// The same, of `rebuild(until)`.
+    fn generation_at(recs: &[SessionRecord], until: Option<u32>) -> u64 {
+        let home = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let mut w = SessionWriter::<SessionRecord>::create_in(
+            home.path(),
+            root.path(),
+            HeaderInit::default(),
+        )
+        .unwrap();
+        for r in recs {
+            w.append(r).unwrap();
+        }
+        w.checkpoint().unwrap();
+        let reader = SessionReader::<SessionRecord>::open(w.path()).unwrap();
+        rebuild(&reader, until).unwrap().attempts.generation()
+    }
+
+    #[test]
+    fn a_lost_write_moves_the_rebuilt_write_generation() {
+        let root = std::path::Path::new("/r");
+        let turn = |recs: Vec<SessionRecord>| {
+            let mut all = vec![SessionRecord::TurnStart {
+                turn: 1,
+                text: "go".into(),
+            }];
+            all.extend(recs);
+            all.push(SessionRecord::TurnEnd {
+                reason: FinishReason::Cancelled,
+                evidence: None,
+            });
+            all
+        };
+        let lost = SessionRecord::WritesLost {
+            paths: vec![tautly_session::RelPath::from_abs(root, &root.join("a.txt")).unwrap()],
+            late: false,
+        };
+        assert_eq!(
+            generation_after(&turn(vec![lost])),
+            generation_after(&turn(vec![])) + 1
+        );
+    }
+
+    /// A provider step `step` answered with text.
+    fn text_step(step: u32) -> Vec<SessionRecord> {
+        let blob = BlobRef::parse(&"a".repeat(64)).unwrap();
+        vec![
+            SessionRecord::Request {
+                hash: blob,
+                turn: 1,
+                step,
+                model: ModelId::from("mock/m"),
+                blocks: crate::record::BlockHashes {
+                    stable: String::new(),
+                    pinned: String::new(),
+                    history: String::new(),
+                    tail: String::new(),
+                },
+            },
+            SessionRecord::Provider(tautly_provider::ProviderEvent::TextDelta("ok".into())),
+            SessionRecord::Provider(tautly_provider::ProviderEvent::Done {
+                stop: tautly_provider::StopReason::EndTurn,
+            }),
+        ]
+    }
+
+    /// Re-review N3: a late write noticed at step 3's start is past a cut at step 2.
+    #[test]
+    fn a_lost_write_noticed_after_the_cut_is_left_out() {
+        let root = std::path::Path::new("/r");
+        let lost = SessionRecord::WritesLost {
+            paths: vec![tautly_session::RelPath::from_abs(root, &root.join("a.txt")).unwrap()],
+            late: true,
+        };
+        let log = |with_lost: bool| {
+            let mut all = vec![SessionRecord::TurnStart {
+                turn: 1,
+                text: "go".into(),
+            }];
+            all.extend(text_step(2));
+            if with_lost {
+                all.push(lost.clone());
+            }
+            all.extend(text_step(3));
+            all.push(SessionRecord::TurnEnd {
+                reason: FinishReason::Completed,
+                evidence: None,
+            });
+            all
+        };
+        assert_eq!(
+            generation_at(&log(true), Some(2)),
+            generation_at(&log(false), Some(2))
+        );
+        assert_eq!(
+            generation_at(&log(true), None),
+            generation_at(&log(false), None) + 1
+        );
     }
 
     #[test]

@@ -4,7 +4,9 @@
 //! While a turn runs, the actor still answers `Approve`/`Deny` (by request id), `Cancel`
 //! and `Shutdown`; `Pin`/`Unpin` reach the turn at its next step start; everything else
 //! (further messages included) waits for the turn to end. Every command is logged as it
-//! arrives (one that arrives while a `SetModel` builds its provider, once the build ends).
+//! arrives (one that arrives while a `SetModel` builds its provider, once the build ends;
+//! one other than `Cancel`, `Shutdown`, `Approve` and `Deny` that arrives while a `Fork`
+//! runs, once the fork ends, so it lands in the log it applies to).
 //!
 //! MCP servers (`mcp.rs`) start in the background after session start; `Approve`/`Deny`
 //! also answer repository servers' approval requests. At shutdown the servers are stopped
@@ -22,7 +24,11 @@
 //! `ModelSet`, and the `ModelSet` and `ReasoningStripped` records replayed at their
 //! positions); `Fork` moves the engine to a branch of its log, and `Compact`/`Uncompact`
 //! run between turns (all queued behind a running turn). `Compact` sends a summary
-//! request, so it runs as a task like a turn: `Cancel` and `Shutdown` stop it.
+//! request, `Undo` runs git steps and `Fork` copies and rebuilds the log, so each runs as
+//! a task like a turn: the actor keeps reading `Cancel` and `Shutdown`, which stop a
+//! compaction, and an undo or fork still waiting for the session-start checkpoint (an
+//! undo that has started writing runs to its end). Commands answered in the actor wait a
+//! bounded time for a client that is behind, so their answers are not dropped.
 //!
 //! Project memory (`memory.rs`): `ApproveMemory`/`RejectMemory` reach a running turn at its
 //! next step start (like `Pin`) and apply at once when idle; `ConsolidateMemory` asks the
@@ -36,7 +42,7 @@ use std::time::Duration;
 
 use tautly_context::Context;
 use tautly_mcp::ServerSpec;
-use tautly_provider::{Catalog, Provider, Retrying};
+use tautly_provider::{ModelId, Provider, Retrying};
 use tautly_sandbox::{LocalSandbox, Policy, PolicyError, Sandbox, SandboxError};
 use tautly_session::{HeaderInit, SessionWriter};
 use tautly_tools::{ProcessGroups, ReadTracker, registry};
@@ -46,6 +52,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::approvals::{Approvals, Verdict};
 use crate::attempts::AttemptLedger;
+use crate::auth::{KeyringStore, SecretStore};
 use crate::budget::{Budget, Budgets};
 use crate::checkpoint::{self, Checkpointer, GitCheckpoints, Skip, StartCheckpoint};
 use crate::config::{Config, LoadedConfig};
@@ -55,13 +62,13 @@ use crate::mcp::{McpSession, McpSetup, NoPreExec, PreExecHook};
 use crate::memory::{MemoryMode, MemoryState};
 use crate::model_switch::ModelSetup;
 use crate::protocol::{BudgetScope, Command, ErrorKind, Event, FinishReason};
-use crate::provider_setup::{ProviderFactory, provider_for, provider_label};
+use crate::provider_setup::{ProviderFactory, provider_for_with, provider_label};
 use crate::record::SessionRecord;
 use crate::resume;
 use crate::routing::Side;
 use crate::session::{EventSink, Log, LogFailure, Session};
 use crate::turn::TurnControl;
-use crate::workspace::Workspace;
+use crate::workspace::{LiveSession, Workspace};
 
 /// Capacity of the event channel returned by [`EngineBuilder::build`].
 pub const EVENT_CAPACITY: usize = 256;
@@ -141,6 +148,9 @@ pub struct EngineBuilder {
     pub client_mcp: Vec<(String, ServerSpec)>,
     /// Runs before every stdio MCP call. Default: [`NoPreExec`].
     pub pre_exec: Option<Arc<dyn PreExecHook>>,
+    /// Where API keys are looked up after the environment, for every provider the engine
+    /// builds itself (main, side model, `SetModel`). Default: the OS keychain.
+    pub secret_store: Option<Arc<dyn SecretStore>>,
 }
 
 impl EngineBuilder {
@@ -160,6 +170,7 @@ impl EngineBuilder {
             approve_mcp: false,
             client_mcp: Vec::new(),
             pre_exec: None,
+            secret_store: None,
         }
     }
 
@@ -213,19 +224,34 @@ impl EngineBuilder {
         let policy = Policy::new(config.permissions.clone(), root.clone())?;
         let test_matcher =
             Arc::new(TestMatcher::new(&config.evidence).map_err(EngineError::Evidence)?);
-        let mut catalog = Catalog::builtin();
-        if let Some(overrides) = config.catalog_overrides.clone() {
-            catalog.merge(overrides);
-        }
-        let catalog = Arc::new(catalog);
+        let catalog = Arc::new(config.effective_catalog());
         let info = catalog.get(&config.model);
+        let store: Arc<dyn SecretStore> =
+            self.secret_store.unwrap_or_else(|| Arc::new(KeyringStore));
+        let env = |name: &str| std::env::var_os(name);
         let provider = match self.provider {
             Some(p) => p,
-            None => provider_for(&config, &config.model, Arc::clone(&catalog))
+            None => provider_for_with(&config, &config.model, Arc::clone(&catalog), &env, &*store)
                 .map_err(|e| EngineError::Provider(e.to_string()))?,
         };
         let provider: Arc<dyn Provider> = Arc::new(Retrying::new(provider));
-        let (side, side_note) = Side::resolve(&config, &catalog, &provider, self.side_provider);
+        let (side, side_note) =
+            Side::resolve_with(&config, &catalog, &provider, self.side_provider, |id| {
+                provider_for_with(&config, id, Arc::clone(&catalog), &env, &*store)
+            });
+        let provider_factory = self.provider_factory.unwrap_or_else(|| {
+            let (config, catalog, store) =
+                (config.clone(), Arc::clone(&catalog), Arc::clone(&store));
+            Arc::new(move |model: &ModelId| {
+                provider_for_with(
+                    &config,
+                    model,
+                    Arc::clone(&catalog),
+                    &|name| std::env::var_os(name),
+                    &*store,
+                )
+            })
+        });
         let mut config_warnings = self.config_warnings;
         config_warnings.extend(side_note);
         let init = HeaderInit {
@@ -257,6 +283,7 @@ impl EngineBuilder {
             config.model.as_str(),
         )));
         let groups = ProcessGroups::default();
+        let cost_ledger = Arc::new(CostLedger::new(data_home.join(LEDGER_FILE)));
         let checkpoints = config
             .checkpoints
             .enabled
@@ -303,7 +330,7 @@ impl EngineBuilder {
             sandbox,
             workspace,
             provider,
-            setup: ModelSetup::new(config.clone(), Arc::clone(&catalog), self.provider_factory),
+            setup: ModelSetup::new(config.clone(), Arc::clone(&catalog), Some(provider_factory)),
             reasoning_retry: false,
             model: config.model.clone(),
             info,
@@ -324,7 +351,7 @@ impl EngineBuilder {
             session_id: session_id.clone(),
             budgets: Arc::clone(&budgets),
             turn_timeout: config.turn_timeout_s.map(Duration::from_secs),
-            cost_ledger: CostLedger::new(data_home.join(LEDGER_FILE)),
+            cost_ledger: Arc::clone(&cost_ledger),
             cost_ledger_reported: false,
             groups: groups.clone(),
             lost_write_paths: Default::default(),
@@ -339,6 +366,7 @@ impl EngineBuilder {
         };
         let current = Arc::new(Mutex::new((session_id.clone(), session_path.clone())));
         let actor = Actor {
+            _live: session.workspace.enter(),
             log: session.log.clone(),
             events: session.events.clone(),
             approvals: Approvals::new(self.interactive),
@@ -347,6 +375,7 @@ impl EngineBuilder {
             current: Arc::clone(&current),
             budgets,
             groups: groups.clone(),
+            cost_ledger: Arc::clone(&session.cost_ledger),
         };
         runtime.spawn(actor.run(
             session,
@@ -468,12 +497,23 @@ pub(crate) fn last_request_path(session_path: &Path) -> PathBuf {
     session_path.with_extension("last-request.json")
 }
 
-/// What runs as a task, with its own cancellation: a user message's turn, a manual
-/// compaction (a summary request) or a memory consolidation (a side-model request).
+/// What runs as a task, with its own cancellation, while the actor goes on reading
+/// commands (`Cancel`, `Shutdown`): a user message's turn, a manual compaction (a summary
+/// request), a memory consolidation (a side-model request), an undo (git steps) or a fork
+/// (a log copy and rebuild, and maybe a provider build). An undo and a fork first wait for
+/// the session-start checkpoint, since they read the log.
 enum Job {
     Turn(String),
     Compact,
     Consolidate,
+    Undo {
+        turn: Option<u32>,
+        dry_run: bool,
+    },
+    Fork {
+        at: Option<u32>,
+        label: Option<String>,
+    },
 }
 
 /// The task in flight (a turn or a compaction). It hands back the session and the inbox,
@@ -482,9 +522,15 @@ struct Running {
     handle: JoinHandle<(Session, mpsc::UnboundedReceiver<Command>)>,
     cancel: CancellationToken,
     inbox: mpsc::UnboundedSender<Command>,
+    /// A user message's turn (its crash ends the turn); else a command's job.
+    turn: bool,
+    /// A fork: commands other than [`Actor::urgent`] ones wait for its end.
+    fork: bool,
 }
 
 struct Actor {
+    /// Counts the session on its workspace while the actor lives (dropped first).
+    _live: LiveSession,
     log: Log,
     events: EventSink,
     approvals: Approvals,
@@ -494,6 +540,8 @@ struct Actor {
     current: Arc<Mutex<(String, PathBuf)>>,
     budgets: Arc<Mutex<Budgets>>,
     groups: ProcessGroups,
+    /// The session's cost ledger, flushed at shutdown.
+    cost_ledger: Arc<CostLedger>,
 }
 
 /// Collect the commands that arrive into `early` until a `Shutdown` (or the client going
@@ -543,20 +591,23 @@ impl Actor {
         for w in start.config_warnings {
             self.events.try_emit(Event::Warning { message: w });
         }
+        // Commands sent while a resumed session sets up its model (a keychain prompt may
+        // hold it) are kept; a `Shutdown` among them abandons that.
+        let mut early = Vec::new();
         let started = if start.resume {
-            session.resume(&start.config_pins).await
+            session
+                .resume(
+                    &start.config_pins,
+                    until_shutdown(&mut commands, &mut early),
+                )
+                .await
         } else {
             session.init(&start.config_pins).await;
             Ok(())
         };
         // A log that cannot be rebuilt leaves nothing to run: every command is refused.
         let mut state = match started {
-            Ok(()) => {
-                session.begin_checkpoints().await;
-                prune_checkpoints(&session);
-                session.mcp = McpSession::start(start.mcp, &session, self.approvals.clone()).await;
-                Some(session)
-            }
+            Ok(()) => Some(session),
             Err(why) => {
                 self.events
                     .send_or_drop(Event::Error {
@@ -571,7 +622,20 @@ impl Actor {
         };
         let mut running: Option<Running> = None;
         let mut queue: VecDeque<Command> = VecDeque::new();
+        // Commands that arrived while a fork ran, for after it.
+        let mut held: Vec<Command> = Vec::new();
         let mut stopping = false;
+        for cmd in early {
+            let lost = state.is_none();
+            self.received(cmd, lost, None, &mut queue, &mut stopping)
+                .await;
+        }
+        // Nothing more starts for a session that is already shutting down.
+        if let Some(s) = state.as_mut().filter(|_| !stopping) {
+            s.begin_checkpoints(start.resume).await;
+            prune_checkpoints(s);
+            s.mcp = McpSession::start(start.mcp, s, self.approvals.clone()).await;
+        }
         loop {
             if running.is_none() && !stopping {
                 while let Some(cmd) = queue.pop_front() {
@@ -579,6 +643,8 @@ impl Actor {
                         Command::SendMessage { text } => Job::Turn(text),
                         Command::Compact => Job::Compact,
                         Command::ConsolidateMemory => Job::Consolidate,
+                        Command::Undo { turn, dry_run } => Job::Undo { turn, dry_run },
+                        Command::Fork { at, label } => Job::Fork { at, label },
                         Command::SetModel { model } => {
                             match state.as_mut() {
                                 Some(s) => {
@@ -586,8 +652,11 @@ impl Actor {
                                     // taking commands meanwhile, and let a `Shutdown` abandon
                                     // the switch.
                                     let mut early = Vec::new();
+                                    let unbound = s.events.clone();
+                                    s.events = unbound.replying();
                                     s.set_model(model, until_shutdown(&mut commands, &mut early))
                                         .await;
+                                    s.events = unbound;
                                     for cmd in early {
                                         self.received(cmd, false, None, &mut queue, &mut stopping)
                                             .await;
@@ -623,21 +692,61 @@ impl Actor {
             tokio::select! {
                 cmd = commands.recv(), if !stopping => {
                     let cmd = cmd.unwrap_or(Command::Shutdown);
+                    // A fork moves the log to its branch when it ends: what applies after it
+                    // waits, unlogged, and is logged in the branch at the join.
+                    if running.as_ref().is_some_and(|r| r.fork) && !Self::urgent(&cmd) {
+                        if held.len() < COMMAND_CAPACITY {
+                            held.push(cmd);
+                        } else {
+                            self.events.try_emit(Event::Warning {
+                                message: format!(
+                                    "a command was dropped: more than {COMMAND_CAPACITY} \
+                                     arrived while a fork runs"
+                                ),
+                            });
+                        }
+                        continue;
+                    }
                     let lost = state.is_none() && running.is_none();
                     self.received(cmd, lost, running.as_ref(), &mut queue, &mut stopping)
                         .await;
                 }
                 joined = async { (&mut running.as_mut().expect("guarded").handle).await }, if running.is_some() => {
-                    running = None;
+                    let turn = running.take().is_some_and(|r| r.turn);
                     match joined {
                         Ok((mut s, mut inbox)) => {
                             inbox.close();
                             while let Ok(cmd) = inbox.try_recv() {
                                 s.context_command(cmd).await;
                             }
+                            // A fork continues on its branch (`current` is the job's).
+                            self.session_id.clone_from(&s.session_id);
                             state = Some(s);
                         }
-                        Err(e) => self.crashed(e).await,
+                        Err(e) => self.crashed(e, turn).await,
+                    }
+                    let held = std::mem::take(&mut held);
+                    if stopping && !held.is_empty() {
+                        // Logged as they arrived would have been, but never run.
+                        let n = held.len();
+                        let recs: Vec<SessionRecord> =
+                            held.into_iter().map(SessionRecord::Command).collect();
+                        self.with_log(move |l| recs.iter().try_for_each(|r| l.append(r)))
+                            .await;
+                        self.events.try_emit(Event::Warning {
+                            message: format!(
+                                "{n} command{} sent during the fork {} not run: the session \
+                                 is shutting down",
+                                if n == 1 { "" } else { "s" },
+                                if n == 1 { "was" } else { "were" }
+                            ),
+                        });
+                    } else {
+                        for cmd in held {
+                            let lost = state.is_none();
+                            self.received(cmd, lost, None, &mut queue, &mut stopping)
+                                .await;
+                        }
                     }
                 }
             }
@@ -660,10 +769,9 @@ impl Actor {
         }
         self.with_log(|l| l.checkpoint()).await;
         // The episode's usage included: a client that exits once the event stream closes
-        // loses no row, unless the ledger is stuck.
-        if let Some(s) = state.as_ref() {
-            s.cost_ledger.flush(LEDGER_FLUSH).await;
-        }
+        // loses no row, unless the ledger is stuck. (Also after a crashed job lost the
+        // session: the actor keeps the ledger's handle.)
+        self.cost_ledger.flush(LEDGER_FLUSH).await;
     }
 
     /// A command from the channel: logged, then handled at once (shutdown, approvals,
@@ -774,11 +882,22 @@ impl Actor {
             inbox: inbox_rx,
             approvals: self.approvals.clone(),
         };
+        let turn = matches!(job, Job::Turn(_));
+        let fork = matches!(job, Job::Fork { .. });
+        let current = Arc::clone(&self.current);
         let handle = tokio::spawn(async move {
             match job {
                 Job::Turn(text) => session.run_turn(text, &mut ctl).await,
                 Job::Compact => session.compact_command(&ctl).await,
                 Job::Consolidate => session.consolidate_command(&ctl).await,
+                Job::Undo { turn, dry_run } => session.undo_job(turn, dry_run, &ctl).await,
+                Job::Fork { at, label } => {
+                    let on_branch = move |id: &str, path: &Path| {
+                        *current.lock().unwrap_or_else(PoisonError::into_inner) =
+                            (id.to_string(), path.to_path_buf());
+                    };
+                    session.fork_job(at, label, &ctl, on_branch).await
+                }
             }
             (session, ctl.inbox)
         });
@@ -786,7 +905,17 @@ impl Actor {
             handle,
             cancel,
             inbox: inbox_tx,
+            turn,
+            fork,
         }
+    }
+
+    /// What is handled at once even while a fork runs: it stops the fork or answers it.
+    fn urgent(cmd: &Command) -> bool {
+        matches!(
+            cmd,
+            Command::Cancel | Command::Shutdown | Command::Approve { .. } | Command::Deny { .. }
+        )
     }
 
     fn resolve(&self, request_id: &str, verdict: Verdict) {
@@ -797,38 +926,23 @@ impl Actor {
         }
     }
 
-    /// A command that runs between turns.
+    /// A short command that runs between turns, in the actor. Its answer waits (a bounded
+    /// time) for a client that is behind.
     async fn idle_command(&mut self, session: &mut Session, cmd: Command) {
-        // A fork or undo reads the log, which must have the session-start checkpoint.
-        session.settle_start_checkpoint().await;
+        let unbound = session.events.clone();
+        session.events = unbound.replying();
+        self.idle_command_inner(session, cmd).await;
+        session.events = unbound;
+    }
+
+    async fn idle_command_inner(&mut self, session: &mut Session, cmd: Command) {
         match cmd {
             Command::Pin { .. }
             | Command::Unpin { .. }
             | Command::ApproveMemory { .. }
             | Command::RejectMemory { .. } => session.context_command(cmd).await,
             Command::Diff { turn } => session.diff(turn).await,
-            Command::Fork { at, label } => match session.fork(at, label).await {
-                Ok((id, path)) => {
-                    self.session_id.clone_from(&id);
-                    *self.current.lock().unwrap_or_else(PoisonError::into_inner) =
-                        (id.clone(), path);
-                    self.events
-                        .send_or_drop(Event::SessionChanged { session_id: id })
-                        .await;
-                }
-                Err(why) => {
-                    self.events
-                        .send_or_drop(Event::Error {
-                            kind: ErrorKind::Internal,
-                            message: format!("fork: {why}"),
-                            retryable: false,
-                            hint: None,
-                        })
-                        .await;
-                }
-            },
             Command::Uncompact => session.uncompact_command().await,
-            Command::Undo { turn, dry_run } => session.undo_command(turn, dry_run).await,
             other => {
                 let name = serde_json::to_value(&other)
                     .ok()
@@ -844,9 +958,11 @@ impl Actor {
         }
     }
 
-    /// A turn task panicked: an engine bug. The state it held is gone, but the log is
-    /// intact up to the crash (plus the panic's message), so the session can be resumed.
-    async fn crashed(&self, e: tokio::task::JoinError) {
+    /// A job panicked: an engine bug. The state it held is gone, but the log is intact up
+    /// to the crash (plus the panic's message), so the session can be resumed. Only a
+    /// user message's `turn` is ended (`TurnEnd`, `TurnFinished`): a command's job (a
+    /// compaction, a consolidation) started none.
+    async fn crashed(&self, e: tokio::task::JoinError, turn: bool) {
         let what = if e.is_panic() {
             let payload = e.into_panic();
             let text = payload
@@ -858,15 +974,15 @@ impl Actor {
         } else {
             format!("the turn stopped: {e}")
         };
-        let recs = [
-            SessionRecord::EngineError {
-                message: what.clone(),
-            },
-            SessionRecord::TurnEnd {
+        let mut recs = vec![SessionRecord::EngineError {
+            message: what.clone(),
+        }];
+        if turn {
+            recs.push(SessionRecord::TurnEnd {
                 reason: FinishReason::Error,
                 evidence: None,
-            },
-        ];
+            });
+        }
         self.with_log(move |l| {
             recs.iter().try_for_each(|r| l.append(r))?;
             l.checkpoint()
@@ -883,12 +999,14 @@ impl Actor {
                 hint: Some("resume the session to continue".into()),
             })
             .await;
-        self.events
-            .send_or_drop(Event::TurnFinished {
-                reason: FinishReason::Error,
-                evidence: None,
-            })
-            .await;
+        if turn {
+            self.events
+                .send_or_drop(Event::TurnFinished {
+                    reason: FinishReason::Error,
+                    evidence: None,
+                })
+                .await;
+        }
     }
 
     fn lost(&self) {

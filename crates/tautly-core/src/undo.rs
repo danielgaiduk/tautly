@@ -27,6 +27,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use tautly_sandbox::{Sandbox, SandboxError};
 use tautly_session::{BlobRef, ConfineError, RelPath, SessionReader, SessionWriter};
@@ -36,6 +37,7 @@ use crate::checkpoint::{self, Change, CheckpointError, Checkpointer, Skip};
 use crate::protocol::{ErrorKind, Event};
 use crate::record::{SessionRecord, UndoneFile};
 use crate::session::{Log, Session};
+use crate::turn::TurnControl;
 
 /// `note` when the turn ran commands and checkpoints restored them.
 pub const NOTE_GIT: &str = "ignored files and submodules are not restored";
@@ -1274,37 +1276,61 @@ fn undo_plan(
 // ------------------------------------------------------------------ the engine's undo
 
 impl Session {
+    /// `Command::Undo`, as a job the client can cancel while it waits for the
+    /// session-start checkpoint (the undo reads it from the log). Once the undo starts it
+    /// runs to its end (each git step is bounded), so no file is left half restored.
+    pub(crate) async fn undo_job(&mut self, turn: Option<u32>, dry_run: bool, ctl: &TurnControl) {
+        let unbound = self.events.clone();
+        self.events = unbound.bound(ctl.cancel.clone());
+        if self.settle_start_checkpoint_or(&ctl.cancel).await && !ctl.cancel.is_cancelled() {
+            self.undo_command(turn, dry_run).await;
+        } else {
+            self.emit(Event::Error {
+                kind: ErrorKind::Tool,
+                message: "undo cancelled: nothing was changed".into(),
+                retryable: false,
+                hint: None,
+            })
+            .await;
+        }
+        self.events = unbound;
+    }
+
     /// `Command::Undo` (between turns): undo user turn `turn` of this session through its
     /// own log, answered with `Undone` or an `Error`. The files it wrote are no longer
     /// known as the model last saw them.
-    pub(crate) async fn undo_command(&mut self, turn: Option<u32>, dry_run: bool) {
+    async fn undo_command(&mut self, turn: Option<u32>, dry_run: bool) {
         // Make everything logged so far readable.
         self.checkpoint().await;
         let path = self.log.path();
-        let reader =
-            match tokio::task::spawn_blocking(move || SessionReader::<SessionRecord>::open(&path))
-                .await
-            {
-                Ok(Ok(r)) => r,
-                Ok(Err(e)) => return self.undo_failed(UndoError::Session(e)).await,
-                Err(e) => return self.undo_failed(UndoError::Log(e.to_string())).await,
-            };
-        let checkpoints = self.checkpoints.clone();
-        let mut guard = match &checkpoints {
-            Some(c) => Some(c.lock().await),
+        let guard = match &self.checkpoints {
+            Some(c) => Some(Arc::clone(c).lock_owned().await),
             None => None,
         };
-        let mut log = LiveLog(self.log.clone());
-        let result = undo_with(
-            &reader,
-            self.sandbox.as_ref(),
-            guard.as_deref_mut().map(|g| &mut g.cp),
-            turn,
-            dry_run,
-            (!dry_run).then_some(&mut log as &mut dyn UndoLog),
-        )
-        .await;
-        drop(guard);
+        let sandbox = Arc::clone(&self.sandbox);
+        let log = self.log.clone();
+        // The undo reads the whole log and its blobs, writes and fsyncs the log, and reads
+        // and writes files: all blocking I/O, so it runs off the async workers, on a
+        // runtime of its own for its git steps.
+        let result = tokio::task::spawn_blocking(move || {
+            let reader = SessionReader::<SessionRecord>::open(&path)?;
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| UndoError::Log(e.to_string()))?;
+            let mut guard = guard;
+            let mut log = LiveLog(log);
+            rt.block_on(undo_with(
+                &reader,
+                sandbox.as_ref(),
+                guard.as_deref_mut().map(|g| &mut g.cp),
+                turn,
+                dry_run,
+                (!dry_run).then_some(&mut log as &mut dyn UndoLog),
+            ))
+        })
+        .await
+        .unwrap_or_else(|e| Err(UndoError::Log(e.to_string())));
         match result {
             Ok(report) => {
                 if !report.dry_run {

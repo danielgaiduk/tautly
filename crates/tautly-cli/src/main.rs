@@ -6,29 +6,45 @@
 //! - `tautly --rpc` serves the JSON-RPC protocol on stdin/stdout until the client sends
 //!   `shutdown` or disconnects (exit 0), or SIGTERM / SIGHUP arrives (143 / 129, after
 //!   every session has shut down).
+//! - `tautly auth add <provider>` stores an API key in the OS keychain; `tautly doctor`
+//!   checks the setup (spec 7.11.2).
 //!
-//! Flags shared by both: `--approve auto-edit|yolo` (headless `ask` is otherwise denied),
-//! `--approve-memory`, `--approve-mcp`, `--model ID`, `--budget-usd N` (a session budget,
-//! sent before the first message), `--continue` / `--resume ID`, `--no-checkpoints`.
-//! Command-line flags are trusted: they override every configuration file (spec 2.2).
+//! `tautly prompt|sessions|models|undo|memory|index|mcp ...` are utility commands
+//! (`cmd`): they read or change what sessions leave behind and exit.
+//!
+//! Flags shared by `-p` and `--rpc`: `--approve auto-edit|yolo` (headless `ask` is
+//! otherwise denied), `--approve-memory`, `--approve-mcp`, `--model ID`, `--budget-usd N`
+//! (a session budget, sent before the first message), `--continue` / `--resume ID`,
+//! `--no-checkpoints`. Command-line flags are trusted: they override every configuration
+//! file (spec 2.2).
+//!
+//! When no configuration layer or flag names a model, the provider is detected (spec
+//! 7.11.2): the first key in the environment or the keychain, else a local Ollama. The
+//! choice is announced on stderr; nothing found is an error with a setup hint.
 
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-use anyhow::{Context as _, bail};
-use clap::{CommandFactory as _, Parser, ValueEnum};
+use anyhow::{Context as _, anyhow, bail};
+use clap::{CommandFactory as _, Parser, Subcommand, ValueEnum};
+use tautly_core::detect::{
+    Detected, KeyVars, OllamaProbe, detect_with, setup_hint_with, wants_detection,
+};
 use tautly_core::{
-    BudgetScope, CliOverrides, Command, Config, Engine, EngineBuilder, Event, Mode, ModelId,
-    Workspaces, install_signal_handlers,
+    BudgetScope, CliOverrides, Command, Config, Engine, EngineBuilder, Event, LoadedConfig, Mode,
+    ModelId, ProviderSetupError, Workspaces, install_signal_handlers, provider_for_with,
 };
 use tautly_rpc::{EngineFactory, OutputFormat, Server, run_oneshot};
 use tokio::io::BufReader;
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::mpsc;
+
+mod cmd;
+mod local;
 
 /// How long, after the sessions have shut down, background work may hold up the exit.
 const EXIT_GRACE: Duration = Duration::from_secs(2);
@@ -42,6 +58,9 @@ const EXIT_GRACE: Duration = Duration::from_secs(2);
                   130 cancelled (Ctrl-C), 143 SIGTERM, 129 SIGHUP."
 )]
 struct Cli {
+    #[command(subcommand)]
+    command: Option<Sub>,
+
     /// Run PROMPT as one headless turn, print what happens and exit.
     #[arg(
         short = 'p',
@@ -103,6 +122,18 @@ struct Cli {
     mock_script: Option<PathBuf>,
 }
 
+#[derive(Debug, Subcommand)]
+enum Sub {
+    /// Store API keys in the OS keychain.
+    #[command(subcommand)]
+    Auth(cmd::auth::AuthCmd),
+    /// Check the configuration, model, keys, network, data directory, sandbox, git, code
+    /// index and MCP servers.
+    Doctor(cmd::doctor::DoctorArgs),
+    #[command(flatten)]
+    Util(cmd::Command),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum Output {
     Text,
@@ -125,6 +156,18 @@ fn parse_usd(s: &str) -> Result<f64, String> {
 /// A model id must name one of the providers Tautly has an adapter for (core decides).
 fn check_model(id: &str) -> Result<(), String> {
     tautly_core::known_provider(&ModelId::from(id)).map_err(|e| format!("{e}: {}", e.hint()))
+}
+
+/// A provider that cannot be set up. A missing key gets the same hint as a first run that
+/// found no provider (spec 7.11.2), naming the variables `config` makes the session read.
+fn setup_error(e: ProviderSetupError, config: &Config) -> anyhow::Error {
+    match e {
+        ProviderSetupError::MissingKey { .. } => {
+            let hint = setup_hint_with(&KeyVars::from_config(config));
+            anyhow!("{e}\nhint: {hint}")
+        }
+        other => anyhow!("{other}: {}", other.hint()),
+    }
 }
 
 /// The first SIGTERM or SIGHUP, as the exit code it means (128 + its number). The signals
@@ -190,6 +233,12 @@ struct Settings {
     overrides: CliOverrides,
     data_home: PathBuf,
     approve_mcp: bool,
+    secrets: local::Secrets,
+    probe: Arc<dyn OllamaProbe>,
+    /// What provider detection found, once it found something (spec 7.11.2): the same for
+    /// every later session of the process, so it is announced once. Nothing found, or an
+    /// error, is not kept: the next session detects again (after `tautly auth add`, say).
+    detected: Arc<OnceLock<Detected>>,
     #[cfg(feature = "mock")]
     provider: Option<Arc<dyn tautly_provider::Provider>>,
 }
@@ -209,9 +258,58 @@ impl Settings {
             overrides: cli.overrides(),
             data_home: tautly_core::data_home().context("cannot find the data directory")?,
             approve_mcp: cli.approve_mcp,
+            secrets: local::secrets(),
+            probe: local::ollama_probe(),
+            detected: Arc::new(OnceLock::new()),
             #[cfg(feature = "mock")]
             provider,
         })
+    }
+
+    /// Whether a scripted provider replaces the real one (`--mock-script`): then nothing
+    /// is detected and no key is needed.
+    fn scripted(&self) -> bool {
+        #[cfg(feature = "mock")]
+        return self.provider.is_some();
+        #[cfg(not(feature = "mock"))]
+        false
+    }
+
+    /// Set the model when no layer or flag names one and detection is on, announcing it on
+    /// stderr the first time. Detection reads the key variables the configuration names
+    /// (as the session will). Nothing found is an error with the setup hint. This may read
+    /// the keychain and wait for the Ollama probe (blocking).
+    fn detect_model(&self, loaded: &mut LoadedConfig) -> anyhow::Result<()> {
+        if self.scripted() || !wants_detection(loaded) {
+            return Ok(());
+        }
+        let vars = KeyVars::from_config(&loaded.config);
+        let found = match self.detected.get() {
+            Some(d) => d.clone(),
+            None => {
+                let catalog = loaded.config.effective_catalog();
+                let found = detect_with(
+                    &local::env,
+                    &*self.secrets.store,
+                    &*self.probe,
+                    &catalog,
+                    &vars,
+                )
+                .map_err(|e| anyhow!("provider detection failed: {e}"))?;
+                let Some(d) = found else {
+                    bail!("no model provider found\nhint: {}", setup_hint_with(&vars));
+                };
+                // Two sessions may detect at once; the first to finish announces.
+                if self.detected.set(d.clone()).is_ok() {
+                    eprintln!("{}", d.startup_line());
+                }
+                d
+            }
+        };
+        loaded.config.model = found.model;
+        // An uncatalogued Ollama model: the session reports it as a warning.
+        loaded.warnings.extend(found.warning);
+        Ok(())
     }
 
     /// A session on `root` (this may block: configuration files, the keychain).
@@ -222,8 +320,9 @@ impl Settings {
         interactive: bool,
         workspace: Option<Arc<tautly_core::Workspace>>,
     ) -> anyhow::Result<(Engine, mpsc::Receiver<Event>)> {
-        let loaded = Config::load(root, self.overrides.clone())?;
-        let builder = EngineBuilder {
+        let mut loaded = Config::load(root, self.overrides.clone())?;
+        self.detect_model(&mut loaded)?;
+        let mut builder = EngineBuilder {
             resume,
             interactive,
             workspace,
@@ -233,6 +332,23 @@ impl Settings {
             provider: self.provider.clone(),
             ..EngineBuilder::from_loaded(loaded, root)
         };
+        // Every provider the engine builds (side model, `SetModel`) reads this process's
+        // keychain (in tests, the file standing in for it).
+        builder.secret_store = Some(Arc::clone(&self.secrets.store));
+        if !self.scripted() {
+            // The main provider is set up here so a missing key fails before the session
+            // starts, with the setup hint.
+            let config = &builder.config;
+            let provider = provider_for_with(
+                config,
+                &config.model,
+                Arc::new(config.effective_catalog()),
+                &local::env,
+                &*self.secrets.store,
+            )
+            .map_err(|e| setup_error(e, config))?;
+            builder.provider = Some(provider);
+        }
         let (engine, events) = builder.build()?;
         if let Err(e) = install_signal_handlers(&engine) {
             eprintln!("tautly: signals are not handled: {e}");
@@ -241,8 +357,27 @@ impl Settings {
     }
 }
 
+fn exit_code(code: i32) -> ExitCode {
+    ExitCode::from(u8::try_from(code).unwrap_or(1))
+}
+
 fn main() -> ExitCode {
-    let cli = Cli::parse();
+    let mut cli = Cli::parse();
+    if cli.command.is_some()
+        && (cli.prompt.is_some() || cli.rpc || cli.continue_latest || cli.resume.is_some())
+    {
+        Cli::command()
+            .error(
+                clap::error::ErrorKind::ArgumentConflict,
+                "-p, --rpc, --continue and --resume do not go with a command",
+            )
+            .exit();
+    }
+    match cli.command.take() {
+        Some(Sub::Auth(cmd)) => return exit_code(cmd::auth::main(cmd)),
+        Some(Sub::Doctor(args)) => return exit_code(cmd::doctor::main(args)),
+        other => cli.command = other,
+    }
     if cli.output.is_some() && cli.prompt.is_none() {
         Cli::command()
             .error(
@@ -274,7 +409,10 @@ fn main() -> ExitCode {
     ExitCode::from(u8::try_from(code).unwrap_or(1))
 }
 
-async fn run(cli: Cli) -> anyhow::Result<i32> {
+async fn run(mut cli: Cli) -> anyhow::Result<i32> {
+    if let Some(Sub::Util(command)) = cli.command.take() {
+        return cmd::run(command, &cli).await;
+    }
     if cli.prompt.is_none() && !cli.rpc {
         eprintln!(
             "tautly: the interactive REPL is not available yet; use -p PROMPT or --rpc \

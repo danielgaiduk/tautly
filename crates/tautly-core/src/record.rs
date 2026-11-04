@@ -13,12 +13,12 @@ use serde_json::Value;
 use tautly_context::MutationReason;
 use tautly_context::pinned::{PinSource, Pinned};
 use tautly_memory::MemoryChange;
-use tautly_provider::{ModelId, ProviderEvent};
+use tautly_provider::{ModelId, ProviderEvent, RawUsage};
 use tautly_session::{BlobRef, RelPath, SessionReader};
 use tautly_tools::{PersistedEffect, ToolMeta};
 
 use crate::evidence::TestEvidence;
-use crate::protocol::{Command, FinishReason};
+use crate::protocol::{Command, FinishReason, UsageRole};
 
 /// One line of a session log, in the order things happened.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -40,6 +40,11 @@ pub enum SessionRecord {
         repo_map: Option<BlobRef>,
         system_prompt_hash: String,
         tools_hash: String,
+        /// The tool specs as sent (the serialized `tools` of the request, so the blob's
+        /// hash is `tools_hash`), MCP tools included: a rebuild assembles each logged step
+        /// with the tools in force at it. None in logs written before this field.
+        #[serde(default)]
+        tools: Option<BlobRef>,
     },
     /// A provider request (H6): `hash` is the blake3 of the serialized `CanonicalRequest`
     /// (which is not stored), `turn` the user turn (1-based), `step` the absolute provider
@@ -58,6 +63,19 @@ pub enum SessionRecord {
     /// are merged into one event each; a response that broke off mid-stream (and was sent
     /// again) is not logged.
     Provider(ProviderEvent),
+    /// Usage no logged response carries, as charged (ledger, budgets, `Usage`): a
+    /// side-model request (a compaction summary, a consolidation, an episode, a
+    /// `web_fetch` answer), or the main model's usage for a response that reported none,
+    /// broke off or was cancelled (estimated, or as reported), and what the retry wrapper
+    /// discarded for it. With the `Provider(Usage)` and `Provider(DiscardedUsage)` events
+    /// of complete responses (spent on their step's `Request.model`) it is the session's
+    /// whole spend, so resume and receipts can price it without the cost ledger.
+    Charged {
+        role: UsageRole,
+        model: ModelId,
+        usage: RawUsage,
+        estimated: bool,
+    },
     /// A tool call of the response before it. `args` is the input as it stands in the
     /// history: an empty object when the model's JSON did not parse.
     ToolCall {
@@ -91,6 +109,16 @@ pub enum SessionRecord {
         post_image_blob: Option<BlobRef>,
         #[serde(alias = "turn")]
         step: u32,
+    },
+    /// Writes whose outcome is unknown: abandoned at their bound after a cancel, or found
+    /// changed later (the abandoned write landed). The files may hold anything; the write
+    /// generation moves, as it did live (a rebuild replays it into the attempt ledger).
+    /// Logged where it was noticed: inside the step whose write was abandoned, or (`late`)
+    /// at the start of a later step, which a cut before that step leaves out.
+    WritesLost {
+        paths: Vec<RelPath>,
+        #[serde(default)]
+        late: bool,
     },
     /// An undo of user turn `turn` (H7, written by Task 26): each file's content just
     /// before the undo (`from_blob`; none: it did not exist) and what it was set to (`to`;
@@ -146,7 +174,9 @@ pub enum SessionRecord {
         reason: String,
     },
     /// A git checkpoint of the work tree (written by Task 47): `n` is its number in the
-    /// session, `turn` the user turn and `step` the provider step it was taken at.
+    /// session, `turn` the user turn and `step` the provider step it was taken at, `point`
+    /// where (a `BeforeExec` one sits inside its step; spec 7.12.1 finds the files at a
+    /// step boundary by log offset, not by `step`).
     Checkpoint {
         n: u32,
         commit: String,
@@ -155,12 +185,18 @@ pub enum SessionRecord {
         dirty: bool,
         turn: u32,
         step: u32,
+        /// None in logs written before this field.
+        #[serde(default)]
+        point: Option<CheckpointPoint>,
     },
-    /// A checkpoint that was not taken, and why (written by Task 47).
+    /// A checkpoint that was not taken, and why (written by Task 47), at `point`.
     CheckpointSkipped {
         reason: String,
         turn: u32,
         step: u32,
+        /// None in logs written before this field.
+        #[serde(default)]
+        point: Option<CheckpointPoint>,
     },
     /// The session is renamed; the last one wins over the header's label.
     Labeled { label: String },
@@ -206,6 +242,29 @@ pub struct BlockHashes {
     pub pinned: String,
     pub history: String,
     pub tail: String,
+}
+
+/// Where in the session a [`SessionRecord::Checkpoint`] (or `CheckpointSkipped`) was
+/// taken (spec 7.11.11).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckpointPoint {
+    /// A new session's start: the files as the session found them.
+    SessionStart,
+    /// A resumed session's start: the files now, including whatever changed while no
+    /// session ran.
+    ResumeStart,
+    /// Before a command (`bash`, a stdio MCP call) of step `step`, after that step's
+    /// earlier runs.
+    BeforeExec,
+    /// At the end of a user turn whose last step is `step`.
+    TurnEnd,
+    /// Before a rewind or branch switch writes (spec 7.12; written by Task 49): the tip as
+    /// it was.
+    BeforeRestore,
+    /// A point this version does not know (read only).
+    #[serde(other)]
+    Unknown,
 }
 
 /// One file of an [`SessionRecord::Undone`].
@@ -289,9 +348,11 @@ const KNOWN_TYPES: &[&str] = &[
     "prefix_applied",
     "request",
     "provider",
+    "charged",
     "tool_call",
     "tool_result",
     "edit",
+    "writes_lost",
     "undone",
     "uncompacted",
     "compaction",
@@ -561,6 +622,34 @@ mod tests {
     }
 
     #[test]
+    fn records_written_before_their_additive_fields_still_read() {
+        let old: SessionRecord = serde_json::from_str(
+            r#"{"type":"prefix_applied","data":{"agents_md":null,"repo_map":null,
+                "system_prompt_hash":"s","tools_hash":"t"}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            old,
+            SessionRecord::PrefixApplied { tools: None, .. }
+        ));
+        let lost: SessionRecord =
+            serde_json::from_str(r#"{"type":"writes_lost","data":{"paths":[]}}"#).unwrap();
+        assert!(matches!(
+            lost,
+            SessionRecord::WritesLost { late: false, .. }
+        ));
+        let checkpoint: SessionRecord = serde_json::from_str(
+            r#"{"type":"checkpoint","data":{"n":1,"commit":"c","tree":"t","head":null,
+                "dirty":false,"turn":1,"step":2}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            checkpoint,
+            SessionRecord::Checkpoint { point: None, .. }
+        ));
+    }
+
+    #[test]
     fn every_record_type_is_known() {
         let blob = BlobRef::parse(&"a".repeat(64)).unwrap();
         let all = [
@@ -570,6 +659,7 @@ mod tests {
                 repo_map: None,
                 system_prompt_hash: "s".into(),
                 tools_hash: "t".into(),
+                tools: Some(blob.clone()),
             },
             SessionRecord::Request {
                 hash: blob.clone(),
@@ -584,6 +674,12 @@ mod tests {
                 },
             },
             SessionRecord::Provider(ProviderEvent::TextDelta(String::new())),
+            SessionRecord::Charged {
+                role: UsageRole::Side,
+                model: ModelId::from("mock/small"),
+                usage: RawUsage::default(),
+                estimated: false,
+            },
             SessionRecord::ToolCall {
                 id: String::new(),
                 name: String::new(),
@@ -664,14 +760,20 @@ mod tests {
                 dirty: true,
                 turn: 1,
                 step: 0,
+                point: Some(CheckpointPoint::SessionStart),
             },
             SessionRecord::CheckpointSkipped {
                 reason: "timeout".into(),
                 turn: 1,
                 step: 3,
+                point: Some(CheckpointPoint::BeforeExec),
             },
             SessionRecord::Labeled {
                 label: "try-a".into(),
+            },
+            SessionRecord::WritesLost {
+                paths: vec![rel("a.txt")],
+                late: true,
             },
             SessionRecord::ModelSet {
                 model: ModelId::from("openai/gpt-5"),
