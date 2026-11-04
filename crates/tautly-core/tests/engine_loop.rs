@@ -791,6 +791,43 @@ async fn user_pin_command_pins_and_reports_refusals() {
 }
 
 #[tokio::test]
+async fn commands_and_budget_scopes_from_a_newer_client_are_refused_not_fatal() {
+    let fx = Fx::new();
+    let mock = MockProvider::new(vec![text_step("ok")]);
+    let mut run = start(fx.builder(config(Mode::Ask), &mock));
+    run.engine.send(Command::Unknown).await.unwrap();
+    run.engine
+        .send(Command::SetBudget {
+            scope: tautly_core::BudgetScope::Unknown,
+            max_usd: None,
+            max_tokens: Some(1),
+        })
+        .await
+        .unwrap();
+    run.say("go").await;
+    let events = run.until(|e| matches!(e, Event::TurnFinished { .. })).await;
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            Event::Error { message, .. } if message.contains("does not know this command")
+        )),
+        "{events:?}"
+    );
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            Event::Warning { message } if message.contains("SetBudget ignored: unknown scope")
+        )),
+        "{events:?}"
+    );
+    // The 1-token limit of the unknown scope applied to nothing.
+    assert_eq!(finish_reason(&events), FinishReason::Completed);
+    // Both are logged as received.
+    let recs = records(&run.engine);
+    assert!(recs.contains(&SessionRecord::Command(Command::Unknown)));
+}
+
+#[tokio::test]
 async fn context_gc_runs_only_at_step_start_and_emits_context_collected() {
     let fx = Fx::new();
     let big: String = (0..400)

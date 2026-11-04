@@ -163,6 +163,9 @@ impl Budgets {
 
     /// Replace one scope's limits (`SetBudget`); its state is reported afresh.
     pub fn set(&mut self, scope: BudgetScope, limit: Budget) {
+        if scope == BudgetScope::Unknown {
+            return;
+        }
         let s = self.scope_mut(scope);
         s.limit = limit;
         s.reported = BudgetState::Ok;
@@ -227,7 +230,7 @@ impl Budgets {
             let (limit, usd, tokens) = (s.limit, s.usd, s.tokens);
             let name = match scope {
                 BudgetScope::Turn => "turn",
-                BudgetScope::Session => "session",
+                BudgetScope::Session | BudgetScope::Unknown => "session",
             };
             let detail = self.detail(limit, usd, tokens);
             out.push(match state {
@@ -247,7 +250,8 @@ impl Budgets {
     fn state(&self, scope: BudgetScope) -> BudgetState {
         let s = match scope {
             BudgetScope::Turn => &self.turn,
-            BudgetScope::Session => &self.session,
+            // Never asked for `Unknown`: `set` ignores it.
+            BudgetScope::Session | BudgetScope::Unknown => &self.session,
         };
         self.effective(s.limit).check(s.usd, s.tokens)
     }
@@ -275,7 +279,7 @@ impl Budgets {
     fn scope_mut(&mut self, scope: BudgetScope) -> &mut Scope {
         match scope {
             BudgetScope::Turn => &mut self.turn,
-            BudgetScope::Session => &mut self.session,
+            BudgetScope::Session | BudgetScope::Unknown => &mut self.session,
         }
     }
 }

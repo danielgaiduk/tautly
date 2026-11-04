@@ -675,6 +675,14 @@ impl Actor {
             }
             // After a crashed turn every command gets the same answer.
             _ if lost => self.lost(),
+            Command::Unknown => self.events.try_emit(Event::Error {
+                kind: ErrorKind::Internal,
+                message: "this engine does not know this command (sent by a newer client?); \
+                          it was ignored"
+                    .into(),
+                retryable: false,
+                hint: None,
+            }),
             Command::Approve { request_id } => {
                 self.resolve(&request_id, Verdict::Approved);
             }
@@ -710,6 +718,12 @@ impl Actor {
     /// `SetBudget`: replace one scope's limits. Clients are trusted (the project layer's
     /// tighten-only rule applies to configuration files only).
     fn set_budget(&self, scope: BudgetScope, max_usd: Option<f64>, max_tokens: Option<u64>) {
+        if scope == BudgetScope::Unknown {
+            self.events.try_emit(Event::Warning {
+                message: "SetBudget ignored: unknown scope (sent by a newer client?)".into(),
+            });
+            return;
+        }
         if max_usd.is_some_and(|usd| !usd.is_finite() || usd < 0.0) {
             self.events.try_emit(Event::Warning {
                 message: "SetBudget ignored: max_usd must be a number of at least 0".into(),

@@ -457,6 +457,67 @@ mod tests {
     }
 
     #[test]
+    fn records_holding_values_from_a_newer_version_stay_readable() {
+        let read = |line: &str| -> SessionRecord {
+            serde_json::from_str(line).unwrap_or_else(|e| panic!("{line}: {e}"))
+        };
+        assert_eq!(
+            read(r#"{"type":"command","data":{"type":"teleport","to":"mars"}}"#),
+            SessionRecord::Command(Command::Unknown)
+        );
+        assert_eq!(
+            read(
+                r#"{"type":"command","data":{"type":"set_budget","scope":"week",
+                    "max_usd":null,"max_tokens":5}}"#
+            ),
+            SessionRecord::Command(Command::SetBudget {
+                scope: crate::protocol::BudgetScope::Unknown,
+                max_usd: None,
+                max_tokens: Some(5),
+            })
+        );
+        assert_eq!(
+            read(r#"{"type":"provider","data":{"citation":{"url":"u"}}}"#),
+            SessionRecord::Provider(ProviderEvent::Unknown)
+        );
+        assert_eq!(
+            read(r#"{"type":"provider","data":{"done":{"stop":{"paused":{"s":3}}}}}"#),
+            SessionRecord::Provider(ProviderEvent::Done {
+                stop: tautly_provider::StopReason::Unknown
+            })
+        );
+        let result = read(&format!(
+            r#"{{"type":"tool_result","data":{{"id":"c","result_blob":"{}","is_error":false,
+                "effects":[{{"type":"read","path":"a.txt","range":{{"start":null,"end":null}},
+                "file_hash":"{}","shown":{{"type":"folded","n":2}}}}],
+                "meta":{{"exit_code":null,"error_kind":null}}}}}}"#,
+            "a".repeat(64),
+            "b".repeat(64)
+        ));
+        let SessionRecord::ToolResult { effects, .. } = result else {
+            panic!("{result:?}")
+        };
+        assert!(
+            matches!(
+                effects[..],
+                [PersistedEffect::Read {
+                    shown: tautly_tools::Shown::Unknown,
+                    ..
+                }]
+            ),
+            "{effects:?}"
+        );
+        let proposal = read(
+            r#"{"type":"memory_proposal","data":{"id":"mem-1","change":{"upsert":{"id":"x",
+                "title":"t","kind":"pattern","anchors":[],"created":0,"body":"b"},"delete":[]}}}"#,
+        );
+        let SessionRecord::MemoryProposal { change, .. } = proposal else {
+            panic!("{proposal:?}")
+        };
+        assert_eq!(change.upsert.unwrap().kind, tautly_memory::MemoryKind::Fact);
+    }
+
+    #[test]
     fn an_edit_written_with_turn_reads_as_its_step() {
         let rec: SessionRecord = serde_json::from_str(
             r#"{"type":"edit","data":{"path":"a.txt","pre_image":null,"post_image_blob":null,

@@ -596,6 +596,60 @@ async fn resume_restores_budget_spend_and_set_budget() {
 }
 
 #[tokio::test]
+async fn a_log_holding_values_from_a_newer_version_still_resumes() {
+    let fx = Fx::new();
+    let cfg = || config(Mode::Ask);
+    let mock = MockProvider::new(vec![text_step("first")]);
+    let mut run = start(fx.builder(cfg(), &mock));
+    run.turn_with("one").await;
+    let id = run.engine.session_id().to_string();
+    let path = run.engine.session_path().to_path_buf();
+    run.stop().await;
+
+    // A newer version appended records with commands, provider events, stop reasons,
+    // budget scopes and read kinds this version does not know.
+    let text = std::fs::read_to_string(&path).unwrap();
+    let last: Value = serde_json::from_str(text.lines().last().unwrap()).unwrap();
+    let (mut offset, t) = (last["offset"].as_u64().unwrap() + 1, last["t"].clone());
+    let future = [
+        json!({"type": "command", "data": {"type": "teleport", "to": "mars"}}),
+        json!({"type": "command", "data": {"type": "set_budget", "scope": "week",
+                                           "max_usd": null, "max_tokens": 1}}),
+        json!({"type": "provider", "data": {"citation": {"url": "u"}}}),
+        json!({"type": "provider", "data": {"done": {"stop": {"paused": {"s": 3}}}}}),
+        json!({"type": "tool_result", "data": {"id": "fut", "result_blob": "a".repeat(64),
+            "is_error": false, "meta": {"exit_code": null, "error_kind": null},
+            "effects": [{"type": "read", "path": "a.txt",
+                         "range": {"start": null, "end": null},
+                         "file_hash": "b".repeat(64), "shown": {"type": "folded"}}]}}),
+    ];
+    let mut appended = String::new();
+    for data in future {
+        let line = json!({"type": "record", "offset": offset, "t": t, "data": data});
+        appended.push_str(&format!("{line}\n"));
+        offset += 1;
+    }
+    std::fs::write(&path, format!("{text}{appended}")).unwrap();
+
+    let recs = records_at(&path);
+    assert!(recs.contains(&SessionRecord::Command(Command::Unknown)));
+    assert!(recs.contains(&SessionRecord::Provider(ProviderEvent::Unknown)));
+    rebuild_at(&path, None);
+
+    let mock = MockProvider::new(vec![text_step("second")]);
+    let mut run = start(fx.resume(cfg(), &mock, &id));
+    let events = run.turn_with("two").await;
+    assert!(
+        !events.iter().any(|e| matches!(e, Event::Error { .. })),
+        "{events:?}"
+    );
+    // The unknown scope's 1-token limit applied to nothing.
+    assert_eq!(finish_reason(&events), FinishReason::Completed);
+    assert!(text_of(&mock.requests()[0]).contains("first"));
+    run.stop().await;
+}
+
+#[tokio::test]
 async fn resume_warns_when_the_logged_system_prompt_differs() {
     let fx = Fx::new();
     let mock = MockProvider::new(vec![text_step("ok")]);

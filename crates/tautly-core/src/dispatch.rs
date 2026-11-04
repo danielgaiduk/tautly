@@ -111,6 +111,7 @@ impl Outcome {
         let name = match scope {
             BudgetScope::Turn => "turn",
             BudgetScope::Session => "session",
+            BudgetScope::Unknown => "unknown",
         };
         Outcome::refused(ToolResult::error(format!(
             "not run: the {name} budget is exhausted"

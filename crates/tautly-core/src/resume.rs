@@ -434,7 +434,9 @@ impl Replay<'_> {
                 scope,
                 max_usd,
                 max_tokens,
-            } if max_usd.is_none_or(|usd| usd.is_finite() && usd >= 0.0) => {
+            } if scope != BudgetScope::Unknown
+                && max_usd.is_none_or(|usd| usd.is_finite() && usd >= 0.0) =>
+            {
                 self.out.budgets.push((
                     scope,
                     Budget {
