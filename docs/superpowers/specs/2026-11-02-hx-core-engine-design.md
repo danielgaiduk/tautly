@@ -670,7 +670,7 @@ Every operation here creates a new branch or a new view. None truncates a log, a
 - **Outside git:** only tool edits are restored, and `note` says command effects were not.
 
 #### 7.12.3 Session tree and switching
-- **Branches are first-class.** Each session's header gives its parent `(session, step)`, `label` and `origin`. `Fork{at?, label?}` (REPL `/fork [label]`) creates a conversation-only branch at step `at` (default: the tip) without touching files. `Label{label}` (`/label <name>`) renames the current branch.
+- **Branches are first-class.** Each session's header gives its parent `(session, record offset)` (the step is the one whose last record is at `offset − 1`), `label` and `origin`. `Fork{at?, label?}` (REPL `/fork [label]`) creates a conversation-only branch at step `at` (default: the tip) without touching files. `Label{label}` (`/label <name>`) renames the current branch.
 - **`session/tree {root}`** (RPC), `tautly sessions tree` and `/tree` list the project's sessions (H10) as a tree. Each node is `{session_id, parent?, label?, origin, created, steps, last_prompt, cost_usd?, live, current}`. The REPL prints one indented line per branch: `* <label or id8>  step N · <origin> · $cost · <last prompt, 40 chars>`, with `*` marking the current branch.
 - **`Command::Switch{session_id, dry_run, overwrite}`** (`/switch <label|id|n>`) materializes the target branch's tip (`expected_tip(target)`) in place, with the same conflict rules and backup as rewind. It then continues that session (`Switched{branch, report}`, `SessionChanged`). Switching back and forth restores each tip exactly.
 

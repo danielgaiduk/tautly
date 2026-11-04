@@ -1079,6 +1079,8 @@ proptest! { #[test] fn apply_then_inverse_restores(text in "[a-z\\n]{1,200}", ..
 
 ### Task 33: Performance gates in CI
 
+**Checkpoint 4 amendment (binding):** C-M5. A `ToolCall` record whose `args` JSON is over 4 KiB stores the arguments as a blob reference (`args_blob`, additive with `#[serde(default)]`; `args` is then `null`), so an edit-heavy session no longer logs every large argument twice. Readers take the arguments from the blob. The `SendMessage`/`TurnStart.text` duplication is accepted. Add a gate: a scripted session with ten 200 KB `write` calls has a log under 1.3× the sum of its post-image blobs plus 64 KiB.
+
 **Checkpoint 2 amendments (binding):** Add an RSS gate for a 100k-file tree (index open + tree) and a gate that a no-op post-bash freshness check with a live watcher is cookie-based (< 50 ms), not a full refresh.
 
 **v1 scope note (binding, user-approved 2026-11-03):**
@@ -1109,6 +1111,8 @@ proptest! { #[test] fn apply_then_inverse_restores(text in "[a-z\\n]{1,200}", ..
 - [ ] **Step 5: Commit** `git commit -m "ci: performance gates for startup, RSS, soak, big output"`
 
 ### Task 34: `tautly eval` runner and starter task set
+
+**Checkpoint 4 amendment (binding):** C-M8. Add `ToolMeta.repair: Option<&'static str>` (the `RepairStage` name, serialized and shown in `ToolMetaView`, additive) so `summary.edit_repairs_by_stage` can be filled from the event stream.
 
 **Benchmark kit amendment (binding, user-approved 2026-11-03; spec 9.3):**
 - `tautly eval` gains `--trials N` (default 1). Results keep one entry per task and trial, and `summary` gains `trials` and the per-metric `mean`/`stdev` across trials.
@@ -1830,6 +1834,11 @@ Task 48 runs before Task 26. Tasks 49–53 run after Task 46 and before checkpoi
 
 ### Task 49: Rewind as fork, session tree, switching (execute after Task 46)
 
+**Checkpoint 4 amendments (binding):**
+- C-M6: `Header.parent` holds a record offset, not a step. Add `fn step_at_offset(reader, offset: u64) -> u32` (the step whose last record is at `offset − 1`) and use it for `TreeNode.parent`, compare's `fork_point` and rewind.
+- `state_at` is defined by log offset (spec 7.12.1). `Checkpoint`/`CheckpointSkipped` records carry `point` (`TurnStart`, `TurnEnd`, `Step`, `BeforeRestore`; Task 49 is the first writer of `BeforeRestore`). A checkpoint whose `point` is missing or unknown counts as partial when its turn has no `turn_end` checkpoint before it; cover it in the matrix (`tests/checkpoint_points.rs` already has the reading rule).
+- Use `Workspace::live_sessions` for the lease's live count. `Checkpointer::for_session` (offline undo) was not built in checkpoint 4; build it here if the offline paths need it.
+
 **Files:**
 - Create: `crates/tautly-core/src/{timetravel.rs,lease.rs,tree.rs}`
 - Modify:
@@ -1961,6 +1970,8 @@ Task 48 runs before Task 26. Tasks 49–53 run after Task 46 and before checkpoi
 - [ ] **Step 5: Commit** `git commit -m "feat(core,cli): session playback"`
 
 ### Task 52: Compare (execute after Task 51)
+
+**Checkpoint 4 amendments (binding):** C-M7. Wall time is `Σ(TurnEnd.t − TurnStart.t)` (not `SendMessage.t`, which is logged on arrival and overlaps queued messages). Steps are distinct `Request.step` values (a retry after `ReasoningStripped` or an overflow compaction repeats a step). Cost includes `Charged` records (side-model and estimated usage), each priced by its own model.
 
 **Files:**
 - Create: `crates/tautly-core/src/compare.rs`, `crates/tautly-cli/src/cmd/compare.rs`
