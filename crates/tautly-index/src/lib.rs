@@ -3,6 +3,7 @@
 pub mod extract;
 mod fresh;
 mod lang;
+mod peek;
 mod store;
 mod tree;
 mod trigram;
@@ -11,6 +12,7 @@ mod watch;
 
 pub use extract::{Extracted, extract};
 pub use lang::Lang;
+pub use peek::{IndexPeek, peek};
 pub use store::{
     Index, IndexError, IndexStats, RefRow, RefreshHold, RefreshStats, SymbolKind, SymbolRow,
 };

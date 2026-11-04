@@ -40,3 +40,4 @@ keyring = { workspace = true, features = ["linux-native-async-persistent", "cryp
 insta.workspace = true
 ignore.workspace = true
 proptest.workspace = true
+wiremock.workspace = true

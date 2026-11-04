@@ -10,7 +10,9 @@ use tautly_provider::openai::OpenAiProvider;
 use tautly_provider::{Catalog, ModelId, Provider};
 use url::Url;
 
-use crate::auth::api_key;
+use std::ffi::OsString;
+
+use crate::auth::{KeyringStore, SecretStore, api_key_with};
 use crate::config::{Config, ProviderEntry};
 
 const ANTHROPIC_URL: &str = "https://api.anthropic.com";
@@ -119,15 +121,35 @@ pub(crate) fn provider_for(
     model: &ModelId,
     catalog: Arc<Catalog>,
 ) -> Result<Arc<dyn Provider>, ProviderSetupError> {
+    provider_for_with(
+        config,
+        model,
+        catalog,
+        &|name| std::env::var_os(name),
+        &KeyringStore,
+    )
+}
+
+/// [`provider_for`] with the environment and the keychain injected (a client that checks
+/// the key before it starts a session; tests). Compat models use
+/// [`Config::effective_compat`], so the built-in `openrouter` and `ollama` entries work
+/// without configuration. A native provider (`anthropic`, `openai`, `google`) without a
+/// key is [`ProviderSetupError::MissingKey`]; a compat endpoint may have none.
+pub fn provider_for_with(
+    config: &Config,
+    model: &ModelId,
+    catalog: Arc<Catalog>,
+    env: &dyn Fn(&str) -> Option<OsString>,
+    store: &dyn SecretStore,
+) -> Result<Arc<dyn Provider>, ProviderSetupError> {
     known_provider(model)?;
     let head = model.as_str().split('/').next().unwrap_or("");
     let (name, entry) = match model.provider() {
         "compat" => {
             let compat = head.strip_prefix("compat:").unwrap_or("");
             let entry = config
-                .providers
-                .compat
-                .iter()
+                .effective_compat()
+                .into_iter()
                 .find(|c| c.name == compat)
                 .ok_or_else(|| ProviderSetupError::NoCompatEntry {
                     name: compat.to_string(),
@@ -150,7 +172,8 @@ pub(crate) fn provider_for(
             });
         }
     };
-    let lookup = api_key(&name, &entry).map_err(|e| ProviderSetupError::Other(e.to_string()))?;
+    let lookup = api_key_with(&name, &entry, env, store)
+        .map_err(|e| ProviderSetupError::Other(e.to_string()))?;
     let base = |default: &str| -> Result<Url, ProviderSetupError> {
         match &entry.base_url {
             Some(u) => Ok(u.clone()),
