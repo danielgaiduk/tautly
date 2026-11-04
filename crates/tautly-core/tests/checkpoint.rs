@@ -2020,7 +2020,8 @@ async fn git_dir_with_linked_refs_or_objects_takes_no_checkpoint() {
     victim.git(&["update-ref", "refs/tautly/checkpoints/old/1", &head]);
     let vgit = victim.path(".git");
     let link = |from: PathBuf, to: PathBuf| std::os::unix::fs::symlink(to, from).unwrap();
-    let layouts: Vec<(&str, Box<dyn Fn(&Repo)>)> = vec![
+    type Layout<'a> = (&'a str, Box<dyn Fn(&Repo) + 'a>);
+    let layouts: Vec<Layout> = vec![
         (
             "refs and objects",
             Box::new(|r: &Repo| {
