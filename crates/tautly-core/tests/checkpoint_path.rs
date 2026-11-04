@@ -238,3 +238,110 @@ fn session_start_checkpoint_does_not_delay_the_first_command() {
         assert!(taken.len() >= 2, "{taken:?}");
     });
 }
+
+fn bash_step(id: &str, command: &str) -> MockTurn {
+    MockTurn::Events(vec![
+        ProviderEvent::ToolCall {
+            id: id.into(),
+            name: "bash".into(),
+            input_json: serde_json::json!({ "command": command }).to_string(),
+        },
+        ProviderEvent::Done {
+            stop: StopReason::ToolUse,
+        },
+    ])
+}
+
+#[test]
+fn old_git_in_a_partial_clone_warns_once_and_logs_one_skip() {
+    let git = real_git();
+    let repo = repo(&git);
+    let home = tempfile::tempdir().unwrap();
+    let marker = home.path().join("lazy-fetch");
+    let url = format!("ext::sh -c touch% {}", marker.display());
+    for (key, value) in [
+        ("core.repositoryformatversion", "1"),
+        ("extensions.partialClone", "origin"),
+        ("remote.origin.promisor", "true"),
+        ("remote.origin.url", url.as_str()),
+        ("protocol.ext.allow", "always"),
+    ] {
+        let ok = Process::new(&git)
+            .current_dir(repo.path())
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .args(["config", key, value])
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok);
+    }
+    // Git 2.43, which ignores GIT_NO_LAZY_FETCH.
+    let shim_dir = tempfile::tempdir().unwrap();
+    let shim = shim_dir.path().join("git");
+    std::fs::write(
+        &shim,
+        format!(
+            "#!/bin/sh\nfor last in \"$@\"; do :; done\n\
+             case \"$last\" in version|--version) echo 'git version 2.43.0'; exit 0;; esac\n\
+             unset GIT_NO_LAZY_FETCH\nexec '{}' \"$@\"\n",
+            git.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let path = format!("{}:/bin:/usr/bin", shim_dir.path().display());
+    let (events, log) = with_path(Path::new(&path), async {
+        let (engine, mut events) = engine(
+            repo.path(),
+            home.path(),
+            vec![
+                bash_step("b1", "printf 'b\\n' > a.txt"),
+                text_step("first"),
+                bash_step("b2", "printf 'c\\n' > a.txt"),
+                text_step("second"),
+            ],
+        );
+        let mut seen = Vec::new();
+        for text in ["one", "two"] {
+            engine
+                .send(Command::SendMessage { text: text.into() })
+                .await
+                .unwrap();
+            loop {
+                let ev = next(&mut events).await;
+                let done = matches!(ev, Event::TurnFinished { .. });
+                seen.push(ev);
+                if done {
+                    break;
+                }
+            }
+        }
+        let log = engine.session_path().to_path_buf();
+        seen.extend(stop(engine, events).await);
+        (seen, log)
+    });
+    let warnings: Vec<&String> = events
+        .iter()
+        .filter_map(|e| match e {
+            Event::Warning { message } if message.starts_with("checkpoint skipped") => {
+                Some(message)
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert!(warnings[0].contains("partial clone"), "{warnings:?}");
+    let reader = SessionReader::<SessionRecord>::open(&log).unwrap();
+    let mut skips = Vec::new();
+    let mut taken = 0;
+    for r in reader.records() {
+        match r.unwrap().1 {
+            SessionRecord::CheckpointSkipped { reason, .. } => skips.push(reason),
+            SessionRecord::Checkpoint { .. } => taken += 1,
+            _ => {}
+        }
+    }
+    assert_eq!(skips, ["unsafe_partial_clone"]);
+    assert_eq!(taken, 0);
+    assert!(!marker.exists(), "the promisor remote's command ran");
+}

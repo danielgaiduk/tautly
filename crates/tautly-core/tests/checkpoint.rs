@@ -1357,3 +1357,214 @@ async fn fork_at_an_earlier_step_reuses_only_checkpoints_it_has_refs_for() {
         assert_eq!(repo.git(&["rev-parse", &name]), commit);
     }
 }
+
+// -------------------------------------------------- partial clones, excludes, .git links
+
+/// The first `git` on `PATH`.
+fn real_git() -> PathBuf {
+    let path = std::env::var_os("PATH").unwrap();
+    std::env::split_paths(&path)
+        .map(|d| d.join("git"))
+        .find(|p| p.is_file())
+        .expect("git is installed")
+}
+
+/// A git that says it is `version` and, like git before 2.44, ignores
+/// `GIT_NO_LAZY_FETCH` (and `GIT_ALLOW_PROTOCOL` as well, so only the `-c` settings
+/// stand between a lazy fetch and the promisor remote).
+fn old_git_shim(dir: &Path, version: &str) -> PathBuf {
+    let shim = dir.join(format!("git-{version}"));
+    executable(
+        &shim,
+        &format!(
+            "#!/bin/sh\nfor last in \"$@\"; do :; done\n\
+             case \"$last\" in version|--version) echo 'git version {version}'; exit 0;; esac\n\
+             unset GIT_NO_LAZY_FETCH GIT_ALLOW_PROTOCOL\nexec '{}' \"$@\"\n",
+            real_git().display()
+        ),
+    );
+    shim
+}
+
+/// Make `repo` a partial clone whose promisor remote's URL runs `touch <marker>` (an
+/// `ext::` transport the repository's own configuration allows); with `missing`, HEAD's
+/// `sub` tree object is deleted, so reading HEAD needs a lazy fetch.
+fn promisor(repo: &Repo, marker: &Path, missing: bool) {
+    if missing {
+        let sub = repo.git(&["rev-parse", "HEAD:sub"]);
+        std::fs::remove_file(repo.path(&format!(".git/objects/{}/{}", &sub[..2], &sub[2..])))
+            .unwrap();
+    }
+    let url = format!("ext::sh -c touch% {}", marker.display());
+    for (key, value) in [
+        ("core.repositoryformatversion", "1"),
+        ("extensions.partialClone", "origin"),
+        ("remote.origin.promisor", "true"),
+        ("remote.origin.url", url.as_str()),
+        ("protocol.ext.allow", "always"),
+    ] {
+        repo.git(&["config", key, value]);
+    }
+}
+
+#[tokio::test]
+async fn promisor_remote_never_runs_where_git_ignores_no_lazy_fetch() {
+    let repo = Repo::with(&[("a.txt", "a\n"), ("sub/x.txt", "x\n")]);
+    let marker = repo.home.path().join("lazy-fetch");
+    promisor(&repo, &marker, true);
+    // New enough to pass the version check, yet lazy fetching: only the per-protocol
+    // overrides keep the `ext::` command from running.
+    let shim = old_git_shim(repo.home.path(), "2.99.0");
+    let mut cp = repo
+        .checkpointer(CheckpointConfig::default())
+        .with_git(&shim);
+    let _ = cp.snapshot(0, true).await;
+    let _ = cp.backup().await;
+    assert!(!marker.exists(), "the promisor remote's command ran");
+
+    // Control: the same git, with the repository's protocol setting, runs it.
+    let index = repo.home.path().join("control-index");
+    let ran = Process::new(&shim)
+        .current_dir(repo.root())
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_INDEX_FILE", &index)
+        .args(["-c", "protocol.allow=never", "read-tree", "HEAD"])
+        .output()
+        .unwrap();
+    assert!(marker.exists(), "the lazy fetch was not set up: {ran:?}");
+}
+
+#[tokio::test]
+async fn old_git_takes_no_checkpoint_of_a_partial_clone() {
+    let repo = Repo::with(&[("a.txt", "a\n"), ("sub/x.txt", "x\n")]);
+    let marker = repo.home.path().join("lazy-fetch");
+    promisor(&repo, &marker, true);
+    let old = old_git_shim(repo.home.path(), "2.43.0");
+    let mut cp = repo
+        .checkpointer(CheckpointConfig::default())
+        .with_git(&old);
+    assert_eq!(cp.snapshot(0, true).await, Err(Skip::UnsafePartialClone));
+    assert_eq!(cp.backup().await, Err(Skip::UnsafePartialClone));
+    assert!(!marker.exists(), "the promisor remote's command ran");
+    assert!(repo.refs("refs/tautly/").is_empty());
+
+    // A promisor remote alone (no `extensions.partialClone`) is a partial clone too.
+    let promisor_only = Repo::with(&[("a.txt", "a\n")]);
+    promisor_only.git(&["config", "remote.origin.promisor", "true"]);
+    promisor_only.git(&["config", "remote.origin.url", "https://example.invalid/r"]);
+    let mut cp = promisor_only
+        .checkpointer(CheckpointConfig::default())
+        .with_git(&old);
+    assert_eq!(cp.snapshot(0, true).await, Err(Skip::UnsafePartialClone));
+
+    // Git 2.44 honours GIT_NO_LAZY_FETCH: a partial clone gets its checkpoints.
+    let complete = Repo::with(&[("a.txt", "a\n"), ("sub/x.txt", "x\n")]);
+    promisor(&complete, &marker, false);
+    let new = old_git_shim(complete.home.path(), "2.44.0");
+    let mut cp = complete
+        .checkpointer(CheckpointConfig::default())
+        .with_git(&new);
+    assert!(cp.snapshot(0, true).await.is_ok());
+    // And a repository that is no partial clone, with the old git.
+    let plain = Repo::with(&[("a.txt", "a\n")]);
+    let mut cp = plain
+        .checkpointer(CheckpointConfig::default())
+        .with_git(&old);
+    assert!(cp.snapshot(0, true).await.is_ok());
+    assert!(!marker.exists());
+}
+
+#[tokio::test]
+async fn undo_uses_the_excludes_of_the_turns_start() {
+    let repo = Repo::with(&[("tracked.txt", "orig\n")]);
+    repo.write(".env", "SECRET=1\n");
+    repo.write(".secret", "S\n");
+    // Ignored only by the repository's exclude file and the user's excludes file.
+    std::fs::write(repo.path(".git/info/exclude"), ".env\n").unwrap();
+    let global = repo.home.path().join("excludes");
+    std::fs::write(&global, ".secret\n").unwrap();
+    repo.git(&["config", "core.excludesFile", global.to_str().unwrap()]);
+    // Both are emptied while the turn's command runs (after its checkpoint).
+    let mock = MockProvider::new(vec![
+        tools_step(vec![bash(
+            "b1",
+            "touch ready && while [ ! -e go ]; do sleep 0.02; done \
+             && printf 'changed\\n' > tracked.txt",
+        )]),
+        text_step("done"),
+    ]);
+    let mut run = start(repo.builder(config(), &mock));
+    run.send(Command::SendMessage { text: "go".into() }).await;
+    let began = Instant::now();
+    while !repo.path("ready").exists() {
+        assert!(began.elapsed() < WAIT, "the command did not start");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    std::fs::write(repo.path(".git/info/exclude"), "").unwrap();
+    std::fs::write(&global, "").unwrap();
+    repo.write("go", "");
+    run.until(|e| matches!(e, Event::TurnFinished { .. })).await;
+    let answer = run.undo(None, false).await;
+    run.stop().await;
+    let Event::Undone {
+        restored,
+        mut deleted,
+        note,
+        ..
+    } = answer
+    else {
+        panic!("{answer:?}")
+    };
+    deleted.sort();
+    assert_eq!(restored, ["tracked.txt"]);
+    assert_eq!(deleted, ["go", "ready"]);
+    let note = note.unwrap();
+    assert!(note.contains(".env") && note.contains(".secret"), "{note}");
+    assert_eq!(repo.read(".env").as_deref(), Some("SECRET=1\n"));
+    assert_eq!(repo.read(".secret").as_deref(), Some("S\n"));
+    assert_eq!(repo.read("tracked.txt").as_deref(), Some("orig\n"));
+}
+
+#[tokio::test]
+async fn dot_git_symlink_takes_no_checkpoint_and_says_so() {
+    let real = Repo::with(&[("a.txt", "a\n")]);
+    let root = Repo::bare_dir();
+    std::os::unix::fs::symlink(real.path(".git"), root.path(".git")).unwrap();
+    root.write("a.txt", "a\n");
+    assert!(
+        Checkpointer::new(
+            root.sandbox(),
+            root.root(),
+            "s".into(),
+            CheckpointConfig::default()
+        )
+        .is_none()
+    );
+    let mock = MockProvider::new(vec![
+        tools_step(vec![bash("b1", "printf 'b\\n' > a.txt")]),
+        text_step("first"),
+        tools_step(vec![bash("b2", "printf 'c\\n' > a.txt")]),
+        text_step("second"),
+    ]);
+    let mut run = start(root.builder(config(), &mock));
+    let mut events = run.turn_with("one").await;
+    events.extend(run.turn_with("two").await);
+    let (_, path) = run.engine.current_session();
+    run.stop().await;
+    let skipped: Vec<String> = warnings(&events)
+        .into_iter()
+        .filter(|w| w.starts_with("checkpoint skipped"))
+        .collect();
+    assert_eq!(skipped, [skip_warning(&Skip::GitDirSymlink)]);
+    let reasons: Vec<String> = records_at(&path)
+        .into_iter()
+        .filter_map(|r| match r {
+            SessionRecord::CheckpointSkipped { reason, .. } => Some(reason),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(reasons, ["git_dir_symlink"]);
+    // Nothing was written to the repository the link points at.
+    assert!(real.refs("refs/tautly/").is_empty());
+}

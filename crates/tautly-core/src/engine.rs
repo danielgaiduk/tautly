@@ -48,7 +48,7 @@ use tokio_util::sync::CancellationToken;
 use crate::approvals::{Approvals, Verdict};
 use crate::attempts::AttemptLedger;
 use crate::budget::{Budget, Budgets};
-use crate::checkpoint::{self, Checkpointer, GitCheckpoints, StartCheckpoint};
+use crate::checkpoint::{self, Checkpointer, GitCheckpoints, Skip, StartCheckpoint};
 use crate::config::{Config, LoadedConfig};
 use crate::evidence::{EvidenceTracker, TestMatcher};
 use crate::ledger::{CostLedger, LEDGER_FILE};
@@ -268,13 +268,14 @@ impl EngineBuilder {
             })
             .flatten()
             .map(|cp| GitCheckpoints::shared(cp.with_process_groups(groups.clone())));
-        // Checkpoints are on in a git work tree, yet none can be taken: no git to run.
-        let start_checkpoint = if config.checkpoints.enabled
-            && checkpoints.is_none()
-            && checkpoint::git_dir(&root).is_some()
-            && checkpoint::git_on_path().is_none()
-        {
-            StartCheckpoint::NoGit
+        // Checkpoints are on in a git work tree, yet none can be taken: `.git` is a
+        // symbolic link (to a repository that may not be this one's), or no git to run.
+        let start_checkpoint = if !config.checkpoints.enabled || checkpoints.is_some() {
+            StartCheckpoint::Idle
+        } else if checkpoint::dot_git_is_link(&root) {
+            StartCheckpoint::Skipped(Skip::GitDirSymlink)
+        } else if checkpoint::git_dir(&root).is_some() && checkpoint::git_on_path().is_none() {
+            StartCheckpoint::Skipped(Skip::NoGit)
         } else {
             StartCheckpoint::Idle
         };
