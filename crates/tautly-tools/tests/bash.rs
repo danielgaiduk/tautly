@@ -50,6 +50,24 @@ fn alive(marker: &str) -> bool {
         .success()
 }
 
+/// Review B-M4: the variables the session strips (the provider API keys) do not reach a
+/// command; others still do. (`HOME` and `USER` stand in for key variables: setting one in
+/// this process would race the other tests.)
+#[tokio::test]
+async fn stripped_variables_do_not_reach_commands() {
+    let (dir, sb) = sandbox();
+    let cx = cx(&dir).with_env_remove(vec!["HOME".into(), "TAUTLY_NOT_SET_ANYWHERE".into()]);
+    let r = BashTool
+        .run(
+            json!({ "command": "echo \"home=${HOME-unset} path=${PATH:+set}\"" }),
+            &sb,
+            &cx,
+        )
+        .await;
+    assert!(!r.is_error, "{}", r.output);
+    assert!(r.output.contains("home=unset path=set"), "{}", r.output);
+}
+
 #[tokio::test]
 async fn captures_stdout_stderr_and_exit_code() {
     let r = run_bash("echo out; echo err >&2; exit 3").await;

@@ -200,7 +200,7 @@ trait Tool: Send + Sync {
 | `read` | Line ranges; emits hashline anchors when the active edit format is `hashline`; images for capable models; re-reads return `unchanged`/diff (7.2) unless `full: true` |
 | `edit` | Per-model edit format (5.3) |
 | `write` | Create/overwrite a file |
-| `bash` | Runs via sandbox in its own process group; default timeout 120 s; output > 2 KB passed through output filters (7.3), else/fallback capped at 30 KB (head + tail kept); full output spilled to a temp file referenced in the result |
+| `bash` | Runs via sandbox in its own process group; default timeout 120 s; output > 2 KB passed through output filters (7.3), else/fallback capped at 30 KB (head + tail kept); full output spilled to a temp file referenced in the result. The command inherits the user's environment minus shell-state variables (`CDPATH`, `BASH_ENV`, `ENV`, `SHELLOPTS`, `BASHOPTS`, `PROMPT_COMMAND`, `PS4`) and minus the provider key variables MCP servers are denied (7.11.10: `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`, `OPENROUTER_API_KEY` and every configured `api_key_env`): the commands an agent runs (`npm test`, a `build.rs`) are often repository code. A command that needs a key gets it from the user's own shell, not from tautly's environment |
 | `grep`, `glob` | ripgrep crates (`grep-searcher`, `ignore`); `.gitignore`-aware |
 | `outline`, `symbol`, `refs` | Code-index queries (7.1) |
 | `find` | One ranked search over paths, symbols and text (7.10) |

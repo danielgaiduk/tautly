@@ -102,8 +102,9 @@ impl McpSetup {
     }
 }
 
-/// The default provider key variables plus every configured `api_key_env`.
-fn provider_key_vars(config: &Config) -> Vec<String> {
+/// The default provider key variables plus every configured `api_key_env`: stripped from
+/// MCP servers and from bash commands.
+pub(crate) fn provider_key_vars(config: &Config) -> Vec<String> {
     let p = &config.providers;
     let mut vars: Vec<String> = PROVIDER_KEY_VARS.iter().map(|s| s.to_string()).collect();
     let configured = [&p.anthropic, &p.openai, &p.google]

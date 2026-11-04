@@ -480,6 +480,7 @@ impl Session {
             .with_cancel(ctl.cancel.child_token())
             .with_turn(turn)
             .with_process_groups(self.groups.clone())
+            .with_env_remove(crate::mcp::provider_key_vars(&self.setup.config))
             .with_side(Arc::clone(&self.side.runner));
         if let Some(index) = self.workspace.index() {
             cx = cx.with_index(index);
