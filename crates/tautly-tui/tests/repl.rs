@@ -688,7 +688,7 @@ async fn approval_a_sends_exact_session_rule() {
     // Quoted words as the policy parses them (review T30-M2).
     assert_eq!(
         rule("bash", json!({"command": "git commit -m \"fix  it\""})).as_deref(),
-        Some("bash(git commit -m fix  it)")
+        Some("bash(git commit -m 'fix  it')")
     );
     assert_eq!(rule("bash", json!({"command": "echo $(date)"})), None);
     assert_eq!(rule("bash", json!({"command": "a && b"})), None);
@@ -1312,10 +1312,10 @@ async fn approval_a_on_a_quoted_command_is_accepted() {
         .filter(|p| p.contains("allow?"))
         .collect();
     assert_eq!(asks.len(), 1, "{:?}\n{}", ran.prompts, ran.out);
-    assert!(asks[0].contains("(bash(echo a  b))"), "{asks:?}");
+    assert!(asks[0].contains("(bash(echo 'a  b'))"), "{asks:?}");
     assert!(
         ran.out
-            .contains("allowed for this session: bash(echo a  b)"),
+            .contains("allowed for this session: bash(echo 'a  b')"),
         "{}",
         ran.out
     );

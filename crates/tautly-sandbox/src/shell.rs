@@ -1132,6 +1132,19 @@ fn redirect_of(node: Node, src: &[u8]) -> Result<Option<Redirect>, Unparseable> 
             break;
         }
     }
+    // `cmd > out.txt a b` runs `cmd a b`: the grammar files the words after the target
+    // under the redirect, where they would be lost to the rules. Refuse (fail closed).
+    let mut dests = node.walk();
+    if node
+        .children_by_field_name("destination", &mut dests)
+        .nth(1)
+        .is_some()
+    {
+        return Err(Unparseable(format!(
+            "words after the target of `{op}` are arguments the rules cannot see; put them \
+             before the redirect"
+        )));
+    }
     let Some(dest) = node.child_by_field_name("destination") else {
         // `>&-` / `2>&-` close a descriptor; anything else is unknown.
         return if matches!(op, ">&-" | "<&-") {

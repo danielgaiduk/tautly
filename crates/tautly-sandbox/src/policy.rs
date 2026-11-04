@@ -63,6 +63,20 @@ struct Rule {
     tool_glob: Option<GlobMatcher>,
     /// `None` matches any invocation of the tool.
     glob: Option<GlobMatcher>,
+    /// A command rule whose pattern names a write redirect (holds ` > `): the pattern
+    /// split at its first ` > `, matched structurally ([`Redirected`]).
+    redirect: Option<Redirected>,
+}
+
+/// The two halves of a rule pattern that names a write redirect (`cargo test > *`): the
+/// command half matches the bare command ([`command_line`]), the redirect half the
+/// command's write-redirect targets joined in order (`t1 > t2`, each [quoted](quote_word)).
+/// Never one flattened string, so neither a target nor a quoted `'>'` argument can supply
+/// the other half's text.
+#[derive(Debug)]
+struct Redirected {
+    command: GlobMatcher,
+    targets: GlobMatcher,
 }
 
 impl Rule {
@@ -103,8 +117,10 @@ impl Rule {
                 tool: text.to_string(),
                 tool_glob,
                 glob: None,
+                redirect: None,
             });
         }
+        let mut redirect = None;
         let (tool, glob) = match text.find(['(', ')']) {
             None => (text, None),
             Some(i) if text.as_bytes()[i] == b'(' => {
@@ -115,6 +131,17 @@ impl Rule {
                     return Err(bad("unexpected parenthesis in pattern"));
                 }
                 let m = Glob::new(inner).map_err(|e| bad(&e.to_string()))?;
+                if let Some((command, targets)) = inner.split_once(" > ") {
+                    let glob = |p: &str| {
+                        Glob::new(p)
+                            .map(|g| g.compile_matcher())
+                            .map_err(|e| bad(&e.to_string()))
+                    };
+                    redirect = Some(Redirected {
+                        command: glob(command)?,
+                        targets: glob(targets)?,
+                    });
+                }
                 (&text[..i], Some(m.compile_matcher()))
             }
             Some(_) => return Err(bad("unexpected ')'")),
@@ -136,6 +163,7 @@ impl Rule {
             tool: tool.to_string(),
             tool_glob: None,
             glob,
+            redirect,
         })
     }
 
@@ -144,12 +172,6 @@ impl Rule {
             Some(g) => tool.starts_with(MCP_PREFIX) && g.is_match(tool),
             None => self.tool == tool,
         }
-    }
-
-    /// The rule's pattern names a write redirect (` > `, the form [`allow_subject`] gives
-    /// every write operator).
-    fn names_redirect(&self) -> bool {
-        self.glob.is_some() && self.text.contains(" > ")
     }
 
     fn matches_str(&self, tool: &str, s: &str) -> bool {
@@ -262,7 +284,12 @@ impl Policy {
             tool.to_string()
         } else {
             let subject = match self.subjects(effect, raw_cmd) {
-                Subjects::Commands(cmds) if cmds.len() == 1 => allow_subject(&cmds[0]),
+                // A bare command reading ` > ` could not be told from a redirect.
+                Subjects::Commands(cmds)
+                    if cmds.len() == 1 && !command_line(&cmds[0]).contains(" > ") =>
+                {
+                    allow_subject(&cmds[0])
+                }
                 Subjects::Paths(ps) if ps.len() == 1 && ps[0].real.is_none() => {
                     path_str(ps[0].rel.as_ref()?)
                 }
@@ -356,12 +383,7 @@ impl Policy {
             let hit = match subjects {
                 Subjects::None => r.glob.is_none(),
                 Subjects::Commands(cmds) => {
-                    r.glob.is_none()
-                        || cmds.iter().any(|c| {
-                            r.matches_str(tool, &c.argv.join(" "))
-                                || r.matches_str(tool, &command_line(c))
-                                || r.matches_str(tool, &allow_subject(c))
-                        })
+                    r.glob.is_none() || cmds.iter().any(|c| self.deny_hits(r, tool, c))
                 }
                 Subjects::Unparseable { raw, .. } => r.matches_str(tool, raw) || r.glob.is_none(),
                 Subjects::Paths(ps) => {
@@ -377,6 +399,43 @@ impl Policy {
             }
         }
         None
+    }
+
+    /// Whether deny rule `r` refuses command `c`. A rule that names a redirect
+    /// ([`Redirected`]) needs a write redirect, its command half matching the bare command
+    /// (or argv), and its target half matching some target in any spelling: as written,
+    /// quoted, or normalized root-relative from each directory the command may run in (so
+    /// `bash(* > .env)` refuses `> ./.env` and `> src/../.env`). Any other rule matches the
+    /// bare command or argv only, never a file name a redirect writes to.
+    fn deny_hits(&self, r: &Rule, tool: &str, c: &SimpleCommand) -> bool {
+        let argv = c.argv.join(" ");
+        let bare = command_line(c);
+        let Some(red) = &r.redirect else {
+            return r.matches_str(tool, &argv) || r.matches_str(tool, &bare);
+        };
+        if !(red.command.is_match(&bare) || red.command.is_match(&argv)) {
+            return false;
+        }
+        let root_only = [PathBuf::new()];
+        let cwds: &[PathBuf] = if c.cwds.is_empty() {
+            &root_only
+        } else {
+            &c.cwds
+        };
+        write_targets(c).iter().any(|t| {
+            let joined = cwds.iter().filter_map(|cwd| {
+                let full = if Path::new(t).is_absolute() {
+                    PathBuf::from(t)
+                } else {
+                    cwd.join(t)
+                };
+                normalize(&self.root, &full.to_string_lossy()).map(|p| path_str(&p))
+            });
+            [t.to_string(), quote_word(t)]
+                .into_iter()
+                .chain(joined)
+                .any(|form| red.targets.is_match(&form))
+        })
     }
 
     fn needs_approval(&self, subjects: &Subjects) -> Option<String> {
@@ -502,32 +561,69 @@ fn escape_reason(argv: &[String]) -> Option<String> {
     None
 }
 
-/// The command as rules see it: leading assignments, then argv.
+/// The command as rules see it: leading assignments (as written), then argv, each word
+/// that could read as shell syntax [quoted](quote_word). So a quoted `'>'` argument stays
+/// `'>'` and never looks like a redirect.
 fn command_line(c: &SimpleCommand) -> String {
     c.assignments
         .iter()
-        .chain(&c.argv)
-        .map(String::as_str)
+        .cloned()
+        .chain(c.argv.iter().map(|w| quote_word(w)))
         .collect::<Vec<_>>()
         .join(" ")
 }
 
-/// Whether one of `rules` allows command `c`. Leading assignments are part of what a rule
-/// must match, and so are write redirects ([`allow_subject`]). A command with write
-/// redirects needs a single rule that matches it with them and that either also matches
-/// the bare command (`bash(cargo test*)`: the pattern covers the command and reaches the
-/// redirect) or names a redirect (its pattern holds ` > `, as an exact rule does). So the
-/// model-chosen target of a redirect never satisfies a suffix or infix pattern on its own:
-/// `bash(* --version)` does not allow `rm -rf src > ' --version'`.
+/// `w` as a shell word: as it is, or in single quotes (a `'` written `'\''`) when it is
+/// empty or holds whitespace, `>`, `<`, `|`, `&`, `;` or a quote.
+fn quote_word(w: &str) -> String {
+    let special =
+        |c: char| c.is_whitespace() || matches!(c, '>' | '<' | '|' | '&' | ';' | '\'' | '"');
+    if !w.is_empty() && !w.chars().any(special) {
+        return w.to_string();
+    }
+    format!("'{}'", w.replace('\'', "'\\''"))
+}
+
+/// A command's write-redirect targets, in order: every write operator (`>`, `>>`, `&>`,
+/// `2>`, ...), except to `/dev/null`. Reads and fd duplications (`2>&1`) are not targets.
+fn write_targets(c: &SimpleCommand) -> Vec<&str> {
+    c.redirects
+        .iter()
+        .filter(|r| r.write && r.target != "/dev/null")
+        .map(|r| r.target.as_str())
+        .collect()
+}
+
+/// Whether one of `rules` allows command `c`, matched structurally (never one flattened
+/// string a target or a quoted `'>'` could supply text to):
+/// - a rule that names a redirect ([`Redirected`]) needs at least one write redirect, its
+///   command half matching the bare command ([`command_line`]) and its target half the
+///   targets joined in order: `bash(cargo test > *)` allows `cargo test > out.txt`, not
+///   `cargo test '>' x --config …` (no redirect) nor `cargo test --release > out.txt`;
+/// - any other rule must match the bare command and, when there are write redirects, the
+///   command with them ([`allow_subject`]): `bash(cargo test*)` allows
+///   `cargo test > out.txt`, while `bash(* --version)` does not allow
+///   `rm -rf src > ' --version'`.
 fn allows_command(rules: &[&Rule], tool: &str, c: &SimpleCommand) -> bool {
     let bare = command_line(c);
+    let targets = write_targets(c);
+    let joined = targets
+        .iter()
+        .map(|t| quote_word(t))
+        .collect::<Vec<_>>()
+        .join(" > ");
     let subject = allow_subject(c);
-    if subject == bare {
-        return rules.iter().any(|r| r.matches_str(tool, &bare));
-    }
-    rules.iter().any(|r| {
-        r.matches_str(tool, &subject) && (r.names_redirect() || r.matches_str(tool, &bare))
-    })
+    rules
+        .iter()
+        .filter(|r| r.is_for(tool))
+        .any(|r| match &r.redirect {
+            Some(red) => {
+                !targets.is_empty() && red.command.is_match(&bare) && red.targets.is_match(&joined)
+            }
+            None => {
+                r.matches_str(tool, &bare) && (targets.is_empty() || r.matches_str(tool, &subject))
+            }
+        })
 }
 
 /// The command as allow rules see it: [`command_line`], then ` > <target>` for each write
@@ -536,13 +632,9 @@ fn allows_command(rules: &[&Rule], tool: &str, c: &SimpleCommand) -> bool {
 /// does) or name it. Reads and fd duplications (`2>&1`) are not included.
 fn allow_subject(c: &SimpleCommand) -> String {
     let mut s = command_line(c);
-    for r in c
-        .redirects
-        .iter()
-        .filter(|r| r.write && r.target != "/dev/null")
-    {
+    for t in write_targets(c) {
         s.push_str(" > ");
-        s.push_str(&r.target);
+        s.push_str(&quote_word(t));
     }
     s
 }

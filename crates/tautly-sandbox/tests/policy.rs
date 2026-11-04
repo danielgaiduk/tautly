@@ -1111,7 +1111,7 @@ fn exact_rule_is_built_from_the_parsed_call_and_matches_it() {
     let rule = |raw: &str| pol.exact_rule("bash", &sh, Some(raw));
     assert_eq!(
         rule("git commit -m \"fix the  bug\"").as_deref(),
-        Some("bash(git commit -m fix the  bug)")
+        Some("bash(git commit -m 'fix the  bug')")
     );
     assert_eq!(
         rule("cargo   test\t-p x").as_deref(),
@@ -1210,4 +1210,179 @@ fn redirect_targets_do_not_satisfy_suffix_or_infix_patterns() {
     // Deny rules see the redirect too.
     let deny = with_rules(Mode::Yolo, &[], &["bash(* > .env)"]);
     assert!(matches!(run(&deny, "echo x > .env"), Decision::Deny { .. }));
+}
+
+// --- re-review 2 T30-N2: a rule that names a redirect is matched structurally ---
+#[test]
+fn rules_naming_a_redirect_match_command_and_targets_separately() {
+    let run = |pol: &Policy, raw: &str| pol.decide("bash", &exec("sh"), Some(raw));
+    let cases: &[(&str, &[&str], &[&str])] = &[
+        (
+            "bash(cargo test > *)",
+            &["cargo test > out.txt", "cargo test > a > b"],
+            &[
+                "cargo test --release > out.txt",
+                "FOO=1 cargo test > out.txt",
+                "cargo test '>' x; rm -rf src",
+                // (a): no redirect at all, a literal '>' argument.
+                "cargo test '>' x --config 'target.aarch64-apple-darwin.runner=\"sh -c id\"'",
+                "cargo test '>' x -- --ignored",
+                "cargo test > out.txt '>' y --no-run",
+            ],
+        ),
+        (
+            "bash(npm test > *)",
+            &[],
+            &["npm test '>' x --script-shell ./evil.sh"],
+        ),
+        (
+            "bash(git log > *)",
+            &[],
+            &["git log '>' x --output=src/lib.rs"],
+        ),
+        (
+            "bash(git * > log.txt)",
+            &[],
+            &["git push --force '>' log.txt"],
+        ),
+        (
+            "bash(git * --dry-run > log.txt)",
+            &["git push --dry-run > log.txt"],
+            // (b): a target supplies the text before the pattern's ` > `.
+            &[
+                "git push --force > ' --dry-run' > log.txt",
+                "git push --force > ' --dry-run > log.txt'",
+            ],
+        ),
+        (
+            "bash(* --check > fmt.log)",
+            &[],
+            &["rm -rf src > ' --check' > fmt.log"],
+        ),
+        (
+            "bash(npm * --dry-run > *)",
+            &[],
+            &["npm publish > ' --dry-run' > x"],
+        ),
+        ("bash(* > out.txt)", &["rm -rf src > out.txt"], &[]),
+        (
+            "bash(make * > build.log)",
+            &["make install > build.log"],
+            &[],
+        ),
+    ];
+    for (rule, allowed, asked) in cases {
+        let config = with_rules(Mode::Ask, &[rule], &[]);
+        let mut session = p(Mode::Ask);
+        session.add_session_allow(rule).unwrap();
+        for pol in [&config, &session] {
+            for raw in *allowed {
+                assert_eq!(run(pol, raw), Decision::Allow, "{rule}: {raw}");
+            }
+            for raw in *asked {
+                assert!(asks(run(pol, raw)), "{rule}: {raw}");
+            }
+        }
+    }
+    // One target holding ` > ` is not two targets.
+    let two = with_rules(Mode::Ask, &["bash(echo hi > a > b)"], &[]);
+    assert_eq!(run(&two, "echo hi > a > b"), Decision::Allow);
+    assert!(asks(run(&two, "echo hi > 'a > b'")));
+}
+
+// --- re-review 2 T30-N3/N4: deny rules on redirects ---
+#[test]
+fn deny_rules_on_redirect_targets_see_every_spelling() {
+    let run = |pol: &Policy, raw: &str| pol.decide("bash", &exec("sh"), Some(raw));
+    let deny = with_rules(Mode::Yolo, &[], &["bash(* > .env)"]);
+    for raw in [
+        "echo x > .env",
+        "echo x 2> .env",
+        "echo x >> .env",
+        "echo x > ./.env",
+        "echo x > src/../.env",
+        "echo x > .//.env",
+        "cd src && echo x > ../.env",
+    ] {
+        assert!(matches!(run(&deny, raw), Decision::Deny { .. }), "{raw}");
+    }
+    assert_eq!(run(&deny, "echo x > env.txt"), Decision::Allow);
+    // Still denied through the bare command.
+    let push = with_rules(Mode::Yolo, &[], &["bash(git push*)"]);
+    assert!(matches!(
+        run(&push, "git push > /dev/null"),
+        Decision::Deny { .. }
+    ));
+    assert_eq!(run(&push, "git status > 'git push'"), Decision::Allow);
+}
+
+#[test]
+fn deny_rules_without_a_redirect_do_not_match_file_names() {
+    let run = |pol: &Policy, raw: &str| pol.decide("bash", &exec("sh"), Some(raw));
+    for (deny, allow, raw) in [
+        ("bash(*.sh)", "bash(echo*)", "echo hi > notes.sh"),
+        (
+            "bash(*prod*)",
+            "bash(cargo test*)",
+            "cargo test > prod-report.txt",
+        ),
+        (
+            "bash(* --force)",
+            "bash(git status*)",
+            "git status > ' --force'",
+        ),
+    ] {
+        let pol = with_rules(Mode::Ask, &[allow], &[deny]);
+        assert_eq!(run(&pol, raw), Decision::Allow, "{deny}: {raw}");
+    }
+}
+
+// --- re-review 2 T30 ruling 3: words that could read as shell syntax are quoted ---
+#[test]
+fn rules_see_quoted_words_quoted() {
+    let pol = p(Mode::Ask);
+    let sh = exec("sh");
+    let rule = |raw: &str| pol.exact_rule("bash", &sh, Some(raw));
+    assert_eq!(
+        rule("git commit -m \"fix the  bug\"").as_deref(),
+        Some("bash(git commit -m 'fix the  bug')")
+    );
+    assert_eq!(rule("echo '>' x").as_deref(), Some("bash(echo '>' x)"));
+    assert_eq!(
+        rule("echo \"it's\"").as_deref(),
+        Some("bash(echo 'it'\\\\''s')")
+    );
+    assert_eq!(
+        rule("echo hi > 'a > b'").as_deref(),
+        Some("bash(echo hi > 'a > b')")
+    );
+    // A quoted '>' argument never reads as a redirect to a rule.
+    let quoted = with_rules(Mode::Ask, &["bash(echo > x)"], &[]);
+    assert!(asks(quoted.decide("bash", &sh, Some("echo '>' x"))));
+    assert_eq!(
+        quoted.decide("bash", &sh, Some("echo > x")),
+        Decision::Allow
+    );
+}
+
+// --- re-review 2 T30, found while fixing N2: words after a redirect target ---
+#[test]
+fn words_after_a_redirect_target_are_not_hidden_from_rules() {
+    // `cmd > out.txt a b` runs `cmd a b`; the parser filed `a b` under the redirect.
+    assert!(tautly_sandbox::parse_commands("cargo test > out.txt --config x").is_err());
+    let pol = with_rules(
+        Mode::Ask,
+        &["bash(cargo test*)", "bash(cargo test > *)"],
+        &[],
+    );
+    for raw in [
+        "cargo test > out.txt '>' y --no-run",
+        "cargo test > out.txt --config 'target.x.runner=\"sh -c id\"'",
+    ] {
+        assert!(asks(pol.decide("bash", &exec("sh"), Some(raw))), "{raw}");
+    }
+    assert_eq!(
+        pol.decide("bash", &exec("sh"), Some("cargo test > out.txt 2>&1")),
+        Decision::Allow
+    );
 }
