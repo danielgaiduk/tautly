@@ -176,43 +176,65 @@ pub enum Line {
     Eof,
 }
 
-/// Read the next line, keeping at most `max` bytes of it in memory.
+/// Reads lines, keeping at most `max` bytes of each in memory. Unlike [`read_line`], a
+/// call that is dropped before it finishes (a `select!` branch losing) loses nothing: what
+/// it had read stays here for the next call.
+#[derive(Default)]
+pub struct LineReader {
+    line: Vec<u8>,
+    too_long: bool,
+}
+
+impl LineReader {
+    /// The next line. Cancel safe.
+    pub async fn read(
+        &mut self,
+        input: &mut (impl AsyncBufRead + Unpin),
+        max: usize,
+    ) -> std::io::Result<Line> {
+        loop {
+            let buf = input.fill_buf().await?;
+            if buf.is_empty() {
+                let (too_long, line) = (self.too_long, std::mem::take(&mut self.line));
+                self.too_long = false;
+                return Ok(match (too_long, line.is_empty()) {
+                    (true, _) => Line::TooLong,
+                    (false, true) => Line::Eof,
+                    (false, false) => Line::Line(line),
+                });
+            }
+            let (chunk, used, end) = match buf.iter().position(|&b| b == b'\n') {
+                Some(i) => (&buf[..i], i + 1, true),
+                None => (buf, buf.len(), false),
+            };
+            if !self.too_long {
+                if self.line.len() + chunk.len() > max {
+                    self.too_long = true;
+                    self.line = Vec::new();
+                } else {
+                    self.line.extend_from_slice(chunk);
+                }
+            }
+            input.consume(used);
+            if end {
+                let line = std::mem::take(&mut self.line);
+                return Ok(if std::mem::take(&mut self.too_long) {
+                    Line::TooLong
+                } else {
+                    Line::Line(line)
+                });
+            }
+        }
+    }
+}
+
+/// Read the next line, keeping at most `max` bytes of it in memory. Not cancel safe: use
+/// a [`LineReader`] where the call may be dropped.
 pub async fn read_line(
     input: &mut (impl AsyncBufRead + Unpin),
     max: usize,
 ) -> std::io::Result<Line> {
-    let mut line = Vec::new();
-    let mut too_long = false;
-    loop {
-        let buf = input.fill_buf().await?;
-        if buf.is_empty() {
-            return Ok(match (too_long, line.is_empty()) {
-                (true, _) => Line::TooLong,
-                (false, true) => Line::Eof,
-                (false, false) => Line::Line(line),
-            });
-        }
-        let (chunk, used, end) = match buf.iter().position(|&b| b == b'\n') {
-            Some(i) => (&buf[..i], i + 1, true),
-            None => (buf, buf.len(), false),
-        };
-        if !too_long {
-            if line.len() + chunk.len() > max {
-                too_long = true;
-                line = Vec::new();
-            } else {
-                line.extend_from_slice(chunk);
-            }
-        }
-        input.consume(used);
-        if end {
-            return Ok(if too_long {
-                Line::TooLong
-            } else {
-                Line::Line(line)
-            });
-        }
-    }
+    LineReader::default().read(input, max).await
 }
 
 #[cfg(test)]
@@ -276,5 +298,30 @@ mod tests {
             Line::Line(b"last".to_vec())
         );
         assert_eq!(read_line(&mut input, 10).await.unwrap(), Line::Eof);
+    }
+
+    #[tokio::test]
+    async fn a_dropped_read_loses_nothing() {
+        use tokio::io::AsyncWriteExt;
+        let (mut tx, rx) = tokio::io::duplex(64);
+        let mut input = tokio::io::BufReader::new(rx);
+        let mut reader = LineReader::default();
+        tx.write_all(b"ab").await.unwrap();
+        // The read gives up half way through the line (another `select!` branch won).
+        let waited = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            reader.read(&mut input, 10),
+        )
+        .await;
+        assert!(waited.is_err());
+        tx.write_all(b"cd\nef\n").await.unwrap();
+        assert_eq!(
+            reader.read(&mut input, 10).await.unwrap(),
+            Line::Line(b"abcd".to_vec())
+        );
+        assert_eq!(
+            reader.read(&mut input, 10).await.unwrap(),
+            Line::Line(b"ef".to_vec())
+        );
     }
 }

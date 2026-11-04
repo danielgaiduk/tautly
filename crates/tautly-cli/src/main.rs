@@ -298,8 +298,18 @@ async fn oneshot(
     resume: Option<String>,
     prompt: String,
 ) -> anyhow::Result<i32> {
-    let (engine, events) =
+    // Watched before the engine (and its own handlers) exists, so a SIGTERM or SIGHUP at
+    // any point still ends the process with its code.
+    let terminated = tokio::spawn(terminated()?);
+    let (engine, mut events) =
         tokio::task::spawn_blocking(move || settings.build(&root, resume, false, None)).await??;
+    if terminated.is_finished() {
+        // The signal came before the session could hear it: shut the session down unused.
+        let _ = engine.send(Command::Shutdown).await;
+        drop(engine);
+        while events.recv().await.is_some() {}
+        return Ok(terminated.await.unwrap_or(1));
+    }
     for cmd in cli.start_commands() {
         let _ = engine.send(cmd).await;
     }
@@ -309,7 +319,6 @@ async fn oneshot(
     };
     // SIGTERM / SIGHUP shut the session down (the turn ends as cancelled); the exit code
     // still says which signal it was.
-    let terminated = tokio::spawn(terminated()?);
     let code = run_oneshot(engine, events, prompt, output, tokio::io::stdout()).await;
     if terminated.is_finished() {
         return Ok(terminated.await.unwrap_or(code));

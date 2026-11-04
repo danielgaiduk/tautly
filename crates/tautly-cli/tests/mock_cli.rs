@@ -299,5 +299,11 @@ fn rpc_mode_ends_on_sigterm() {
             .all(|m| m["params"]["session_id"] == sid.as_str()),
         "{rest:?}"
     );
+    // The session is announced as closed before the process goes.
+    assert_eq!(
+        rest.last().map(|m| m["method"].clone()),
+        Some(json!("session/closed")),
+        "{rest:?}"
+    );
     drop(stdin);
 }

@@ -367,16 +367,17 @@ fn methods_map_to_commands() {
     // Wire names only: the serde tag of a command that is not a method is not one.
     assert_eq!(code("session/new", json!({})), METHOD_NOT_FOUND);
     assert_eq!(code("send_message", json!({})), INVALID_PARAMS);
-    // A value this version does not know (from a newer client) reaches the engine as
-    // `Unknown`, which ignores it with a warning (forward compatibility, spec 3.4).
+    // A value this version does not know is refused rather than passed to the engine to
+    // be ignored: the client learns it was not understood (spec 3.4).
     assert_eq!(
-        command_for("set_budget", &json!({"scope": "forever"})).unwrap(),
-        Command::SetBudget {
-            scope: BudgetScope::Unknown,
-            max_usd: None,
-            max_tokens: None,
-        }
+        code("set_budget", json!({"scope": "forever", "max_usd": 1})),
+        INVALID_PARAMS
     );
+    assert_eq!(
+        code("set_budget", json!({"scope": "unknown", "max_usd": 1})),
+        INVALID_PARAMS
+    );
+    assert!(command_for("set_budget", &json!({"scope": "session", "max_usd": 1})).is_ok());
     assert_eq!(code("approve", json!({"request_id": 5})), INVALID_PARAMS);
 }
 
@@ -1105,7 +1106,12 @@ async fn a_session_that_ends_by_itself_is_removed_and_announced() {
 #[tokio::test]
 async fn the_stop_future_ends_the_server_like_a_disconnect() {
     let fx = Fx::new();
-    let (f, _) = factory(&fx, config(Mode::Ask), vec![write_then_done()], false);
+    let (f, _) = factory(
+        &fx,
+        config(Mode::Ask),
+        vec![write_then_done(), MockProvider::new(vec![])],
+        false,
+    );
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
     let server = Server::new(f, fx.workspaces(), fx.dir.path()).stop_on(async move {
         let _ = stopped.await;
@@ -1120,6 +1126,11 @@ async fn the_stop_future_ends_the_server_like_a_disconnect() {
         .as_str()
         .unwrap()
         .to_string();
+    let root = fx.root().to_string_lossy().into_owned();
+    let other = c.ok("session/new", json!({"root": root})).await["session_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
     c.ok("send_message", json!({"text": "write it"})).await;
     c.until_type(&sid, "tool_approval_requested").await;
     // SIGTERM, say: the pending request is denied, the session drained, the server ends
@@ -1127,6 +1138,18 @@ async fn the_stop_future_ends_the_server_like_a_disconnect() {
     stop.send(()).unwrap();
     c.finish().await;
     let events = std::mem::take(&mut c.events);
+    // Every open session is announced as closed, after its last event.
+    for id in [&sid, &other] {
+        let kinds: Vec<&str> = events_of(&events, id)
+            .map(|e| e["type"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            kinds.iter().filter(|k| **k == "session/closed").count(),
+            1,
+            "{id}: {kinds:?}"
+        );
+        assert_eq!(kinds.last(), Some(&"session/closed"), "{id}: {kinds:?}");
+    }
     let finished = events_of(&events, &sid)
         .find(|e| e["type"] == "tool_finished")
         .unwrap_or_else(|| panic!("the call was never answered: {events:?}"));
@@ -1183,6 +1206,115 @@ async fn shutdown_does_not_wait_for_a_session_still_being_built() {
     }
     // The build finishes later; its session is shut down on its own.
     release.send(()).unwrap();
+}
+
+/// A factory whose builds wait, as on a keychain dialog, until released (or the test ends):
+/// the factory, a signal that a build has started, and the release.
+fn gated(
+    fx: &Fx,
+    mocks: Vec<MockProvider>,
+) -> (
+    EngineFactory,
+    std::sync::mpsc::Receiver<()>,
+    std::sync::mpsc::Sender<()>,
+) {
+    let (f, _) = factory(fx, config(Mode::Ask), mocks, false);
+    let (release, gate) = std::sync::mpsc::channel::<()>();
+    let gate = Arc::new(std::sync::Mutex::new(gate));
+    let (entered_tx, entered) = std::sync::mpsc::channel::<()>();
+    let entered_tx = std::sync::Mutex::new(entered_tx);
+    let blocking: EngineFactory = Arc::new(move |spec| {
+        let _ = entered_tx.lock().unwrap().send(());
+        let _ = gate.lock().unwrap().recv();
+        f(spec)
+    });
+    (blocking, entered, release)
+}
+
+async fn wait_entered(entered: &std::sync::mpsc::Receiver<()>) {
+    let deadline = tokio::time::Instant::now() + WAIT;
+    while entered.try_recv().is_err() {
+        assert!(tokio::time::Instant::now() < deadline, "never built");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+#[tokio::test]
+async fn a_blocked_initialize_build_does_not_stop_the_reader_or_the_stop_future() {
+    let fx = Fx::new();
+    let (blocking, entered, release) = gated(&fx, vec![]);
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let server = Server::new(blocking, fx.workspaces(), fx.dir.path()).stop_on(async move {
+        let _ = stopped.await;
+    });
+    let mut c = Client::start(server);
+    let init_id = c.request("initialize", json!({})).await;
+    wait_entered(&entered).await;
+    // Input is still read while the build waits: requests behind `initialize` are held,
+    // up to a limit, and the ones over it are refused at once.
+    for _ in 0..1000 {
+        c.request("session/list", json!({})).await;
+    }
+    let quick = Duration::from_secs(5);
+    let refused = tokio::time::timeout(quick, c.read())
+        .await
+        .expect("the reader is stuck in the build")
+        .expect("output ended");
+    assert_eq!(refused["error"]["code"], NOT_INITIALIZED, "{refused}");
+    // The stop future is heard too: the server ends without waiting for the build.
+    stop.send(()).unwrap();
+    let mut answers = Vec::new();
+    tokio::time::timeout(quick, async {
+        while let Some(msg) = c.read().await {
+            answers.push(msg);
+        }
+    })
+    .await
+    .expect("the stop waited for the build");
+    tokio::time::timeout(quick, &mut c.server)
+        .await
+        .expect("the server did not stop")
+        .unwrap()
+        .unwrap();
+    if let Some(resp) = answers.iter().find(|m| m["id"] == init_id) {
+        assert!(resp["error"]["code"].is_i64(), "{resp}");
+    }
+    // The build finishes later; its session is shut down on its own.
+    release.send(()).unwrap();
+}
+
+#[tokio::test]
+async fn requests_behind_a_slow_initialize_run_after_it_in_order() {
+    let fx = Fx::new();
+    let (blocking, entered, release) = gated(&fx, vec![MockProvider::new(vec![text_step("hi")])]);
+    let mut c = Client::start(Server::new(blocking, fx.workspaces(), fx.dir.path()));
+    let init_id = c.request("initialize", json!({})).await;
+    let list_id = c.request("session/list", json!({})).await;
+    let send_id = c.request("send_message", json!({"text": "hello"})).await;
+    // A script: the input ends right behind the requests; they are still answered (the
+    // disconnect then shuts the session down).
+    c.input = None;
+    wait_entered(&entered).await;
+    release.send(()).unwrap();
+    c.finish().await;
+    let responses: Vec<Value> = c
+        .raw
+        .iter()
+        .map(|l| serde_json::from_str::<Value>(l).unwrap())
+        .filter(|m| m.get("id").is_some())
+        .collect();
+    let order: Vec<Value> = responses.iter().map(|m| m["id"].clone()).collect();
+    assert_eq!(
+        order,
+        vec![init_id.clone(), list_id.clone(), send_id.clone()]
+    );
+    let sid = responses[0]["result"]["session_id"].as_str().unwrap();
+    assert_eq!(
+        responses[1]["result"]["sessions"][0]["session_id"], sid,
+        "{}",
+        responses[1]
+    );
+    assert_eq!(responses[2]["result"], Value::Null, "{}", responses[2]);
 }
 
 #[tokio::test]

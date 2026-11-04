@@ -13,11 +13,15 @@
 //!   and waits for `approve`/`deny`, memory proposals wait for
 //!   `approve_memory`/`reject_memory`. Otherwise the headless rules apply (`ask` resolves
 //!   to deny, proposals are rejected unless the session's configuration approves them),
-//!   and nothing ever waits for input.
+//!   and nothing ever waits for input. The default session is built off the reader, which
+//!   goes on reading (and hearing the stop future) meanwhile; requests sent before
+//!   `initialize` has answered are held (up to 256, more are refused with `-32002`) and
+//!   handled in order once it has, also when the input ends right behind them.
 //! - The engine commands, by their wire names, with the command's fields as params:
 //!   `send_message`, `approve`, `deny`, `cancel`, `set_budget`, `compact`, `uncompact`,
 //!   `pin`, `unpin`, `approve_memory`, `reject_memory`, `consolidate_memory`, `fork`,
-//!   `set_model`, `diff`, `undo` ([`command_for`]). Each takes an optional `session_id`:
+//!   `set_model`, `diff`, `undo` ([`command_for`]; a value this version does not know, such
+//!   as a `set_budget` scope, is `-32602`). Each takes an optional `session_id`:
 //!   without one, the default session (or the only open session). The result is `null`
 //!   once the session has the command; what it does arrives as events.
 //! - `session/new {root, resume?, fork?: {session_id, at?, label?}}` opens a session on
@@ -31,7 +35,8 @@
 //!   ends the server.
 //!
 //! A session that stops by itself (a signal, a crash) is taken out of the server after its
-//! last event and announced with a `session/closed {session_id}` notification. Pending
+//! last event and announced with a `session/closed {session_id}` notification; so is every
+//! open session when the stop future fires (SIGTERM, SIGHUP), after it has shut down. Pending
 //! approval requests are denied when a session shuts down, so a client that sends
 //! `shutdown` or disconnects (end of input), or a stop future that fires
 //! ([`Server::stop_on`]), leaves nothing waiting. A session that forks (`fork`) announces
@@ -39,14 +44,14 @@
 //! afterwards; the old id stays an alias of it until it closes, so a command sent with it
 //! right after `fork` reaches the session whether or not the move has been seen.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use serde_json::{Value, json};
-use tautly_core::{Command, Engine, Event, PROTOCOL_VERSION, Workspace, Workspaces};
+use tautly_core::{BudgetScope, Command, Engine, Event, PROTOCOL_VERSION, Workspace, Workspaces};
 use tokio::io::{AsyncBufRead, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::{JoinHandle, JoinSet};
@@ -116,12 +121,25 @@ pub fn command_for(method: &str, params: &Value) -> Result<Command, Error> {
     fields.remove("session_id");
     // Last, so a `type` among the params cannot name another command.
     fields.insert("type".into(), Value::String(method.to_string()));
-    serde_json::from_value(Value::Object(fields)).map_err(|e| {
+    let command = serde_json::from_value(Value::Object(fields)).map_err(|e| {
         Error::new(
             INVALID_PARAMS,
             format!("invalid params for `{method}`: {e}"),
         )
-    })
+    })?;
+    // The engine reads a value it does not know as `Unknown` (so old logs stay readable);
+    // a client is told instead that it was not understood.
+    match command {
+        Command::Unknown
+        | Command::SetBudget {
+            scope: BudgetScope::Unknown,
+            ..
+        } => Err(Error::new(
+            INVALID_PARAMS,
+            format!("invalid params for `{method}`: a value this server does not know"),
+        )),
+        command => Ok(command),
+    }
 }
 
 /// Serve one prebuilt session over `stdin`/`stdout` (the single-session form): `initialize`
@@ -181,8 +199,9 @@ impl Server {
         self
     }
 
-    /// Stop serving when `stop` completes, as on a disconnect (`tautly --rpc`: SIGTERM,
-    /// SIGHUP).
+    /// Stop serving when `stop` completes (`tautly --rpc`: SIGTERM, SIGHUP): as on a
+    /// disconnect, but each session is announced with `session/closed` once its last event
+    /// is out.
     pub fn stop_on(mut self, stop: impl Future<Output = ()> + Send + 'static) -> Server {
         self.stop = Some(Box::pin(stop));
         self
@@ -214,25 +233,45 @@ impl Server {
             root: self.root,
             resume: self.resume,
             prebuilt: self.prebuilt,
-            initialized: false,
             interactive: false,
             tasks: JoinSet::new(),
+            init_done: None,
+            deferred: VecDeque::new(),
         };
+        let mut reader = jsonrpc::LineReader::default();
+        let mut eof = false;
         let mut result = Ok(());
         let mut writer_done = false;
+        let mut stopped = false;
         loop {
             while conn.tasks.try_join_next().is_some() {}
+            // The input ended: what was sent before it still gets its answer, so wait for
+            // `initialize` and the requests behind it.
+            if eof && conn.init_done.is_none() {
+                break;
+            }
             let read = tokio::select! {
-                read = jsonrpc::read_line(&mut input, MAX_LINE) => read,
+                read = reader.read(&mut input, MAX_LINE), if !eof => Some(read),
+                () = conn.init_finished() => None,
                 _ = &mut writer => {
                     // The output is gone: the client cannot hear us any more.
                     writer_done = true;
                     break;
                 }
-                () = &mut stop => break,
+                () = &mut stop => {
+                    stopped = true;
+                    break;
+                }
+            };
+            let Some(read) = read else {
+                // `initialize` has answered: the requests that came behind it, in order.
+                if conn.run_deferred().await == Flow::Stop {
+                    break;
+                }
+                continue;
             };
             match read {
-                Ok(Line::Eof) => break,
+                Ok(Line::Eof) => eof = true,
                 Err(e) => {
                     result = Err(RpcError::Input(e));
                     break;
@@ -261,7 +300,7 @@ impl Server {
                 }
             }
         }
-        conn.close_all().await;
+        conn.close_all(stopped).await;
         drop(conn);
         if !writer_done {
             let _ = writer.await;
@@ -296,6 +335,20 @@ struct State {
     next: u64,
     /// `shutdown` or a disconnect: sessions that finish opening are shut down at once.
     closing: bool,
+    init: Init,
+    /// Sessions taken out by a stop (a signal) that are announced with `session/closed`
+    /// when their events end, though no longer reachable.
+    announce: HashSet<u64>,
+}
+
+/// How far `initialize` has got.
+#[derive(Default, Clone, Copy, PartialEq, Eq)]
+enum Init {
+    #[default]
+    Not,
+    /// The default session is being built (off the reader, which goes on reading).
+    Building,
+    Done,
 }
 
 struct Slot {
@@ -465,8 +518,16 @@ impl Shared {
         Some(slot)
     }
 
-    /// Stop new sessions and take every open one out.
-    fn remove_all(&self) -> Vec<Slot> {
+    /// A session's events ended: whether it is to be announced as closed (it was still open
+    /// here, or a stop took it out and asked for the announcement); it is out either way.
+    fn ended(&self, key: u64) -> bool {
+        let announced = self.lock().announce.remove(&key);
+        self.remove_key(key).is_some() || announced
+    }
+
+    /// Stop new sessions and take every open one out; with `announce`, each is still
+    /// announced as closed when its events end.
+    fn remove_all(&self, announce: bool) -> Vec<Slot> {
         self.closed.send_replace(true);
         let mut st = self.lock();
         st.closing = true;
@@ -474,6 +535,9 @@ impl Shared {
         st.default = None;
         let mut slots: Vec<(u64, Slot)> = st.sessions.drain().collect();
         slots.sort_by_key(|(key, _)| *key);
+        if announce {
+            st.announce.extend(slots.iter().map(|(key, _)| *key));
+        }
         slots.into_iter().map(|(_, slot)| slot).collect()
     }
 
@@ -533,7 +597,7 @@ async fn forward(
             None => match events.recv().await {
                 Some(ev) => ev,
                 None => {
-                    if shared.remove_key(key).is_some() {
+                    if shared.ended(key) {
                         let params = json!({ "session_id": id });
                         shared
                             .send(jsonrpc::notification("session/closed", params))
@@ -572,24 +636,49 @@ async fn write_lines(mut lines: mpsc::Receiver<String>, mut output: impl AsyncWr
     }
 }
 
+/// A checked `initialize`.
+struct Handshake {
+    interactive: bool,
+    open_default: bool,
+}
+
 /// The connection: what only the reader touches.
 struct Conn {
     shared: Arc<Shared>,
     root: PathBuf,
     resume: Option<String>,
     prebuilt: Option<(Engine, mpsc::Receiver<Event>)>,
-    initialized: bool,
     interactive: bool,
     /// Requests answered by a task of their own (`session/new`, `session/close`).
     tasks: JoinSet<()>,
+    /// Fires when the task building the default session is done (`initialize` answered).
+    init_done: Option<oneshot::Receiver<()>>,
+    /// Messages that came while it was building, handled once it is done.
+    deferred: VecDeque<Incoming>,
 }
+
+/// Messages held while `initialize` builds the default session; more are refused.
+const MAX_DEFERRED: usize = 256;
 
 impl Conn {
     async fn handle(&mut self, msg: Incoming) -> Flow {
         let id = msg.id().cloned();
+        if self.init_done.is_some() {
+            // Requests sent right behind `initialize` run in order once it has answered.
+            if self.deferred.len() >= MAX_DEFERRED {
+                let err = Error::new(
+                    NOT_INITIALIZED,
+                    "too many requests before `initialize` answered: wait for its response",
+                );
+                self.shared.reply(id.as_ref(), Err(err)).await;
+            } else {
+                self.deferred.push_back(msg);
+            }
+            return Flow::Go;
+        }
         let method = msg.method().to_string();
         let params = msg.params().clone();
-        if !self.initialized && method != "initialize" {
+        if self.shared.lock().init != Init::Done && method != "initialize" {
             let err = Error::new(NOT_INITIALIZED, "send `initialize` first");
             self.shared.reply(id.as_ref(), Err(err)).await;
             return Flow::Go;
@@ -645,7 +734,7 @@ impl Conn {
                 }
             }
             "shutdown" => {
-                self.close_all().await;
+                self.close_all(false).await;
                 self.shared.reply(id.as_ref(), Ok(Value::Null)).await;
                 return Flow::Stop;
             }
@@ -657,26 +746,91 @@ impl Conn {
         Flow::Go
     }
 
-    async fn initialize(&mut self, id: Option<Value>, params: &Value) {
-        let result = self.handshake(params).await;
-        let (reply, go) = match result {
-            Ok((reply, go)) => {
-                self.initialized = true;
-                (Ok(reply), go)
+    /// Completes when the default session's build is done (never while none is under
+    /// way). Cancel safe.
+    async fn init_finished(&mut self) {
+        match self.init_done.as_mut() {
+            Some(done) => {
+                let _ = done.await;
             }
-            Err(e) => (Err(e), None),
-        };
-        self.shared.reply(id.as_ref(), reply).await;
-        drop(go);
+            None => std::future::pending().await,
+        }
     }
 
-    /// Check the handshake and open the default session; the reply and the default
-    /// session's go-ahead.
-    async fn handshake(
-        &mut self,
-        params: &Value,
-    ) -> Result<(Value, Option<oneshot::Sender<()>>), Error> {
-        if self.initialized {
+    /// The build is done: handle the messages held for it.
+    async fn run_deferred(&mut self) -> Flow {
+        self.init_done = None;
+        for msg in std::mem::take(&mut self.deferred) {
+            if self.handle(msg).await == Flow::Stop {
+                return Flow::Stop;
+            }
+        }
+        Flow::Go
+    }
+
+    /// `initialize`: the checks and the single-session forms answer here; building the
+    /// default session (it may wait on a keychain dialog) is a task of its own, so the
+    /// reader goes on reading input and hearing the stop future meanwhile. What comes in
+    /// until it answers is held and handled, in order, afterwards.
+    async fn initialize(&mut self, id: Option<Value>, params: &Value) {
+        let plan = match self.check_handshake(params) {
+            Ok(plan) => plan,
+            Err(e) => {
+                self.shared.reply(id.as_ref(), Err(e)).await;
+                return;
+            }
+        };
+        let shared = Arc::clone(&self.shared);
+        let version = format!("{}.{}", PROTOCOL_VERSION.0, PROTOCOL_VERSION.1);
+        if !plan.open_default {
+            shared.lock().init = Init::Done;
+            let reply = json!({"protocol": version, "session_id": null});
+            shared.reply(id.as_ref(), Ok(reply)).await;
+            return;
+        }
+        if let Some((engine, events)) = self.prebuilt.take() {
+            let sid = engine.session_id().to_string();
+            let go = shared
+                .register(sid.clone(), None, engine, events, Vec::new(), true)
+                .await;
+            shared.lock().init = Init::Done;
+            shared
+                .reply(
+                    id.as_ref(),
+                    Ok(json!({"protocol": version, "session_id": sid})),
+                )
+                .await;
+            drop(go);
+            return;
+        }
+        let (root, resume, interactive) =
+            (self.root.clone(), self.resume.clone(), plan.interactive);
+        let (done, init_done) = oneshot::channel();
+        self.init_done = Some(init_done);
+        self.tasks.spawn(async move {
+            let _done = done;
+            match shared.open(root, resume, interactive).await {
+                Ok((engine, events, root)) => {
+                    let sid = engine.session_id().to_string();
+                    let go = shared
+                        .register(sid.clone(), Some(root), engine, events, Vec::new(), true)
+                        .await;
+                    shared.lock().init = Init::Done;
+                    let reply = json!({"protocol": version, "session_id": sid});
+                    shared.reply(id.as_ref(), Ok(reply)).await;
+                    drop(go);
+                }
+                Err(e) => {
+                    shared.lock().init = Init::Not;
+                    shared.reply(id.as_ref(), Err(e)).await;
+                }
+            }
+        });
+    }
+
+    /// Check the handshake's params and mark `initialize` as under way.
+    fn check_handshake(&mut self, params: &Value) -> Result<Handshake, Error> {
+        if self.shared.lock().init != Init::Not {
             return Err(Error::new(INVALID_REQUEST, "already initialized"));
         }
         check_protocol(params.get("protocol"))?;
@@ -706,26 +860,11 @@ impl Conn {
             ));
         }
         self.interactive = interactive;
-        let version = format!("{}.{}", PROTOCOL_VERSION.0, PROTOCOL_VERSION.1);
-        if !open_default {
-            return Ok((json!({"protocol": version, "session_id": null}), None));
-        }
-        let (engine, events, root) = match self.prebuilt.take() {
-            Some((engine, events)) => (engine, events, None),
-            None => {
-                let (engine, events, root) = self
-                    .shared
-                    .open(self.root.clone(), self.resume.clone(), interactive)
-                    .await?;
-                (engine, events, Some(root))
-            }
-        };
-        let sid = engine.session_id().to_string();
-        let go = self
-            .shared
-            .register(sid.clone(), root, engine, events, Vec::new(), true)
-            .await;
-        Ok((json!({"protocol": version, "session_id": sid}), go))
+        self.shared.lock().init = Init::Building;
+        Ok(Handshake {
+            interactive,
+            open_default,
+        })
     }
 
     async fn command(&self, method: &str, params: &Value) -> Result<Value, Error> {
@@ -741,8 +880,9 @@ impl Conn {
     /// Shut every session down, the prebuilt one too if it was never served, and wait
     /// for the requests in flight (a session that finishes opening meanwhile is shut down
     /// at once; a build still running is not waited for), until all their events are out.
-    async fn close_all(&mut self) {
-        let slots = self.shared.remove_all();
+    /// With `announce` (a signal), each session is then announced with `session/closed`.
+    async fn close_all(&mut self, announce: bool) {
+        let slots = self.shared.remove_all(announce);
         let prebuilt = self.prebuilt.take();
         let tasks = &mut self.tasks;
         tokio::join!(
