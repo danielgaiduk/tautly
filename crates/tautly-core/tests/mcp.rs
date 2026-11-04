@@ -330,7 +330,11 @@ async fn repo_server_not_spawned_without_approval() {
     tokio::time::sleep(Duration::from_millis(500)).await;
     assert!(!pid_file.exists(), "the server ran before the approval");
 
-    run.send(Command::Approve { request_id }).await;
+    run.send(Command::Approve {
+        request_id,
+        session_rule: None,
+    })
+    .await;
     run.until_state("echo", McpState::Ready).await;
     let started = pids(&pid_file);
     assert_eq!(started.len(), 2);
@@ -381,6 +385,7 @@ async fn repo_server_approval_request_and_answer_are_logged() {
 
     run.send(Command::Approve {
         request_id: request_id.clone(),
+        session_rule: None,
     })
     .await;
     run.until_state("echo", McpState::Ready).await;
@@ -389,6 +394,7 @@ async fn repo_server_approval_request_and_answer_are_logged() {
     let answered = logged.iter().position(|r| {
         *r == SessionRecord::Command(Command::Approve {
             request_id: request_id.clone(),
+            session_rule: None,
         })
     });
     assert!(answered > asked, "{logged:?}");
@@ -695,6 +701,7 @@ async fn mcp_call_asks_in_ask_and_auto_edit_allowed_in_yolo() {
         assert_eq!(tool, "mcp__echo__echo");
         run.send(Command::Approve {
             request_id: request_id.clone(),
+            session_rule: None,
         })
         .await;
         let events = run.until(|e| matches!(e, Event::TurnFinished { .. })).await;
@@ -1188,7 +1195,11 @@ async fn unhashable_server_is_approved_for_this_run_only() {
         .await;
     let (request_id, _, _, launch) = approval_request(&events).unwrap();
     assert!(launch.contains("this run only"), "{launch}");
-    run.send(Command::Approve { request_id }).await;
+    run.send(Command::Approve {
+        request_id,
+        session_rule: None,
+    })
+    .await;
     run.until_state("echo", McpState::Ready).await;
     run.shutdown().await;
     let file = fx.home.path().join(APPROVALS_FILE);
@@ -1359,7 +1370,11 @@ async fn pending_approval_is_announced_again_each_turn() {
         let (again, ..) = approval_request(&turn).expect("re-announced at the turn start");
         assert_eq!(again, first);
     }
-    run.send(Command::Approve { request_id: first }).await;
+    run.send(Command::Approve {
+        request_id: first,
+        session_rule: None,
+    })
+    .await;
     run.until_state("echo", McpState::Ready).await;
     run.shutdown().await;
 }

@@ -72,6 +72,9 @@ clap = { version = "4.5", features = ["derive"] }
 anyhow = "1"
 # `tautly auth add`: hidden input from the terminal.
 rpassword = "7"
+# The REPL's line editor (tautly-tui). 0.49 is the newest release within the workspace's
+# rust-version (0.50 needs Rust 1.95).
+reedline = "0.49"
 # YAML frontmatter of memory entries: panic-free parser with input budgets (hostile repos).
 serde-saphyr = { version = "2.1", default-features = false, features = ["deserialize"] }
 

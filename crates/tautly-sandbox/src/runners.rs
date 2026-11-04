@@ -10,7 +10,7 @@ use crate::shell::Unparseable;
 
 /// Commands that run the rest of their argv as another command. We look through
 /// them conservatively: any later word may be the inner command.
-const WRAPPERS: &[&str] = &[
+pub(crate) const WRAPPERS: &[&str] = &[
     "sudo",
     "doas",
     "env",

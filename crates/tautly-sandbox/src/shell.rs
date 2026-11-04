@@ -252,6 +252,17 @@ fn walk(
         "command" => walk_command(node, src, out, cx, depth),
         "declaration_command" | "unset_command" => walk_declaration(node, src, out, cx, depth),
         "test_command" => {
+            // `[ … ]` is the ordinary `[` command, so `>` and `<` inside it are redirects
+            // (`[ a > Z ]` truncates `Z`); only `[[ … ]]` compares. The grammar reads both
+            // as comparisons, so a single-bracket test holding one fails closed.
+            let single = node.child(0).is_some_and(|c| text(c, src) == "[");
+            if single && holds_redirect(node, src) {
+                return Err(Unparseable(
+                    "redirect inside `[ … ]`: the `[` command, unlike `[[ … ]]`, redirects on \
+                     `>` and `<`"
+                        .into(),
+                ));
+            }
             cx.push(
                 out,
                 SimpleCommand {
@@ -424,6 +435,9 @@ fn walk_command(
                 collect_redirects(child, src, &mut redirects, &mut extra, cx, depth)?
             }
             "comment" => {}
+            // `cmd 0<&3`: a digit-only word glued to a redirect operator is its
+            // descriptor in bash; the grammar may leave it as a word before the redirect.
+            _ if child.is_named() && is_glued_descriptor(child, src) => {}
             _ if child.is_named() => {
                 argv.push(unquote(child, src));
                 rest.push(child);
@@ -551,6 +565,10 @@ fn walk_redirected(
             "file_redirect" | "heredoc_redirect" | "herestring_redirect" => {
                 collect_redirects(child, src, &mut redirects, &mut extra, cx, depth)?
             }
+            // Structural invariant: a redirected compound command has no words of its
+            // own (a function definition has its name), so a word here (`{ cmd; } >&- a`,
+            // a bash syntax error) is unknown.
+            k if !function && WORDS.contains(&k) => return Err(hidden_word("the redirect")),
             _ => walk(child, src, out, cx, depth)?,
         }
     }
@@ -679,21 +697,113 @@ fn collect_redirects(
             }
             for child in node.children(&mut cur) {
                 match child.kind() {
+                    _ if !child.is_named() => {}
+                    "file_descriptor" | "heredoc_start" | "heredoc_end" | "comment" => {}
                     "file_redirect" | "heredoc_redirect" | "herestring_redirect" => {
                         collect_redirects(child, src, redirects, extra, cx, depth)?
                     }
-                    _ => {
-                        // `cmd <<EOF | next`: `next` reads `cmd`'s output.
+                    // `cmd <<EOF | next` / `cmd <<EOF && next`: `next` reads `cmd`'s
+                    // output or runs after it; the body may hold substitutions.
+                    k if k == "heredoc_body" || STATEMENTS.contains(&k) => {
                         let start = extra.len();
                         walk(child, src, extra, cx, depth)?;
                         reject_fed_modules(&extra[start..])?;
                     }
+                    // Structural invariant: anything else on the line (`cmd <<EOF a b`)
+                    // is a word bash passes to the command, which the rules could not see.
+                    _ => return Err(hidden_word("the heredoc delimiter")),
                 }
             }
             Ok(())
         }
+        "herestring_redirect" => {
+            // `<<< word`: exactly one operand; anything more is unknown.
+            let operands = node
+                .named_children(&mut node.walk())
+                .filter(|c| !matches!(c.kind(), "file_descriptor" | "comment"))
+                .count();
+            if operands != 1 {
+                return Err(hidden_word("the herestring"));
+            }
+            walk_children(node, src, extra, cx, depth)
+        }
         _ => walk_children(node, src, extra, cx, depth),
     }
+}
+
+/// Node kinds that are statements of their own (the grammar's `_statement`), as a
+/// heredoc line may continue with one (`cmd <<EOF | next`).
+const STATEMENTS: &[&str] = &[
+    "redirected_statement",
+    "variable_assignment",
+    "variable_assignments",
+    "command",
+    "declaration_command",
+    "unset_command",
+    "test_command",
+    "negated_command",
+    "for_statement",
+    "c_style_for_statement",
+    "while_statement",
+    "if_statement",
+    "case_statement",
+    "pipeline",
+    "list",
+    "subshell",
+    "compound_statement",
+    "function_definition",
+];
+
+/// Node kinds that are a word (the grammar's `_literal`): one bash would pass to the
+/// command, so one that must reach argv or be a redirect operand.
+const WORDS: &[&str] = &[
+    "word",
+    "string",
+    "raw_string",
+    "translated_string",
+    "ansi_c_string",
+    "number",
+    "expansion",
+    "simple_expansion",
+    "command_substitution",
+    "process_substitution",
+    "arithmetic_expansion",
+    "brace_expression",
+    "concatenation",
+];
+
+/// Whether `node`'s subtree holds a `<` or `>` token (any operator starting with one:
+/// `>=` inside `[ … ]` is a redirect to `=`) or a redirect node.
+fn holds_redirect(node: Node, src: &[u8]) -> bool {
+    let redirect = if node.is_named() {
+        matches!(
+            node.kind(),
+            "file_redirect" | "heredoc_redirect" | "herestring_redirect" | "redirected_statement"
+        )
+    } else {
+        text(node, src).starts_with(['<', '>'])
+    };
+    let mut cur = node.walk();
+    redirect || node.children(&mut cur).any(|c| holds_redirect(c, src))
+}
+
+/// Whether a command's word is a redirect descriptor: all digits and glued to a `<` or `>`
+/// that follows it (`0<&3`), but not to a process substitution (`0<(cmd)` keeps the `0`).
+fn is_glued_descriptor(node: Node, src: &[u8]) -> bool {
+    let t = text(node, src);
+    let after = &src[node.end_byte()..];
+    !t.is_empty()
+        && t.bytes().all(|b| b.is_ascii_digit())
+        && (after.starts_with(b"<") || after.starts_with(b">"))
+        && !(after.starts_with(b"<(") || after.starts_with(b">("))
+}
+
+/// A word the grammar filed under a redirect (`cmd > f a`, `cmd >&- a`, `cmd <<EOF a`):
+/// bash passes it to the command, where the rules could not see it. Refuse (fail closed).
+fn hidden_word(after: &str) -> Unparseable {
+    Unparseable(format!(
+        "words after {after} are arguments the rules cannot see; put them before the redirect"
+    ))
 }
 
 /// Whether a redirect feeds the command's stdin: a heredoc, a herestring, or
@@ -1123,24 +1233,42 @@ pub(crate) fn is_dangerous_env(name: &str) -> bool {
         || DANGEROUS_ENV_PREFIXES.iter().any(|p| upper.starts_with(p))
 }
 
+/// The file redirect a `file_redirect` node describes, or `None` for an fd duplication
+/// or close. Structural invariant: besides its operator and descriptor the node holds
+/// exactly one word, the target, and a close operator (`>&-`, `<&-`) holds none; `cmd >
+/// out.txt a b` and `cmd >&- a` run `cmd a b` and `cmd a`, and the grammar files those
+/// words under the redirect, where the rules could not see them. Refuse (fail closed).
 fn redirect_of(node: Node, src: &[u8]) -> Result<Option<Redirect>, Unparseable> {
     let mut op = "";
+    let mut words = Vec::new();
     let mut cur = node.walk();
     for child in node.children(&mut cur) {
-        if !child.is_named() {
-            op = text(child, src);
-            break;
+        match child.kind() {
+            _ if !child.is_named() => {
+                if op.is_empty() {
+                    op = text(child, src);
+                }
+            }
+            "file_descriptor" | "comment" => {}
+            _ => words.push(child),
         }
     }
-    let Some(dest) = node.child_by_field_name("destination") else {
+    let close = matches!(op, ">&-" | "<&-");
+    if close && !words.is_empty() {
+        return Err(hidden_word(&format!("`{op}`")));
+    }
+    if words.len() > 1 {
+        return Err(hidden_word(&format!("the target of `{op}`")));
+    }
+    let Some(dest) = words.first() else {
         // `>&-` / `2>&-` close a descriptor; anything else is unknown.
-        return if matches!(op, ">&-" | "<&-") {
+        return if close {
             Ok(None)
         } else {
             Err(Unparseable(format!("redirect `{op}` without a target")))
         };
     };
-    let target = unquote(dest, src);
+    let target = unquote(*dest, src);
     let dup = matches!(op, ">&" | "<&")
         && (target == "-" || (!target.is_empty() && target.bytes().all(|b| b.is_ascii_digit())));
     if dup {

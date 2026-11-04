@@ -1,0 +1,25 @@
+[package]
+name = "tautly-tui"
+description = "Tautly's daily-driver line REPL: streamed output, compact tool rows, approvals, slash commands"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+tautly-core = { path = "../tautly-core" }
+async-trait.workspace = true
+futures.workspace = true
+reedline.workspace = true
+serde_json.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["io-util"] }
+
+[dev-dependencies]
+async-trait.workspace = true
+tautly-provider = { path = "../tautly-provider" }
+tautly-sandbox = { path = "../tautly-sandbox" }
+regex.workspace = true
+tempfile.workspace = true
+tokio.workspace = true

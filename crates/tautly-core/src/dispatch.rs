@@ -43,7 +43,7 @@ use tautly_tools::{
 };
 use tokio::sync::mpsc;
 
-use crate::approvals::Verdict;
+use crate::approvals::{ApprovalFor, Verdict};
 use crate::protocol::{BudgetScope, EffectView, Event};
 use crate::record::{ApprovalKind, SessionRecord};
 use crate::session::{Log, LogFailure, Session};
@@ -403,8 +403,56 @@ impl Session {
             Decision::Deny { rule } => Err(Outcome::refused(ToolResult::error(format!(
                 "denied by the permission rule `{rule}`; the call did not run"
             )))),
-            Decision::Ask { reason } => self.ask(p.call, tool, &args, reason, turn, ctl).await,
+            Decision::Ask { reason } => {
+                let (bases, rule) = self.ask(p.call, tool, &args, reason, turn, ctl).await?;
+                if let Some(rule) = rule {
+                    self.add_session_rule(&rule, &p.call.name, effect, raw_cmd)
+                        .await;
+                }
+                Ok(bases)
+            }
         }
+    }
+
+    /// "Allow for this session" (spec 7.11.8): `rule` becomes a session allow rule only if
+    /// it matches the call it came with; otherwise that call is approved once and the user
+    /// is told. Deny rules, protected paths and unparseable commands still come first.
+    async fn add_session_rule(
+        &mut self,
+        rule: &str,
+        tool: &str,
+        effect: &Effect,
+        raw_cmd: Option<&str>,
+    ) {
+        let shown = crate::printable(rule);
+        let why = match self.policy.rule_matches(rule, tool, effect, raw_cmd) {
+            Ok(true) => match self.policy.add_session_allow(rule) {
+                Ok(()) => {
+                    let note = if broad_rule(rule) {
+                        " (broad: it matches far more than this call; deny rules, protected \
+                         paths and unparseable commands still ask or refuse)"
+                            .to_string()
+                    } else {
+                        String::new()
+                    };
+                    self.emit(Event::Warning {
+                        message: format!("allowed for this session: {shown}{note}"),
+                    })
+                    .await;
+                    return;
+                }
+                Err(e) => e.to_string(),
+            },
+            Ok(false) => format!("it does not match this `{}` call", crate::printable(tool)),
+            Err(e) => e.to_string(),
+        };
+        self.emit(Event::Warning {
+            message: format!(
+                "session rule `{shown}` not added: {}; the call was approved once",
+                crate::printable(&why)
+            ),
+        })
+        .await;
     }
 
     /// Preview the call, then ask the user (interactive) or deny (headless, spec 3.4). A
@@ -418,7 +466,7 @@ impl Session {
         reason: String,
         turn: u32,
         ctl: &TurnControl,
-    ) -> Result<Option<Bases>, Outcome> {
+    ) -> Result<(Option<Bases>, Option<String>), Outcome> {
         let (diff, bases) = match self.preview(tool, args, turn, ctl).await? {
             Some(Ok(preview)) => (Some(preview.diff), Some(preview.bases)),
             Some(Err(result)) => {
@@ -430,7 +478,7 @@ impl Session {
             }
             None => (None, None),
         };
-        let Some((request_id, rx)) = ctl.approvals.open() else {
+        let Some((request_id, rx)) = ctl.approvals.open(ApprovalFor::Tool) else {
             return Err(Outcome::refused(ToolResult::error(format!(
                 "denied: this call needs approval ({reason}), and nobody can approve it in \
                  this session (headless); the user can allow it with --approve auto-edit or yolo"
@@ -460,7 +508,7 @@ impl Session {
             }
         };
         match verdict {
-            Verdict::Approved => Ok(bases),
+            Verdict::Approved { session_rule } => Ok((bases, session_rule)),
             Verdict::Denied { reason } => Err(Outcome::refused(ToolResult::error(match reason {
                 Some(r) => format!("denied by user: {r}"),
                 None => "denied by user".to_string(),
@@ -816,8 +864,51 @@ fn persist_result(
     })
 }
 
+/// Whether a session rule matches far more than one call, so its acceptance notice says
+/// so: a bare tool (`bash`), a pattern of only wildcards and spaces (`bash(*)`,
+/// `bash(* *)`, `bash(?*)`), or an MCP rule with a part of only wildcards (`mcp__x__*`,
+/// `mcp__*`).
+fn broad_rule(rule: &str) -> bool {
+    let wild = |s: &str| s.chars().all(|c| matches!(c, '*' | '?' | ' '));
+    if let Some(rest) = rule.strip_prefix("mcp__") {
+        return rest.split("__").any(|part| !part.is_empty() && wild(part));
+    }
+    match rule.split_once('(') {
+        None => true,
+        Some((_, p)) => wild(p.strip_suffix(')').unwrap_or(p)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    /// Re-review T30 (M1 nit): rules that match far more than one call are flagged.
+    #[test]
+    fn broad_rules_are_recognized() {
+        for broad in [
+            "bash",
+            "bash(*)",
+            "bash(**)",
+            "bash(* *)",
+            "bash(?*)",
+            "mcp__x__*",
+            "mcp__*",
+            "edit",
+            "edit(*)",
+        ] {
+            assert!(super::broad_rule(broad), "{broad}");
+        }
+        for narrow in [
+            "bash(cargo test*)",
+            "bash(ls)",
+            "mcp__x__create_issue",
+            "mcp__x__create_*",
+            "edit(src/*.rs)",
+            "web_fetch(docs.rs)",
+        ] {
+            assert!(!super::broad_rule(narrow), "{narrow}");
+        }
+    }
+
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
     use std::sync::mpsc;

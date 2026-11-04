@@ -375,6 +375,7 @@ async fn set_model_during_turn_applies_at_next_user_turn() {
     .await;
     run.send(Command::Approve {
         request_id: request_id.clone(),
+        session_rule: None,
     })
     .await;
     let rest = run.turn().await;

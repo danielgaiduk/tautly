@@ -94,6 +94,7 @@ fn every_event() -> Vec<Event> {
             meta: ToolMetaView {
                 exit_code: Some(1),
                 error_kind: Some("stale".into()),
+                saved: None,
             },
             diff: Some(DiffPreview {
                 unified: "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1 @@\n-a\n+b\n".into(),
@@ -274,6 +275,7 @@ fn every_command() -> Vec<Command> {
         },
         Command::Approve {
             request_id: "req_1".into(),
+            session_rule: None,
         },
         Command::Deny {
             request_id: "req_1".into(),
@@ -424,8 +426,24 @@ fn approval_events_and_commands_carry_request_ids() {
     assert_eq!(
         approve,
         Command::Approve {
-            request_id: "r".into()
+            request_id: "r".into(),
+            session_rule: None,
         }
+    );
+    // "Allow for this session": on the wire, never in the session log.
+    let always = Command::Approve {
+        request_id: "r".into(),
+        session_rule: Some("bash(cargo test*)".into()),
+    };
+    let v = serde_json::to_value(&always).unwrap();
+    assert_eq!(
+        v,
+        json!({"type": "approve", "request_id": "r", "session_rule": "bash(cargo test*)"})
+    );
+    assert_eq!(serde_json::from_value::<Command>(v).unwrap(), always);
+    assert_eq!(
+        serde_json::to_value(always.for_log()).unwrap(),
+        json!({"type": "approve", "request_id": "r"})
     );
 }
 
@@ -652,7 +670,8 @@ fn tool_meta_view_copies_meta() {
         ToolMetaView::from(&meta),
         ToolMetaView {
             exit_code: Some(2),
-            error_kind: Some("not_found".into())
+            error_kind: Some("not_found".into()),
+            saved: None,
         }
     );
     assert_eq!(

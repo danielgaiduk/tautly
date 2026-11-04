@@ -4,6 +4,7 @@
 //! speak only these types.
 
 mod approvals;
+pub use approvals::exact_rule;
 pub mod attempts;
 pub mod auth;
 pub mod budget;
@@ -56,7 +57,10 @@ pub use provider_setup::{
 };
 pub use receipt::{ReceiptBuilder, Savings};
 pub use record::SessionRecord;
-pub use signals::{Signal, SignalPolicy, SignalRouter, handle_signals, install_signal_handlers};
+pub use signals::{
+    Signal, SignalPolicy, SignalRouter, handle_signals, install_signal_handlers,
+    install_termination_handlers,
+};
 pub use workspace::{IndexLockError, Workspace, Workspaces};
 // Types that appear in `Event` and `Command`, re-exported so clients need no other crate.
 pub use tautly_context::{Breakdown, MutationReason};
@@ -66,7 +70,7 @@ pub use tautly_provider::{ModelId, ProviderEvent, Quota, RawUsage};
 // What a client needs to fill `CliOverrides` and to find the data directory.
 pub use tautly_sandbox::Mode;
 pub use tautly_session::paths::data_home;
-pub use tautly_tools::DiffPreview;
+pub use tautly_tools::{DiffPreview, SaveKind, Saved};
 // What the CLI's utility commands (`tautly prompt|sessions|models|mcp ...`) read, so that
 // `tautly-cli` depends on this crate alone.
 pub use tautly_context::prompt::system as system_prompt;
