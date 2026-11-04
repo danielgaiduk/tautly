@@ -324,7 +324,8 @@ fn every_command() -> Vec<Command> {
             | Command::Diff { .. }
             | Command::SetModel { .. }
             | Command::Undo { .. }
-            | Command::Shutdown => {}
+            | Command::Shutdown
+            | Command::Unknown => {}
         }
     }
     commands
@@ -426,7 +427,7 @@ fn command_json_shape_is_stable() {
 }
 
 #[test]
-fn commands_accept_missing_optional_fields_and_reject_unknown_types() {
+fn commands_accept_missing_optional_fields_and_read_unknown_types_as_unknown() {
     let c: Command = serde_json::from_str(r#"{"type":"deny","request_id":"r"}"#).unwrap();
     assert_eq!(
         c,
@@ -445,7 +446,10 @@ fn commands_accept_missing_optional_fields_and_reject_unknown_types() {
             max_tokens: None
         }
     );
-    assert!(serde_json::from_str::<Command>(r#"{"type":"explode"}"#).is_err());
+    assert_eq!(
+        serde_json::from_str::<Command>(r#"{"type":"explode","power":9}"#).unwrap(),
+        Command::Unknown
+    );
     assert!(
         serde_json::from_str::<Command>(r#"{"type":"approve"}"#).is_err(),
         "request_id is required"
@@ -722,8 +726,53 @@ fn unknown_events_and_values_read_as_unknown_not_as_errors() {
         effects,
         [EffectView::Unknown, EffectView::Exec { may_write: true }]
     );
-    // A command the engine does not know is still an error: it cannot be ignored.
-    assert!(serde_json::from_value::<Command>(json!({"type": "explode"})).is_err());
+    // A command or budget scope the engine does not know reads as `Unknown` (the engine
+    // answers it with an error, and a log holding it stays readable).
+    assert_eq!(
+        serde_json::from_value::<Command>(json!({"type": "explode"})).unwrap(),
+        Command::Unknown
+    );
+    assert_eq!(
+        serde_json::from_value::<Command>(
+            json!({"type": "set_budget", "scope": "week", "max_usd": 1.0, "max_tokens": null})
+        )
+        .unwrap(),
+        Command::SetBudget {
+            scope: BudgetScope::Unknown,
+            max_usd: Some(1.0),
+            max_tokens: None,
+        }
+    );
+    // A read effect shown in a way this version does not know.
+    let e: Event = serde_json::from_value(json!({
+        "type": "tool_finished", "call_id": "c", "tool": "t", "output": "", "is_error": false,
+        "blocked": false, "meta": {},
+        "effects": [{"type": "read", "path": "a", "range": {"start": null, "end": null},
+                     "shown": {"type": "folded", "lines": 3}}]
+    }))
+    .unwrap();
+    let Event::ToolFinished { effects, .. } = e else {
+        panic!()
+    };
+    assert_eq!(
+        effects,
+        [EffectView::Read {
+            path: "a".into(),
+            range: LineRange::ALL,
+            shown: Shown::Unknown,
+        }]
+    );
+    // A memory kind this version does not know reads as a fact.
+    let e: Event = serde_json::from_value(json!({
+        "type": "memory_proposed", "proposal_id": "p",
+        "change": {"upsert": {"id": "x", "title": "t", "kind": "pattern", "anchors": [],
+                              "created": 0, "body": "b"}, "delete": []}
+    }))
+    .unwrap();
+    let Event::MemoryProposed { change, .. } = e else {
+        panic!()
+    };
+    assert_eq!(change.upsert.unwrap().kind, MemoryKind::Fact);
 }
 
 #[test]

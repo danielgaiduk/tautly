@@ -108,6 +108,10 @@ pub enum Shown {
     /// A diff against the turn-`since` output, which must stay in context; this output is
     /// also the new baseline.
     Diff { since: u32 },
+    /// A kind this version does not know (read back from a newer log): treated as an
+    /// output that covers nothing and keeps no baseline.
+    #[serde(other)]
+    Unknown,
 }
 
 /// Structured facts about a result, so the engine never parses `output`.

@@ -159,8 +159,10 @@ pub struct CanonicalRequest {
     pub volatile_tail: bool,
 }
 
+/// Why a response ended. Persisted in session logs (`Done`): a reason this version does
+/// not know reads as [`StopReason::Unknown`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(remote = "Self", rename_all = "snake_case")]
 pub enum StopReason {
     EndTurn,
     ToolUse,
@@ -168,6 +170,8 @@ pub enum StopReason {
     StopSequence,
     Refusal,
     Other(String),
+    /// A stop reason this version does not know (read back from a newer log).
+    Unknown,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -185,8 +189,10 @@ pub struct Quota {
     pub reset_at: Option<SystemTime>,
 }
 
+/// One item of a streamed response. Persisted in session logs: an event type this version
+/// does not know reads as [`ProviderEvent::Unknown`] (match with a wildcard arm).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(remote = "Self", rename_all = "snake_case")]
 pub enum ProviderEvent {
     TextDelta(String),
     ReasoningDelta(String),
@@ -210,4 +216,209 @@ pub enum ProviderEvent {
     Done {
         stop: StopReason,
     },
+    /// An event this version does not know (read back from a newer log); ignored.
+    Unknown,
+}
+
+/// The variant names [`StopReason`] reads.
+const STOP_REASONS: &[&str] = &[
+    "end_turn",
+    "tool_use",
+    "max_tokens",
+    "stop_sequence",
+    "refusal",
+    "other",
+    "unknown",
+];
+
+/// The variant names [`ProviderEvent`] reads.
+const PROVIDER_EVENTS: &[&str] = &[
+    "text_delta",
+    "reasoning_delta",
+    "reasoning_signature",
+    "redacted_reasoning",
+    "tool_call",
+    "usage",
+    "discarded_usage",
+    "quota",
+    "done",
+    "unknown",
+];
+
+/// The variant name of an externally tagged value: the string itself (a unit variant), or
+/// the key of a one-key object.
+fn external_tag(value: &Value) -> Option<&str> {
+    match value {
+        Value::String(s) => Some(s),
+        Value::Object(m) if m.len() == 1 => m.keys().next().map(String::as_str),
+        _ => None,
+    }
+}
+
+/// Deserialize an externally tagged enum whose derive is `remote = "Self"`: a variant name
+/// not in `known` is `unknown`; anything else (a bad payload, a value that is no variant)
+/// is left to the derived impl, and fails as before.
+fn tolerant<'de, D, T>(
+    d: D,
+    known: &[&str],
+    unknown: T,
+    derived: impl FnOnce(Value) -> Result<T, serde_json::Error>,
+) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Value::deserialize(d)?;
+    match external_tag(&value) {
+        Some(tag) if !known.contains(&tag) => Ok(unknown),
+        _ => derived(value).map_err(serde::de::Error::custom),
+    }
+}
+
+impl Serialize for StopReason {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        StopReason::serialize(self, s)
+    }
+}
+
+impl<'de> Deserialize<'de> for StopReason {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        tolerant(
+            d,
+            STOP_REASONS,
+            StopReason::Unknown,
+            StopReason::deserialize,
+        )
+    }
+}
+
+impl Serialize for ProviderEvent {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        ProviderEvent::serialize(self, s)
+    }
+}
+
+impl<'de> Deserialize<'de> for ProviderEvent {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        tolerant(
+            d,
+            PROVIDER_EVENTS,
+            ProviderEvent::Unknown,
+            ProviderEvent::deserialize,
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stop_reasons_from_a_newer_version_read_as_unknown() {
+        for text in [
+            r#""paused""#,
+            r#"{"paused":{"for":3}}"#,
+            r#"{"paused":"x"}"#,
+        ] {
+            assert_eq!(
+                serde_json::from_str::<StopReason>(text).unwrap(),
+                StopReason::Unknown,
+                "{text}"
+            );
+        }
+        let known = [
+            StopReason::EndTurn,
+            StopReason::ToolUse,
+            StopReason::MaxTokens,
+            StopReason::StopSequence,
+            StopReason::Refusal,
+            StopReason::Other("x".into()),
+            StopReason::Unknown,
+        ];
+        // A variant added without a sample above fails to compile here; one missing from
+        // `STOP_REASONS` fails the round trip.
+        for r in &known {
+            match r {
+                StopReason::EndTurn
+                | StopReason::ToolUse
+                | StopReason::MaxTokens
+                | StopReason::StopSequence
+                | StopReason::Refusal
+                | StopReason::Other(_)
+                | StopReason::Unknown => {}
+            }
+        }
+        for r in known {
+            let text = serde_json::to_string(&r).unwrap();
+            assert_eq!(serde_json::from_str::<StopReason>(&text).unwrap(), r);
+        }
+        // A known reason with a bad payload is still an error.
+        assert!(serde_json::from_str::<StopReason>(r#"{"other":7}"#).is_err());
+        assert!(serde_json::from_str::<StopReason>("7").is_err());
+    }
+
+    #[test]
+    fn provider_events_from_a_newer_version_read_as_unknown() {
+        for text in [
+            r#""from_the_future""#,
+            r#"{"from_the_future":{"a":1}}"#,
+            r#"{"from_the_future":[1,2]}"#,
+        ] {
+            assert_eq!(
+                serde_json::from_str::<ProviderEvent>(text).unwrap(),
+                ProviderEvent::Unknown,
+                "{text}"
+            );
+        }
+        let done: ProviderEvent = serde_json::from_str(r#"{"done":{"stop":"paused"}}"#).unwrap();
+        assert_eq!(
+            done,
+            ProviderEvent::Done {
+                stop: StopReason::Unknown
+            }
+        );
+        let usage = RawUsage {
+            input: 1,
+            output: 2,
+            cache_read: 3,
+            cache_write: 4,
+        };
+        let known = [
+            ProviderEvent::TextDelta("t".into()),
+            ProviderEvent::ReasoningDelta("r".into()),
+            ProviderEvent::ReasoningSignature("s".into()),
+            ProviderEvent::RedactedReasoning("d".into()),
+            ProviderEvent::ToolCall {
+                id: "c".into(),
+                name: "n".into(),
+                input_json: "{}".into(),
+            },
+            ProviderEvent::Usage(usage),
+            ProviderEvent::DiscardedUsage(usage),
+            ProviderEvent::Quota(Quota::default()),
+            ProviderEvent::Done {
+                stop: StopReason::EndTurn,
+            },
+            ProviderEvent::Unknown,
+        ];
+        for e in &known {
+            match e {
+                ProviderEvent::TextDelta(_)
+                | ProviderEvent::ReasoningDelta(_)
+                | ProviderEvent::ReasoningSignature(_)
+                | ProviderEvent::RedactedReasoning(_)
+                | ProviderEvent::ToolCall { .. }
+                | ProviderEvent::Usage(_)
+                | ProviderEvent::DiscardedUsage(_)
+                | ProviderEvent::Quota(_)
+                | ProviderEvent::Done { .. }
+                | ProviderEvent::Unknown => {}
+            }
+        }
+        for e in known {
+            let text = serde_json::to_string(&e).unwrap();
+
+            assert_eq!(serde_json::from_str::<ProviderEvent>(&text).unwrap(), e);
+        }
+        assert!(serde_json::from_str::<ProviderEvent>(r#"{"usage":"x"}"#).is_err());
+    }
 }

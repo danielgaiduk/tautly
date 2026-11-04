@@ -358,6 +358,17 @@ fn old_git_in_a_partial_clone_warns_once_and_logs_one_skip() {
 /// never in the repository.
 #[test]
 fn undo_uses_the_global_excludes_file_of_the_turns_start() {
+    undo_with_global_excludes(false);
+}
+
+/// The same when the excludes file is a symbolic link (as a dotfiles manager makes it):
+/// the user's own configuration names it, so it is followed.
+#[test]
+fn undo_follows_a_symlinked_global_excludes_file() {
+    undo_with_global_excludes(true);
+}
+
+fn undo_with_global_excludes(symlinked: bool) {
     let git = real_git();
     let repo = repo(&git);
     let root = repo.path().canonicalize().unwrap();
@@ -366,10 +377,17 @@ fn undo_uses_the_global_excludes_file_of_the_turns_start() {
     let user = tempfile::tempdir().unwrap();
     let ignore = user.path().join("ignore");
     std::fs::write(&ignore, ".secret\n").unwrap();
+    let named = if symlinked {
+        let link = user.path().join("ignore-link");
+        std::os::unix::fs::symlink(&ignore, &link).unwrap();
+        link
+    } else {
+        ignore.clone()
+    };
     let global = user.path().join("gitconfig");
     std::fs::write(
         &global,
-        format!("[core]\n\texcludesFile = {}\n", ignore.display()),
+        format!("[core]\n\texcludesFile = {}\n", named.display()),
     )
     .unwrap();
     let answer = with_env("GIT_CONFIG_GLOBAL", global.as_os_str(), async {

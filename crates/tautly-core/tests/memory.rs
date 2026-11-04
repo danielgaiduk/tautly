@@ -937,6 +937,46 @@ async fn exhausted_budget_sends_no_episode_or_consolidation_request() {
 }
 
 #[tokio::test]
+async fn an_explicit_consolidation_is_held_back_only_by_the_session_budget() {
+    let fx = Fx::new();
+    fx.entry_file("a", "a", "Use pnpm");
+    fx.entry_file("b", "b", "Always pnpm");
+    let mut cfg = config(Mode::Ask);
+    // The last turn used up its turn budget (110 of 50 tokens); the session has room.
+    cfg.budget.turn = BudgetLimits {
+        max_usd: None,
+        max_tokens: Some(50),
+    };
+    let mock = MockProvider::new(vec![
+        text_step("done"),
+        text_step("[]"),
+        text_step("# Never asked"),
+    ]);
+    let mut run = start(fx.ready(cfg, &mock).await);
+    run.turn_with("work").await;
+    run.send(Command::ConsolidateMemory).await;
+    let ev = run
+        .until(|e| matches!(e, Event::Warning { message } if message.contains("consolidation")))
+        .await;
+    assert!(
+        warnings(&ev).iter().any(|w| w.contains("no changes")),
+        "{ev:?}"
+    );
+    assert_eq!(mock.requests().len(), 2, "consolidation was not asked for");
+    // The episode, which nobody asked for, still respects every budget.
+    let session = run.engine.session_id().to_string();
+    let after = run.stop().await;
+    assert_eq!(mock.requests().len(), 2, "the episode asked the side model");
+    assert!(
+        warnings(&after)
+            .iter()
+            .any(|w| w.contains("episode") && w.contains("budget")),
+        "{after:?}"
+    );
+    assert!(!fx.episode_path(&session).exists());
+}
+
+#[tokio::test]
 async fn consolidation_prompt_fits_the_side_model_window() {
     let fx = Fx::new();
     for i in 0..40 {

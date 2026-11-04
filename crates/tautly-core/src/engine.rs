@@ -69,6 +69,8 @@ pub const EVENT_CAPACITY: usize = 256;
 const COMMAND_CAPACITY: usize = 64;
 /// At shutdown, how long left-behind process groups get between SIGTERM and SIGKILL.
 const GROUP_GRACE: Duration = Duration::from_millis(500);
+/// Longest a shutdown waits for the cost ledger to write the rows queued for it.
+const LEDGER_FLUSH: Duration = Duration::from_secs(1);
 
 #[derive(Debug, thiserror::Error)]
 pub enum EngineError {
@@ -271,7 +273,7 @@ impl EngineBuilder {
                 // Each checkpoint's exclude rules are kept next to the project's session
                 // logs (owner-only), shared by its sessions (resumes and forks read them).
                 let cp = match session_path.parent() {
-                    Some(dir) => cp.with_excludes_store(dir.join("checkpoint-excludes")),
+                    Some(dir) => cp.with_excludes_store(dir.join(checkpoint::EXCLUDES_DIR)),
                     None => cp,
                 };
                 GitCheckpoints::shared(cp.with_process_groups(groups.clone()))
@@ -322,6 +324,7 @@ impl EngineBuilder {
             cost_ledger_reported: false,
             groups: groups.clone(),
             lost_write_paths: Default::default(),
+            lost_write_probes: Default::default(),
             evidence: EvidenceTracker::new(test_matcher),
             mcp: None,
             pre_exec: self.pre_exec.unwrap_or_else(|| Arc::new(NoPreExec)),
@@ -375,8 +378,9 @@ fn prune_checkpoints(session: &Session) {
         let st = shared.lock().await;
         let keep_days = st.cp.config().keep_days;
         let root = sandbox.root().to_path_buf();
+        let excludes = st.cp.excludes_dir().map(Path::to_path_buf);
         // Best effort: what is not pruned now is at the next start.
-        let _ = checkpoint::prune(sandbox.as_ref(), &root, keep_days).await;
+        let _ = checkpoint::prune(sandbox.as_ref(), &root, keep_days, excludes.as_deref()).await;
         drop(st);
     });
 }
@@ -546,13 +550,7 @@ impl Actor {
             Ok(()) => {
                 session.begin_checkpoints().await;
                 prune_checkpoints(&session);
-                session.mcp = McpSession::start(
-                    start.mcp,
-                    Arc::clone(&session.sandbox),
-                    session.events.clone(),
-                    self.approvals.clone(),
-                )
-                .await;
+                session.mcp = McpSession::start(start.mcp, &session, self.approvals.clone()).await;
                 Some(session)
             }
             Err(why) => {
@@ -657,6 +655,11 @@ impl Actor {
             s.end_episode().await;
         }
         self.with_log(|l| l.checkpoint()).await;
+        // The episode's usage included: a client that exits once the event stream closes
+        // loses no row, unless the ledger is stuck.
+        if let Some(s) = state.as_ref() {
+            s.cost_ledger.flush(LEDGER_FLUSH).await;
+        }
     }
 
     /// A command from the channel: logged, then handled at once (shutdown, approvals,
@@ -682,6 +685,14 @@ impl Actor {
             }
             // After a crashed turn every command gets the same answer.
             _ if lost => self.lost(),
+            Command::Unknown => self.events.try_emit(Event::Error {
+                kind: ErrorKind::Internal,
+                message: "this engine does not know this command (sent by a newer client?); \
+                          it was ignored"
+                    .into(),
+                retryable: false,
+                hint: None,
+            }),
             Command::Approve { request_id } => {
                 self.resolve(&request_id, Verdict::Approved);
             }
@@ -717,6 +728,12 @@ impl Actor {
     /// `SetBudget`: replace one scope's limits. Clients are trusted (the project layer's
     /// tighten-only rule applies to configuration files only).
     fn set_budget(&self, scope: BudgetScope, max_usd: Option<f64>, max_tokens: Option<u64>) {
+        if scope == BudgetScope::Unknown {
+            self.events.try_emit(Event::Warning {
+                message: "SetBudget ignored: unknown scope (sent by a newer client?)".into(),
+            });
+            return;
+        }
         if max_usd.is_some_and(|usd| !usd.is_finite() || usd < 0.0) {
             self.events.try_emit(Event::Warning {
                 message: "SetBudget ignored: max_usd must be a number of at least 0".into(),

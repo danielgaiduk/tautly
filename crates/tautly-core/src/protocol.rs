@@ -9,11 +9,13 @@
 //! Readers ignore fields they do not know (no wire type denies unknown fields), so adding
 //! a field is a minor-version change; every new field that is not an `Option` must carry
 //! `#[serde(default)]`. An event type, [`EffectView`] kind, [`ErrorKind`],
-//! [`FinishReason`], [`UsageRole`] or [`DiffStatus`] value a reader does not know reads as
-//! its `Unknown` variant instead of failing the message, so those can also grow in minor
-//! versions (match with a wildcard arm). New values of enums defined in other crates
-//! ([`MutationReason`], `Shown`, `MemoryKind`) are a major-version change. An unknown
-//! [`Command`] is an error: the engine cannot ignore what it was asked to do.
+//! [`FinishReason`], [`UsageRole`], [`DiffStatus`], `Shown`, [`MutationReason`] or
+//! [`McpState`] value a reader does not know reads as its `Unknown` variant instead of
+//! failing the message, so those can also grow in minor versions (match with a wildcard
+//! arm). An unknown `MemoryKind` reads as `fact`. A [`Command`] or [`BudgetScope`] the
+//! engine does not know reads as `Unknown` too (so a session log holding one stays
+//! readable), and the engine answers it with an `Error` (a `Warning` for `SetBudget`): it
+//! cannot ignore what it was asked to do.
 //! Timestamps are unix seconds (`u64`).
 //!
 //! An event never carries a session id: the transport (JSON-RPC) adds it per notification.
@@ -367,6 +369,9 @@ pub enum DiffStatus {
 pub enum BudgetScope {
     Turn,
     Session,
+    /// A scope this version does not know: a `SetBudget` for it is ignored with a warning.
+    #[serde(other)]
+    Unknown,
 }
 
 /// Client to engine.
@@ -439,6 +444,10 @@ pub enum Command {
         dry_run: bool,
     },
     Shutdown,
+    /// A command this version does not know (from a newer client, or read back from a
+    /// newer log): answered with an `Error`, and skipped on resume.
+    #[serde(other)]
+    Unknown,
 }
 
 /// `#[serde(with = "...")]` for a `PathBuf` that must serialize even when it is not valid
@@ -521,6 +530,7 @@ pub(crate) mod memory_change_wire {
     pub(super) struct EntryWire {
         id: String,
         title: String,
+        #[serde(deserialize_with = "kind_or_fact")]
         kind: MemoryKind,
         anchors: Vec<MemAnchor>,
         created: u64,
@@ -529,6 +539,12 @@ pub(crate) mod memory_change_wire {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         tags: Vec<String>,
         body: String,
+    }
+
+    /// A kind this version does not know (from a newer engine or log) reads as a fact, so
+    /// the message or record that holds it stays readable.
+    fn kind_or_fact<'de, D: Deserializer<'de>>(d: D) -> Result<MemoryKind, D::Error> {
+        Ok(MemoryKind::parse(&String::deserialize(d)?).unwrap_or(MemoryKind::Fact))
     }
 
     impl From<&MemoryEntry> for EntryWire {
