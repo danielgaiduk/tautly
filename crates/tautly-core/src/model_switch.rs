@@ -232,7 +232,9 @@ impl Session {
         let built = tokio::select! {
             biased;
             built = self.build_provider(&model) => built,
-            () = stop => Err(ProviderSetupError::Other("the session is shutting down".into())),
+            () = stop => Err(ProviderSetupError::Other(
+                "its setup was stopped (shutdown or cancel)".into(),
+            )),
         };
         match built {
             Ok((provider, side, side_note)) => {

@@ -22,7 +22,11 @@
 //! `ModelSet`, and the `ModelSet` and `ReasoningStripped` records replayed at their
 //! positions); `Fork` moves the engine to a branch of its log, and `Compact`/`Uncompact`
 //! run between turns (all queued behind a running turn). `Compact` sends a summary
-//! request, so it runs as a task like a turn: `Cancel` and `Shutdown` stop it.
+//! request, `Undo` runs git steps and `Fork` copies and rebuilds the log, so each runs as
+//! a task like a turn: the actor keeps reading `Cancel` and `Shutdown`, which stop a
+//! compaction, and an undo or fork still waiting for the session-start checkpoint (an
+//! undo that has started writing runs to its end). Commands answered in the actor wait a
+//! bounded time for a client that is behind, so their answers are not dropped.
 //!
 //! Project memory (`memory.rs`): `ApproveMemory`/`RejectMemory` reach a running turn at its
 //! next step start (like `Pin`) and apply at once when idle; `ConsolidateMemory` asks the
