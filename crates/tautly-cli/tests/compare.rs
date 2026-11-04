@@ -376,3 +376,83 @@ fn unrelated_sessions_are_compared_whole() {
     let text = s.ok(&["compare", &one.a.id, &two.b.id]);
     assert!(text.contains("no common fork point"), "{text}");
 }
+
+#[test]
+fn a_malformed_line_names_the_session() {
+    let s = Scratch::new();
+    let t = tree(&s);
+    // Break b's first record (not its last line, which would read as a cut-off tail): a
+    // well-formed line whose payload is no record.
+    let text = std::fs::read_to_string(&t.b.path).unwrap();
+    let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
+    lines[1] = json!({"type": "record", "offset": 0, "t": 1,
+        "data": {"type": "turn_start", "data": {"turn": "bad"}}})
+    .to_string();
+    std::fs::write(&t.b.path, lines.join("\n") + "\n").unwrap();
+    let out = s.run(&["compare", &t.a.id, &t.b.id]);
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains(&format!("session {}", t.b.id)), "{err}");
+}
+
+#[test]
+fn three_sessions_meeting_at_different_ancestors_count_from_the_earliest() {
+    let s = Scratch::new();
+    let t = tree(&s);
+    // c branches from try-a after try-a's own turn: c and try-a meet at try-a's step 4,
+    // c and try-b at the parent's step 2.
+    let a_last = {
+        let r = tautly_session::SessionReader::<SessionRecord>::open(&t.a.path).unwrap();
+        r.records().count() as u64 - 1
+    };
+    let mut c = s.fork(&t.a, a_last, "c");
+    c.turn(40_000, 3, "and on");
+    c.step(40_100, 3, 6, "m/a", 7, 1);
+    c.end(40_500, None);
+    let c = c.done();
+    let out = s.ok(&["compare", &c.id, &t.b.id, &t.a.id, "--json"]);
+    let v: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["fork_point"]["session_id"], json!(t.parent.id));
+    assert_eq!(v["fork_point"]["step"], 2);
+    // From step 2, c holds try-a's turn and its own.
+    assert_eq!(v["sessions"][0]["user_turns"], 2);
+    assert_eq!(v["sessions"][0]["tokens_in"], 2_007);
+    assert_eq!(v["sessions"][1]["user_turns"], 2);
+    assert_eq!(v["sessions"][2]["user_turns"], 1);
+}
+
+#[test]
+fn sessions_sharing_a_label_are_told_apart() {
+    let s = Scratch::new();
+    let t = tree(&s);
+    let mut x = s.fork(&t.parent, 4, "try-a");
+    x.turn(50_000, 2, "same name");
+    x.end(50_100, None);
+    let x = x.done();
+    let out = s.ok(&["compare", &t.a.id, &x.id]);
+    let header = out.lines().next().unwrap();
+    assert_eq!(header.matches("try-a (").count(), 2, "{out}");
+}
+
+#[test]
+fn the_output_says_diffs_are_tool_edits_only_and_notes_commands() {
+    let s = Scratch::new();
+    let t = tree(&s);
+    let mut x = s.fork(&t.parent, 4, "cmds");
+    x.turn(50_000, 2, "run it");
+    let blob = x.blob(b"ran");
+    let result = json!({"type": "tool_result", "data": {
+        "id": "x1", "result_blob": blob, "is_error": false,
+        "effects": [{"type": "exec", "may_write": true}],
+        "meta": {}, "ran": true, "blocked": false,
+    }});
+    x.at(50_050, serde_json::from_value(result).unwrap());
+    x.end(50_100, None);
+    let x = x.done();
+    let out = s.ok(&["compare", &t.a.id, &x.id]);
+    assert!(out.contains("tool edits only"), "{out}");
+    assert!(
+        out.contains("cmds: 1 command that may have changed files"),
+        "{out}"
+    );
+}

@@ -20,6 +20,7 @@ files touched  2                                     2
 diff           +3 -1                                 +2 -0
 
 figures count from the fork point: session <p> at step 2
+files and diff count tool edits only; changes made by commands are not in the logs
 (est.): some usage is the engine's estimate
 
 file      touched by

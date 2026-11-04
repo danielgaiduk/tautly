@@ -5,7 +5,7 @@
 use std::path::{Path, PathBuf};
 
 use serde_json::{Value, json};
-use tautly_core::compare::{BranchSummary, fork_point, summarize};
+use tautly_core::compare::{BranchSummary, fork_cut, fork_point, summarize, summarize_at};
 use tautly_core::record::BlockHashes;
 use tautly_core::{FinishReason, Ledger, SessionRecord, TestEvidence, UsageRole};
 use tautly_provider::{Catalog, ModelId, ProviderEvent, RawUsage};
@@ -200,6 +200,23 @@ impl Log {
             },
         );
         self.edit(t, step, path, Some(before), None);
+    }
+
+    /// A `bash` call `id` that may have written files.
+    fn exec(&mut self, t: u64, id: &str) {
+        let result_blob = self.blob(b"ran");
+        self.at(
+            t,
+            SessionRecord::ToolResult {
+                id: id.into(),
+                result_blob,
+                is_error: false,
+                effects: vec![PersistedEffect::Exec { may_write: true }],
+                meta: ToolMeta::default(),
+                ran: true,
+                blocked: false,
+            },
+        );
     }
 
     /// Append a record this version does not know, at time `t`.
@@ -645,5 +662,251 @@ fn untrusted_paths_are_left_out_and_unknown_records_make_one_note() {
         got.notes.iter().any(|n| n.contains("4 paths")),
         "{:?}",
         got.notes
+    );
+}
+
+// ------------------------------------------------------------- fix round 1
+
+fn at(reader: &SessionReader<SessionRecord>, cut: Option<u64>) -> BranchSummary {
+    summarize_at(reader, None, &catalog(), cut).unwrap()
+}
+
+/// Three turns of one step each: steps (1, 2), (3, 4), (5, 6); the offsets of their
+/// `TurnEnd`s.
+fn three_turns(h: &Home) -> (Done, [u64; 3]) {
+    let mut a = h.log(HeaderInit::default());
+    let mut ends = [0; 3];
+    for (i, end) in ends.iter_mut().enumerate() {
+        let n = i as u32;
+        let t = 1_000 * (u64::from(n) + 1);
+        a.turn(t, n + 1, "go");
+        a.request(t + 100, n + 1, 2 * n + 2, "m/a");
+        a.usage(t + 200, 10, 1);
+        *end = a.end(t + 500, None);
+    }
+    (a.done(), ends)
+}
+
+#[test]
+fn a_rewind_into_the_copied_prefix_meets_at_its_own_cut() {
+    let h = Home::new();
+    let (a, ends) = three_turns(&h);
+    // B: forked from A at its tip (step 6). C: B rewound to step 2, inside the prefix B
+    // copied from A. D: forked from A at step 4.
+    let mut b = h.fork(&a, ends[2], "b");
+    b.turn(50_000, 4, "b");
+    b.end(50_100, None);
+    let b = b.done();
+    let mut c = h.fork(&b, ends[0], "c");
+    c.turn(60_000, 2, "c");
+    c.request(60_100, 2, 4, "m/a");
+    c.usage(60_200, 999, 9);
+    c.end(61_000, None);
+    let c = c.done();
+    let mut d = h.fork(&a, ends[1], "d");
+    d.turn(70_000, 3, "d");
+    d.end(70_100, None);
+    let d = d.done();
+    let (ra, rb, rc, rd) = (a.reader(), b.reader(), c.reader(), d.reader());
+
+    assert_eq!(
+        fork_point(rc.header(), ra.header(), h.data()),
+        Some((a.id.clone(), 2))
+    );
+    assert_eq!(
+        fork_point(rc.header(), rd.header(), h.data()),
+        Some((a.id.clone(), 2))
+    );
+    assert_eq!(
+        fork_point(rc.header(), rb.header(), h.data()),
+        Some((b.id.clone(), 2))
+    );
+    let cut = fork_cut(rc.header(), rd.header(), h.data()).unwrap();
+    assert_eq!(cut.offset, ends[0]);
+    let sc = at(&rc, Some(cut.offset));
+    assert_eq!((sc.user_turns, sc.steps, sc.tokens_in), (1, 1, 999));
+    // D from step 2: A's second turn (copied) and its own.
+    let sd = at(&rd, Some(cut.offset));
+    assert_eq!(
+        (sd.user_turns, sd.steps, sd.tokens_in),
+        (2, 1, 10),
+        "{sd:?}"
+    );
+}
+
+#[test]
+fn a_mid_turn_fork_counts_the_rest_of_the_parents_turn() {
+    let h = Home::new();
+    let mut p = h.log(HeaderInit::default());
+    p.turn(1_000, 1, "go");
+    p.request(1_100, 1, 2, "m/a");
+    let mid = p.usage(1_200, 100, 10);
+    p.request(5_000, 1, 3, "m/a");
+    p.usage(5_100, 500, 50);
+    p.end(8_800, None);
+    let p = p.done();
+    // E branches after step 2, mid-turn: its copy is closed with a cancelled turn end,
+    // written with `Forked` (both at 0 here).
+    let mut e = h.fork(&p, mid, "e");
+    e.at(
+        0,
+        SessionRecord::TurnEnd {
+            reason: FinishReason::Cancelled,
+            evidence: None,
+        },
+    );
+    e.turn(30_000, 2, "again");
+    e.request(30_100, 2, 4, "m/a");
+    e.usage(30_200, 70, 7);
+    e.end(31_000, None);
+    let e = e.done();
+    let (rp, re) = (p.reader(), e.reader());
+    let cut = fork_cut(rp.header(), re.header(), h.data()).unwrap();
+    assert_eq!(
+        (cut.session_id.as_str(), cut.step, cut.offset),
+        (p.id.as_str(), 2, mid)
+    );
+    let sp = at(&rp, Some(cut.offset));
+    assert_eq!((sp.user_turns, sp.steps, sp.tokens_in), (0, 1, 500));
+    assert_eq!(
+        sp.wall_ms,
+        8_800 - 5_000,
+        "the open turn runs from the cut on"
+    );
+    let se = at(&re, Some(cut.offset));
+    assert_eq!((se.user_turns, se.steps, se.tokens_in), (1, 1, 70));
+    // The copy's close runs from `Forked` to its turn end (no time), then its own turn.
+    assert_eq!(se.wall_ms, 1_000);
+}
+
+#[test]
+fn a_branchs_ledger_rows_count_from_its_own_fork_and_the_parents_do_not() {
+    let h = Home::new();
+    let (p, last) = parent(&h);
+    let mut b = h.fork(&p, last, "b");
+    b.turn(10_000, 2, "b");
+    b.request(10_100, 2, 4, "m/a");
+    b.usage(10_200, 10, 1);
+    b.end(10_300, None);
+    let b = b.done();
+    let ledger = Ledger::open(&h.data().join("ledger.sqlite")).unwrap();
+    for (id, usd) in [(&p.id, 5.0), (&b.id, 0.07)] {
+        ledger
+            .record(id, &ModelId::from("m/a"), &usage(10, 1), Some(usd))
+            .unwrap();
+    }
+    let cut = fork_cut(p.reader().header(), b.reader().header(), h.data()).unwrap();
+    assert_eq!(cut.offset, last);
+    let sb = summarize_at(&b.reader(), Some(&ledger), &catalog(), Some(cut.offset)).unwrap();
+    assert_eq!(sb.cost_usd, Some(0.07));
+    let sp = summarize_at(&p.reader(), Some(&ledger), &catalog(), Some(cut.offset)).unwrap();
+    assert_eq!(
+        sp.cost_usd,
+        Some(0.0),
+        "the parent's rows are before the cut"
+    );
+}
+
+#[test]
+fn an_undo_is_in_the_diff_stat_and_makes_the_last_test_stale() {
+    let h = Home::new();
+    let mut s = h.log(HeaderInit::default());
+    let ev = TestEvidence {
+        command: "cargo test".into(),
+        exit_code: Some(0),
+        passed: Some(1),
+        failed: Some(0),
+        step: 2,
+        write_gen: 1,
+        stale: false,
+        edits_since: 0,
+        execs_since: 0,
+    };
+    s.turn(1_000, 1, "one");
+    s.request(1_100, 1, 2, "m/a");
+    s.edit(1_150, 2, "u.txt", None, Some("a\nb\n"));
+    let end = s.end(1_200, Some(ev));
+    let from_blob = Some(s.blob(b"a\nb\n"));
+    s.at(
+        2_000,
+        SessionRecord::Undone {
+            turn: 1,
+            files: vec![tautly_core::record::UndoneFile {
+                path: rel("u.txt"),
+                from_blob,
+                from_mode: Some(0o644),
+                to: None,
+                to_mode: None,
+            }],
+            backup_ref: None,
+        },
+    );
+    let s = s.done();
+    let got = sum(&s.reader(), None);
+    assert!(got.files.contains("u.txt"));
+    // Created, then undone: no net change.
+    assert_eq!((got.added, got.removed), (0, 0));
+    assert!(
+        got.evidence.unwrap().stale,
+        "an undo changes files after the test"
+    );
+
+    // From the turn's end on, only the undo counts: the file goes away.
+    let only = at(&s.reader(), Some(end));
+    assert_eq!((only.added, only.removed), (0, 2), "{only:?}");
+}
+
+#[test]
+fn write_failures_count_and_commands_after_the_cut_are_noted() {
+    let h = Home::new();
+    let mut s = h.log(HeaderInit::default());
+    s.turn(1_000, 1, "go");
+    s.request(1_100, 1, 2, "m/a");
+    s.call(1_200, "w1", "write", true, false);
+    s.call(1_300, "e1", "edit", true, false);
+    s.exec(1_400, "x1");
+    s.exec(1_500, "x2");
+    s.end(1_600, None);
+    let s = s.done();
+    let got = sum(&s.reader(), None);
+    assert_eq!(got.edit_failures, 2);
+    assert!(
+        got.notes
+            .iter()
+            .any(|n| n.contains("2 commands") && n.contains("not counted")),
+        "{:?}",
+        got.notes
+    );
+}
+
+#[test]
+fn a_hostile_step_number_does_not_panic() {
+    let h = Home::new();
+    let mut s = h.log(HeaderInit::default());
+    s.turn(1_000, 1, "go");
+    s.request(1_100, 1, u32::MAX, "m/a");
+    s.turn(1_200, 2, "again");
+    s.end(1_300, None);
+    let s = s.done();
+    let got = sum(&s.reader(), Some(1));
+    assert_eq!(got.user_turns, 1);
+}
+
+#[test]
+fn an_unreadable_ancestor_log_falls_back_to_the_branch_copy() {
+    let h = Home::new();
+    let (a, ends) = three_turns(&h);
+    let b = h.fork(&a, ends[1], "b").done();
+    let d = h.fork(&a, ends[1], "d").done();
+    // A's first record no longer reads.
+    let text = std::fs::read_to_string(&a.path).unwrap();
+    let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
+    lines[1] = json!({"type": "record", "offset": 0, "t": 1,
+        "data": {"type": "turn_start", "data": {"turn": "bad"}}})
+    .to_string();
+    std::fs::write(&a.path, lines.join("\n") + "\n").unwrap();
+    assert_eq!(
+        fork_point(b.reader().header(), d.reader().header(), h.data()),
+        Some((a.id.clone(), 4))
     );
 }

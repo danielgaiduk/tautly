@@ -2,16 +2,18 @@
 //! Nothing here calls a provider or a tool, or reads a file outside the logs, their blob
 //! stores and the cost ledger.
 //!
-//! - **Fork point.** [`fork_point`] walks each session's parent chain (`Header.parent`:
+//! - **Fork point.** [`fork_cut`] walks each session's parent chain (`Header.parent`:
 //!   the parent and the offset of the last record the branch copied) to the nearest
-//!   session both chains hold, and takes the earlier of the two offsets they left it at,
-//!   as a step ([`step_at_offset`]). A parent whose log was deleted still has an id and an
-//!   offset in its branch's header, and its branch's log holds the copied records.
-//! - **Figures** ([`summarize`]) count the records after the fork point: the branch's own
-//!   `Forked` boundary when its header names that step, else the records from the first
-//!   step past it (as a rewind to that step would cut).
-//!   - Wall time is `Σ(TurnEnd.t − TurnStart.t)` over the turns that start after the cut
-//!     (a `SendMessage` is logged when it arrives, which may be while another turn runs).
+//!   session both chains hold. Copies keep their source's offsets, so what a session holds
+//!   of an ancestor ends at the smallest offset along its chain (a rewind into a copied
+//!   prefix copies less than its parent did). The fork point is the earlier of the two
+//!   sides' offsets ([`ForkPoint::offset`]): the same record in every log that holds it,
+//!   with its step read from the ancestor's log, else from a branch's copy. A parent whose
+//!   log was deleted still has an id and an offset in its branch's header.
+//! - **Figures** ([`summarize_at`]) count the records after the cut offset.
+//!   - Wall time is `Σ(TurnEnd.t − TurnStart.t)` (a `SendMessage` is logged when it
+//!     arrives, which may be while another turn runs); a turn open at the cut runs from
+//!     the first record after it.
 //!   - Steps are distinct `Request.step` values: a retry repeats its step.
 //!   - Cost: the cost ledger's rows of the session (discarded and estimated attempts
 //!     included) when the counted range is exactly the session's own records; otherwise,
@@ -21,7 +23,8 @@
 //!     unpriced models are marked.
 //!   - Files and the diff stat come from the `Edit` and `Undone` records after the cut:
 //!     each path's earliest content there against the last one a tool left, from the
-//!     log's blob store. Command effects are not in them.
+//!     log's blob store. What commands changed is not in the logs: a note counts the
+//!     commands after the cut that may have written files.
 //! - **Untrusted logs.** A path that is absolute, has a `..` or `.` component or a NUL
 //!   byte is left out (with one note), resolved under the session's own root only; ids
 //!   from headers must be plain session ids before they name a file; records of an
@@ -40,14 +43,14 @@ use crate::checkpoint::check_session;
 use crate::evidence::TestEvidence;
 use crate::ledger::Ledger;
 use crate::record::SessionRecord;
-use crate::timetravel::{StepCounter, Writes, befores, step_at_offset};
+use crate::timetravel::{StepCounter, Writes, befores, ran_command, step_at_offset};
 
 /// The most sessions one comparison takes.
 pub const MAX_SESSIONS: usize = 5;
 /// The longest parent chain followed.
 const MAX_DEPTH: usize = 64;
-/// The tool whose failures count as edit failures.
-const EDIT_TOOL: &str = "edit";
+/// The tools whose failures count as edit failures.
+const EDIT_TOOLS: [&str; 2] = ["edit", "write"];
 
 /// One session's figures, counted after its fork point (or over the whole session).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -134,10 +137,16 @@ fn chain(h: &Header, data_home: &Path) -> Vec<Link> {
     }];
     let mut seen = HashSet::from([h.session_id.clone()]);
     let mut next = h.parent.clone().map(|p| (p, h.project.clone()));
+    // What the chain's own session holds of each ancestor: a branch copies its parent's
+    // records verbatim (same offsets), so it holds an ancestor's only as far as every
+    // copy between them reached (a rewind into a copied prefix copies less).
+    let mut held: Option<u64> = None;
     while let Some(((id, offset), project)) = next.take() {
         if out.len() > MAX_DEPTH || check_session(&id).is_err() || !seen.insert(id.clone()) {
             break;
         }
+        let through = held.map_or(offset, |h| h.min(offset));
+        held = Some(through);
         let path = log_path(data_home, &project, &id);
         let header = path.as_deref().and_then(|p| header_of(p, &id));
         next = header
@@ -145,56 +154,91 @@ fn chain(h: &Header, data_home: &Path) -> Vec<Link> {
             .and_then(|h| h.parent.clone().map(|p| (p, h.project.clone())));
         out.push(Link {
             id,
-            through: Some(offset),
+            through: Some(through),
             log: header.and(path),
         });
     }
     out
 }
 
+/// Where two sessions branched apart.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForkPoint {
+    /// The nearest session both hold the records of.
+    pub session_id: String,
+    /// The step in force at `offset`.
+    pub step: u32,
+    /// The last record both share: the same record in every log that copied it.
+    pub offset: u64,
+}
+
 /// Where sessions `a` and `b` branched apart: the nearest session both descend from (or
-/// one of them, when the other descends from it) and the step at the earlier of the two
-/// points they left it. None when they share no ancestor, or are the same session.
-/// Parent logs are looked up under `data_home`. Blocking I/O (the logs).
-pub fn fork_point(a: &Header, b: &Header, data_home: &Path) -> Option<(String, u32)> {
+/// one of them, when the other descends from it) and the earlier of the two points they
+/// left it. None when they share no ancestor, are the same session, or no log can say
+/// which step that point is. Parent logs are looked up under `data_home`. Blocking I/O
+/// (the logs).
+pub fn fork_cut(a: &Header, b: &Header, data_home: &Path) -> Option<ForkPoint> {
     let (ca, cb) = (chain(a, data_home), chain(b, data_home));
     for (i, la) in ca.iter().enumerate() {
         let Some(j) = cb.iter().position(|lb| lb.id == la.id) else {
             continue;
         };
         let lb = &cb[j];
-        // The earlier cut, and the branch log that copied the session through it.
-        let (cut, copy) = match (la.through, lb.through) {
+        let offset = match (la.through, lb.through) {
             (None, None) => return None,
-            (Some(x), None) => (x, &ca[i - 1]),
-            (None, Some(y)) => (y, &cb[j - 1]),
-            (Some(x), Some(y)) if x <= y => (x, &ca[i - 1]),
-            (Some(_), Some(y)) => (y, &cb[j - 1]),
+            (x, y) => x.unwrap_or(u64::MAX).min(y.unwrap_or(u64::MAX)),
         };
-        let log = la.log.as_ref().or(copy.log.as_ref())?;
-        let reader = SessionReader::<SessionRecord>::open(log).ok()?;
-        return Some((la.id.clone(), step_at_offset(&reader, cut)));
+        // The ancestor's own log, else a branch log that copied it through `offset` (the
+        // link before it on either side holds it at least that far).
+        let mut logs = vec![la.log.as_ref()];
+        if i > 0 {
+            logs.push(ca[i - 1].log.as_ref());
+        }
+        if j > 0 {
+            logs.push(cb[j - 1].log.as_ref());
+        }
+        let step = logs
+            .into_iter()
+            .flatten()
+            .find_map(|log| step_through(log, offset))?;
+        return Some(ForkPoint {
+            session_id: la.id.clone(),
+            step,
+            offset,
+        });
+    }
+    None
+}
+
+/// [`fork_cut`]'s session and step.
+pub fn fork_point(a: &Header, b: &Header, data_home: &Path) -> Option<(String, u32)> {
+    fork_cut(a, b, data_home).map(|f| (f.session_id, f.step))
+}
+
+/// The step in force at record `offset` of the log at `log` (as [`step_at_offset`]
+/// counts it); none when the log cannot be read as far as that record.
+fn step_through(log: &Path, offset: u64) -> Option<u32> {
+    let reader = SessionReader::<SessionRecord>::open(log).ok()?;
+    let mut steps = StepCounter::default();
+    for rec in reader.records() {
+        let (at, rec) = rec.ok()?;
+        if at > offset {
+            break;
+        }
+        steps.see(&rec);
+        if at == offset {
+            return Some(steps.last);
+        }
     }
     None
 }
 
 // ------------------------------------------------------------------- figures
 
-/// Which records count.
-#[derive(Clone, Copy)]
-enum Cut {
-    /// All of them.
-    Whole,
-    /// Those after this offset (the session's own fork boundary).
-    Offset(u64),
-    /// Those from the first step past this one.
-    Step(u32),
-}
-
-/// The figures of `reader`'s session after step `from_step` of its lineage (none: the
-/// whole session), with cost from `ledger` when it covers exactly that range, else from
-/// the logged usage priced with `catalog` (`Config::effective_catalog`). Blocking I/O
-/// (the log, its blobs, the ledger).
+/// [`summarize_at`] from step `from_step` of the session's lineage (none: the whole
+/// session): cut at the session's own fork record when its header names that step, else
+/// before the first step past it (as a rewind to that step cuts). Comparisons should cut
+/// at [`ForkPoint::offset`] instead, which names the same record in every log.
 pub fn summarize(
     reader: &SessionReader<SessionRecord>,
     ledger: Option<&Ledger>,
@@ -203,41 +247,76 @@ pub fn summarize(
 ) -> Result<BranchSummary, CompareError> {
     let header = reader.header();
     let cut = match (from_step, &header.parent) {
-        (None, _) => Cut::Whole,
-        (Some(n), Some((_, off))) if step_at_offset(reader, *off) == n => Cut::Offset(*off),
-        (Some(n), _) => Cut::Step(n),
+        (None, _) => None,
+        (Some(n), Some((_, off))) if step_at_offset(reader, *off) == n => Some(*off),
+        (Some(n), _) => step_cut(reader, n)?,
     };
-    // The ledger holds a session's own requests: after its fork, or all of a root's.
+    summarize_at(reader, ledger, catalog, cut)
+}
+
+/// The offset of the last record before the first one of a step past `n` (none: that is
+/// the first record, so every record counts; the last record when no step is past `n`).
+fn step_cut(reader: &SessionReader<SessionRecord>, n: u32) -> Result<Option<u64>, CompareError> {
+    let mut steps = StepCounter::default();
+    let mut last = None;
+    for rec in reader.records() {
+        let (at, rec) = rec?;
+        steps.see(&rec);
+        let starts = matches!(
+            rec,
+            SessionRecord::TurnStart { .. } | SessionRecord::Request { .. }
+        );
+        if starts && steps.last > n {
+            return Ok(at.checked_sub(1));
+        }
+        last = Some(at);
+    }
+    Ok(last)
+}
+
+/// The figures of `reader`'s session after record `cut` (none: the whole session), with
+/// cost from `ledger` when it covers exactly that range (the session's own records: `cut`
+/// is its header's parent offset, or it has no parent and `cut` is none), else from the
+/// logged usage priced with `catalog` (`Config::effective_catalog`). A turn open at the
+/// cut counts its wall time from the first record after it. Blocking I/O (the log, its
+/// blobs, the ledger).
+pub fn summarize_at(
+    reader: &SessionReader<SessionRecord>,
+    ledger: Option<&Ledger>,
+    catalog: &Catalog,
+    cut: Option<u64>,
+) -> Result<BranchSummary, CompareError> {
+    let header = reader.header();
     let own_range = match cut {
-        Cut::Whole => header.parent.is_none(),
-        Cut::Offset(_) => true,
-        Cut::Step(_) => false,
+        None => header.parent.is_none(),
+        Some(c) => header.parent.as_ref().is_some_and(|(_, off)| *off == c),
     };
     let mut t = Tally::new(header);
-    let mut steps = StepCounter::default();
-    let mut counting = matches!(cut, Cut::Whole);
+    let mut counting = cut.is_none();
+    let mut open_turn = false;
     for entry in reader.entries() {
         let e = entry?;
         if let SessionRecord::Labeled { label } = &e.rec {
             t.label = Some(label.clone());
         }
-        steps.see(&e.rec);
-        if !counting {
-            counting = match cut {
-                Cut::Whole => true,
-                Cut::Offset(off) => e.offset > off,
-                Cut::Step(n) => {
-                    matches!(
-                        e.rec,
-                        SessionRecord::TurnStart { .. } | SessionRecord::Request { .. }
-                    ) && steps.last > n
-                }
-            };
+        if !counting && cut.is_some_and(|c| e.offset > c) {
+            counting = true;
+            if open_turn {
+                t.turn_start = Some(e.t_ms);
+            }
         }
         // Edits before the cut leave the kinds behind them; the next result clears them.
         let wrote = t.writes.see(&e.rec);
         if counting {
             t.see(e.t_ms, &e.rec, wrote);
+        } else {
+            match &e.rec {
+                SessionRecord::TurnStart { .. } => open_turn = true,
+                SessionRecord::TurnEnd { .. } => open_turn = false,
+                // A response after the cut is priced at its step's model.
+                SessionRecord::Request { model, .. } => t.model = Some(model.clone()),
+                _ => {}
+            }
         }
     }
     t.close_response();
@@ -274,6 +353,8 @@ struct Tally {
     /// Each path's last content a tool left (outer none: not known).
     last: BTreeMap<String, Option<Option<BlobRef>>>,
     unknown: u32,
+    /// Records after the cut that may have changed files no record names.
+    commands: u32,
 }
 
 impl Tally {
@@ -304,6 +385,7 @@ impl Tally {
             first: BTreeMap::new(),
             last: BTreeMap::new(),
             unknown: 0,
+            commands: 0,
         }
     }
 
@@ -383,7 +465,15 @@ impl Tally {
             } => {
                 self.tool_calls += u32::from(*ran);
                 self.blocked += u32::from(*blocked);
-                if *is_error && self.calls.get(id).is_some_and(|n| n == EDIT_TOOL) {
+                if ran_command(rec) {
+                    self.commands += 1;
+                }
+                if *is_error
+                    && self
+                        .calls
+                        .get(id)
+                        .is_some_and(|n| EDIT_TOOLS.contains(&n.as_str()))
+                {
                     self.edit_failures += 1;
                 }
                 for e in effects {
@@ -401,9 +491,8 @@ impl Tally {
             }
             SessionRecord::Edit { asserted: true, .. } => {}
             rec @ (SessionRecord::Edit { .. } | SessionRecord::Undone { .. }) => {
-                if matches!(rec, SessionRecord::Edit { .. }) {
-                    self.edits_after_test += 1;
-                }
+                // An undo changes files too: a test before it no longer holds.
+                self.edits_after_test += 1;
                 for (path, before) in befores(rec) {
                     if let Some(p) = self.path(&path) {
                         self.first.entry(p.clone()).or_insert(before);
@@ -417,6 +506,7 @@ impl Tally {
                 }
             }
             SessionRecord::Unknown => self.unknown += 1,
+            rec @ SessionRecord::WritesLost { .. } if ran_command(rec) => self.commands += 1,
             _ => {}
         }
     }
@@ -445,6 +535,15 @@ impl Tally {
                 "{n} record{} written by a newer version {} skipped",
                 plural(n),
                 if n == 1 { "was" } else { "were" }
+            ));
+        }
+        if self.commands > 0 {
+            let n = self.commands as usize;
+            notes.push(format!(
+                "{n} command{} that may have changed files ran; what {} changed is not \
+                 counted in the files or the diff",
+                plural(n),
+                if n == 1 { "it" } else { "they" }
             ));
         }
         let (added, removed) = self.diff_stat(reader, &mut notes);
@@ -537,16 +636,24 @@ impl Tally {
                 .transpose()
                 .map_err(|_| ())
         };
-        let mut changes = Vec::new();
+        let (mut added, mut removed) = (0u32, 0u32);
         let (mut unknown, mut unreadable) = (0usize, 0usize);
+        // One file at a time, so only its two contents are held.
         for (path, before) in &self.first {
             let Some(Some(after)) = self.last.get(path) else {
                 unknown += 1;
                 continue;
             };
-            match (read(before), read(after)) {
-                (Ok(b), Ok(a)) => changes.push((PathBuf::from(path), b, a)),
-                _ => unreadable += 1,
+            let (Ok(b), Ok(a)) = (read(before), read(after)) else {
+                unreadable += 1;
+                continue;
+            };
+            let change: FileChange<'_> = (PathBuf::from(path), b.as_deref(), a.as_deref());
+            // Only the counts are wanted: no diff text is kept.
+            let (_, counts) = diff_files(&[change], 0, 0);
+            for c in counts {
+                added = added.saturating_add(c.added);
+                removed = removed.saturating_add(c.removed);
             }
         }
         if unknown > 0 {
@@ -565,15 +672,7 @@ impl Tally {
                 if unreadable == 1 { "its" } else { "their" }
             ));
         }
-        let refs: Vec<FileChange<'_>> = changes
-            .iter()
-            .map(|(p, b, a)| (p.clone(), b.as_deref(), a.as_deref()))
-            .collect();
-        // Only the counts are wanted: no diff text is kept.
-        let (_, counts) = diff_files(&refs, 0, 0);
-        counts.iter().fold((0u32, 0u32), |(a, r), c| {
-            (a.saturating_add(c.added), r.saturating_add(c.removed))
-        })
+        (added, removed)
     }
 }
 

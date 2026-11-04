@@ -25,6 +25,7 @@ expression: "redact(&serde_json::to_string_pretty(&v).unwrap(), &t)"
     }
   ],
   "fork_point": {
+    "offset": 4,
     "session_id": "<p>",
     "step": 2
   },

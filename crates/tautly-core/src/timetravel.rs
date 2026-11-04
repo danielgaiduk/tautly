@@ -224,7 +224,7 @@ impl StepCounter {
     pub fn see(&mut self, rec: &SessionRecord) -> Option<(u32, u32)> {
         match rec {
             SessionRecord::TurnStart { turn, .. } => {
-                self.last += 1;
+                self.last = self.last.saturating_add(1);
                 self.open = None;
                 Some((self.last, *turn))
             }
@@ -463,7 +463,7 @@ impl Writes {
 }
 
 /// A record that may have changed files no record names: a command ran.
-fn ran_command(rec: &SessionRecord) -> bool {
+pub(crate) fn ran_command(rec: &SessionRecord) -> bool {
     match rec {
         SessionRecord::ToolResult { effects, .. } => effects.iter().any(|e| {
             matches!(

@@ -6,17 +6,21 @@
 //! The text form prints one column per session (its label, or the shortest prefix of its
 //! id that tells the sessions apart): models, user turns and steps, tokens, cost, wall
 //! time, tool calls, blocked calls, edit failures, the last test run (never its command,
-//! which may name paths), files touched and the net diff stat; then the fork point, a
-//! files table (`only <x>`, `both`/`all`, or the sessions that touched it) and the notes.
-//! Everything a log supplies is escaped. `--json` prints one object: `fork_point`
-//! (`{session_id, step}` or null), `sessions` (each session's figures) and `files`
-//! (`{path, sessions}`).
+//! which may name paths), files touched and the net diff stat (tool edits only: what
+//! commands changed is not in the logs, and a session's notes count the commands that may
+//! have written files); then the fork point, a files table (`only <x>`, `both`/`all`, or
+//! the sessions that touched it) and the notes. Two sessions with one label are told apart
+//! by an id prefix. Everything a log supplies is escaped. `--json` prints one object:
+//! `fork_point` (`{session_id, step, offset}` or null), `sessions` (each session's
+//! figures, notes included) and `files` (`{path, sessions}`).
 
 use std::collections::HashSet;
 
 use anyhow::{Context as _, bail};
 use serde_json::json;
-use tautly_core::compare::{BranchSummary, MAX_SESSIONS, files_table, fork_point, summarize};
+use tautly_core::compare::{
+    BranchSummary, ForkPoint, MAX_SESSIONS, files_table, fork_cut, summarize_at,
+};
 use tautly_core::{Catalog, CliOverrides, Config, SessionReader, SessionRecord, printable};
 
 use super::receipt::last_test;
@@ -75,11 +79,15 @@ pub fn run(args: Args, env: &Env) -> anyhow::Result<i32> {
         }
     };
     let fork = common_fork_point(&readers, env);
-    let from_step = fork.as_ref().map(|(_, step)| *step);
+    let cut = fork.as_ref().map(|f| f.offset);
     let summaries = readers
         .iter()
-        .map(|r| summarize(r, ledger.as_ref(), &catalog, from_step))
-        .collect::<Result<Vec<_>, _>>()?;
+        .zip(&found)
+        .map(|(r, s)| {
+            summarize_at(r, ledger.as_ref(), &catalog, cut)
+                .with_context(|| format!("session {}", printable(&s.id)))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
     let files = files_table(&summaries);
     if args.json {
         let files: Vec<_> = files
@@ -92,7 +100,7 @@ pub fn run(args: Args, env: &Env) -> anyhow::Result<i32> {
             })
             .collect();
         let out = json!({
-            "fork_point": fork.as_ref().map(|(id, step)| json!({"session_id": id, "step": step})),
+            "fork_point": fork,
             "sessions": summaries,
             "files": files,
         });
@@ -103,14 +111,15 @@ pub fn run(args: Args, env: &Env) -> anyhow::Result<i32> {
     Ok(0)
 }
 
-/// The fork point all the sessions share: the first one's with each other one, all of the
-/// same lineage, so the earliest of them is the common one. None when any pair has none.
-fn common_fork_point(readers: &[SessionReader<SessionRecord>], env: &Env) -> Option<(String, u32)> {
+/// The fork point all the sessions share: the first one's with each other one. Every one
+/// lies on the first session's own chain, so the earliest (smallest offset) is the point
+/// all of them hold. None when any pair has none: whole sessions are compared.
+fn common_fork_point(readers: &[SessionReader<SessionRecord>], env: &Env) -> Option<ForkPoint> {
     let (first, rest) = readers.split_first()?;
-    let mut common: Option<(String, u32)> = None;
+    let mut common: Option<ForkPoint> = None;
     for r in rest {
-        let fp = fork_point(first.header(), r.header(), &env.data_home)?;
-        if common.as_ref().is_none_or(|c| fp.1 < c.1) {
+        let fp = fork_cut(first.header(), r.header(), &env.data_home)?;
+        if common.as_ref().is_none_or(|c| fp.offset < c.offset) {
             common = Some(fp);
         }
     }
@@ -118,23 +127,34 @@ fn common_fork_point(readers: &[SessionReader<SessionRecord>], env: &Env) -> Opt
 }
 
 /// Each session's column name: its label, else the shortest prefix of its id (at least
-/// eight characters) that no other compared session's id starts with.
+/// eight characters) that no other compared session's id starts with. A label two
+/// sessions share is followed by that prefix.
 fn names(summaries: &[BranchSummary]) -> Vec<String> {
     let ids: Vec<&str> = summaries.iter().map(|s| s.session_id.as_str()).collect();
+    let short = |s: &BranchSummary| {
+        // By characters: an id read from a log may be any text.
+        let id: Vec<char> = s.session_id.chars().collect();
+        let prefix = |n: usize| id.iter().take(n).collect::<String>();
+        let short = (8..id.len())
+            .map(prefix)
+            .find(|p| ids.iter().filter(|o| o.starts_with(p.as_str())).count() == 1)
+            .unwrap_or_else(|| s.session_id.clone());
+        printable(&short)
+    };
     summaries
         .iter()
         .map(|s| match &s.label {
-            Some(l) => printable(l),
-            None => {
-                // By characters: an id read from a log may be any text.
-                let id: Vec<char> = s.session_id.chars().collect();
-                let prefix = |n: usize| id.iter().take(n).collect::<String>();
-                let short = (8..id.len())
-                    .map(prefix)
-                    .find(|p| ids.iter().filter(|o| o.starts_with(p.as_str())).count() == 1)
-                    .unwrap_or_else(|| s.session_id.clone());
-                printable(&short)
+            Some(l)
+                if summaries
+                    .iter()
+                    .filter(|o| o.label.as_ref() == Some(l))
+                    .count()
+                    > 1 =>
+            {
+                format!("{} ({})", printable(l), short(s))
             }
+            Some(l) => printable(l),
+            None => short(s),
         })
         .collect()
 }
@@ -142,7 +162,7 @@ fn names(summaries: &[BranchSummary]) -> Vec<String> {
 /// The text form.
 fn text(
     summaries: &[BranchSummary],
-    fork: Option<&(String, u32)>,
+    fork: Option<&ForkPoint>,
     files: &[(String, Vec<usize>)],
 ) -> String {
     let names = names(summaries);
@@ -208,12 +228,16 @@ fn text(
     }
     out.push('\n');
     match fork {
-        Some((id, step)) => out.push_str(&format!(
-            "figures count from the fork point: session {} at step {step}\n",
-            printable(id)
+        Some(f) => out.push_str(&format!(
+            "figures count from the fork point: session {} at step {}\n",
+            printable(&f.session_id),
+            f.step
         )),
         None => out.push_str("no common fork point: the figures cover whole sessions\n"),
     }
+    out.push_str(
+        "files and diff count tool edits only; changes made by commands are not in the logs\n",
+    );
     if summaries.iter().any(|s| s.cost_estimated) {
         out.push_str("(est.): some usage is the engine's estimate\n");
     }
