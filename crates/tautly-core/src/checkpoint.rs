@@ -1029,7 +1029,7 @@ impl Checkpointer {
         cfg: CheckpointConfig,
     ) -> Option<Checkpointer> {
         let git_dir = git_dir(&root)?;
-        let program = git_on_path()?;
+        let program = git_on_path(&root)?;
         let tmp = tempfile::Builder::new()
             .prefix("tautly-checkpoint-")
             .tempdir()
@@ -1758,12 +1758,29 @@ fn plain_relative(p: &Path) -> bool {
         .all(|c| matches!(c, std::path::Component::Normal(_)))
 }
 
-/// The first executable `git` on `PATH`.
-pub(crate) fn git_on_path() -> Option<PathBuf> {
+/// The first executable `git` on `PATH` for the work tree at `root` (see
+/// [`git_on_path_from`]).
+pub(crate) fn git_on_path(root: &Path) -> Option<PathBuf> {
+    git_on_path_from(&std::env::var_os("PATH")?, root)
+}
+
+/// The first executable `git` in the directories of `path` (a `PATH` value) that the
+/// repository cannot have put there. Skipped: an empty or relative entry (git runs with
+/// the root as its working directory, so `bin` or an empty entry would name a git the
+/// repository ships), and an entry inside the root, by name or once links are resolved,
+/// as is a candidate that resolves into it. The git found is returned resolved, so the
+/// path that is run is the one checked.
+fn git_on_path_from(path: &std::ffi::OsStr, root: &Path) -> Option<PathBuf> {
     use std::os::unix::fs::PermissionsExt;
-    let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path)
-        .map(|dir| dir.join("git"))
+    let real_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let inside = |p: &Path| p.starts_with(root) || p.starts_with(&real_root);
+    std::env::split_paths(path)
+        .filter(|dir| dir.is_absolute() && !inside(dir))
+        .filter_map(|dir| {
+            let real_dir = dir.canonicalize().ok()?;
+            let git = real_dir.join("git").canonicalize().ok()?;
+            (!inside(&real_dir) && !inside(&git)).then_some(git)
+        })
         .find(|p| {
             std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
         })
@@ -1799,7 +1816,7 @@ async fn with_plain_git<T>(
     root: &Path,
     f: impl AsyncFnOnce(&Git<'_>) -> Result<T, CheckpointError>,
 ) -> Result<T, CheckpointError> {
-    let program = git_on_path().ok_or(CheckpointError::NoGit)?;
+    let program = git_on_path(root).ok_or(CheckpointError::NoGit)?;
     let git_dir = git_dir(root).ok_or_else(|| {
         CheckpointError::Invalid(format!("{} is not a git work tree", root.display()))
     })?;
@@ -2178,6 +2195,58 @@ mod tests {
         assert_eq!(git_dir(dir.path()), Some(PathBuf::from("/abs/repo.git")));
         std::fs::write(dir.path().join(".git"), "not a pointer\n").unwrap();
         assert_eq!(git_dir(dir.path()), None);
+    }
+
+    /// An executable script at `path` that prints `name`.
+    fn fake_git(path: &Path, name: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, format!("#!/bin/sh\necho {name}\n")).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[test]
+    fn git_on_path_skips_relative_entries_and_the_work_tree() {
+        let top = tempfile::tempdir().unwrap();
+        let top = top.path().canonicalize().unwrap();
+        let root = top.join("repo");
+        fake_git(&root.join("git"), "repo-top");
+        fake_git(&root.join("bin/git"), "repo-bin");
+        fake_git(&root.join("node_modules/.bin/git"), "repo-node");
+        let outside = top.join("tools");
+        fake_git(&outside.join("git"), "outside");
+        // The repository's directories named relative to this process's working
+        // directory: a relative entry is found there, and git then runs with the root as
+        // its working directory (probe P1).
+        let cwd = std::env::current_dir().unwrap().canonicalize().unwrap();
+        let up = "../".repeat(cwd.components().count() - 1);
+        let rel = |p: &Path| format!("{up}{}", p.strip_prefix("/").unwrap().display());
+        assert!(Path::new(&rel(&root.join("bin"))).join("git").is_file());
+        std::os::unix::fs::symlink(&outside, root.join("linked")).unwrap();
+        let o = outside.display();
+        for path in [
+            // An empty entry is the working directory: the root, for git (probe P1b).
+            format!(":{o}"),
+            format!("{}:{o}", rel(&root.join("bin"))),
+            format!("bin:node_modules/.bin:{o}"),
+            format!(
+                "{}:{}:{}:{o}",
+                root.display(),
+                root.join("bin").display(),
+                root.join("node_modules/.bin").display(),
+            ),
+            format!("{}/./bin:{o}", root.display()),
+            format!("{}/../bin:{o}", root.join("node_modules").display()),
+        ] {
+            let found = git_on_path_from(std::ffi::OsStr::new(&path), &root);
+            assert_eq!(found, Some(outside.join("git")), "PATH={path}");
+        }
+        // Only the repository's gits: none.
+        let path = format!(":bin:{}", root.join("bin").display());
+        assert_eq!(git_on_path_from(std::ffi::OsStr::new(&path), &root), None);
+        // A directory reached through a link inside the root is the repository's too.
+        let path = root.join("linked");
+        assert_eq!(git_on_path_from(path.as_os_str(), &root), None);
     }
 
     fn git(root: &Path, args: &[&str]) {

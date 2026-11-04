@@ -284,7 +284,7 @@ impl EngineBuilder {
             StartCheckpoint::Idle
         } else if checkpoint::dot_git_is_link(&root) {
             StartCheckpoint::Skipped(Skip::GitDirSymlink)
-        } else if checkpoint::git_dir(&root).is_some() && checkpoint::git_on_path().is_none() {
+        } else if checkpoint::git_dir(&root).is_some() && checkpoint::git_on_path(&root).is_none() {
             StartCheckpoint::Skipped(Skip::NoGit)
         } else {
             StartCheckpoint::Idle
