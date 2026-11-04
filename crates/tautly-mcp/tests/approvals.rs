@@ -378,6 +378,31 @@ fn launch_shapes_key_the_code_they_run() {
         ("justfile", stdio("just", &["mcp"], &[])),
         ("deno.json", stdio("deno", &["task", "mcp"], &[])),
         ("bin/srv.js", stdio("node", &["--import=./bin/srv.js"], &[])),
+        // Review S2-M1: combined option letters ending in `m`, and parent packages.
+        ("tool.py", stdio("python3", &["-um", "tool"], &[])),
+        ("tool.py", stdio("python3", &["-Im", "tool"], &[])),
+        ("tool.py", stdio("python3", &["-umtool"], &[])),
+        ("pq/__init__.py", stdio("python3", &["-m", "pq.sub"], &[])),
+        (
+            "pq/sub/__init__.py",
+            stdio("python3", &["-m", "pq.sub.x"], &[]),
+        ),
+        // Review S2-M2: a runner anywhere in the command line.
+        ("package.json", stdio("sh", &["-c", "npm run mcp"], &[])),
+        (
+            "package.json",
+            stdio("/usr/bin/env", &["npm", "run", "mcp"], &[]),
+        ),
+        // Review S2-M3: the files a runner prefers or is configured by.
+        ("GNUmakefile", stdio("make", &["serve"], &[])),
+        ("makefile", stdio("make", &["serve"], &[])),
+        ("Justfile", stdio("just", &["mcp"], &[])),
+        (".justfile", stdio("just", &["mcp"], &[])),
+        (".npmrc", stdio("npm", &["run", "mcp"], &[])),
+        (".yarnrc.yml", stdio("yarn", &["mcp"], &[])),
+        ("bunfig.toml", stdio("bun", &["run", "mcp"], &[])),
+        (".cargo/config.toml", stdio("cargo", &["run"], &[])),
+        ("deno.jsonc", stdio("deno", &["task", "mcp"], &[])),
     ];
     for (file, spec) in &cases {
         write(file, "v1");
@@ -418,4 +443,16 @@ fn launch_shapes_key_the_code_they_run() {
     std::os::unix::fs::symlink("/etc/passwd", repo.join("dist/link")).unwrap();
     assert_ne!(before, k(&spec));
     assert!(approval_key(&repo, "s", &spec).rememberable);
+
+    // Review S2-M5: names and link targets may hold newlines; two different trees must
+    // not encode alike (a re-pointed link plus a renamed file).
+    std::fs::remove_file(repo.join("dist/link")).unwrap();
+    std::os::unix::fs::symlink("evil.js\nm", repo.join("dist/lib.js")).unwrap();
+    write("dist/m", "same");
+    let a = k(&spec);
+    std::fs::remove_file(repo.join("dist/lib.js")).unwrap();
+    std::fs::remove_file(repo.join("dist/m")).unwrap();
+    std::os::unix::fs::symlink("evil.js", repo.join("dist/lib.js")).unwrap();
+    write("dist/m\nm", "same");
+    assert_ne!(a, k(&spec));
 }

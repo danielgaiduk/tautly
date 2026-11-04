@@ -12,7 +12,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 const MAX_FILE: u64 = 1024 * 1024;
 /// Most bytes of files read for one key.
 const MAX_TOTAL: u64 = 8 * 1024 * 1024;
-/// Most files read for one key (directories walked included).
+/// Most entries read for one key: files, and the directories walked.
 const MAX_FILES: u32 = 4000;
 /// Directory names never walked: version control, dependencies, build output, caches.
 const SKIPPED_DIRS: &[&str] = &[".git", "node_modules", "target", ".venv", "__pycache__"];
@@ -20,15 +20,29 @@ const SKIPPED_DIRS: &[&str] = &[".git", "node_modules", "target", ".venv", "__py
 const RUNNERS: &[&str] = &[
     "npm", "npx", "pnpm", "yarn", "bun", "uv", "uvx", "poetry", "make", "cargo", "just", "deno",
 ];
-/// The manifests a runner reads from its working directory.
+/// The manifests a runner reads from its working directory, the files it prefers over
+/// them (`GNUmakefile`, `makefile`, `Justfile`, `.justfile`) and its configuration there
+/// (`.npmrc`, `.yarnrc.yml`, `bunfig.toml`, `.cargo/config.toml`), which can redirect
+/// what runs.
 const MANIFESTS: &[&str] = &[
     "package.json",
     "pyproject.toml",
+    "GNUmakefile",
+    "makefile",
     "Makefile",
     "justfile",
+    "Justfile",
+    ".justfile",
     "Cargo.toml",
     "deno.json",
+    "deno.jsonc",
+    ".npmrc",
+    ".yarnrc.yml",
+    "bunfig.toml",
+    ".cargo/config.toml",
 ];
+/// Python options without a value, which may precede `m` in one token (`-um`, `-Im`).
+const PYTHON_FLAGS: &str = "bBdEhiIOqsSuvx";
 /// Characters a shell splits words on (besides whitespace), and quotes.
 const SHELL_SPLIT: &[char] = &[';', '&', '|', '(', ')', '<', '>', '\'', '"', '`'];
 
@@ -36,22 +50,23 @@ const SHELL_SPLIT: &[char] = &[';', '&', '|', '(', ')', '<', '>', '\'', '"', '`'
 /// relative paths taken against `base` (the server's working directory). Candidates:
 ///
 /// - every word (the command included), and every token of it split on whitespace and
-///   shell metacharacters (`;&|()<>`, quotes), which covers `sh -c "cd srv && node
-///   main.js"`;
+///   shell metacharacters (`;&|()<>`, quotes, backticks), which covers `sh -c "cd srv &&
+///   node main.js"`;
 /// - the value after a token's first `=` (`--require=./x.js`), and what follows a
 ///   one-letter flag (`-r./pre.js`);
-/// - for `-m <mod>` (and `-m<mod>`), `<mod>` with `.` as `/`, as a directory and as
-///   `<mod>.py`;
-/// - when the command is a runner (npm, npx, pnpm, yarn, bun, uv, uvx, poetry, make,
-///   cargo, just, deno), the manifests in the working directory (package.json,
-///   pyproject.toml, Makefile, justfile, Cargo.toml, deno.json).
+/// - for `-m <mod>` (also `-m<mod>`, and option letters ending in `m` such as `-um <mod>`),
+///   `<mod>` with `.` as `/`, as a directory, `<mod>.py` and `<mod>.pyc`, and the
+///   `__init__.py` (`.pyc`) of every parent package;
+/// - when any token is a runner (npm, npx, pnpm, yarn, bun, uv, uvx, poetry, make, cargo,
+///   just, deno; by basename, so `/usr/bin/env npm` and `sh -c "npm run x"` count), the
+///   [`MANIFESTS`] in the working directory that exist.
 ///
 /// A candidate inside the root (by name or once links are resolved) adds an entry: the
 /// blake3 of a regular file; the recursive content of a directory (names, link targets,
 /// file hashes; `.git`, `node_modules`, `target`, `.venv`, `__pycache__` and tautly's
 /// `.tautly/tmp` skipped, links never followed); the resolved path of a link leading out
 /// of the root; or `missing`. Bounds: [`MAX_FILE`] per file, [`MAX_TOTAL`] and
-/// [`MAX_FILES`] per key. Content that cannot be hashed (over a bound, unreadable, a FIFO)
+/// [`MAX_FILES`] entries per key. Content that cannot be hashed (over a bound, unreadable, a FIFO)
 /// gets a value no other call produces and clears `rememberable`, so the server is asked
 /// about at every start. Candidates outside the root add nothing.
 pub(crate) fn files_named(
@@ -105,34 +120,36 @@ pub(crate) fn files_named(
 /// `(word index, candidate path)` for every candidate of `argv` (see [`files_named`]).
 fn candidates(argv: &[&String], base: &Path) -> Vec<(usize, String)> {
     let mut out = Vec::new();
+    let mut runner = false;
     for (i, word) in argv.iter().enumerate() {
         let tokens = std::iter::once(word.as_str()).chain(
             word.split(|c: char| c.is_whitespace() || SHELL_SPLIT.contains(&c))
                 .filter(|t| !t.is_empty() && *t != word.as_str()),
         );
         for token in tokens {
+            runner |= Path::new(token)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| RUNNERS.contains(&n));
             out.push((i, token.to_string()));
             if let Some((_, value)) = token.split_once('=') {
                 out.push((i, value.to_string()));
             }
             if let Some(rest) = short_flag_value(token) {
                 out.push((i, rest.to_string()));
-                if token.starts_with("-m") {
-                    module_paths(i, rest, &mut out);
+            }
+            match python_module_flag(token) {
+                Some(Some(module)) => module_paths(i, module, &mut out),
+                Some(None) => {
+                    if let Some(module) = argv.get(i + 1) {
+                        module_paths(i + 1, module, &mut out);
+                    }
                 }
+                None => {}
             }
         }
-        if *word == "-m"
-            && let Some(module) = argv.get(i + 1)
-        {
-            module_paths(i + 1, module, &mut out);
-        }
     }
-    let command = argv
-        .first()
-        .and_then(|c| Path::new(c.as_str()).file_name())
-        .and_then(|n| n.to_str());
-    if command.is_some_and(|c| RUNNERS.contains(&c)) {
+    if runner {
         for m in MANIFESTS {
             if base.join(m).symlink_metadata().is_ok() {
                 out.push((0, (*m).to_string()));
@@ -152,7 +169,20 @@ fn short_flag_value(token: &str) -> Option<&str> {
     (flag.is_ascii_alphabetic() && !value.is_empty()).then_some(value)
 }
 
-/// `module` (`a.b`) as the directory `a/b` and the files `a/b.py` and `a/b.pyc`.
+/// Python's `-m` in a token: `Some(None)` when the module is the next word (`-m`, `-um`,
+/// `-Im`), `Some(Some(mod))` when attached (`-mtool`, `-umtool`); none otherwise.
+fn python_module_flag(token: &str) -> Option<Option<&str>> {
+    let letters = token.strip_prefix('-')?;
+    if letters.starts_with('-') {
+        return None;
+    }
+    let flags = letters.trim_start_matches(|c| PYTHON_FLAGS.contains(c));
+    let module = flags.strip_prefix('m')?;
+    Some((!module.is_empty()).then_some(module))
+}
+
+/// `module` (`a.b`) as the directory `a/b` and the files `a/b.py` and `a/b.pyc`, with the
+/// `__init__.py` (and `.pyc`) of each parent package (`a/__init__.py`), which runs first.
 fn module_paths(word: usize, module: &str, out: &mut Vec<(usize, String)>) {
     let path = module.replace('.', "/");
     if path.is_empty() {
@@ -161,6 +191,12 @@ fn module_paths(word: usize, module: &str, out: &mut Vec<(usize, String)>) {
     out.push((word, format!("{path}.py")));
     // A sourceless module: bytecode imported where no source is.
     out.push((word, format!("{path}.pyc")));
+    let parts: Vec<&str> = path.split('/').collect();
+    for n in 1..parts.len() {
+        let parent = parts[..n].join("/");
+        out.push((word, format!("{parent}/__init__.py")));
+        out.push((word, format!("{parent}/__init__.pyc")));
+    }
     out.push((word, path));
 }
 
@@ -194,53 +230,58 @@ fn hash_file(path: &Path, budget: &mut Budget) -> Option<String> {
 }
 
 /// The blake3 hex of the directory `dir`'s content: every entry's path relative to it,
-/// in name order, with a file's hash, a link's target (never followed) or a nested
-/// directory's entries (an empty directory adds nothing). [`SKIPPED_DIRS`] and
-/// `<root>/.tautly/tmp` are left out. None when a bound is exceeded or something cannot be
-/// read or hashed.
+/// in name order, with a file's hash or a link's target (never followed), each field
+/// length-prefixed so no two trees encode alike (names and targets may hold newlines);
+/// an empty directory adds nothing. [`SKIPPED_DIRS`] and `<root>/.tautly/tmp` are left
+/// out. Walked without recursion, so depth costs no stack; a directory with more entries
+/// than the budget left is refused before its names are all collected. None when a bound
+/// is exceeded or something cannot be read or hashed.
 fn hash_dir(root: &Path, dir: &Path, budget: &mut Budget) -> Option<String> {
-    let mut hasher = blake3::Hasher::new();
-    walk(root, dir, Path::new(""), &mut hasher, budget)?;
-    Some(hasher.finalize().to_hex().to_string())
-}
-
-fn walk(
-    root: &Path,
-    dir: &Path,
-    rel: &Path,
-    hasher: &mut blake3::Hasher,
-    budget: &mut Budget,
-) -> Option<()> {
+    use std::os::unix::ffi::OsStrExt;
     let scratch = root.join(".tautly").join("tmp");
-    let mut names: Vec<_> = std::fs::read_dir(dir)
-        .ok()?
-        .map(|e| e.map(|e| e.file_name()))
-        .collect::<Result<_, _>>()
-        .ok()?;
-    names.sort();
-    for name in names {
-        let path = dir.join(&name);
-        let meta = path.symlink_metadata().ok()?;
-        let kind = meta.file_type();
-        if kind.is_dir() && (SKIPPED_DIRS.iter().any(|s| name == *s) || path == scratch) {
-            continue;
+    let mut hasher = blake3::Hasher::new();
+    let field = |hasher: &mut blake3::Hasher, bytes: &[u8]| {
+        hasher.update(&(bytes.len() as u64).to_le_bytes());
+        hasher.update(bytes);
+    };
+    // Directories still to read, deepest-first in name order: (absolute, relative).
+    let mut pending: Vec<(PathBuf, PathBuf)> = vec![(dir.to_path_buf(), PathBuf::new())];
+    while let Some((dir, rel)) = pending.pop() {
+        let mut names = Vec::new();
+        for entry in std::fs::read_dir(&dir).ok()? {
+            if names.len() as u64 >= u64::from(budget.files) {
+                return None;
+            }
+            names.push(entry.ok()?.file_name());
         }
-        let entry = rel.join(&name);
-        let line = if kind.is_symlink() {
-            format!(
-                "link\0{}",
-                std::fs::read_link(&path).ok()?.to_string_lossy()
-            )
-        } else if kind.is_dir() {
-            budget.files = budget.files.checked_sub(1)?;
-            walk(root, &path, &entry, hasher, budget)?;
-            continue;
-        } else {
-            format!("file\0{}", hash_file(&path, budget)?)
-        };
-        hasher.update(format!("{}\0{line}\n", entry.to_string_lossy()).as_bytes());
+        names.sort();
+        let mut subdirs = Vec::new();
+        for name in names {
+            let path = dir.join(&name);
+            let kind = path.symlink_metadata().ok()?.file_type();
+            let entry = rel.join(&name);
+            if kind.is_dir() {
+                if SKIPPED_DIRS.iter().any(|s| name == *s) || path == scratch {
+                    continue;
+                }
+                budget.files = budget.files.checked_sub(1)?;
+                subdirs.push((path, entry));
+                continue;
+            }
+            let (tag, value): (&[u8], Vec<u8>) = if kind.is_symlink() {
+                let target = std::fs::read_link(&path).ok()?;
+                (b"link", target.as_os_str().as_bytes().to_vec())
+            } else {
+                (b"file", hash_file(&path, budget)?.into_bytes())
+            };
+            field(&mut hasher, entry.as_os_str().as_bytes());
+            field(&mut hasher, tag);
+            field(&mut hasher, &value);
+        }
+        // Popped in name order: the first subdirectory last.
+        pending.extend(subdirs.into_iter().rev());
     }
-    Some(())
+    Some(hasher.finalize().to_hex().to_string())
 }
 
 /// `path` with `.` and `..` components resolved by name (no links followed).
