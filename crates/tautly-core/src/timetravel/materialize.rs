@@ -10,8 +10,14 @@ use tautly_session::{BlobRef, RelPath, SessionReader};
 
 use super::{FileState, TtError};
 use crate::checkpoint::{self, Checkpointer};
-use crate::record::{BackupFile, SessionRecord};
+use crate::record::{BackupFile, SessionRecord, Wrote};
 use crate::undo::{Disk, MAX_DISK_READ, UndoLog, read_disk};
+
+/// Why a path is blocked (never written).
+const WHY_LINK: &str = "a symbolic link or a file is above it (a write would land elsewhere)";
+const WHY_DIR: &str = "a directory is in the way";
+const WHY_UNKEPT: &str =
+    "the git snapshot cannot hold it and its content cannot be kept (a link, or over 64 MiB)";
 
 /// The note of a materialize with git checkpoints.
 const NOTE_GIT: &str = "ignored files and submodules are not restored";
@@ -210,7 +216,7 @@ fn by_path(
 /// Why `rel`'s parent chain cannot be written through: a component above it is a symbolic
 /// link or not a directory (a write would land elsewhere, or git would replace it). Missing
 /// components are fine (they are created).
-fn parent_in_the_way(root: &Path, rel: &Path) -> bool {
+pub(crate) fn parent_in_the_way(root: &Path, rel: &Path) -> bool {
     let mut at = root.to_path_buf();
     let Some(parent) = rel.parent() else {
         return false;
@@ -481,7 +487,7 @@ pub(crate) async fn materialize_inner(
             // Nothing below a link or a file is this tree's; writing there would land
             // elsewhere (or replace the link).
             if want != Val::Absent {
-                blocked.push(rel);
+                blocked.push((rel, WHY_LINK));
             }
             continue;
         }
@@ -493,7 +499,7 @@ pub(crate) async fn materialize_inner(
         if now == Val::Other {
             // A directory is never removed, and never written over.
             if want != Val::Absent {
-                blocked.push(rel);
+                blocked.push((rel, WHY_DIR));
             }
             continue;
         }
@@ -537,18 +543,22 @@ pub(crate) async fn materialize_inner(
         if git && (log.is_none() || !storable(&planned[i].disk)) {
             let p = planned.remove(i);
             conflicts.retain(|c| *c != p.rel);
-            blocked.push(p.rel);
+            blocked.push((p.rel, WHY_UNKEPT));
             continue;
         }
         kept_in_log.push(i);
         i += 1;
     }
-    if git && blocked.iter().any(|b| !held.contains(b)) {
-        notes.push(
-            "a file the git snapshot cannot hold (an ignored file over 64 MiB, or a link) \
-             is never overwritten"
-                .to_string(),
-        );
+    blocked.sort();
+    for why in [WHY_LINK, WHY_DIR, WHY_UNKEPT] {
+        let names: Vec<String> = blocked
+            .iter()
+            .filter(|(_, w)| *w == why)
+            .map(|(p, _)| text(p))
+            .collect();
+        if !names.is_empty() {
+            notes.push(format!("blocked, {why}: {}", names.join(", ")));
+        }
     }
     let unlisted = conflicts.iter().any(|c| !overwrite.contains(c)) || !blocked.is_empty();
     let backup = match (cp.as_deref(), &log) {
@@ -557,7 +567,6 @@ pub(crate) async fn materialize_inner(
         (None, Some(_)) if planned.iter().all(|p| storable(&p.disk)) => Some("log"),
         (None, _) => None,
     };
-    blocked.sort();
     let mut report = MaterializeReport {
         restored: planned
             .iter()
@@ -570,7 +579,7 @@ pub(crate) async fn materialize_inner(
             .map(|p| text(&p.rel))
             .collect(),
         conflicts: conflicts.iter().map(text).collect(),
-        blocked: blocked.iter().map(text).collect(),
+        blocked: blocked.iter().map(|(p, _)| text(p)).collect(),
         dry_run,
         applied: false,
         backup: backup.map(str::to_string),
@@ -614,11 +623,17 @@ pub(crate) async fn materialize_inner(
                 Disk::File { bytes, mode } => (true, Some(log.blob(bytes)?), Some(*mode)),
                 _ => (true, None, None),
             };
+            let wrote = match &p.src {
+                Src::Blob(b) => Some(Wrote::Blob(b.clone())),
+                Src::Absent => Some(Wrote::Absent),
+                Src::Base => None,
+            };
             files.push(BackupFile {
                 path,
                 existed,
                 blob,
                 mode,
+                wrote,
             });
         }
         let paths = planned
@@ -673,7 +688,7 @@ pub(crate) async fn fail(
 }
 
 /// Refuse to write `rel` unless the sandbox resolves it to itself (no link on the way).
-fn confined(sb: &dyn Sandbox, root: &Path, rel: &Path) -> Result<PathBuf, TtError> {
+pub(crate) fn confined(sb: &dyn Sandbox, root: &Path, rel: &Path) -> Result<PathBuf, TtError> {
     let full = root.join(rel);
     let refuse = || TtError::Other(format!("{} no longer resolves to itself", rel.display()));
     if parent_in_the_way(root, rel) {

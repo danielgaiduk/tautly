@@ -630,32 +630,57 @@ impl Actor {
             session_id: self.session_id.clone(),
         });
         session.workspace.start();
-        // The lease first: nothing runs on the working tree without it.
+        // Commands sent while a resumed session sets up its model (a keychain prompt may
+        // hold it), or while the lease is waited for, are kept; a `Shutdown` among them
+        // abandons that.
+        let mut early = Vec::new();
+        // The lease first: nothing runs on the working tree without it. Tried in short
+        // slices (each off the async workers), so a `Shutdown` (or SIGTERM, which sends
+        // one) stops the wait at once.
         let mut unleased = None;
         if start.lease_pending {
-            let (home, root) = (session.data_home.clone(), session.root().to_path_buf());
-            let wait = start.lease_wait;
-            let taken =
-                tokio::task::spawn_blocking(move || Lease::shared_within(&home, &root, wait))
+            let deadline = tokio::time::Instant::now() + start.lease_wait;
+            let stop = until_shutdown(&mut commands, &mut early);
+            tokio::pin!(stop);
+            loop {
+                let (home, root) = (session.data_home.clone(), session.root().to_path_buf());
+                let tried = tokio::task::spawn_blocking(move || Lease::try_shared(&home, &root))
                     .await
                     .map_err(std::io::Error::other)
                     .and_then(|r| r);
-            match taken {
-                Ok(lease) => session.lease = Some(lease.for_workspace(&session.workspace)),
-                Err(e) => unleased = Some(e),
+                match tried {
+                    Ok(Some(lease)) => {
+                        session.lease = Some(lease.for_workspace(&session.workspace));
+                        break;
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        unleased = Some(e.to_string());
+                        break;
+                    }
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    unleased = Some(format!(
+                        "a rewind or switch elsewhere held the working tree for over {}s",
+                        start.lease_wait.as_secs()
+                    ));
+                    break;
+                }
+                tokio::select! {
+                    () = &mut stop => {
+                        unleased = Some("the session was shut down while it waited".into());
+                        break;
+                    }
+                    () = tokio::time::sleep(Duration::from_millis(50)) => {}
+                }
             }
         }
         for w in start.config_warnings {
             self.events.try_emit(Event::Warning { message: w });
         }
-        // Commands sent while a resumed session sets up its model (a keychain prompt may
-        // hold it) are kept; a `Shutdown` among them abandons that.
-        let mut early = Vec::new();
-        let started = if let Some(e) = unleased {
+        let started = if let Some(why) = unleased {
             Err(format!(
-                "the working-tree lease could not be had in {}s ({e}): a rewind or switch \
-                 elsewhere holds the working tree; this session does not start",
-                start.lease_wait.as_secs()
+                "the working-tree lease could not be had ({why}); this session does not start"
             ))
         } else if start.resume {
             session
@@ -857,6 +882,7 @@ impl Actor {
             }
         }
         if let Some(s) = state.as_mut() {
+            s.finish_turn_end().await;
             s.abandon_start_checkpoint();
         }
         // MCP servers end with their process groups. (A session lost to a crashed turn

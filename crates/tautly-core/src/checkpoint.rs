@@ -2546,13 +2546,25 @@ impl Session {
         }
     }
 
+    /// At shutdown: let a cancelled turn's end checkpoint still being taken finish, for at
+    /// most the snapshot bound (`timeout_ms`) and a margin; then it is abandoned (its git
+    /// is killed). The files as that turn left them are what tells a later human edit
+    /// apart.
+    pub(crate) async fn finish_turn_end(&mut self) {
+        let Some(mut job) = self.end_recovery.take() else {
+            return;
+        };
+        let bound = Duration::from_millis(self.setup.config.checkpoints.timeout_ms)
+            + Duration::from_secs(2);
+        if tokio::time::timeout(bound, &mut job).await.is_err() {
+            job.abort();
+        }
+    }
+
     /// At shutdown: abandon a session-start checkpoint still being taken (its git is
     /// killed).
     pub(crate) fn abandon_start_checkpoint(&mut self) {
         if let StartCheckpoint::Running(job) = std::mem::take(&mut self.start_checkpoint) {
-            job.abort();
-        }
-        if let Some(job) = self.end_recovery.take() {
             job.abort();
         }
     }

@@ -57,6 +57,7 @@ use tautly_session::{
 };
 use tautly_tools::PersistedEffect;
 
+pub(crate) use self::materialize::confined;
 pub use self::materialize::{MaterializeReport, materialize};
 use self::materialize::{fail, materialize_inner};
 use crate::checkpoint::{CheckpointError, Checkpointer, Point, Skip};
@@ -495,10 +496,31 @@ pub fn expected_tip(reader: &SessionReader<SessionRecord>) -> Result<FileState, 
     let mut last: Option<String> = None;
     let mut between: BTreeMap<RelPath, Option<Option<BlobRef>>> = BTreeMap::new();
     let mut command = false;
+    // A turn ended (cancelled, or closed after a crash) with no checkpoint of its end
+    // since the pair began: nothing then marks when the human's changes began, so the
+    // pair counts whatever commands ran in it (Task 49 N1).
+    let mut cut = false;
+    let mut end_checkpointed = false;
     for (i, (offset, rec)) in recs.iter().enumerate() {
+        match rec {
+            SessionRecord::Checkpoint {
+                point: Some(CheckpointPoint::TurnEnd),
+                ..
+            } => end_checkpointed = true,
+            SessionRecord::TurnEnd { .. } => {
+                cut |= !end_checkpointed;
+                end_checkpointed = false;
+            }
+            SessionRecord::Request { .. }
+            | SessionRecord::Provider(_)
+            | SessionRecord::ToolCall { .. }
+            | SessionRecord::ToolResult { .. }
+            | SessionRecord::CheckpointSkipped { .. } => end_checkpointed = false,
+            _ => {}
+        }
         if let SessionRecord::Checkpoint { commit, point, .. } = rec {
             if let Some(from) = &last
-                && !command
+                && (!command || cut)
                 && from != commit
             {
                 state.pairs.push(Pair {
@@ -512,6 +534,7 @@ pub fn expected_tip(reader: &SessionReader<SessionRecord>) -> Result<FileState, 
             last = Some(commit.clone());
             between.clear();
             command = false;
+            cut = false;
             continue;
         }
         command |= ran_command(rec);

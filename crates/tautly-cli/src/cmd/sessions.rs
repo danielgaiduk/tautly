@@ -37,9 +37,15 @@ pub enum Cmd {
     RestoreBackup {
         /// The full session id.
         id: String,
-        /// Show what would be put back; change nothing.
+        /// Put it back without asking (needed when stdin is not a terminal).
         #[arg(long)]
-        dry_run: bool,
+        yes: bool,
+        /// Put it back although that rewind or switch finished.
+        #[arg(long)]
+        force: bool,
+        /// A file changed since the restore wrote it, to put back all the same.
+        #[arg(long = "overwrite", value_name = "PATH")]
+        overwrite: Vec<String>,
     },
     /// Delete a session's log and its git checkpoint refs.
     Delete {
@@ -61,7 +67,12 @@ pub async fn run(cmd: Cmd, env: &Env) -> anyhow::Result<i32> {
         Cmd::Tree => tree(env),
         Cmd::Export { id, format } => export(env, &id, format),
         Cmd::Delete { id } => delete(env, &id).await,
-        Cmd::RestoreBackup { id, dry_run } => restore_backup(env, &id, dry_run).await,
+        Cmd::RestoreBackup {
+            id,
+            yes,
+            force,
+            overwrite,
+        } => restore_backup(env, &id, yes, force, overwrite).await,
     }
 }
 
@@ -315,14 +326,48 @@ fn markdown(reader: &SessionReader<SessionRecord>) -> anyhow::Result<String> {
     Ok(md)
 }
 
-async fn restore_backup(env: &Env, id: &str, dry_run: bool) -> anyhow::Result<i32> {
-    let done = tautly_core::sessions::restore_backup(
-        &env.data_home,
-        env.workspace.sandbox().as_ref(),
-        id,
-        dry_run,
-    )
-    .await?;
+/// `sessions restore-backup`: what would be put back first, then (after a y/N on a
+/// terminal, or with `--yes`) put back.
+async fn restore_backup(
+    env: &Env,
+    id: &str,
+    yes: bool,
+    force: bool,
+    overwrite: Vec<String>,
+) -> anyhow::Result<i32> {
+    use std::io::IsTerminal as _;
+    let sb = env.workspace.sandbox().as_ref();
+    let mut opts = tautly_core::sessions::RestoreBackupOptions {
+        dry_run: true,
+        force,
+        overwrite,
+    };
+    let plan = tautly_core::sessions::restore_backup(&env.data_home, sb, id, &opts).await?;
+    print_backup(&plan, true);
+    if plan.written.is_empty() && plan.removed.is_empty() {
+        return Ok(0);
+    }
+    if !yes {
+        if !std::io::stdin().is_terminal() {
+            println!("nothing was changed: run it again with --yes to put these back");
+            return Ok(1);
+        }
+        print!("put these back? [y/N] ");
+        std::io::stdout().flush()?;
+        let mut answer = String::new();
+        std::io::stdin().read_line(&mut answer)?;
+        if !matches!(answer.trim(), "y" | "Y" | "yes") {
+            println!("nothing was changed");
+            return Ok(1);
+        }
+    }
+    opts.dry_run = false;
+    let done = tautly_core::sessions::restore_backup(&env.data_home, sb, id, &opts).await?;
+    print_backup(&done, false);
+    Ok(0)
+}
+
+fn print_backup(done: &tautly_core::sessions::BackupRestored, dry_run: bool) {
     let list = |v: &[String]| {
         if v.is_empty() {
             "nothing".to_string()
@@ -333,19 +378,25 @@ async fn restore_backup(env: &Env, id: &str, dry_run: bool) -> anyhow::Result<i3
                 .join(", ")
         }
     };
-    let verb = if dry_run {
-        "would put back"
+    let (put, rm) = if dry_run {
+        ("would put back", "would remove")
     } else {
-        "put back"
+        ("put back", "removed")
     };
-    println!("{verb}: {}", list(&done.written));
-    println!(
-        "{} removed: {}",
-        if dry_run { "would be" } else { "and" },
-        list(&done.removed)
-    );
+    println!("{put}: {}", list(&done.written));
+    println!("{rm}: {}", list(&done.removed));
+    if !done.conflicts.is_empty() {
+        println!(
+            "left alone (changed since the restore wrote them; --overwrite <path> puts one \
+             back): {}",
+            list(&done.conflicts)
+        );
+    }
     if !done.not_kept.is_empty() {
-        println!("not kept (a link or over 64 MiB): {}", list(&done.not_kept));
+        println!(
+            "not kept or not writable (a link, over 64 MiB, or a link above it): {}",
+            list(&done.not_kept)
+        );
     }
     if let Some(b) = &done.backup_ref {
         let b = tautly_core::printable(b);
@@ -360,7 +411,6 @@ async fn restore_backup(env: &Env, id: &str, dry_run: bool) -> anyhow::Result<i3
              then `git restore --source {b} -- <path>` for each one to put back"
         );
     }
-    Ok(0)
 }
 
 async fn delete(env: &Env, id: &str) -> anyhow::Result<i32> {

@@ -308,6 +308,20 @@ pub struct BackupFile {
     pub blob: Option<BlobRef>,
     #[serde(default)]
     pub mode: Option<u32>,
+    /// What the restore wrote there (none: not known), so putting the backup back can
+    /// tell a later human edit (Task 49 N10).
+    #[serde(default)]
+    pub wrote: Option<Wrote>,
+}
+
+/// What a restore wrote at a path.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Wrote {
+    /// This content.
+    Blob(BlobRef),
+    /// It deleted the file.
+    Absent,
 }
 
 /// One file of an [`SessionRecord::Undone`].
@@ -825,6 +839,7 @@ mod tests {
                     existed: true,
                     blob: Some(BlobRef::parse(&"b".repeat(64)).unwrap()),
                     mode: Some(0o644),
+                    wrote: Some(Wrote::Absent),
                 }],
             },
             SessionRecord::RestoreEnded {
