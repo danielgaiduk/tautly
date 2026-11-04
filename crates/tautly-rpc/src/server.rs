@@ -339,6 +339,10 @@ struct State {
     /// Sessions taken out by a stop (a signal) that are announced with `session/closed`
     /// when their events end, though no longer reachable.
     announce: HashSet<u64>,
+    /// The MCP server approval requests each session has sent (by slot): an `approve` of
+    /// one with a `session_rule` is refused (`-32602`), since session rules are for tool
+    /// calls only.
+    server_requests: HashSet<(u64, String)>,
 }
 
 /// How far `initialize` has got.
@@ -478,7 +482,7 @@ impl Shared {
 
     /// The session a method addresses: `session_id`, else the default session, else the
     /// only one open.
-    fn session(&self, params: &Value) -> Result<Arc<Engine>, Error> {
+    fn session_key(&self, params: &Value) -> Result<(u64, Arc<Engine>), Error> {
         let st = self.lock();
         let key = match params.get("session_id") {
             Some(Value::String(id)) => *st
@@ -498,7 +502,20 @@ impl Shared {
             },
             Some(_) => return Err(Error::new(INVALID_PARAMS, "`session_id` must be a string")),
         };
-        Ok(Arc::clone(&st.sessions[&key].engine))
+        Ok((key, Arc::clone(&st.sessions[&key].engine)))
+    }
+
+    /// Session `key` sent an MCP server approval request `request_id`.
+    fn server_request(&self, key: u64, request_id: &str) {
+        self.lock()
+            .server_requests
+            .insert((key, request_id.to_string()));
+    }
+
+    fn is_server_request(&self, key: u64, request_id: &str) -> bool {
+        self.lock()
+            .server_requests
+            .contains(&(key, request_id.to_string()))
     }
 
     /// Take session `id` (its current id or an alias) out of the server: none of its ids
@@ -512,6 +529,7 @@ impl Shared {
         let mut st = self.lock();
         let slot = st.sessions.remove(&key)?;
         st.ids.retain(|_, k| *k != key);
+        st.server_requests.retain(|(k, _)| *k != key);
         if st.default == Some(key) {
             st.default = None;
         }
@@ -532,6 +550,7 @@ impl Shared {
         let mut st = self.lock();
         st.closing = true;
         st.ids.clear();
+        st.server_requests.clear();
         st.default = None;
         let mut slots: Vec<(u64, Slot)> = st.sessions.drain().collect();
         slots.sort_by_key(|(key, _)| *key);
@@ -614,6 +633,10 @@ async fn forward(
         // Routed by the new id before the client can learn it.
         if let Some(new) = &renamed {
             shared.renamed(key, new);
+        }
+        // Known before the client can answer it.
+        if let Event::McpServerApprovalRequested { request_id, .. } = &ev {
+            shared.server_request(key, request_id);
         }
         let event = serde_json::to_value(&ev).unwrap_or_else(
             |e| json!({"type": "warning", "message": format!("an event could not be sent: {e}")}),
@@ -869,7 +892,21 @@ impl Conn {
 
     async fn command(&self, method: &str, params: &Value) -> Result<Value, Error> {
         let cmd = command_for(method, params)?;
-        let engine = self.shared.session(params)?;
+        let (key, engine) = self.shared.session_key(params)?;
+        if let Command::Approve {
+            request_id,
+            session_rule: Some(_),
+        } = &cmd
+            && self.shared.is_server_request(key, request_id)
+        {
+            return Err(Error::new(
+                INVALID_PARAMS,
+                format!(
+                    "invalid params for `approve`: `{request_id}` is an MCP server approval; \
+                     session_rule applies to tool calls only"
+                ),
+            ));
+        }
         engine
             .send(cmd)
             .await

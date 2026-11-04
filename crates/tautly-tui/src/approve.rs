@@ -6,62 +6,19 @@
 //! call (else it approves once and warns); deny rules and protected paths still win.
 //! Memory proposals and MCP server approvals are plain `y`/`n` questions.
 
+use std::path::Path;
+
 use serde_json::Value;
 use tautly_core::printable;
 
 /// The exact-target session rule for a call, as `a` sends it: `edit(<path>)`,
-/// `write(<path>)`, `bash(<command>)` (whitespace collapsed), `web_fetch(<host>)` or
-/// `mcp__<server>__<tool>`, with glob metacharacters escaped. None when the call has no
-/// single target such a rule can name (a patch, a command with parentheses).
-pub fn exact_rule(tool: &str, args: &Value) -> Option<String> {
-    let arg = |k: &str| args.get(k).and_then(Value::as_str);
-    let target = match tool {
-        "edit" | "write" => {
-            let mut path = arg("path")?;
-            while let Some(rest) = path.strip_prefix("./") {
-                path = rest;
-            }
-            path.to_string()
-        }
-        "bash" => arg("command")?
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" "),
-        "web_fetch" => host(arg("url")?)?,
-        t if t.starts_with("mcp__") => {
-            let plain = t
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
-            return plain.then(|| t.to_string());
-        }
-        _ => return None,
-    };
-    // A rule's pattern cannot hold parentheses, and an empty one would match anything.
-    if target.is_empty() || target.contains(['(', ')']) {
-        return None;
-    }
-    Some(format!("{tool}({})", escape_glob(&target)))
-}
-
-/// The host a `web_fetch` URL reaches, as the policy sees it: lowercase, no port, no
-/// trailing dot, no IPv6 brackets.
-fn host(url: &str) -> Option<String> {
-    let url = url::Url::parse(url).ok()?;
-    let h = url.host_str()?.to_ascii_lowercase();
-    let h = h.trim_start_matches('[').trim_end_matches(']');
-    Some(h.trim_end_matches('.').to_string())
-}
-
-/// `s` as a glob that matches only itself.
-fn escape_glob(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        if matches!(c, '*' | '?' | '[' | ']' | '{' | '}' | '\\') {
-            out.push('\\');
-        }
-        out.push(c);
-    }
-    out
+/// `write(<path>)`, `bash(<command>)`, `web_fetch(<host>)` or `mcp__<server>__<tool>`,
+/// built by the engine's policy parser ([`tautly_core::exact_rule`]) so the engine accepts
+/// it for this call: quoted words, write redirects and root-relative paths as rules see
+/// them, glob characters escaped. `root` is where the session started. None when no single
+/// rule names the call (several commands, a patch, parentheses).
+pub fn exact_rule(root: &Path, tool: &str, args: &Value) -> Option<String> {
+    tautly_core::exact_rule(root, tool, args)
 }
 
 /// The question under a tool call's approval request.
@@ -133,7 +90,12 @@ mod tests {
         assert_eq!(yes_no("Yes"), Some(true));
         assert_eq!(yes_no("x"), None);
         assert_eq!(
-            exact_rule("web_fetch", &serde_json::json!({"url": "http://[::1]:8/x"})).as_deref(),
+            exact_rule(
+                Path::new("/"),
+                "web_fetch",
+                &serde_json::json!({"url": "http://[::1]:8/x"})
+            )
+            .as_deref(),
             Some("web_fetch(::1)")
         );
     }

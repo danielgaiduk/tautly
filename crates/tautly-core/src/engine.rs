@@ -50,7 +50,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use crate::approvals::{Approvals, Verdict};
+use crate::approvals::{ApprovalFor, Approvals, Verdict};
 use crate::attempts::AttemptLedger;
 use crate::auth::{KeyringStore, SecretStore};
 use crate::budget::{Budget, Budgets};
@@ -786,6 +786,26 @@ impl Actor {
         queue: &mut VecDeque<Command>,
         stopping: &mut bool,
     ) {
+        // A session rule is for tool calls only: on an MCP server approval it is refused
+        // (not logged, the request left pending) rather than dropped.
+        if let Command::Approve {
+            request_id,
+            session_rule: Some(_),
+        } = &cmd
+            && self.approvals.kind(request_id) == Some(ApprovalFor::McpServer)
+        {
+            self.events.try_emit(Event::Error {
+                kind: ErrorKind::Policy,
+                message: format!(
+                    "session_rule applies to tool calls only: the MCP server approval `{}` \
+                     is still pending",
+                    crate::printable(request_id)
+                ),
+                retryable: false,
+                hint: Some("approve or deny it without a session_rule".into()),
+            });
+            return;
+        }
         self.with_log({
             let rec = SessionRecord::Command(cmd.for_log());
             move |l| l.append(&rec)

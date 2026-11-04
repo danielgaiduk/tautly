@@ -41,6 +41,8 @@ wiremock.workspace = true
 # A real index database for the doctor's read-only index check.
 tautly-sandbox = { path = "../tautly-sandbox" }
 rusqlite.workspace = true
+# The REPL test drives the binary through a pseudo-terminal (openpty).
+libc.workspace = true
 
 # These need the `mock` feature: it lets a test choose a file instead of the OS keychain
 # (`TAUTLY_TEST_SECRET_STORE`) and the Ollama port (`TAUTLY_TEST_OLLAMA_PORT`), so no test
@@ -59,6 +61,10 @@ required-features = ["mock"]
 
 [[test]]
 name = "doctor"
+required-features = ["mock"]
+
+[[test]]
+name = "repl_pty"
 required-features = ["mock"]
 
 # `cargo binstall tautly` downloads the cargo-dist archive of the host (or the nearest musl)

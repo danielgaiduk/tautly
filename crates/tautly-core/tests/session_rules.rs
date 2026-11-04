@@ -211,6 +211,7 @@ async fn session_rule_allows_matching_call() {
     assert_eq!(f.len(), 2, "{f:?}");
     assert!(f.iter().all(|(_, err, _)| !err), "{f:?}");
     assert!(warnings(&seen).is_empty(), "{seen:?}");
+    assert_eq!(notices(&seen), ["allowed for this session: bash(echo hi)"]);
     run.shutdown().await;
 }
 
@@ -346,5 +347,127 @@ async fn non_matching_session_rule_approves_once_and_warns() {
         "{w:?}"
     );
     assert!(w[1].contains("bash(echo (hi)"), "{w:?}");
+    run.shutdown().await;
+}
+
+fn notices(events: &[Event]) -> Vec<String> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            Event::Warning { message } if message.starts_with("allowed for this session") => {
+                Some(message.clone())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// Review T30-I2: the exact rule for a command does not cover it with a write redirect.
+#[tokio::test]
+async fn exact_rule_does_not_cover_a_write_redirect() {
+    let fx = Fx::new();
+    let mock = MockProvider::new(vec![
+        step(bash("b1", "echo hi")),
+        step(bash("b2", "echo hi > a.txt")),
+        text_step("done"),
+    ]);
+    let mut run = fx.start(config(&[]), &mock, None);
+    run.send(Command::SendMessage { text: "go".into() }).await;
+    let mut seen = Vec::new();
+    let req = run.until_ask_or_end(&mut seen).await.expect("b1 asks");
+    run.approve(req, Some("bash(echo hi)")).await;
+    let req = run.until_ask_or_end(&mut seen).await;
+    assert!(req.is_some(), "the redirect asks again: {seen:?}");
+    run.approve(req.unwrap(), None).await;
+    assert_eq!(run.until_ask_or_end(&mut seen).await, None);
+    assert_eq!(notices(&seen), ["allowed for this session: bash(echo hi)"]);
+    run.shutdown().await;
+}
+
+/// Review T30-M1: a broad rule says how broad it is.
+#[tokio::test]
+async fn broad_session_rule_says_so() {
+    let fx = Fx::new();
+    let mock = MockProvider::new(vec![
+        step(bash("b1", "echo hi")),
+        step(bash("b2", "ls")),
+        text_step("done"),
+    ]);
+    let mut run = fx.start(config(&[]), &mock, None);
+    run.send(Command::SendMessage { text: "go".into() }).await;
+    let mut seen = Vec::new();
+    let req = run.until_ask_or_end(&mut seen).await.expect("b1 asks");
+    run.approve(req, Some("bash")).await;
+    assert_eq!(run.until_ask_or_end(&mut seen).await, None, "{seen:?}");
+    let n = notices(&seen);
+    assert_eq!(n.len(), 1, "{seen:?}");
+    assert!(
+        n[0].starts_with("allowed for this session: bash (every `bash` call"),
+        "{n:?}"
+    );
+    run.shutdown().await;
+}
+
+/// Review T30-I1: a session rule on an MCP server approval is refused with an `Error`;
+/// the request stays pending and can still be answered.
+#[tokio::test]
+async fn session_rule_on_mcp_server_approval_is_refused() {
+    let fx = Fx::new();
+    std::fs::create_dir_all(fx.dir.path().join(".tautly")).unwrap();
+    std::fs::write(
+        fx.dir.path().join(".tautly/config.toml"),
+        "[mcp.servers.srv]\ncommand = \"/nonexistent/tautly-test-server\"\n",
+    )
+    .unwrap();
+    let root = fx.dir.path().canonicalize().unwrap();
+    let mut cfg = tautly_core::Config::load_from(None, &root, Default::default())
+        .unwrap()
+        .config;
+    let base = config(&[]);
+    cfg.model = base.model;
+    cfg.catalog_overrides = base.catalog_overrides;
+    cfg.permissions = base.permissions;
+    let mock = MockProvider::new(vec![]);
+    let mut run = fx.start(cfg, &mock, None);
+    let mut seen = Vec::new();
+    let request_id = loop {
+        let ev = run.next().await;
+        seen.push(ev.clone());
+        if let Event::McpServerApprovalRequested { request_id, .. } = ev {
+            break request_id;
+        }
+    };
+    run.approve(request_id.clone(), Some("mcp__srv__*")).await;
+    let refused = loop {
+        let ev = run.next().await;
+        match ev {
+            Event::Error { message, .. } => break message,
+            Event::McpServerStatus {
+                state: tautly_core::McpState::AwaitingApproval,
+                ..
+            } => {}
+            Event::McpServerStatus { .. } => panic!("the server moved on: {ev:?}"),
+            _ => {}
+        }
+    };
+    assert!(refused.contains("tool calls only"), "{refused}");
+    // Still pending: a plain answer is taken.
+    run.send(Command::Deny {
+        request_id,
+        reason: None,
+    })
+    .await;
+    loop {
+        match run.next().await {
+            Event::McpServerStatus {
+                state: tautly_core::McpState::Skipped,
+                ..
+            } => break,
+            Event::Warning { message } if message.contains("is pending") => {
+                panic!("the request was gone: {message}")
+            }
+            _ => {}
+        }
+    }
     run.shutdown().await;
 }

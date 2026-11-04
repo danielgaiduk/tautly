@@ -6,7 +6,7 @@
 //! prompt. At the prompt Ctrl+C otherwise just clears the line, and Ctrl+D exits.
 
 use std::collections::HashSet;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
@@ -62,6 +62,9 @@ pub async fn run_repl(
         answered: HashSet::new(),
         listing: Vec::new(),
     };
+    // A session resumed at start (`--continue`) counts its earlier turns in the total.
+    let first = repl.engine.session_id().to_string();
+    repl.st.receipts = repl.earlier_receipts(&first).await;
     let ended = repl.main_loop().await;
     let closed = repl.close().await;
     ended.and(closed)
@@ -185,13 +188,15 @@ where
         while let Some(Some(())) = self.signals.next().now_or_never() {}
         loop {
             let ev = tokio::select! {
-                ev = self.events.recv() => ev,
+                // A Ctrl+C is acted on before events already queued behind it.
+                biased;
                 Some(()) = self.signals.next() => {
                     if self.interrupt().await? {
                         return Ok(Pumped::Exit);
                     }
                     continue;
                 }
+                ev = self.events.recv() => ev,
             };
             let Some(ev) = ev else {
                 return Ok(Pumped::Exit);
@@ -212,6 +217,12 @@ where
         loop {
             let ev = tokio::select! {
                 ev = self.events.recv() => ev,
+                Some(()) = self.signals.next() => {
+                    if self.interrupt().await? {
+                        return Ok(true);
+                    }
+                    continue;
+                }
                 () = tokio::time::sleep(QUIET) => return Ok(false),
             };
             match ev {
@@ -300,19 +311,9 @@ where
         }
     }
 
-    /// The exact-target rule for a call, its path made relative to the root first (rules
-    /// match root-relative paths).
+    /// The exact-target rule for a call (paths judged against the session's root).
     fn exact_rule(&self, tool: &str, args: &Value) -> Option<String> {
-        let mut args = args.clone();
-        if let Some(rel) = args
-            .get("path")
-            .and_then(Value::as_str)
-            .and_then(|p| Path::new(p).strip_prefix(&self.root).ok())
-            .map(|r| r.to_string_lossy().into_owned())
-        {
-            args["path"] = Value::String(rel);
-        }
-        approve::exact_rule(tool, &args)
+        approve::exact_rule(&self.root, tool, args)
     }
 
     /// Ask `allow? [y]es [n]o [a]lways this session (<rule>)` and send the answer.
@@ -512,7 +513,7 @@ where
             text.push_str(&format!(
                 "{:>2}  {}  {:>8}  {}  {cost}\n",
                 i + 1,
-                s.id,
+                printable(&s.id),
                 ago(age),
                 printable(&s.first_prompt)
             ));

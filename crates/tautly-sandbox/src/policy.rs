@@ -240,6 +240,36 @@ impl Policy {
         Ok(allows(&|s| rule.matches_str(tool, s), &subjects))
     }
 
+    /// The narrowest rule that allows this call, as "allow for this session" offers it:
+    /// `tool(<subject>)` with glob characters escaped (the command as rules see it, the
+    /// root-relative path or the host), or the name of an MCP tool. None when no single
+    /// rule can name the call: several commands, an unparseable one, several paths, a path
+    /// outside the root or reached through a symlink, a read-only call, or a subject with
+    /// parentheses (which a rule cannot hold). The rule returned always
+    /// [matches](Self::rule_matches) the call.
+    pub fn exact_rule(&self, tool: &str, effect: &Effect, raw_cmd: Option<&str>) -> Option<String> {
+        let rule = if tool.starts_with(MCP_PREFIX) {
+            tool.to_string()
+        } else {
+            let subject = match self.subjects(effect, raw_cmd) {
+                Subjects::Commands(cmds) if cmds.len() == 1 => allow_subject(&cmds[0]),
+                Subjects::Paths(ps) if ps.len() == 1 && ps[0].real.is_none() => {
+                    path_str(ps[0].rel.as_ref()?)
+                }
+                Subjects::Host(h) => h,
+                _ => return None,
+            };
+            if subject.is_empty() || subject.contains(['(', ')']) {
+                return None;
+            }
+            format!("{tool}({})", escape_glob(&subject))
+        };
+        self.rule_matches(&rule, tool, effect, raw_cmd)
+            .ok()
+            .filter(|m| *m)
+            .map(|_| rule)
+    }
+
     /// Order: deny rules, protected paths, unparseable commands, allow rules (configured
     /// and session), mode default.
     ///
@@ -419,8 +449,8 @@ impl Policy {
 fn allows(any: &dyn Fn(&str) -> bool, subjects: &Subjects) -> bool {
     match subjects {
         Subjects::Commands(cmds) => {
-            // Leading assignments are part of what the rule must match.
-            !cmds.is_empty() && cmds.iter().all(|c| any(&command_line(c)))
+            // Leading assignments and write redirects are part of what the rule must match.
+            !cmds.is_empty() && cmds.iter().all(|c| any(&allow_subject(c)))
         }
         Subjects::Paths(ps) => {
             !ps.is_empty()
@@ -475,6 +505,35 @@ fn command_line(c: &SimpleCommand) -> String {
         .map(String::as_str)
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// The command as allow rules see it: [`command_line`], then ` > <target>` for each write
+/// redirect (`>`, `>>`, `&>`, ...) other than `/dev/null`. So `bash(cargo test)` does not
+/// allow `cargo test > src/lib.rs`; a pattern must reach the redirect (`bash(cargo test*)`
+/// does) or name it. Reads and fd duplications (`2>&1`) are not included.
+fn allow_subject(c: &SimpleCommand) -> String {
+    let mut s = command_line(c);
+    for r in c
+        .redirects
+        .iter()
+        .filter(|r| r.write && r.target != "/dev/null")
+    {
+        s.push_str(" > ");
+        s.push_str(&r.target);
+    }
+    s
+}
+
+/// `s` as a glob that matches only itself.
+fn escape_glob(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if matches!(c, '*' | '?' | '[' | ']' | '{' | '}' | '\\') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// A dangerous `NAME=VALUE` in the command's own environment, or anywhere in its

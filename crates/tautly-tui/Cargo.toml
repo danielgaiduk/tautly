@@ -15,9 +15,9 @@ serde_json.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["io-util"] }
-url.workspace = true
 
 [dev-dependencies]
+async-trait.workspace = true
 tautly-provider = { path = "../tautly-provider" }
 tautly-sandbox = { path = "../tautly-sandbox" }
 regex.workspace = true

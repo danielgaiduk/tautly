@@ -38,7 +38,8 @@ use tautly_core::detect::{
 };
 use tautly_core::{
     BudgetScope, CliOverrides, Command, Config, Engine, EngineBuilder, Event, LoadedConfig, Mode,
-    ModelId, ProviderSetupError, Workspaces, install_signal_handlers, provider_for_with,
+    ModelId, ProviderSetupError, Workspaces, install_signal_handlers, install_termination_handlers,
+    provider_for_with,
 };
 use tautly_rpc::{EngineFactory, OutputFormat, Server, run_oneshot};
 use tokio::io::BufReader;
@@ -247,6 +248,8 @@ struct Settings {
     /// every later session of the process, so it is announced once. Nothing found, or an
     /// error, is not kept: the next session detects again (after `tautly auth add`, say).
     detected: Arc<OnceLock<Detected>>,
+    /// The REPL owns Ctrl-C: the engines' signal handler covers SIGTERM and SIGHUP only.
+    repl: bool,
     #[cfg(feature = "mock")]
     provider: Option<Arc<dyn tautly_provider::Provider>>,
 }
@@ -269,6 +272,7 @@ impl Settings {
             secrets: local::secrets(),
             probe: local::ollama_probe(),
             detected: Arc::new(OnceLock::new()),
+            repl: false,
             #[cfg(feature = "mock")]
             provider,
         })
@@ -358,7 +362,12 @@ impl Settings {
             builder.provider = Some(provider);
         }
         let (engine, events) = builder.build()?;
-        if let Err(e) = install_signal_handlers(&engine) {
+        let installed = if self.repl {
+            install_termination_handlers(&engine)
+        } else {
+            install_signal_handlers(&engine)
+        };
+        if let Err(e) = installed {
             eprintln!("tautly: signals are not handled: {e}");
         }
         Ok((engine, events))

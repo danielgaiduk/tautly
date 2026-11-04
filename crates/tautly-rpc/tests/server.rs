@@ -578,6 +578,52 @@ async fn approve_with_session_rule() {
     c.finish().await;
 }
 
+/// A `session_rule` on an MCP server approval is refused with `-32602`; the request stays
+/// pending and the server does not start.
+#[tokio::test]
+async fn approve_with_session_rule_on_mcp_server_is_refused() {
+    let fx = Fx::new();
+    fx.write(
+        ".tautly/config.toml",
+        "[mcp.servers.srv]\ncommand = \"/nonexistent/tautly-test-server\"\n",
+    );
+    let cfg = config_with(tautly_core::CliOverrides::default(), &fx.root());
+    let mut c = single(&fx, cfg, MockProvider::new(vec![]));
+    let sid = c
+        .ok(
+            "initialize",
+            json!({"protocol": "1.0", "client": {"interactive": true}}),
+        )
+        .await["session_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let seen = c.until_type(&sid, "mcp_server_approval_requested").await;
+    let request_id = seen.last().unwrap().1["request_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let code = c
+        .err(
+            "approve",
+            json!({"request_id": request_id, "session_rule": "mcp__srv__*"}),
+        )
+        .await;
+    assert_eq!(code, INVALID_PARAMS);
+    // Still pending: a plain deny is taken, and the server never started.
+    c.ok("deny", json!({"request_id": request_id})).await;
+    let events = c
+        .until(|s, e| s == sid && e["type"] == "mcp_server_status" && e["state"] == "skipped")
+        .await;
+    assert!(
+        !events_of(&events, &sid).any(|e| e["type"] == "mcp_server_status"
+            && (e["state"] == "ready" || e["state"] == "starting")),
+        "{events:?}"
+    );
+    c.ok("shutdown", json!({})).await;
+    c.finish().await;
+}
+
 #[tokio::test]
 async fn pending_approval_denied_on_disconnect() {
     let fx = Fx::new();

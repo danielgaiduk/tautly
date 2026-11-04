@@ -4,6 +4,7 @@
 //! speak only these types.
 
 mod approvals;
+pub use approvals::exact_rule;
 pub mod attempts;
 pub mod auth;
 pub mod budget;
@@ -56,7 +57,10 @@ pub use provider_setup::{
 };
 pub use receipt::{ReceiptBuilder, Savings};
 pub use record::SessionRecord;
-pub use signals::{Signal, SignalPolicy, SignalRouter, handle_signals, install_signal_handlers};
+pub use signals::{
+    Signal, SignalPolicy, SignalRouter, handle_signals, install_signal_handlers,
+    install_termination_handlers,
+};
 pub use workspace::{IndexLockError, Workspace, Workspaces};
 // Types that appear in `Event` and `Command`, re-exported so clients need no other crate.
 pub use tautly_context::{Breakdown, MutationReason};

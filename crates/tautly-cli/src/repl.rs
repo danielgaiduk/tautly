@@ -22,7 +22,8 @@ pub fn wanted() -> bool {
     std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
 }
 
-pub async fn run(cli: &Cli, settings: Settings) -> anyhow::Result<i32> {
+pub async fn run(cli: &Cli, mut settings: Settings) -> anyhow::Result<i32> {
+    settings.repl = true;
     let root = std::env::current_dir().context("cannot read the current directory")?;
     let resume = cli.resume_id(&settings.data_home, &root)?;
     // Detection runs (and is announced) before the session starts; a scripted provider

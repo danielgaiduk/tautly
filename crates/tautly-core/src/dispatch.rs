@@ -43,7 +43,7 @@ use tautly_tools::{
 };
 use tokio::sync::mpsc;
 
-use crate::approvals::Verdict;
+use crate::approvals::{ApprovalFor, Verdict};
 use crate::protocol::{BudgetScope, EffectView, Event};
 use crate::record::{ApprovalKind, SessionRecord};
 use crate::session::{Log, LogFailure, Session};
@@ -427,7 +427,26 @@ impl Session {
         let shown = crate::printable(rule);
         let why = match self.policy.rule_matches(rule, tool, effect, raw_cmd) {
             Ok(true) => match self.policy.add_session_allow(rule) {
-                Ok(()) => return,
+                Ok(()) => {
+                    let broad = match rule.split_once('(') {
+                        None => !tool.starts_with("mcp__"),
+                        Some((_, p)) => p.trim_end_matches(')').chars().all(|c| c == '*'),
+                    };
+                    let note = if broad {
+                        format!(
+                            " (every `{}` call; deny rules, protected paths and unparseable \
+                             commands still ask or refuse)",
+                            crate::printable(tool)
+                        )
+                    } else {
+                        String::new()
+                    };
+                    self.emit(Event::Warning {
+                        message: format!("allowed for this session: {shown}{note}"),
+                    })
+                    .await;
+                    return;
+                }
                 Err(e) => e.to_string(),
             },
             Ok(false) => format!("it does not match this `{}` call", crate::printable(tool)),
@@ -465,7 +484,7 @@ impl Session {
             }
             None => (None, None),
         };
-        let Some((request_id, rx)) = ctl.approvals.open() else {
+        let Some((request_id, rx)) = ctl.approvals.open(ApprovalFor::Tool) else {
             return Err(Outcome::refused(ToolResult::error(format!(
                 "denied: this call needs approval ({reason}), and nobody can approve it in \
                  this session (headless); the user can allow it with --approve auto-edit or yolo"

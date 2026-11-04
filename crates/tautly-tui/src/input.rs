@@ -218,11 +218,18 @@ impl HistoryFile {
     }
 
     /// Append `entry`; a file that cannot be written is left as it is (history is a
-    /// convenience, never a reason to stop).
+    /// convenience, never a reason to stop). Concurrent REPLs take turns: the update holds
+    /// an exclusive lock on `<file>.lock`, so none loses another's entry.
     pub(crate) fn add(&self, entry: &str) {
         let Some(path) = &self.path else {
             return;
         };
+        let Ok(lock) = open_private(&lock_path(path), false) else {
+            return;
+        };
+        if lock.lock().is_err() {
+            return;
+        }
         let mut entries = read_history(path);
         if entries.last().map(String::as_str) == Some(entry) {
             return;
@@ -234,23 +241,45 @@ impl HistoryFile {
             .map(|e| format!("{}\n", escape(e)))
             .collect();
         let _ = write_private(path, &text);
+        // The lock is released when `lock` is dropped.
     }
 }
 
-fn write_private(path: &Path, text: &str) -> std::io::Result<()> {
+fn lock_path(path: &Path) -> PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(".lock");
+    path.with_file_name(name)
+}
+
+/// Open (creating) a file readable by its owner only; `truncate` empties it.
+fn open_private(path: &Path, truncate: bool) -> std::io::Result<std::fs::File> {
     use std::os::unix::fs::OpenOptionsExt as _;
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    let tmp = path.with_extension("tmp");
-    let mut f = std::fs::OpenOptions::new()
+    std::fs::OpenOptions::new()
         .write(true)
         .create(true)
-        .truncate(true)
+        .truncate(truncate)
         .mode(0o600)
-        .open(&tmp)?;
-    f.write_all(text.as_bytes())?;
-    std::fs::rename(&tmp, path)
+        .open(path)
+}
+
+/// Replace `path` with `text` through a temporary file of a name no other process uses.
+fn write_private(path: &Path, text: &str) -> std::io::Result<()> {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.subsec_nanos());
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(format!(".{}.{nanos}.tmp", std::process::id()));
+    let tmp = path.with_file_name(name);
+    let written = open_private(&tmp, true)
+        .and_then(|mut f| f.write_all(text.as_bytes()))
+        .and_then(|()| std::fs::rename(&tmp, path));
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    written
 }
 
 fn read_history(path: &Path) -> Vec<String> {
@@ -303,5 +332,34 @@ mod tests {
         use std::os::unix::fs::PermissionsExt as _;
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600);
+        // Nothing but the file and its lock is left behind.
+        let mut names: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["h", "h.lock"]);
+    }
+
+    /// Review T30-M6: REPLs writing at once lose no entry.
+    #[test]
+    fn concurrent_writers_keep_every_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("h");
+        let threads: Vec<_> = (0..8)
+            .map(|t| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    let h = HistoryFile::new(Some(path));
+                    for i in 0..20 {
+                        h.add(&format!("t{t}-{i}"));
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        assert_eq!(read_history(&path).len(), 160);
     }
 }

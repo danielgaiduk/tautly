@@ -1071,3 +1071,102 @@ fn session_allow_rules_rank_with_config_allows_below_deny_and_protected() {
     // A new policy (a resumed session) has none of them.
     assert!(asks(run(&p(Mode::Ask), "cargo test -p x")));
 }
+
+// --- review T30-I2: write redirects are part of what an allow rule must match ---
+#[test]
+fn allow_rules_do_not_cover_write_redirects_they_do_not_name() {
+    let run = |pol: &Policy, raw: &str| pol.decide("bash", &exec("sh"), Some(raw));
+    let mut session = p(Mode::Ask);
+    session.add_session_allow("bash(cargo test)").unwrap();
+    // Configured allow rules had the same gap: both kinds are fixed in one place.
+    let config = with_rules(Mode::Ask, &["bash(cargo test)"], &[]);
+    for pol in [&session, &config] {
+        assert_eq!(run(pol, "cargo test"), Decision::Allow);
+        assert_eq!(run(pol, "cargo test 2>&1"), Decision::Allow);
+        assert_eq!(run(pol, "cargo test > /dev/null"), Decision::Allow);
+        assert_eq!(run(pol, "cargo test < input.txt"), Decision::Allow);
+        for raw in [
+            "cargo test > src/lib.rs",
+            "cargo test >> src/main.rs",
+            "cargo test &> out.log",
+            "cargo test > Cargo.toml",
+            "cargo test > /tmp/x",
+        ] {
+            assert!(asks(run(pol, raw)), "{raw}");
+        }
+    }
+    // A pattern that reaches the redirect, or names it, still allows it.
+    let wide = with_rules(Mode::Ask, &["bash(cargo test*)"], &[]);
+    assert_eq!(run(&wide, "cargo test > out.txt"), Decision::Allow);
+    let named = with_rules(Mode::Ask, &["bash(cargo test > out.txt)"], &[]);
+    assert_eq!(run(&named, "cargo test > out.txt"), Decision::Allow);
+    assert!(asks(run(&named, "cargo test > other.txt")));
+}
+
+// --- review T30-M2: the exact rule comes from the policy's own parser ---
+#[test]
+fn exact_rule_is_built_from_the_parsed_call_and_matches_it() {
+    let pol = p(Mode::Ask);
+    let sh = exec("sh");
+    let rule = |raw: &str| pol.exact_rule("bash", &sh, Some(raw));
+    assert_eq!(
+        rule("git commit -m \"fix the  bug\"").as_deref(),
+        Some("bash(git commit -m fix the  bug)")
+    );
+    assert_eq!(
+        rule("cargo   test\t-p x").as_deref(),
+        Some("bash(cargo test -p x)")
+    );
+    assert_eq!(rule("ls *.rs").as_deref(), Some("bash(ls \\*.rs)"));
+    assert_eq!(
+        rule("cargo test > out.txt").as_deref(),
+        Some("bash(cargo test > out.txt)")
+    );
+    // No single rule names these.
+    for raw in [
+        "a && b",
+        "echo ok\nrm x",
+        "echo $(date)",
+        "echo $(",
+        "echo '(x)'",
+    ] {
+        assert_eq!(rule(raw), None, "{raw}");
+    }
+    for raw in [
+        "git commit -m \"fix the  bug\"",
+        "cargo test > out.txt",
+        "ls *.rs",
+    ] {
+        let r = rule(raw).unwrap();
+        assert!(pol.rule_matches(&r, "bash", &sh, Some(raw)).unwrap(), "{r}");
+    }
+    assert_eq!(
+        pol.exact_rule("edit", &write("/ws/src/a.rs"), None)
+            .as_deref(),
+        Some("edit(src/a.rs)")
+    );
+    assert_eq!(
+        pol.exact_rule("write", &write("./b[1].txt"), None)
+            .as_deref(),
+        Some("write(b\\[1\\].txt)")
+    );
+    assert_eq!(
+        pol.exact_rule("edit", &write("/elsewhere/a.rs"), None),
+        None
+    );
+    let two = Effect::Write {
+        paths: vec!["a".into(), "b".into()],
+    };
+    assert_eq!(pol.exact_rule("edit", &two, None), None);
+    assert_eq!(
+        pol.exact_rule("web_fetch", &net("docs.rs"), None)
+            .as_deref(),
+        Some("web_fetch(docs.rs)")
+    );
+    assert_eq!(
+        pol.exact_rule("mcp__gh__create_issue", &exec("srv"), None)
+            .as_deref(),
+        Some("mcp__gh__create_issue")
+    );
+    assert_eq!(pol.exact_rule("read", &Effect::ReadOnly, None), None);
+}

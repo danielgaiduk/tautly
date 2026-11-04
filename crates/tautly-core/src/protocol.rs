@@ -421,9 +421,12 @@ pub enum Command {
     /// `session_rule` ("allow for this session", spec 7.11.8; tool calls only) is an allow
     /// rule (`bash(cargo test*)`, `edit(src/a.rs)`, `mcp__github__*`) added for as long as
     /// the engine runs. It is accepted only when it matches the pending call; otherwise the
-    /// call is approved once with a `Warning`. It never outranks a deny rule, a protected
-    /// path or an unparseable command, is never written to configuration or to the session
-    /// log, and is gone after a resume.
+    /// call is approved once with a `Warning` (an accepted one is announced with a
+    /// `Warning` too: `allowed for this session: <rule>`). It never outranks a deny rule, a
+    /// protected path or an unparseable command, never covers a write redirect it does not
+    /// name, is never written to configuration or to the session log, and is gone after a
+    /// resume. On an MCP server approval it is refused with an `Error` and the request stays
+    /// pending ([`crate::exact_rule`] builds the rule a client offers).
     Approve {
         request_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]

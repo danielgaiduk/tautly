@@ -167,6 +167,19 @@ pub fn install_signal_handlers(engine: &Engine) -> std::io::Result<()> {
     install_into(&INSTALLED, listen, |router| router.add(engine))
 }
 
+/// The router behind [`install_termination_handlers`] (SIGTERM and SIGHUP only).
+static TERMINATION: Mutex<Installed> = Mutex::new(None);
+
+/// Like [`install_signal_handlers`], for SIGTERM and SIGHUP only: SIGINT keeps its
+/// default disposition until the client listens for it itself. For a client that owns
+/// Ctrl-C (the REPL: a cancel, then an exit), so that no second listener counts presses
+/// on its own clock. A process uses one of the two installers, not both.
+pub fn install_termination_handlers(engine: &Engine) -> std::io::Result<()> {
+    install_into(&TERMINATION, listen_termination, |router| {
+        router.add(engine)
+    })
+}
+
 /// [`install_signal_handlers`] on `slot`: start the listener with `listen` unless it runs,
 /// then `register` the engine with the router.
 fn install_into(
@@ -213,6 +226,21 @@ fn listen(router: &Arc<SignalRouter>) -> std::io::Result<JoinHandle<()>> {
             else => return None,
         };
         Some((sig, (int, term, hup)))
+    });
+    Ok(handle_signals(router, signals))
+}
+
+/// SIGTERM and SIGHUP, fed to `router`.
+fn listen_termination(router: &Arc<SignalRouter>) -> std::io::Result<JoinHandle<()>> {
+    let term = signal(SignalKind::terminate())?;
+    let hup = signal(SignalKind::hangup())?;
+    let signals = futures::stream::unfold((term, hup), |(mut term, mut hup)| async {
+        let sig = tokio::select! {
+            Some(()) = term.recv() => Signal::Terminate,
+            Some(()) = hup.recv() => Signal::Hangup,
+            else => return None,
+        };
+        Some((sig, (term, hup)))
     });
     Ok(handle_signals(router, signals))
 }

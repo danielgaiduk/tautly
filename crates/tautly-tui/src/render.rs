@@ -255,16 +255,13 @@ pub fn event(e: &Event, st: &mut RenderState, opts: &ReplOptions) -> Option<Stri
             diff,
             ..
         } => {
-            let shown = st
-                .target(call_id)
-                .map_or_else(|| target(tool, args), str::to_string);
             st.mark_asked(call_id);
             let mut out = format!(
-                "{} {} {}\n  {}\n",
+                "{} {}  ({})\n{}",
                 paint(YELLOW, "?"),
                 paint(BOLD, &printable(tool)),
-                shown,
-                printable(reason)
+                printable(reason),
+                approval_args(tool, args)
             );
             if let Some(d) = diff {
                 out.push_str(&diff_text(&d.unified, opts.color));
@@ -388,7 +385,12 @@ pub fn event(e: &Event, st: &mut RenderState, opts: &ReplOptions) -> Option<Stri
         Event::SessionChanged { session_id } => {
             let first = st.session.is_none();
             st.session = Some(session_id.clone());
-            (!first).then(|| st.line(paint(DIM, &format!("now on session {session_id}"))))
+            (!first).then(|| {
+                st.line(paint(
+                    DIM,
+                    &format!("now on session {}", printable(session_id)),
+                ))
+            })
         }
         Event::TurnReceipt { .. } => {
             let r = Receipt::from_event(e)?;
@@ -628,6 +630,42 @@ pub fn evidence_line(ev: &TestEvidence) -> String {
     )
 }
 
+/// Most lines of arguments an approval shows before `(N more lines)`.
+pub const APPROVAL_LINES: usize = 200;
+
+/// What an approval shows of a call, in full (never the row's 60-column cut): a command
+/// line by line (a newline in it starts a new `$` line, so two commands never read as
+/// one), a path, a URL, or the arguments as pretty-printed JSON (MCP tools and the rest).
+/// Escaped (spec 3.4); capped at [`APPROVAL_LINES`] lines with a marker.
+pub fn approval_args(tool: &str, args: &Value) -> String {
+    let arg = |k: &str| args.get(k).and_then(Value::as_str);
+    let lines: Vec<String> = match (tool, arg("command"), arg("path"), arg("url")) {
+        ("bash", Some(cmd), _, _) => printable_multiline(cmd)
+            .split('\n')
+            .enumerate()
+            .map(|(i, l)| format!("  {} {l}", if i == 0 { "$" } else { ">" }))
+            .collect(),
+        ("edit" | "write", _, Some(path), _) => vec![format!("  {}", printable(path))],
+        ("web_fetch", _, _, Some(url)) => vec![format!("  {}", printable(url))],
+        _ => {
+            let json = serde_json::to_string_pretty(args).unwrap_or_default();
+            printable_multiline(&json)
+                .split('\n')
+                .map(|l| format!("  {l}"))
+                .collect()
+        }
+    };
+    let mut out = String::new();
+    for l in lines.iter().take(APPROVAL_LINES) {
+        out.push_str(l);
+        out.push('\n');
+    }
+    if lines.len() > APPROVAL_LINES {
+        let _ = writeln!(out, "  ({} more lines)", lines.len() - APPROVAL_LINES);
+    }
+    out
+}
+
 /// A call's target as its row shows it: the command, path, pattern or URL, escaped and
 /// cut to [`TARGET_COLUMNS`].
 pub fn target(tool: &str, args: &Value) -> String {
@@ -692,7 +730,8 @@ fn diff_stat(d: &DiffPreview) -> (u32, u32) {
 /// A unified diff, escaped line by line, coloured when `color` is on.
 pub fn diff_text(unified: &str, color: bool) -> String {
     let mut out = String::new();
-    for raw in unified.lines() {
+    // Split on `\n` only: a `\r` stays and shows (`\r`), so a CRLF change is visible.
+    for raw in unified.split_terminator('\n') {
         let line = printable_multiline(raw);
         let code = if raw.starts_with("+++") || raw.starts_with("---") {
             BOLD

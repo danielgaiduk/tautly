@@ -36,7 +36,7 @@ use tautly_tools::{Tool, registry};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use crate::approvals::{Approvals, Verdict};
+use crate::approvals::{ApprovalFor, Approvals, Verdict};
 use crate::checkpoint::Point;
 use crate::config::Config;
 use crate::protocol::Event;
@@ -549,7 +549,7 @@ impl McpSession {
             );
         }
         for (name, spec, source, k, rememberable) in ask {
-            let Some((request_id, rx)) = approvals.open() else {
+            let Some((request_id, rx)) = approvals.open(ApprovalFor::McpServer) else {
                 continue;
             };
             hub.note(&name, source, McpState::AwaitingApproval, None);
