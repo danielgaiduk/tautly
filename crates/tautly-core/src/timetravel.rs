@@ -224,7 +224,7 @@ impl StepCounter {
     pub fn see(&mut self, rec: &SessionRecord) -> Option<(u32, u32)> {
         match rec {
             SessionRecord::TurnStart { turn, .. } => {
-                self.last += 1;
+                self.last = self.last.saturating_add(1);
                 self.open = None;
                 Some((self.last, *turn))
             }
@@ -298,7 +298,7 @@ fn earliest(values: Vec<(RelPath, Option<BlobRef>)>) -> Vec<(RelPath, Option<Blo
 }
 
 /// What `rec` (an `Edit` or `Undone`) wrote before: `(path, content before)` each.
-fn befores(rec: &SessionRecord) -> Vec<(RelPath, Option<BlobRef>)> {
+pub(crate) fn befores(rec: &SessionRecord) -> Vec<(RelPath, Option<BlobRef>)> {
     match rec {
         SessionRecord::Edit {
             path, pre_image, ..
@@ -407,14 +407,14 @@ pub fn state_at(reader: &SessionReader<SessionRecord>, at: u32) -> Result<FileSt
 
 /// What the `Edit`s after a `ToolResult` say of each path's new content.
 #[derive(Default)]
-struct Writes {
+pub(crate) struct Writes {
     /// What the result the edits follow did to each path (deleted or edited).
     kinds: std::collections::HashMap<RelPath, bool>,
 }
 
 impl Writes {
     /// What `rec` left in its paths (`None`: not known), or nothing when it writes none.
-    fn see(&mut self, rec: &SessionRecord) -> Vec<(RelPath, Option<Option<BlobRef>>)> {
+    pub(crate) fn see(&mut self, rec: &SessionRecord) -> Vec<(RelPath, Option<Option<BlobRef>>)> {
         match rec {
             SessionRecord::ToolResult { effects, .. } => {
                 self.kinds.clear();
@@ -463,7 +463,7 @@ impl Writes {
 }
 
 /// A record that may have changed files no record names: a command ran.
-fn ran_command(rec: &SessionRecord) -> bool {
+pub(crate) fn ran_command(rec: &SessionRecord) -> bool {
     match rec {
         SessionRecord::ToolResult { effects, .. } => effects.iter().any(|e| {
             matches!(

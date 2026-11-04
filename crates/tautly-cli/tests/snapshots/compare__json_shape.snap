@@ -1,0 +1,131 @@
+---
+source: crates/tautly-cli/tests/compare.rs
+expression: "redact(&serde_json::to_string_pretty(&v).unwrap(), &t)"
+---
+{
+  "files": [
+    {
+      "path": "a.txt",
+      "sessions": [
+        "<a>"
+      ]
+    },
+    {
+      "path": "b.txt",
+      "sessions": [
+        "<b>"
+      ]
+    },
+    {
+      "path": "both.txt",
+      "sessions": [
+        "<a>",
+        "<b>"
+      ]
+    }
+  ],
+  "fork_point": {
+    "offset": 4,
+    "session_id": "<p>",
+    "step": 2
+  },
+  "sessions": [
+    {
+      "added": 3,
+      "blocked": 0,
+      "cache_read": 0,
+      "cost_estimated": false,
+      "cost_partial": false,
+      "cost_usd": 0.0024,
+      "edit_failures": 1,
+      "evidence": {
+        "command": "cargo test --secret-path /home/x",
+        "edits_since": 0,
+        "execs_since": 0,
+        "exit_code": 0,
+        "failed": 0,
+        "passed": 12,
+        "stale": false,
+        "step": 4,
+        "write_gen": 1
+      },
+      "files": [
+        "a.txt",
+        "both.txt"
+      ],
+      "label": "try-a",
+      "models": [
+        "m/a"
+      ],
+      "notes": [],
+      "removed": 1,
+      "session_id": "<a>",
+      "steps": 1,
+      "tokens_in": 2000,
+      "tokens_out": 200,
+      "tool_calls": 2,
+      "user_turns": 1,
+      "wall_ms": 4200
+    },
+    {
+      "added": 2,
+      "blocked": 0,
+      "cache_read": 0,
+      "cost_estimated": true,
+      "cost_partial": false,
+      "cost_usd": 0.0045000000000000005,
+      "edit_failures": 0,
+      "evidence": {
+        "command": "cargo test --secret-path /home/x",
+        "edits_since": 1,
+        "execs_since": 0,
+        "exit_code": 1,
+        "failed": 2,
+        "passed": 10,
+        "stale": true,
+        "step": 5,
+        "write_gen": 1
+      },
+      "files": [
+        "b.txt",
+        "both.txt"
+      ],
+      "label": "try-b\u001b[31m",
+      "models": [
+        "m/a",
+        "m/small"
+      ],
+      "notes": [],
+      "removed": 0,
+      "session_id": "<b>",
+      "steps": 3,
+      "tokens_in": 4000,
+      "tokens_out": 400,
+      "tool_calls": 0,
+      "user_turns": 2,
+      "wall_ms": 6000
+    },
+    {
+      "added": 0,
+      "blocked": 0,
+      "cache_read": 0,
+      "cost_estimated": false,
+      "cost_partial": false,
+      "cost_usd": 0.0,
+      "edit_failures": 0,
+      "evidence": null,
+      "files": [],
+      "label": null,
+      "models": [],
+      "notes": [],
+      "removed": 0,
+      "session_id": "<p>",
+      "steps": 0,
+      "tokens_in": 0,
+      "tokens_out": 0,
+      "tool_calls": 0,
+      "user_turns": 0,
+      "wall_ms": 0
+    }
+  ]
+}

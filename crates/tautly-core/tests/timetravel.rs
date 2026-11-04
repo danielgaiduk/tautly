@@ -890,6 +890,46 @@ async fn fork_children_own_checkpoint_refs() {
     run.stop().await;
 }
 
+/// Compare's ledger rule (Task 52) relies on this: a fork's ledger rows are its own
+/// requests only, never the parent's it copied, so the rows cover exactly the records
+/// after its header's parent offset.
+#[tokio::test]
+async fn a_fork_childs_ledger_rows_hold_only_its_post_fork_requests() {
+    let repo = Repo::git_repo();
+    let mock = MockProvider::new(vec![text_step("one"), text_step("two"), text_step("three")]);
+    let mut run = Run::start(repo.builder(&mock));
+    run.turn_with("first").await;
+    let (parent, _) = run.current();
+    run.engine
+        .send(Command::Fork {
+            at: None,
+            label: Some("b".into()),
+        })
+        .await
+        .unwrap();
+    run.until(|e| matches!(e, Event::SessionChanged { .. }))
+        .await;
+    let (child, child_log) = run.current();
+    assert_ne!(child, parent);
+    run.turn_with("second").await;
+    run.turn_with("third").await;
+    run.stop().await;
+
+    let ledger =
+        tautly_core::Ledger::open(&repo.home().join(tautly_core::ledger::LEDGER_FILE)).unwrap();
+    assert_eq!(ledger.session_totals(&parent).unwrap().requests, 1);
+    assert_eq!(ledger.session_totals(&child).unwrap().requests, 2);
+
+    // Compare, cut at the child's own fork record, takes the child's rows as they are.
+    let r = reader(&child_log);
+    let cut = r.header().parent.as_ref().unwrap().1;
+    let s = tautly_core::compare::summarize_at(&r, Some(&ledger), &Catalog::default(), Some(cut))
+        .unwrap();
+    let rows = ledger.session_totals(&child).unwrap();
+    assert_eq!((s.tokens_in, s.tokens_out), (rows.input, rows.output));
+    assert_eq!(s.user_turns, 2);
+}
+
 // ------------------------------------------------------------ labels and the tree
 
 #[tokio::test]
