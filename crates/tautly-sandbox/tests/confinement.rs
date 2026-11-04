@@ -127,6 +127,62 @@ async fn spawn_runs_in_cwd_with_env() {
     assert_eq!(out.trim(), "bar");
 }
 
+/// Review N2: a bare program name is looked up on the child's `PATH` with the rule git
+/// already followed (absolute entries outside the root only), so `PATH=bin:...` or an
+/// empty entry cannot make a user-trusted MCP server run a program the repository ships.
+#[tokio::test]
+async fn spawn_never_runs_a_bare_name_from_the_work_tree() {
+    use std::os::unix::fs::PermissionsExt;
+    use tautly_sandbox::SpawnSpec;
+    use tokio::io::AsyncReadExt;
+    let (t, sb) = sandbox();
+    let tools = tempfile::tempdir().unwrap();
+    let script = |path: &Path, says: &str| {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, format!("#!/bin/sh\necho {says}\n")).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    };
+    script(&t.path().join("bin/mytool"), "REPO");
+    script(&t.path().join("mytool"), "REPO");
+    script(&tools.path().join("mytool"), "OUTSIDE");
+    let run = |path: String| {
+        let sb = sb.clone();
+        async move {
+            let mut child = sb
+                .spawn(SpawnSpec {
+                    argv: vec!["mytool".into()],
+                    cwd: ".".into(),
+                    env: vec![("PATH".into(), path)],
+                    env_remove: vec![],
+                    new_process_group: true,
+                })
+                .await?;
+            let mut out = String::new();
+            child
+                .stdout
+                .take()
+                .unwrap()
+                .read_to_string(&mut out)
+                .await
+                .unwrap();
+            Ok::<_, SandboxError>(out.trim().to_string())
+        }
+    };
+    let o = tools.path().display();
+    for path in [format!("bin:{o}"), format!(":{o}")] {
+        assert_eq!(run(path.clone()).await.unwrap(), "OUTSIDE", "PATH={path}");
+    }
+    // Only the repository's: a clear error, nothing run.
+    let err = run(format!("bin::{}", t.path().join("bin").display()))
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("mytool not found on PATH outside the work tree"),
+        "{err}"
+    );
+}
+
 #[tokio::test]
 async fn write_atomic_new_file_gets_umask_default_mode() {
     use std::os::unix::fs::MetadataExt;

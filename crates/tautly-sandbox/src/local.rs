@@ -108,7 +108,30 @@ impl LocalSandbox {
             .split_first()
             .ok_or_else(|| SandboxError::Denied("empty argv".into()))?;
         let cwd = self.resolve(&spec.cwd)?;
-        let mut cmd = Command::new(prog);
+        // A bare name is looked up here, not by the OS: on the child's `PATH`, absolute
+        // entries outside the root only (`which_outside`), so a relative or empty entry
+        // cannot run a program the repository ships. It keeps its bare name as arg0.
+        let mut cmd = if prog.contains('/') {
+            Command::new(prog)
+        } else {
+            let path = match spec.env.iter().rev().find(|(k, _)| k == "PATH") {
+                Some((_, v)) => Some(std::ffi::OsString::from(v)),
+                None if spec.env_remove.iter().any(|k| k == "PATH") => None,
+                None => std::env::var_os("PATH"),
+            };
+            let found = path
+                .as_deref()
+                .and_then(|p| crate::which_outside(prog, p, &self.root))
+                .ok_or_else(|| {
+                    SandboxError::Io(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        format!("{prog} not found on PATH outside the work tree"),
+                    ))
+                })?;
+            let mut cmd = Command::new(found);
+            cmd.arg0(prog);
+            cmd
+        };
         cmd.args(args)
             .current_dir(cwd)
             .envs(spec.env.iter().map(|(k, v)| (k, v)))
