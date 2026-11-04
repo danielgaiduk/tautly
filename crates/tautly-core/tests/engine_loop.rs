@@ -367,6 +367,7 @@ async fn ask_emits_approval_and_waits() {
     run.engine
         .send(Command::Approve {
             request_id: request_id.clone(),
+            session_rule: None,
         })
         .await
         .unwrap();
@@ -1749,6 +1750,7 @@ async fn a_pin_queued_behind_a_message_reaches_that_turn() {
     run.engine
         .send(Command::Approve {
             request_id: request_id.clone(),
+            session_rule: None,
         })
         .await
         .unwrap();

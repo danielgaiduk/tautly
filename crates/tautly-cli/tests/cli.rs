@@ -58,6 +58,7 @@ fn help_lists_the_flags() {
         "--resume",
         "--rpc",
         "--no-checkpoints",
+        "--no-footer",
         "auto-edit",
         "yolo",
     ] {
@@ -86,12 +87,15 @@ fn bad_flags_are_usage_errors() {
     }
 }
 
+/// Without `-p`, `--rpc` or a command the REPL runs, which needs a terminal (these runs
+/// have none).
 #[test]
 fn without_a_mode_it_says_what_to_use() {
     let s = Scratch::new();
     let out = s.run(&[]);
     assert_eq!(out.status.code(), Some(2));
     let err = stderr(&out);
+    assert!(err.contains("the REPL needs a terminal"), "{err}");
     assert!(err.contains("-p") && err.contains("--rpc"), "{err}");
 }
 

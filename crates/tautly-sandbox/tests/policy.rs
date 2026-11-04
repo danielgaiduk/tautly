@@ -1004,3 +1004,70 @@ fn mcp_rules_match_tool_names_and_globs() {
         assert!(Policy::new(cfg, PathBuf::from("/ws")).is_err(), "{bad}");
     }
 }
+
+// --- session rules (spec 7.11.8) ---
+#[test]
+fn rule_matches_needs_every_subject_of_the_call() {
+    let pol = p(Mode::Ask);
+    let sh = exec("sh");
+    let m = |rule: &str, tool: &str, e: &Effect, raw: Option<&str>| {
+        pol.rule_matches(rule, tool, e, raw).unwrap()
+    };
+    let raw = Some("cargo  test -p x");
+    assert!(m("bash(cargo test -p x)", "bash", &sh, raw));
+    assert!(m("bash(cargo test*)", "bash", &sh, raw));
+    assert!(!m("bash(cargo build*)", "bash", &sh, raw));
+    assert!(!m("edit(cargo test*)", "bash", &sh, raw));
+    // Every component of a compound command must match; unparseable input matches none.
+    assert!(!m(
+        "bash(cargo test*)",
+        "bash",
+        &sh,
+        Some("cargo test && rm -rf x")
+    ));
+    assert!(!m("bash", "bash", &sh, Some("echo $(")));
+    assert!(m("edit(src/a.rs)", "edit", &write("src/a.rs"), None));
+    assert!(m("edit(src/a.rs)", "edit", &write("/ws/src/a.rs"), None));
+    assert!(!m("edit(src/a.rs)", "edit", &write("src/b.rs"), None));
+    assert!(m("web_fetch(docs.rs)", "web_fetch", &net("docs.rs"), None));
+    assert!(!m(
+        "web_fetch(crates.io)",
+        "web_fetch",
+        &net("docs.rs"),
+        None
+    ));
+    let mcp = exec("server");
+    assert!(m("mcp__gh__create", "mcp__gh__create", &mcp, None));
+    assert!(m("mcp__gh__*", "mcp__gh__create", &mcp, None));
+    assert!(!m("mcp__gh__list", "mcp__gh__create", &mcp, None));
+    assert!(pol.rule_matches("bash(a(b)", "bash", &sh, None).is_err());
+    // An exact rule escapes glob characters: it matches the literal command only.
+    assert!(m("bash(ls \\*.rs)", "bash", &sh, Some("ls *.rs")));
+    assert!(!m("bash(ls \\*.rs)", "bash", &sh, Some("ls a.rs")));
+    assert!(m("edit(a\\[1\\].txt)", "edit", &write("a[1].txt"), None));
+    assert!(!m("edit(a\\[1\\].txt)", "edit", &write("a1.txt"), None));
+}
+
+#[test]
+fn session_allow_rules_rank_with_config_allows_below_deny_and_protected() {
+    let mut pol = with_rules(
+        Mode::Ask,
+        &["bash(git status)"],
+        &["bash(cargo test --all*)"],
+    );
+    let run = |pol: &Policy, raw: &str| pol.decide("bash", &exec("sh"), Some(raw));
+    assert!(asks(run(&pol, "cargo test -p x")));
+    pol.add_session_allow("bash(cargo test*)").unwrap();
+    assert_eq!(run(&pol, "cargo test -p x"), Decision::Allow);
+    // Components may be allowed by a configured rule and a session rule together.
+    assert_eq!(run(&pol, "git status && cargo test"), Decision::Allow);
+    assert!(matches!(
+        run(&pol, "cargo test --all"),
+        Decision::Deny { .. }
+    ));
+    pol.add_session_allow("edit(Cargo.toml)").unwrap();
+    assert!(asks(pol.decide("edit", &write("Cargo.toml"), None)));
+    assert!(pol.add_session_allow("bash(a(b)").is_err());
+    // A new policy (a resumed session) has none of them.
+    assert!(asks(run(&p(Mode::Ask), "cargo test -p x")));
+}

@@ -66,7 +66,7 @@ pub use tautly_provider::{ModelId, ProviderEvent, Quota, RawUsage};
 // What a client needs to fill `CliOverrides` and to find the data directory.
 pub use tautly_sandbox::Mode;
 pub use tautly_session::paths::data_home;
-pub use tautly_tools::DiffPreview;
+pub use tautly_tools::{DiffPreview, SaveKind, Saved};
 // What the CLI's utility commands (`tautly prompt|sessions|models|mcp ...`) read, so that
 // `tautly-cli` depends on this crate alone.
 pub use tautly_context::prompt::system as system_prompt;

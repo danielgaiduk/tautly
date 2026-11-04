@@ -1,0 +1,102 @@
+//! Slash commands (spec 7.11.8).
+
+/// A line that starts with `/`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Slash {
+    /// `/model [id]`: switch, or list the current model and those with a key.
+    Model(Option<String>),
+    /// `/cost`: the last turn's and the session's receipt.
+    Cost,
+    /// `/diff [N]`: the session's (or user turn N's) net change.
+    Diff(Option<u32>),
+    /// `/undo [N]`: show the dry run, ask, then undo.
+    Undo(Option<u32>),
+    /// `/resume [n|id]`: list the work tree's last sessions, or resume one.
+    Resume(Option<String>),
+    Compact,
+    Pin(String),
+    Unpin(String),
+    Fork,
+    MemoryConsolidate,
+    Help,
+    /// Anything else (or a known command with arguments it does not take): the help is
+    /// printed.
+    Unknown(String),
+}
+
+/// What `/help` (and an unknown command) prints.
+pub const HELP: &str = "\
+commands:
+  /model [id]          switch model; without an id, list the current one and those with a key
+  /cost                the last turn's and the session's receipt
+  /diff [N]            what the session (or user turn N) changed
+  /undo [N]            undo the last turn (or turn N), after showing what it would do
+  /resume [n|id]       list this work tree's last sessions, or resume one
+  /compact             compact the conversation now
+  /pin <text>          keep <text> in the context
+  /unpin <text>        remove that pin
+  /fork                branch the conversation into a new session
+  /memory consolidate  propose merging and pruning project memory
+  /help                this list
+keys: Ctrl+C cancels a turn (twice within 2 s exits), clears the line at the prompt;
+      Ctrl+D on an empty line exits; Alt+Enter starts a new line";
+
+/// The slash command `line` names, or None when it is a message (no leading `/`).
+pub fn parse(line: &str) -> Option<Slash> {
+    let line = line.trim();
+    let rest = line.strip_prefix('/')?;
+    let (name, arg) = match rest.split_once(char::is_whitespace) {
+        Some((n, a)) => (n, a.trim()),
+        None => (rest, ""),
+    };
+    let arg = (!arg.is_empty()).then(|| arg.to_string());
+    let unknown = || Slash::Unknown(line.to_string());
+    let number = |a: &Option<String>| match a {
+        None => Some(None),
+        Some(s) => s.parse::<u32>().ok().filter(|n| *n > 0).map(Some),
+    };
+    Some(match (name, arg) {
+        ("model", a) => Slash::Model(a),
+        ("cost", None) => Slash::Cost,
+        ("diff", a) => number(&a).map_or_else(unknown, Slash::Diff),
+        ("undo", a) => number(&a).map_or_else(unknown, Slash::Undo),
+        ("resume", a) => Slash::Resume(a),
+        ("compact", None) => Slash::Compact,
+        ("pin", Some(t)) => Slash::Pin(t),
+        ("unpin", Some(t)) => Slash::Unpin(t),
+        ("fork", None) => Slash::Fork,
+        ("memory", Some(a)) if a == "consolidate" => Slash::MemoryConsolidate,
+        ("help", None) => Slash::Help,
+        _ => unknown(),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_commands_and_rejects_bad_arguments() {
+        assert_eq!(parse("hello"), None);
+        assert_eq!(parse("/model"), Some(Slash::Model(None)));
+        assert_eq!(parse("/model a/b"), Some(Slash::Model(Some("a/b".into()))));
+        assert_eq!(parse("/diff 2"), Some(Slash::Diff(Some(2))));
+        assert_eq!(parse(" /diff "), Some(Slash::Diff(None)));
+        assert_eq!(parse("/undo"), Some(Slash::Undo(None)));
+        assert_eq!(
+            parse("/pin  use pnpm "),
+            Some(Slash::Pin("use pnpm".into()))
+        );
+        assert_eq!(parse("/memory consolidate"), Some(Slash::MemoryConsolidate));
+        for bad in [
+            "/diff x",
+            "/diff 0",
+            "/pin",
+            "/memory",
+            "/cost now",
+            "/nope",
+        ] {
+            assert_eq!(parse(bad), Some(Slash::Unknown(bad.into())), "{bad}");
+        }
+    }
+}

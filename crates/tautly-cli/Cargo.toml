@@ -1,6 +1,6 @@
 [package]
 name = "tautly"
-description = "The `tautly` command: one-shot (`-p`), JSON-RPC (`--rpc`) and utility commands"
+description = "The `tautly` command: the REPL, one-shot (`-p`), JSON-RPC (`--rpc`) and utility commands"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -19,12 +19,14 @@ mock = ["dep:tautly-provider"]
 [dependencies]
 tautly-core = { path = "../tautly-core" }
 tautly-rpc = { path = "../tautly-rpc" }
+tautly-tui = { path = "../tautly-tui" }
 tautly-provider = { path = "../tautly-provider", optional = true }
 # `tautly doctor`: the code index's state and where its database lives.
 tautly-index = { path = "../tautly-index" }
 tautly-session = { path = "../tautly-session" }
 anyhow.workspace = true
 clap.workspace = true
+futures.workspace = true
 reqwest.workspace = true
 rpassword.workspace = true
 serde_json.workspace = true

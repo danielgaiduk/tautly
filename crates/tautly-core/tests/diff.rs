@@ -273,7 +273,11 @@ async fn approval_carries_diff_preview() {
     );
     assert!(!diff.truncated);
     assert_eq!(fx.slurp("src/lib.rs"), "fn a() {}\nfn old() {}\n");
-    run.send(Command::Approve { request_id }).await;
+    run.send(Command::Approve {
+        request_id,
+        session_rule: None,
+    })
+    .await;
     let events = run.turn().await;
     assert_eq!(reason(&events), FinishReason::Completed);
     let f = finished(&events);
@@ -323,7 +327,11 @@ async fn file_changed_after_approval_fails_stale() {
     let (_, request_id, diff) = run.approve_next().await;
     assert!(diff.is_some());
     fx.write("a.txt", "alpha\nbeta\nexternal\n");
-    run.send(Command::Approve { request_id }).await;
+    run.send(Command::Approve {
+        request_id,
+        session_rule: None,
+    })
+    .await;
     let events = run.turn().await;
     let f = finished(&events);
     let edit = f.iter().find(|f| f.0 == "e1").unwrap();
@@ -364,7 +372,11 @@ async fn tool_finished_carries_applied_diff_in_every_mode() {
             for _ in 0..2 {
                 let (evs, request_id, _) = run.approve_next().await;
                 events.extend(evs);
-                run.send(Command::Approve { request_id }).await;
+                run.send(Command::Approve {
+                    request_id,
+                    session_rule: None,
+                })
+                .await;
             }
         }
         events.extend(run.turn().await);
@@ -522,6 +534,7 @@ async fn session_diff_reply_waits_for_a_full_event_channel() {
     for i in 0..300 {
         run.send(Command::Approve {
             request_id: format!("nope-{i}"),
+            session_rule: None,
         })
         .await;
     }

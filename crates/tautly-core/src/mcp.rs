@@ -590,8 +590,8 @@ impl McpSession {
                 let verdict = rx.await.unwrap_or(Verdict::Denied { reason: None });
                 lock(&pending).retain(|(id, _)| *id != request_id);
                 match verdict {
-                    Verdict::Approved if !rememberable => hub.add(name, spec, source),
-                    Verdict::Approved => {
+                    Verdict::Approved { .. } if !rememberable => hub.add(name, spec, source),
+                    Verdict::Approved { .. } => {
                         let (n, r) = (name.clone(), root.clone());
                         let saved = tokio::task::spawn_blocking(move || {
                             ApprovalStore::open(&store_path).approve(&k, &r, &n)

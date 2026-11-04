@@ -6,13 +6,15 @@
 //! - `tautly --rpc` serves the JSON-RPC protocol on stdin/stdout until the client sends
 //!   `shutdown` or disconnects (exit 0), or SIGTERM / SIGHUP arrives (143 / 129, after
 //!   every session has shut down).
+//! - `tautly` alone, on a terminal, runs the daily-driver REPL (spec 7.11.8): messages,
+//!   approvals (`y`, `n`, `a` for this session), slash commands, a receipt after each turn.
 //! - `tautly auth add <provider>` stores an API key in the OS keychain; `tautly doctor`
 //!   checks the setup (spec 7.11.2).
 //!
 //! `tautly prompt|sessions|models|undo|memory|index|mcp ...` are utility commands
 //! (`cmd`): they read or change what sessions leave behind and exit.
 //!
-//! Flags shared by `-p` and `--rpc`: `--approve auto-edit|yolo` (headless `ask` is
+//! Flags shared by `-p`, `--rpc` and the REPL: `--approve auto-edit|yolo` (headless `ask` is
 //! otherwise denied), `--approve-memory`, `--approve-mcp`, `--model ID`, `--budget-usd N`
 //! (a session budget, sent before the first message), `--continue` / `--resume ID`,
 //! `--no-checkpoints`. Command-line flags are trusted: they override every configuration
@@ -45,6 +47,7 @@ use tokio::sync::mpsc;
 
 mod cmd;
 mod local;
+mod repl;
 
 /// How long, after the sessions have shut down, background work may hold up the exit.
 const EXIT_GRACE: Duration = Duration::from_secs(2);
@@ -114,6 +117,10 @@ struct Cli {
     /// Take no git checkpoints before commands (undo then reverts only the agent's edits).
     #[arg(long)]
     no_checkpoints: bool,
+
+    /// Do not print the receipt footer after each turn of the REPL.
+    #[arg(long)]
+    no_footer: bool,
 
     /// Use a scripted provider: a JSON array of responses, each an array of provider
     /// events (tests).
@@ -197,8 +204,7 @@ impl Cli {
             }),
             approve_memory: self.approve_memory.then_some(true),
             checkpoints: self.no_checkpoints.then_some(false),
-            // No flag yet: the REPL (Task 30) adds one for its receipt footer.
-            receipts_footer: None,
+            receipts_footer: self.no_footer.then_some(false),
         }
     }
 
@@ -416,11 +422,12 @@ async fn run(mut cli: Cli) -> anyhow::Result<i32> {
         return cmd::run(command, &cli).await;
     }
     if cli.prompt.is_none() && !cli.rpc {
-        eprintln!(
-            "tautly: the interactive REPL is not available yet; use -p PROMPT or --rpc \
-             (see --help)"
-        );
-        return Ok(2);
+        if !repl::wanted() {
+            eprintln!("tautly: the REPL needs a terminal; use -p PROMPT or --rpc (see --help)");
+            return Ok(2);
+        }
+        let settings = Settings::new(&cli)?;
+        return repl::run(&cli, settings).await;
     }
     let settings = Settings::new(&cli)?;
     let root = std::env::current_dir().context("cannot read the current directory")?;

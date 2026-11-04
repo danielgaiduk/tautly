@@ -14,8 +14,14 @@ use tokio::sync::oneshot;
 /// The answer to one approval request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Verdict {
-    Approved,
-    Denied { reason: Option<String> },
+    /// Allowed; for a tool call, `session_rule` asks to allow calls it matches for the
+    /// rest of the session (spec 7.11.8), which the turn checks against the call first.
+    Approved {
+        session_rule: Option<String>,
+    },
+    Denied {
+        reason: Option<String>,
+    },
 }
 
 /// Shared between the actor (which receives `Approve`/`Deny`) and the turn (which waits).
@@ -94,13 +100,13 @@ mod tests {
         let (id1, rx1) = a.open().unwrap();
         let (id2, rx2) = a.open().unwrap();
         assert_ne!(id1, id2);
-        assert!(!a.resolve("nope", Verdict::Approved));
-        assert!(a.resolve(&id2, Verdict::Approved));
-        assert_eq!(rx2.await.unwrap(), Verdict::Approved);
+        assert!(!a.resolve("nope", Verdict::Approved { session_rule: None }));
+        assert!(a.resolve(&id2, Verdict::Approved { session_rule: None }));
+        assert_eq!(rx2.await.unwrap(), Verdict::Approved { session_rule: None });
         a.deny_all("shutting down");
         assert!(
             matches!(rx1.await.unwrap(), Verdict::Denied { reason: Some(r) } if r == "shutting down")
         );
-        assert!(!a.resolve(&id1, Verdict::Approved));
+        assert!(!a.resolve(&id1, Verdict::Approved { session_rule: None }));
     }
 }

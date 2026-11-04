@@ -29,7 +29,7 @@ use tautly_context::{Breakdown, ContextStatus, MutationReason};
 pub use tautly_mcp::McpState;
 use tautly_memory::{MemoryChange, MemoryEntry};
 use tautly_provider::{ModelId, Quota};
-use tautly_tools::{AppliedEffect, DiffPreview, LineRange, Shown, ToolMeta};
+use tautly_tools::{AppliedEffect, DiffPreview, LineRange, Saved, Shown, ToolMeta};
 
 use crate::evidence::TestEvidence;
 use crate::receipt::Savings;
@@ -149,6 +149,10 @@ pub struct ToolMetaView {
     pub exit_code: Option<i32>,
     /// A stable name for why the call failed (`not_found`, `stale`, ...).
     pub error_kind: Option<String>,
+    /// What the result saved against a plain harness (an estimate, spec 7.11.1): an
+    /// output filter's summary, a re-read diff, an index answer. Sent only when set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub saved: Option<Saved>,
 }
 
 impl From<&ToolMeta> for ToolMetaView {
@@ -156,6 +160,7 @@ impl From<&ToolMeta> for ToolMetaView {
         ToolMetaView {
             exit_code: meta.exit_code,
             error_kind: meta.error_kind.map(str::to_string),
+            saved: meta.saved,
         }
     }
 }
@@ -412,8 +417,17 @@ pub enum Command {
     },
     /// Allow the call behind a [`Event::ToolApprovalRequested`], or the server behind a
     /// [`Event::McpServerApprovalRequested`] (request ids are unique across both).
+    ///
+    /// `session_rule` ("allow for this session", spec 7.11.8; tool calls only) is an allow
+    /// rule (`bash(cargo test*)`, `edit(src/a.rs)`, `mcp__github__*`) added for as long as
+    /// the engine runs. It is accepted only when it matches the pending call; otherwise the
+    /// call is approved once with a `Warning`. It never outranks a deny rule, a protected
+    /// path or an unparseable command, is never written to configuration or to the session
+    /// log, and is gone after a resume.
     Approve {
         request_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_rule: Option<String>,
     },
     Deny {
         request_id: String,
@@ -477,6 +491,20 @@ pub enum Command {
     /// newer log): answered with an `Error`, and skipped on resume.
     #[serde(other)]
     Unknown,
+}
+
+impl Command {
+    /// The command as the session log records it: an `Approve` without its
+    /// `session_rule`, which is consent for this process only and never stored (spec 5.5).
+    pub fn for_log(&self) -> Command {
+        match self {
+            Command::Approve { request_id, .. } => Command::Approve {
+                request_id: request_id.clone(),
+                session_rule: None,
+            },
+            other => other.clone(),
+        }
+    }
 }
 
 /// `#[serde(with = "...")]` for a `PathBuf` that must serialize even when it is not valid

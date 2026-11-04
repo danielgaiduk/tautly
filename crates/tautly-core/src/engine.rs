@@ -323,7 +323,7 @@ impl EngineBuilder {
         let session = Session {
             context,
             reads: Arc::new(ReadTracker::default()),
-            policy: Arc::new(policy),
+            policy,
             ledger: AttemptLedger::default(),
             log: Log::new(writer),
             events: EventSink::new(event_tx),
@@ -732,7 +732,7 @@ impl Actor {
                         // Logged as they arrived would have been, but never run.
                         let n = held.len();
                         let recs: Vec<SessionRecord> =
-                            held.into_iter().map(SessionRecord::Command).collect();
+                            held.iter().map(|c| SessionRecord::Command(c.for_log())).collect();
                         self.with_log(move |l| recs.iter().try_for_each(|r| l.append(r)))
                             .await;
                         self.events.try_emit(Event::Warning {
@@ -787,7 +787,7 @@ impl Actor {
         stopping: &mut bool,
     ) {
         self.with_log({
-            let rec = SessionRecord::Command(cmd.clone());
+            let rec = SessionRecord::Command(cmd.for_log());
             move |l| l.append(&rec)
         })
         .await;
@@ -807,8 +807,11 @@ impl Actor {
                 retryable: false,
                 hint: None,
             }),
-            Command::Approve { request_id } => {
-                self.resolve(&request_id, Verdict::Approved);
+            Command::Approve {
+                request_id,
+                session_rule,
+            } => {
+                self.resolve(&request_id, Verdict::Approved { session_rule });
             }
             Command::Deny { request_id, reason } => {
                 self.resolve(&request_id, Verdict::Denied { reason });

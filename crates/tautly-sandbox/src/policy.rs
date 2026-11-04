@@ -186,6 +186,8 @@ pub struct Policy {
     mode: Mode,
     allow: Vec<Rule>,
     deny: Vec<Rule>,
+    /// Allow rules added for this session ([`Policy::add_session_allow`]); memory only.
+    session: Vec<Rule>,
     root: PathBuf,
 }
 
@@ -200,6 +202,7 @@ impl Policy {
             mode: cfg.mode,
             allow: parse(&cfg.allow)?,
             deny: parse(&cfg.deny)?,
+            session: Vec::new(),
             root,
         })
     }
@@ -208,7 +211,37 @@ impl Policy {
         &self.root
     }
 
-    /// Order: deny rules, protected paths, unparseable commands, allow rules, mode default.
+    /// Add an in-memory allow rule for the rest of this policy's life ("allow for this
+    /// session", spec 7.11.8). It is checked with the configured allow rules, so deny
+    /// rules, protected paths and unparseable commands still win over it.
+    pub fn add_session_allow(&mut self, rule: &str) -> Result<(), PolicyError> {
+        let rule = Rule::parse(rule)?;
+        if !self.session.iter().any(|r| r.text == rule.text) {
+            self.session.push(rule);
+        }
+        Ok(())
+    }
+
+    /// Whether `rule` alone, as an allow rule, would allow this call: every subject the
+    /// call has (each parsed command, each write path, the host) must match it. A
+    /// read-only call matches a rule for its tool.
+    pub fn rule_matches(
+        &self,
+        rule: &str,
+        tool: &str,
+        effect: &Effect,
+        raw_cmd: Option<&str>,
+    ) -> Result<bool, PolicyError> {
+        let rule = Rule::parse(rule)?;
+        if matches!(effect, Effect::ReadOnly) {
+            return Ok(rule.is_for(tool));
+        }
+        let subjects = self.subjects(effect, raw_cmd);
+        Ok(allows(&|s| rule.matches_str(tool, s), &subjects))
+    }
+
+    /// Order: deny rules, protected paths, unparseable commands, allow rules (configured
+    /// and session), mode default.
     ///
     /// Write paths are judged both as written and after following symlinks under
     /// the workspace root (read from disk at decision time), so a committed
@@ -228,7 +261,13 @@ impl Policy {
         if let Some(reason) = self.needs_approval(&subjects) {
             return Decision::Ask { reason };
         }
-        if self.allowed(tool, &subjects) {
+        let any_rule = |s: &str| {
+            self.allow
+                .iter()
+                .chain(&self.session)
+                .any(|r| r.matches_str(tool, s))
+        };
+        if allows(&any_rule, &subjects) {
             return Decision::Allow;
         }
         self.mode_default(effect, &subjects)
@@ -315,25 +354,6 @@ impl Policy {
         }
     }
 
-    fn allowed(&self, tool: &str, subjects: &Subjects) -> bool {
-        let any = |s: &str| self.allow.iter().any(|r| r.matches_str(tool, s));
-        match subjects {
-            Subjects::Commands(cmds) => {
-                // Leading assignments are part of what the rule must match.
-                !cmds.is_empty() && cmds.iter().all(|c| any(&command_line(c)))
-            }
-            Subjects::Paths(ps) => {
-                !ps.is_empty()
-                    && ps.iter().all(|p| {
-                        p.rel.as_ref().is_some_and(|r| any(&path_str(r)))
-                            && p.real.as_ref().is_none_or(|r| any(&path_str(r)))
-                    })
-            }
-            Subjects::Host(h) => any(h),
-            Subjects::Unparseable { .. } | Subjects::None => false,
-        }
-    }
-
     fn mode_default(&self, effect: &Effect, subjects: &Subjects) -> Decision {
         let ask = |reason: &str| Decision::Ask {
             reason: reason.to_string(),
@@ -390,6 +410,27 @@ impl Policy {
             })
             .or_else(|| git_reason(&c.argv))
             .or_else(|| escape_reason(&c.argv))
+    }
+}
+
+/// Whether every subject of a call is allowed, `any` saying whether some rule allows one:
+/// each parsed command, each write path (as normalized inside the root, and after
+/// following symlinks), the host.
+fn allows(any: &dyn Fn(&str) -> bool, subjects: &Subjects) -> bool {
+    match subjects {
+        Subjects::Commands(cmds) => {
+            // Leading assignments are part of what the rule must match.
+            !cmds.is_empty() && cmds.iter().all(|c| any(&command_line(c)))
+        }
+        Subjects::Paths(ps) => {
+            !ps.is_empty()
+                && ps.iter().all(|p| {
+                    p.rel.as_ref().is_some_and(|r| any(&path_str(r)))
+                        && p.real.as_ref().is_none_or(|r| any(&path_str(r)))
+                })
+        }
+        Subjects::Host(h) => any(h),
+        Subjects::Unparseable { .. } | Subjects::None => false,
     }
 }
 

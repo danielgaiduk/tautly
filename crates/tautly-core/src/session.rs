@@ -343,7 +343,8 @@ impl Drop for Startup {
 pub(crate) struct Session {
     pub context: Context,
     pub reads: Arc<ReadTracker>,
-    pub policy: Arc<Policy>,
+    /// The permission policy, with the session rules added by approvals (memory only).
+    pub policy: Policy,
     pub ledger: AttemptLedger,
     pub log: Log,
     pub events: EventSink,

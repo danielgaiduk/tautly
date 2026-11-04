@@ -255,6 +255,7 @@ fn methods_map_to_commands() {
             json!({"request_id": "approval-1"}),
             Command::Approve {
                 request_id: "approval-1".into(),
+                session_rule: None,
             },
         ),
         (
@@ -517,6 +518,62 @@ async fn interactive_ask_waits_for_client_approval() {
         .expect("the write ran");
     assert_eq!(finished["is_error"], false, "{finished}");
     assert!(fx.exists("approved.txt"));
+    c.ok("shutdown", json!({})).await;
+    c.finish().await;
+}
+
+/// `approve` passes its optional `session_rule` on: the second identical call is not asked.
+#[tokio::test]
+async fn approve_with_session_rule() {
+    assert_eq!(
+        command_for(
+            "approve",
+            &json!({"request_id": "approval-1", "session_rule": "bash(cargo test*)"}),
+        )
+        .unwrap(),
+        Command::Approve {
+            request_id: "approval-1".into(),
+            session_rule: Some("bash(cargo test*)".into()),
+        }
+    );
+    let fx = Fx::new();
+    let echo = |id: &str| call(id, "bash", json!({"command": "echo hi"}));
+    let mock = MockProvider::new(vec![
+        tools_step(vec![echo("b1")]),
+        tools_step(vec![echo("b2")]),
+        text_step("done"),
+    ]);
+    let mut c = single(&fx, config(Mode::Ask), mock);
+    let sid = c
+        .ok(
+            "initialize",
+            json!({"protocol": "1.0", "client": {"interactive": true}}),
+        )
+        .await["session_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    c.ok("send_message", json!({"text": "go"})).await;
+    let seen = c.until_type(&sid, "tool_approval_requested").await;
+    let request_id = seen.last().unwrap().1["request_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    c.ok(
+        "approve",
+        json!({"request_id": request_id, "session_rule": "bash(echo hi)"}),
+    )
+    .await;
+    let events = c.until_type(&sid, "turn_finished").await;
+    assert_eq!(events.last().unwrap().1["reason"], "completed");
+    let asked = events_of(&events, &sid)
+        .filter(|e| e["type"] == "tool_approval_requested")
+        .count();
+    assert_eq!(asked, 0, "the second call ran without asking: {events:?}");
+    let ran = events_of(&events, &sid)
+        .filter(|e| e["type"] == "tool_finished" && e["is_error"] == false)
+        .count();
+    assert_eq!(ran, 2, "{events:?}");
     c.ok("shutdown", json!({})).await;
     c.finish().await;
 }
