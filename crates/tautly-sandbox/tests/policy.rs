@@ -1386,3 +1386,239 @@ fn words_after_a_redirect_target_are_not_hidden_from_rules() {
         Decision::Allow
     );
 }
+
+// --- re-review 3 T30-N6: close operators and heredoc delimiters hide arguments ---
+#[test]
+fn close_operators_and_heredocs_cannot_hide_arguments_from_rules() {
+    let sh = exec("sh");
+    let not_allowed = |d: Decision| !matches!(d, Decision::Allow);
+    // The exact rule `a` offers for a plain `cargo test`, granted for the session.
+    let mut session = p(Mode::Ask);
+    let rule = session.exact_rule("bash", &sh, Some("cargo test")).unwrap();
+    assert_eq!(rule, "bash(cargo test)");
+    session.add_session_allow(&rule).unwrap();
+    assert_eq!(
+        session.decide("bash", &sh, Some("cargo test")),
+        Decision::Allow
+    );
+    for raw in [
+        "cargo test <<EOF --config=build.rustc-wrapper=./evil.sh\nx\nEOF",
+        "cargo test <<'EOF' '--config=target.aarch64-apple-darwin.runner=\"sh -c id\"'\nx\nEOF",
+        "cargo test <<-EOF --no-run\nx\nEOF",
+        "cargo test >&- --no-run",
+        "cargo test 2>&- --no-run",
+        "cargo test <&- --no-run",
+        "cargo test 3>&- --no-run",
+    ] {
+        assert!(asks(session.decide("bash", &sh, Some(raw))), "{raw}");
+    }
+    // Configured and session rules that name a redirect.
+    for (rule, raw) in [
+        (
+            "bash(cargo test > *)",
+            "cargo test >&- '--config=target.aarch64-apple-darwin.runner=\"sh -c id\"'",
+        ),
+        (
+            "bash(cargo test > *)",
+            "cargo test > out.txt <<'EOF' '--config=target.aarch64-apple-darwin.runner=\"sh -c id\"'\nx\nEOF",
+        ),
+        ("bash(cargo test > *)", "cargo test > out.txt 2>&- --no-run"),
+        ("bash(git status > *)", "git status >&- push"),
+        (
+            "bash(git status > *)",
+            "git status > log <<EOF push\nx\nEOF",
+        ),
+        ("bash(cargo test*)", "cargo test >&- --no-run"),
+    ] {
+        let config = with_rules(Mode::Ask, &[rule], &[]);
+        let mut session = p(Mode::Ask);
+        session.add_session_allow(rule).unwrap();
+        for pol in [&config, &session] {
+            assert!(asks(pol.decide("bash", &sh, Some(raw))), "{rule}: {raw}");
+        }
+    }
+    // Deny rules in yolo mode: the hidden words must not slip past them.
+    for (deny, raw) in [
+        ("bash(git push*)", "git >&- push"),
+        ("bash(git push*)", "git 2>&- push --force"),
+        ("bash(git push*)", "git <<EOF push\nx\nEOF"),
+        ("bash(git push*)", "git <<'EOF' push\nx\nEOF"),
+        ("bash(rm -rf*)", "rm <<'EOF' -rf src\nx\nEOF"),
+        ("bash(rm -rf*)", "rm >&- -rf src"),
+    ] {
+        let pol = with_rules(Mode::Yolo, &[], &[deny]);
+        assert!(
+            not_allowed(pol.decide("bash", &sh, Some(raw))),
+            "{deny}: {raw}"
+        );
+    }
+    // The same commands without the hidden words are judged as before.
+    let pol = with_rules(Mode::Yolo, &[], &["bash(git push*)"]);
+    assert_eq!(
+        pol.decide("bash", &sh, Some("git status >&-")),
+        Decision::Allow
+    );
+    assert!(matches!(
+        pol.decide("bash", &sh, Some("git push >&-")),
+        Decision::Deny { .. }
+    ));
+}
+
+// --- re-review 3 T30-N5: a target half is matched against each target alone ---
+#[test]
+fn redirect_target_halves_match_each_target_alone() {
+    let run = |pol: &Policy, raw: &str| pol.decide("bash", &exec("sh"), Some(raw));
+    let cases: &[(&str, &[&str], &[&str])] = &[
+        (
+            "bash(cargo test > logs/*)",
+            &["cargo test > logs/x", "cargo test > logs/a > logs/b"],
+            &[
+                "cargo test > logs/x > src/main.rs",
+                "cargo test > src/main.rs > logs/x",
+                "cargo test > logs/../src/lib.rs",
+                "cargo test > logs//../src/lib.rs",
+                "cargo test > logs/./../src/lib.rs",
+                "cd logs && cargo test > ../src/lib.rs",
+                // The raw spelling must match too.
+                "cargo test > ./logs/x",
+                "cd src && cargo test > ../logs/x",
+                "cargo test > /ws/logs/x",
+            ],
+        ),
+        (
+            "bash(cargo test > *.txt)",
+            &["cargo test > a.txt", "cargo test > a.txt > b.txt"],
+            &[
+                "cargo test > src/lib.rs > a.txt",
+                "cargo test > a.txt > src/lib.rs",
+            ],
+        ),
+        (
+            "bash(cargo test > out*)",
+            &["cargo test > out.txt"],
+            &["cargo test > out.txt > src/lib.rs"],
+        ),
+        (
+            "bash(cargo test > *)",
+            &["cargo test > a > b", "cargo test > out.txt"],
+            &["cargo test > ../out.txt"],
+        ),
+        (
+            "bash(cargo test > out.txt)",
+            &["cargo test > out.txt", "cargo test 2> out.txt"],
+            &[
+                "cargo test > out.txt > src/lib.rs",
+                "cargo test > src/lib.rs > out.txt",
+                "cargo test > ./out.txt",
+            ],
+        ),
+        // A target half holding ` > ` is matched positionally, with the same count.
+        (
+            "bash(cargo test > out.txt > err.txt)",
+            &["cargo test > out.txt 2> err.txt"],
+            &[
+                "cargo test > err.txt > out.txt",
+                "cargo test > out.txt",
+                "cargo test > out.txt > err.txt > x",
+            ],
+        ),
+        (
+            "bash(cargo test > logs/* > tmp/*)",
+            &["cargo test > logs/a > tmp/b"],
+            &[
+                "cargo test > logs/a",
+                "cargo test > tmp/b > logs/a",
+                "cargo test > logs/a > src/x",
+            ],
+        ),
+    ];
+    for (rule, allowed, asked) in cases {
+        let config = with_rules(Mode::Ask, &[rule], &[]);
+        let mut session = p(Mode::Ask);
+        session.add_session_allow(rule).unwrap();
+        for pol in [&config, &session] {
+            for raw in *allowed {
+                assert_eq!(run(pol, raw), Decision::Allow, "{rule}: {raw}");
+            }
+            for raw in *asked {
+                assert!(asks(run(pol, raw)), "{rule}: {raw}");
+            }
+        }
+    }
+    // A quoted target holding ` > ` is one target, in the rule as in the command.
+    let pol = p(Mode::Ask);
+    let sh = exec("sh");
+    let rule = pol
+        .exact_rule("bash", &sh, Some("echo hi > 'a > b'"))
+        .unwrap();
+    assert_eq!(rule, "bash(echo hi > 'a > b')");
+    assert!(
+        pol.rule_matches(&rule, "bash", &sh, Some("echo hi > 'a > b'"))
+            .unwrap()
+    );
+    assert!(
+        !pol.rule_matches(&rule, "bash", &sh, Some("echo hi > a > b"))
+            .unwrap()
+    );
+    let rule = pol
+        .exact_rule("bash", &sh, Some("echo hi > a > b"))
+        .unwrap();
+    assert_eq!(rule, "bash(echo hi > a > b)");
+    assert!(
+        !pol.rule_matches(&rule, "bash", &sh, Some("echo hi > b > a"))
+            .unwrap()
+    );
+}
+
+// --- re-review 3 T30-N8: deny targets follow symlinks ---
+#[test]
+fn redirect_targets_are_judged_after_following_symlinks() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("logs")).unwrap();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(root.join(".env"), "").unwrap();
+    std::fs::write(root.join("src/lib.rs"), "").unwrap();
+    std::os::unix::fs::symlink(".env", root.join("envlink")).unwrap();
+    std::os::unix::fs::symlink("../.env", root.join("logs/env")).unwrap();
+    std::os::unix::fs::symlink("../src/lib.rs", root.join("logs/lib")).unwrap();
+    let pol = |mode, allow: &[&str], deny: &[&str]| {
+        Policy::new(
+            PolicyConfig {
+                mode,
+                allow: allow.iter().map(|s| s.to_string()).collect(),
+                deny: deny.iter().map(|s| s.to_string()).collect(),
+            },
+            root.to_path_buf(),
+        )
+        .unwrap()
+    };
+    let sh = exec("sh");
+    let deny = pol(Mode::Yolo, &[], &["bash(* > .env)"]);
+    for raw in [
+        "echo x > envlink",
+        "echo x > ./envlink",
+        "echo x > logs/env",
+        "cd logs && echo x > env",
+    ] {
+        assert!(
+            matches!(deny.decide("bash", &sh, Some(raw)), Decision::Deny { .. }),
+            "{raw}"
+        );
+    }
+    assert_eq!(
+        deny.decide("bash", &sh, Some("echo x > logs/other")),
+        Decision::Allow
+    );
+    // An allow rule scoped to a place does not reach through a link out of it.
+    let allow = pol(Mode::Ask, &["bash(cargo test > logs/*)"], &[]);
+    assert!(asks(allow.decide(
+        "bash",
+        &sh,
+        Some("cargo test > logs/lib")
+    )));
+    assert_eq!(
+        allow.decide("bash", &sh, Some("cargo test > logs/fresh")),
+        Decision::Allow
+    );
+}

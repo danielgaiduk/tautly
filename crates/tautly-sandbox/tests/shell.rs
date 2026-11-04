@@ -1064,3 +1064,154 @@ fn control_whitespace_inside_single_quotes_or_quoted_heredoc_still_parses() {
     assert!(parse_commands("cat <<'EOF'\nfoo\r\nbar\x0c\nEOF\n").is_ok());
     assert!(parse_commands("cat <<EOF\nfoo\r\nEOF\n").is_err());
 }
+
+// ---- Task 30 re-review 3, N6: close operators and heredoc delimiters ----
+
+#[test]
+fn words_after_a_close_operator_or_heredoc_delimiter_are_unparseable() {
+    // bash runs `cmd a` for each of these; the grammar files `a` under the redirect.
+    for s in [
+        "cmd >&- a",
+        "cmd 2>&- a",
+        "cmd <&- a",
+        "cmd 3>&- a",
+        "cmd <<EOF a b c\nx\nEOF\n",
+        "cmd <<'EOF' a\nx\nEOF\n",
+        "cmd <<-EOF a\nx\nEOF\n",
+        "cmd <<\"EOF\" a\nx\nEOF\n",
+        "cmd > out.txt <<'EOF' a\nx\nEOF\n",
+        "cargo test <<EOF --config=build.rustc-wrapper=./evil.sh\nx\nEOF\n",
+        "{ cmd; } >&- a",
+        "( cmd ) <<EOF a\nx\nEOF\n",
+        "f() { :; } >&- a",
+    ] {
+        assert!(parse_commands(s).is_err(), "{s}");
+    }
+    // Without a trailing word these stay analyzable.
+    assert_eq!(parse_commands("cmd a >&-").unwrap()[0].argv, ["cmd", "a"]);
+    assert!(
+        parse_commands("cmd a 2>&-").unwrap()[0]
+            .redirects
+            .is_empty()
+    );
+    assert_eq!(
+        parse_commands("cmd a <<EOF\nx\nEOF\n").unwrap()[0].argv,
+        ["cmd", "a"]
+    );
+    assert_eq!(
+        argv0s(&parse_commands("cmd <<EOF | next\nx\nEOF\n").unwrap()),
+        ["cmd", "next"]
+    );
+    assert_eq!(
+        argv0s(&parse_commands("cmd <<EOF && next\nx\nEOF\n").unwrap()),
+        ["cmd", "next"]
+    );
+}
+
+/// The structural invariant: a word that bash passes to a command is in some
+/// command's argv or is a redirect target, or the input is unparseable. `ZZMARK`
+/// stands wherever the grammar might file a word away from argv.
+#[test]
+fn every_word_reaches_argv_or_a_target_or_the_input_is_unparseable() {
+    const M: &str = "ZZMARK";
+    let shapes = [
+        "cmd ZZMARK",
+        "cmd > f ZZMARK",
+        "cmd 2> f ZZMARK",
+        "cmd >> f ZZMARK",
+        "cmd &> f ZZMARK",
+        "cmd >| f ZZMARK",
+        "cmd < f ZZMARK",
+        "cmd <> f ZZMARK",
+        "cmd 2>&1 ZZMARK",
+        "cmd >&2 ZZMARK",
+        "cmd >& f ZZMARK",
+        "cmd <& 3 ZZMARK",
+        "cmd >&- ZZMARK",
+        "cmd <&- ZZMARK",
+        "cmd 2>&- ZZMARK",
+        "cmd 9>&- ZZMARK",
+        "cmd {fd}> f ZZMARK",
+        "cmd {fd}>&- ZZMARK",
+        "cmd ZZMARK >&-",
+        "cmd > f 2>&- ZZMARK",
+        "cmd >&- > f ZZMARK",
+        "cmd >&- 'ZZMARK'",
+        "cmd >&- \"ZZMARK\"",
+        "cmd >&- $'ZZMARK'",
+        "cmd >&- a\"ZZMARK\"",
+        "cmd >&- ZZMARK=1",
+        "cmd >&- --ZZMARK",
+        "cmd >&- -ZZMARK",
+        "cmd >&- ZZMARK > g",
+        "cmd >&- ; ZZMARK",
+        "cmd <<< hi ZZMARK",
+        "cmd <<EOF ZZMARK\nx\nEOF\n",
+        "cmd <<EOF a ZZMARK\nx\nEOF\n",
+        "cmd <<EOF ZZMARK b\nx\nEOF\n",
+        "cmd <<'EOF' ZZMARK\nx\nEOF\n",
+        "cmd <<\"EOF\" ZZMARK\nx\nEOF\n",
+        "cmd <<\\EOF ZZMARK\nx\nEOF\n",
+        "cmd <<-EOF ZZMARK\nx\nEOF\n",
+        "cmd 3<<EOF ZZMARK\nx\nEOF\n",
+        "cmd <<EOF 'ZZMARK'\nx\nEOF\n",
+        "cmd <<EOF \"ZZMARK\"\nx\nEOF\n",
+        "cmd <<EOF ZZMARK > g\nx\nEOF\n",
+        "cmd <<EOF > g ZZMARK\nx\nEOF\n",
+        "cmd <<EOF 2> g ZZMARK\nx\nEOF\n",
+        "cmd <<EOF >&- ZZMARK\nx\nEOF\n",
+        "cmd <<EOF <<< hi ZZMARK\nx\nEOF\n",
+        "cmd <<EOF | ZZMARK\nx\nEOF\n",
+        "cmd <<EOF |& ZZMARK\nx\nEOF\n",
+        "cmd <<EOF && ZZMARK\nx\nEOF\n",
+        "cmd <<EOF || ZZMARK\nx\nEOF\n",
+        "cmd <<EOF ; ZZMARK\nx\nEOF\n",
+        "cmd <<EOF\nx\nEOF\nZZMARK\n",
+        "cmd ZZMARK <<EOF\nx\nEOF\n",
+        "cmd <<EOF <<EOF2 ZZMARK\nx\nEOF\ny\nEOF2\n",
+        "cmd <<EOF ZZMARK <<EOF2\nx\nEOF\ny\nEOF2\n",
+        "cmd > f\\\n ZZMARK",
+        "cmd >&-\\\n ZZMARK",
+        "cmd >&-\tZZMARK",
+        "FOO=1 cmd >&- ZZMARK",
+        "FOO=1 >&- cmd ZZMARK",
+        "{ cmd; } > f ZZMARK",
+        "{ cmd; } >&- ZZMARK",
+        "{ cmd; } <<EOF ZZMARK\nx\nEOF\n",
+        "( cmd ) >&- ZZMARK",
+        "( cmd ) <<EOF ZZMARK\nx\nEOF\n",
+        "f() { :; } >&- ZZMARK",
+        "f() { :; } <<EOF ZZMARK\nx\nEOF\n",
+        "if cmd; then :; fi >&- ZZMARK",
+        "while cmd; do :; done <<EOF ZZMARK\nx\nEOF\n",
+        "for x in a; do cmd; done >&- ZZMARK",
+        "cmd | cmd2 >&- ZZMARK",
+        "cmd && cmd2 >&- ZZMARK",
+        "cmd $(cmd2 >&- ZZMARK)",
+        "cmd <(cmd2 <<EOF ZZMARK\nx\nEOF\n)",
+        "[[ -f x ]] >&- ZZMARK",
+        "export A=1 >&- ZZMARK",
+        "! cmd >&- ZZMARK",
+    ];
+    for s in shapes {
+        let Ok(cmds) = parse_commands(s) else {
+            continue;
+        };
+        let seen = cmds.iter().any(|c| {
+            c.argv.iter().any(|w| w.contains(M)) || c.redirects.iter().any(|r| r.target == M)
+        });
+        assert!(seen, "{s:?} parsed as {cmds:?} but hides {M}");
+    }
+    // The invariant does not refuse the ordinary shapes.
+    for s in [
+        "cmd ZZMARK",
+        "cmd ZZMARK >&-",
+        "cmd ZZMARK <<EOF\nx\nEOF\n",
+        "cmd <<EOF | ZZMARK\nx\nEOF\n",
+        "cmd <<EOF && ZZMARK\nx\nEOF\n",
+        "cmd <<EOF > g\nx\nEOF\n",
+        "cmd <<< ZZMARK",
+    ] {
+        assert!(parse_commands(s).is_ok(), "{s}");
+    }
+}

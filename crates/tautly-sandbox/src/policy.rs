@@ -1,5 +1,6 @@
 //! Permission policy: decides whether a tool call runs, needs approval, or is denied.
 
+use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 
 use globset::{Glob, GlobMatcher};
@@ -7,7 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::effect::Effect;
 use crate::protected::{
-    Resolved, argv_word_reason, normalize, path_reason, redirect_reason, resolve_links,
+    Resolved, argv_word_reason, normalize, path_reason, rebase, redirect_reason, resolve_links,
 };
 use crate::shell::{SimpleCommand, is_dangerous_env, parse_commands};
 
@@ -69,14 +70,66 @@ struct Rule {
 }
 
 /// The two halves of a rule pattern that names a write redirect (`cargo test > *`): the
-/// command half matches the bare command ([`command_line`]), the redirect half the
-/// command's write-redirect targets joined in order (`t1 > t2`, each [quoted](quote_word)).
-/// Never one flattened string, so neither a target nor a quoted `'>'` argument can supply
-/// the other half's text.
+/// command half matches the bare command ([`command_line`]); the target half, split at
+/// each further ` > ` outside quotes ([`split_targets`]), matches the command's write
+/// targets one by one ([`Policy::targets_match`]). Never one flattened string, so neither
+/// a target nor a quoted `'>'` argument can supply the other half's text, and no target
+/// can stretch a `*` over its neighbour.
 #[derive(Debug)]
 struct Redirected {
     command: GlobMatcher,
-    targets: GlobMatcher,
+    /// One pattern: every target must match it. Several: positional, the same count.
+    targets: Vec<GlobMatcher>,
+}
+
+/// Split a rule's target half at each ` > ` outside single quotes. Targets are written
+/// the way [`quote_word`] renders them, so `'a > b'` stays one target; a backslash
+/// outside quotes escapes the next character (glob syntax, and `'\''`).
+fn split_targets(half: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let (mut start, mut quoted, mut i) = (0, false, 0);
+    let bytes = half.as_bytes();
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\'' => quoted = !quoted,
+            b'\\' if !quoted => i += 1,
+            b' ' if !quoted && half[i..].starts_with(" > ") => {
+                out.push(&half[start..i]);
+                start = i + 3;
+                i += 2;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    out.push(&half[start..]);
+    out
+}
+
+/// What write target `t` names from working directory `cwd`, root-relative.
+struct TargetForms {
+    /// Its lexical normalization, when that lands inside the root.
+    lexical: Option<String>,
+    /// The path reached once symlinks on disk are followed, when that differs.
+    real: Option<String>,
+    /// Whether it stays inside the root, lexically and through every link.
+    inside: bool,
+}
+
+impl TargetForms {
+    /// Every root-relative form the target has.
+    fn iter(&self) -> impl Iterator<Item = &str> {
+        self.lexical.iter().chain(&self.real).map(String::as_str)
+    }
+}
+
+/// The directories `c` may run in: the root when none is recorded.
+fn cwds_of(c: &SimpleCommand) -> Cow<'_, [PathBuf]> {
+    if c.cwds.is_empty() {
+        Cow::Owned(vec![PathBuf::new()])
+    } else {
+        Cow::Borrowed(&c.cwds)
+    }
 }
 
 impl Rule {
@@ -139,7 +192,10 @@ impl Rule {
                     };
                     redirect = Some(Redirected {
                         command: glob(command)?,
-                        targets: glob(targets)?,
+                        targets: split_targets(targets)
+                            .into_iter()
+                            .map(glob)
+                            .collect::<Result<_, _>>()?,
                     });
                 }
                 (&text[..i], Some(m.compile_matcher()))
@@ -265,7 +321,7 @@ impl Policy {
             return Ok(rule.is_for(tool));
         }
         let subjects = self.subjects(effect, raw_cmd);
-        Ok(allows(&[&rule], tool, &subjects))
+        Ok(self.allows(&[&rule], tool, &subjects))
     }
 
     /// The narrowest rule that allows this call, as "allow for this session" offers it:
@@ -329,7 +385,7 @@ impl Policy {
             return Decision::Ask { reason };
         }
         let rules: Vec<&Rule> = self.allow.iter().chain(&self.session).collect();
-        if allows(&rules, tool, &subjects) {
+        if self.allows(&rules, tool, &subjects) {
             return Decision::Allow;
         }
         self.mode_default(effect, &subjects)
@@ -403,10 +459,12 @@ impl Policy {
 
     /// Whether deny rule `r` refuses command `c`. A rule that names a redirect
     /// ([`Redirected`]) needs a write redirect, its command half matching the bare command
-    /// (or argv), and its target half matching some target in any spelling: as written,
-    /// quoted, or normalized root-relative from each directory the command may run in (so
-    /// `bash(* > .env)` refuses `> ./.env` and `> src/../.env`). Any other rule matches the
-    /// bare command or argv only, never a file name a redirect writes to.
+    /// (or argv), and one of its target patterns matching some target in any spelling: as
+    /// written, quoted, or root-relative from each directory the command may run in,
+    /// lexically normalized and with symlinks followed ([`TargetForms`]; so
+    /// `bash(* > .env)` refuses `> ./.env`, `> src/../.env` and `> envlink` when `envlink
+    /// -> .env`). Any other rule matches the bare command or argv only, never a file name a
+    /// redirect writes to.
     fn deny_hits(&self, r: &Rule, tool: &str, c: &SimpleCommand) -> bool {
         let argv = c.argv.join(" ");
         let bare = command_line(c);
@@ -416,26 +474,43 @@ impl Policy {
         if !(red.command.is_match(&bare) || red.command.is_match(&argv)) {
             return false;
         }
-        let root_only = [PathBuf::new()];
-        let cwds: &[PathBuf] = if c.cwds.is_empty() {
-            &root_only
-        } else {
-            &c.cwds
-        };
         write_targets(c).iter().any(|t| {
-            let joined = cwds.iter().filter_map(|cwd| {
-                let full = if Path::new(t).is_absolute() {
-                    PathBuf::from(t)
-                } else {
-                    cwd.join(t)
-                };
-                normalize(&self.root, &full.to_string_lossy()).map(|p| path_str(&p))
-            });
+            let relative: Vec<String> = cwds_of(c)
+                .iter()
+                .flat_map(|cwd| {
+                    let forms = self.target_forms(cwd, t);
+                    forms
+                        .iter()
+                        .flat_map(|f| [f.to_string(), quote_word(f)])
+                        .collect::<Vec<_>>()
+                })
+                .collect();
             [t.to_string(), quote_word(t)]
                 .into_iter()
-                .chain(joined)
-                .any(|form| red.targets.is_match(&form))
+                .chain(relative)
+                .any(|form| red.targets.iter().any(|g| g.is_match(&form)))
         })
+    }
+
+    /// What write target `t` names from working directory `cwd`, root-relative (see
+    /// [`TargetForms`]). Links are followed on disk at decision time, as for write paths.
+    fn target_forms(&self, cwd: &Path, t: &str) -> TargetForms {
+        let full = rebase(cwd, t);
+        let lexical = normalize(&self.root, &full);
+        let (real, inside) = match resolve_links(&self.root, Path::new(&full)) {
+            Some(Resolved::Inside(real)) => (
+                (lexical.as_ref() != Some(&real)).then(|| path_str(&real)),
+                lexical.is_some(),
+            ),
+            Some(Resolved::Outside(_) | Resolved::Loop) => (None, false),
+            // Nothing on disk to follow (or an error on the way): the lexical form stands.
+            None => (None, lexical.is_some()),
+        };
+        TargetForms {
+            lexical: lexical.as_deref().map(path_str),
+            real,
+            inside,
+        }
     }
 
     fn needs_approval(&self, subjects: &Subjects) -> Option<String> {
@@ -475,12 +550,7 @@ impl Policy {
     /// Relative paths are judged from every directory an earlier `cd` in the same
     /// input may have left the command in.
     fn command_reason(&self, c: &SimpleCommand) -> Option<String> {
-        let root_only = [PathBuf::new()];
-        let cwds: &[PathBuf] = if c.cwds.is_empty() {
-            &root_only
-        } else {
-            &c.cwds
-        };
+        let cwds = cwds_of(c);
         env_reason(c)
             .or_else(|| {
                 cwds.iter().find_map(|cwd| {
@@ -508,23 +578,79 @@ impl Policy {
     }
 }
 
-/// Whether `rules` allow every subject of a call of `tool`: each parsed command, each
-/// write path (as normalized inside the root, and after following symlinks), the host.
-fn allows(rules: &[&Rule], tool: &str, subjects: &Subjects) -> bool {
-    let any = |s: &str| rules.iter().any(|r| r.matches_str(tool, s));
-    match subjects {
-        Subjects::Commands(cmds) => {
-            !cmds.is_empty() && cmds.iter().all(|c| allows_command(rules, tool, c))
+impl Policy {
+    /// Whether `rules` allow every subject of a call of `tool`: each parsed command, each
+    /// write path (as normalized inside the root, and after following symlinks), the host.
+    fn allows(&self, rules: &[&Rule], tool: &str, subjects: &Subjects) -> bool {
+        let any = |s: &str| rules.iter().any(|r| r.matches_str(tool, s));
+        match subjects {
+            Subjects::Commands(cmds) => {
+                !cmds.is_empty() && cmds.iter().all(|c| self.allows_command(rules, tool, c))
+            }
+            Subjects::Paths(ps) => {
+                !ps.is_empty()
+                    && ps.iter().all(|p| {
+                        p.rel.as_ref().is_some_and(|r| any(&path_str(r)))
+                            && p.real.as_ref().is_none_or(|r| any(&path_str(r)))
+                    })
+            }
+            Subjects::Host(h) => any(h),
+            Subjects::Unparseable { .. } | Subjects::None => false,
         }
-        Subjects::Paths(ps) => {
-            !ps.is_empty()
-                && ps.iter().all(|p| {
-                    p.rel.as_ref().is_some_and(|r| any(&path_str(r)))
-                        && p.real.as_ref().is_none_or(|r| any(&path_str(r)))
-                })
-        }
-        Subjects::Host(h) => any(h),
-        Subjects::Unparseable { .. } | Subjects::None => false,
+    }
+
+    /// Whether one of `rules` allows command `c`, matched structurally (never one
+    /// flattened string a target or a quoted `'>'` could supply text to):
+    /// - a rule that names a redirect ([`Redirected`]) needs at least one write redirect,
+    ///   its command half matching the bare command ([`command_line`]) and its target half
+    ///   every target ([`Self::targets_match`]): `bash(cargo test > *)` allows
+    ///   `cargo test > out.txt`, not `cargo test '>' x --config …` (no redirect) nor
+    ///   `cargo test --release > out.txt`;
+    /// - any other rule must match the bare command and, when there are write redirects,
+    ///   the command with them ([`allow_subject`]): `bash(cargo test*)` allows
+    ///   `cargo test > out.txt`, while `bash(* --version)` does not allow
+    ///   `rm -rf src > ' --version'`.
+    fn allows_command(&self, rules: &[&Rule], tool: &str, c: &SimpleCommand) -> bool {
+        let bare = command_line(c);
+        let targets = write_targets(c);
+        let subject = allow_subject(c);
+        rules
+            .iter()
+            .filter(|r| r.is_for(tool))
+            .any(|r| match &r.redirect {
+                Some(red) => {
+                    !targets.is_empty()
+                        && red.command.is_match(&bare)
+                        && self.targets_match(red, c, &targets)
+                }
+                None => {
+                    r.matches_str(tool, &bare)
+                        && (targets.is_empty() || r.matches_str(tool, &subject))
+                }
+            })
+    }
+
+    /// Whether the target half of `red` covers every write target of `c`, each on its
+    /// own: a half without ` > ` must match each target; one with ` > ` is matched
+    /// positionally, with the same count. A target matches by its raw spelling
+    /// ([quoted](quote_word)) and by every root-relative form it has from each directory
+    /// the command may run in, lexically normalized and with symlinks followed
+    /// ([`TargetForms`]); one with no root-relative form never matches. So
+    /// `bash(cargo test > logs/*)` allows `> logs/x`, not `> logs/x > src/main.rs`,
+    /// `> logs/../src/lib.rs` nor `> logs/link` when the link leaves `logs/`.
+    fn targets_match(&self, red: &Redirected, c: &SimpleCommand, targets: &[&str]) -> bool {
+        let patterns: Vec<&GlobMatcher> = match red.targets.as_slice() {
+            [one] => vec![one; targets.len()],
+            many => many.iter().collect(),
+        };
+        patterns.len() == targets.len()
+            && targets.iter().zip(patterns).all(|(t, g)| {
+                g.is_match(quote_word(t))
+                    && cwds_of(c).iter().all(|cwd| {
+                        let forms = self.target_forms(cwd, t);
+                        forms.inside && forms.iter().all(|f| g.is_match(quote_word(f)))
+                    })
+            })
     }
 }
 
@@ -592,38 +718,6 @@ fn write_targets(c: &SimpleCommand) -> Vec<&str> {
         .filter(|r| r.write && r.target != "/dev/null")
         .map(|r| r.target.as_str())
         .collect()
-}
-
-/// Whether one of `rules` allows command `c`, matched structurally (never one flattened
-/// string a target or a quoted `'>'` could supply text to):
-/// - a rule that names a redirect ([`Redirected`]) needs at least one write redirect, its
-///   command half matching the bare command ([`command_line`]) and its target half the
-///   targets joined in order: `bash(cargo test > *)` allows `cargo test > out.txt`, not
-///   `cargo test '>' x --config …` (no redirect) nor `cargo test --release > out.txt`;
-/// - any other rule must match the bare command and, when there are write redirects, the
-///   command with them ([`allow_subject`]): `bash(cargo test*)` allows
-///   `cargo test > out.txt`, while `bash(* --version)` does not allow
-///   `rm -rf src > ' --version'`.
-fn allows_command(rules: &[&Rule], tool: &str, c: &SimpleCommand) -> bool {
-    let bare = command_line(c);
-    let targets = write_targets(c);
-    let joined = targets
-        .iter()
-        .map(|t| quote_word(t))
-        .collect::<Vec<_>>()
-        .join(" > ");
-    let subject = allow_subject(c);
-    rules
-        .iter()
-        .filter(|r| r.is_for(tool))
-        .any(|r| match &r.redirect {
-            Some(red) => {
-                !targets.is_empty() && red.command.is_match(&bare) && red.targets.is_match(&joined)
-            }
-            None => {
-                r.matches_str(tool, &bare) && (targets.is_empty() || r.matches_str(tool, &subject))
-            }
-        })
 }
 
 /// The command as allow rules see it: [`command_line`], then ` > <target>` for each write

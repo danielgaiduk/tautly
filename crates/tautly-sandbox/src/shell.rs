@@ -551,6 +551,10 @@ fn walk_redirected(
             "file_redirect" | "heredoc_redirect" | "herestring_redirect" => {
                 collect_redirects(child, src, &mut redirects, &mut extra, cx, depth)?
             }
+            // Structural invariant: a redirected compound command has no words of its
+            // own (a function definition has its name), so a word here (`{ cmd; } >&- a`,
+            // a bash syntax error) is unknown.
+            k if !function && WORDS.contains(&k) => return Err(hidden_word("the redirect")),
             _ => walk(child, src, out, cx, depth)?,
         }
     }
@@ -679,21 +683,87 @@ fn collect_redirects(
             }
             for child in node.children(&mut cur) {
                 match child.kind() {
+                    _ if !child.is_named() => {}
+                    "file_descriptor" | "heredoc_start" | "heredoc_end" | "comment" => {}
                     "file_redirect" | "heredoc_redirect" | "herestring_redirect" => {
                         collect_redirects(child, src, redirects, extra, cx, depth)?
                     }
-                    _ => {
-                        // `cmd <<EOF | next`: `next` reads `cmd`'s output.
+                    // `cmd <<EOF | next` / `cmd <<EOF && next`: `next` reads `cmd`'s
+                    // output or runs after it; the body may hold substitutions.
+                    k if k == "heredoc_body" || STATEMENTS.contains(&k) => {
                         let start = extra.len();
                         walk(child, src, extra, cx, depth)?;
                         reject_fed_modules(&extra[start..])?;
                     }
+                    // Structural invariant: anything else on the line (`cmd <<EOF a b`)
+                    // is a word bash passes to the command, which the rules could not see.
+                    _ => return Err(hidden_word("the heredoc delimiter")),
                 }
             }
             Ok(())
         }
+        "herestring_redirect" => {
+            // `<<< word`: exactly one operand; anything more is unknown.
+            let operands = node
+                .named_children(&mut node.walk())
+                .filter(|c| !matches!(c.kind(), "file_descriptor" | "comment"))
+                .count();
+            if operands != 1 {
+                return Err(hidden_word("the herestring"));
+            }
+            walk_children(node, src, extra, cx, depth)
+        }
         _ => walk_children(node, src, extra, cx, depth),
     }
+}
+
+/// Node kinds that are statements of their own (the grammar's `_statement`), as a
+/// heredoc line may continue with one (`cmd <<EOF | next`).
+const STATEMENTS: &[&str] = &[
+    "redirected_statement",
+    "variable_assignment",
+    "variable_assignments",
+    "command",
+    "declaration_command",
+    "unset_command",
+    "test_command",
+    "negated_command",
+    "for_statement",
+    "c_style_for_statement",
+    "while_statement",
+    "if_statement",
+    "case_statement",
+    "pipeline",
+    "list",
+    "subshell",
+    "compound_statement",
+    "function_definition",
+];
+
+/// Node kinds that are a word (the grammar's `_literal`): one bash would pass to the
+/// command, so one that must reach argv or be a redirect operand.
+const WORDS: &[&str] = &[
+    "word",
+    "string",
+    "raw_string",
+    "translated_string",
+    "ansi_c_string",
+    "number",
+    "expansion",
+    "simple_expansion",
+    "command_substitution",
+    "process_substitution",
+    "arithmetic_expansion",
+    "brace_expression",
+    "concatenation",
+];
+
+/// A word the grammar filed under a redirect (`cmd > f a`, `cmd >&- a`, `cmd <<EOF a`):
+/// bash passes it to the command, where the rules could not see it. Refuse (fail closed).
+fn hidden_word(after: &str) -> Unparseable {
+    Unparseable(format!(
+        "words after {after} are arguments the rules cannot see; put them before the redirect"
+    ))
 }
 
 /// Whether a redirect feeds the command's stdin: a heredoc, a herestring, or
@@ -1123,37 +1193,42 @@ pub(crate) fn is_dangerous_env(name: &str) -> bool {
         || DANGEROUS_ENV_PREFIXES.iter().any(|p| upper.starts_with(p))
 }
 
+/// The file redirect a `file_redirect` node describes, or `None` for an fd duplication
+/// or close. Structural invariant: besides its operator and descriptor the node holds
+/// exactly one word, the target, and a close operator (`>&-`, `<&-`) holds none; `cmd >
+/// out.txt a b` and `cmd >&- a` run `cmd a b` and `cmd a`, and the grammar files those
+/// words under the redirect, where the rules could not see them. Refuse (fail closed).
 fn redirect_of(node: Node, src: &[u8]) -> Result<Option<Redirect>, Unparseable> {
     let mut op = "";
+    let mut words = Vec::new();
     let mut cur = node.walk();
     for child in node.children(&mut cur) {
-        if !child.is_named() {
-            op = text(child, src);
-            break;
+        match child.kind() {
+            _ if !child.is_named() => {
+                if op.is_empty() {
+                    op = text(child, src);
+                }
+            }
+            "file_descriptor" | "comment" => {}
+            _ => words.push(child),
         }
     }
-    // `cmd > out.txt a b` runs `cmd a b`: the grammar files the words after the target
-    // under the redirect, where they would be lost to the rules. Refuse (fail closed).
-    let mut dests = node.walk();
-    if node
-        .children_by_field_name("destination", &mut dests)
-        .nth(1)
-        .is_some()
-    {
-        return Err(Unparseable(format!(
-            "words after the target of `{op}` are arguments the rules cannot see; put them \
-             before the redirect"
-        )));
+    let close = matches!(op, ">&-" | "<&-");
+    if close && !words.is_empty() {
+        return Err(hidden_word(&format!("`{op}`")));
     }
-    let Some(dest) = node.child_by_field_name("destination") else {
+    if words.len() > 1 {
+        return Err(hidden_word(&format!("the target of `{op}`")));
+    }
+    let Some(dest) = words.first() else {
         // `>&-` / `2>&-` close a descriptor; anything else is unknown.
-        return if matches!(op, ">&-" | "<&-") {
+        return if close {
             Ok(None)
         } else {
             Err(Unparseable(format!("redirect `{op}` without a target")))
         };
     };
-    let target = unquote(dest, src);
+    let target = unquote(*dest, src);
     let dup = matches!(op, ">&" | "<&")
         && (target == "-" || (!target.is_empty() && target.bytes().all(|b| b.is_ascii_digit())));
     if dup {
