@@ -13,7 +13,8 @@
 //!   ends mid-step) gets a synthetic `cancelled` result.
 //! - `GcApplied` (`reapply_gc`), `Compaction` (`reapply_compaction`), `PinsFolded`,
 //!   `MemoryIndexApplied`, `PrefixApplied` (AGENTS.md and the repo map as logged, never
-//!   read from disk again), `StartPins`, `Uncompacted` and `Undone` are redone where they
+//!   read from disk again; with a calibration, the requests after it are assembled with
+//!   the tools it logged, MCP tools included), `StartPins`, `Uncompacted` and `Undone` are redone where they
 //!   happened. Tool results are read back from their blobs; only references and the
 //!   latest compaction stay in memory.
 //! - `Pin`/`Unpin` sent while a turn runs reach it at its next step start, as they did
@@ -218,6 +219,7 @@ pub(crate) fn rebuild_with(
         started: false,
         pending: Vec::new(),
         results: HashMap::new(),
+        logged_tools: None,
     };
     let mut stopped = false;
     for rec in reader.records() {
@@ -283,6 +285,9 @@ struct Replay<'a> {
     pending: Vec<Command>,
     /// The result blob of every call, for an `Uncompacted` restore.
     results: HashMap<String, BlobRef>,
+    /// The tools the last `PrefixApplied` logged (with a calibration): the requests after
+    /// it were assembled with them. None: assembled from the registry (an older log).
+    logged_tools: Option<Vec<ToolSpec>>,
 }
 
 impl Replay<'_> {
@@ -382,6 +387,7 @@ impl Replay<'_> {
                         .assemblies
                         .entry(model.clone())
                         .or_insert_with(|| c.assembly(&model));
+                    let specs = self.logged_tools.as_ref().unwrap_or(specs);
                     self.out.context.assemble(caps, specs, &model).1
                 });
                 self.step = Some(OpenStep {
@@ -506,16 +512,21 @@ impl Replay<'_> {
                 repo_map,
                 system_prompt_hash,
                 tools_hash,
+                tools,
             } => {
                 let agents_text = self.text(agents_md.as_ref(), "AGENTS.md");
                 let map_text = self.text(repo_map.as_ref(), "repo map");
                 self.ctx().agents_md = agents_text;
                 self.ctx().repo_map = map_text;
+                if self.calibration.is_some() {
+                    self.logged_tools = tools.as_ref().and_then(|b| self.tool_specs(b));
+                }
                 self.out.prefix = Some(SessionRecord::PrefixApplied {
                     agents_md,
                     repo_map,
                     system_prompt_hash,
                     tools_hash,
+                    tools,
                 });
             }
             SessionRecord::StartPins { pins } => {
@@ -600,6 +611,26 @@ impl Replay<'_> {
             Err(e) => {
                 self.warn(format!(
                     "the logged {what} could not be read ({e}); left out"
+                ));
+                None
+            }
+        }
+    }
+
+    /// The tool specs of a `PrefixApplied` blob (none: unreadable, which is said; the
+    /// requests are then assembled from the registry).
+    fn tool_specs(&mut self, blob: &BlobRef) -> Option<Vec<ToolSpec>> {
+        let parsed = self
+            .reader
+            .read_blob(blob)
+            .map_err(|e| e.to_string())
+            .and_then(|b| serde_json::from_slice::<Vec<ToolSpec>>(&b).map_err(|e| e.to_string()));
+        match parsed {
+            Ok(specs) => Some(specs),
+            Err(e) => {
+                self.warn(format!(
+                    "the logged tools could not be read ({e}); the estimate is rebuilt with \
+                     this version's"
                 ));
                 None
             }
@@ -974,8 +1005,8 @@ impl Session {
     }
 
     /// The rest of a resumed session's start: the spend so far, the stale-read guard of
-    /// files unchanged since, and a warning when this build's system prompt or tools
-    /// differ from the logged ones. AGENTS.md and the repo map are the logged ones; a
+    /// files unchanged since, and (at the first request, once the MCP tools have joined) a
+    /// warning when this build's system prompt or tools differ from the logged ones. AGENTS.md and the repo map are the logged ones; a
     /// session that never sent a request starts up as a new one, keeping the start pins
     /// it logged.
     async fn resume_start(&mut self, resumed: Resumed, config_pins: &[String]) {
@@ -984,9 +1015,10 @@ impl Session {
         }
         match &resumed.prefix {
             None => self.init_with(config_pins, resumed.start_pins).await,
-            Some(prefix) => {
+            Some(_) => {
                 self.start_housekeeping();
-                self.warn_if_prefix_changed(prefix).await;
+                // Compared at the first request, once the MCP tools have joined.
+                self.prefix_log.check_next();
                 // The logged index stands until the store is checked again (once the code
                 // index is ready), which an epoch then applies.
                 self.memory.live = true;
@@ -995,44 +1027,6 @@ impl Session {
         }
         self.restore_spend(resumed.usage).await;
         self.restore_guard(resumed.seen).await;
-    }
-
-    async fn warn_if_prefix_changed(&self, logged: &SessionRecord) {
-        let (req, _) = self.assemble();
-        let due = PrefixLog::default().due(
-            self.context.agents_md.as_deref(),
-            self.context.repo_map.as_deref(),
-            &req,
-        );
-        let (
-            Some((
-                SessionRecord::PrefixApplied {
-                    system_prompt_hash: system,
-                    tools_hash: tools,
-                    ..
-                },
-                _,
-            )),
-            SessionRecord::PrefixApplied {
-                system_prompt_hash: logged_system,
-                tools_hash: logged_tools,
-                ..
-            },
-        ) = (due, logged)
-        else {
-            return;
-        };
-        let what = match (system != *logged_system, tools != *logged_tools) {
-            (true, true) => "system prompt and tools differ",
-            (true, false) => "system prompt differs",
-            (false, true) => "tools differ",
-            (false, false) => return,
-        };
-        self.warn(format!(
-            "this version's {what} from the ones this session was logged with: the \
-             provider's prompt cache will be cold for the next request"
-        ))
-        .await;
     }
 
     /// Count what the session spent before against its budgets: the cost ledger's rows of

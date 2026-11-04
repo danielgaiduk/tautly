@@ -40,6 +40,11 @@ pub enum SessionRecord {
         repo_map: Option<BlobRef>,
         system_prompt_hash: String,
         tools_hash: String,
+        /// The tool specs as sent (the serialized `tools` of the request, so the blob's
+        /// hash is `tools_hash`), MCP tools included: a rebuild assembles each logged step
+        /// with the tools in force at it. None in logs written before this field.
+        #[serde(default)]
+        tools: Option<BlobRef>,
     },
     /// A provider request (H6): `hash` is the blake3 of the serialized `CanonicalRequest`
     /// (which is not stored), `turn` the user turn (1-based), `step` the absolute provider
@@ -561,6 +566,19 @@ mod tests {
     }
 
     #[test]
+    fn records_written_before_their_additive_fields_still_read() {
+        let old: SessionRecord = serde_json::from_str(
+            r#"{"type":"prefix_applied","data":{"agents_md":null,"repo_map":null,
+                "system_prompt_hash":"s","tools_hash":"t"}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            old,
+            SessionRecord::PrefixApplied { tools: None, .. }
+        ));
+    }
+
+    #[test]
     fn every_record_type_is_known() {
         let blob = BlobRef::parse(&"a".repeat(64)).unwrap();
         let all = [
@@ -570,6 +588,7 @@ mod tests {
                 repo_map: None,
                 system_prompt_hash: "s".into(),
                 tools_hash: "t".into(),
+                tools: Some(blob.clone()),
             },
             SessionRecord::Request {
                 hash: blob.clone(),

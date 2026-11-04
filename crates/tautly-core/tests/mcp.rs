@@ -1265,3 +1265,107 @@ async fn cancel_during_the_mcp_startup_wait_ends_the_turn_within_200ms() {
     assert!(mock.requests().is_empty());
     run.shutdown().await;
 }
+
+// ---------------------------------------------------------------------------------------
+// Resume of a session that had MCP tools
+
+/// A text response reporting `input` tokens (the estimator calibrates on it).
+fn text_with_usage(text: &str, input: u64) -> MockTurn {
+    MockTurn::Events(vec![
+        ProviderEvent::TextDelta(text.into()),
+        ProviderEvent::Usage(tautly_provider::RawUsage {
+            input,
+            output: 5,
+            cache_read: 0,
+            cache_write: 0,
+        }),
+        ProviderEvent::Done {
+            stop: StopReason::EndTurn,
+        },
+    ])
+}
+
+/// `used` of each `ContextStatus` in `events`.
+fn used(events: &[Event]) -> Vec<u32> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            Event::ContextStatus { used, .. } => Some(*used),
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn a_resumed_mcp_session_estimates_as_the_live_one_and_does_not_warn_of_new_tools() {
+    // Review C probe: the rebuild calibrated without the MCP schemas (the resumed
+    // estimate ran high) and the resume warned that the tools differ, though the first
+    // resumed request carries the very same tools.
+    let fx = Fx::new();
+    let cfg = with_user_server(Mode::Ask, &[]);
+
+    // The live session: two turns.
+    let live = MockProvider::new(vec![
+        text_with_usage("one", 6000),
+        text_with_usage("two", 6000),
+    ]);
+    let mut run = start(fx.builder(cfg.clone(), &live));
+    run.turn_with("first").await;
+    let live_two = run.turn_with("second").await;
+    run.shutdown().await;
+
+    // The same first turn in another session, then resumed for the second.
+    let first = MockProvider::new(vec![text_with_usage("one", 6000)]);
+    let mut run = start(fx.builder(cfg.clone(), &first));
+    let id = run.engine.session_id().to_string();
+    run.turn_with("first").await;
+    run.shutdown().await;
+    let resumed = MockProvider::new(vec![text_with_usage("two", 6000)]);
+    let mut run = start(EngineBuilder {
+        resume: Some(id),
+        ..fx.builder(cfg, &resumed)
+    });
+    let resumed_two = run.turn_with("second").await;
+    run.shutdown().await;
+
+    assert_eq!(
+        mcp_names(&resumed.requests()[0]),
+        mcp_names(&live.requests()[1])
+    );
+    assert_eq!(mcp_names(&resumed.requests()[0]).len(), ECHO_TOOL_COUNT);
+    assert_eq!(used(&resumed_two), used(&live_two));
+    let differ: Vec<&Event> = resumed_two
+        .iter()
+        .filter(|e| matches!(e, Event::Warning { message } if message.contains("differ")))
+        .collect();
+    assert!(differ.is_empty(), "{differ:?}");
+}
+
+#[tokio::test]
+async fn a_resumed_session_whose_mcp_tools_are_gone_warns_once_at_its_first_request() {
+    let fx = Fx::new();
+    let first = MockProvider::new(vec![text_with_usage("one", 6000)]);
+    let mut run = start(fx.builder(with_user_server(Mode::Ask, &[]), &first));
+    let id = run.engine.session_id().to_string();
+    run.turn_with("first").await;
+    run.shutdown().await;
+    // Resumed without the server.
+    let resumed = MockProvider::new(vec![
+        text_with_usage("two", 6000),
+        text_with_usage("three", 6000),
+    ]);
+    let mut run = start(EngineBuilder {
+        resume: Some(id),
+        ..fx.builder(config(Mode::Ask), &resumed)
+    });
+    let two = run.turn_with("second").await;
+    let three = run.turn_with("third").await;
+    run.shutdown().await;
+    let differ = |events: &[Event]| {
+        events
+            .iter()
+            .filter(|e| matches!(e, Event::Warning { message } if message.contains("tools differ")))
+            .count()
+    };
+    assert_eq!((differ(&two), differ(&three)), (1, 0), "{two:?}");
+}

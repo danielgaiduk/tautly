@@ -279,10 +279,11 @@ Structured record: task, plan steps with status, files read/edited with content 
     - `git.head` is read from the `.git` files without spawning git, so start-up stays fast. `dirty` is unknown in the header.
     - The session-start `Checkpoint` record (7.11.11) carries the authoritative head, dirty state and tree.
     - A later `Labeled{label}` record renames the session (the last one wins).
-  - **H5, prefix inputs:** `PrefixApplied{agents_md?, repo_map?, system_prompt_hash, tools_hash}` is written before the first request, and again before any request whose stable-prefix inputs changed (for example MCP tools joining, a model switch changing the edit format).
+  - **H5, prefix inputs:** `PrefixApplied{agents_md?, repo_map?, system_prompt_hash, tools_hash, tools?}` is written before the first request, and again before any request whose stable-prefix inputs changed (for example MCP tools joining, a model switch changing the edit format).
     - `agents_md` and `repo_map` are blobs of the raw text the context holds (none when absent): the content of the `<agents_md>` and `<repo_map>` blocks, without the tags the request wraps it in, so resume can restore it unchanged. `system_prompt_hash` is the blake3 of the system prompt block as sent, `tools_hash` that of the serialized tool list.
+    - `tools` (additive, CP4 fix wave; none in older logs) is a blob of that serialized tool list, MCP tools included, so its reference equals `tools_hash`. A rebuild assembles each logged step with the tools in force at it, so the resumed estimator is calibrated as the live one was (MCP tools join a live session only at a user-turn start, after the rebuild); a log without it falls back to this version's built-in tools.
     - Resume, rewind and replay use the logged text and never regenerate it.
-    - If the current binary's system prompt or tool schemas hash differently, resume warns that the cache will be cold.
+    - If the current binary's system prompt or tool schemas hash differently, the resumed session warns that the cache is cold. The comparison is made at its first request, once the MCP tools have joined, so a resumed session with the same MCP servers does not warn.
   - **H6, richer `Request`:** `Request{hash, turn, step, model, blocks: {stable, pinned, history, tail}}`. `turn` is the user turn, `step` the absolute provider step, and `blocks` the blake3 of each block.
   - **H7, edits and undo are logged and reversible:**
     - `Edit` and `PersistedEffect::Edited` carry `post_image_blob`, the written content (deduped). `Edit.step` is the provider step it happened in (map steps to user turns through the `Request` records).
