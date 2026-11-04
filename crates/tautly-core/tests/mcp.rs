@@ -1055,6 +1055,40 @@ async fn changed_env_value_asks_again() {
 
 /// Review B-I1: the approval covers the script the command line names. The same command
 /// line with the script rewritten (a PR branch) asks again instead of starting.
+/// Review N9: a server whose command line names a file that cannot be hashed (here over
+/// the 1 MiB limit) can never match a remembered approval, so approving it is for this run
+/// only: the prompt says so and nothing is written to the approvals file.
+#[tokio::test]
+async fn unhashable_server_is_approved_for_this_run_only() {
+    let fx = Fx::new();
+    fx.write(
+        "scripts/mcp.sh",
+        &format!("#!/bin/sh\nexec '{}' stdio\n", fixture()),
+    );
+    fx.write("big.dat", &"x".repeat(1024 * 1024 + 1));
+    fx.write(
+        ".tautly/config.toml",
+        "[mcp.servers.echo]\ncommand = \"/bin/sh\"\nargs = [\"scripts/mcp.sh\", \"big.dat\"]\n",
+    );
+    let (cfg, _) = fx.loaded(Mode::Ask);
+    let mock = MockProvider::new(vec![]);
+    let mut run = start(EngineBuilder {
+        interactive: true,
+        ..fx.builder(cfg, &mock)
+    });
+    let events = run
+        .until(|e| matches!(e, Event::McpServerApprovalRequested { .. }))
+        .await;
+    let (request_id, _, _, launch) = approval_request(&events).unwrap();
+    assert!(launch.contains("this run only"), "{launch}");
+    run.send(Command::Approve { request_id }).await;
+    run.until_state("echo", McpState::Ready).await;
+    run.shutdown().await;
+    let file = fx.home.path().join(APPROVALS_FILE);
+    let saved = std::fs::read_to_string(&file).unwrap_or_default();
+    assert!(!saved.contains("\"echo\""), "{saved}");
+}
+
 #[tokio::test]
 async fn rewritten_server_script_asks_again() {
     let fx = Fx::new();

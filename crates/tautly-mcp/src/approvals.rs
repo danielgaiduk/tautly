@@ -36,6 +36,23 @@ static WRITERS: Mutex<()> = Mutex::new(());
 /// approval). Their values are repository content, not the user's secrets, and they decide
 /// what runs (`NODE_OPTIONS`, `LD_PRELOAD`, `PATH`), so a changed value asks again.
 pub fn key(root: &Path, name: &str, spec: &ServerSpec) -> String {
+    approval_key(root, name, spec).key
+}
+
+/// An approval key, and whether an approval under it may be remembered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApprovalKey {
+    pub key: String,
+    /// False when a file the command line names could not be hashed (too big,
+    /// unreadable, not a regular file): the key then holds a value no other call
+    /// produces, so a stored approval could never match. Such a server is approved for
+    /// the run only, and nothing is written to the approvals file.
+    pub rememberable: bool,
+}
+
+/// [`key`], with whether it may be remembered.
+pub fn approval_key(root: &Path, name: &str, spec: &ServerSpec) -> ApprovalKey {
+    let mut rememberable = true;
     let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
     let pairs_hash = |m: &BTreeMap<String, String>| {
         let pairs: Vec<(&String, &String)> = m.iter().collect();
@@ -61,7 +78,7 @@ pub fn key(root: &Path, name: &str, spec: &ServerSpec) -> String {
                 "cwd": cwd.as_ref().map(|c| c.to_string_lossy().into_owned()),
                 "env": env.keys().collect::<Vec<_>>(),
                 "env_values": pairs_hash(env),
-                "files": files_named(&root, &base, &argv),
+                "files": files_named(&root, &base, &argv, &mut rememberable),
             })
         }
         ServerSpec::Http { url, headers } => serde_json::json!({
@@ -76,9 +93,10 @@ pub fn key(root: &Path, name: &str, spec: &ServerSpec) -> String {
         "name": name,
         "launch": launch,
     });
-    blake3::hash(input.to_string().as_bytes())
+    let key = blake3::hash(input.to_string().as_bytes())
         .to_hex()
-        .to_string()
+        .to_string();
+    ApprovalKey { key, rememberable }
 }
 
 /// What the files a stdio server's command line names inside the (canonical) `root`
@@ -99,7 +117,12 @@ pub fn key(root: &Path, name: &str, spec: &ServerSpec) -> String {
 ///
 /// Not covered: what the script loads in turn (imports, `node_modules`), files named
 /// only through variables, and programs found through a `PATH` the server's `env` sets.
-fn files_named(root: &Path, base: &Path, argv: &[&String]) -> Vec<serde_json::Value> {
+fn files_named(
+    root: &Path,
+    base: &Path,
+    argv: &[&String],
+    rememberable: &mut bool,
+) -> Vec<serde_json::Value> {
     let mut budget = MAX_KEYED_TOTAL;
     let mut entries = Vec::new();
     for (i, word) in argv.iter().enumerate() {
@@ -123,7 +146,10 @@ fn files_named(root: &Path, base: &Path, argv: &[&String]) -> Vec<serde_json::Va
                 Some(r) if r.is_dir() => serde_json::json!("dir"),
                 Some(r) => match hash_file(&r, &mut budget) {
                     Some(h) => serde_json::json!({ "blake3": h }),
-                    None => serde_json::json!({ "unknown": nonce() }),
+                    None => {
+                        *rememberable = false;
+                        serde_json::json!({ "unknown": nonce() })
+                    }
                 },
             };
             entries.push(serde_json::json!({ "word": i, "path": candidate, "state": state }));

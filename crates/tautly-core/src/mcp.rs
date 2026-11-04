@@ -22,7 +22,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use tautly_mcp::approvals::key;
+use tautly_mcp::approvals::approval_key;
 use tautly_mcp::config::parse_mcp_json;
 use tautly_mcp::names::{MAX_SERVER_NAME, is_valid_server_name, sanitize};
 use tautly_mcp::{
@@ -142,6 +142,10 @@ pub struct PlannedServer {
     pub approval: Approval,
     /// The approval key of a repository server ([`tautly_mcp::approvals::key`]).
     pub key: Option<String>,
+    /// An approval may be remembered (false: a file its command line names cannot be
+    /// hashed, so it is approved for the run only; see
+    /// [`tautly_mcp::approvals::ApprovalKey`]).
+    pub rememberable: bool,
 }
 
 /// The servers of a session, by name, and what was noticed on the way (shadowed servers,
@@ -262,6 +266,7 @@ pub async fn plan_servers(
             source,
             approval: Approval::Trusted,
             key: None,
+            rememberable: false,
         });
     }
     if !repo.is_empty() {
@@ -272,7 +277,7 @@ pub async fn plan_servers(
             let keyed: Vec<_> = repo
                 .into_iter()
                 .map(|(name, spec, source)| {
-                    let k = key(&root, &name, &spec);
+                    let k = approval_key(&root, &name, &spec);
                     (name, spec, source, k)
                 })
                 .collect();
@@ -289,7 +294,7 @@ pub async fn plan_servers(
             return plan;
         };
         for (name, spec, source, k) in keyed {
-            let approval = if store.is_approved(&k) {
+            let approval = if k.rememberable && store.is_approved(&k.key) {
                 Approval::Remembered
             } else if approve_mcp {
                 Approval::ThisRun
@@ -301,7 +306,8 @@ pub async fn plan_servers(
                 spec,
                 source,
                 approval,
-                key: Some(k),
+                key: Some(k.key),
+                rememberable: k.rememberable,
             });
         }
     }
@@ -384,7 +390,7 @@ impl McpSession {
         for s in plan.servers {
             match (s.approval, s.key) {
                 (Approval::Pending, Some(k)) if approvals.is_interactive() => {
-                    ask.push((s.name, s.spec, s.source, k));
+                    ask.push((s.name, s.spec, s.source, k, s.rememberable));
                 }
                 (Approval::Pending, _) => skip.push((s.name, s.source)),
                 _ => start.push((s.name, s.spec, s.source)),
@@ -415,13 +421,19 @@ impl McpSession {
                 ),
             );
         }
-        for (name, spec, source, k) in ask {
+        for (name, spec, source, k, rememberable) in ask {
             let Some((request_id, rx)) = approvals.open() else {
                 continue;
             };
             hub.note(&name, source, McpState::AwaitingApproval, None);
             // What runs once approved is this `spec`, exactly as shown and keyed.
-            let launch = spec.launch(source);
+            let mut launch = spec.launch(source);
+            if !rememberable {
+                launch.push_str(
+                    " (approved for this run only: a file its command line names cannot be \
+                     hashed)",
+                );
+            }
             owner
                 .log_approval(SessionRecord::ApprovalRequested {
                     request_id: request_id.clone(),
@@ -450,6 +462,7 @@ impl McpSession {
                 let verdict = rx.await.unwrap_or(Verdict::Denied { reason: None });
                 lock(&pending).retain(|(id, _)| *id != request_id);
                 match verdict {
+                    Verdict::Approved if !rememberable => hub.add(name, spec, source),
                     Verdict::Approved => {
                         let (n, r) = (name.clone(), root.clone());
                         let saved = tokio::task::spawn_blocking(move || {
