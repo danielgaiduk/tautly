@@ -906,6 +906,50 @@ fn undo_of_a_session_without_turns_says_so() {
 }
 
 #[test]
+fn memory_consolidate_escapes_control_characters_in_what_it_shows() {
+    let s = Scratch::new();
+    let entry = |id: &str, body: &str| {
+        format!(
+            "---\nid: {id}\ntitle: \"Note {id}\"\nkind: fact\nanchors: []\n\
+             created: 2026-01-01T00:00:00\n---\n{body}\n"
+        )
+    };
+    s.write(
+        ".tautly/memory/evil-a.md",
+        &entry("evil-a", "old a\u{1b}[2K\u{1b}[1Aforged\rover"),
+    );
+    s.write(
+        ".tautly/memory/evil-b.md",
+        &entry("evil-b", "old b\u{7}bell\nsecond"),
+    );
+    // The side model's merge carries such characters too.
+    let reply = json!([{
+        "merge": ["evil-a", "evil-b"],
+        "into": {"title": "Merged", "kind": "fact",
+                 "body": "new\u{1b}[31mred\rback\nsecond\tline"}
+    }])
+    .to_string();
+    let out = consolidate(&s, &reply, "n\n");
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    for (what, bytes) in [("stdout", &out.stdout), ("stderr", &out.stderr)] {
+        for b in bytes.iter() {
+            assert!(
+                *b >= 0x20 || *b == b'\n' || *b == b'\t',
+                "{what} has control byte {b:#04x}: {}",
+                String::from_utf8_lossy(bytes)
+            );
+        }
+    }
+    let said = out_text(&out);
+    assert!(
+        said.contains(r"old a\u{1b}[2K\u{1b}[1Aforged\rover"),
+        "{said}"
+    );
+    assert!(said.contains(r"new\u{1b}[31mred\rback"), "{said}");
+    assert!(said.contains("\n      second\tline"), "lines kept: {said}");
+}
+
+#[test]
 fn memory_consolidate_with_nothing_to_do_says_so() {
     let s = Scratch::new();
     let out = consolidate(&s, "[]", "");

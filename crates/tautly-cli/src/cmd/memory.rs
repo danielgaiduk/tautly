@@ -6,7 +6,9 @@ use std::time::Duration;
 
 use anyhow::bail;
 use clap::Subcommand;
-use tautly_core::{Command as EngineCommand, Event, MemoryChange, MemoryEntry};
+use tautly_core::{
+    Command as EngineCommand, Event, MemoryChange, MemoryEntry, printable, printable_multiline,
+};
 
 use super::{Env, cut};
 use crate::{Cli, Settings};
@@ -39,9 +41,9 @@ pub async fn run(cmd: Cmd, env: &Env, cli: &Cli) -> anyhow::Result<i32> {
             for e in &entries {
                 println!(
                     "{:<width$}  {:<10}  {}{}",
-                    e.id,
+                    printable(&e.id),
                     e.kind.as_str(),
-                    e.title,
+                    printable(&e.title),
                     if e.stale { "  [stale]" } else { "" }
                 );
             }
@@ -52,7 +54,8 @@ pub async fn run(cmd: Cmd, env: &Env, cli: &Cli) -> anyhow::Result<i32> {
             let Some(entry) = entries.iter().find(|e| e.id == id) else {
                 bail!("no memory entry `{id}` (see `tautly memory list`)");
             };
-            print!("{}", entry.to_markdown());
+            // Repository text: control characters escaped, lines kept.
+            print!("{}", printable_multiline(&entry.to_markdown()));
             println!(
                 "\nstatus: {}",
                 if entry.stale {
@@ -117,16 +120,16 @@ async fn consolidate(env: &Env, cli: &Cli) -> anyhow::Result<i32> {
                 change,
                 replaces,
             } => proposals.push((proposal_id, change, replaces)),
-            Event::Warning { message } => eprintln!("tautly: {message}"),
+            Event::Warning { message } => eprintln!("tautly: {}", printable(&message)),
             Event::SessionDiff { .. } => break,
             // Consolidation reports its own problems as warnings, so an error is the
             // answer to the barrier (`diff: ...`), or the session is lost (it would never
             // answer): either way nothing more comes.
             Event::Error { message, hint, .. } => {
                 if !message.starts_with("diff:") {
-                    eprintln!("tautly: {message}");
+                    eprintln!("tautly: {}", printable(&message));
                     if let Some(hint) = hint {
-                        eprintln!("tautly: {hint}");
+                        eprintln!("tautly: {}", printable(&hint));
                     }
                 }
                 break;
@@ -171,7 +174,7 @@ async fn consolidate(env: &Env, cli: &Cli) -> anyhow::Result<i32> {
     let mut warnings = Vec::new();
     while let Some(event) = events.recv().await {
         if let Event::Warning { message } = event {
-            eprintln!("tautly: {message}");
+            eprintln!("tautly: {}", printable(&message));
             warnings.push(message);
         }
     }
@@ -226,21 +229,23 @@ fn show(n: usize, total: usize, change: &MemoryChange, replaces: &[MemoryEntry])
         let title = replaces
             .iter()
             .find(|e| e.id == *id)
-            .map(|e| format!("  \"{}\"", e.title))
+            .map(|e| format!("  \"{}\"", printable(&e.title)))
             .unwrap_or_default();
-        println!("  - delete {id}{title}");
+        println!("  - delete {}{title}", printable(id));
         if let Some(old) = replaces.iter().find(|e| e.id == *id) {
-            println!("      {}", cut(old.body.lines().next().unwrap_or(""), 100));
+            let first = old.body.lines().next().unwrap_or("");
+            println!("      {}", printable(&cut(first, 100)));
         }
     }
     if let Some(entry) = &change.upsert {
         println!(
             "  + write {} [{}]  \"{}\"",
-            entry.id,
+            printable(&entry.id),
             entry.kind.as_str(),
-            entry.title
+            printable(&entry.title)
         );
-        for line in entry.body.lines() {
+        // `lines` splits at CR LF too; what is left of a CR is escaped.
+        for line in printable_multiline(&entry.body).lines() {
             println!("      {line}");
         }
     }

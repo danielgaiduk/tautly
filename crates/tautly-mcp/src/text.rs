@@ -72,6 +72,25 @@ pub fn printable(s: &str) -> String {
     out
 }
 
+/// `s` for display as lines of text (a memory entry's body): like [`printable`], but
+/// newlines and tabs stay and backslashes are not doubled, so code and paths read as
+/// written. CR (as `\r`), ESC and every other control or invisible character are escaped
+/// (`\u{..}`), so the text cannot redraw the screen or overwrite a line.
+pub fn printable_multiline(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\n' | '\t' => out.push(c),
+            '\r' => out.push_str("\\r"),
+            c if c.is_control() || invisible(c) => {
+                out.push_str(&format!("\\u{{{:x}}}", c as u32));
+            }
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 /// `s` for the model: control and invisible characters removed, except newlines and
 /// tabs.
 pub(crate) fn strip_control(s: &str) -> String {

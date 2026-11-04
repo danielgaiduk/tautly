@@ -69,7 +69,7 @@ pub use tautly_tools::DiffPreview;
 // `tautly-cli` depends on this crate alone.
 pub use tautly_context::prompt::system as system_prompt;
 pub use tautly_mcp::config::{import_into_toml, parse_mcp_json};
-pub use tautly_mcp::{McpHub, ServerStatus, printable};
+pub use tautly_mcp::{McpHub, ServerStatus, printable, printable_multiline};
 pub use tautly_provider::{Catalog, ModelInfo, Price};
 pub use tautly_session::{
     Error as LogError, Origin, SessionReader, SessionSummary as LogSummary,

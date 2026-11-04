@@ -408,6 +408,34 @@ fn memory_list_shows_stale_marker() {
 }
 
 #[test]
+fn memory_show_and_list_escape_control_characters_but_keep_lines() {
+    let s = Scratch::new();
+    // A repository's memory entry whose body tries to erase and overwrite lines.
+    s.write(
+        ".tautly/memory/evil.md",
+        "---\nid: evil\ntitle: \"Evil\"\nkind: fact\nanchors: []\ncreated: 2026-01-01T00:00:00\n---\n\
+         first line\u{1b}[2K\u{1b}[1Aforged\rover\u{7}write\nsecond\tline with C:\\dir\nthird\n",
+    );
+    for args in [&["memory", "show", "evil"][..], &["memory", "list"]] {
+        let out = s.run(args);
+        assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+        assert_no_control_bytes("stdout", &out.stdout);
+        assert_no_control_bytes("stderr", &out.stderr);
+    }
+    let out = s.run(&["memory", "show", "evil"]);
+    let shown = stdout(&out);
+    // Escaped, so visible; the entry's lines and tabs and backslashes are as written.
+    assert!(
+        shown.contains(r"first line\u{1b}[2K\u{1b}[1Aforged\rover\u{7}write"),
+        "{shown}"
+    );
+    assert!(
+        shown.contains("\nsecond\tline with C:\\dir\nthird\n"),
+        "{shown}"
+    );
+}
+
+#[test]
 fn memory_list_without_entries_says_so() {
     let s = Scratch::new();
     let out = s.run(&["memory", "list"]);
