@@ -7,16 +7,21 @@
 //! refresh and the watcher, then opens the memory store. Until then, and when opening
 //! fails, tools run without an index (`ToolCx` gets none) and memory tools report that
 //! memory is unavailable.
+//!
+//! [`Workspaces`] hands every session a process starts on one root the same workspace.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, PoisonError, RwLock, Weak};
 use std::time::Duration;
 
 use tautly_index::{Index, WatchHandle};
 use tautly_memory::{MemoryStore, sanitize_title};
-use tautly_sandbox::Sandbox;
+use tautly_sandbox::{LocalSandbox, Sandbox};
 use tokio::sync::watch;
+
+use crate::engine::{EngineError, session_root};
 
 /// What opening produced. Each part may be missing; `warnings` says why.
 pub(crate) struct Opened {
@@ -175,5 +180,45 @@ impl Workspace {
         })
         .await
         .unwrap_or(false)
+    }
+}
+
+/// The workspaces of a process's sessions (spec 3.4): one per root, opened by the first
+/// session on it and closed when the last one ends. Held weakly, so a root no session
+/// uses has nothing open. Clones share the registry.
+#[derive(Clone)]
+pub struct Workspaces {
+    data_home: PathBuf,
+    open: Arc<Mutex<HashMap<PathBuf, Weak<Workspace>>>>,
+}
+
+impl Workspaces {
+    /// Workspaces whose index databases and memory episodes live under `data_home` (the
+    /// sessions' `EngineBuilder::data_home`).
+    pub fn new(data_home: impl Into<PathBuf>) -> Workspaces {
+        Workspaces {
+            data_home: data_home.into(),
+            open: Arc::default(),
+        }
+    }
+
+    pub fn data_home(&self) -> &Path {
+        &self.data_home
+    }
+
+    /// The workspace of the root a session started in `start` runs on
+    /// ([`session_root`]): the one a live session already uses, else a new one on a
+    /// `LocalSandbox` (nothing is opened until a session starts it).
+    pub fn get(&self, start: &Path) -> Result<Arc<Workspace>, EngineError> {
+        let root = session_root(start)?;
+        let mut open = self.open.lock().unwrap_or_else(PoisonError::into_inner);
+        open.retain(|_, ws| ws.strong_count() > 0);
+        if let Some(ws) = open.get(&root).and_then(Weak::upgrade) {
+            return Ok(ws);
+        }
+        let sandbox: Arc<dyn Sandbox> = Arc::new(LocalSandbox::new(root.clone())?);
+        let ws = Workspace::new(sandbox, &self.data_home);
+        open.insert(root, Arc::downgrade(&ws));
+        Ok(ws)
     }
 }
