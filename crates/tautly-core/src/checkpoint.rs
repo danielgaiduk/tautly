@@ -842,15 +842,16 @@ fn common_dir(git_dir: &Path) -> PathBuf {
     }
 }
 
-/// A regular file's bytes, up to `limit` (none: missing). Err: a symbolic link (never
-/// followed: `O_NOFOLLOW`), not a regular file (a FIFO is opened without blocking and
-/// never read), longer than `limit`, or unreadable.
-fn read_regular(path: &Path, limit: u64) -> Result<Option<Vec<u8>>, ()> {
+/// A regular file's bytes, up to `limit` (none: missing). Err: a symbolic link (unless
+/// `follow`; otherwise never followed: `O_NOFOLLOW`), not a regular file (a FIFO is opened
+/// without blocking and never read), longer than `limit`, or unreadable.
+fn read_regular(path: &Path, follow: bool, limit: u64) -> Result<Option<Vec<u8>>, ()> {
     use std::io::Read;
     use std::os::unix::fs::OpenOptionsExt;
+    let nofollow = if follow { 0 } else { libc::O_NOFOLLOW };
     let file = match std::fs::OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .custom_flags(nofollow | libc::O_NONBLOCK | libc::O_CLOEXEC)
         .open(path)
     {
         Ok(f) => f,
@@ -1318,9 +1319,10 @@ impl Checkpointer {
 
     /// The exclude rules outside the work tree now: the user's excludes file (see
     /// [`Git::user_excludes_file`]), then the repository's `info/exclude` (later rules
-    /// win, as in git). Neither is read through a symbolic link. None when no store keeps
-    /// them, when one cannot be read (or `info` is a symbolic link), or when they are
-    /// longer than [`MAX_EXCLUDES`].
+    /// win, as in git). The user's file may be a symbolic link (only the user's own
+    /// configuration names it, so it is followed); `info/exclude` is repository content
+    /// and is never read through one. None when no store keeps them, when one cannot be
+    /// read (or `info` is a symbolic link), or when they are longer than [`MAX_EXCLUDES`].
     async fn excludes_now(
         &self,
         git: &Git<'_>,
@@ -1339,8 +1341,12 @@ impl Checkpointer {
             return Ok(None);
         }
         let mut rules = Vec::new();
-        for path in [user, Some(info.join("exclude"))].into_iter().flatten() {
-            match read_regular(&self.root.join(path), MAX_EXCLUDES) {
+        let sources = [(user, true), (Some(info.join("exclude")), false)];
+        for (path, follow) in sources {
+            let Some(path) = path else {
+                continue;
+            };
+            match read_regular(&self.root.join(path), follow, MAX_EXCLUDES) {
                 Ok(Some(bytes)) => {
                     rules.extend(bytes);
                     rules.push(b'\n');
