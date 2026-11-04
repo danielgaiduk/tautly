@@ -26,11 +26,15 @@
 //!   as a `set_budget` scope, is `-32602`). Each takes an optional `session_id`:
 //!   without one, the default session (or the only open session). The result is `null`
 //!   once the session has the command; what it does arrives as events.
-//! - `session/new {root, resume?, fork?: {session_id, at?, label?}}` opens a session on
-//!   the work tree `root` (absolute) belongs to and returns `{session_id}`. Sessions on
-//!   one root share a `Workspace` (code index, watcher, memory store: opened once, closed
-//!   with the last session). `fork` branches a session that is not open here (its log up
-//!   to step `at`) and opens the branch.
+//! - `session/new {root, resume?, fork?: {session_id, at?, label?, worktree?, model?}}`
+//!   opens a session on the work tree `root` (absolute) belongs to and returns
+//!   `{session_id}`. Sessions on one root share a `Workspace` (code index, watcher, memory
+//!   store: opened once, closed with the last session). `fork` branches a session that is
+//!   not open here (its log up to step `at`) and opens the branch. With `worktree: true`
+//!   (spec 7.12.4) the branch is made from the log without starting the parent, in a new
+//!   git worktree holding the files of step `at` (default: the last), on `model` when
+//!   given; the session opens there, and the reply is `{session_id, worktree, note}`.
+//!   Outside git it is refused.
 //! - `session/tree {root, session_id?}` returns `{nodes}`: the sessions of the project
 //!   the work tree `root` (absolute) belongs to, as a tree in depth-first order (spec
 //!   7.12.3; each node `{session_id, parent: [id, step] | null, label, origin, created,
@@ -1056,6 +1060,21 @@ async fn session_new(
                 .await;
             Ok((json!({ "session_id": sid }), go))
         }
+        (None, Some(fork)) if fork.worktree => {
+            let made = fork_worktree(shared, &root, fork).await?;
+            let worktree = made.worktree.clone();
+            let (engine, events, root) = shared
+                .open(made.worktree, Some(made.session_id), interactive)
+                .await?;
+            let sid = engine.session_id().to_string();
+            let go = shared
+                .register(sid.clone(), Some(root), engine, events, Vec::new(), false)
+                .await;
+            Ok((
+                json!({ "session_id": sid, "worktree": worktree.to_string_lossy(), "note": made.note }),
+                go,
+            ))
+        }
         (None, Some(fork)) => {
             if shared.is_open(&fork.session_id) {
                 return Err(Error::new(
@@ -1110,11 +1129,70 @@ async fn session_new(
     }
 }
 
+/// `session/new {fork: {…, worktree: true}}` (spec 7.12.4): the parent's log (a session of
+/// the project `root` is in) forked at step `at` (default: its last) into a new worktree of
+/// that repository, without starting the parent.
+async fn fork_worktree(
+    shared: &Arc<Shared>,
+    root: &Path,
+    fork: ForkSpec,
+) -> Result<tautly_core::worktree::WorktreeFork, Error> {
+    let Some((_, workspaces)) = shared.factory.clone() else {
+        return Err(Error::new(
+            SESSION_FAILED,
+            "this server serves one session and cannot open others",
+        ));
+    };
+    let parent = fork.session_id.clone();
+    let failed = |why: String| {
+        Error::new(
+            SESSION_FAILED,
+            tautly_core::printable(&format!("cannot fork `{parent}`: {why}")),
+        )
+    };
+    let data_home = workspaces.data_home().to_path_buf();
+    let found = {
+        let (root, id, home) = (root.to_path_buf(), parent.clone(), data_home.clone());
+        tokio::task::spawn_blocking(move || -> Result<_, String> {
+            let workspace = workspaces.get(&root).map_err(|e| e.to_string())?;
+            let log = tautly_core::list_logs(&home, workspace.root())
+                .map_err(|e| e.to_string())?
+                .into_iter()
+                .find(|s| s.id == id)
+                .map(|s| s.path)
+                .ok_or_else(|| format!("no session `{id}` in this project"))?;
+            Ok((workspace, log))
+        })
+        .await
+        .map_err(|e| e.to_string())
+        .and_then(|r| r)
+    };
+    let (workspace, log) = found.map_err(failed)?;
+    let request = tautly_core::worktree::ForkRequest {
+        at: fork.at,
+        dir: None,
+        label: fork.label,
+        model: fork.model,
+    };
+    tautly_core::worktree::fork_to_worktree(
+        Arc::clone(workspace.sandbox()),
+        &data_home,
+        &log,
+        request,
+    )
+    .await
+    .map_err(|e| failed(e.to_string()))
+}
+
 /// `session/new`'s `fork`.
 struct ForkSpec {
     session_id: String,
     at: Option<u32>,
     label: Option<String>,
+    /// Into a new git worktree (spec 7.12.4), from the log: the parent is not started.
+    worktree: bool,
+    /// The model a worktree fork continues on.
+    model: Option<tautly_core::ModelId>,
 }
 
 impl ForkSpec {
@@ -1140,18 +1218,32 @@ impl ForkSpec {
             Some(Value::String(s)) => Some(s.clone()),
             Some(_) => return Err(invalid("`fork.label` must be a string")),
         };
-        if f.get("worktree").and_then(Value::as_bool) == Some(true) {
-            return Err(invalid("worktree forks are not supported yet"));
-        }
-        if f.get("model").is_some_and(|m| !m.is_null()) {
-            return Err(invalid(
-                "`fork.model` is not supported yet: send `set_model` to the branch",
-            ));
-        }
+        let worktree = match f.get("worktree") {
+            None | Some(Value::Null) => false,
+            Some(Value::Bool(b)) => *b,
+            Some(_) => return Err(invalid("`fork.worktree` must be a boolean")),
+        };
+        let model = match f.get("model") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(m)) if worktree => {
+                let model = tautly_core::ModelId::from(m.as_str());
+                tautly_core::known_provider(&model)
+                    .map_err(|e| invalid(&format!("`fork.model`: {e}")))?;
+                Some(model)
+            }
+            Some(Value::String(_)) => {
+                return Err(invalid(
+                    "`fork.model` needs `worktree: true`: send `set_model` to the branch",
+                ));
+            }
+            Some(_) => return Err(invalid("`fork.model` must be a model id")),
+        };
         Ok(ForkSpec {
             session_id,
             at,
             label,
+            worktree,
+            model,
         })
     }
 }

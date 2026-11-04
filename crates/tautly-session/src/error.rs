@@ -31,6 +31,14 @@ pub enum Error {
     InvalidBlobRef(String),
     #[error("blob {0} not found")]
     BlobNotFound(String),
+    #[error("{0:?} is not a session id")]
+    InvalidSessionId(String),
+    #[error(
+        "{} is not in the project of the session log {}",
+        root.display(),
+        log.display()
+    )]
+    OtherProject { root: PathBuf, log: PathBuf },
     #[error("no usable data directory: {0}")]
     DataHome(String),
 }

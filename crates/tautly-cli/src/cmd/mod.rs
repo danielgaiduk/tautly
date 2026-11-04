@@ -1,13 +1,14 @@
-//! The utility commands (`tautly prompt|sessions|models|undo|memory|index|mcp|stats|receipt
-//! ...`): each
-//! reads or changes what a session leaves behind, in the work tree of the current
-//! directory, without a model turn (`memory consolidate` aside).
+//! The utility commands (`tautly prompt|sessions|models|fork|undo|memory|index|mcp|stats|
+//! receipt ...`): each reads or changes what a session leaves behind, in the work tree of
+//! the current directory, without a model turn (`memory consolidate` and `fork --prompt`
+//! aside).
 //!
 //! Output goes to stdout, problems to stderr; the exit code is 0, or 1 when the command
 //! failed (a refused undo, an unknown session, ...). Usage errors exit 2, as clap does.
 
 pub mod auth;
 pub mod doctor;
+mod fork;
 mod index;
 mod mcp;
 mod memory;
@@ -45,6 +46,9 @@ pub enum Command {
         #[command(subcommand)]
         cmd: models::Cmd,
     },
+    /// Branch a session at a step into a new git worktree, optionally running a prompt
+    /// there.
+    Fork(fork::Args),
     /// Revert what a user turn changed (the last one by default).
     Undo(undo::Args),
     /// List and show project memory, or tidy it with the side model.
@@ -75,6 +79,7 @@ pub async fn run(command: Command, cli: &Cli) -> anyhow::Result<i32> {
         Command::Prompt { cmd } => prompt::run(cmd, &env),
         Command::Sessions { cmd } => sessions::run(cmd, &env).await,
         Command::Models { cmd } => models::run(cmd, &env).await,
+        Command::Fork(args) => fork::run(args, &env, cli).await,
         Command::Undo(args) => undo::run(args, &env).await,
         Command::Memory { cmd } => memory::run(cmd, &env, cli).await,
         Command::Index { cmd } => index::run(cmd, &env).await,

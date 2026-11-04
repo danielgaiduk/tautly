@@ -92,6 +92,38 @@ impl<R: Serialize> SessionWriter<R> {
     pub fn create_in(data_home: &Path, root: &Path, init: HeaderInit) -> Result<Self> {
         let header = new_header(Ulid::new(), root, init);
         let dir = paths::sessions_dir(data_home, &header.project);
+        Self::create_at(dir, header)
+    }
+
+    /// A new session for the work tree at `root` whose log goes next to the log at
+    /// `beside` (a fork's parent), so that the two share the blob store. `root` must
+    /// belong to the same project ([`project_id`](paths::project_id); another worktree of
+    /// the repository, say), else [`Error::OtherProject`]. `id` is the session id to use
+    /// (a ULID, [`new_session_id`]; none: a new one), so a caller can name things after
+    /// the session before it exists.
+    pub fn create_beside(
+        beside: &Path,
+        root: &Path,
+        id: Option<&str>,
+        init: HeaderInit,
+    ) -> Result<Self> {
+        let ulid = match id {
+            Some(id) => Ulid::from_string(id).map_err(|_| Error::InvalidSessionId(id.into()))?,
+            None => Ulid::new(),
+        };
+        let header = new_header(ulid, root, init);
+        let dir = beside.parent().unwrap_or(Path::new("."));
+        if dir.file_name().and_then(|n| n.to_str()) != Some(header.project.as_str()) {
+            return Err(Error::OtherProject {
+                root: header.root,
+                log: beside.to_path_buf(),
+            });
+        }
+        Self::create_at(dir.to_path_buf(), header)
+    }
+
+    /// Create the log of `header` in the project directory `dir`.
+    fn create_at(dir: PathBuf, header: Header) -> Result<Self> {
         paths::create_private_dir_all(&dir)?;
         let path = dir.join(format!("{}.jsonl", header.session_id));
         let file = OpenOptions::new()
@@ -278,6 +310,11 @@ fn new_header(ulid: Ulid, root: &Path, init: HeaderInit) -> Header {
         config_hash: init.config_hash,
         tags: init.tags,
     }
+}
+
+/// A new session id (a ULID), for [`SessionWriter::create_beside`].
+pub fn new_session_id() -> String {
+    Ulid::new().to_string()
 }
 
 /// Unix milliseconds now (0 before 1970, which only a broken clock gives).

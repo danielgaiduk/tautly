@@ -1347,13 +1347,19 @@ async fn an_offline_edit_after_a_crash_in_a_command_turn_is_a_conflict() {
     // N1 round 3: the turn's end was never checkpointed (the log was cut after its
     // command); the pair that ends in the resume's checkpoint spans that cut end, so what
     // changed in it unexplained is the human's: the offline edit, and also the command's
-    // own file (a spurious conflict, which fails safe).
+    // own file (a spurious conflict, which fails safe). The snapshots get a generous time
+    // limit: one skipped under load leaves the offline edit out of the tip (Task 49
+    // M-R3a), which is safe but not what this checks.
     let repo = Repo::git_repo();
+    let patient = |mut b: EngineBuilder| {
+        b.config.checkpoints.timeout_ms = 120_000;
+        b
+    };
     let mock = MockProvider::new(vec![
         tools_step(vec![bash("b1", "printf 'cmd\\n' > c.txt")]),
         text_step("done"),
     ]);
-    let mut run = Run::start(repo.builder(&mock));
+    let mut run = Run::start(patient(repo.builder(&mock)));
     let id = run.engine.session_id().to_string();
     run.turn_with("go").await;
     let log = run.current().1;
@@ -1369,12 +1375,13 @@ async fn an_offline_edit_after_a_crash_in_a_command_turn_is_a_conflict() {
     repo.write("b.txt", "offline\n");
     let mut run = Run::start(EngineBuilder {
         resume: Some(id),
-        ..repo.builder(&MockProvider::new(vec![]))
+        ..patient(repo.builder(&MockProvider::new(vec![])))
     });
     let (_, report) = run.rewind(1, false, &[]).await.done();
+    // Whatever else happens, the human edit is never overwritten.
+    assert_eq!(repo.read("b.txt").as_deref(), Some("offline\n"));
     assert!(!report.applied, "{report:?}");
     assert_eq!(report.conflicts, ["b.txt", "c.txt"], "{report:?}");
-    assert_eq!(repo.read("b.txt").as_deref(), Some("offline\n"));
     run.stop().await;
 }
 
@@ -1606,6 +1613,15 @@ fn opts(
         dry_run,
         force,
         overwrite: overwrite.iter().map(|s| s.to_string()).collect(),
+        include_own: false,
+    }
+}
+
+/// [`opts`] that also considers the backups `restore-backup` kept itself.
+fn own_opts(force: bool, overwrite: &[&str]) -> tautly_core::sessions::RestoreBackupOptions {
+    tautly_core::sessions::RestoreBackupOptions {
+        include_own: true,
+        ..opts(false, force, overwrite)
     }
 }
 
@@ -1655,12 +1671,59 @@ async fn restore_backup_puts_back_what_the_log_kept() {
         .unwrap();
     assert_eq!(done.written, ["a.txt"]);
     assert_eq!(repo.read("a.txt").as_deref(), Some("human\n"));
-    // And it can be put back in turn: the content it replaced was kept.
+    assert!(!done.own);
+    // And it can be put back in turn, when asked: the content it replaced was kept.
+    let again = restore_backup(&repo, &a, &own_opts(true, &[]))
+        .await
+        .unwrap();
+    assert!(again.own);
+    assert_eq!(again.written, ["a.txt"]);
+    assert_eq!(repo.read("a.txt").as_deref(), Some("one\n"));
+}
+
+#[tokio::test]
+async fn restore_backup_run_again_does_not_reverse_itself() {
+    // Task 49 M-R3b: without --include-own, its own backups are passed over, so a run
+    // again (here after the first was cut off before its end) finishes the rewind's
+    // backup instead of undoing what the first run wrote.
+    let (repo, a) = overwritten_outside_git().await;
+    let done = restore_backup(&repo, &a, &opts(false, true, &[]))
+        .await
+        .unwrap();
+    assert_eq!(done.written, ["a.txt"]);
+    assert_eq!(repo.read("a.txt").as_deref(), Some("human\n"));
+    // Cut off: its `RestoreEnded` is lost.
+    let log = logs(repo.home())
+        .into_iter()
+        .find(|p| p.to_string_lossy().contains(&a))
+        .unwrap();
+    let text = std::fs::read_to_string(&log).unwrap();
+    let kept: Vec<&str> = text.lines().collect();
+    assert!(kept.last().unwrap().contains("restore_ended"));
+    std::fs::write(&log, kept[..kept.len() - 1].join("\n") + "\n").unwrap();
     let again = restore_backup(&repo, &a, &opts(false, true, &[]))
         .await
         .unwrap();
-    assert_eq!(again.written, ["a.txt"]);
+    assert!(again.skipped_own && !again.own, "{again:?}");
+    assert!(again.written.is_empty(), "{again:?}");
+    assert_eq!(repo.read("a.txt").as_deref(), Some("human\n"));
+}
+
+#[tokio::test]
+async fn restore_backup_counts_a_mode_change_as_a_conflict() {
+    // Task 49 M-R3c: a human `chmod` alone is a change too.
+    use std::os::unix::fs::PermissionsExt;
+    let (repo, a) = overwritten_outside_git().await;
+    let path = repo.root().join("a.txt");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let done = restore_backup(&repo, &a, &opts(false, true, &[]))
+        .await
+        .unwrap();
+    assert_eq!(done.conflicts, ["a.txt"], "{done:?}");
+    assert!(done.written.is_empty());
     assert_eq!(repo.read("a.txt").as_deref(), Some("one\n"));
+    let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o755);
 }
 
 #[tokio::test]
@@ -1680,7 +1743,7 @@ async fn restore_backup_never_overwrites_a_later_human_edit() {
         .unwrap();
     assert_eq!(done.written, ["a.txt"]);
     assert_eq!(repo.read("a.txt").as_deref(), Some("human\n"));
-    let back = restore_backup(&repo, &a, &opts(false, true, &[]))
+    let back = restore_backup(&repo, &a, &own_opts(true, &[]))
         .await
         .unwrap();
     assert_eq!(back.written, ["a.txt"]);

@@ -726,7 +726,7 @@ Every operation here creates a new branch or a new view. None truncates a log, a
 
 #### 7.12.4 Fork at a step into an isolated worktree
 - **Command:** `tautly fork <session> --at N [--model M] [--prompt TEXT] [--label L] [--dir PATH] [--approve auto-edit|yolo] [--budget-usd N] [--output json|text]`.
-- **Worktree:** it creates `git worktree add --detach <dir> <commit>` at `state_at(N)`'s checkpoint and applies the tool-edit reverts there. Git runs with hooks disabled. `<dir>` defaults to `<data home>/worktrees/<project-id>/<session-id>`.
+- **Worktree:** it creates `git worktree add --detach <dir> <commit>`, where `<commit>` is `state_at(N)`'s checkpoint with the tool-edit reverts applied, composed as a commit of its own (Task 50), so the worktree starts clean at exactly that state. Git runs with hooks disabled, through the checkpoints' hardened git. `<dir>` defaults to `<data home>/worktrees/<project-id>/<session-id>`. A state with no checkpoint to start from is refused with its note.
 - **Session:** a new session (`origin: what_if`, parent `(session, step N)`, `root` = the worktree) holding the records up to step N. Root-relative paths make them valid there. It shares blobs with its parent (H10). `--model` applies `SetModel` before the first message.
 - **Running:**
   - Without `--prompt` it prints the worktree path, the session id and the resume command.

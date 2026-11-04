@@ -2194,6 +2194,49 @@ pub async fn delete_session_refs(
     .await
 }
 
+/// `git worktree add --detach <dir> <commit>` on the repository at `root` (a fork's own
+/// worktree, spec 7.12.4), with every setting a checkpoint's git runs with: no hook (a
+/// `post-checkout` one included), filter, fsmonitor or transport runs. Only the new
+/// worktree and its administrative files are written; the user's index, HEAD and work
+/// tree are not.
+pub(crate) async fn worktree_add(
+    sb: &dyn Sandbox,
+    root: &Path,
+    dir: &Path,
+    commit: &str,
+) -> Result<(), CheckpointError> {
+    let dir = dir.to_string_lossy();
+    with_plain_git(sb, root, async |git| {
+        let args = ["worktree", "add", "--detach", "--", &dir, commit];
+        git.run(&args, None, Checkpointer::housekeeping_deadline())
+            .await?;
+        Ok(())
+    })
+    .await
+}
+
+/// `git worktree remove [--force] <dir>` on the repository at `root`, through the same
+/// hardened git. Without `force`, git refuses a worktree with modified or untracked files.
+pub(crate) async fn worktree_remove(
+    sb: &dyn Sandbox,
+    root: &Path,
+    dir: &Path,
+    force: bool,
+) -> Result<(), CheckpointError> {
+    let dir = dir.to_string_lossy();
+    with_plain_git(sb, root, async |git| {
+        let mut args = vec!["worktree", "remove"];
+        if force {
+            args.push("--force");
+        }
+        args.extend(["--", &dir]);
+        git.run(&args, None, Checkpointer::housekeeping_deadline())
+            .await?;
+        Ok(())
+    })
+    .await
+}
+
 async fn delete_refs(
     git: &Git<'_>,
     names: &[String],

@@ -628,12 +628,18 @@ pub(crate) async fn materialize_inner(
                 Src::Absent => Some(Wrote::Absent),
                 Src::Base => None,
             };
+            // A blob is written over a file with that file's mode (see `write`).
+            let wrote_mode = match (&p.src, &p.disk) {
+                (Src::Blob(_), Disk::File { mode, .. }) => Some(*mode),
+                _ => None,
+            };
             files.push(BackupFile {
                 path,
                 existed,
                 blob,
                 mode,
                 wrote,
+                wrote_mode,
             });
         }
         let paths = planned
@@ -647,6 +653,7 @@ pub(crate) async fn materialize_inner(
             backup_ref: report.backup_ref.clone(),
             files,
             paths,
+            restore_backup: false,
         })?;
     }
     let written = write(sb, cp.as_deref(), target, tbase.as_deref(), &planned).await;

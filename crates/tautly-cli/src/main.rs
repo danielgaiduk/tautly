@@ -13,7 +13,7 @@
 //! - `tautly auth add <provider>` stores an API key in the OS keychain; `tautly doctor`
 //!   checks the setup (spec 7.11.2).
 //!
-//! `tautly prompt|sessions|models|undo|memory|index|mcp ...` are utility commands
+//! `tautly prompt|sessions|models|fork|undo|memory|index|mcp ...` are utility commands
 //! (`cmd`): they read or change what sessions leave behind and exit.
 //!
 //! Flags shared by `-p`, `--rpc`, `acp` (written before it) and the REPL: `--approve
@@ -477,6 +477,27 @@ async fn oneshot(
     resume: Option<String>,
     prompt: String,
 ) -> anyhow::Result<i32> {
+    let output = output_format(cli.output);
+    headless(settings, root, resume, prompt, cli.start_commands(), output).await
+}
+
+fn output_format(output: Option<Output>) -> OutputFormat {
+    match output {
+        Some(Output::Json) => OutputFormat::Json,
+        Some(Output::Text) | None => OutputFormat::Text,
+    }
+}
+
+/// Run `prompt` as one headless turn of a session on `root` (`tautly -p`, `tautly fork
+/// --prompt`), after the `start` commands; the exit code (see the module docs).
+async fn headless(
+    settings: Settings,
+    root: PathBuf,
+    resume: Option<String>,
+    prompt: String,
+    start: Vec<Command>,
+    output: OutputFormat,
+) -> anyhow::Result<i32> {
     // Watched before the engine (and its own handlers) exists, so a SIGTERM or SIGHUP at
     // any point still ends the process with its code.
     let terminated = tokio::spawn(terminated()?);
@@ -489,13 +510,9 @@ async fn oneshot(
         while events.recv().await.is_some() {}
         return Ok(terminated.await.unwrap_or(1));
     }
-    for cmd in cli.start_commands() {
+    for cmd in start {
         let _ = engine.send(cmd).await;
     }
-    let output = match cli.output {
-        Some(Output::Json) => OutputFormat::Json,
-        Some(Output::Text) | None => OutputFormat::Text,
-    };
     // SIGTERM / SIGHUP shut the session down (the turn ends as cancelled); the exit code
     // still says which signal it was.
     let code = run_oneshot(engine, events, prompt, output, tokio::io::stdout()).await;
