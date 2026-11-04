@@ -1532,6 +1532,42 @@ async fn a_failed_index_refresh_is_reported_once() {
     assert_eq!(n, 1, "{events:?}");
 }
 
+/// Review C M10 seam (Task 49's working-tree lease): a workspace knows how many sessions
+/// run on it.
+#[tokio::test]
+async fn a_workspace_counts_its_live_sessions() {
+    let fx = Fx::new();
+    let sb: Arc<dyn Sandbox> = Arc::new(LocalSandbox::new(fx.root()).unwrap());
+    let ws = Workspace::new(sb, fx.home.path());
+    assert_eq!(ws.live_sessions(), 0);
+    let session = |mock: &MockProvider| {
+        start(EngineBuilder {
+            workspace: Some(Arc::clone(&ws)),
+            ..fx.builder(config(Mode::Ask), mock)
+        })
+    };
+    let (one, two) = (MockProvider::new(vec![]), MockProvider::new(vec![]));
+    let (mut a, mut b) = (session(&one), session(&two));
+    assert_eq!(ws.live_sessions(), 2);
+    for run in [&mut a, &mut b] {
+        run.engine.send(Command::Shutdown).await.unwrap();
+        while tokio::time::timeout(WAIT, run.events.recv())
+            .await
+            .expect("the engine did not stop")
+            .is_some()
+        {}
+    }
+    let deadline = Instant::now() + WAIT;
+    while ws.live_sessions() != 0 {
+        assert!(
+            Instant::now() < deadline,
+            "{} still live",
+            ws.live_sessions()
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
 #[tokio::test]
 async fn old_spill_files_are_cleaned_at_start() {
     let fx = Fx::new();

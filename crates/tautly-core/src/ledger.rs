@@ -18,9 +18,9 @@ pub const LEDGER_FILE: &str = "ledger.sqlite";
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// `PRAGMA user_version` of the schema below. Changes are additive only (new columns with
-/// defaults); a build still refuses a file whose version is newer than it knows
-/// ([`LedgerError::Newer`]), so it never writes rows a newer schema might misread.
-const SCHEMA_VERSION: i64 = 2;
+/// defaults, new indexes); a build still refuses a file whose version is newer than it
+/// knows ([`LedgerError::Newer`]), so it never writes rows a newer schema might misread.
+const SCHEMA_VERSION: i64 = 3;
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS usage (
@@ -36,10 +36,14 @@ CREATE TABLE IF NOT EXISTS usage (
     estimated INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS usage_at ON usage(at_ms);
+CREATE INDEX IF NOT EXISTS usage_session ON usage(session);
 ";
 
 /// Version 1 to 2: whether the engine estimated the row.
 const V2: &str = "ALTER TABLE usage ADD COLUMN estimated INTEGER NOT NULL DEFAULT 0;";
+/// Version 2 to 3: a session's totals (every resume, every row of a session list) without
+/// a scan of the whole table.
+const V3: &str = "CREATE INDEX IF NOT EXISTS usage_session ON usage(session);";
 
 #[derive(Debug, thiserror::Error)]
 pub enum LedgerError {
@@ -276,10 +280,15 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch("BEGIN IMMEDIATE")?;
     let step = || -> rusqlite::Result<()> {
         let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
-        match version {
-            0 => conn.execute_batch(SCHEMA)?,
-            1 => conn.execute_batch(V2)?,
-            _ => {}
+        if version == 0 {
+            conn.execute_batch(SCHEMA)?;
+        } else {
+            if version < 2 {
+                conn.execute_batch(V2)?;
+            }
+            if version < 3 {
+                conn.execute_batch(V3)?;
+            }
         }
         if version < SCHEMA_VERSION {
             conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;

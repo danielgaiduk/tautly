@@ -645,6 +645,27 @@ async fn a_write_that_lands_after_its_bound_is_noticed_at_the_next_step() {
             .any(|w| w.contains("late.txt changed after its write was abandoned")),
         "{second:?}"
     );
+    // Both are logged (the write generation moves; a rebuild replays it), review C M3.
+    let lost: Vec<(Vec<String>, bool)> = records(&run.engine)
+        .into_iter()
+        .filter_map(|r| match r {
+            SessionRecord::WritesLost { paths, late } => Some((
+                paths
+                    .iter()
+                    .map(|p| p.as_str().to_string())
+                    .collect::<Vec<_>>(),
+                late,
+            )),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        lost,
+        [
+            (vec!["late.txt".to_string()], false),
+            (vec!["late.txt".to_string()], true)
+        ]
+    );
 }
 
 #[tokio::test]
@@ -1045,6 +1066,61 @@ async fn usage_of_a_stream_broken_mid_way_is_estimated_and_counted() {
     let t = fx.ledger_rows(2).await;
     assert_eq!((t.requests, t.estimated), (2, 1));
     assert_eq!(t.input, 2000);
+}
+
+/// A response with no usage at all (an openai-compat server that ignores
+/// `include_usage`): its input and output are estimated and counted.
+fn no_usage_text(text: &str) -> MockTurn {
+    MockTurn::Events(vec![
+        ProviderEvent::TextDelta(text.into()),
+        ProviderEvent::Done {
+            stop: StopReason::EndTurn,
+        },
+    ])
+}
+
+#[tokio::test]
+async fn a_response_without_usage_is_charged_an_estimate() {
+    let fx = Fx::new();
+    let mock = MockProvider::new(vec![
+        tools_step(vec![bash("c1", "true")], None),
+        no_usage_text("done"),
+    ]);
+    let mut run = start(fx.builder(config(true), &mock));
+    let events = run.turn_with("go").await;
+    assert_eq!(finish_reason(&events), FinishReason::Completed);
+    let u = usage_events(&events);
+    assert_eq!(u.len(), 2, "one estimate per response: {events:?}");
+    assert!(
+        u.iter().all(|(i, o, est)| *i > 0 && *o > 0 && *est),
+        "{u:?}"
+    );
+    let t = fx.ledger_rows(2).await;
+    assert_eq!((t.requests, t.estimated), (2, 2));
+    assert!(t.usd > 0.0, "{t:?}");
+}
+
+#[tokio::test]
+async fn responses_without_usage_count_against_the_token_budget() {
+    // Review probe P1: tool calls, then text, never any usage; `max_tokens = 10`.
+    let fx = Fx::new();
+    let mut cfg = config(false);
+    cfg.budget.session.max_tokens = Some(10);
+    let mock = MockProvider::new(vec![
+        tools_step(vec![bash("c1", "true")], None),
+        tools_step(vec![bash("c2", "true")], None),
+        tools_step(vec![bash("c3", "true")], None),
+        no_usage_text("done"),
+    ]);
+    let mut run = start(fx.builder(cfg, &mock));
+    let events = run.turn_with("go").await;
+    assert_eq!(finish_reason(&events), FinishReason::Budget, "{events:?}");
+    assert_eq!(
+        mock.requests().len(),
+        1,
+        "no request after the budget ran out"
+    );
+    assert_eq!(usage_events(&events).len(), 1, "{events:?}");
 }
 
 #[tokio::test]

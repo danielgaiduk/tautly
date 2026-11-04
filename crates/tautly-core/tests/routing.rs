@@ -296,7 +296,8 @@ impl Fx {
         }
     }
 
-    /// `(model, cost_usd, input, output)` of every ledger row, once there are `n`.
+    /// `(model, cost_usd, input, output)` of every ledger row of reported usage (the
+    /// estimates for the main steps that report none are left out), once there are `n`.
     async fn ledger_rows(&self, n: usize) -> Vec<(String, Option<f64>, u64, u64)> {
         let end = Instant::now() + WAIT;
         loop {
@@ -317,9 +318,9 @@ impl Fx {
         else {
             return Vec::new();
         };
-        let Ok(mut stmt) =
-            conn.prepare("SELECT model, cost_usd, input, output FROM usage ORDER BY id")
-        else {
+        let Ok(mut stmt) = conn.prepare(
+            "SELECT model, cost_usd, input, output FROM usage WHERE estimated = 0 ORDER BY id",
+        ) else {
             return Vec::new();
         };
         stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
@@ -472,6 +473,92 @@ async fn compaction_summary_requested_from_side_model_not_main() {
     ));
 }
 
+/// The tokens and cost of the `Usage` events of `role`.
+fn spent(events: &[Event], role: UsageRole) -> (u64, f64) {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            Event::Usage {
+                role: r,
+                tokens_in,
+                tokens_out,
+                cost_usd,
+                ..
+            } if *r == role => Some((tokens_in + tokens_out, cost_usd.unwrap_or(0.0))),
+            _ => None,
+        })
+        .fold((0, 0.0), |(t, c), (t2, c2)| (t + t2, c + c2))
+}
+
+/// Make the cost ledger unusable: resume then restores the spend from the log alone.
+fn break_ledger(fx: &Fx) {
+    let ledger = fx.home.path().join("ledger.sqlite");
+    let _ = std::fs::remove_file(&ledger);
+    for ext in ["-wal", "-shm"] {
+        let mut p = ledger.clone().into_os_string();
+        p.push(ext);
+        let _ = std::fs::remove_file(PathBuf::from(p));
+    }
+    std::fs::create_dir(&ledger).unwrap();
+}
+
+/// Review C M2: side-model usage is in the session log (not only the ledger), and a
+/// resume without the ledger prices each logged usage by the model it was spent on.
+#[tokio::test]
+async fn a_resume_without_the_ledger_counts_side_usage_priced_by_its_own_model() {
+    let fx = compaction_fx();
+    let main = MockProvider::new(compaction_script());
+    let side = MockProvider::new(vec![text_step("SUMMARY-TEXT", usage(2000, 300))]);
+    let mut run = start(fx.builder(config(Some(SMALL_PRICE)), &main, &side));
+    let id = run.engine.session_id().to_string();
+    let events = run.turn_with(&long_prompt()).await;
+    assert_eq!(finish_reason(&events), FinishReason::Completed);
+    let (main_tokens, main_usd) = spent(&events, UsageRole::Main);
+    let (side_tokens, side_usd) = spent(&events, UsageRole::Side);
+    assert_eq!(side_tokens, 2300);
+    run.engine.send(Command::Shutdown).await.unwrap();
+    while run.events.recv().await.is_some() {}
+    break_ledger(&fx);
+
+    let resume = |mock: &MockProvider| EngineBuilder {
+        resume: Some(id.clone()),
+        ..fx.builder(config(Some(SMALL_PRICE)), mock, &MockProvider::new(vec![]))
+    };
+    let budget = |max_usd: Option<f64>, max_tokens: Option<u64>| Command::SetBudget {
+        scope: tautly_core::BudgetScope::Session,
+        max_usd,
+        max_tokens,
+    };
+    // Tokens: the main steps' alone are within the limit, with the side request's not.
+    let mock = MockProvider::new(vec![text_step("never sent", usage(1, 1))]);
+    let mut run = start(resume(&mock));
+    run.engine
+        .send(budget(None, Some(main_tokens + 1)))
+        .await
+        .unwrap();
+    let events = run.turn_with("again").await;
+    assert_eq!(finish_reason(&events), FinishReason::Budget, "{events:?}");
+    assert!(mock.requests().is_empty());
+    run.engine.send(Command::Shutdown).await.unwrap();
+    while run.events.recv().await.is_some() {}
+
+    // Cost: just above what was spent, each response at its own model's price (the side
+    // request priced as the main model would be past it).
+    let mock = MockProvider::new(vec![text_step("sent", usage(1, 1))]);
+    let mut run = start(resume(&mock));
+    let limit = (main_usd + side_usd) * 1.01;
+    run.engine.send(budget(Some(limit), None)).await.unwrap();
+    let events = run.turn_with("again").await;
+    assert_eq!(
+        finish_reason(&events),
+        FinishReason::Completed,
+        "{events:?}"
+    );
+    assert_eq!(mock.requests().len(), 1);
+    run.engine.send(Command::Shutdown).await.unwrap();
+    while run.events.recv().await.is_some() {}
+}
+
 #[tokio::test]
 async fn side_usage_priced_and_recorded_with_side_model_id() {
     let fx = compaction_fx();
@@ -532,46 +619,91 @@ async fn an_unpriced_side_model_has_no_cost_and_the_usd_budget_warns_once() {
 #[tokio::test]
 async fn side_usage_has_role_side_and_counts_toward_budget_and_ledger() {
     let fx = compaction_fx();
-    let main = MockProvider::new(compaction_script());
+    let mut script = compaction_script();
+    script.push(text_step("never sent", usage(1, 1)));
+    let main = MockProvider::new(script);
     let side = MockProvider::new(vec![text_step("SUMMARY-TEXT", usage(2000, 300))]);
-    let mut cfg = config(Some(SMALL_PRICE));
-    // The main model's steps report nothing but the last (110 tokens): only the side
-    // request's 2,300 tokens can take the session past 80% of 2,800.
-    cfg.budget.session = BudgetLimits {
-        max_usd: None,
-        max_tokens: Some(2800),
-    };
-    let mut run = start(fx.builder(cfg, &main, &side));
+    let mut run = start(fx.builder(config(Some(SMALL_PRICE)), &main, &side));
     let events = run.turn_with(&long_prompt()).await;
     assert_eq!(finish_reason(&events), FinishReason::Completed);
-
-    let usage_at = events
-        .iter()
-        .position(|e| {
-            matches!(
-                e,
+    let tokens = |role: UsageRole| -> u64 {
+        events
+            .iter()
+            .filter_map(|e| match e {
                 Event::Usage {
-                    role: UsageRole::Side,
+                    role: r,
+                    tokens_in,
+                    tokens_out,
                     ..
-                }
-            )
+                } if *r == role => Some(tokens_in + tokens_out),
+                _ => None,
+            })
+            .sum()
+    };
+    assert_eq!(tokens(UsageRole::Side), 2300);
+    // The main steps' tokens alone are within this limit; with the side request's they
+    // are past it, so the next turn sends nothing.
+    run.engine
+        .send(Command::SetBudget {
+            scope: tautly_core::BudgetScope::Session,
+            max_usd: None,
+            max_tokens: Some(tokens(UsageRole::Main) + 1),
         })
-        .expect("a Usage with role side");
-    let warn_at = events
-        .iter()
-        .position(|e| matches!(e, Event::Warning { message } if message.contains("session budget 82% used")))
-        .unwrap_or_else(|| panic!("no 80% warning: {:?}", warnings(&events)));
-    assert!(warn_at > usage_at, "{events:?}");
-    // The main response's own usage came after the warning.
-    assert!(events[warn_at..].iter().any(|e| matches!(
-        e,
-        Event::Usage {
-            role: UsageRole::Main,
-            ..
-        }
-    )));
+        .await
+        .unwrap();
+    let next = run.turn_with("again").await;
+    assert_eq!(finish_reason(&next), FinishReason::Budget, "{next:?}");
+    assert_eq!(main.requests().len(), 5);
     let rows = fx.ledger_rows(2).await;
     assert_eq!(rows.iter().filter(|r| r.0 == SMALL).count(), 1);
+}
+
+/// Index of the first `Usage` of `role` in `events`.
+fn first_usage(events: &[Event], role: UsageRole) -> Option<usize> {
+    events
+        .iter()
+        .position(|e| matches!(e, Event::Usage { role: r, .. } if *r == role))
+}
+
+/// The 80% warning a side request causes follows that request's `Usage` (re-review N7:
+/// the property `charge()` documents). The limit is sized from a first run of the same
+/// script, so that the main steps before the side request stay below 80% and the side
+/// request's 2,300 tokens take the session past it (with 1,150 tokens of slack either
+/// way for estimate noise between the runs).
+#[tokio::test]
+async fn the_80_percent_warning_a_side_request_causes_follows_its_usage() {
+    let fx = compaction_fx();
+    let run_once = |max_tokens: Option<u64>| {
+        let main = MockProvider::new(compaction_script());
+        let side = MockProvider::new(vec![text_step("SUMMARY-TEXT", usage(2000, 300))]);
+        let mut cfg = config(Some(SMALL_PRICE));
+        cfg.budget.session = BudgetLimits {
+            max_usd: None,
+            max_tokens,
+        };
+        let mut run = start(fx.builder(cfg, &main, &side));
+        async move {
+            let events = run.turn_with(&long_prompt()).await;
+            run.engine.send(Command::Shutdown).await.unwrap();
+            while run.events.recv().await.is_some() {}
+            events
+        }
+    };
+    let measured = run_once(None).await;
+    let side_at = first_usage(&measured, UsageRole::Side).expect("a side request");
+    let (main_before, _) = spent(&measured[..side_at], UsageRole::Main);
+    let limit = (main_before + 1150) * 5 / 4;
+
+    let events = run_once(Some(limit)).await;
+    let side_at = first_usage(&events, UsageRole::Side).expect("a side request");
+    let warn_at = events
+        .iter()
+        .position(|e| {
+            matches!(e, Event::Warning { message }
+                if message.starts_with("session budget") && message.contains("% used"))
+        })
+        .unwrap_or_else(|| panic!("no 80% warning: {:?}", warnings(&events)));
+    assert!(warn_at > side_at, "{events:?}");
 }
 
 #[tokio::test]

@@ -225,6 +225,7 @@ async fn prefix_applied_logged_before_first_request_with_agents_md_and_repo_map_
         repo_map,
         system_prompt_hash,
         tools_hash,
+        tools,
     } = prefix
     else {
         unreachable!()
@@ -239,6 +240,9 @@ async fn prefix_applied_logged_before_first_request_with_agents_md_and_repo_map_
     assert!(text_of(req, 3).contains(map.trim()), "{map}");
     assert_eq!(*system_prompt_hash, hex(text_of(req, 0).as_bytes()));
     assert_eq!(*tools_hash, hex(&serde_json::to_vec(&req.tools).unwrap()));
+    // The tool specs as sent, so a rebuild assembles with them (MCP tools included).
+    let specs = blob_text(&reader, tools.as_ref().expect("the tools are logged"));
+    assert_eq!(specs, serde_json::to_string(&req.tools).unwrap());
 }
 
 #[tokio::test]

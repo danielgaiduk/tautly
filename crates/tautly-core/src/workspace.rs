@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, RwLock, Weak};
 use std::time::Duration;
 
@@ -80,6 +80,17 @@ pub struct Workspace {
     data_home: PathBuf,
     started: AtomicBool,
     opened: watch::Sender<Option<Arc<Opened>>>,
+    /// Sessions running on it ([`Workspace::live_sessions`]).
+    live: AtomicUsize,
+}
+
+/// One live session of a [`Workspace`]; counted until dropped.
+pub(crate) struct LiveSession(Arc<Workspace>);
+
+impl Drop for LiveSession {
+    fn drop(&mut self) {
+        self.0.live.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 impl Workspace {
@@ -91,7 +102,20 @@ impl Workspace {
             data_home: data_home.to_path_buf(),
             started: AtomicBool::new(false),
             opened: watch::Sender::new(None),
+            live: AtomicUsize::new(0),
         })
+    }
+
+    /// Sessions running on this workspace now (an engine counts from its build until its
+    /// actor ends): rewind and switch need it to be theirs alone (spec 7.12.1 lease).
+    pub fn live_sessions(&self) -> usize {
+        self.live.load(Ordering::SeqCst)
+    }
+
+    /// Count a session as live until the returned guard drops.
+    pub(crate) fn enter(self: &Arc<Self>) -> LiveSession {
+        self.live.fetch_add(1, Ordering::SeqCst);
+        LiveSession(Arc::clone(self))
     }
 
     /// Start opening the index, watcher and memory store in the background; later calls
