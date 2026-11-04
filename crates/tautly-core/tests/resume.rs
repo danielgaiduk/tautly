@@ -1340,6 +1340,89 @@ fn after_last_compaction(recs: &[SessionRecord]) -> Vec<&SessionRecord> {
         .collect()
 }
 
+/// A catalog with an explicit (warm) prompt cache and a window that never asks for
+/// threshold compaction.
+fn warm_cache_catalog() -> Catalog {
+    Catalog::from_toml(&format!(
+        r#"[models."{MODEL}"]
+context_window = 200000
+max_output = 8000
+parallel_tools = true
+reasoning = "none"
+cache = "explicit"
+images = false
+edit_format = "str_replace"
+"#
+    ))
+    .unwrap()
+}
+
+/// The records of the last turn before its first `Request`.
+fn before_last_request(recs: &[SessionRecord]) -> Vec<&SessionRecord> {
+    let at = recs
+        .iter()
+        .rposition(|r| matches!(r, SessionRecord::TurnStart { .. }))
+        .unwrap();
+    recs[at..]
+        .iter()
+        .take_while(|r| !matches!(r, SessionRecord::Request { .. }))
+        .collect()
+}
+
+/// Re-review N6: a manual `Compact` or `Uncompact` breaks the cached prefix between
+/// turns; the next step's epoch takes a pin sent after it along, so the prefix breaks
+/// once.
+#[tokio::test]
+async fn a_manual_compact_or_uncompact_makes_the_next_epoch_cold() {
+    for uncompact in [false, true] {
+        let fx = Fx::new();
+        let mut cfg = compaction_fixture(&fx);
+        cfg.catalog_overrides = Some(warm_cache_catalog());
+        let mut script = four_reads();
+        script.push(text_step("first done"));
+        script.push(text_step("SUMMARY-ONE"));
+        script.push(text_step("between"));
+        script.push(text_step("second done"));
+        let mock = MockProvider::new(script);
+        let mut run = start(fx.builder(cfg, &mock));
+        run.turn_with("first").await;
+        run.send(Command::Compact).await;
+        run.until(|e| matches!(e, Event::Compacted { .. })).await;
+        if uncompact {
+            // A request after the compaction warms the cache again.
+            run.turn_with("between").await;
+            run.send(Command::Uncompact).await;
+        }
+        run.send(Command::Pin {
+            text: "PIN-AFTER".into(),
+        })
+        .await;
+        let events = run.turn_with("second").await;
+        assert_eq!(
+            finish_reason(&events),
+            FinishReason::Completed,
+            "{events:?}"
+        );
+        let path = run.engine.session_path().to_path_buf();
+        run.stop().await;
+        let recs = records_at(&path);
+        if uncompact {
+            assert!(
+                recs.iter()
+                    .any(|r| matches!(r, SessionRecord::Uncompacted { .. })),
+                "{recs:?}"
+            );
+        }
+        let before = before_last_request(&recs);
+        assert!(
+            before
+                .iter()
+                .any(|r| matches!(r, SessionRecord::PinsFolded)),
+            "uncompact {uncompact}: {before:?}"
+        );
+    }
+}
+
 /// Review A M6: the overflow retry's compaction breaks the cached prefix outside the
 /// epoch; the retried step's epoch takes the pending pins with it, so it breaks once.
 #[tokio::test]

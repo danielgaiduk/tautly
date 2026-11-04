@@ -1314,6 +1314,8 @@ impl Session {
         if self.context.fold_session_pins() {
             self.log(SessionRecord::PinsFolded).await;
         }
+        // The cached prefix is gone: what is pending by the next step goes in its epoch.
+        self.context.force_cold_epoch();
         self.checkpoint().await;
         let (_, status) = self.assemble();
         self.emit(Event::context_status(&status)).await;
@@ -1390,6 +1392,8 @@ impl Session {
             restored,
         })
         .await;
+        // The cached prefix is gone: what is pending by the next step goes in its epoch.
+        self.context.force_cold_epoch();
         self.checkpoint().await;
         let (_, status) = self.assemble();
         self.emit(Event::context_status(&status)).await;
