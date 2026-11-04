@@ -665,20 +665,14 @@ impl Session {
     /// within [`STARTUP_WAIT`], else run the session without them. A cancel (spec 8) stops
     /// the wait and leaves them to the next turn's first request.
     pub async fn apply_startup(&mut self, cancel: &CancellationToken) {
-        let Some(mut rx) = self.startup.as_mut().and_then(|s| s.prefix.take()) else {
+        let Some(startup) = self.startup.as_mut() else {
             return;
         };
-        let ready = tokio::select! {
-            r = tokio::time::timeout(STARTUP_WAIT, &mut rx) => r,
-            () = cancel.cancelled() => {
-                if let Some(s) = self.startup.as_mut() {
-                    s.prefix = Some(rx);
-                }
-                return;
-            }
+        let Some(ready) = take_prefix(&mut startup.prefix, STARTUP_WAIT, cancel).await else {
+            return;
         };
         match ready {
-            Ok(Ok(prefix)) => {
+            Some(prefix) => {
                 self.context.repo_map = prefix.repo_map;
                 if prefix.memory_live {
                     self.memory.live = true;
@@ -688,7 +682,7 @@ impl Session {
                     }
                 }
             }
-            _ => {
+            None => {
                 self.warn(
                     "the code index is still building: this session runs without a repo map \
                      and memory index",
@@ -734,6 +728,25 @@ impl Session {
 
     pub fn root(&self) -> &Path {
         self.sandbox.root()
+    }
+}
+
+/// Wait up to `wait` for the start-up prefix in `slot`: `Some(Some(prefix))` when it came,
+/// `Some(None)` when it did not in time (or its task ended), and `None` when `cancel`
+/// fired first, with the receiver put back in `slot` for the next turn. Nothing to wait
+/// for (`slot` empty): `None`.
+async fn take_prefix(
+    slot: &mut Option<oneshot::Receiver<Prefix>>,
+    wait: Duration,
+    cancel: &CancellationToken,
+) -> Option<Option<Prefix>> {
+    let mut rx = slot.take()?;
+    tokio::select! {
+        r = tokio::time::timeout(wait, &mut rx) => Some(r.ok().and_then(Result::ok)),
+        () = cancel.cancelled() => {
+            *slot = Some(rx);
+            None
+        }
     }
 }
 
@@ -940,6 +953,54 @@ mod tests {
             log_if_due(&mut log, Some("agents"), None, &req),
             Some(first)
         );
+    }
+
+    /// Re-review N4: a cancel stops the start-up wait at once and keeps the receiver, so
+    /// the next turn's first request still takes the repo map.
+    #[tokio::test]
+    async fn a_cancelled_startup_wait_returns_at_once_and_keeps_the_prefix_for_later() {
+        let (tx, rx) = oneshot::channel();
+        let mut slot = Some(rx);
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let t0 = std::time::Instant::now();
+        assert!(
+            take_prefix(&mut slot, Duration::from_secs(30), &cancel)
+                .await
+                .is_none()
+        );
+        assert!(
+            t0.elapsed() < Duration::from_millis(20),
+            "{:?}",
+            t0.elapsed()
+        );
+        assert!(slot.is_some(), "the receiver is kept");
+        tx.send(Prefix {
+            repo_map: Some("MAP".into()),
+            memory_live: false,
+        })
+        .map_err(drop)
+        .unwrap();
+        let got = take_prefix(
+            &mut slot,
+            Duration::from_secs(30),
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("not cancelled")
+        .expect("ready");
+        assert_eq!(got.repo_map.as_deref(), Some("MAP"));
+        assert!(slot.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_startup_wait_that_runs_out_says_so() {
+        let (_tx, rx) = oneshot::channel::<Prefix>();
+        let mut slot = Some(rx);
+        let never = CancellationToken::new();
+        let got = take_prefix(&mut slot, Duration::from_millis(10), &never).await;
+        assert!(matches!(got, Some(None)));
+        assert!(slot.is_none());
     }
 
     #[test]
