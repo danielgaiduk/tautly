@@ -158,15 +158,24 @@ impl LocalSandbox {
     }
 }
 
-/// Whether a `.gitignore` holds only `*` rules (at least one), besides blank lines and
-/// `#` comments.
+/// Whether a `.gitignore` holds only `*` rules (at least one), besides empty lines and
+/// `#` comments, read as git reads it: each line loses one trailing `\r` and its trailing
+/// unescaped spaces, nothing else. Leading whitespace, tabs and other spaces (NBSP) are
+/// part of the pattern for git, so `" *"` or `"*\t"` is not `*` and does not ignore the
+/// spill files.
 fn ignores_everything(text: &[u8]) -> bool {
     let Ok(text) = std::str::from_utf8(text) else {
         return false;
     };
     let mut rules = text
-        .lines()
-        .map(str::trim)
+        .split('\n')
+        .map(|line| {
+            let mut line = line.strip_suffix('\r').unwrap_or(line);
+            while line.ends_with(' ') && !line.ends_with("\\ ") {
+                line = &line[..line.len() - 1];
+            }
+            line
+        })
         .filter(|l| !l.is_empty() && !l.starts_with('#'))
         .peekable();
     rules.peek().is_some() && rules.all(|l| l == "*")

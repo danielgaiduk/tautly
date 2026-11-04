@@ -246,7 +246,19 @@ async fn spill_is_content_addressed_relative_and_gitignored() {
 /// output: it is rewritten to `*`.
 #[tokio::test]
 async fn spill_rewrites_a_gitignore_that_is_not_ignore_all() {
-    for committed in ["", "custom\n", "!*\n", "*\n!spill/\n"] {
+    // Including whitespace git does not strip: leading spaces, tabs, NBSP (review S2-I2).
+    for committed in [
+        "",
+        "custom\n",
+        "!*\n",
+        "*\n!spill/\n",
+        "  *  \n",
+        " *\n",
+        "\t*\n",
+        "*\t\n",
+        "\u{a0}*\n",
+        "*\u{a0}\n",
+    ] {
         let (t, sb) = sandbox();
         std::fs::create_dir_all(t.path().join(".tautly/tmp")).unwrap();
         std::fs::write(t.path().join(".tautly/tmp/.gitignore"), committed).unwrap();
@@ -262,7 +274,7 @@ async fn spill_rewrites_a_gitignore_that_is_not_ignore_all() {
 /// put back before the next spill file is written.
 #[tokio::test]
 async fn spill_gitignore_is_checked_every_time_and_tolerates_formatting() {
-    for kept in ["*\n", "# tautly scratch\n*\n\n", "  *  \n"] {
+    for kept in ["*\n", "# tautly scratch\n*\n\n", "*  \n", "*\r\n"] {
         let (t, sb) = sandbox();
         std::fs::create_dir_all(t.path().join(".tautly/tmp")).unwrap();
         std::fs::write(t.path().join(".tautly/tmp/.gitignore"), kept).unwrap();
