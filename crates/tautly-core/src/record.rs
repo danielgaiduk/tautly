@@ -151,7 +151,9 @@ pub enum SessionRecord {
         reason: String,
     },
     /// A git checkpoint of the work tree (written by Task 47): `n` is its number in the
-    /// session, `turn` the user turn and `step` the provider step it was taken at.
+    /// session, `turn` the user turn and `step` the provider step it was taken at, `point`
+    /// where (a `BeforeExec` one sits inside its step; spec 7.12.1 finds the files at a
+    /// step boundary by log offset, not by `step`).
     Checkpoint {
         n: u32,
         commit: String,
@@ -160,12 +162,18 @@ pub enum SessionRecord {
         dirty: bool,
         turn: u32,
         step: u32,
+        /// None in logs written before this field.
+        #[serde(default)]
+        point: Option<CheckpointPoint>,
     },
-    /// A checkpoint that was not taken, and why (written by Task 47).
+    /// A checkpoint that was not taken, and why (written by Task 47), at `point`.
     CheckpointSkipped {
         reason: String,
         turn: u32,
         step: u32,
+        /// None in logs written before this field.
+        #[serde(default)]
+        point: Option<CheckpointPoint>,
     },
     /// The session is renamed; the last one wins over the header's label.
     Labeled { label: String },
@@ -211,6 +219,29 @@ pub struct BlockHashes {
     pub pinned: String,
     pub history: String,
     pub tail: String,
+}
+
+/// Where in the session a [`SessionRecord::Checkpoint`] (or `CheckpointSkipped`) was
+/// taken (spec 7.11.11).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckpointPoint {
+    /// A new session's start: the files as the session found them.
+    SessionStart,
+    /// A resumed session's start: the files now, including whatever changed while no
+    /// session ran.
+    ResumeStart,
+    /// Before a command (`bash`, a stdio MCP call) of step `step`, after that step's
+    /// earlier runs.
+    BeforeExec,
+    /// At the end of a user turn whose last step is `step`.
+    TurnEnd,
+    /// Before a rewind or branch switch writes (spec 7.12; written by Task 49): the tip as
+    /// it was.
+    BeforeRestore,
+    /// A point this version does not know (read only).
+    #[serde(other)]
+    Unknown,
 }
 
 /// One file of an [`SessionRecord::Undone`].
@@ -683,11 +714,13 @@ mod tests {
                 dirty: true,
                 turn: 1,
                 step: 0,
+                point: Some(CheckpointPoint::SessionStart),
             },
             SessionRecord::CheckpointSkipped {
                 reason: "timeout".into(),
                 turn: 1,
                 step: 3,
+                point: Some(CheckpointPoint::BeforeExec),
             },
             SessionRecord::Labeled {
                 label: "try-a".into(),

@@ -541,7 +541,7 @@ impl Actor {
         // A log that cannot be rebuilt leaves nothing to run: every command is refused.
         let mut state = match started {
             Ok(()) => {
-                session.begin_checkpoints().await;
+                session.begin_checkpoints(start.resume).await;
                 prune_checkpoints(&session);
                 session.mcp = McpSession::start(start.mcp, &session, self.approvals.clone()).await;
                 Some(session)

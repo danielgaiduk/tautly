@@ -42,7 +42,7 @@ use crate::memory::OVER_BUDGET_WARNING;
 use crate::model_switch::rejects_reasoning;
 use crate::protocol::{BudgetScope, Command, ErrorKind, Event, FinishReason, UsageRole};
 use crate::provider_setup::provider_label;
-use crate::record::SessionRecord;
+use crate::record::{CheckpointPoint, SessionRecord};
 use crate::routing::{Side, model_failed};
 use crate::session::Session;
 
@@ -329,6 +329,7 @@ impl Session {
                 reason: "cancelled".into(),
                 turn: self.user_turn,
                 step: self.last_step(),
+                point: Some(CheckpointPoint::TurnEnd),
             })
             .await;
         } else {

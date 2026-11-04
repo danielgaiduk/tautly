@@ -55,7 +55,7 @@ mod excludes_store;
 
 use self::excludes_store::ExcludesStore;
 use crate::config::CheckpointConfig;
-use crate::record::SessionRecord;
+use crate::record::{CheckpointPoint, SessionRecord};
 use crate::session::{EventSink, Log, Session};
 
 /// The directory, next to a project's session logs, where each checkpoint's exclude
@@ -1934,14 +1934,28 @@ impl GitCheckpoints {
 /// Where in the session a checkpoint is taken.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Point {
-    /// Session start (and resume): always a full snapshot.
-    Start,
+    /// Session start: always a full snapshot.
+    SessionStart,
+    /// A resumed session's start: always a full snapshot.
+    ResumeStart,
     /// Before a command (`bash`, a stdio MCP call): always looks at the files, since a
     /// change the watcher has not delivered yet must not be attributed to the command.
     BeforeExec,
     /// At a user turn's end: reused without running git when the write generation did
     /// not move and the watcher saw no change.
     TurnEnd,
+}
+
+impl Point {
+    /// How the log names it.
+    fn logged(self) -> Option<CheckpointPoint> {
+        Some(match self {
+            Point::SessionStart => CheckpointPoint::SessionStart,
+            Point::ResumeStart => CheckpointPoint::ResumeStart,
+            Point::BeforeExec => CheckpointPoint::BeforeExec,
+            Point::TurnEnd => CheckpointPoint::TurnEnd,
+        })
+    }
 }
 
 /// How the session-start checkpoint stands.
@@ -1983,7 +1997,7 @@ impl CheckpointJob {
         let write_gen = self.write_gen;
         let snap = async {
             match point {
-                Point::Start => st.cp.snapshot_now().await,
+                Point::SessionStart | Point::ResumeStart => st.cp.snapshot_now().await,
                 Point::BeforeExec => st.cp.snapshot(write_gen, true).await,
                 Point::TurnEnd => st.cp.snapshot(write_gen, watcher_changed).await,
             }
@@ -2005,6 +2019,7 @@ impl CheckpointJob {
                 dirty: r.dirty,
                 turn,
                 step,
+                point: point.logged(),
             },
             Some(Err(skip)) => {
                 st.off = skip.is_permanent();
@@ -2034,6 +2049,7 @@ impl CheckpointJob {
                     reason: skip.code().into(),
                     turn,
                     step,
+                    point: point.logged(),
                 }
             }
             None => {
@@ -2042,6 +2058,7 @@ impl CheckpointJob {
                     reason: "cancelled".into(),
                     turn,
                     step,
+                    point: point.logged(),
                 }
             }
         };
@@ -2097,6 +2114,7 @@ impl Session {
                         reason: "cancelled".into(),
                         turn: job.turn,
                         step,
+                        point: point.logged(),
                     })
                     .await;
                     return;
@@ -2115,13 +2133,19 @@ impl Session {
     /// taken (no git, `.git` a symbolic link), a warning and a `CheckpointSkipped` record
     /// instead. A remote a push to would publish the checkpoint refs to (see
     /// [`Checkpointer::publishing_remotes`]) is warned about first, once.
-    pub(crate) async fn begin_checkpoints(&mut self) {
+    pub(crate) async fn begin_checkpoints(&mut self, resumed: bool) {
+        let point = if resumed {
+            Point::ResumeStart
+        } else {
+            Point::SessionStart
+        };
         if let StartCheckpoint::Skipped(skip) = std::mem::take(&mut self.start_checkpoint) {
             self.warn(skip_warning(&skip)).await;
             self.log(SessionRecord::CheckpointSkipped {
                 reason: skip.code().into(),
                 turn: self.user_turn,
                 step: self.last_step(),
+                point: point.logged(),
             })
             .await;
             return;
@@ -2136,7 +2160,7 @@ impl Session {
             if !remotes.is_empty() {
                 job.events.warn(publishing_warning(&remotes)).await;
             }
-            job.run(&mut st, Point::Start, None).await;
+            job.run(&mut st, point, None).await;
         }));
     }
 

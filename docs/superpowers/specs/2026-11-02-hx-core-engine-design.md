@@ -292,7 +292,8 @@ Structured record: task, plan steps with status, files read/edited with content 
   - **H8, approval requests:** `ApprovalRequested{request_id, kind: tool|mcp_server|memory, call_id?, reason}` is logged before its event is emitted.
   - **H9, point-in-time rebuild:** `rebuild(reader, until)` cuts at any step boundary and synthesizes `cancelled` results for open calls. `Fork{at?, label?}` branches from any step.
   - **H10, project id:** sessions and blobs are keyed by `<project-id>` (above). The header's `root` names the worktree.
-  - **Checkpoint record:** `Checkpoint{n, commit, tree, head?, dirty, turn, step}`, plus `CheckpointSkipped{reason, turn, step}`. The single checkpoint mechanism is the git one of 7.11.11.
+  - **Checkpoint record:** `Checkpoint{n, commit, tree, head?, dirty, turn, step, point?}`, plus `CheckpointSkipped{reason, turn, step, point?}`. The single checkpoint mechanism is the git one of 7.11.11.
+    - `point` (additive, CP4 fix wave; none in older logs) says where it was taken: `session_start`, `resume_start`, `before_exec` (before a command of step `step`, so inside that step), `turn_end` (the turn's last step is `step`) or `before_restore` (before a rewind or switch writes, Task 49); a value a reader does not know reads as `unknown`. The step field alone cannot place a checkpoint at a step boundary (7.12.1).
 
 ## 7. Token efficiency and memory
 
@@ -606,7 +607,7 @@ At each directory level where `AGENTS.md` is read (root and ancestors, 6.1), a d
   - `tautly sessions delete <id>` removes the session log and its checkpoint refs, plus its worktree when it is a worktree fork (7.12.4). Blobs are shared across the project's sessions and are kept; blob garbage collection is post-v1.
 - **Implementation notes (Task 47):**
   - The temporary index lives for the session (a private temp directory), and each snapshot starts with `read-tree --reset <HEAD>`, which keeps the stat data of unchanged entries, so `add -A` rehashes only what changed. Ref names are created only if absent (`update-ref --stdin` `create`); a taken number moves on. Commits are never signed; `gc.auto=0`; git finds the repository at the root only (`GIT_CEILING_DIRECTORIES`).
-  - A reused checkpoint is logged again (same `n` and commit) at its new turn and step, so "a checkpoint precedes every command" holds in the log. Before a command the files are always looked at (a change the watcher has not delivered yet must not be attributed to the command); at a turn end an unchanged write generation and watcher event count reuse the previous checkpoint without running git. A cancelled turn logs `CheckpointSkipped{cancelled}` at its end instead of taking one.
+  - A reused checkpoint is logged again (same `n` and commit) at its new turn, step and point, so "a checkpoint precedes every command" holds in the log. Before a command the files are always looked at (a change the watcher has not delivered yet must not be attributed to the command); at a turn end an unchanged write generation and watcher event count reuse the previous checkpoint without running git. A cancelled turn logs `CheckpointSkipped{cancelled}` at its end instead of taking one.
   - Undo goes back to the turn's first checkpoint, with the tool edits made before it reverted to their pre-images. A file must be as the turn left it — the content (and mode) its tools wrote last if no command ran after that, else its content in the turn's last checkpoint — or already at the target; otherwise nothing is written (`LaterTurns` when a later, not undone turn changed it through edits or between its checkpoints, else `Changed`). The backup ref is taken only when something is written; a dry run creates no ref. A turn whose checkpoints the repository no longer has falls back to the pre-images.
   - Pruning compares each ref's commit date (`committerdate`) with `keep_days`, so a fork's adopted refs age with the commits they name. `[checkpoints]` is user layer only (a project file's is dropped with a warning); `CliOverrides.checkpoints` (`--no-checkpoints`) turns them off.
   - **Nothing the repository configures runs.** Every git call passes `--git-dir=<the root's .git, or the directory a .git file names>` and `--work-tree=<root>` (so `core.worktree` cannot move the snapshot or a restore outside the root), `GIT_CONFIG_NOSYSTEM=1`, and `-c core.splitIndex=false -c submodule.recurse=false -c protocol.allow=never -c credential.helper= -c core.askPass=` besides the hook and fsmonitor overrides; no pager, editor or askpass runs. Before each operation the filter drivers the configuration defines are read (`git config --get-regexp '^filter\.'`, which executes nothing) and each is switched off with `-c filter.<d>.clean= -c filter.<d>.smudge= -c filter.<d>.process= -c filter.<d>.required=false` on every call (`write-tree` too may run a clean filter on a racily clean file). A driver name git cannot take on the command line fails the snapshot instead. So files tracked through Git LFS (or another filter) are snapshotted and restored as their bytes in the work tree (LFS pointers stay pointers, smudged files stay smudged).
@@ -621,15 +622,20 @@ Every operation here creates a new branch or a new view. None truncates a log, a
 
 #### 7.12.1 Step addresses and file states
 - **Step addresses.** Steps are numbered by the single context turn counter (7.2), 1-based. User messages are context turns too, so provider steps are not consecutive (e.g. 2, 3, 5); every tool, record and CLI uses this one numbering. "At step N" means steps 1..N are kept and the next step is N+1. `at = 0` means before the first step. CLIs and the REPL show step numbers next to user turns (`tautly sessions show`, `/tree`).
-- **`state_at(session, N)`, the files at a step boundary:**
-  1. Take the earliest `Checkpoint` record after step N.
-  2. Restore its tree.
-  3. Revert, in reverse order, every `Edit` (to its pre-image) and every `Undone` (to its `from_blob`) between step N and that checkpoint.
+- **`state_at(session, N)`, the files at a step boundary.** The rule goes by log offset, never by the `step` field: a `BeforeExec` checkpoint carries the step it sits inside (taken before that step's command ran), while a `TurnEnd` or start checkpoint carries the step it follows, so neither `step >= N` nor `step > N` picks the right one.
+  1. Find the last record of step N: the last of its `Request`, `Provider`, `ToolCall`, `ToolResult` and `Edit` records (a checkpoint is never a step's last record; for a user message's step, its `TurnStart`; for N = 0, the log's start).
+  2. Take the first `Checkpoint` record after it.
+  3. Restore its tree.
+  4. Revert, in reverse order, every `Edit` (to its pre-image) and every `Undone` (to its `from_blob`) between that last record and the checkpoint.
 
-  This is exact, because a checkpoint precedes every command (7.11.11).
+  This is exact, because a checkpoint precedes every command and ends every turn (7.11.11). The cases (tests in `crates/tautly-core/tests/checkpoint_points.rs`):
+  - **N is a turn's last step:** the turn's `turn_end` checkpoint follows at once. Human edits made between turns are not in it; the next turn's `before_exec`, which has them, is not chosen.
+  - **N is inside a turn, a command follows in step N + 1:** that command's `before_exec` checkpoint (stamped N + 1) holds what step N + 1 wrote before it; those `Edit`s lie between and are reverted. Step N + 1's own boundary is not that checkpoint (its command ran after it) but the next one.
+  - **N is inside a turn, no command follows:** the turn's `turn_end` checkpoint, with the later steps' `Edit`s reverted.
 - **Partial states.** These cases give a *partial* state, reported with a note, and only tool edits are reverted:
   - no later checkpoint exists (a crash mid-turn, or outside git);
-  - a command between the boundary and that checkpoint had its checkpoint skipped.
+  - a `CheckpointSkipped` lies between the boundary and the chosen checkpoint (a command whose checkpoint was skipped, or a turn end skipped because the turn was cancelled, which lets the next turn's checkpoint, with human edits, be chosen);
+  - the chosen checkpoint is a `resume_start` one: the earlier session crashed after step N's results but before its turn-end checkpoint, and it holds whatever changed while no session ran (a `session_start` one is chosen only for the session's first boundaries, where it is exact).
 - **`expected_tip(session)`** is the files as the agent left them: the latest checkpoint plus later tool-edit post-images. A file whose disk hash differs from `expected_tip` was changed by someone else: a **human edit**.
 - **Working-tree lease.** Engines hold a shared `flock` on `<data home>/locks/<root-hash>.lock`. Rewind and switch need it exclusive. They are refused while another live session, in this process or another, uses the same working tree.
 
