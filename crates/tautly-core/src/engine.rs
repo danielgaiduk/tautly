@@ -77,6 +77,8 @@ pub const EVENT_CAPACITY: usize = 256;
 const COMMAND_CAPACITY: usize = 64;
 /// At shutdown, how long left-behind process groups get between SIGTERM and SIGKILL.
 const GROUP_GRACE: Duration = Duration::from_millis(500);
+/// Default [`EngineBuilder::lease_wait`].
+const LEASE_WAIT: Duration = Duration::from_secs(30);
 /// Longest a shutdown waits for the cost ledger to write the rows queued for it.
 const LEDGER_FLUSH: Duration = Duration::from_secs(1);
 
@@ -103,6 +105,8 @@ pub enum EngineError {
     },
     #[error("cannot resume the session: {0}")]
     Resume(#[from] resume::OpenError),
+    #[error("cannot lock the working tree (the working-tree lease): {0}")]
+    Lease(std::io::Error),
 }
 
 /// Everything a session needs; see [`EngineBuilder::build`].
@@ -152,6 +156,9 @@ pub struct EngineBuilder {
     /// Where API keys are looked up after the environment, for every provider the engine
     /// builds itself (main, side model, `SetModel`). Default: the OS keychain.
     pub secret_store: Option<Arc<dyn SecretStore>>,
+    /// How long the session waits at start for the working-tree lease while a rewind or
+    /// switch elsewhere holds it (spec 7.12.1); then it fails to start. Default 30 s.
+    pub lease_wait: Duration,
 }
 
 impl EngineBuilder {
@@ -172,6 +179,7 @@ impl EngineBuilder {
             client_mcp: Vec::new(),
             pre_exec: None,
             secret_store: None,
+            lease_wait: LEASE_WAIT,
         }
     }
 
@@ -258,13 +266,11 @@ impl EngineBuilder {
         // Held for the engine's life; rewind and switch take it exclusively.
         // Not waited for here (this may run on an async worker): while a rewind elsewhere
         // holds it exclusively, the actor takes it before its first command.
+        // An engine never runs without it: a lock file that cannot be opened fails the build.
         let (lease, lease_pending) = match Lease::try_shared(&data_home, &root) {
             Ok(Some(lease)) => (Some(lease.for_workspace(&workspace)), false),
             Ok(None) => (None, true),
-            Err(e) => {
-                config_warnings.push(lease_warning(&e));
-                (None, false)
-            }
+            Err(e) => return Err(EngineError::Lease(e)),
         };
         let init = HeaderInit {
             model: Some(config.model.as_str().to_string()),
@@ -378,6 +384,7 @@ impl EngineBuilder {
             receipt: None,
             gc_elided: Vec::new(),
             lease,
+            end_recovery: None,
         };
         let current = Arc::new(Mutex::new((session_id.clone(), session_path.clone())));
         let actor = Actor {
@@ -401,6 +408,7 @@ impl EngineBuilder {
                 resume: self.resume.is_some(),
                 mcp,
                 lease_pending,
+                lease_wait: self.lease_wait,
             },
         ));
         Ok((
@@ -596,16 +604,11 @@ struct Start {
     /// The session is resumed: its context is rebuilt from the log first.
     resume: bool,
     mcp: McpSetup,
-    /// The working-tree lease was held exclusively elsewhere at build: taken (waiting a
-    /// bounded time, off the async workers) before the first command.
+    /// The working-tree lease was held exclusively elsewhere at build: taken (waiting up
+    /// to `lease_wait`, off the async workers) before anything else; else the session does
+    /// not start.
     lease_pending: bool,
-}
-
-/// The warning when the working-tree lease cannot be had.
-fn lease_warning(e: &std::io::Error) -> String {
-    format!(
-        "the working-tree lease is unavailable ({e}); rewind and switch are off for this session"
-    )
+    lease_wait: Duration,
 }
 
 /// The actor's task dropped without a shutdown (the runtime went away): no process group
@@ -627,19 +630,19 @@ impl Actor {
             session_id: self.session_id.clone(),
         });
         session.workspace.start();
+        // The lease first: nothing runs on the working tree without it.
+        let mut unleased = None;
         if start.lease_pending {
             let (home, root) = (session.data_home.clone(), session.root().to_path_buf());
-            let taken = tokio::task::spawn_blocking(move || {
-                Lease::shared_within(&home, &root, Duration::from_secs(10))
-            })
-            .await
-            .map_err(std::io::Error::other)
-            .and_then(|r| r);
+            let wait = start.lease_wait;
+            let taken =
+                tokio::task::spawn_blocking(move || Lease::shared_within(&home, &root, wait))
+                    .await
+                    .map_err(std::io::Error::other)
+                    .and_then(|r| r);
             match taken {
                 Ok(lease) => session.lease = Some(lease.for_workspace(&session.workspace)),
-                Err(e) => self.events.try_emit(Event::Warning {
-                    message: lease_warning(&e),
-                }),
+                Err(e) => unleased = Some(e),
             }
         }
         for w in start.config_warnings {
@@ -648,7 +651,13 @@ impl Actor {
         // Commands sent while a resumed session sets up its model (a keychain prompt may
         // hold it) are kept; a `Shutdown` among them abandons that.
         let mut early = Vec::new();
-        let started = if start.resume {
+        let started = if let Some(e) = unleased {
+            Err(format!(
+                "the working-tree lease could not be had in {}s ({e}): a rewind or switch \
+                 elsewhere holds the working tree; this session does not start",
+                start.lease_wait.as_secs()
+            ))
+        } else if start.resume {
             session
                 .resume(
                     &start.config_pins,
@@ -663,12 +672,21 @@ impl Actor {
         let mut state = match started {
             Ok(()) => Some(session),
             Err(why) => {
+                let unleased = session.lease.is_none();
                 self.events
                     .send_or_drop(Event::Error {
                         kind: ErrorKind::Internal,
-                        message: format!("cannot resume the session: {why}"),
+                        message: if unleased {
+                            format!("cannot start the session: {why}")
+                        } else {
+                            format!("cannot resume the session: {why}")
+                        },
                         retryable: false,
-                        hint: Some("the session log may be damaged".into()),
+                        hint: Some(if unleased {
+                            "start it again once the other rewind or switch has finished".into()
+                        } else {
+                            "the session log may be damaged".into()
+                        }),
                     })
                     .await;
                 None

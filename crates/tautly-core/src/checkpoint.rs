@@ -2253,6 +2253,9 @@ pub(crate) enum Point {
     TurnEnd,
     /// Before a rewind or branch switch writes: always a full snapshot.
     BeforeRestore,
+    /// At a turn's start when the previous turn's end has no checkpoint: always a full
+    /// snapshot.
+    TurnStart,
 }
 
 impl Point {
@@ -2264,6 +2267,7 @@ impl Point {
             Point::BeforeExec => CheckpointPoint::BeforeExec,
             Point::TurnEnd => CheckpointPoint::TurnEnd,
             Point::BeforeRestore => CheckpointPoint::BeforeRestore,
+            Point::TurnStart => CheckpointPoint::TurnStart,
         })
     }
 }
@@ -2298,18 +2302,24 @@ impl CheckpointJob {
     /// with a warning), holding the lock throughout, so the log has checkpoints in the
     /// order they were taken. A cancel abandons the snapshot (its processes are killed),
     /// logged as skipped.
-    async fn run(self, st: &mut GitCheckpoints, point: Point, cancel: Option<&CancellationToken>) {
+    async fn run(
+        self,
+        st: &mut GitCheckpoints,
+        point: Point,
+        cancel: Option<&CancellationToken>,
+    ) -> bool {
         if st.off {
-            return;
+            return false;
         }
         let watcher_changed = self.watcher.is_none() || self.watcher != st.fs_events;
         st.fs_events = self.watcher;
         let write_gen = self.write_gen;
         let snap = async {
             match point {
-                Point::SessionStart | Point::ResumeStart | Point::BeforeRestore => {
-                    st.cp.snapshot_now().await
-                }
+                Point::SessionStart
+                | Point::ResumeStart
+                | Point::BeforeRestore
+                | Point::TurnStart => st.cp.snapshot_now().await,
                 Point::BeforeExec => st.cp.snapshot(write_gen, true).await,
                 Point::TurnEnd => st.cp.snapshot(write_gen, watcher_changed).await,
             }
@@ -2322,6 +2332,7 @@ impl CheckpointJob {
             None => Some(snap.await),
         };
         let (turn, step) = (self.turn, self.step);
+        let made = matches!(taken, Some(Ok(_)));
         let rec = match taken {
             Some(Ok(r)) => SessionRecord::Checkpoint {
                 n: r.n,
@@ -2375,6 +2386,7 @@ impl CheckpointJob {
             }
         };
         self.log(rec).await;
+        made
     }
 
     async fn log(&self, rec: SessionRecord) {
@@ -2435,6 +2447,45 @@ impl Session {
             None => shared.lock().await,
         };
         job.run(&mut st, point, cancel).await;
+    }
+
+    /// After a cancelled turn (whose end has a `CheckpointSkipped{cancelled}`): its end
+    /// checkpoint, taken in the background once its commands have stopped, so the files
+    /// as it left them are known before a human changes them (Task 49 N1). The next turn
+    /// waits for it ([`settle_turn_end`](Self::settle_turn_end)).
+    pub(crate) fn recover_turn_end(&mut self) {
+        let Some(shared) = self.checkpoints.clone() else {
+            return;
+        };
+        let job = self.checkpoint_job(self.last_step());
+        let log = job.log.clone();
+        self.end_recovery = Some(tokio::spawn(async move {
+            let mut st = shared.lock().await;
+            let taken = job.run(&mut st, Point::TurnEnd, None).await;
+            drop(st);
+            // Durable at once: no turn is running to flush it.
+            let _ = tokio::task::spawn_blocking(move || log.checkpoint()).await;
+            taken
+        }));
+    }
+
+    /// At a turn's start: wait for the previous turn's end checkpoint being recovered;
+    /// when none could be taken, take a `turn_start` one now, before anything else runs.
+    pub(crate) async fn settle_turn_end(&mut self, cancel: &CancellationToken) {
+        let Some(mut job) = self.end_recovery.take() else {
+            return;
+        };
+        let taken = tokio::select! {
+            r = &mut job => r.unwrap_or(false),
+            () = cancel.cancelled() => {
+                job.abort();
+                return;
+            }
+        };
+        if !taken {
+            self.git_checkpoint(Point::TurnStart, self.last_step(), Some(cancel))
+                .await;
+        }
     }
 
     /// At session start (after init or resume): the session-start checkpoint, in the
@@ -2499,6 +2550,9 @@ impl Session {
     /// killed).
     pub(crate) fn abandon_start_checkpoint(&mut self) {
         if let StartCheckpoint::Running(job) = std::mem::take(&mut self.start_checkpoint) {
+            job.abort();
+        }
+        if let Some(job) = self.end_recovery.take() {
             job.abort();
         }
     }

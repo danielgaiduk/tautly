@@ -1271,7 +1271,8 @@ async fn a_restore_cut_off_is_warned_about_at_resume() {
     let offset = records(&log).len();
     let line = json!({"type": "record", "offset": offset, "t": 0, "data": {
         "type": "restore_begun",
-        "data": {"backup_ref": "refs/tautly/checkpoints/x/undo-9", "files": []}}});
+        "data": {"backup_ref": "refs/tautly/checkpoints/x/undo-9", "files": [],
+                 "paths": ["a.txt", "b.txt"]}}});
     let mut text = std::fs::read_to_string(&log).unwrap();
     text.push_str(&format!("{line}\n"));
     std::fs::write(&log, text).unwrap();
@@ -1289,5 +1290,326 @@ async fn a_restore_cut_off_is_warned_about_at_resume() {
         message.contains("refs/tautly/checkpoints/x/undo-9"),
         "{message}"
     );
+    // N8: only the listed paths are suggested, after a look at the difference.
+    assert!(
+        message.contains("git diff refs/tautly/checkpoints/x/undo-9 -- a.txt b.txt"),
+        "{message}"
+    );
+    assert!(!message.contains("-- ."), "{message}");
     run.stop().await;
+}
+
+// ------------------------------------------------- fix round 2
+
+/// Wait until the log has a `Checkpoint` record after its last `TurnEnd` (a cancelled
+/// turn's end checkpoint, taken after it).
+async fn end_checkpoint_after_turn_end(log: &Path) {
+    let deadline = tokio::time::Instant::now() + WAIT;
+    loop {
+        let recs = records(log);
+        let end = recs
+            .iter()
+            .rposition(|r| matches!(r, SessionRecord::TurnEnd { .. }));
+        if end.is_some_and(|e| {
+            recs[e..]
+                .iter()
+                .any(|r| matches!(r, SessionRecord::Checkpoint { .. }))
+        }) {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no end checkpoint: {recs:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+#[tokio::test]
+async fn human_edit_after_a_cancelled_command_turn_is_a_conflict() {
+    // N1 (review probe p13b): turn 1's command is cancelled; its end checkpoint is taken
+    // after it, so the human's edit between turns falls in a command-free pair.
+    let repo = Repo::git_repo();
+    let mock = MockProvider::new(vec![
+        tools_step(vec![bash("b1", "sleep 30")]),
+        tools_step(vec![write("w1", "a.txt", "two\n")]),
+        text_step("second"),
+    ]);
+    let mut run = Run::start(repo.builder(&mock));
+    run.engine
+        .send(Command::SendMessage { text: "one".into() })
+        .await
+        .unwrap();
+    run.until(|e| matches!(e, Event::ToolStarted { .. })).await;
+    run.engine.send(Command::Cancel).await.unwrap();
+    run.until(|e| matches!(e, Event::TurnFinished { .. })).await;
+    end_checkpoint_after_turn_end(&run.current().1).await;
+    repo.write("b.txt", "mine\n");
+    run.turn_with("two").await;
+    let (_, report) = run.rewind(2, false, &[]).await.done();
+    assert!(!report.applied, "{report:?}");
+    assert_eq!(report.conflicts, ["b.txt"], "{report:?}");
+    assert_eq!(repo.read("b.txt").as_deref(), Some("mine\n"));
+    run.stop().await;
+}
+
+#[tokio::test]
+async fn an_offline_edit_after_a_crash_in_a_command_turn_is_the_agents() {
+    // N4, the ruled limit: the turn's end was never checkpointed; the resume's start
+    // checkpoint holds both the command's and the human's changes, so they are the
+    // agent's. The disk matches the tip: no conflict, and the backup holds the edit.
+    let repo = Repo::git_repo();
+    let mock = MockProvider::new(vec![
+        tools_step(vec![bash("b1", "printf 'cmd\\n' > c.txt")]),
+        text_step("done"),
+    ]);
+    let mut run = Run::start(repo.builder(&mock));
+    let id = run.engine.session_id().to_string();
+    run.turn_with("go").await;
+    let log = run.current().1;
+    run.stop().await;
+    let recs = records(&log);
+    let cut = recs
+        .iter()
+        .rposition(|r| matches!(r, SessionRecord::ToolResult { .. }))
+        .unwrap();
+    let text = std::fs::read_to_string(&log).unwrap();
+    let kept: Vec<&str> = text.lines().take(cut + 2).collect();
+    std::fs::write(&log, kept.join("\n") + "\n").unwrap();
+    repo.write("b.txt", "offline\n");
+    let mut run = Run::start(EngineBuilder {
+        resume: Some(id),
+        ..repo.builder(&MockProvider::new(vec![]))
+    });
+    let (_, report) = run.rewind(1, false, &[]).await.done();
+    assert!(report.applied, "{report:?}");
+    assert!(report.conflicts.is_empty(), "{report:?}");
+    assert_eq!(repo.read("b.txt").as_deref(), Some("bee\n"));
+    let backup = report.backup_ref.unwrap();
+    assert_eq!(
+        repo.git(&["show", &format!("{backup}:b.txt")]).as_deref(),
+        Some("offline\n")
+    );
+    run.stop().await;
+}
+
+fn ignoring_logs() -> Repo {
+    let repo = Repo::git_repo();
+    repo.write(".gitignore", "*.log\n");
+    repo.git(&["add", "-A"]);
+    repo.git(&["commit", "-q", "-m", "ignore"]);
+    repo
+}
+
+fn writes_gen_log() -> MockProvider {
+    MockProvider::new(vec![
+        tools_step(vec![write("w1", "a.txt", "one\n")]),
+        text_step("first"),
+        tools_step(vec![write("w2", "gen.log", "generated\n")]),
+        text_step("second"),
+    ])
+}
+
+#[tokio::test]
+async fn an_ignored_file_is_kept_in_the_log_before_a_git_overwrite() {
+    // N2 (review probe p14): the snapshot cannot hold an ignored file.
+    let repo = ignoring_logs();
+    let mock = writes_gen_log();
+    let mut run = run_two_turns(&repo, &mock).await;
+    let log = run.current().1;
+    repo.write("gen.log", "the human's\n");
+    let (_, report) = run.rewind(3, false, &[]).await.done();
+    assert_eq!(report.conflicts, ["gen.log"], "{report:?}");
+    let (_, report) = run.rewind(3, false, &["gen.log"]).await.done();
+    assert!(report.applied, "{report:?}");
+    assert_eq!(repo.read("gen.log"), None);
+    let backup = report.backup_ref.clone().unwrap();
+    assert_eq!(repo.git(&["show", &format!("{backup}:gen.log")]), None);
+    let begun: Value = raw_lines(&log)
+        .iter()
+        .map(|l| serde_json::from_str::<Value>(l).unwrap())
+        .rfind(|v| v["data"]["type"] == "restore_begun")
+        .unwrap();
+    let file = &begun["data"]["data"]["files"][0];
+    assert_eq!(file["path"], "gen.log", "{begun}");
+    let blob = tautly_session::BlobRef::parse(file["blob"].as_str().unwrap()).unwrap();
+    assert_eq!(reader(&log).read_blob(&blob).unwrap(), b"the human's\n");
+    assert_eq!(begun["data"]["data"]["paths"], json!(["gen.log"]));
+    run.stop().await;
+}
+
+#[tokio::test]
+async fn an_ignored_file_too_large_to_keep_is_blocked() {
+    // N2: over 64 MiB, it could be neither kept nor put back: never overwritten.
+    let repo = ignoring_logs();
+    let mock = writes_gen_log();
+    let mut run = run_two_turns(&repo, &mock).await;
+    let size = 65 * 1024 * 1024;
+    std::fs::write(repo.root().join("gen.log"), vec![b'h'; size]).unwrap();
+    for overwrite in [&[][..], &["gen.log"][..]] {
+        let (_, report) = run.rewind(3, false, overwrite).await.done();
+        assert!(!report.applied, "{report:?}");
+        assert_eq!(report.blocked, ["gen.log"], "{report:?}");
+        assert!(report.conflicts.is_empty(), "{report:?}");
+    }
+    assert_eq!(
+        std::fs::metadata(repo.root().join("gen.log"))
+            .unwrap()
+            .len(),
+        size as u64
+    );
+    run.stop().await;
+}
+
+#[tokio::test]
+async fn a_switch_restores_an_ignored_file_the_target_wrote() {
+    // N7: the target's tool wrote `gen.log`; no checkpoint holds it.
+    let repo = ignoring_logs();
+    let mock = writes_gen_log();
+    let mut run = run_two_turns(&repo, &mock).await;
+    let (a, _) = run.current();
+    run.rewind(3, false, &[]).await.done();
+    assert_eq!(repo.read("gen.log"), None);
+    let (_, report) = run.switch(&a, &[]).await.done();
+    assert!(report.applied, "{report:?}");
+    assert_eq!(repo.read("gen.log").as_deref(), Some("generated\n"));
+    run.stop().await;
+}
+
+#[tokio::test]
+async fn a_switch_to_a_locked_session_logs_nothing() {
+    // N7: the target's lock is checked before the tip checkpoint is taken.
+    use std::os::fd::AsRawFd;
+    let repo = Repo::git_repo();
+    let mock = two_turns();
+    let mut run = run_two_turns(&repo, &mock).await;
+    let (a, _) = run.current();
+    let (_, b_log) = {
+        run.rewind(3, false, &[]).await.done();
+        run.current()
+    };
+    let a_log = logs(repo.home())
+        .into_iter()
+        .find(|p| reader(p).header().session_id == a)
+        .unwrap();
+    let held = std::fs::File::open(&a_log).unwrap();
+    // SAFETY: flock on a file descriptor we own.
+    assert_eq!(unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX) }, 0);
+    let before = raw_lines(&b_log).len();
+    let why = run.switch(&a, &[]).await.error();
+    assert!(why.contains("open"), "{why}");
+    drop(held);
+    let added: Vec<Value> = raw_lines(&b_log)[before..]
+        .iter()
+        .map(|l| serde_json::from_str::<Value>(l).unwrap()["data"]["type"].clone())
+        .collect();
+    assert!(!added.contains(&json!("checkpoint")), "{added:?}");
+    run.stop().await;
+}
+
+#[tokio::test]
+async fn a_switch_records_the_restore_in_both_sessions() {
+    // N8: the session switched to is the one usually resumed.
+    let repo = Repo::git_repo();
+    let mock = two_turns();
+    let mut run = run_two_turns(&repo, &mock).await;
+    let (a, a_log) = run.current();
+    run.rewind(3, false, &[]).await.done();
+    run.switch(&a, &[]).await.done();
+    let types: Vec<Value> = raw_lines(&a_log)
+        .iter()
+        .map(|l| serde_json::from_str::<Value>(l).unwrap()["data"]["type"].clone())
+        .collect();
+    let begun = types.iter().filter(|t| **t == "restore_begun").count();
+    let ended = types.iter().filter(|t| **t == "restore_ended").count();
+    // The rewind's (A was left) and the switch's (A was switched to).
+    assert_eq!((begun, ended), (2, 2), "{types:?}");
+    run.stop().await;
+}
+
+#[tokio::test]
+async fn an_engine_never_runs_without_the_lease() {
+    // N3 (review probe p15): another engine's rewind holds it exclusively too long.
+    let repo = Repo::git_repo();
+    let lease = tautly_core::Lease::shared(repo.home(), &repo.root()).unwrap();
+    let held = lease.try_exclusive().unwrap();
+    let mock = MockProvider::new(vec![text_step("never")]);
+    let mut run = Run::start(EngineBuilder {
+        lease_wait: Duration::from_millis(300),
+        ..repo.builder(&mock)
+    });
+    let seen = run.until(|e| matches!(e, Event::Error { .. })).await;
+    let Some(Event::Error { message, .. }) = seen.last() else {
+        unreachable!()
+    };
+    assert!(message.contains("cannot start the session"), "{message}");
+    run.engine
+        .send(Command::SendMessage { text: "hi".into() })
+        .await
+        .unwrap();
+    let seen = run.until(|e| matches!(e, Event::Error { .. })).await;
+    assert!(
+        matches!(seen.last(), Some(Event::Error { message, .. }) if message.contains("takes no more commands")),
+        "{seen:?}"
+    );
+    assert!(mock.requests().is_empty());
+    drop(held);
+    run.stop().await;
+
+    // A lock file that cannot be opened fails the build.
+    let repo = Repo::git_repo();
+    std::fs::write(repo.home().join("locks"), "not a directory").unwrap();
+    let built = repo.builder(&MockProvider::new(vec![])).build();
+    let err = built.err().expect("built without a lease");
+    assert!(err.to_string().contains("working-tree lease"), "{err}");
+}
+
+#[tokio::test]
+async fn restore_backup_puts_back_what_the_log_kept() {
+    // N6: outside git, the bytes kept in `RestoreBegun` go back on request.
+    let repo = Repo::plain();
+    let mock = MockProvider::new(vec![
+        tools_step(vec![write("w1", "a.txt", "one\n")]),
+        text_step("first"),
+        tools_step(vec![write("w2", "a.txt", "two\n")]),
+        text_step("second"),
+    ]);
+    let mut run = run_two_turns(&repo, &mock).await;
+    let a = run.current().0;
+    repo.write("a.txt", "human\n");
+    run.rewind(3, false, &["a.txt"]).await.done();
+    assert_eq!(repo.read("a.txt").as_deref(), Some("one\n"));
+    let sb = LocalSandbox::new(repo.root()).unwrap();
+    // Not while an engine runs on the work tree.
+    let busy = tautly_core::sessions::restore_backup(repo.home(), &sb, &a, false).await;
+    assert!(busy.is_err());
+    run.stop().await;
+    // The stopped engine lets go of the lease as its actor ends.
+    let deadline = tokio::time::Instant::now() + WAIT;
+    let dry = loop {
+        match tautly_core::sessions::restore_backup(repo.home(), &sb, &a, true).await {
+            Ok(d) => break d,
+            Err(e) if tokio::time::Instant::now() < deadline => {
+                let _ = e;
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            Err(e) => panic!("{e}"),
+        }
+    };
+    assert_eq!(dry.written, ["a.txt"]);
+    assert_eq!(repo.read("a.txt").as_deref(), Some("one\n"));
+    let mut tries = 0;
+    let done = loop {
+        tries += 1;
+        match tautly_core::sessions::restore_backup(repo.home(), &sb, &a, false).await {
+            Ok(d) => break d,
+            Err(e) if tries < 200 => {
+                let _ = e;
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            Err(e) => panic!("{e}"),
+        }
+    };
+    assert_eq!(done.written, ["a.txt"]);
+    assert_eq!(repo.read("a.txt").as_deref(), Some("human\n"));
 }

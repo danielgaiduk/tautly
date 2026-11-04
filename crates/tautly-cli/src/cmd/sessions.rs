@@ -1,4 +1,4 @@
-//! `tautly sessions list|show|tree|export|delete` (spec 6.5, 7.12.3).
+//! `tautly sessions list|show|tree|export|restore-backup|delete` (spec 6.5, 7.12).
 
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
@@ -32,6 +32,15 @@ pub enum Cmd {
         #[arg(long, value_enum, default_value = "md")]
         format: Format,
     },
+    /// Put back the files the session's last rewind or switch kept in its log before it
+    /// wrote them (after one was cut off).
+    RestoreBackup {
+        /// The full session id.
+        id: String,
+        /// Show what would be put back; change nothing.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Delete a session's log and its git checkpoint refs.
     Delete {
         /// The full session id.
@@ -52,6 +61,7 @@ pub async fn run(cmd: Cmd, env: &Env) -> anyhow::Result<i32> {
         Cmd::Tree => tree(env),
         Cmd::Export { id, format } => export(env, &id, format),
         Cmd::Delete { id } => delete(env, &id).await,
+        Cmd::RestoreBackup { id, dry_run } => restore_backup(env, &id, dry_run).await,
     }
 }
 
@@ -303,6 +313,54 @@ fn markdown(reader: &SessionReader<SessionRecord>) -> anyhow::Result<String> {
     }
     flush(&mut md, &mut said);
     Ok(md)
+}
+
+async fn restore_backup(env: &Env, id: &str, dry_run: bool) -> anyhow::Result<i32> {
+    let done = tautly_core::sessions::restore_backup(
+        &env.data_home,
+        env.workspace.sandbox().as_ref(),
+        id,
+        dry_run,
+    )
+    .await?;
+    let list = |v: &[String]| {
+        if v.is_empty() {
+            "nothing".to_string()
+        } else {
+            v.iter()
+                .map(|p| tautly_core::printable(p))
+                .collect::<Vec<_>>()
+                .join(", ")
+        }
+    };
+    let verb = if dry_run {
+        "would put back"
+    } else {
+        "put back"
+    };
+    println!("{verb}: {}", list(&done.written));
+    println!(
+        "{} removed: {}",
+        if dry_run { "would be" } else { "and" },
+        list(&done.removed)
+    );
+    if !done.not_kept.is_empty() {
+        println!("not kept (a link or over 64 MiB): {}", list(&done.not_kept));
+    }
+    if let Some(b) = &done.backup_ref {
+        let b = tautly_core::printable(b);
+        let paths = done
+            .paths
+            .iter()
+            .map(|p| tautly_core::printable(p))
+            .collect::<Vec<_>>()
+            .join(" ");
+        println!(
+            "the other files it wrote are in the snapshot {b}: `git diff {b} -- {paths}`, \
+             then `git restore --source {b} -- <path>` for each one to put back"
+        );
+    }
+    Ok(0)
 }
 
 async fn delete(env: &Env, id: &str) -> anyhow::Result<i32> {

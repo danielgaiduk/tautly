@@ -955,14 +955,22 @@ impl Session {
         let root = self.root().to_path_buf();
         let overwrite = rel_paths(&root, overwrite)?;
         let _lease = self.exclusive()?;
-        let found = {
+        // The target is found and (to apply) locked before anything is logged: a session
+        // another engine has open is refused here.
+        let (found, opened) = {
             let (home, root, id) = (self.data_home.clone(), root.clone(), target_id.to_string());
             blocking(move |_| {
-                tautly_session::list_here_in(&home, &root)?
+                let found = tautly_session::list_here_in(&home, &root)?
                     .into_iter()
                     .find(|s| s.id == id)
                     .map(|s| s.path)
-                    .ok_or(TtError::NotFound(id))
+                    .ok_or(TtError::NotFound(id))?;
+                let writer = if dry_run {
+                    None
+                } else {
+                    Some(SessionWriter::<SessionRecord>::reopen(&found)?)
+                };
+                Ok((found, writer))
             })
             .await?
         };
@@ -983,16 +991,17 @@ impl Session {
             rt.block_on(async move {
                 let mut guard = guard;
                 let mut cp = guard.as_deref_mut().map(|g| &mut g.cp);
-                // Locked first: a session another engine has open is refused here.
-                let mut writer = if dry_run {
-                    None
-                } else {
-                    Some(SessionWriter::<SessionRecord>::reopen(&found)?)
-                };
+                let mut writer = opened;
                 let there = SessionReader::<SessionRecord>::open(&found)?;
                 let here = SessionReader::<SessionRecord>::open(&current)?;
                 let target = expected_tip(&there)?;
                 let expected = expected_tip(&here)?;
+                // Both sessions record the restore, so a cut-off one is warned about
+                // whichever is resumed.
+                let mut both = Both {
+                    here: &mut live,
+                    there: writer.as_mut(),
+                };
                 let applied = materialize_inner(
                     sandbox.as_ref(),
                     cp.as_deref_mut(),
@@ -1000,7 +1009,7 @@ impl Session {
                     &expected,
                     &overwrite,
                     dry_run,
-                    Some(&mut live as &mut dyn UndoLog),
+                    Some(&mut both as &mut dyn UndoLog),
                 )
                 .await?;
                 let materialize::Applied {
@@ -1042,9 +1051,13 @@ impl Session {
                     Ok::<_, TtError>(r)
                 }
                 .await;
+                let mut both = Both {
+                    here: &mut live,
+                    there: Some(&mut writer),
+                };
                 match continued {
                     Ok(r) => {
-                        ended(&mut live, &mut report);
+                        ended(&mut both, &mut report);
                         Ok((report, Some((writer, r))))
                     }
                     Err(e) => {
@@ -1052,7 +1065,7 @@ impl Session {
                         Err(fail(
                             sandbox.as_ref(),
                             cp.as_deref(),
-                            Some(&mut live as &mut dyn UndoLog),
+                            Some(&mut both as &mut dyn UndoLog),
                             &rollback,
                             backup,
                             e,
@@ -1080,8 +1093,29 @@ impl Session {
     }
 }
 
+/// The session a switch leaves and the one it switches to, logged to together (blobs go
+/// to the first: both logs share the project's blob store).
+struct Both<'a> {
+    here: &'a mut LiveLog,
+    there: Option<&'a mut SessionWriter<SessionRecord>>,
+}
+
+impl UndoLog for Both<'_> {
+    fn blob(&mut self, bytes: &[u8]) -> Result<BlobRef, UndoError> {
+        self.here.blob(bytes)
+    }
+
+    fn record(&mut self, rec: &SessionRecord) -> Result<(), UndoError> {
+        self.here.record(rec)?;
+        match self.there.as_deref_mut() {
+            Some(w) => UndoLog::record(w, rec),
+            None => Ok(()),
+        }
+    }
+}
+
 /// Log that a restore that wrote files ended well; a log that cannot say so is noted.
-fn ended(live: &mut LiveLog, report: &mut MaterializeReport) {
+fn ended(live: &mut dyn UndoLog, report: &mut MaterializeReport) {
     if report.restored.is_empty() && report.deleted.is_empty() {
         return;
     }

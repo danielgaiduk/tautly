@@ -213,6 +213,9 @@ pub enum SessionRecord {
         backup_ref: Option<String>,
         #[serde(default)]
         files: Vec<BackupFile>,
+        /// Every path it is about to write (the snapshot holds the rest of the tree too).
+        #[serde(default)]
+        paths: Vec<RelPath>,
     },
     /// The end of the restore a `RestoreBegun` started: whether the files are now the
     /// target's (`applied`), else whether they were put back (`rolled_back`).
@@ -283,6 +286,9 @@ pub enum CheckpointPoint {
     /// Before a rewind or branch switch writes (spec 7.12; written by Task 49): the tip as
     /// it was.
     BeforeRestore,
+    /// At a user turn's start, before anything else, when the previous turn's end
+    /// checkpoint was skipped and could not be taken after it either (Task 49 N1).
+    TurnStart,
     /// The files a rewind or switch materialized, as the branch continues from them
     /// (spec 7.12; written by Task 49): exactly `state_at` of the step it branched at, or
     /// the tip switched to. Older builds read it as `Unknown`.
@@ -813,6 +819,7 @@ mod tests {
             },
             SessionRecord::RestoreBegun {
                 backup_ref: None,
+                paths: vec![rel("a")],
                 files: vec![BackupFile {
                     path: rel("a"),
                     existed: true,

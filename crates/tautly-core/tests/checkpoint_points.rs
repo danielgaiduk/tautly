@@ -488,7 +488,29 @@ async fn a_skipped_turn_end_makes_the_next_checkpoint_partial() {
             ..
         }
     )));
+    // The turn's end checkpoint is taken after it, once its command has stopped (Task 49
+    // N1): logged after the `TurnEnd`, behind the skip, so still partial.
     let b = boundary(&recs, 2).unwrap();
-    assert_eq!(b.point, Some(CheckpointPoint::BeforeExec), "{b:?}");
+    assert_eq!(b.point, Some(CheckpointPoint::TurnEnd), "{b:?}");
     assert!(b.partial, "{b:?}");
+    let end = recs
+        .iter()
+        .position(|r| matches!(r, SessionRecord::TurnEnd { .. }))
+        .unwrap();
+    let next = recs[end..]
+        .iter()
+        .position(|r| matches!(r, SessionRecord::TurnStart { .. }))
+        .unwrap();
+    assert!(
+        recs[end..end + next].iter().any(|r| matches!(
+            r,
+            SessionRecord::Checkpoint {
+                point: Some(CheckpointPoint::TurnEnd),
+                turn: 1,
+                ..
+            }
+        )),
+        "{:?}",
+        &recs[end..]
+    );
 }

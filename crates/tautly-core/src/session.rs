@@ -433,6 +433,9 @@ pub(crate) struct Session {
     /// The shared working-tree lease (spec 7.12.1); none when the lock file could not be
     /// opened (then rewind and switch are refused).
     pub lease: Option<Lease>,
+    /// A cancelled turn's end checkpoint, being taken after it (Task 49 N1): whether one
+    /// was taken.
+    pub end_recovery: Option<JoinHandle<bool>>,
     /// Each collection of this session: the call ids it elided and the tokens it freed,
     /// so a request can tell how many elided tokens are still out of the context.
     pub gc_elided: Vec<(Vec<String>, u32)>,

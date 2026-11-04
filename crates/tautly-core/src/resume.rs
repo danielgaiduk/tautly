@@ -247,15 +247,30 @@ pub(crate) fn rebuild_with(
     // Pins of a turn the log ends in (or the cut closes) reach the context as its
     // leftovers would have.
     r.apply_pending();
-    if let Some(backup) = r.restoring.take() {
+    if let Some((backup, paths, kept)) = r.restoring.take() {
+        let id = &reader.header().session_id;
+        let names: Vec<&str> = paths.iter().map(tautly_session::RelPath::as_str).collect();
+        let list = names.join(" ");
+        let restore_cmd = format!("`tautly sessions restore-backup {id}`");
         r.warn(match backup {
-            Some(b) => format!(
-                "a rewind or switch was cut off while it wrote files; the files from before it \
-                 are in the snapshot {b} (`git restore --source {b} -- .`)"
+            Some(b) => {
+                let mut text = format!(
+                    "a rewind or switch was cut off while it wrote {list}; their content from \
+                     before it is in the snapshot {b}: compare with `git diff {b} -- {list}` \
+                     and put back only those paths with `git restore --source {b} -- {list}` \
+                     (later edits of other files are kept)"
+                );
+                if kept {
+                    text.push_str(&format!(
+                        "; files the snapshot cannot hold are put back by {restore_cmd}"
+                    ));
+                }
+                text
+            }
+            None => format!(
+                "a rewind or switch was cut off while it wrote {list}; their content from \
+                 before it is kept in the session log: put it back with {restore_cmd}"
             ),
-            None => "a rewind or switch was cut off while it wrote files; their content from \
-                 before it is in the session log's last RestoreBegun record"
-                .to_string(),
         });
     }
     if r.unknown > 0 {
@@ -324,7 +339,7 @@ struct Replay<'a> {
     unknown: usize,
     /// A rewind or switch began writing files and its end is not logged: the backup ref
     /// it named, if any.
-    restoring: Option<Option<String>>,
+    restoring: Option<(Option<String>, Vec<tautly_session::RelPath>, bool)>,
 }
 
 impl Replay<'_> {
@@ -488,7 +503,11 @@ impl Replay<'_> {
             | SessionRecord::CheckpointSkipped { .. }
             | SessionRecord::Labeled { .. }
             | SessionRecord::EngineError { .. } => {}
-            SessionRecord::RestoreBegun { backup_ref, .. } => self.restoring = Some(backup_ref),
+            SessionRecord::RestoreBegun {
+                backup_ref,
+                files,
+                paths,
+            } => self.restoring = Some((backup_ref, paths, !files.is_empty())),
             SessionRecord::RestoreEnded { .. } => self.restoring = None,
             SessionRecord::Unknown => self.unknown += 1,
         }

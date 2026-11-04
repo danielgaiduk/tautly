@@ -209,3 +209,116 @@ fn first_prompt(log: &Path) -> Option<String> {
     }
     None
 }
+
+/// What [`restore_backup`] put back (with `dry_run`: would put back); root-relative.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BackupRestored {
+    /// Files written with their content from before the restore.
+    pub written: Vec<String>,
+    /// Files removed (they did not exist before it).
+    pub removed: Vec<String>,
+    /// Files whose content was not kept (a link, or over 64 MiB).
+    pub not_kept: Vec<String>,
+    /// The restore's snapshot, which holds the rest (git).
+    pub backup_ref: Option<String>,
+    /// Every path the restore was about to write.
+    pub paths: Vec<String>,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum BackupError {
+    #[error("no session {0} in this project")]
+    NotFound(String),
+    #[error("session {0} has no rewind or switch backup")]
+    NoBackup(String),
+    #[error("cannot read the session: {0}")]
+    Session(#[from] tautly_session::Error),
+    #[error("{0}")]
+    Lease(#[from] crate::lease::LeaseError),
+    #[error("cannot lock the working tree: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("{path}: {source}")]
+    Disk {
+        path: String,
+        source: tautly_sandbox::SandboxError,
+    },
+    #[error("a path in the session log cannot be used here: {0}")]
+    Path(#[from] tautly_session::ConfineError),
+}
+
+/// Put back the files the last rewind or switch of session `id` kept in the session log
+/// before it wrote them (its `RestoreBegun` record; spec 7.12.2), through `sandbox`:
+/// `tautly sessions restore-backup <id>`. Refused while any engine runs on the working
+/// tree (the lease, spec 7.12.1). A snapshot ref the record names holds the other files;
+/// it is returned, with the paths, to point the user at it. With `dry_run` nothing is
+/// written.
+pub async fn restore_backup(
+    data_home: &Path,
+    sandbox: &dyn Sandbox,
+    id: &str,
+    dry_run: bool,
+) -> Result<BackupRestored, BackupError> {
+    let root = sandbox.root().to_path_buf();
+    let lease = crate::lease::Lease::try_shared(data_home, &root)?
+        .ok_or(BackupError::Lease(crate::lease::LeaseError::Busy))?;
+    let _alone = lease.try_exclusive()?;
+    let log = tautly_session::list_here_in(data_home, &root)?
+        .into_iter()
+        .find(|s| s.id == id)
+        .map(|s| s.path)
+        .ok_or_else(|| BackupError::NotFound(id.to_string()))?;
+    let reader = tautly_session::SessionReader::<SessionRecord>::open(&log)?;
+    let mut last = None;
+    for rec in reader.records() {
+        if let (
+            _,
+            SessionRecord::RestoreBegun {
+                backup_ref,
+                files,
+                paths,
+            },
+        ) = rec?
+        {
+            last = Some((backup_ref, files, paths));
+        }
+    }
+    let (backup_ref, files, paths) = last.ok_or_else(|| BackupError::NoBackup(id.to_string()))?;
+    let mut done = BackupRestored {
+        backup_ref,
+        paths: paths.iter().map(|p| p.as_str().to_string()).collect(),
+        ..BackupRestored::default()
+    };
+    for f in files {
+        let full = f.path.resolve(&root)?;
+        let name = f.path.as_str().to_string();
+        let disk = |source| BackupError::Disk {
+            path: full.display().to_string(),
+            source,
+        };
+        match (f.existed, f.blob) {
+            (true, Some(blob)) => {
+                if !dry_run {
+                    let bytes = reader.read_blob(&blob)?;
+                    sandbox
+                        .write_atomic(&full, &bytes, f.mode)
+                        .await
+                        .map_err(disk)?;
+                }
+                done.written.push(name);
+            }
+            (true, None) => done.not_kept.push(name),
+            (false, _) => {
+                if !dry_run {
+                    match sandbox.remove_file(&full).await {
+                        Ok(()) => {}
+                        Err(tautly_sandbox::SandboxError::Io(e))
+                            if e.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(e) => return Err(disk(e)),
+                    }
+                }
+                done.removed.push(name);
+            }
+        }
+    }
+    Ok(done)
+}

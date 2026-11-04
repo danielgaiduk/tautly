@@ -95,12 +95,12 @@ struct Planned {
     disk: Disk,
 }
 
-/// How to put the files back if a later step fails.
-pub(crate) enum Rollback {
-    /// The backup snapshot's commit.
-    Git(String),
-    /// Each written path's content before (outside git).
-    Files(Vec<(PathBuf, Disk)>),
+/// How to put the files back if a later step fails: the backup snapshot's commit (with
+/// git), then each path it does not hold (outside git: every path written; in git: the
+/// ignored ones) with its content before.
+pub(crate) struct Rollback {
+    git: Option<String>,
+    files: Vec<(PathBuf, Disk)>,
 }
 
 /// What [`materialize_inner`] did.
@@ -301,6 +301,8 @@ struct View<'s> {
     overlay: HashMap<PathBuf, Option<BlobRef>>,
     entries: Option<HashMap<PathBuf, (String, String)>>,
     fallback: HashMap<PathBuf, Option<BlobRef>>,
+    /// A path neither base has and the fallback lacks is not known (else: absent).
+    strict: bool,
 }
 
 impl View<'_> {
@@ -329,8 +331,12 @@ impl View<'_> {
             };
             return Ok(Some((val, Src::Base)));
         }
-        if in_neither && let Some(v) = self.fallback.get(rel) {
-            return Ok(Some((blobs.val(&self.state.log, v).await?, blob(v))));
+        if in_neither {
+            match self.fallback.get(rel) {
+                Some(v) => return Ok(Some((blobs.val(&self.state.log, v).await?, blob(v)))),
+                None if self.strict => return Ok(None),
+                None => {}
+            }
         }
         Ok(Some((Val::Absent, Src::Absent)))
     }
@@ -395,10 +401,12 @@ pub(crate) async fn materialize_inner(
     let same_log = target.log == expected.log;
     let t_over = by_path(&root, &target.overlay)?;
     let e_over = by_path(&root, &expected.overlay)?;
+    // What an ignored file goes back to: for a rewind, its earliest content after the
+    // target's checkpoint; for a switch, the last content the target's tools left in it.
     let later = if same_log {
         by_path(&root, &target.later)?
     } else {
-        HashMap::new()
+        by_path(&root, &target.written)?
     };
 
     // The paths that may change.
@@ -431,12 +439,14 @@ pub(crate) async fn materialize_inner(
         overlay: t_over,
         entries: base_entries(cp.as_deref(), tbase.as_deref(), &list).await?,
         fallback: later,
+        strict: !same_log,
     };
     let eview = View {
         state: expected,
         overlay: e_over,
         entries: base_entries(cp.as_deref(), ebase.as_deref(), &list).await?,
         fallback: by_path(&root, &expected.written)?,
+        strict: false,
     };
     let in_base = |v: &View, p: &Path| v.entries.as_ref().is_some_and(|e| e.contains_key(p));
 
@@ -494,15 +504,60 @@ pub(crate) async fn materialize_inner(
     }
     drop(blobs);
     let text = |p: &PathBuf| p.to_string_lossy().into_owned();
-    let unlisted = conflicts.iter().any(|c| !overwrite.contains(c)) || !blocked.is_empty();
-    // Where the content the write replaces is kept.
+    let git = cp.is_some();
+    // The paths a git snapshot of the tree now would not hold (ignored files): their
+    // content before is kept in the session log instead, or they are not written at all.
+    let tree = match cp.as_deref() {
+        Some(c) if !planned.is_empty() => Some(c.tree_id(true, deadline).await?),
+        _ => None,
+    };
+    let held: BTreeSet<PathBuf> = match (cp.as_deref(), &tree) {
+        (Some(c), Some(tree)) => {
+            let present: Vec<PathBuf> = planned
+                .iter()
+                .filter(|p| p.disk != Disk::Absent)
+                .map(|p| p.rel.clone())
+                .collect();
+            c.entries(tree, &present, deadline)
+                .await?
+                .into_keys()
+                .collect()
+        }
+        _ => BTreeSet::new(),
+    };
     let storable = |d: &Disk| matches!(d, Disk::Absent | Disk::File { .. });
+    let mut kept_in_log = Vec::new();
+    let mut i = 0;
+    while i < planned.len() {
+        if held.contains(&planned[i].rel) {
+            i += 1;
+            continue;
+        }
+        // With git, a path the snapshot cannot restore is never overwritten unbacked.
+        if git && (log.is_none() || !storable(&planned[i].disk)) {
+            let p = planned.remove(i);
+            conflicts.retain(|c| *c != p.rel);
+            blocked.push(p.rel);
+            continue;
+        }
+        kept_in_log.push(i);
+        i += 1;
+    }
+    if git && blocked.iter().any(|b| !held.contains(b)) {
+        notes.push(
+            "a file the git snapshot cannot hold (an ignored file over 64 MiB, or a link) \
+             is never overwritten"
+                .to_string(),
+        );
+    }
+    let unlisted = conflicts.iter().any(|c| !overwrite.contains(c)) || !blocked.is_empty();
     let backup = match (cp.as_deref(), &log) {
         _ if planned.is_empty() => None,
         (Some(_), _) => Some("git"),
         (None, Some(_)) if planned.iter().all(|p| storable(&p.disk)) => Some("log"),
         (None, _) => None,
     };
+    blocked.sort();
     let mut report = MaterializeReport {
         restored: planned
             .iter()
@@ -534,46 +589,49 @@ pub(crate) async fn materialize_inner(
     }
 
     // The backup, before the first write.
-    let mut files = Vec::new();
-    let rollback = match cp.as_deref_mut() {
-        Some(c) if !planned.is_empty() => {
-            let tree = c.tree_id(true, deadline).await?;
-            let made = c.commit_backup(&tree, deadline).await?;
-            report.backup_ref = Some(made.refname);
-            Rollback::Git(made.commit)
-        }
-        _ => {
-            if let Some(log) = log.as_deref_mut() {
-                for p in &planned {
-                    let path = RelPath::from_abs(&root, &root.join(&p.rel))
-                        .ok_or_else(|| TtError::BadPath(text(&p.rel)))?;
-                    let (existed, blob, mode) = match &p.disk {
-                        Disk::Absent => (false, None, None),
-                        Disk::File { bytes, mode } => (true, Some(log.blob(bytes)?), Some(*mode)),
-                        _ => (true, None, None),
-                    };
-                    files.push(BackupFile {
-                        path,
-                        existed,
-                        blob,
-                        mode,
-                    });
-                }
-            }
-            Rollback::Files(
-                planned
-                    .iter()
-                    .map(|p| (p.rel.clone(), p.disk.clone()))
-                    .collect(),
-            )
-        }
+    let mut rollback = Rollback {
+        git: None,
+        files: kept_in_log
+            .iter()
+            .map(|&i| (planned[i].rel.clone(), planned[i].disk.clone()))
+            .collect(),
     };
+    if let (Some(c), Some(tree)) = (cp.as_deref_mut(), &tree) {
+        let made = c.commit_backup(tree, deadline).await?;
+        report.backup_ref = Some(made.refname);
+        rollback.git = Some(made.commit);
+    }
     if let Some(log) = log.as_deref_mut()
         && !planned.is_empty()
     {
+        let mut files = Vec::with_capacity(kept_in_log.len());
+        for &i in &kept_in_log {
+            let p = &planned[i];
+            let path = RelPath::from_abs(&root, &root.join(&p.rel))
+                .ok_or_else(|| TtError::BadPath(text(&p.rel)))?;
+            let (existed, blob, mode) = match &p.disk {
+                Disk::Absent => (false, None, None),
+                Disk::File { bytes, mode } => (true, Some(log.blob(bytes)?), Some(*mode)),
+                _ => (true, None, None),
+            };
+            files.push(BackupFile {
+                path,
+                existed,
+                blob,
+                mode,
+            });
+        }
+        let paths = planned
+            .iter()
+            .map(|p| {
+                RelPath::from_abs(&root, &root.join(&p.rel))
+                    .ok_or_else(|| TtError::BadPath(text(&p.rel)))
+            })
+            .collect::<Result<_, _>>()?;
         log.record(&SessionRecord::RestoreBegun {
             backup_ref: report.backup_ref.clone(),
             files,
+            paths,
         })?;
     }
     let written = write(sb, cp.as_deref(), target, tbase.as_deref(), &planned).await;
@@ -689,39 +747,38 @@ pub(crate) async fn roll_back(
     cp: Option<&Checkpointer>,
     r: &Rollback,
 ) -> Result<(), TtError> {
-    match (r, cp) {
-        (Rollback::Git(commit), Some(cp)) => {
+    match (&r.git, cp) {
+        (Some(commit), Some(cp)) => {
             cp.restore(commit, false).await?;
         }
-        (Rollback::Git(_), None) => {
+        (Some(_), None) => {
             return Err(TtError::Other("no checkpointer to restore with".into()));
         }
-        (Rollback::Files(files), _) => {
-            let mut lost = Vec::new();
-            for (rel, disk) in files {
-                let full = sb.root().join(rel);
-                match disk {
-                    Disk::File { bytes, mode } => {
-                        sb.write_atomic(&full, bytes, Some(*mode))
-                            .await
-                            .map_err(|source| TtError::Disk {
-                                path: full.display().to_string(),
-                                source,
-                            })?;
-                    }
-                    Disk::Absent => checkpoint::remove(sb, &full).await?,
-                    Disk::Large { .. } | Disk::Link(_) | Disk::Other => {
-                        lost.push(rel.display().to_string());
-                    }
-                }
+        (None, _) => {}
+    }
+    let mut lost = Vec::new();
+    for (rel, disk) in &r.files {
+        let full = sb.root().join(rel);
+        match disk {
+            Disk::File { bytes, mode } => {
+                sb.write_atomic(&full, bytes, Some(*mode))
+                    .await
+                    .map_err(|source| TtError::Disk {
+                        path: full.display().to_string(),
+                        source,
+                    })?;
             }
-            if !lost.is_empty() {
-                return Err(TtError::Other(format!(
-                    "not kept, so not put back: {}",
-                    lost.join(", ")
-                )));
+            Disk::Absent => checkpoint::remove(sb, &full).await?,
+            Disk::Large { .. } | Disk::Link(_) | Disk::Other => {
+                lost.push(rel.display().to_string());
             }
         }
+    }
+    if !lost.is_empty() {
+        return Err(TtError::Other(format!(
+            "not kept, so not put back: {}",
+            lost.join(", ")
+        )));
     }
     Ok(())
 }
