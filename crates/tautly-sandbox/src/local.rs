@@ -40,14 +40,17 @@ impl LocalSandbox {
 }
 
 impl LocalSandbox {
-    /// Create `.tautly/tmp` with a `.gitignore` of exactly `*` and the spill directory.
-    /// Done once, and again only if the directory disappears.
+    /// Make sure `.tautly/tmp/.gitignore` ignores everything: checked at every spill, since
+    /// a checkout can replace it mid-session (git treats an ignored file as expendable).
     ///
-    /// A `.gitignore` the repository committed with anything else (empty, `!*`) would
-    /// un-ignore the spill files, which hold full command output, so `git add -A` and
-    /// checkpoints would take them: it is rewritten. One that is not a regular file (a
-    /// symbolic link, which would be written through, or a FIFO) refuses the spill.
-    async fn prepare_spill_dir(&self) -> Result<(), SandboxError> {
+    /// A `.gitignore` that says anything else (empty, `!*`, other rules) would un-ignore the
+    /// spill files, which hold full command output, so `git add -A` would take them: it is
+    /// rewritten to `*`. One whose rules (lines that are not blank or `#` comments) are
+    /// all exactly `*` is left as it is, so a tracked one never shows as modified. One that
+    /// is not a regular file (a symbolic link, which would be written through, or a FIFO)
+    /// refuses the spill.
+    async fn ensure_spill_ignore(&self) -> Result<(), SandboxError> {
+        const MAX_IGNORE: u64 = 4096;
         let ignore = Path::new(".tautly/tmp/.gitignore");
         let path = self.resolve(ignore)?;
         self.guard_protected_target(ignore, &path)?;
@@ -55,7 +58,8 @@ impl LocalSandbox {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
             Err(e) => return Err(e.into()),
             Ok(m) if m.is_file() => {
-                m.len() != 1 || tokio::fs::read(self.root.join(ignore)).await? != b"*"
+                m.len() > MAX_IGNORE
+                    || !ignores_everything(&tokio::fs::read(self.root.join(ignore)).await?)
             }
             Ok(_) => {
                 return Err(SandboxError::Denied(
@@ -66,6 +70,11 @@ impl LocalSandbox {
         if rewrite {
             self.write_atomic(ignore, b"*", None).await?;
         }
+        Ok(())
+    }
+
+    /// Create the spill directory. Done once, and again only if it disappears.
+    async fn prepare_spill_dir(&self) -> Result<(), SandboxError> {
         let dir = Path::new(SPILL_DIR);
         let path = self.resolve(dir)?;
         self.guard_protected_target(dir, &path)?;
@@ -147,6 +156,20 @@ impl LocalSandbox {
         }
         Ok(cmd.spawn()?)
     }
+}
+
+/// Whether a `.gitignore` holds only `*` rules (at least one), besides blank lines and
+/// `#` comments.
+fn ignores_everything(text: &[u8]) -> bool {
+    let Ok(text) = std::str::from_utf8(text) else {
+        return false;
+    };
+    let mut rules = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .peekable();
+    rules.peek().is_some() && rules.all(|l| l == "*")
 }
 
 #[async_trait]
@@ -253,6 +276,7 @@ impl Sandbox for LocalSandbox {
         let rel = Path::new(SPILL_DIR).join(format!("{}.txt", &hash[..16]));
         let path = self.resolve(&rel)?;
         self.guard_protected_target(&rel, &path)?;
+        self.ensure_spill_ignore().await?;
         let len = bytes.len() as u64;
         if tokio::fs::metadata(&path)
             .await

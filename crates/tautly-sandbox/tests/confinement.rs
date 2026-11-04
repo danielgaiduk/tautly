@@ -256,6 +256,34 @@ async fn spill_rewrites_a_gitignore_that_is_not_ignore_all() {
     }
 }
 
+/// Review N5: a file that already ignores everything (`*` with a newline, comments, blank
+/// lines: what an editor writes) is left alone, so a tracked one never shows as modified;
+/// and the file is checked at every spill, so one replaced mid-session (a checkout) is
+/// put back before the next spill file is written.
+#[tokio::test]
+async fn spill_gitignore_is_checked_every_time_and_tolerates_formatting() {
+    for kept in ["*\n", "# tautly scratch\n*\n\n", "  *  \n"] {
+        let (t, sb) = sandbox();
+        std::fs::create_dir_all(t.path().join(".tautly/tmp")).unwrap();
+        std::fs::write(t.path().join(".tautly/tmp/.gitignore"), kept).unwrap();
+        sb.spill(b"x").await.unwrap();
+        let gi = std::fs::read_to_string(t.path().join(".tautly/tmp/.gitignore")).unwrap();
+        assert_eq!(gi, kept, "{kept:?}");
+    }
+    let (t, sb) = sandbox();
+    sb.spill(b"one").await.unwrap();
+    std::fs::write(t.path().join(".tautly/tmp/.gitignore"), "").unwrap();
+    sb.spill(b"two").await.unwrap();
+    let gi = std::fs::read_to_string(t.path().join(".tautly/tmp/.gitignore")).unwrap();
+    assert_eq!(gi, "*");
+    // Also when the content is already spilled (nothing new is written, but the file
+    // is exposed all the same).
+    std::fs::write(t.path().join(".tautly/tmp/.gitignore"), "!*\n").unwrap();
+    sb.spill(b"two").await.unwrap();
+    let gi = std::fs::read_to_string(t.path().join(".tautly/tmp/.gitignore")).unwrap();
+    assert_eq!(gi, "*");
+}
+
 /// A `.tautly/tmp/.gitignore` that is a symbolic link (to a file of the repository, or
 /// dangling) is neither written through nor trusted: nothing is spilled.
 #[tokio::test]
