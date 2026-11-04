@@ -1,0 +1,15 @@
+---
+source: crates/tautly-rpc/tests/oneshot.rs
+expression: "stable.join(\"\\n\")"
+---
+{"session_id":"[session]","type":"session_changed"}
+{"type":"turn_started"}
+{"breakdown":"[n]","budget":"[n]","type":"context_status","used":"[n]","warnings":[]}
+{"args":{"path":"a.txt"},"call_id":"c1","tool":"read","type":"tool_call_proposed"}
+{"call_id":"c1","tool":"read","type":"tool_started"}
+{"blocked":false,"call_id":"c1","diff":null,"effects":[{"path":"[root]/a.txt","range":{"end":null,"start":null},"shown":{"type":"full"},"type":"read"}],"is_error":false,"meta":{"error_kind":null,"exit_code":null},"output":"1\thello","tool":"read","type":"tool_finished"}
+{"text":"The file says hello.","type":"text_delta"}
+{"cache_read":0,"cache_write":0,"cost_usd":null,"quota":null,"role":"main","tokens_in":100,"tokens_out":10,"type":"usage"}
+{"breakdown":"[n]","budget":"[n]","type":"context_status","used":"[n]","warnings":[]}
+{"reason":"completed","type":"turn_finished"}
+{"message":"the session's episode was not written: provider error: mock script exhausted","type":"warning"}

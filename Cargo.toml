@@ -62,5 +62,8 @@ tower-service = "0.3"
 reqwest013 = { package = "reqwest", version = "0.13.2", default-features = false }
 rustls = { version = "0.23", default-features = false }
 webpki-roots = "1"
+# The `tautly` binary: argument parsing and errors (anyhow only in tautly-cli).
+clap = { version = "4.5", features = ["derive"] }
+anyhow = "1"
 # YAML frontmatter of memory entries: panic-free parser with input budgets (hostile repos).
 serde-saphyr = { version = "2.1", default-features = false, features = ["deserialize"] }
