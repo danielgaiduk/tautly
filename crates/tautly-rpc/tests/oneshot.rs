@@ -45,13 +45,19 @@ fn warnings(events: &[Value]) -> Vec<String> {
 }
 
 /// The event stream with what differs between runs replaced: session ids, the temporary
-/// root, and the context numbers (which depend on whether the repo map was ready).
+/// root, and the context numbers (which depend on whether the repo map was ready), the
+/// estimated usage of a response that reported none included.
 fn normalized(out: &str, fx: &Fx) -> String {
     let root = fx.root().to_string_lossy().into_owned();
     let mut lines = Vec::new();
     for mut ev in events(out) {
         if ev["type"] == "session_changed" {
             ev["session_id"] = json!("[session]");
+        }
+        if ev["type"] == "usage" && ev["estimated"] == true {
+            for key in ["tokens_in", "tokens_out"] {
+                ev[key] = json!("[n]");
+            }
         }
         if ev["type"] == "context_status" {
             for key in ["used", "budget", "breakdown"] {

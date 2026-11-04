@@ -4,6 +4,7 @@ expression: "stable.join(\"\\n\")"
 ---
 {"session_id":"[session]","type":"session_changed"}
 {"type":"turn_started"}
+{"cache_read":0,"cache_write":0,"cost_usd":null,"estimated":true,"quota":null,"role":"main","tokens_in":"[n]","tokens_out":"[n]","type":"usage"}
 {"breakdown":"[n]","budget":"[n]","type":"context_status","used":"[n]","warnings":[]}
 {"args":{"path":"a.txt"},"call_id":"c1","tool":"read","type":"tool_call_proposed"}
 {"call_id":"c1","tool":"read","type":"tool_started"}
