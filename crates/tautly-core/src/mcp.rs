@@ -13,8 +13,9 @@
 //!
 //! Servers start in the background. The tool set changes only at a user-turn start
 //! (`Session::refresh_mcp_tools`): the first waits up to `startup_timeout_ms` for
-//! servers still starting (a `Cancel` or `Shutdown` stops the wait); a server ready later, or a changed tool list, joins at the next
-//! one, with a warning that the cached prefix breaks once.
+//! servers still starting (a `Cancel` or `Shutdown` stops the wait); a server ready
+//! later, or a changed tool list, joins at the next one, with a warning that the cached
+//! prefix breaks once (that step's epoch is then forced cold).
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};

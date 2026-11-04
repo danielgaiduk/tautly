@@ -658,6 +658,54 @@ async fn side_usage_has_role_side_and_counts_toward_budget_and_ledger() {
     assert_eq!(rows.iter().filter(|r| r.0 == SMALL).count(), 1);
 }
 
+/// Index of the first `Usage` of `role` in `events`.
+fn first_usage(events: &[Event], role: UsageRole) -> Option<usize> {
+    events
+        .iter()
+        .position(|e| matches!(e, Event::Usage { role: r, .. } if *r == role))
+}
+
+/// The 80% warning a side request causes follows that request's `Usage` (re-review N7:
+/// the property `charge()` documents). The limit is sized from a first run of the same
+/// script, so that the main steps before the side request stay below 80% and the side
+/// request's 2,300 tokens take the session past it (with 1,150 tokens of slack either
+/// way for estimate noise between the runs).
+#[tokio::test]
+async fn the_80_percent_warning_a_side_request_causes_follows_its_usage() {
+    let fx = compaction_fx();
+    let run_once = |max_tokens: Option<u64>| {
+        let main = MockProvider::new(compaction_script());
+        let side = MockProvider::new(vec![text_step("SUMMARY-TEXT", usage(2000, 300))]);
+        let mut cfg = config(Some(SMALL_PRICE));
+        cfg.budget.session = BudgetLimits {
+            max_usd: None,
+            max_tokens,
+        };
+        let mut run = start(fx.builder(cfg, &main, &side));
+        async move {
+            let events = run.turn_with(&long_prompt()).await;
+            run.engine.send(Command::Shutdown).await.unwrap();
+            while run.events.recv().await.is_some() {}
+            events
+        }
+    };
+    let measured = run_once(None).await;
+    let side_at = first_usage(&measured, UsageRole::Side).expect("a side request");
+    let (main_before, _) = spent(&measured[..side_at], UsageRole::Main);
+    let limit = (main_before + 1150) * 5 / 4;
+
+    let events = run_once(Some(limit)).await;
+    let side_at = first_usage(&events, UsageRole::Side).expect("a side request");
+    let warn_at = events
+        .iter()
+        .position(|e| {
+            matches!(e, Event::Warning { message }
+                if message.starts_with("session budget") && message.contains("% used"))
+        })
+        .unwrap_or_else(|| panic!("no 80% warning: {:?}", warnings(&events)));
+    assert!(warn_at > side_at, "{events:?}");
+}
+
 #[tokio::test]
 async fn without_a_small_tier_the_main_model_summarizes() {
     let fx = compaction_fx();

@@ -14,9 +14,9 @@
 //! - `GcApplied` (`reapply_gc`), `Compaction` (`reapply_compaction`), `PinsFolded`,
 //!   `MemoryIndexApplied`, `PrefixApplied` (AGENTS.md and the repo map as logged, never
 //!   read from disk again; with a calibration, the requests after it are assembled with
-//!   the tools it logged, MCP tools included), `StartPins`, `Uncompacted` and `Undone` are redone where they
-//!   happened. Tool results are read back from their blobs; only references and the
-//!   latest compaction stay in memory.
+//!   the tools it logged, MCP tools included), `StartPins`, `Uncompacted` and `Undone`
+//!   are redone where they happened. Tool results are read back from their blobs; only
+//!   references and the latest compaction stay in memory.
 //! - `Pin`/`Unpin` sent while a turn runs reach it at its next step start, as they did
 //!   live (at the step's first epoch record, its request, or the turn's end).
 //! - `Forked` (a branch's first own record) starts the spend over: the usage logged
@@ -1051,9 +1051,9 @@ impl Session {
 
     /// The rest of a resumed session's start: the spend so far, the stale-read guard of
     /// files unchanged since, and (at the first request, once the MCP tools have joined) a
-    /// warning when this build's system prompt or tools differ from the logged ones. AGENTS.md and the repo map are the logged ones; a
-    /// session that never sent a request starts up as a new one, keeping the start pins
-    /// it logged.
+    /// warning when this build's system prompt or tools differ from the logged ones.
+    /// AGENTS.md and the repo map are the logged ones; a session that never sent a request
+    /// starts up as a new one, keeping the start pins it logged.
     async fn resume_start(&mut self, resumed: Resumed, config_pins: &[String]) {
         for w in resumed.warnings {
             self.warn(format!("resume: {w}")).await;

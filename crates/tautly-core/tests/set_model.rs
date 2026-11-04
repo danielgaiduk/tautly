@@ -163,9 +163,12 @@ impl Fx {
         std::fs::write(self.dir.path().join(rel), text).unwrap();
     }
 
+    /// The mock serves the main model, the side model and every switch, so no test looks
+    /// up a key (the OS keychain can stall a lookup).
     fn builder(&self, cfg: Config, mock: &MockProvider) -> EngineBuilder {
         EngineBuilder {
             provider: Some(Arc::new(mock.clone())),
+            side_provider: Some(Arc::new(mock.clone())),
             provider_factory: Some(factory(mock)),
             data_home: Some(self.home.path().to_path_buf()),
             ..EngineBuilder::new(cfg, self.dir.path())
