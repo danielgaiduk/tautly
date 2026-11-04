@@ -1186,8 +1186,12 @@ async fn dead_server_tools_removed_at_next_user_turn() {
         text_step("turn 2"),
     ]);
     let mut run = start(fx.builder(with_user_server(Mode::Yolo, &[]), &mock));
-    run.turn_with("one").await;
-    run.until_state("echo", McpState::Failed).await;
+    let first = run.turn_with("one").await;
+    // The server may be reported dead during turn one already.
+    let failed = |e: &Event| matches!(e, Event::McpServerStatus { server, state: McpState::Failed, .. } if server == "echo");
+    if !first.iter().any(failed) {
+        run.until(failed).await;
+    }
     let events = run.turn_with("two").await;
     assert!(
         events.iter().any(
