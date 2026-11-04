@@ -388,6 +388,28 @@ pub enum Event {
         tools: u32,
         message: Option<String>,
     },
+    /// One event of a [`Command::Replay`] (spec 7.12.5): `event` as the logged stream
+    /// had it, from the record at log `offset`, written at `t_ms` (Unix milliseconds).
+    /// Nothing in it is live: its approval request and memory proposal ids are prefixed
+    /// `replayed:` and can never be answered, and a client must not act on it.
+    Replayed {
+        offset: u64,
+        t_ms: u64,
+        event: Box<Event>,
+    },
+    /// The end of a [`Command::Replay`] of session `session_id` (the session replayed,
+    /// which need not be the one the event is sent on): `events` [`Event::Replayed`] were
+    /// sent; `cancelled` when a `Cancel` stopped it.
+    ReplayFinished {
+        session_id: String,
+        events: u32,
+        cancelled: bool,
+    },
+    /// The user's message that started a turn. Sent only inside [`Event::Replayed`] (a
+    /// live client knows what it sent).
+    UserMessage {
+        text: String,
+    },
     /// An event type this version does not know.
     #[serde(other)]
     Unknown,
@@ -548,11 +570,31 @@ pub enum Command {
     Label {
         label: String,
     },
+    /// Play session `session_id` of this project back from its log (default: the current
+    /// session; spec 7.12.5): each logged event as an [`Event::Replayed`], paced by the
+    /// records' timestamps (each gap divided by `speed` and capped at 2 s; `speed` 0 is
+    /// instant), from step `from_step` on (default: the start), then
+    /// [`Event::ReplayFinished`]. Read-only: no provider request, no tool, no file
+    /// access beyond the log and its blobs. Idle only: while anything runs it is answered
+    /// with an `Error`. `Cancel` stops it.
+    Replay {
+        #[serde(default)]
+        session_id: Option<String>,
+        #[serde(default = "one")]
+        speed: f32,
+        #[serde(default)]
+        from_step: Option<u32>,
+    },
     Shutdown,
     /// A command this version does not know (from a newer client, or read back from a
     /// newer log): answered with an `Error`, and skipped on resume.
     #[serde(other)]
     Unknown,
+}
+
+/// The default [`Command::Replay`] speed: real time.
+fn one() -> f32 {
+    1.0
 }
 
 impl Command {

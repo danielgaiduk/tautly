@@ -742,19 +742,20 @@ Every operation here creates a new branch or a new view. None truncates a log, a
 
   | Record | Event |
   |---|---|
-  | `SendMessage` | `UserMessage{text}` + `TurnStarted` |
+  | `TurnStart` | `UserMessage{text}` + `TurnStarted` (not `SendMessage`: a message sent mid-turn is logged on arrival but starts its turn at its `TurnStart`) |
   | provider text and reasoning | `TextDelta` / `ReasoningDelta` (redacted reasoning skipped) |
   | `ToolCall` | `ToolCallProposed` |
-  | `ApprovalRequested` | `ToolApprovalRequested` (no `diff`) |
-  | `ToolResult` | `ToolFinished` (output from its blob) |
-  | provider usage | `Usage` |
+  | `ApprovalRequested` (a tool's) | `ToolApprovalRequested` (no `diff`; id prefixed `replayed:`) |
+  | `ToolResult` | `ToolFinished` (output from its blob, no `diff`) |
+  | provider usage | `Usage` (the response's last, after its discarded attempts; priced by its step's `Request.model`) |
+  | `Charged` | `Usage` (priced by its own `model`; `estimated` kept) |
   | `Compaction` | `Compacted` |
   | `GcApplied` | `ContextCollected` |
-  | `MemoryProposal` | `MemoryProposed` |
+  | `MemoryProposal` | `MemoryProposed` (id prefixed `replayed:`) |
   | `ModelSet` | `ModelChanged` |
   | `TurnEnd` | `TurnFinished` |
 
-- **Pacing:** each gap is `Δt / speed`, capped at 2 s; `speed = 0` is instant.
+- **Pacing:** each gap is `Δt / speed`, capped at 2 s; `speed = 0` is instant. Events are streamed from the log (a bounded queue), so memory does not grow with the log or its blobs.
 - **Read-only:** no provider request, no tool execution, no file access beyond the log and its blobs. It works without an API key. Replayed approval request ids cannot be answered. `Cancel` stops a replay.
 
 #### 7.12.6 Compare

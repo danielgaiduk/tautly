@@ -384,6 +384,25 @@ fn methods_map_to_commands() {
                 label: "main".into(),
             },
         ),
+        (
+            "replay",
+            json!({"target": "01X", "session_id": "s1", "speed": 0, "from_step": 3}),
+            Command::Replay {
+                session_id: Some("01X".into()),
+                speed: 0.0,
+                from_step: Some(3),
+            },
+        ),
+        // Defaults: the session addressed, at real-time speed, from the start.
+        (
+            "replay",
+            json!({"session_id": "s1"}),
+            Command::Replay {
+                session_id: None,
+                speed: 1.0,
+                from_step: None,
+            },
+        ),
         ("shutdown", json!({}), Command::Shutdown),
         // A `type` among the params cannot turn one command into another.
         (

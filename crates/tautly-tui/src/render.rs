@@ -309,16 +309,20 @@ pub fn event(e: &Event, st: &mut RenderState, opts: &ReplOptions) -> Option<Stri
                 "cancelled" => DIM,
                 _ => YELLOW,
             };
-            let secs = pending.as_ref().and_then(|p| p.started).map_or(0.0, |t| {
-                (st.clock)().saturating_duration_since(t).as_secs_f64()
-            });
+            // No start time (a replay, or a call that never started): no duration.
+            let secs = pending
+                .as_ref()
+                .and_then(|p| p.started)
+                .map(|t| (st.clock)().saturating_duration_since(t).as_secs_f64());
             let shown = pending.as_ref().map_or("", |p| p.target.as_str());
             let mut row = format!("{} {}", paint(colour, status), printable(tool));
             if !shown.is_empty() {
                 row.push(' ');
                 row.push_str(shown);
             }
-            let _ = write!(row, " {secs:.1}s");
+            if let Some(secs) = secs {
+                let _ = write!(row, " {secs:.1}s");
+            }
             let mut notes = Vec::new();
             if let Some(code) = meta.exit_code {
                 notes.push(format!("exit {code}"));
@@ -549,6 +553,32 @@ pub fn event(e: &Event, st: &mut RenderState, opts: &ReplOptions) -> Option<Stri
             }
             Some(st.line(paint(DIM, &text)))
         }
+        Event::Replayed { event: logged, .. } => match &**logged {
+            // A logged switch is history: the session's model stays what it is.
+            Event::ModelChanged { model, provider } => Some(st.line(format!(
+                "model: {} ({})",
+                printable(model.as_str()),
+                printable(provider)
+            ))),
+            // Nothing replayed is answered: shown, never asked.
+            Event::Replayed { .. } => None,
+            inner => event(inner, st, opts),
+        },
+        Event::UserMessage { text } => {
+            let text = printable_multiline(text);
+            let text = text.strip_suffix('\n').unwrap_or(&text);
+            Some(st.line(paint(BOLD, &format!("> {}", text.replace('\n', "\n  ")))))
+        }
+        Event::ReplayFinished {
+            events, cancelled, ..
+        } => Some(st.line(paint(
+            DIM,
+            &if *cancelled {
+                format!("replay cancelled after {events} events")
+            } else {
+                format!("replay finished: {events} events")
+            },
+        ))),
         _ => None,
     }
 }
