@@ -5,8 +5,8 @@
 //! and `Shutdown`; `Pin`/`Unpin` reach the turn at its next step start; everything else
 //! (further messages included) waits for the turn to end. Every command is logged as it
 //! arrives (one that arrives while a `SetModel` builds its provider, once the build ends;
-//! one other than `Cancel`, `Shutdown`, `Approve` and `Deny` that arrives while a `Fork`
-//! runs, once the fork ends, so it lands in the log it applies to).
+//! one other than `Cancel`, `Shutdown`, `Approve` and `Deny` that arrives while a `Fork`,
+//! `Rewind` or `Switch` runs, once it ends, so it lands in the log it applies to).
 //!
 //! MCP servers (`mcp.rs`) start in the background after session start; `Approve`/`Deny`
 //! also answer repository servers' approval requests. At shutdown the servers are stopped
@@ -57,6 +57,7 @@ use crate::budget::{Budget, Budgets};
 use crate::checkpoint::{self, Checkpointer, GitCheckpoints, Skip, StartCheckpoint};
 use crate::config::{Config, LoadedConfig};
 use crate::evidence::{EvidenceTracker, TestMatcher};
+use crate::lease::Lease;
 use crate::ledger::{CostLedger, LEDGER_FILE};
 use crate::mcp::{McpSession, McpSetup, NoPreExec, PreExecHook};
 use crate::memory::{MemoryMode, MemoryState};
@@ -254,6 +255,17 @@ impl EngineBuilder {
         });
         let mut config_warnings = self.config_warnings;
         config_warnings.extend(side_note);
+        // Held for the engine's life; rewind and switch take it exclusively.
+        let lease = match Lease::shared(&data_home, &root) {
+            Ok(lease) => Some(lease.for_workspace(&workspace)),
+            Err(e) => {
+                config_warnings.push(format!(
+                    "the working-tree lease is unavailable ({e}); rewind and switch are off \
+                     for this session"
+                ));
+                None
+            }
+        };
         let init = HeaderInit {
             model: Some(config.model.as_str().to_string()),
             config_hash: Some(config.hash()),
@@ -365,6 +377,7 @@ impl EngineBuilder {
             header_init: init,
             receipt: None,
             gc_elided: Vec::new(),
+            lease,
         };
         let current = Arc::new(Mutex::new((session_id.clone(), session_path.clone())));
         let actor = Actor {
@@ -516,6 +529,17 @@ enum Job {
         at: Option<u32>,
         label: Option<String>,
     },
+    Rewind {
+        at: u32,
+        label: Option<String>,
+        dry_run: bool,
+        overwrite: Vec<String>,
+    },
+    Switch {
+        session_id: String,
+        dry_run: bool,
+        overwrite: Vec<String>,
+    },
 }
 
 /// The task in flight (a turn or a compaction). It hands back the session and the inbox,
@@ -647,6 +671,26 @@ impl Actor {
                         Command::ConsolidateMemory => Job::Consolidate,
                         Command::Undo { turn, dry_run } => Job::Undo { turn, dry_run },
                         Command::Fork { at, label } => Job::Fork { at, label },
+                        Command::Rewind {
+                            at,
+                            label,
+                            dry_run,
+                            overwrite,
+                        } => Job::Rewind {
+                            at,
+                            label,
+                            dry_run,
+                            overwrite,
+                        },
+                        Command::Switch {
+                            session_id,
+                            dry_run,
+                            overwrite,
+                        } => Job::Switch {
+                            session_id,
+                            dry_run,
+                            overwrite,
+                        },
                         Command::SetModel { model } => {
                             match state.as_mut() {
                                 Some(s) => {
@@ -908,20 +952,41 @@ impl Actor {
             approvals: self.approvals.clone(),
         };
         let turn = matches!(job, Job::Turn(_));
-        let fork = matches!(job, Job::Fork { .. });
+        // A fork, rewind or switch moves the log: what arrives meanwhile waits for it.
+        let fork = matches!(
+            job,
+            Job::Fork { .. } | Job::Rewind { .. } | Job::Switch { .. }
+        );
         let current = Arc::clone(&self.current);
+        let moved = move |id: &str, path: &Path| {
+            *current.lock().unwrap_or_else(PoisonError::into_inner) =
+                (id.to_string(), path.to_path_buf());
+        };
         let handle = tokio::spawn(async move {
             match job {
                 Job::Turn(text) => session.run_turn(text, &mut ctl).await,
                 Job::Compact => session.compact_command(&ctl).await,
                 Job::Consolidate => session.consolidate_command(&ctl).await,
                 Job::Undo { turn, dry_run } => session.undo_job(turn, dry_run, &ctl).await,
-                Job::Fork { at, label } => {
-                    let on_branch = move |id: &str, path: &Path| {
-                        *current.lock().unwrap_or_else(PoisonError::into_inner) =
-                            (id.to_string(), path.to_path_buf());
-                    };
-                    session.fork_job(at, label, &ctl, on_branch).await
+                Job::Fork { at, label } => session.fork_job(at, label, &ctl, moved).await,
+                Job::Rewind {
+                    at,
+                    label,
+                    dry_run,
+                    overwrite,
+                } => {
+                    session
+                        .rewind_job(at, label, dry_run, overwrite, &ctl, moved)
+                        .await
+                }
+                Job::Switch {
+                    session_id,
+                    dry_run,
+                    overwrite,
+                } => {
+                    session
+                        .switch_job(session_id, dry_run, overwrite, &ctl, moved)
+                        .await
                 }
             }
             (session, ctl.inbox)
@@ -968,6 +1033,10 @@ impl Actor {
             | Command::RejectMemory { .. } => session.context_command(cmd).await,
             Command::Diff { turn } => session.diff(turn).await,
             Command::Uncompact => session.uncompact_command().await,
+            Command::Label { label } => {
+                session.log(SessionRecord::Labeled { label }).await;
+                session.checkpoint().await;
+            }
             other => {
                 let name = serde_json::to_value(&other)
                     .ok()

@@ -262,6 +262,10 @@ pub enum CheckpointPoint {
     /// Before a rewind or branch switch writes (spec 7.12; written by Task 49): the tip as
     /// it was.
     BeforeRestore,
+    /// The files a rewind or switch materialized, as the branch continues from them
+    /// (spec 7.12; written by Task 49): exactly `state_at` of the step it branched at, or
+    /// the tip switched to. Older builds read it as `Unknown`.
+    Restored,
     /// A point this version does not know (read only).
     #[serde(other)]
     Unknown,

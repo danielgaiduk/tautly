@@ -523,6 +523,16 @@ pub fn event(e: &Event, st: &mut RenderState, opts: &ReplOptions) -> Option<Stri
             }
             Some(st.line(out))
         }
+        Event::Rewound { at, report, .. } => {
+            Some(st.line(materialized(&format!("rewind to step {at}"), report)))
+        }
+        Event::Switched { branch, report } => {
+            let short: String = branch.chars().take(8).collect();
+            Some(st.line(materialized(
+                &format!("switch to {}", printable(&short)),
+                report,
+            )))
+        }
         Event::McpServerStatus {
             server,
             state,
@@ -541,6 +551,50 @@ pub fn event(e: &Event, st: &mut RenderState, opts: &ReplOptions) -> Option<Stri
         }
         _ => None,
     }
+}
+
+/// What a rewind or switch (`what`) did or would do: what it restores and deletes, the
+/// conflicts, the backup and the note. Paths are escaped.
+fn materialized(what: &str, r: &tautly_core::MaterializeReport) -> String {
+    let list = |v: &[String]| {
+        if v.is_empty() {
+            "nothing".to_string()
+        } else {
+            v.iter()
+                .map(|p| printable(p))
+                .collect::<Vec<_>>()
+                .join(", ")
+        }
+    };
+    let mut out = if r.applied {
+        format!(
+            "{what}: restored {}; deleted {}",
+            list(&r.restored),
+            list(&r.deleted)
+        )
+    } else if r.dry_run {
+        format!(
+            "{what} would restore: {}\n  and delete: {}",
+            list(&r.restored),
+            list(&r.deleted)
+        )
+    } else {
+        format!("{what} not done: nothing was changed")
+    };
+    if !r.conflicts.is_empty() {
+        let _ = write!(
+            out,
+            "\n  conflicts (changed since the agent left them): {}",
+            list(&r.conflicts)
+        );
+    }
+    if let Some(b) = &r.backup_ref {
+        let _ = write!(out, "\n  snapshot before: {}", printable(b));
+    }
+    if let Some(n) = &r.note {
+        let _ = write!(out, "\n  note: {}", printable(n));
+    }
+    out
 }
 
 /// The receipt footer: `turn N · S steps · 12.4s · ctx <used>/<budget> tok · cache 86% ·

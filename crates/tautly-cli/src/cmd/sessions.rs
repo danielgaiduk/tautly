@@ -1,4 +1,4 @@
-//! `tautly sessions list|show|export|delete` (spec 6.5).
+//! `tautly sessions list|show|tree|export|delete` (spec 6.5, 7.12.3).
 
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
@@ -23,6 +23,8 @@ pub enum Cmd {
         /// The session id, or a prefix of it.
         id: String,
     },
+    /// The project's sessions as a tree of branches.
+    Tree,
     /// Print a session as its raw log (jsonl) or as a readable transcript (md).
     Export {
         /// The session id, or a prefix of it.
@@ -47,6 +49,7 @@ pub async fn run(cmd: Cmd, env: &Env) -> anyhow::Result<i32> {
     match cmd {
         Cmd::List => list(env),
         Cmd::Show { id } => show(env, &id),
+        Cmd::Tree => tree(env),
         Cmd::Export { id, format } => export(env, &id, format),
         Cmd::Delete { id } => delete(env, &id).await,
     }
@@ -72,6 +75,20 @@ fn list(env: &Env) -> anyhow::Result<i32> {
             utc(s.started),
             s.first_prompt
         );
+    }
+    Ok(0)
+}
+
+/// One indented line per branch, as `/tree` prints it (no session is current here).
+fn tree(env: &Env) -> anyhow::Result<i32> {
+    let nodes = tautly_core::tree::for_root(&env.data_home, env.root(), None)
+        .context("cannot list the sessions")?;
+    if nodes.is_empty() {
+        println!("no sessions in this project");
+        return Ok(0);
+    }
+    for line in tautly_core::tree::lines(&nodes) {
+        println!("{line}");
     }
     Ok(0)
 }

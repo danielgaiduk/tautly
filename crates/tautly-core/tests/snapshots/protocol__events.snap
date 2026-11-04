@@ -267,5 +267,38 @@ expression: events
     "dry_run": false,
     "backup_ref": "refs/tautly/checkpoints/01J0/undo-7",
     "note": "ignored files and submodules are not restored"
+  },
+  {
+    "type": "rewound",
+    "at": 3,
+    "branch": "01JBRANCH",
+    "report": {
+      "restored": [
+        "src/lib.rs"
+      ],
+      "deleted": [
+        "new.txt"
+      ],
+      "conflicts": [],
+      "dry_run": false,
+      "applied": true,
+      "backup_ref": "refs/tautly/checkpoints/01J0/undo-8",
+      "note": null
+    }
+  },
+  {
+    "type": "switched",
+    "branch": "01J0",
+    "report": {
+      "restored": [],
+      "deleted": [],
+      "conflicts": [
+        "notes.md"
+      ],
+      "dry_run": true,
+      "applied": false,
+      "backup_ref": null,
+      "note": null
+    }
   }
 ]

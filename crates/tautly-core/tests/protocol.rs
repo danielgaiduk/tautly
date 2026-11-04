@@ -5,8 +5,8 @@ use serde_json::json;
 use tautly_context::{Breakdown, ContextStatus, MutationReason};
 use tautly_core::{
     BudgetScope, Command, DiffFile, DiffPreview, DiffStatus, EffectView, ErrorKind, Event,
-    FinishReason, McpState, MemAnchor, MemoryChange, PROTOCOL_VERSION, Savings, ToolMetaView,
-    UsageRole,
+    FinishReason, MaterializeReport, McpState, MemAnchor, MemoryChange, PROTOCOL_VERSION, Savings,
+    ToolMetaView, UsageRole,
 };
 use tautly_memory::{MemoryEntry, MemoryKind};
 use tautly_provider::{ModelId, Quota};
@@ -236,6 +236,27 @@ fn every_event() -> Vec<Event> {
             backup_ref: Some("refs/tautly/checkpoints/01J0/undo-7".into()),
             note: Some("ignored files and submodules are not restored".into()),
         },
+        Event::Rewound {
+            at: 3,
+            branch: "01JBRANCH".into(),
+            report: MaterializeReport {
+                restored: vec!["src/lib.rs".into()],
+                deleted: vec!["new.txt".into()],
+                conflicts: vec![],
+                dry_run: false,
+                applied: true,
+                backup_ref: Some("refs/tautly/checkpoints/01J0/undo-8".into()),
+                note: None,
+            },
+        },
+        Event::Switched {
+            branch: "01J0".into(),
+            report: MaterializeReport {
+                conflicts: vec!["notes.md".into()],
+                dry_run: true,
+                ..MaterializeReport::default()
+            },
+        },
     ];
     for e in &events {
         match e {
@@ -262,6 +283,8 @@ fn every_event() -> Vec<Event> {
             | Event::McpServerApprovalRequested { .. }
             | Event::McpServerStatus { .. }
             | Event::Undone { .. }
+            | Event::Rewound { .. }
+            | Event::Switched { .. }
             | Event::Unknown => {}
         }
     }
@@ -332,6 +355,26 @@ fn every_command() -> Vec<Command> {
             turn: Some(2),
             dry_run: true,
         },
+        Command::Rewind {
+            at: 3,
+            label: Some("try-b".into()),
+            dry_run: true,
+            overwrite: vec![],
+        },
+        Command::Rewind {
+            at: 2,
+            label: None,
+            dry_run: false,
+            overwrite: vec!["notes.md".into()],
+        },
+        Command::Switch {
+            session_id: "01J0".into(),
+            dry_run: false,
+            overwrite: vec![],
+        },
+        Command::Label {
+            label: "main".into(),
+        },
         Command::Shutdown,
     ];
     for c in &commands {
@@ -352,6 +395,9 @@ fn every_command() -> Vec<Command> {
             | Command::Diff { .. }
             | Command::SetModel { .. }
             | Command::Undo { .. }
+            | Command::Rewind { .. }
+            | Command::Switch { .. }
+            | Command::Label { .. }
             | Command::Shutdown
             | Command::Unknown => {}
         }

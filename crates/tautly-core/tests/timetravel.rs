@@ -1,0 +1,956 @@
+//! Time travel (spec 7.12, Task 49): file states at step boundaries, rewind as a fork,
+//! switching branches, the working-tree lease, labels and the session tree. Against real
+//! git repositories (and a plain directory) with scripted providers.
+
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+use std::process::Command as Process;
+use std::sync::Arc;
+use std::time::Duration;
+
+use serde_json::{Value, json};
+use tautly_core::record::{CheckpointPoint, session_label};
+use tautly_core::resume::rebuild;
+use tautly_core::timetravel::{expected_tip, state_at, step_at_offset};
+use tautly_core::{
+    Command, Config, EngineBuilder, Event, MaterializeReport, SessionRecord, TtError, tree,
+};
+use tautly_provider::{
+    CanonicalRequest, Catalog, MockProvider, MockTurn, ModelId, ProviderEvent, StopReason,
+};
+use tautly_sandbox::{LocalSandbox, Mode, Sandbox};
+use tautly_session::{Origin, SessionReader};
+use tempfile::TempDir;
+use tokio::sync::mpsc;
+
+const MODEL: &str = "mock/test";
+const WAIT: Duration = Duration::from_secs(30);
+
+// ------------------------------------------------------------------------ fixtures
+
+struct Repo {
+    dir: TempDir,
+    home: TempDir,
+}
+
+impl Repo {
+    /// A git repository with `a.txt` and `b.txt` committed.
+    fn git_repo() -> Repo {
+        let repo = Repo::plain();
+        repo.git(&["init", "-q", "-b", "main"]);
+        repo.write("a.txt", "zero\n");
+        repo.write("b.txt", "bee\n");
+        repo.git(&["add", "-A"]);
+        repo.git(&["commit", "-q", "-m", "init"]);
+        repo
+    }
+
+    /// A directory that is not a git work tree, with `a.txt`.
+    fn plain() -> Repo {
+        let repo = Repo {
+            dir: tempfile::tempdir().unwrap(),
+            home: tempfile::tempdir().unwrap(),
+        };
+        repo.write("a.txt", "zero\n");
+        repo
+    }
+
+    fn root(&self) -> PathBuf {
+        self.dir.path().canonicalize().unwrap()
+    }
+
+    fn home(&self) -> &Path {
+        self.home.path()
+    }
+
+    fn write(&self, rel: &str, text: &str) {
+        let p = self.root().join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, text).unwrap();
+    }
+
+    fn read(&self, rel: &str) -> Option<String> {
+        std::fs::read_to_string(self.root().join(rel)).ok()
+    }
+
+    /// Every file of the work tree (outside `.git` and `.tautly`) and its content.
+    fn files(&self) -> BTreeMap<String, String> {
+        fn walk(root: &Path, dir: &Path, out: &mut BTreeMap<String, String>) {
+            for e in std::fs::read_dir(dir).unwrap() {
+                let p = e.unwrap().path();
+                let rel = p.strip_prefix(root).unwrap().to_string_lossy().into_owned();
+                if rel == ".git" || rel == ".tautly" {
+                    continue;
+                }
+                if p.is_dir() {
+                    walk(root, &p, out);
+                } else {
+                    out.insert(rel, std::fs::read_to_string(&p).unwrap_or_default());
+                }
+            }
+        }
+        let mut out = BTreeMap::new();
+        walk(&self.root(), &self.root(), &mut out);
+        out
+    }
+
+    fn git(&self, args: &[&str]) -> Option<String> {
+        let out = Process::new("git")
+            .current_dir(self.root())
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .args(["-c", "user.name=T", "-c", "user.email=t@example.com"])
+            .args(args)
+            .output()
+            .unwrap();
+        out.status
+            .success()
+            .then(|| String::from_utf8(out.stdout).unwrap())
+    }
+
+    fn config() -> Config {
+        let catalog = Catalog::from_toml(&format!(
+            r#"[models."{MODEL}"]
+context_window = 200000
+max_output = 8000
+parallel_tools = true
+reasoning = "none"
+cache = "none"
+images = false
+edit_format = "str_replace"
+"#
+        ))
+        .unwrap();
+        let mut cfg = Config {
+            model: ModelId::from(MODEL),
+            catalog_overrides: Some(catalog),
+            ..Config::default()
+        };
+        cfg.permissions.mode = Mode::Yolo;
+        cfg
+    }
+
+    fn builder(&self, mock: &MockProvider) -> EngineBuilder {
+        EngineBuilder {
+            provider: Some(Arc::new(mock.clone())),
+            data_home: Some(self.home().to_path_buf()),
+            ..EngineBuilder::new(Repo::config(), self.dir.path())
+        }
+    }
+
+    fn project(&self) -> String {
+        tautly_session::paths::project_id(&self.root())
+    }
+}
+
+fn call(id: &str, name: &str, args: Value) -> ProviderEvent {
+    ProviderEvent::ToolCall {
+        id: id.into(),
+        name: name.into(),
+        input_json: args.to_string(),
+    }
+}
+
+fn write(id: &str, path: &str, content: &str) -> ProviderEvent {
+    call(id, "write", json!({ "path": path, "content": content }))
+}
+
+fn bash(id: &str, command: &str) -> ProviderEvent {
+    call(id, "bash", json!({ "command": command }))
+}
+
+fn tools_step(calls: Vec<ProviderEvent>) -> MockTurn {
+    let mut evs = calls;
+    evs.push(ProviderEvent::Done {
+        stop: StopReason::ToolUse,
+    });
+    MockTurn::Events(evs)
+}
+
+fn text_step(text: &str) -> MockTurn {
+    MockTurn::Events(vec![
+        ProviderEvent::TextDelta(text.into()),
+        ProviderEvent::Done {
+            stop: StopReason::EndTurn,
+        },
+    ])
+}
+
+struct Run {
+    engine: tautly_core::Engine,
+    events: mpsc::Receiver<Event>,
+}
+
+impl Run {
+    fn start(b: EngineBuilder) -> Run {
+        let (engine, events) = b.build().unwrap();
+        Run { engine, events }
+    }
+
+    async fn next(&mut self) -> Event {
+        tokio::time::timeout(WAIT, self.events.recv())
+            .await
+            .expect("timed out waiting for an event")
+            .expect("event channel closed")
+    }
+
+    /// Events until one `until` accepts (included).
+    async fn until(&mut self, until: impl Fn(&Event) -> bool) -> Vec<Event> {
+        let mut seen = Vec::new();
+        loop {
+            let ev = self.next().await;
+            let done = until(&ev);
+            seen.push(ev);
+            if done {
+                return seen;
+            }
+        }
+    }
+
+    async fn turn_with(&mut self, text: &str) {
+        self.engine
+            .send(Command::SendMessage { text: text.into() })
+            .await
+            .unwrap();
+        self.until(|e| matches!(e, Event::TurnFinished { .. }))
+            .await;
+    }
+
+    /// Send `cmd` and wait for its answer: `Rewound`/`Switched` (then the
+    /// `SessionChanged` that follows an applied one), or an `Error`.
+    async fn answer(&mut self, cmd: Command) -> Answer {
+        self.engine.send(cmd).await.unwrap();
+        let seen = self
+            .until(|e| {
+                matches!(
+                    e,
+                    Event::Rewound { .. } | Event::Switched { .. } | Event::Error { .. }
+                )
+            })
+            .await;
+        match seen.last().unwrap().clone() {
+            Event::Rewound { branch, report, .. } | Event::Switched { branch, report } => {
+                if report.applied {
+                    let changed = self
+                        .until(|e| matches!(e, Event::SessionChanged { .. }))
+                        .await;
+                    let Some(Event::SessionChanged { session_id }) = changed.last() else {
+                        unreachable!()
+                    };
+                    assert_eq!(*session_id, branch);
+                }
+                Answer::Done(branch, report)
+            }
+            Event::Error { message, .. } => Answer::Error(message),
+            _ => unreachable!(),
+        }
+    }
+
+    async fn rewind(&mut self, at: u32, dry_run: bool, overwrite: &[&str]) -> Answer {
+        self.answer(Command::Rewind {
+            at,
+            label: None,
+            dry_run,
+            overwrite: overwrite.iter().map(|s| s.to_string()).collect(),
+        })
+        .await
+    }
+
+    async fn switch(&mut self, id: &str, overwrite: &[&str]) -> Answer {
+        self.answer(Command::Switch {
+            session_id: id.into(),
+            dry_run: false,
+            overwrite: overwrite.iter().map(|s| s.to_string()).collect(),
+        })
+        .await
+    }
+
+    fn current(&self) -> (String, PathBuf) {
+        self.engine.current_session()
+    }
+
+    async fn stop(mut self) {
+        self.engine.send(Command::Shutdown).await.unwrap();
+        while tokio::time::timeout(WAIT, self.events.recv())
+            .await
+            .expect("the engine did not stop")
+            .is_some()
+        {}
+    }
+}
+
+#[derive(Debug)]
+enum Answer {
+    Done(String, MaterializeReport),
+    Error(String),
+}
+
+impl Answer {
+    fn done(self) -> (String, MaterializeReport) {
+        match self {
+            Answer::Done(b, r) => (b, r),
+            Answer::Error(e) => panic!("expected an answer, got the error: {e}"),
+        }
+    }
+
+    fn error(self) -> String {
+        match self {
+            Answer::Error(e) => e,
+            Answer::Done(b, r) => panic!("expected an error, got {b}: {r:?}"),
+        }
+    }
+}
+
+fn reader(path: &Path) -> SessionReader<SessionRecord> {
+    SessionReader::<SessionRecord>::open(path).unwrap()
+}
+
+fn records(path: &Path) -> Vec<SessionRecord> {
+    reader(path).records().map(|r| r.unwrap().1).collect()
+}
+
+fn raw_lines(path: &Path) -> Vec<String> {
+    std::fs::read_to_string(path)
+        .unwrap()
+        .lines()
+        .map(str::to_string)
+        .collect()
+}
+
+fn logs(home: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let sessions = home.join("sessions");
+    for project in std::fs::read_dir(sessions).unwrap() {
+        for e in std::fs::read_dir(project.unwrap().path()).unwrap() {
+            let p = e.unwrap().path();
+            if p.extension().is_some_and(|x| x == "jsonl") {
+                out.push(p);
+            }
+        }
+    }
+    out
+}
+
+/// Two turns: (1 user, 2 write a=one, 3 text) and (4 user, 5 write a=two and run a
+/// command that changes b.txt and creates c.txt, 6 text).
+fn two_turns() -> MockProvider {
+    MockProvider::new(vec![
+        tools_step(vec![write("w1", "a.txt", "one\n")]),
+        text_step("first"),
+        tools_step(vec![
+            write("w2", "a.txt", "two\n"),
+            bash("b1", "printf 'changed\\n' > b.txt && printf 'x\\n' > c.txt"),
+        ]),
+        text_step("second"),
+    ])
+}
+
+async fn run_two_turns(repo: &Repo, mock: &MockProvider) -> Run {
+    let mut run = Run::start(repo.builder(mock));
+    run.turn_with("one").await;
+    run.turn_with("two").await;
+    run
+}
+
+// --------------------------------------------------------------------- file states
+
+#[tokio::test]
+async fn state_at_uses_earliest_checkpoint_after_and_reverts_tool_edits() {
+    // Steps: 1 user, 2 write a=one, 3 write a=two then bash c=x, 4 text.
+    let repo = Repo::git_repo();
+    let mock = MockProvider::new(vec![
+        tools_step(vec![write("w1", "a.txt", "one\n")]),
+        tools_step(vec![
+            write("w2", "a.txt", "two\n"),
+            bash("b1", "printf 'x\\n' > c.txt"),
+        ]),
+        text_step("done"),
+    ]);
+    let mut run = Run::start(repo.builder(&mock));
+    run.turn_with("go").await;
+    let log = run.current().1;
+    run.stop().await;
+    let recs = records(&log);
+    let commit_at = |point: CheckpointPoint| {
+        recs.iter()
+            .find_map(|r| match r {
+                SessionRecord::Checkpoint {
+                    commit, point: p, ..
+                } if *p == Some(point) => Some(commit.clone()),
+                _ => None,
+            })
+            .unwrap()
+    };
+    let r = reader(&log);
+
+    // After step 2: step 3's `BeforeExec` checkpoint, with step 3's write reverted.
+    let s2 = state_at(&r, 2).unwrap();
+    assert_eq!(
+        s2.base,
+        Some(commit_at(CheckpointPoint::BeforeExec)),
+        "{s2:?}"
+    );
+    assert_eq!(s2.partial, None);
+    assert_eq!(s2.overlay.len(), 1, "{s2:?}");
+    assert_eq!(s2.overlay[0].0.as_str(), "a.txt");
+    let pre = s2.overlay[0].1.clone().expect("a.txt existed after step 2");
+    assert_eq!(r.read_blob(&pre).unwrap(), b"one\n");
+
+    // After step 3 (its own `BeforeExec` came before its command ran): the turn end.
+    let s3 = state_at(&r, 3).unwrap();
+    assert_eq!(s3.base, Some(commit_at(CheckpointPoint::TurnEnd)), "{s3:?}");
+    assert!(s3.overlay.is_empty());
+    assert_eq!(s3.partial, None);
+
+    // Before the first step: the session-start checkpoint.
+    let s0 = state_at(&r, 0).unwrap();
+    assert_eq!(s0.base, Some(commit_at(CheckpointPoint::SessionStart)));
+    assert!(s0.overlay.is_empty());
+
+    // The tip is the turn end, with nothing after it.
+    let tip = expected_tip(&r).unwrap();
+    assert_eq!(tip.base, Some(commit_at(CheckpointPoint::TurnEnd)));
+    assert!(tip.overlay.is_empty());
+
+    assert!(matches!(
+        state_at(&r, 9),
+        Err(TtError::NoSuchStep { at: 9, last: 4 })
+    ));
+}
+
+/// The log at `log`, rewritten with every checkpoint's `point` removed (`None`) or set
+/// to a value this build does not know.
+fn without_points(log: &Path, point: Option<&str>) -> PathBuf {
+    let text = std::fs::read_to_string(log).unwrap();
+    let mut lines = text.lines();
+    let mut out = vec![lines.next().unwrap().to_string()];
+    for l in lines {
+        let mut v: Value = serde_json::from_str(l).unwrap();
+        if v["data"]["type"] == "checkpoint" {
+            let data = v["data"]["data"].as_object_mut().unwrap();
+            match point {
+                None => drop(data.remove("point")),
+                Some(p) => drop(data.insert("point".into(), json!(p))),
+            }
+        }
+        out.push(v.to_string());
+    }
+    let rewritten = log.with_extension(format!("{}.jsonl", point.unwrap_or("none")));
+    std::fs::write(&rewritten, out.join("\n") + "\n").unwrap();
+    rewritten
+}
+
+#[tokio::test]
+async fn state_at_with_skipped_checkpoint_is_partial() {
+    // A cancelled turn logs `CheckpointSkipped{cancelled}` at its end: the next turn's
+    // checkpoint (which has whatever changed meanwhile) is only partial for step 2.
+    let repo = Repo::git_repo();
+    let mock = MockProvider::new(vec![
+        tools_step(vec![bash("b1", "sleep 30")]),
+        tools_step(vec![bash("b2", "true")]),
+        text_step("done"),
+    ]);
+    let mut run = Run::start(repo.builder(&mock));
+    run.engine
+        .send(Command::SendMessage { text: "one".into() })
+        .await
+        .unwrap();
+    run.until(|e| matches!(e, Event::ToolStarted { .. })).await;
+    run.engine.send(Command::Cancel).await.unwrap();
+    run.until(|e| matches!(e, Event::TurnFinished { .. })).await;
+    run.turn_with("two").await;
+    let log = run.current().1;
+    run.stop().await;
+    let r = reader(&log);
+    let s = state_at(&r, 2).unwrap();
+    assert!(s.base.is_some());
+    assert!(s.partial.is_some(), "{s:?}");
+
+    // The matrix's other partial case (spec 7.12.1): a checkpoint whose point is missing
+    // (an older build) or unknown (a newer one), with no `turn_end` checkpoint of the
+    // step's turn before it. With its point known, the same boundary is exact.
+    let mock = MockProvider::new(vec![
+        tools_step(vec![write("w1", "a.txt", "one\n")]),
+        text_step("first"),
+    ]);
+    let mut run = Run::start(repo.builder(&mock));
+    run.turn_with("one").await;
+    let log = run.current().1;
+    run.stop().await;
+    let exact = state_at(&reader(&log), 3).unwrap();
+    assert_eq!(exact.partial, None, "{exact:?}");
+    for point in [None, Some("from_the_future")] {
+        let rewritten = without_points(&log, point);
+        let s = state_at(&reader(&rewritten), 3).unwrap();
+        assert_eq!(s.base, exact.base);
+        assert!(s.partial.is_some(), "{point:?}: {s:?}");
+    }
+}
+
+// ------------------------------------------------------------------------- rewind
+
+#[tokio::test]
+async fn rewind_creates_branch_and_leaves_old_log_unmodified_except_tip_checkpoint() {
+    let repo = Repo::git_repo();
+    let mock = two_turns();
+    let mut run = run_two_turns(&repo, &mock).await;
+    let (old_id, old_log) = run.current();
+    let before = raw_lines(&old_log);
+
+    let (branch, report) = run.rewind(3, false, &[]).await.done();
+    assert!(report.applied, "{report:?}");
+    assert!(!report.dry_run);
+    assert!(report.conflicts.is_empty());
+    assert!(report.backup_ref.is_some());
+    assert_ne!(branch, old_id);
+    assert_eq!(run.current().0, branch);
+    assert_eq!(repo.read("a.txt").as_deref(), Some("one\n"));
+
+    // The old log: every line as it was, then only the command and the tip checkpoint.
+    let after = raw_lines(&old_log);
+    assert_eq!(after[..before.len()], before[..]);
+    let added: Vec<SessionRecord> = records(&old_log)[before.len() - 1..].to_vec();
+    assert!(
+        added.iter().all(|r| matches!(
+            r,
+            SessionRecord::Command(Command::Rewind { .. })
+                | SessionRecord::Checkpoint {
+                    point: Some(CheckpointPoint::BeforeRestore),
+                    ..
+                }
+        )),
+        "{added:?}"
+    );
+    assert!(added.iter().any(|r| matches!(
+        r,
+        SessionRecord::Checkpoint {
+            point: Some(CheckpointPoint::BeforeRestore),
+            ..
+        }
+    )));
+
+    // The branch: origin rewind, parent (old session, offset of step 3's end).
+    let branch_log = run.current().1;
+    let b = reader(&branch_log);
+    assert_eq!(b.header().origin, Origin::Rewind);
+    let (parent, offset) = b.header().parent.clone().unwrap();
+    assert_eq!(parent, old_id);
+    assert_eq!(step_at_offset(&b, offset), 3);
+    assert_eq!(step_at_offset(&reader(&old_log), offset), 3);
+    // Its tip is the files it continues from: a checkpoint of its own with that tree.
+    let tip = expected_tip(&b).unwrap();
+    let at3 = state_at(&reader(&old_log), 3).unwrap();
+    assert!(tip.overlay.is_empty() && at3.overlay.is_empty());
+    let tree = |c: &str| repo.git(&["rev-parse", &format!("{c}^{{tree}}")]).unwrap();
+    assert_eq!(tree(&tip.base.unwrap()), tree(&at3.base.unwrap()));
+    assert!(matches!(
+        records(&branch_log).last(),
+        Some(SessionRecord::Checkpoint {
+            point: Some(CheckpointPoint::Restored),
+            step: 3,
+            ..
+        })
+    ));
+    run.stop().await;
+}
+
+#[tokio::test]
+async fn rewind_restores_tool_and_bash_changes() {
+    let repo = Repo::git_repo();
+    let mock = two_turns();
+    let mut run = run_two_turns(&repo, &mock).await;
+    assert_eq!(repo.read("c.txt").as_deref(), Some("x\n"));
+    let (_, report) = run.rewind(3, false, &[]).await.done();
+    assert!(report.applied);
+    assert_eq!(repo.read("a.txt").as_deref(), Some("one\n"));
+    assert_eq!(repo.read("b.txt").as_deref(), Some("bee\n"));
+    assert_eq!(repo.read("c.txt"), None);
+    let mut restored = report.restored.clone();
+    restored.sort();
+    assert_eq!(restored, ["a.txt", "b.txt"]);
+    assert_eq!(report.deleted, ["c.txt"]);
+    // The user's index and HEAD are untouched: only the work tree differs from HEAD.
+    assert_eq!(repo.git(&["status", "--porcelain"]).unwrap(), " M a.txt\n");
+    run.stop().await;
+}
+
+#[tokio::test]
+async fn rewind_conflict_on_human_edit_writes_nothing_and_creates_no_branch() {
+    let repo = Repo::git_repo();
+    let mock = two_turns();
+    let mut run = run_two_turns(&repo, &mock).await;
+    let (id, _) = run.current();
+    repo.write("a.txt", "human\n");
+    let sessions = logs(repo.home()).len();
+
+    // The dry run says so.
+    let (_, dry) = run.rewind(3, true, &[]).await.done();
+    assert!(dry.dry_run && !dry.applied);
+    assert_eq!(dry.conflicts, ["a.txt"]);
+
+    let (branch, report) = run.rewind(3, false, &[]).await.done();
+    assert!(!report.applied, "{report:?}");
+    assert_eq!(report.conflicts, ["a.txt"]);
+    assert_eq!(report.backup_ref, None);
+    assert!(branch.is_empty());
+    assert_eq!(repo.read("a.txt").as_deref(), Some("human\n"));
+    assert_eq!(repo.read("c.txt").as_deref(), Some("x\n"));
+    assert_eq!(run.current().0, id);
+    assert_eq!(logs(repo.home()).len(), sessions);
+    run.stop().await;
+}
+
+#[tokio::test]
+async fn rewind_overwrite_list_applies_with_backup_ref() {
+    let repo = Repo::git_repo();
+    let mock = two_turns();
+    let mut run = run_two_turns(&repo, &mock).await;
+    repo.write("a.txt", "human\n");
+    let (branch, report) = run.rewind(3, false, &["a.txt"]).await.done();
+    assert!(report.applied, "{report:?}");
+    assert_eq!(report.conflicts, ["a.txt"]);
+    assert!(!branch.is_empty());
+    assert_eq!(repo.read("a.txt").as_deref(), Some("one\n"));
+    // The backup holds the human edit.
+    let backup = report.backup_ref.unwrap();
+    assert!(backup.contains("/undo-"), "{backup}");
+    assert_eq!(
+        repo.git(&["show", &format!("{backup}:a.txt")]).as_deref(),
+        Some("human\n")
+    );
+    run.stop().await;
+}
+
+#[tokio::test]
+async fn human_edit_outside_changed_paths_left_alone() {
+    let repo = Repo::git_repo();
+    repo.write("z.txt", "zed\n");
+    repo.git(&["add", "-A"]);
+    repo.git(&["commit", "-q", "-m", "z"]);
+    let mock = two_turns();
+    let mut run = run_two_turns(&repo, &mock).await;
+    repo.write("z.txt", "human\n");
+    repo.write("notes.txt", "mine\n");
+    let (_, report) = run.rewind(3, false, &[]).await.done();
+    assert!(report.applied, "{report:?}");
+    assert!(report.conflicts.is_empty());
+    assert_eq!(repo.read("z.txt").as_deref(), Some("human\n"));
+    assert_eq!(repo.read("notes.txt").as_deref(), Some("mine\n"));
+    assert_eq!(repo.read("a.txt").as_deref(), Some("one\n"));
+    run.stop().await;
+}
+
+#[tokio::test]
+async fn human_added_file_not_deleted_without_overwrite() {
+    // Turn 2's command created c.txt; a human replaced it. The rewind would delete it: a
+    // conflict. A file only a human added is no change at all.
+    let repo = Repo::git_repo();
+    let mock = two_turns();
+    let mut run = run_two_turns(&repo, &mock).await;
+    repo.write("c.txt", "human\n");
+    repo.write("new.txt", "mine\n");
+    let (_, report) = run.rewind(3, false, &[]).await.done();
+    assert!(!report.applied);
+    assert_eq!(report.conflicts, ["c.txt"]);
+    assert_eq!(repo.read("c.txt").as_deref(), Some("human\n"));
+    assert_eq!(repo.read("a.txt").as_deref(), Some("two\n"));
+
+    let (_, report) = run.rewind(3, false, &["c.txt"]).await.done();
+    assert!(report.applied, "{report:?}");
+    assert_eq!(report.deleted, ["c.txt"]);
+    assert_eq!(repo.read("c.txt"), None);
+    assert_eq!(repo.read("new.txt").as_deref(), Some("mine\n"));
+    run.stop().await;
+}
+
+fn assemble(rebuilt: &tautly_core::resume::Rebuilt) -> CanonicalRequest {
+    let caps = Repo::config()
+        .effective_catalog()
+        .get(&ModelId::from(MODEL))
+        .caps;
+    let specs: Vec<_> = tautly_tools::registry(&caps, Vec::new())
+        .iter()
+        .map(|t| t.spec(&caps))
+        .collect();
+    rebuilt
+        .context
+        .assemble(&caps, &specs, &ModelId::from(MODEL))
+        .0
+}
+
+#[tokio::test]
+async fn context_after_rewind_equals_rebuild_until() {
+    let repo = Repo::git_repo();
+    let mut script = vec![
+        tools_step(vec![write("w1", "a.txt", "one\n")]),
+        text_step("first"),
+        tools_step(vec![write("w2", "a.txt", "two\n")]),
+        text_step("second"),
+    ];
+    script.push(text_step("on the branch"));
+    let mock = MockProvider::new(script);
+    let mut run = run_two_turns(&repo, &mock).await;
+    let old_log = run.current().1;
+    let expected = assemble(&rebuild(&reader(&old_log), Some(3)).unwrap());
+    run.rewind(3, false, &[]).await.done();
+    run.turn_with("and now?").await;
+    let req = mock.requests().last().unwrap().clone();
+    let n = expected.messages.len();
+    assert_eq!(req.system, expected.system);
+    assert_eq!(req.messages[..n - 1], expected.messages[..n - 1]);
+    let text = serde_json::to_string(&req.messages).unwrap();
+    assert!(text.contains("and now?"));
+    assert!(!text.contains("second"), "{text}");
+    run.stop().await;
+}
+
+#[tokio::test]
+async fn non_git_rewind_restores_tool_edits_and_notes_commands() {
+    let repo = Repo::plain();
+    let mock = MockProvider::new(vec![
+        tools_step(vec![write("w1", "a.txt", "one\n")]),
+        text_step("first"),
+        tools_step(vec![
+            write("w2", "a.txt", "two\n"),
+            bash("b1", "printf 'x\\n' > c.txt"),
+        ]),
+        text_step("second"),
+    ]);
+    let mut run = run_two_turns(&repo, &mock).await;
+    let (branch, report) = run.rewind(3, false, &[]).await.done();
+    assert!(report.applied, "{report:?}");
+    assert!(!branch.is_empty());
+    assert_eq!(report.backup_ref, None);
+    assert_eq!(report.restored, ["a.txt"]);
+    assert_eq!(repo.read("a.txt").as_deref(), Some("one\n"));
+    // The command's file is not known to the rewind.
+    assert_eq!(repo.read("c.txt").as_deref(), Some("x\n"));
+    let note = report.note.unwrap_or_default();
+    assert!(note.contains("command"), "{note}");
+
+    // A human edit is a conflict outside git too.
+    let mut run2 = run;
+    repo.write("a.txt", "human\n");
+    let (old, _) = {
+        let logs = logs(repo.home());
+        let old = logs.into_iter().find(|p| p != &run2.current().1).unwrap();
+        (reader(&old).header().session_id.clone(), ())
+    };
+    let (_, report) = run2.switch(&old, &[]).await.done();
+    assert!(!report.applied);
+    assert_eq!(report.conflicts, ["a.txt"]);
+    run2.stop().await;
+}
+
+// ---------------------------------------------------------------- switch and lease
+
+#[tokio::test]
+async fn switch_back_and_forth_restores_each_tip_exactly() {
+    let repo = Repo::git_repo();
+    let mut script = two_turns_script();
+    script.extend([
+        tools_step(vec![
+            write("w3", "d.txt", "dee\n"),
+            bash("b2", "printf 'branch\\n' > b.txt"),
+        ]),
+        text_step("on the branch"),
+    ]);
+    let mock = MockProvider::new(script);
+    let mut run = run_two_turns(&repo, &mock).await;
+    let (a, _) = run.current();
+    let tip_a = repo.files();
+
+    let (b, _) = run.rewind(3, false, &[]).await.done();
+    run.turn_with("branch work").await;
+    let tip_b = repo.files();
+    assert_ne!(tip_a, tip_b);
+
+    for _ in 0..2 {
+        let (to, report) = run.switch(&a, &[]).await.done();
+        assert!(report.applied, "{report:?}");
+        assert!(report.conflicts.is_empty(), "{report:?}");
+        assert_eq!(to, a);
+        assert_eq!(run.current().0, a);
+        assert_eq!(repo.files(), tip_a);
+
+        let (to, report) = run.switch(&b, &[]).await.done();
+        assert!(report.applied, "{report:?}");
+        assert_eq!(to, b);
+        assert_eq!(repo.files(), tip_b);
+    }
+    // Switching to the session it is on is refused.
+    let why = run.switch(&b, &[]).await.error();
+    assert!(why.contains("already"), "{why}");
+    run.stop().await;
+}
+
+fn two_turns_script() -> Vec<MockTurn> {
+    vec![
+        tools_step(vec![write("w1", "a.txt", "one\n")]),
+        text_step("first"),
+        tools_step(vec![
+            write("w2", "a.txt", "two\n"),
+            bash("b1", "printf 'changed\\n' > b.txt && printf 'x\\n' > c.txt"),
+        ]),
+        text_step("second"),
+    ]
+}
+
+#[tokio::test]
+async fn rewind_and_switch_refused_while_lease_shared_elsewhere() {
+    let repo = Repo::git_repo();
+    let mock = two_turns();
+    let mut run = run_two_turns(&repo, &mock).await;
+    let (a, _) = run.current();
+    // A second engine on the same work tree.
+    let other = Run::start(repo.builder(&MockProvider::new(vec![])));
+    let other_id = other.engine.session_id().to_string();
+    let why = run.rewind(3, false, &[]).await.error();
+    assert!(why.contains("another live session"), "{why}");
+    let why = run.switch(&other_id, &[]).await.error();
+    assert!(why.contains("another live session"), "{why}");
+    assert_eq!(repo.read("a.txt").as_deref(), Some("two\n"));
+    assert_eq!(run.current().0, a);
+    other.stop().await;
+
+    // Sessions of this process sharing the workspace count too.
+    let sb: Arc<dyn Sandbox> = Arc::new(LocalSandbox::new(repo.root()).unwrap());
+    let ws = tautly_core::Workspace::new(sb, repo.home());
+    let mock = two_turns();
+    let mut shared = Run::start(EngineBuilder {
+        workspace: Some(Arc::clone(&ws)),
+        ..repo.builder(&mock)
+    });
+    shared.turn_with("one").await;
+    run.stop().await;
+    let second = Run::start(EngineBuilder {
+        workspace: Some(Arc::clone(&ws)),
+        ..repo.builder(&MockProvider::new(vec![]))
+    });
+    let why = shared.rewind(1, false, &[]).await.error();
+    assert!(why.contains("another live session"), "{why}");
+    second.stop().await;
+    // Alone again: allowed.
+    let (_, report) = shared.rewind(1, false, &[]).await.done();
+    assert!(report.applied, "{report:?}");
+    shared.stop().await;
+}
+
+#[tokio::test]
+async fn fork_children_own_checkpoint_refs() {
+    let repo = Repo::git_repo();
+    let mock = two_turns();
+    let mut run = run_two_turns(&repo, &mock).await;
+    let (a, _) = run.current();
+    let (b, _) = run.rewind(3, false, &[]).await.done();
+    let b_log = run.current().1;
+    // Back on the parent, whose tip the files are again.
+    run.switch(&a, &[]).await.done();
+    run.stop().await;
+
+    // Every checkpoint the branch's log names has a ref of the branch's own.
+    let refs = repo
+        .git(&[
+            "for-each-ref",
+            "--format=%(objectname)",
+            &format!("refs/tautly/checkpoints/{b}/"),
+        ])
+        .unwrap();
+    for rec in records(&b_log) {
+        if let SessionRecord::Checkpoint { commit, .. } = rec {
+            assert!(refs.contains(&commit), "{commit} has no ref of {b}: {refs}");
+        }
+    }
+
+    // Delete the parent (its refs go) and drop unreachable objects: the branch still
+    // materializes, from its own refs.
+    let sb = LocalSandbox::new(repo.root()).unwrap();
+    tautly_core::sessions::delete(repo.home(), &sb, &a)
+        .await
+        .unwrap();
+    repo.git(&["reflog", "expire", "--expire=now", "--all"]);
+    repo.git(&["gc", "-q", "--prune=now"]).unwrap();
+    assert_eq!(repo.read("c.txt").as_deref(), Some("x\n"));
+    let mut run = Run::start(repo.builder(&MockProvider::new(vec![])));
+    let (_, report) = run.switch(&b, &[]).await.done();
+    assert!(report.applied, "{report:?}");
+    assert!(report.conflicts.is_empty(), "{report:?}");
+    assert_eq!(repo.read("a.txt").as_deref(), Some("one\n"));
+    assert_eq!(repo.read("b.txt").as_deref(), Some("bee\n"));
+    assert_eq!(repo.read("c.txt"), None);
+    run.stop().await;
+}
+
+// ------------------------------------------------------------ labels and the tree
+
+#[tokio::test]
+async fn label_command_renames_branch() {
+    let repo = Repo::git_repo();
+    let mock = MockProvider::new(vec![text_step("hi")]);
+    let mut run = Run::start(repo.builder(&mock));
+    run.turn_with("hello").await;
+    run.engine
+        .send(Command::Label {
+            label: "main-line".into(),
+        })
+        .await
+        .unwrap();
+    let log = run.current().1;
+    let id = run.current().0;
+    run.stop().await;
+    assert_eq!(
+        session_label(&reader(&log)).unwrap().as_deref(),
+        Some("main-line")
+    );
+    let nodes = tree::build(repo.home(), &repo.project(), None).unwrap();
+    let node = nodes.iter().find(|n| n.session_id == id).unwrap();
+    assert_eq!(node.label.as_deref(), Some("main-line"));
+}
+
+#[tokio::test]
+async fn tree_lists_parent_step_label_origin_live_current() {
+    let repo = Repo::git_repo();
+    let mock = two_turns();
+    let mut run = run_two_turns(&repo, &mock).await;
+    let (a, _) = run.current();
+    let answer = run
+        .answer(Command::Rewind {
+            at: 3,
+            label: Some("try-b".into()),
+            dry_run: false,
+            overwrite: vec![],
+        })
+        .await;
+    let (b, _) = answer.done();
+    let nodes = tree::build(repo.home(), &repo.project(), Some(&b)).unwrap();
+    assert_eq!(nodes.len(), 2, "{nodes:?}");
+    // Parents first.
+    assert_eq!(nodes[0].session_id, a);
+    assert_eq!(nodes[0].parent, None);
+    assert_eq!(nodes[0].origin, Origin::User);
+    assert_eq!(nodes[0].steps, 6);
+    assert_eq!(nodes[0].last_prompt, "two");
+    assert!(!nodes[0].live && !nodes[0].current);
+    assert_eq!(nodes[1].session_id, b);
+    assert_eq!(nodes[1].parent, Some((a.clone(), 3)));
+    assert_eq!(nodes[1].label.as_deref(), Some("try-b"));
+    assert_eq!(nodes[1].origin, Origin::Rewind);
+    assert_eq!(nodes[1].steps, 3);
+    assert_eq!(nodes[1].last_prompt, "one");
+    assert!(nodes[1].live && nodes[1].current);
+
+    let lines = tree::lines(&nodes);
+    assert_eq!(lines.len(), 2);
+    assert!(
+        lines[0].starts_with(&format!("  {}  step 6 · user · ", &a[..8])),
+        "{lines:?}"
+    );
+    assert!(lines[0].ends_with(" · two"), "{lines:?}");
+    assert!(
+        lines[1].starts_with("  * try-b  step 3 · rewind · "),
+        "{lines:?}"
+    );
+    run.stop().await;
+    let nodes = tree::build(repo.home(), &repo.project(), None).unwrap();
+    assert!(nodes.iter().all(|n| !n.live && !n.current));
+}

@@ -94,6 +94,32 @@ expression: every_command()
     "dry_run": true
   },
   {
+    "type": "rewind",
+    "at": 3,
+    "label": "try-b",
+    "dry_run": true,
+    "overwrite": []
+  },
+  {
+    "type": "rewind",
+    "at": 2,
+    "label": null,
+    "dry_run": false,
+    "overwrite": [
+      "notes.md"
+    ]
+  },
+  {
+    "type": "switch",
+    "session_id": "01J0",
+    "dry_run": false,
+    "overwrite": []
+  },
+  {
+    "type": "label",
+    "label": "main"
+  },
+  {
     "type": "shutdown"
   }
 ]

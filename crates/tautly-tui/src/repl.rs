@@ -428,6 +428,13 @@ where
                         .await?,
                 ));
             }
+            Slash::Rewind(at) => return self.rewind(at).await,
+            Slash::Tree => self.tree().await?,
+            Slash::Switch(which) => return self.switch(&which).await,
+            Slash::Label(label) => {
+                self.send(Command::Label { label }).await?;
+                return self.quiet().await;
+            }
             Slash::MemoryConsolidate => {
                 self.send(Command::ConsolidateMemory).await?;
                 return Ok(exit(
@@ -476,6 +483,134 @@ where
         })
         .await?;
         Ok(matches!(self.pump(answered).await?, Pumped::Exit))
+    }
+
+    /// `/rewind N`: the dry run, then (on `y`) the rewind; with conflicts, a second
+    /// question before they are overwritten.
+    async fn rewind(&mut self, at: u32) -> Result<bool, ReplError> {
+        let rewind = |dry_run, overwrite| Command::Rewind {
+            at,
+            label: None,
+            dry_run,
+            overwrite,
+        };
+        self.materialize(rewind, &format!("rewind to step {at}? [y]es [n]o "))
+            .await
+    }
+
+    /// `/switch <label|id|n>`: the branch it names (`n`: its line in `/tree`), its dry
+    /// run, then (on `y`) the switch.
+    async fn switch(&mut self, which: &str) -> Result<bool, ReplError> {
+        let nodes = self.tree_nodes().await;
+        let found = match which.parse::<usize>() {
+            Ok(n) if (1..=nodes.len()).contains(&n) => Some(&nodes[n - 1]),
+            _ => {
+                let by_label: Vec<_> = nodes
+                    .iter()
+                    .filter(|n| n.label.as_deref() == Some(which))
+                    .collect();
+                let by_id: Vec<_> = nodes
+                    .iter()
+                    .filter(|n| n.session_id == which || n.session_id.starts_with(which))
+                    .collect();
+                match (by_label.as_slice(), by_id.as_slice()) {
+                    ([one], _) | ([], [one]) => Some(*one),
+                    _ => None,
+                }
+            }
+        };
+        let Some(node) = found else {
+            let text = format!("no single branch `{}` (see /tree)", printable(which));
+            self.print_line(&text).await?;
+            return Ok(false);
+        };
+        let (id, name) = (
+            node.session_id.clone(),
+            node.label
+                .clone()
+                .unwrap_or_else(|| node.session_id.chars().take(8).collect()),
+        );
+        let switch = |dry_run, overwrite| Command::Switch {
+            session_id: id.clone(),
+            dry_run,
+            overwrite,
+        };
+        let prompt = format!("switch to {}? [y]es [n]o ", printable(&name));
+        self.materialize(switch, &prompt).await
+    }
+
+    /// A rewind or switch: `cmd(dry_run, overwrite)`'s dry run, the question `prompt`, on
+    /// conflicts whether to overwrite them (a backup is kept), then the command itself.
+    async fn materialize(
+        &mut self,
+        cmd: impl Fn(bool, Vec<String>) -> Command,
+        prompt: &str,
+    ) -> Result<bool, ReplError> {
+        let answered = |e: &Event| {
+            matches!(
+                e,
+                Event::Rewound { .. } | Event::Switched { .. } | Event::Error { .. }
+            )
+        };
+        self.send(cmd(true, Vec::new())).await?;
+        let shown = match self.pump(answered).await? {
+            Pumped::Exit => return Ok(true),
+            Pumped::Done(ev) => ev,
+        };
+        let (Event::Rewound { report, .. } | Event::Switched { report, .. }) = *shown else {
+            return Ok(false);
+        };
+        let (yes, exit) = self.ask_yes_no(prompt).await?;
+        if exit || !yes {
+            return Ok(exit);
+        }
+        if !report.conflicts.is_empty() {
+            let question = format!(
+                "overwrite {} files you changed? (backup kept) [y]es [n]o ",
+                report.conflicts.len()
+            );
+            let (yes, exit) = self.ask_yes_no(&question).await?;
+            if exit || !yes {
+                return Ok(exit);
+            }
+        }
+        self.send(cmd(false, report.conflicts)).await?;
+        let done = match self.pump(answered).await? {
+            Pumped::Exit => return Ok(true),
+            Pumped::Done(ev) => ev,
+        };
+        let applied = matches!(
+            &*done,
+            Event::Rewound { report, .. } | Event::Switched { report, .. } if report.applied
+        );
+        if applied {
+            let moved = |e: &Event| matches!(e, Event::SessionChanged { .. } | Event::Error { .. });
+            return Ok(matches!(self.pump(moved).await?, Pumped::Exit));
+        }
+        Ok(false)
+    }
+
+    /// The project's sessions as a tree, the current one marked.
+    async fn tree_nodes(&self) -> Vec<tautly_core::TreeNode> {
+        let Some(home) = self.opts.data_home.clone() else {
+            return Vec::new();
+        };
+        let (root, current) = (self.root.clone(), self.engine.current_session().0);
+        tokio::task::spawn_blocking(move || {
+            tautly_core::tree::for_root(&home, &root, Some(&current)).unwrap_or_default()
+        })
+        .await
+        .unwrap_or_default()
+    }
+
+    /// `/tree`: one indented line per branch.
+    async fn tree(&mut self) -> Result<(), ReplError> {
+        let nodes = self.tree_nodes().await;
+        if nodes.is_empty() {
+            return self.print_line("no sessions in this project").await;
+        }
+        let text = tautly_core::tree::lines(&nodes).join("\n");
+        self.print_line(&text).await
     }
 
     /// `/model`: the current model, then the others whose provider has a key.

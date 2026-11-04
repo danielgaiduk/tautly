@@ -1004,7 +1004,7 @@ impl Session {
 
     /// What a rebuild calibrates the estimator with: this session's catalog and its MCP
     /// tools.
-    fn calibration(&self) -> Calibration {
+    pub(crate) fn calibration(&self) -> Calibration {
         Calibration {
             catalog: Arc::clone(&self.setup.catalog),
             extra: self
@@ -1236,6 +1236,7 @@ impl Session {
                 &parent_path,
                 end + 1,
                 cut.incomplete_turn,
+                Vec::new(),
             )?;
             let rebuilt = SessionReader::<SessionRecord>::open(child.path())
                 .map_err(ResumeError::from)
@@ -1251,9 +1252,26 @@ impl Session {
         .await
         .map_err(err)??;
         let (child, rebuilt) = made;
-        let id = child.session_id().to_string();
-        let path = child.path().to_path_buf();
-        self.log.replace(child);
+        Ok(self
+            .continue_on(child, rebuilt, stop, Continue::Branch)
+            .await)
+    }
+
+    /// Continue on the log `writer` (a branch, or a session switched to) with the context
+    /// `rebuilt` from it: the log, the session id, the checkpoint refs and numbering
+    /// ([`adopt_checkpoints`](Self::adopt_checkpoints)), the last-request file, the spend
+    /// (none for a new branch; the session's own for one switched to), the rebuilt state
+    /// and the model the log ends on. Returns the session's id and log.
+    pub(crate) async fn continue_on(
+        &mut self,
+        writer: SessionWriter<SessionRecord>,
+        rebuilt: Rebuilt,
+        stop: impl std::future::Future<Output = ()>,
+        how: Continue,
+    ) -> (String, PathBuf) {
+        let id = writer.session_id().to_string();
+        let path = writer.path().to_path_buf();
+        self.log.replace(writer);
         self.session_id = id.clone();
         self.adopt_checkpoints(&id, &rebuilt.checkpoints).await;
         self.last_request_path = crate::engine::last_request_path(&path);
@@ -1264,13 +1282,20 @@ impl Session {
             .without_spend();
         *self.budgets.lock().unwrap_or_else(PoisonError::into_inner) = fresh;
         let mut resumed = self.adopt(rebuilt);
+        let what = match how {
+            Continue::Branch => "fork",
+            Continue::Resumed => "switch",
+        };
         for w in std::mem::take(&mut resumed.warnings) {
-            self.warn(format!("fork: {w}")).await;
+            self.warn(format!("{what}: {w}")).await;
+        }
+        if how == Continue::Resumed {
+            self.restore_spend(std::mem::take(&mut resumed.usage)).await;
         }
         if let Some(model) = resumed.model {
             self.restore_model(model, stop, Stopped::Continue).await;
         }
-        Ok((id, path))
+        (id, path)
     }
 
     /// A branch's own refs for the checkpoints its log copied (spec 7.11.11), and its
@@ -1418,17 +1443,27 @@ fn err(e: impl std::fmt::Display) -> String {
     e.to_string()
 }
 
+/// How [`Session::continue_on`] continues.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Continue {
+    /// On a new branch (a fork or rewind): nothing spent yet.
+    Branch,
+    /// On an existing session (a switch): its spend so far counts.
+    Resumed,
+}
+
 /// A fork's log: the first `count` records of the log at `parent`, copied verbatim, then
-/// `Forked` (what follows is the branch's own) and a `TurnEnd{cancelled}` when the copy
-/// ends inside a turn (`close_turn`). On a failure the half-written log is removed, so no
-/// broken branch is listed.
-fn branch(
+/// `Forked` (what follows is the branch's own), a `TurnEnd{cancelled}` when the copy ends
+/// inside a turn (`close_turn`), and `tail` (a rewind's record of the files it continues
+/// from). On a failure the half-written log is removed, so no broken branch is listed.
+pub(crate) fn branch(
     data_home: &std::path::Path,
     root: &std::path::Path,
     init: HeaderInit,
     parent: &std::path::Path,
     count: u64,
     close_turn: bool,
+    tail: Vec<SessionRecord>,
 ) -> Result<SessionWriter<SessionRecord>, String> {
     let mut child =
         SessionWriter::<SessionRecord>::create_in(data_home, root, init).map_err(err)?;
@@ -1440,6 +1475,9 @@ fn branch(
                 reason: FinishReason::Cancelled,
                 evidence: None,
             })?;
+        }
+        for rec in &tail {
+            child.append(rec)?;
         }
         child.checkpoint()
     })();
@@ -1453,7 +1491,7 @@ fn branch(
 }
 
 /// Close and remove a branch's log that could not be completed.
-fn discard(child: SessionWriter<SessionRecord>) {
+pub(crate) fn discard(child: SessionWriter<SessionRecord>) {
     let path = child.path().to_path_buf();
     drop(child);
     let _ = std::fs::remove_file(path);
@@ -1594,6 +1632,7 @@ mod tests {
             &missing,
             3,
             false,
+            Vec::new(),
         );
         assert!(made.is_err());
         assert_eq!(logs(home.path()), Vec::<PathBuf>::new());

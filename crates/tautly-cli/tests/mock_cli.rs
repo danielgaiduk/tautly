@@ -390,6 +390,21 @@ fn sessions_list_shows_ids() {
 }
 
 #[test]
+fn sessions_tree_lists_the_project_sessions() {
+    let s = Scratch::new();
+    let out = s.run(&["sessions", "tree"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert!(out_text(&out).contains("no sessions"), "{}", out_text(&out));
+    let id = s.prompt("fix the parser", json!([text("done")]), &[]);
+    let out = s.run(&["sessions", "tree"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let tree = out_text(&out);
+    let want = format!("  {}  step 2 · user · ", &id[..8]);
+    assert!(tree.starts_with(&want), "{tree}");
+    assert!(tree.trim_end().ends_with(" · fix the parser"), "{tree}");
+}
+
+#[test]
 fn sessions_show_lists_the_user_turns() {
     let s = Scratch::new();
     s.write("a.txt", "old\n");

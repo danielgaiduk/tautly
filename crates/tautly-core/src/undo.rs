@@ -55,7 +55,7 @@ const NOTE_KEPT: &str = "kept (ignored before the turn)";
 
 /// Largest file undo reads from the work tree (to compare it and to log what it held).
 /// A larger one is compared by a streaming hash, and what it held is not logged.
-const MAX_DISK_READ: u64 = 64 * 1024 * 1024;
+pub(crate) const MAX_DISK_READ: u64 = 64 * 1024 * 1024;
 const NOTE_LARGE: &str = "prior content over 64 MiB not kept in the session log";
 
 /// What an undo did (with `dry_run`: would do). Paths are absolute.
@@ -425,7 +425,7 @@ impl Back {
 
 /// What is at a path now, as git sees it: symbolic links are never followed.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum Disk {
+pub(crate) enum Disk {
     /// Nothing (or the path is below a link or a file, where git does not look).
     Absent,
     /// A regular file and its permission bits.
@@ -914,7 +914,7 @@ fn rel_path(root: &Path, rel: &Path) -> Result<RelPath, UndoError> {
 /// path below a link or a file is absent. A regular file longer than `limit` bytes is
 /// hashed as it is read ([`Disk::Large`]) rather than read whole into memory (a command
 /// can leave a multi-GB file behind).
-async fn read_disk(root: &Path, rel: &Path, limit: u64) -> Result<Disk, UndoError> {
+pub(crate) async fn read_disk(root: &Path, rel: &Path, limit: u64) -> Result<Disk, UndoError> {
     use std::os::unix::ffi::OsStringExt;
     use std::os::unix::fs::MetadataExt;
     let full = root.join(rel);
