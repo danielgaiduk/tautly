@@ -367,9 +367,15 @@ fn methods_map_to_commands() {
     // Wire names only: the serde tag of a command that is not a method is not one.
     assert_eq!(code("session/new", json!({})), METHOD_NOT_FOUND);
     assert_eq!(code("send_message", json!({})), INVALID_PARAMS);
+    // A value this version does not know (from a newer client) reaches the engine as
+    // `Unknown`, which ignores it with a warning (forward compatibility, spec 3.4).
     assert_eq!(
-        code("set_budget", json!({"scope": "forever"})),
-        INVALID_PARAMS
+        command_for("set_budget", &json!({"scope": "forever"})).unwrap(),
+        Command::SetBudget {
+            scope: BudgetScope::Unknown,
+            max_usd: None,
+            max_tokens: None,
+        }
     );
     assert_eq!(code("approve", json!({"request_id": 5})), INVALID_PARAMS);
 }
