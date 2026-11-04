@@ -5,7 +5,8 @@ use serde_json::json;
 use tautly_context::{Breakdown, ContextStatus, MutationReason};
 use tautly_core::{
     BudgetScope, Command, DiffFile, DiffPreview, DiffStatus, EffectView, ErrorKind, Event,
-    FinishReason, McpState, MemAnchor, MemoryChange, PROTOCOL_VERSION, ToolMetaView, UsageRole,
+    FinishReason, McpState, MemAnchor, MemoryChange, PROTOCOL_VERSION, Savings, ToolMetaView,
+    UsageRole,
 };
 use tautly_memory::{MemoryEntry, MemoryKind};
 use tautly_provider::{ModelId, Quota};
@@ -154,6 +155,30 @@ fn every_event() -> Vec<Event> {
         Event::SessionChanged {
             session_id: "01J0SESSION".into(),
         },
+        Event::TurnReceipt {
+            turn: 3,
+            model: ModelId::from("anthropic/claude-opus-5-5"),
+            tokens_in: 1200,
+            tokens_out: 300,
+            cache_read: 4800,
+            cache_write: 200,
+            side_tokens: 150,
+            cost_usd: Some(0.0125),
+            wall_ms: 4200,
+            cache_hit_ratio: Some(0.8),
+            steps: 2,
+            tool_calls: 3,
+            saved: Savings {
+                index: 900,
+                diff_reads: 120,
+                context_gc: 3000,
+                filters: 0,
+                cache_read_tokens: 4800,
+                cache_usd: Some(0.0126),
+                total_usd: Some(0.0168),
+            },
+            estimated: true,
+        },
         Event::TurnFinished {
             reason: FinishReason::MaxTurns,
             evidence: None,
@@ -227,6 +252,7 @@ fn every_event() -> Vec<Event> {
             | Event::ContextCollected { .. }
             | Event::MemoryProposed { .. }
             | Event::SessionChanged { .. }
+            | Event::TurnReceipt { .. }
             | Event::TurnFinished { .. }
             | Event::Error { .. }
             | Event::SessionDiff { .. }

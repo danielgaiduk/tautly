@@ -11,7 +11,7 @@ use tautly_sandbox::{Effect, Sandbox};
 
 use crate::cap::{OUTPUT_CAP, cap_text};
 use crate::spec::{decode_text, parse_args, tool_spec};
-use crate::{GrepTool, Tool, ToolCx, ToolError, ToolResult};
+use crate::{GrepTool, SaveKind, Saved, Tool, ToolCx, ToolError, ToolResult};
 
 /// Default number of `refs` results.
 const DEFAULT_REFS_LIMIT: usize = 50;
@@ -186,7 +186,17 @@ impl Tool for OutlineTool {
             })
             .collect::<Vec<_>>()
             .join("\n");
-        finish(header, body)
+        let mut r = finish(header, body);
+        // The whole file is what a plain harness would have read instead.
+        let size = match sb.resolve(Path::new(&a.path)) {
+            Ok(full) => sb.metadata(&full).await.ok().map(|m| m.len),
+            Err(_) => None,
+        };
+        if let Some(size) = size {
+            let size = usize::try_from(size).unwrap_or(usize::MAX);
+            r.meta.saved = Saved::of(SaveKind::Index, size, r.output.len());
+        }
+        r
     }
 }
 
@@ -263,7 +273,9 @@ impl Tool for SymbolTool {
                     ));
                 }
                 let source = lines[start - 1..end].join("\n");
-                finish(None, format!("{}\n{source}", location(row)))
+                let mut r = finish(None, format!("{}\n{source}", location(row)));
+                r.meta.saved = Saved::of(SaveKind::Index, bytes.len(), r.output.len());
+                r
             }
             many => {
                 let mut body = format!(

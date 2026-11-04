@@ -6,9 +6,11 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, params};
+use serde::Serialize;
 use tautly_provider::{ModelId, RawUsage};
 
 use crate::protocol::Event;
+use crate::receipt::Savings;
 use crate::session::EventSink;
 
 /// The ledger's file name in the data home.
@@ -20,7 +22,7 @@ const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 /// `PRAGMA user_version` of the schema below. Changes are additive only (new columns with
 /// defaults, new indexes); a build still refuses a file whose version is newer than it
 /// knows ([`LedgerError::Newer`]), so it never writes rows a newer schema might misread.
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS usage (
@@ -44,6 +46,38 @@ const V2: &str = "ALTER TABLE usage ADD COLUMN estimated INTEGER NOT NULL DEFAUL
 /// Version 2 to 3: a session's totals (every resume, every row of a session list) without
 /// a scan of the whole table.
 const V3: &str = "CREATE INDEX IF NOT EXISTS usage_session ON usage(session);";
+/// Version 3 to 4 (and part of a new ledger): one row per turn receipt (spec 7.11.1).
+/// `at` is unix milliseconds, `root` the root's bytes; the `saved_*` columns are the
+/// receipt's token estimates.
+const V4: &str = "
+CREATE TABLE IF NOT EXISTS receipts (
+    id INTEGER PRIMARY KEY,
+    session TEXT NOT NULL,
+    project TEXT NOT NULL,
+    root BLOB NOT NULL,
+    turn INTEGER NOT NULL,
+    model TEXT NOT NULL,
+    at INTEGER NOT NULL,
+    tokens_in INTEGER NOT NULL,
+    tokens_out INTEGER NOT NULL,
+    cache_read INTEGER NOT NULL,
+    cache_write INTEGER NOT NULL,
+    side_tokens INTEGER NOT NULL,
+    cost_usd REAL,
+    wall_ms INTEGER NOT NULL,
+    steps INTEGER NOT NULL,
+    tool_calls INTEGER NOT NULL,
+    saved_index INTEGER NOT NULL,
+    saved_diff_reads INTEGER NOT NULL,
+    saved_context_gc INTEGER NOT NULL,
+    saved_filters INTEGER NOT NULL,
+    cache_usd REAL,
+    total_usd REAL,
+    estimated INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS receipts_session ON receipts(session);
+CREATE INDEX IF NOT EXISTS receipts_at ON receipts(at);
+";
 
 #[derive(Debug, thiserror::Error)]
 pub enum LedgerError {
@@ -55,6 +89,8 @@ pub enum LedgerError {
         "cost ledger: written by a newer tautly (schema {found}, this one knows {SCHEMA_VERSION}); left as it is"
     )]
     Newer { found: i64 },
+    #[error("cost ledger: only a turn receipt can be stored as one")]
+    NotAReceipt,
 }
 
 impl LedgerError {
@@ -95,6 +131,65 @@ impl Totals {
     pub fn tokens(&self) -> u64 {
         self.input + self.output + self.cache_read + self.cache_write
     }
+}
+
+/// The [`GroupBy::Project`] key of usage rows whose session left no receipt.
+pub const NO_PROJECT: &str = "-";
+
+/// How [`Ledger::stats`] groups its rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GroupBy {
+    /// The UTC day, `YYYY-MM-DD`.
+    Day,
+    /// The model id (usage rows: the model billed; receipt rows: the turn's main model).
+    Model,
+    /// The project id (spec 6.5); usage rows find theirs through their session's receipts.
+    Project,
+}
+
+/// One group of [`Ledger::stats`]. Tokens, cost and the cache hit ratio come from usage
+/// rows; turns, savings and wall time from receipt rows.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct StatsRow {
+    pub key: String,
+    pub turns: u64,
+    /// Every token billed: input, output and both cache kinds.
+    pub tokens: u64,
+    /// Cost of the priced usage rows; `None` when none was priced.
+    pub cost_usd: Option<f64>,
+    /// Usage rows without a known price (not in `cost_usd`).
+    pub unpriced: u64,
+    /// Usage rows the engine estimated.
+    pub estimated: u64,
+    /// The receipts' savings estimates, in tokens.
+    pub saved_tokens: u64,
+    /// The receipts' `total_usd`; `None` when none had one.
+    pub saved_usd: Option<f64>,
+    pub wall_ms: u64,
+    /// `cache_read / (input + cache_read)` of the usage rows; `None` when both are 0.
+    pub cache_hit_ratio: Option<f64>,
+}
+
+/// A receipt as the ledger stores it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StoredReceipt {
+    pub session: String,
+    pub project: String,
+    pub root: PathBuf,
+    pub turn: u32,
+    pub model: String,
+    pub at: SystemTime,
+    pub tokens_in: u64,
+    pub tokens_out: u64,
+    pub cache_read: u64,
+    pub cache_write: u64,
+    pub side_tokens: u64,
+    pub cost_usd: Option<f64>,
+    pub wall_ms: u64,
+    pub steps: u32,
+    pub tool_calls: u32,
+    pub saved: Savings,
+    pub estimated: bool,
 }
 
 /// A handle on the ledger file. Several handles (threads, processes) may write at once.
@@ -269,6 +364,201 @@ impl Ledger {
         Ok(totals)
     }
 
+    /// Store a [`Event::TurnReceipt`] of session `session`, in project `project` (its id)
+    /// at `root`.
+    pub fn record_receipt(
+        &self,
+        session: &str,
+        project: &str,
+        root: &Path,
+        receipt: &Event,
+    ) -> Result<()> {
+        use std::os::unix::ffi::OsStrExt;
+        let Event::TurnReceipt {
+            turn,
+            model,
+            tokens_in,
+            tokens_out,
+            cache_read,
+            cache_write,
+            side_tokens,
+            cost_usd,
+            wall_ms,
+            steps,
+            tool_calls,
+            saved,
+            estimated,
+            ..
+        } = receipt
+        else {
+            return Err(LedgerError::NotAReceipt);
+        };
+        let n = |v: u64| i64::try_from(v).unwrap_or(i64::MAX);
+        let finite = |v: Option<f64>| v.filter(|c| c.is_finite());
+        self.conn().execute(
+            "INSERT INTO receipts (session, project, root, turn, model, at, tokens_in, \
+             tokens_out, cache_read, cache_write, side_tokens, cost_usd, wall_ms, steps, \
+             tool_calls, saved_index, saved_diff_reads, saved_context_gc, saved_filters, \
+             cache_usd, total_usd, estimated) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, \
+             ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)",
+            params![
+                session,
+                project,
+                root.as_os_str().as_bytes(),
+                turn,
+                model.as_str(),
+                unix_ms(SystemTime::now()),
+                n(*tokens_in),
+                n(*tokens_out),
+                n(*cache_read),
+                n(*cache_write),
+                n(*side_tokens),
+                finite(*cost_usd),
+                n(*wall_ms),
+                steps,
+                tool_calls,
+                n(saved.index),
+                n(saved.diff_reads),
+                n(saved.context_gc),
+                n(saved.filters),
+                finite(saved.cache_usd),
+                finite(saved.total_usd),
+                estimated,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// The rows recorded at or after `since` (all of them: `None`), grouped `by`, in key
+    /// order. A group may have usage rows and no receipt (side models, sessions from before
+    /// receipts) or, outside `since`, the other way round.
+    pub fn stats(&self, since: Option<SystemTime>, by: GroupBy) -> Result<Vec<StatsRow>> {
+        let since = since.map_or(i64::MIN, unix_ms);
+        let day = |col: &str| format!("strftime('%Y-%m-%d', {col} / 1000, 'unixepoch')");
+        let (usage_key, usage_from, receipt_key) = match by {
+            GroupBy::Day => (day("u.at_ms"), "usage u".to_string(), day("at")),
+            GroupBy::Model => ("u.model".into(), "usage u".into(), "model".into()),
+            GroupBy::Project => (
+                format!("COALESCE(r.project, '{NO_PROJECT}')"),
+                "usage u LEFT JOIN (SELECT session, MIN(project) AS project FROM receipts \
+                 GROUP BY session) r ON r.session = u.session"
+                    .into(),
+                "project".into(),
+            ),
+        };
+        let n = |v: i64| u64::try_from(v).unwrap_or(0);
+        let mut rows: std::collections::BTreeMap<String, StatsRow> = Default::default();
+        let empty = |key: &str| StatsRow {
+            key: key.to_string(),
+            turns: 0,
+            tokens: 0,
+            cost_usd: None,
+            unpriced: 0,
+            estimated: 0,
+            saved_tokens: 0,
+            saved_usd: None,
+            wall_ms: 0,
+            cache_hit_ratio: None,
+        };
+        let conn = self.conn();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {usage_key} AS k, \
+             COALESCE(SUM(u.input + u.output + u.cache_read + u.cache_write), 0), \
+             SUM(u.cost_usd), COUNT(*) - COUNT(u.cost_usd), COALESCE(SUM(u.estimated), 0), \
+             COALESCE(SUM(u.input), 0), COALESCE(SUM(u.cache_read), 0) \
+             FROM {usage_from} WHERE u.at_ms >= ?1 GROUP BY k"
+        ))?;
+        let usage = stmt.query_map(params![since], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                n(r.get(1)?),
+                r.get::<_, Option<f64>>(2)?,
+                n(r.get(3)?),
+                n(r.get(4)?),
+                n(r.get(5)?),
+                n(r.get(6)?),
+            ))
+        })?;
+        for row in usage {
+            let (key, tokens, cost, unpriced, estimated, input, cache_read) = row?;
+            let seen = input.saturating_add(cache_read);
+            let entry = rows.entry(key.clone()).or_insert_with(|| empty(&key));
+            entry.tokens = tokens;
+            entry.cost_usd = cost;
+            entry.unpriced = unpriced;
+            entry.estimated = estimated;
+            entry.cache_hit_ratio = (seen > 0).then(|| cache_read as f64 / seen as f64);
+        }
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {receipt_key} AS k, COUNT(*), \
+             COALESCE(SUM(saved_index + saved_diff_reads + saved_context_gc + saved_filters), 0), \
+             SUM(total_usd), COALESCE(SUM(wall_ms), 0) \
+             FROM receipts WHERE at >= ?1 GROUP BY k"
+        ))?;
+        let receipts = stmt.query_map(params![since], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                n(r.get(1)?),
+                n(r.get(2)?),
+                r.get::<_, Option<f64>>(3)?,
+                n(r.get(4)?),
+            ))
+        })?;
+        for row in receipts {
+            let (key, turns, saved_tokens, saved_usd, wall_ms) = row?;
+            let entry = rows.entry(key.clone()).or_insert_with(|| empty(&key));
+            entry.turns = turns;
+            entry.saved_tokens = saved_tokens;
+            entry.saved_usd = saved_usd;
+            entry.wall_ms = wall_ms;
+        }
+        Ok(rows.into_values().collect())
+    }
+
+    /// Every receipt of session `session`, in turn order.
+    pub fn session_receipts(&self, session: &str) -> Result<Vec<StoredReceipt>> {
+        use std::os::unix::ffi::OsStrExt;
+        let n = |v: i64| u64::try_from(v).unwrap_or(0);
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT session, project, root, turn, model, at, tokens_in, tokens_out, \
+             cache_read, cache_write, side_tokens, cost_usd, wall_ms, steps, tool_calls, \
+             saved_index, saved_diff_reads, saved_context_gc, saved_filters, cache_usd, \
+             total_usd, estimated FROM receipts WHERE session = ?1 ORDER BY turn, id",
+        )?;
+        let rows = stmt.query_map(params![session], |r| {
+            let cache_read = n(r.get(8)?);
+            Ok(StoredReceipt {
+                session: r.get(0)?,
+                project: r.get(1)?,
+                root: PathBuf::from(std::ffi::OsStr::from_bytes(&r.get::<_, Vec<u8>>(2)?)),
+                turn: r.get(3)?,
+                model: r.get(4)?,
+                at: UNIX_EPOCH + Duration::from_millis(n(r.get(5)?)),
+                tokens_in: n(r.get(6)?),
+                tokens_out: n(r.get(7)?),
+                cache_read,
+                cache_write: n(r.get(9)?),
+                side_tokens: n(r.get(10)?),
+                cost_usd: r.get(11)?,
+                wall_ms: n(r.get(12)?),
+                steps: r.get(13)?,
+                tool_calls: r.get(14)?,
+                saved: Savings {
+                    index: n(r.get(15)?),
+                    diff_reads: n(r.get(16)?),
+                    context_gc: n(r.get(17)?),
+                    filters: n(r.get(18)?),
+                    cache_read_tokens: cache_read,
+                    cache_usd: r.get(19)?,
+                    total_usd: r.get(20)?,
+                },
+                estimated: r.get(21)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
     fn conn(&self) -> std::sync::MutexGuard<'_, Connection> {
         self.conn.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -289,6 +579,9 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
             if version < 3 {
                 conn.execute_batch(V3)?;
             }
+        }
+        if version < 4 {
+            conn.execute_batch(V4)?;
         }
         if version < SCHEMA_VERSION {
             conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
@@ -331,8 +624,17 @@ const PENDING_ROWS: usize = 1000;
 /// What the writer is sent.
 enum Msg {
     Row(Row),
+    Receipt(Box<ReceiptRow>),
     /// Answer once every row queued before it is written (or failed).
     Flush(tokio::sync::oneshot::Sender<()>),
+}
+
+/// A turn receipt on its way to the ledger; the writer looks up the project id of `root`
+/// (it reads git files, so off the async workers).
+pub(crate) struct ReceiptRow {
+    pub session: String,
+    pub root: PathBuf,
+    pub receipt: Event,
 }
 
 /// One row on its way to the ledger.
@@ -408,18 +710,22 @@ impl CostLedger {
             let mut reported = false;
             // Ends when the session (the sender) is gone and every queued row is written.
             while let Ok(msg) = rx.recv() {
-                let row = match msg {
-                    Msg::Row(row) => row,
+                let written = match msg {
+                    Msg::Row(row) => write(&ledger, &row),
+                    Msg::Receipt(r) => {
+                        let project = tautly_session::paths::project_id(&r.root);
+                        ledger.record_receipt(&r.session, &project, &r.root, &r.receipt)
+                    }
                     Msg::Flush(done) => {
                         let _ = done.send(());
                         continue;
                     }
                 };
-                if let Err(e) = write(&ledger, &row)
+                if let Err(e) = written
                     && !std::mem::replace(&mut reported, true)
                 {
                     warn(format!(
-                        "a usage row could not be written to the cost ledger ({e}); later \
+                        "a row could not be written to the cost ledger ({e}); later \
                          rows are still recorded, and further failures are not reported"
                     ));
                 }
@@ -430,7 +736,16 @@ impl CostLedger {
     /// Queue one row; never waits. An error says it was dropped (the writer is too far
     /// behind). After the ledger turned out unavailable, rows are dropped silently.
     pub fn record(&self, row: Row) -> std::result::Result<(), String> {
-        match self.tx.try_send(Msg::Row(row)) {
+        self.queue(Msg::Row(row))
+    }
+
+    /// Queue a turn receipt, like [`record`](Self::record).
+    pub fn record_receipt(&self, row: ReceiptRow) -> std::result::Result<(), String> {
+        self.queue(Msg::Receipt(Box::new(row)))
+    }
+
+    fn queue(&self, msg: Msg) -> std::result::Result<(), String> {
+        match self.tx.try_send(msg) {
             Ok(()) | Err(std::sync::mpsc::TrySendError::Disconnected(_)) => Ok(()),
             Err(std::sync::mpsc::TrySendError::Full(_)) => Err(format!(
                 "{PENDING_ROWS} rows are waiting for the cost ledger, so this one was dropped"

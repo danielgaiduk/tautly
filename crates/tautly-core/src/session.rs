@@ -27,6 +27,7 @@ use crate::mcp::{McpSession, PreExecHook};
 use crate::memory::MemoryState;
 use crate::model_switch::ModelSetup;
 use crate::protocol::{Command, ErrorKind, Event};
+use crate::receipt::ReceiptBuilder;
 use crate::record::{BlockHashes, LoggedPin, SessionRecord};
 use crate::routing::Side;
 use crate::workspace::Workspace;
@@ -128,7 +129,8 @@ impl EventSink {
                 None => {}
             }
         }
-        if matches!(ev, Event::TurnFinished { .. }) {
+        // The receipt right before `TurnFinished` gets the same chance (spec 7.11.1).
+        if matches!(ev, Event::TurnFinished { .. } | Event::TurnReceipt { .. }) {
             return self.finish(ev).await;
         }
         if self.overflowing.load(Ordering::Relaxed) {
@@ -402,6 +404,11 @@ pub(crate) struct Session {
     pub data_home: PathBuf,
     /// The header fields every log of this session shares (model, config hash).
     pub header_init: HeaderInit,
+    /// The running user turn's receipt (spec 7.11.1); none between turns.
+    pub receipt: Option<ReceiptBuilder>,
+    /// Each collection of this session: the call ids it elided and the tokens it freed,
+    /// so a request can tell how many elided tokens are still out of the context.
+    pub gc_elided: Vec<(Vec<String>, u32)>,
 }
 
 impl Session {

@@ -82,6 +82,7 @@ mode = "ask"
         mode: Some(Mode::Yolo),
         approve_memory: None,
         checkpoints: None,
+        receipts_footer: None,
     };
     let cfg = f.load(cli).unwrap();
     assert_eq!(cfg.model.as_str(), "anthropic/claude-opus-5-5", "cli wins");

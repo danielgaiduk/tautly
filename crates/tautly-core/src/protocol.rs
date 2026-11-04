@@ -32,6 +32,7 @@ use tautly_provider::{ModelId, Quota};
 use tautly_tools::{AppliedEffect, DiffPreview, LineRange, Shown, ToolMeta};
 
 use crate::evidence::TestEvidence;
+use crate::receipt::Savings;
 
 /// `(major, minor)` of this protocol.
 pub const PROTOCOL_VERSION: (u32, u32) = (1, 0);
@@ -263,6 +264,32 @@ pub enum Event {
     },
     SessionChanged {
         session_id: String,
+    },
+    /// What user turn `turn` (1-based) spent and saved (spec 7.11.1), sent right before its
+    /// `TurnFinished` whatever the reason. Token fields sum the main and side roles;
+    /// `side_tokens` is the side share (input + output). `cache_hit_ratio` is
+    /// `cache_read / (tokens_in + cache_read)`, absent when both are 0. `wall_ms` runs
+    /// from `TurnStarted` to `TurnFinished`; `steps` counts provider requests. Every
+    /// number in `saved` is an estimate: clients label it "est.".
+    TurnReceipt {
+        turn: u32,
+        model: ModelId,
+        tokens_in: u64,
+        tokens_out: u64,
+        cache_read: u64,
+        cache_write: u64,
+        side_tokens: u64,
+        /// `None` when some usage had no known price.
+        cost_usd: Option<f64>,
+        wall_ms: u64,
+        cache_hit_ratio: Option<f64>,
+        steps: u32,
+        tool_calls: u32,
+        saved: Savings,
+        /// Some of the usage is the engine's estimate (a response that reported none,
+        /// broke off or was cancelled). Sent only when true.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        estimated: bool,
     },
     TurnFinished {
         reason: FinishReason,
