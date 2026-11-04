@@ -61,7 +61,7 @@ use crate::resume;
 use crate::routing::Side;
 use crate::session::{EventSink, Log, LogFailure, Session};
 use crate::turn::TurnControl;
-use crate::workspace::Workspace;
+use crate::workspace::{LiveSession, Workspace};
 
 /// Capacity of the event channel returned by [`EngineBuilder::build`].
 pub const EVENT_CAPACITY: usize = 256;
@@ -336,6 +336,7 @@ impl EngineBuilder {
         };
         let current = Arc::new(Mutex::new((session_id.clone(), session_path.clone())));
         let actor = Actor {
+            _live: session.workspace.enter(),
             log: session.log.clone(),
             events: session.events.clone(),
             approvals: Approvals::new(self.interactive),
@@ -489,6 +490,8 @@ struct Running {
 }
 
 struct Actor {
+    /// Counts the session on its workspace while the actor lives (dropped first).
+    _live: LiveSession,
     log: Log,
     events: EventSink,
     approvals: Approvals,

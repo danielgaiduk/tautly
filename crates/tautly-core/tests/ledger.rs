@@ -162,6 +162,46 @@ fn a_version_1_ledger_gains_the_estimated_column_and_keeps_its_rows() {
     assert_eq!((t.requests, t.estimated, t.input), (2, 1, 15));
 }
 
+/// Whether the ledger at `path` has an index on the session column (review C M10:
+/// `session_totals` runs at every resume and per row of a session list).
+fn has_session_index(path: &std::path::Path) -> bool {
+    let conn = rusqlite::Connection::open(path).unwrap();
+    let mut stmt = conn
+        .prepare("SELECT sql FROM sqlite_master WHERE type = 'index' AND tbl_name = 'usage'")
+        .unwrap();
+    stmt.query_map([], |r| r.get::<_, Option<String>>(0))
+        .unwrap()
+        .filter_map(Result::unwrap)
+        .any(|sql| sql.contains("(session"))
+}
+
+#[test]
+fn session_totals_use_an_index_new_ledgers_and_migrated_ones_alike() {
+    let dir = tempfile::tempdir().unwrap();
+    let fresh = dir.path().join("fresh.sqlite");
+    Ledger::open(&fresh).unwrap();
+    assert!(has_session_index(&fresh));
+
+    let old = dir.path().join("old.sqlite");
+    {
+        let conn = rusqlite::Connection::open(&old).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE usage (id INTEGER PRIMARY KEY, at_ms INTEGER NOT NULL, \
+             session TEXT NOT NULL, model TEXT NOT NULL, input INTEGER NOT NULL, \
+             output INTEGER NOT NULL, cache_read INTEGER NOT NULL, \
+             cache_write INTEGER NOT NULL, cost_usd REAL, \
+             estimated INTEGER NOT NULL DEFAULT 0); \
+             CREATE INDEX usage_at ON usage(at_ms); \
+             INSERT INTO usage VALUES (1, 1, 's', 'm', 10, 2, 0, 0, 0.5, 0); \
+             PRAGMA user_version = 2;",
+        )
+        .unwrap();
+    }
+    let ledger = Ledger::open(&old).unwrap();
+    assert_eq!(ledger.session_totals("s").unwrap().input, 10);
+    assert!(has_session_index(&old));
+}
+
 #[test]
 fn the_ledger_file_is_private() {
     use std::os::unix::fs::PermissionsExt;
