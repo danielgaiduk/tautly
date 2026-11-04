@@ -20,6 +20,7 @@
 - Dependencies point downward only: `tautly-cli → {tautly-tui, tautly-rpc, tautly-acp} → tautly-core → {tautly-provider, tautly-tools, tautly-context, tautly-memory, tautly-index, tautly-session, tautly-sandbox, tautly-mcp}`; `tautly-mcp → {tautly-tools, tautly-sandbox}`; `tautly-tools → {tautly-sandbox, tautly-provider, tautly-index, tautly-memory, tautly-session}`; `tautly-memory → {tautly-index, tautly-session}`; `tautly-index → tautly-sandbox`; `tautly-context → {tautly-provider, tautly-tools, tautly-index, tautly-sandbox}`.
 - `tautly-tools` must not call `std::fs::*`, `tokio::fs::*`, `std::process::Command`, `tokio::process::Command` directly (enforced by `clippy::disallowed_methods`/`disallowed_types`).
 - Errors: `thiserror` per crate; `anyhow` only in `tautly-cli`. No `panic = "abort"`.
+- Naming: the package in `crates/tautly-cli` is named `tautly` (cargo-dist names release artifacts after the package; `cargo install tautly`, `cargo binstall tautly`). Use `-p tautly`; "tautly-cli" in this plan still names that crate by its directory.
 - Paths: config `~/.config/tautly/config.toml`, project `.tautly/config.toml`, sessions `~/.local/share/tautly/sessions/<project-id>/<session-id>.jsonl` (+ `blobs/`; `<project-id>` = blake3 of the git common dir, else of the root, Task 48), ledger `~/.local/share/tautly/ledger.sqlite` (+ `receipts` table), worktree forks and bisect worktrees `~/.local/share/tautly/worktrees/<project-id>/<id>`, working-tree leases `~/.local/share/tautly/locks/<root-hash>.lock`, REPL history `~/.local/share/tautly/repl_history`, MCP approvals `~/.local/share/tautly/mcp-approvals.json`, checkpoint refs `refs/tautly/checkpoints/<session>/<n>` in the user's repository. Honor `XDG_CONFIG_HOME` / `XDG_DATA_HOME` and an `TAUTLY_HOME` override (used by tests).
 - Fixed values: bash timeout 120 s; tool output cap 30 KB (head + tail); max 5 retry attempts; compaction threshold 80%; budget warning 80%; system prompt < 2,000 tokens; pinned warning at 10% of window; cancel kills children within 200 ms.
 - Token-efficiency values: diff re-read when < 50% of lines changed; context GC threshold max(2,000 tokens, 5% of window), only at step start (before each provider request); output filters apply above 2 KB, ≤ 20 detail lines per item; memory index ≤ 500 tokens; cache scheduler: default cache TTL 300 s, warm-cache benefit multiplier 5, forced mutation at ≥ 90% of window, threshold compaction deferrable from 80% to 90%; loop breaker: failed-attempts list 10 entries / ≤ 300 tokens, previous-result excerpt 5 lines; tolerant edits: anchor interior similarity ≥ 0.9, structural similarity ≥ 0.8, nearest-window ≤ 20 lines; memory entry body ≤ 300 tokens; `recall` top 5, ≤ 2,000 tokens; `web_fetch` question answers ≤ 1,000 tokens; index build of 10,000 files < 10 s, single-file reindex < 50 ms; token regression gate 10%.
@@ -1053,7 +1054,7 @@ proptest! { #[test] fn apply_then_inverse_restores(text in "[a-z\\n]{1,200}", ..
 - Produces: `tautly prompt show [--full]` (system prompt; `--full` prints last request of latest session as JSON); `tautly sessions list|show <id>|export <id> [--format jsonl|md]`; `tautly models list|update [--from URL]` (default URL `https://models.dev/api.json`, writes `~/.config/tautly/models.toml` overrides); `tautly undo [--turn N]`; `tautly memory list|show <id>|consolidate` (consolidate runs a headless engine turn that issues `ConsolidateMemory` and prompts y/n per proposal); `tautly index status|rebuild`.
 
 - [ ] **Step 1: Write the failing tests:** `prompt_show_prints_system_prompt`; `prompt_show_full_prints_last_request`; `sessions_list_shows_ids`; `sessions_export_md`; `models_update_from_local_fixture_server` (wiremock); `undo_restores_file` (run mock session that edits a file, then `tautly undo`); `memory_list_shows_stale_marker`; `index_status_reports_file_and_symbol_counts`.
-- [ ] **Step 2: Run** `cargo test -p tautly-cli` — Expected: FAIL.
+- [ ] **Step 2: Run** `cargo test -p tautly` — Expected: FAIL.
 - [ ] **Step 3: Implement.**
 - [ ] **Step 4: Run** — Expected: PASS.
 - [ ] **Step 5: Commit** `git commit -m "feat(cli): prompt, sessions, models, undo commands"`
@@ -1127,9 +1128,9 @@ proptest! { #[test] fn apply_then_inverse_restores(text in "[a-z\\n]{1,200}", ..
 - Produces: `tautly eval --tasks <dir> --model <id> [--edit-format str_replace|patch|hashline] [--jobs N] [--out results.json]`; `task.toml` = `{ id, prompt, timeout_s = 600, budget_usd = 1.0, tags = [] }`; results JSON `{ model, edit_format, tasks: [{ id, passed, cost_usd, tokens_in, tokens_out, cache_read, side_tokens, edit_failures, duration_s }], summary: { pass_rate, total_cost_usd, edit_failure_rate, tokens_per_solved_task, cache_hit_ratio, blocked_attempts, edit_repairs_by_stage } }` with `tokens_per_solved_task = Σ(tokens_in + tokens_out + side_tokens) / solved` and `cache_hit_ratio = Σcache_read / Σ(tokens_in + cache_read)`. `tautly eval --replay evals/replay` runs scripted `MockProvider` sessions (deterministic) and compares `tokens_per_solved_task` with `evals/baseline.json`; exits non-zero if it exceeds baseline by > 10%; `--update-baseline` rewrites it. `edit_failures` = count of `edit` ToolResults with `is_error` in the session log.
 
 - [ ] **Step 1: Write the failing tests:** `runs_task_in_temp_git_worktree_and_cleans_up`; `verify_exit_0_is_pass`; `respects_task_budget` (mock exceeding budget → passed=false, reason budget); `edit_format_override_applied` (provider request tool schema matches format); `summary_math` (including tokens per solved task and cache hit ratio); `replay_regression_over_10_percent_fails`; `replay_within_10_percent_passes`.
-- [ ] **Step 2: Run** `cargo test -p tautly-cli --test eval` — Expected: FAIL.
+- [ ] **Step 2: Run** `cargo test -p tautly --test eval` — Expected: FAIL.
 - [ ] **Step 3: Implement** the runner (spawns `tautly -p … --approve yolo --output json` per task in a fresh worktree; parses event stream). Author 50 starter tasks: 15 bug fixes, 10 small features, 10 refactors/renames, 5 multi-file edits, 5 test-writing, 5 config/build fixes; spread across Rust, Python, TypeScript, Go; each `setup.sh` creates a tiny repo, each `verify.sh` runs its tests. Validate every task: `verify.sh` fails on the unmodified setup. Record a replay script for 10 of the tasks (mock responses that exercise read, re-read, outline/symbol, edit, bash test runs and recall) and commit the initial baseline. Add the replay gate to the CI `perf` job.
-- [ ] **Step 4: Run** `cargo test -p tautly-cli --test eval && for d in evals/starter/*/; do (cd $(mktemp -d) && bash "$OLDPWD/$d/setup.sh" && ! bash "$OLDPWD/$d/verify.sh"); done` — Expected: PASS, and every task fails before solving.
+- [ ] **Step 4: Run** `cargo test -p tautly --test eval && for d in evals/starter/*/; do (cd $(mktemp -d) && bash "$OLDPWD/$d/setup.sh" && ! bash "$OLDPWD/$d/verify.sh"); done` — Expected: PASS, and every task fails before solving.
 - [ ] **Step 5: Commit** `git commit -m "feat(eval): tautly eval runner and 50-task starter set"`
 
 ### Task 35: Live smoke suite and daily-driver acceptance
@@ -1151,7 +1152,7 @@ proptest! { #[test] fn apply_then_inverse_restores(text in "[a-z\\n]{1,200}", ..
 
 - [ ] **Step 1: Write the tests:** for each of `anthropic/claude-sonnet-5-5`, `openai/gpt-5`, `google/gemini-3-pro`, `compat:ollama/<small model>` (skipped if no server): in a temp repo containing a failing unit test, run `tautly -p "make the failing test pass" --approve auto-edit --output json` with `--budget-usd 0.50`; assert exit 0 and the repo's test passes.
   - Reasoning continuity (per provider with reasoning support): run a three-step tool loop with reasoning on and compare `reasoning_tokens`/`cache_read` with and without the working-state tail (or ask the model to quote its step-1 reasoning). If continuity is lost, switch that adapter to place the state inside the last tool result's content (Anthropic `tool_result` content blocks, OpenAI `function_call_output.output`, Gemini `functionResponse.response`) using the `CanonicalRequest.volatile_tail` marker, with the last breakpoint on the block before it. Also verify live OpenAI accepts reasoning items next to id-less items.
-- [ ] **Step 2: Run** `cargo test -p tautly-cli --test live_smoke -- --ignored` locally with keys — Expected: PASS for each configured provider.
+- [ ] **Step 2: Run** `cargo test -p tautly --test live_smoke -- --ignored` locally with keys — Expected: PASS for each configured provider.
 - [ ] **Step 3: Acceptance (manual, recorded in `docs/acceptance/2026-xx-daily-driver.md`):** use `tautly` REPL for one real task per adapter on a real repository; note any failure as a new issue.
 - [ ] **Step 4: Run** full suite `cargo test --workspace && cargo clippy --workspace -- -D warnings` — Expected: PASS.
 - [ ] **Step 5: Commit** `git commit -m "test: nightly live smoke suite across four adapters"`
@@ -1278,7 +1279,7 @@ Tasks 39–47 follow the order in **Execution Order**. Each task's new `Event`/`
     - `stats_json_shape` (insta);
     - `receipt_markdown_labels_estimates_and_has_no_paths_prompts_or_project`: the output contains `est.`, and contains neither the root path, the prompt text nor the project name;
     - `receipt_session_id_and_last`.
-- [ ] **Step 2: Run** `cargo test -p tautly-tools --test savings && cargo test -p tautly-core --test receipt && cargo test -p tautly-cli --test stats` — Expected: FAIL.
+- [ ] **Step 2: Run** `cargo test -p tautly-tools --test savings && cargo test -p tautly-core --test receipt && cargo test -p tautly --test stats` — Expected: FAIL.
 - [ ] **Step 3: Implement.** Savings are bytes / 4 everywhere: deterministic, and labelled as estimates. A receipt is a projection of logged records, so resume rebuilds nothing extra.
 - [ ] **Step 4: Run** — Expected: PASS.
 - [ ] **Step 5: Commit** `git commit -m "feat(core,cli): turn receipts, savings estimates, stats and receipt commands"`
@@ -1356,7 +1357,7 @@ Tasks 39–47 follow the order in **Execution Order**. Each task's new `Event`/`
     - `doctor_never_prints_key_values`;
     - `doctor_missing_git_is_warn_not_fail` (`PATH` without git);
     - `doctor_json_shape` (insta).
-- [ ] **Step 2: Run** `cargo test -p tautly-core --test detect && cargo test -p tautly-cli --test first_run --test auth --test doctor` — Expected: FAIL.
+- [ ] **Step 2: Run** `cargo test -p tautly-core --test detect && cargo test -p tautly --test first_run --test auth --test doctor` — Expected: FAIL.
 - [ ] **Step 3: Implement.** Detection reads env first, so the keychain is touched only when no env key exists and the probe runs only as the last resort. Catalog: add the OpenRouter ids of the three native main-tier models at OpenRouter list prices, and common Ollama models (unpriced, conservative capabilities).
 - [ ] **Step 4: Run** — Expected: PASS.
 - [ ] **Step 5: Commit** `git commit -m "feat(cli): zero-config provider detection, auth add, doctor"`
@@ -1386,7 +1387,7 @@ Tasks 39–47 follow the order in **Execution Order**. Each task's new `Event`/`
     - installers `shell` and `homebrew`;
     - `sha256` checksums;
     - the binstall `pkg-url` template matches the planned artifact names.
-  - CI job `musl-static`: `cargo build --release --target x86_64-unknown-linux-musl -p tautly-cli`, then `file target/x86_64-unknown-linux-musl/release/tautly | grep -q 'statically linked'`, then `./tautly --version`.
+  - CI job `musl-static`: `cargo build --release --target x86_64-unknown-linux-musl -p tautly`, then `file target/x86_64-unknown-linux-musl/release/tautly | grep -q 'statically linked'`, then `./tautly --version`.
 - [ ] **Step 2: Run** `bash scripts/check-dist-plan.sh` — Expected: FAIL (no dist config).
 - [ ] **Step 3: Implement.** Run `dist init` with the values above and `dist generate`, commit the workflow, add the binstall metadata and switch the keyring features. If the musl build cannot link the keyring backend, fall back to `-gnu` Linux targets, record that in `dist-workspace.toml` comments and the release notes, and update the check.
 - [ ] **Step 4: Run** `bash scripts/check-dist-plan.sh && dist build --artifacts=local` (host target) and run `tautly --version` from the produced archive — Expected: PASS. Publishing needs the tap repository and a `HOMEBREW_TAP_TOKEN` secret, which the user creates. The first release tag is pushed by the user, not by CI.
@@ -1625,7 +1626,7 @@ Tasks 39–47 follow the order in **Execution Order**. Each task's new `Event`/`
     - `mcp_import_from_claude_json_preserves_comments`;
     - `mcp_list_shows_state_source_approval_and_tools`;
     - `doctor_reports_pending_repo_mcp_approval_as_warn`.
-- [ ] **Step 2: Run** `cargo test -p tautly-mcp && cargo test -p tautly-core --test mcp && cargo test -p tautly-cli --test mcp` — Expected: FAIL.
+- [ ] **Step 2: Run** `cargo test -p tautly-mcp && cargo test -p tautly-core --test mcp && cargo test -p tautly --test mcp` — Expected: FAIL.
 - [ ] **Step 3: Implement.** HTTP uses `rmcp`'s streamable-HTTP client (reqwest, rustls); its host is checked as `Network{host}` per call. Resources, prompts, sampling, elicitation, roots and OAuth are not implemented; requests for them are refused per the MCP spec.
 - [ ] **Step 4: Run** — Expected: PASS.
 - [ ] **Step 5: Commit** `git commit -m "feat(mcp): tools-only MCP client with repository server approval"`
@@ -1754,7 +1755,7 @@ Tasks 39–47 follow the order in **Execution Order**. Each task's new `Event`/`
   - Pruning and deletion:
     - `refs_older_than_keep_days_pruned_at_engine_start` (`GIT_COMMITTER_DATE` in the past);
     - `sessions_delete_removes_log_and_refs_keeps_shared_blobs`.
-- [ ] **Step 2: Run** `cargo test -p tautly-core --test checkpoint && cargo test -p tautly-cli --test cli` — Expected: FAIL.
+- [ ] **Step 2: Run** `cargo test -p tautly-core --test checkpoint && cargo test -p tautly --test cli` — Expected: FAIL.
 - [ ] **Step 3: Implement.**
   - Snapshot: `read-tree HEAD` (or `read-tree --empty`), `add -A`, `write-tree`, `commit-tree -p <prev|HEAD>`, `update-ref`.
   - Restore: `checkout <commit> -- <paths>` under the temp index; added paths are deleted through the sandbox.
@@ -1921,7 +1922,7 @@ Task 48 runs before Task 26. Tasks 49–53 run after Task 46 and before checkpoi
   - `partial_state_refused_with_note`;
   - `sessions_delete_removes_clean_worktree_refuses_dirty_without_force`;
   - `rpc_session_new_fork_worktree`.
-- [ ] **Step 2: Run** `cargo test -p tautly-core --test worktree_fork && cargo test -p tautly-cli --test fork` — Expected: FAIL.
+- [ ] **Step 2: Run** `cargo test -p tautly-core --test worktree_fork && cargo test -p tautly --test fork` — Expected: FAIL.
 - [ ] **Step 3: Implement.** The new worktree builds its own index in the background (index keyed by root). The fork never inherits session rules or pending approvals.
 - [ ] **Step 4: Run** — Expected: PASS.
 - [ ] **Step 5: Commit** `git commit -m "feat(core,cli): fork at a step into an isolated git worktree"`
@@ -1954,7 +1955,7 @@ Task 48 runs before Task 26. Tasks 49–53 run after Task 46 and before checkpoi
   - `replay_during_turn_errors`;
   - `replayed_request_ids_not_answerable`;
   - `cli_replay_without_api_key`.
-- [ ] **Step 2: Run** `cargo test -p tautly-core --test replay && cargo test -p tautly-cli --test replay` — Expected: FAIL.
+- [ ] **Step 2: Run** `cargo test -p tautly-core --test replay && cargo test -p tautly --test replay` — Expected: FAIL.
 - [ ] **Step 3: Implement.**
 - [ ] **Step 4: Run** — Expected: PASS.
 - [ ] **Step 5: Commit** `git commit -m "feat(core,cli): session playback"`
@@ -1985,7 +1986,7 @@ Task 48 runs before Task 26. Tasks 49–53 run after Task 46 and before checkpoi
   - `unrelated_sessions_compared_whole`;
   - `more_than_five_sessions_rejected`;
   - `json_shape`.
-- [ ] **Step 2: Run** `cargo test -p tautly-core --test compare && cargo test -p tautly-cli --test compare` — Expected: FAIL.
+- [ ] **Step 2: Run** `cargo test -p tautly-core --test compare && cargo test -p tautly --test compare` — Expected: FAIL.
 - [ ] **Step 3: Implement.**
 - [ ] **Step 4: Run** — Expected: PASS.
 - [ ] **Step 5: Commit** `git commit -m "feat(cli): compare sessions and branches"`
@@ -2022,7 +2023,7 @@ Task 48 runs before Task 26. Tasks 49–53 run after Task 46 and before checkpoi
   - `asks_unless_yes`;
   - `deny_rule_refuses`;
   - `worktree_removed_on_success_and_error`.
-- [ ] **Step 2: Run** `cargo test -p tautly-core --test bisect && cargo test -p tautly-cli --test bisect` — Expected: FAIL.
+- [ ] **Step 2: Run** `cargo test -p tautly-core --test bisect && cargo test -p tautly --test bisect` — Expected: FAIL.
 - [ ] **Step 3: Implement.**
 - [ ] **Step 4: Run** — Expected: PASS.
 - [ ] **Step 5: Commit** `git commit -m "feat(cli): session bisect over checkpoints"`

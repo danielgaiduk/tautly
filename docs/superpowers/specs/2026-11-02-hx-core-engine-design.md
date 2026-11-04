@@ -80,7 +80,9 @@ tautly-cli        binary: arg parsing, selects REPL, headless or ACP mode; docto
      ├─ tautly-session    append-only session log, resume, fork, undo
      └─ tautly-sandbox    Sandbox trait; this sub-project ships a passthrough-with-policy stub
 ```
-Dependencies only point downward (`tautly-acp → tautly-core`, `tautly-core → tautly-mcp → {tautly-tools, tautly-sandbox}`, `tautly-tools → {tautly-memory, tautly-session}`, `tautly-memory → {tautly-index, tautly-session}`, `tautly-index → tautly-sandbox`, `tautly-tools → tautly-sandbox`, `tautly-context → {tautly-provider, tautly-tools, tautly-index, tautly-sandbox}`). One test-only edge: `tautly-cli → tautly-provider`, behind the `mock` feature, wires `MockProvider` for the hidden `--mock-script` flag (golden and end-to-end tests of the binary; CI runs them with `cargo test -p tautly-cli --features mock`). Release builds never enable it, and it adds no coupling beyond core's public `EngineBuilder::provider`. Each crate is independently testable.
+Dependencies only point downward (`tautly-acp → tautly-core`, `tautly-core → tautly-mcp → {tautly-tools, tautly-sandbox}`, `tautly-tools → {tautly-memory, tautly-session}`, `tautly-memory → {tautly-index, tautly-session}`, `tautly-index → tautly-sandbox`, `tautly-tools → tautly-sandbox`, `tautly-context → {tautly-provider, tautly-tools, tautly-index, tautly-sandbox}`). One test-only edge: `tautly-cli → tautly-provider`, behind the `mock` feature, wires `MockProvider` for the hidden `--mock-script` flag (golden and end-to-end tests of the binary; CI runs them with `cargo test -p tautly --features mock`). Release builds never enable it, and it adds no coupling beyond core's public `EngineBuilder::provider`. Each crate is independently testable.
+
+Naming: the package in `crates/tautly-cli` is named `tautly` (7.11.3: release artifacts and `cargo binstall tautly` carry the product name), so cargo commands use `-p tautly`; `tautly-cli` elsewhere in this spec names that crate by its directory.
 
 ### 2.2 Rules
 - **Single entry point:** `tautly-core` exposes an `Engine` handle. Clients send `Command`s and receive a stream of `Event`s. TUI and RPC are both plain consumers, guaranteeing identical behavior.
@@ -422,7 +424,7 @@ This section covers what a user sees in the first ten minutes and in every turn.
   Exit code 1 if any check fails, else 0.
 
 #### 7.11.3 Release and installers
-- cargo-dist builds and publishes GitHub releases on `v*` tags for `aarch64-apple-darwin`, `x86_64-apple-darwin`, `x86_64-unknown-linux-musl` and `aarch64-unknown-linux-musl`. Linux binaries are static (musl). Each release has sha256 checksums, a `curl | sh` installer, a Homebrew formula pushed to the project's tap, and binaries laid out so `cargo binstall tautly` finds them.
+- cargo-dist builds and publishes GitHub releases on version tags (`vX.Y.Z`; the generated trigger is the glob `**[0-9]+.[0-9]+.[0-9]+*`, which any tag ending in a version also matches) for `aarch64-apple-darwin`, `x86_64-apple-darwin`, `x86_64-unknown-linux-musl` and `aarch64-unknown-linux-musl`. Linux binaries are static (musl). Each release has sha256 checksums, a `curl | sh` installer, a Homebrew formula pushed to the project's tap, and binaries laid out so `cargo binstall tautly` finds them.
 - The Linux keychain backend must link statically: `keyring` with the pure-Rust Secret Service backend (zbus). If that cannot link on musl, the Linux targets fall back to `-gnu` and the decision is recorded in the release notes.
 - macOS code signing and notarisation are post-v1. Neither curl nor Homebrew sets the quarantine flag.
 
