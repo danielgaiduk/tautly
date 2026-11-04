@@ -1455,6 +1455,53 @@ async fn a_compact_that_changes_nothing_keeps_the_next_epoch_warm() {
     );
 }
 
+/// Task 46 review I2: every `Compact` ends with exactly one `CompactFinished`, last: after
+/// the summary when it compacts, after the warning when there is nothing to do.
+#[tokio::test]
+async fn compact_ends_with_one_compact_finished() {
+    let fx = Fx::new();
+    let cfg = compaction_fixture(&fx);
+    let mut script = four_reads();
+    script.push(text_step("first done"));
+    script.push(text_step("SUMMARY-ONE"));
+    let mock = MockProvider::new(script);
+    let mut run = start(fx.builder(cfg, &mock));
+    run.turn_with("first").await;
+    run.send(Command::Compact).await;
+    let events = run
+        .until(|e| matches!(e, Event::CompactFinished { .. }))
+        .await;
+    let compacted = events
+        .iter()
+        .position(|e| matches!(e, Event::Compacted { .. }))
+        .unwrap_or_else(|| panic!("{events:?}"));
+    assert!(compacted < events.len() - 1);
+    assert!(
+        matches!(events.last(), Some(Event::CompactFinished { applied: true, tokens_freed })
+            if *tokens_freed > 0),
+        "{events:?}"
+    );
+    // Again: nothing left to compact, so a warning, then the end.
+    run.send(Command::Compact).await;
+    let events = run
+        .until(|e| matches!(e, Event::CompactFinished { .. }))
+        .await;
+    assert!(
+        events.iter().any(
+            |e| matches!(e, Event::Warning { message } if message.contains("nothing to compact"))
+        ),
+        "{events:?}"
+    );
+    assert!(matches!(
+        events.last(),
+        Some(Event::CompactFinished {
+            applied: false,
+            tokens_freed: 0
+        })
+    ));
+    run.stop().await;
+}
+
 /// Review A M6: the overflow retry's compaction breaks the cached prefix outside the
 /// epoch; the retried step's epoch takes the pending pins with it, so it breaks once.
 #[tokio::test]
@@ -1729,6 +1776,53 @@ async fn replies_to_commands_wait_for_a_client_that_is_behind() {
         .filter(|e| !matches!(e, Event::Warning { message } if message.contains("SetBudget")))
         .collect();
     assert!(answered(&events), "{tail:?}");
+    run.stop().await;
+}
+
+/// Task 46 re-review N1: after a crashed turn the session is lost, yet a `Compact` still
+/// ends with `CompactFinished` and a `SetModel` with its `cannot switch to` refusal, so a
+/// client waiting for either is answered.
+#[tokio::test]
+async fn a_lost_session_still_answers_compact_and_set_model() {
+    let fx = Fx::new();
+    let mock = MockProvider::new(vec![text_step("never")]);
+    let provider = Arc::new(PanicsOn {
+        mock: mock.clone(),
+        n: 0,
+        seen: Default::default(),
+    });
+    let mut run = start(EngineBuilder {
+        provider: Some(provider),
+        ..fx.builder(config(Mode::Ask), &mock)
+    });
+    run.say("crash").await;
+    run.until(|e| matches!(e, Event::TurnFinished { .. })).await;
+    run.send(Command::Compact).await;
+    let events = run
+        .until(|e| matches!(e, Event::CompactFinished { .. }))
+        .await;
+    assert!(
+        events.iter().any(
+            |e| matches!(e, Event::Error { message, .. } if message.contains("takes no more commands"))
+        ),
+        "{events:?}"
+    );
+    assert!(matches!(
+        events.last(),
+        Some(Event::CompactFinished {
+            applied: false,
+            tokens_freed: 0
+        })
+    ));
+    run.send(Command::SetModel {
+        model: ModelId::from("mock/other"),
+    })
+    .await;
+    run.until(|e| {
+        matches!(e, Event::Error { kind: tautly_core::ErrorKind::ProviderFatal, message, .. }
+            if message.starts_with("cannot switch to mock/other:"))
+    })
+    .await;
     run.stop().await;
 }
 

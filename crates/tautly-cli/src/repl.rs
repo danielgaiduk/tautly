@@ -82,7 +82,7 @@ fn factory(cli: &Cli, settings: Settings, root: PathBuf, resume: Option<String>)
 
 /// The catalog's models whose provider has a key (environment or keychain), each provider
 /// asked once per call.
-fn model_lister(config: Config, secrets: local::Secrets) -> ModelLister {
+pub(crate) fn model_lister(config: Config, secrets: local::Secrets) -> ModelLister {
     Arc::new(move || {
         let catalog = config.effective_catalog();
         let compat = config.effective_compat();

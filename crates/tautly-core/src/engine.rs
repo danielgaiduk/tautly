@@ -528,6 +528,8 @@ struct Running {
     turn: bool,
     /// A fork: commands other than [`Actor::urgent`] ones wait for its end.
     fork: bool,
+    /// A `Compact`: its crash still ends it with `CompactFinished`.
+    compact: bool,
 }
 
 struct Actor {
@@ -667,7 +669,10 @@ impl Actor {
                                         break;
                                     }
                                 }
-                                None => self.lost(),
+                                None => {
+                                    self.lost();
+                                    self.switch_refused(&model);
+                                }
                             }
                             continue;
                         }
@@ -684,7 +689,12 @@ impl Actor {
                             running = Some(self.spawn_job(s, job));
                             break;
                         }
-                        None => self.lost(),
+                        None => {
+                            self.lost();
+                            if matches!(job, Job::Compact) {
+                                self.compact_failed().await;
+                            }
+                        }
                     }
                 }
             }
@@ -714,7 +724,7 @@ impl Actor {
                         .await;
                 }
                 joined = async { (&mut running.as_mut().expect("guarded").handle).await }, if running.is_some() => {
-                    let turn = running.take().is_some_and(|r| r.turn);
+                    let (turn, compact) = running.take().map_or((false, false), |r| (r.turn, r.compact));
                     match joined {
                         Ok((mut s, mut inbox)) => {
                             inbox.close();
@@ -725,7 +735,12 @@ impl Actor {
                             self.session_id.clone_from(&s.session_id);
                             state = Some(s);
                         }
-                        Err(e) => self.crashed(e, turn).await,
+                        Err(e) => {
+                            self.crashed(e, turn).await;
+                            if compact {
+                                self.compact_failed().await;
+                            }
+                        }
                     }
                     let held = std::mem::take(&mut held);
                     if stopping && !held.is_empty() {
@@ -817,8 +832,16 @@ impl Actor {
                 self.approvals.deny_all("the session is shutting down");
                 self.shutdown.cancel();
             }
-            // After a crashed turn every command gets the same answer.
-            _ if lost => self.lost(),
+            // After a crashed turn every command gets the same answer, plus the answer a
+            // client waits for: a `Compact` its end, a `SetModel` its refusal.
+            _ if lost => {
+                self.lost();
+                match cmd {
+                    Command::Compact => self.compact_failed().await,
+                    Command::SetModel { model } => self.switch_refused(&model),
+                    _ => {}
+                }
+            }
             Command::Unknown => self.events.try_emit(Event::Error {
                 kind: ErrorKind::Internal,
                 message: "this engine does not know this command (sent by a newer client?); \
@@ -909,6 +932,7 @@ impl Actor {
         };
         let turn = matches!(job, Job::Turn(_));
         let fork = matches!(job, Job::Fork { .. });
+        let compact = matches!(job, Job::Compact);
         let current = Arc::clone(&self.current);
         let handle = tokio::spawn(async move {
             match job {
@@ -932,6 +956,7 @@ impl Actor {
             inbox: inbox_tx,
             turn,
             fork,
+            compact,
         }
     }
 
@@ -1044,5 +1069,29 @@ impl Actor {
             retryable: false,
             hint: Some("resume the session to continue".into()),
         });
+    }
+
+    /// The answer to a `SetModel` a lost session cannot run: the refusal a client waiting
+    /// for the switch recognises (`cannot switch to <model>:`, as `set_model` words it).
+    fn switch_refused(&self, model: &ModelId) {
+        self.events.try_emit(Event::Error {
+            kind: ErrorKind::ProviderFatal,
+            message: format!(
+                "cannot switch to {model}: the session stopped after an internal error"
+            ),
+            retryable: false,
+            hint: Some("resume the session to continue".into()),
+        });
+    }
+
+    /// The end of a `Compact` that could not run (or crashed): nothing applied. Waits for
+    /// room like a turn's `TurnFinished` (the client waits for it).
+    async fn compact_failed(&self) {
+        self.events
+            .emit_last(Event::CompactFinished {
+                applied: false,
+                tokens_freed: 0,
+            })
+            .await;
     }
 }

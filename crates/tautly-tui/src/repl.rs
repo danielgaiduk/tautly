@@ -397,16 +397,11 @@ where
             Slash::Resume(Some(which)) => return self.resume(&which).await,
             Slash::Compact => {
                 self.send(Command::Compact).await?;
+                // Ends with `CompactFinished`, after the summary (or the warning or error
+                // saying why nothing was compacted).
                 return Ok(exit(
-                    self.pump(|e| {
-                        matches!(
-                            e,
-                            Event::ContextStatus { .. }
-                                | Event::Warning { .. }
-                                | Event::Error { .. }
-                        )
-                    })
-                    .await?,
+                    self.pump(|e| matches!(e, Event::CompactFinished { .. }))
+                        .await?,
                 ));
             }
             Slash::Pin(text) => {

@@ -1,0 +1,24 @@
+[package]
+name = "tautly-acp"
+description = "Tautly's Agent Client Protocol bridge (`tautly acp`): editors drive Tautly sessions over stdio"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+tautly-core = { path = "../tautly-core" }
+# JSON-RPC 2.0 line framing, shared with the headless protocol.
+tautly-rpc = { path = "../tautly-rpc" }
+tokio = { workspace = true, features = ["io-util"] }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+# Checks a finished edit's file against the hash it wrote.
+blake3.workspace = true
+
+[dev-dependencies]
+tautly-provider = { path = "../tautly-provider" }
+tempfile.workspace = true
+blake3.workspace = true
+tokio.workspace = true
