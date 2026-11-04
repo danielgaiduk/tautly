@@ -35,6 +35,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::approvals::Approvals;
+use crate::checkpoint::Point;
 use crate::ledger::Row;
 use crate::memory::OVER_BUDGET_WARNING;
 use crate::model_switch::rejects_reasoning;
@@ -318,6 +319,19 @@ impl Session {
         }
         let next = self.evidence.fresh();
         let evidence = std::mem::replace(&mut self.evidence, next).finish();
+        // The work tree as the turn left it (spec 7.11.11), right before its `TurnEnd`. A
+        // cancelled turn ends at once: its last command's changes are then not covered.
+        if self.checkpoints.is_some() && ctl.cancel.is_cancelled() {
+            self.log(SessionRecord::CheckpointSkipped {
+                reason: "cancelled".into(),
+                turn: self.user_turn,
+                step: self.last_step(),
+            })
+            .await;
+        } else {
+            self.git_checkpoint(Point::TurnEnd, self.last_step(), None)
+                .await;
+        }
         self.log(SessionRecord::TurnEnd {
             reason,
             evidence: evidence.clone(),
@@ -429,6 +443,9 @@ impl Session {
                 self.checkpoint().await;
                 return FinishReason::Completed;
             }
+            // The session-start checkpoint precedes the turn's first tool call in the log,
+            // and must not see its edits.
+            self.settle_start_checkpoint().await;
             self.log_all(
                 resp.calls
                     .iter()

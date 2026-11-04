@@ -47,6 +47,7 @@ use tokio_util::sync::CancellationToken;
 use crate::approvals::{Approvals, Verdict};
 use crate::attempts::AttemptLedger;
 use crate::budget::{Budget, Budgets};
+use crate::checkpoint::{self, Checkpointer, GitCheckpoints, Skip, StartCheckpoint};
 use crate::config::{Config, LoadedConfig};
 use crate::evidence::{EvidenceTracker, TestMatcher};
 use crate::ledger::{CostLedger, LEDGER_FILE};
@@ -254,6 +255,38 @@ impl EngineBuilder {
             config.model.as_str(),
         )));
         let groups = ProcessGroups::default();
+        let checkpoints = config
+            .checkpoints
+            .enabled
+            .then(|| {
+                Checkpointer::new(
+                    Arc::clone(&sandbox),
+                    root.clone(),
+                    session_id.clone(),
+                    config.checkpoints,
+                )
+            })
+            .flatten()
+            .map(|cp| {
+                // Each checkpoint's exclude rules are kept next to the project's session
+                // logs (owner-only), shared by its sessions (resumes and forks read them).
+                let cp = match session_path.parent() {
+                    Some(dir) => cp.with_excludes_store(dir.join("checkpoint-excludes")),
+                    None => cp,
+                };
+                GitCheckpoints::shared(cp.with_process_groups(groups.clone()))
+            });
+        // Checkpoints are on in a git work tree, yet none can be taken: `.git` is a
+        // symbolic link (to a repository that may not be this one's), or no git to run.
+        let start_checkpoint = if !config.checkpoints.enabled || checkpoints.is_some() {
+            StartCheckpoint::Idle
+        } else if checkpoint::dot_git_is_link(&root) {
+            StartCheckpoint::Skipped(Skip::GitDirSymlink)
+        } else if checkpoint::git_dir(&root).is_some() && checkpoint::git_on_path().is_none() {
+            StartCheckpoint::Skipped(Skip::NoGit)
+        } else {
+            StartCheckpoint::Idle
+        };
         let session = Session {
             context,
             reads: Arc::new(ReadTracker::default()),
@@ -292,6 +325,8 @@ impl EngineBuilder {
             evidence: EvidenceTracker::new(test_matcher),
             mcp: None,
             pre_exec: self.pre_exec.unwrap_or_else(|| Arc::new(NoPreExec)),
+            checkpoints,
+            start_checkpoint,
             data_home,
             header_init: init,
         };
@@ -327,6 +362,23 @@ impl EngineBuilder {
             event_rx,
         ))
     }
+}
+
+/// Delete checkpoint refs older than `[checkpoints] keep_days` (spec 7.11.11), in the
+/// background after the session-start checkpoint, one git snapshot at a time.
+fn prune_checkpoints(session: &Session) {
+    let Some(shared) = session.checkpoints.clone() else {
+        return;
+    };
+    let sandbox = Arc::clone(&session.sandbox);
+    tokio::spawn(async move {
+        let st = shared.lock().await;
+        let keep_days = st.cp.config().keep_days;
+        let root = sandbox.root().to_path_buf();
+        // Best effort: what is not pruned now is at the next start.
+        let _ = checkpoint::prune(sandbox.as_ref(), &root, keep_days).await;
+        drop(st);
+    });
 }
 
 /// The git top level above `start` (a `.git` directory or file), else `start` itself.
@@ -485,6 +537,8 @@ impl Actor {
         // A log that cannot be rebuilt leaves nothing to run: every command is refused.
         let mut state = match started {
             Ok(()) => {
+                session.begin_checkpoints().await;
+                prune_checkpoints(&session);
                 session.mcp = McpSession::start(
                     start.mcp,
                     Arc::clone(&session.sandbox),
@@ -578,6 +632,9 @@ impl Actor {
                     }
                 }
             }
+        }
+        if let Some(s) = state.as_mut() {
+            s.abandon_start_checkpoint();
         }
         // MCP servers end with their process groups. (A session lost to a crashed turn
         // dropped its servers, which kills their groups.)
@@ -714,6 +771,8 @@ impl Actor {
 
     /// A command that runs between turns.
     async fn idle_command(&mut self, session: &mut Session, cmd: Command) {
+        // A fork or undo reads the log, which must have the session-start checkpoint.
+        session.settle_start_checkpoint().await;
         match cmd {
             Command::Pin { .. }
             | Command::Unpin { .. }
@@ -741,6 +800,7 @@ impl Actor {
                 }
             },
             Command::Uncompact => session.uncompact_command().await,
+            Command::Undo { turn, dry_run } => session.undo_command(turn, dry_run).await,
             other => {
                 let name = serde_json::to_value(&other)
                     .ok()

@@ -3,7 +3,8 @@
 //! then command-line overrides. Tables merge key by key, arrays and scalars replace.
 //!
 //! The project file is repository content, so it is untrusted: it cannot set `providers`,
-//! `telemetry`, `approve_memory`, `catalog_overrides`, `routing` or `evidence`, and in
+//! `telemetry`, `approve_memory`, `catalog_overrides`, `routing`, `evidence` or
+//! `checkpoints` (a repository must not turn off what lets the user undo it), and in
 //! `permissions` it can only lower the mode and add `deny` rules; `budget`, `max_turns`
 //! and `turn_timeout_s` can only go down. Of `[mcp]` it may only declare `servers`, which
 //! never merge with the user's: they are kept apart in [`Config::project_mcp_servers`] and
@@ -105,6 +106,40 @@ pub struct Config {
     /// approval before it starts (spec 7.11.10).
     #[serde(skip)]
     pub project_mcp_servers: BTreeMap<String, ServerSpec>,
+    /// `[checkpoints]`: git checkpoints of the work tree (spec 7.11.11; user layer and
+    /// command line only).
+    #[serde(default)]
+    pub checkpoints: CheckpointConfig,
+}
+
+/// `[checkpoints]` (spec 7.11.11): snapshots of the work tree before every command and at
+/// turn ends, which `/undo` and time travel restore. A snapshot that would take longer
+/// than `timeout_ms`, or that finds more untracked files than the limits, is skipped with
+/// a warning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct CheckpointConfig {
+    pub enabled: bool,
+    /// Checkpoint refs older than this are deleted at engine start (at least 1).
+    pub keep_days: u32,
+    /// Longest one snapshot may take (git is killed after it; at least 1).
+    pub timeout_ms: u64,
+    /// Untracked (not ignored) bytes above which a snapshot is skipped, in MiB.
+    pub max_untracked_mb: u64,
+    /// Untracked (not ignored) files above which a snapshot is skipped.
+    pub max_untracked_files: u64,
+}
+
+impl Default for CheckpointConfig {
+    fn default() -> Self {
+        CheckpointConfig {
+            enabled: true,
+            keep_days: 14,
+            timeout_ms: 3_000,
+            max_untracked_mb: 200,
+            max_untracked_files: 20_000,
+        }
+    }
 }
 
 fn default_model() -> ModelId {
@@ -169,6 +204,7 @@ impl Default for Config {
             evidence: EvidenceConfig::default(),
             mcp: McpConfig::default(),
             project_mcp_servers: BTreeMap::new(),
+            checkpoints: CheckpointConfig::default(),
         }
     }
 }
@@ -256,6 +292,8 @@ pub struct CliOverrides {
     pub mode: Option<Mode>,
     /// `--approve-memory`.
     pub approve_memory: Option<bool>,
+    /// `--no-checkpoints` (`Some(false)`): sets `checkpoints.enabled`.
+    pub checkpoints: Option<bool>,
 }
 
 /// Directory of the user config file: `TAUTLY_HOME` as is (tests), else
@@ -489,6 +527,12 @@ impl Config {
         if let Some(url) = &self.telemetry.endpoint {
             check_http("telemetry.endpoint", url)?;
         }
+        if self.checkpoints.keep_days == 0 {
+            return Err("checkpoints.keep_days must be at least 1".into());
+        }
+        if self.checkpoints.timeout_ms == 0 {
+            return Err("checkpoints.timeout_ms must be at least 1".into());
+        }
 
         let p = &self.providers;
         for (name, entry) in [
@@ -563,6 +607,8 @@ const USER_ONLY_KEYS: &[&str] = &[
     "routing",
     // A repository could otherwise label any command a passing test (spec 7.11.7).
     "evidence",
+    // A repository could otherwise turn off what undoes its commands (spec 7.11.11).
+    "checkpoints",
 ];
 
 /// Everything else a project file may set (some of it only to tighten).
@@ -959,6 +1005,11 @@ fn cli_table(cli: &CliOverrides) -> Table {
     }
     if let Some(approve) = cli.approve_memory {
         t.insert("approve_memory".into(), Value::Boolean(approve));
+    }
+    if let Some(enabled) = cli.checkpoints {
+        let mut checkpoints = Table::new();
+        checkpoints.insert("enabled".into(), Value::Boolean(enabled));
+        t.insert("checkpoints".into(), Value::Table(checkpoints));
     }
     t
 }

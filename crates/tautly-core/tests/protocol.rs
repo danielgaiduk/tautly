@@ -202,6 +202,14 @@ fn every_event() -> Vec<Event> {
             tools: 12,
             message: None,
         },
+        Event::Undone {
+            turn: 2,
+            restored: vec!["src/lib.rs".into()],
+            deleted: vec!["new.txt".into()],
+            dry_run: false,
+            backup_ref: Some("refs/tautly/checkpoints/01J0/undo-7".into()),
+            note: Some("ignored files and submodules are not restored".into()),
+        },
     ];
     for e in &events {
         match e {
@@ -226,6 +234,7 @@ fn every_event() -> Vec<Event> {
             | Event::Warning { .. }
             | Event::McpServerApprovalRequested { .. }
             | Event::McpServerStatus { .. }
+            | Event::Undone { .. }
             | Event::Unknown => {}
         }
     }
@@ -287,6 +296,14 @@ fn every_command() -> Vec<Command> {
         Command::SetModel {
             model: ModelId::from("openai/gpt-5"),
         },
+        Command::Undo {
+            turn: None,
+            dry_run: false,
+        },
+        Command::Undo {
+            turn: Some(2),
+            dry_run: true,
+        },
         Command::Shutdown,
     ];
     for c in &commands {
@@ -306,6 +323,7 @@ fn every_command() -> Vec<Command> {
             | Command::Fork { .. }
             | Command::Diff { .. }
             | Command::SetModel { .. }
+            | Command::Undo { .. }
             | Command::Shutdown => {}
         }
     }

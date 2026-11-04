@@ -486,7 +486,8 @@ impl Session {
     ) -> ToolResult {
         let (tool, effect) = p.runnable.as_ref().expect("admitted calls are runnable");
         let call = p.call;
-        self.before_exec(&call.name, effect, turn).await;
+        self.before_exec(&call.name, effect, turn, &ctl.cancel)
+            .await;
         self.emit(Event::ToolStarted {
             call_id: call.id.clone(),
             tool: call.name.clone(),

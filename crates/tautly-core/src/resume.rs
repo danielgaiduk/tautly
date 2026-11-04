@@ -44,15 +44,9 @@
 //!
 //! # Undo
 //!
-//! [`undo`] restores the files Tautly's tools changed in one user turn to their content
-//! (and mode) before it, newest change first, deleting files the turn created, and logs
-//! `Undone` with each file's content just before (H7), so the undone state can be
-//! restored in turn. It never overwrites what it did not write (spec 7.12): a file whose
-//! content or mode differs from what the log says it is now (a human edit or `chmod`, or
-//! a command) is [`UndoError::Changed`], and a file a later turn changed is
-//! [`UndoError::LaterTurns`] until that turn is undone; either way nothing is written. A
-//! file already back at its content before the turn is logged as undone without a write,
-//! so the turns before it can be undone in turn.
+//! [`undo`] (re-exported from [`crate::undo`], which has the details) reverts one user
+//! turn: its tool edits from their pre-images and, with git checkpoints, its commands'
+//! changes too, never overwriting what it did not write.
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -68,10 +62,7 @@ use tautly_memory::MemoryChange;
 use tautly_provider::{
     Capabilities, Catalog, Content, Message, ModelId, RawUsage, Role, ToolSpec, cost_usd,
 };
-use tautly_sandbox::{Sandbox, SandboxError};
-use tautly_session::{
-    BlobRef, ConfineError, HeaderInit, Origin, RelPath, SessionReader, SessionWriter,
-};
+use tautly_session::{BlobRef, ConfineError, HeaderInit, Origin, SessionReader, SessionWriter};
 use tautly_tools::{
     AppliedEffect, ContextOp, PersistedEffect, ReadTracker, Tool, ToolResult, registry,
 };
@@ -83,7 +74,7 @@ use crate::ledger::{LEDGER_FILE, Ledger};
 use crate::mcp::MCP_TOOL_PREFIX;
 use crate::protocol::{BudgetScope, Command, Event, FinishReason};
 use crate::provider_setup::provider_label;
-use crate::record::{SessionRecord, UndoneFile};
+use crate::record::SessionRecord;
 use crate::session::{PrefixLog, Session};
 use crate::turn::{Response, TurnControl};
 
@@ -127,6 +118,19 @@ pub struct Rebuilt {
     pub(crate) memory_proposals: Vec<(String, MemoryChange)>,
     /// Memory proposals logged (their ids are numbered).
     pub(crate) memory_seq: u32,
+    /// The git checkpoints the log names.
+    pub(crate) checkpoints: LoggedCheckpoints,
+}
+
+/// The checkpoints of a log (spec 7.11.11), for the checkpointer that continues it.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct LoggedCheckpoints {
+    /// Every `Checkpoint`'s `(n, commit)`, in order (a fork adopts them).
+    pub all: Vec<(u32, String)>,
+    /// The highest number used, backups (`undo-<n>`) included.
+    pub max_n: u32,
+    /// The latest one: `(n, commit, tree)`.
+    pub last: Option<(u32, String, String)>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -137,32 +141,7 @@ pub enum ResumeError {
     NoSuchStep { at: u32, last: u32 },
 }
 
-#[derive(Debug, thiserror::Error)]
-pub enum UndoError {
-    #[error("cannot read or write the session log: {0}")]
-    Session(#[from] tautly_session::Error),
-    #[error("there is no turn {turn}; this session has {turns}")]
-    NoSuchTurn { turn: u32, turns: u32 },
-    #[error("a path in the session log cannot be used here: {0}")]
-    Path(#[from] ConfineError),
-    #[error("{path}: {source}")]
-    Disk { path: String, source: SandboxError },
-    #[error("changed since the turn: {}", list(paths))]
-    Changed { paths: Vec<PathBuf> },
-    #[error("changed by later turns: {}", list(paths))]
-    LaterTurns {
-        turns: Vec<u32>,
-        paths: Vec<PathBuf>,
-    },
-}
-
-fn list(paths: &[PathBuf]) -> String {
-    paths
-        .iter()
-        .map(|p| p.display().to_string())
-        .collect::<Vec<_>>()
-        .join(", ")
-}
+pub use crate::undo::{UndoError, UndoReport, undo};
 
 /// What the live loop assembled each request with, so a rebuild calibrates the token
 /// estimator as the live session did (its ratio decides when collection and compaction
@@ -227,6 +206,7 @@ pub(crate) fn rebuild_with(
             end_offset: None,
             model,
             reasoning_retry: false,
+            checkpoints: LoggedCheckpoints::default(),
             seen: HashMap::new(),
             start_pins: false,
             memory_proposals: Vec::new(),
@@ -429,10 +409,17 @@ impl Replay<'_> {
                 self.apply_pending();
                 self.mutation(rec);
             }
+            SessionRecord::Checkpoint {
+                n, commit, tree, ..
+            } => {
+                let logged = &mut self.out.checkpoints;
+                logged.max_n = logged.max_n.max(n);
+                logged.all.push((n, commit.clone()));
+                logged.last = Some((n, commit, tree));
+            }
             SessionRecord::ToolCall { .. }
             | SessionRecord::Edit { .. }
             | SessionRecord::ApprovalRequested { .. }
-            | SessionRecord::Checkpoint { .. }
             | SessionRecord::CheckpointSkipped { .. }
             | SessionRecord::Labeled { .. }
             | SessionRecord::EngineError { .. }
@@ -576,7 +563,17 @@ impl Replay<'_> {
                 }
                 restore_and_keep(self.ctx(), elided);
             }
-            SessionRecord::Undone { files, .. } => {
+            SessionRecord::Undone {
+                files, backup_ref, ..
+            } => {
+                if let Some(n) = backup_ref
+                    .as_deref()
+                    .and_then(|r| r.rsplit_once("/undo-"))
+                    .and_then(|(_, n)| n.parse::<u32>().ok())
+                {
+                    let logged = &mut self.out.checkpoints;
+                    logged.max_n = logged.max_n.max(n);
+                }
                 for f in &files {
                     let Ok(path) = f.path.resolve(&self.root) else {
                         continue;
@@ -902,6 +899,10 @@ impl Session {
         if let Some(failure) = closed {
             self.report(failure).await;
         }
+        let logged = rebuilt.checkpoints.clone();
+        if let Some(c) = &self.checkpoints {
+            c.lock().await.cp.continue_after(logged.max_n, logged.last);
+        }
         let mut resumed = self.adopt(rebuilt);
         if let Some(model) = resumed.model.take() {
             self.restore_model(model).await;
@@ -1159,6 +1160,7 @@ impl Session {
         let path = child.path().to_path_buf();
         self.log.replace(child);
         self.session_id = id.clone();
+        self.adopt_checkpoints(&id, &rebuilt.checkpoints).await;
         self.last_request_path = crate::engine::last_request_path(&path);
         let fresh = self
             .budgets
@@ -1174,6 +1176,27 @@ impl Session {
             self.restore_model(model).await;
         }
         Ok((id, path))
+    }
+
+    /// A branch's own refs for the checkpoints its log copied (spec 7.11.11), and its
+    /// later checkpoints under its own id.
+    async fn adopt_checkpoints(&self, branch: &str, logged: &LoggedCheckpoints) {
+        let Some(c) = &self.checkpoints else {
+            return;
+        };
+        let mut st = c.lock().await;
+        let adopted = st.cp.adopt(branch, &logged.all).await;
+        // The branch reuses only a checkpoint it has a ref for: its log's latest.
+        let last = adopted.is_ok().then(|| logged.last.clone()).flatten();
+        st.cp.branch(branch.to_string(), logged.max_n, last);
+        drop(st);
+        if let Err(e) = adopted {
+            self.warn(format!(
+                "fork: the branch's checkpoint refs could not be made ({e}); deleting the \
+                 parent session can make its checkpoints unavailable to the branch"
+            ))
+            .await;
+        }
     }
 
     /// `Command::Compact` (between turns, as a task the user can cancel): collect and
@@ -1327,274 +1350,6 @@ fn discard(child: SessionWriter<SessionRecord>) {
     let path = child.path().to_path_buf();
     drop(child);
     let _ = std::fs::remove_file(path);
-}
-
-/// One file to undo: its log path, what it is restored to (none: deleted), and what the
-/// log says its content is now (blake3 hex; none: absent) and its mode (none: unknown, as
-/// for a file a tool created).
-struct Target {
-    path: RelPath,
-    pre: Option<BlobRef>,
-    mode: Option<u32>,
-    tip: Option<String>,
-    tip_mode: Option<u32>,
-}
-
-/// Undo the file changes Tautly's tools made in user turn `turn` (default: the last one
-/// that started): each file the turn changed gets the content and mode it had before the
-/// turn's first change of it, newest change first; a file the turn created is deleted.
-/// Each file's content just before the undo is stored as a blob first, and the undo is
-/// logged as `Undone`, so it can itself be reverted. Changes made by commands are not
-/// undone. A file already as it was before the turn (reverted by hand, say) is not written
-/// but is listed in `Undone` too, so earlier turns that changed it can be undone next.
-/// Returns the paths written (none: nothing needed a write; nothing is logged when nothing
-/// was left to undo either).
-///
-/// Nothing the undo did not write is overwritten (spec 7.12), and every check comes before
-/// the first write, so a refusal writes nothing:
-/// - [`UndoError::LaterTurns`]: a later turn changed one of the files and is not undone;
-///   undo the later turns first (newest first).
-/// - [`UndoError::Changed`]: a file's content or mode is not what the log says the session
-///   left it at (the last tool edit or delete, or undo, of it): a human edit or `chmod`, or
-///   a command. (Tools keep a file's mode, so an edit leaves the mode it found.)
-///
-/// The log is reopened for writing, so the session must not be running in an engine
-/// ([`tautly_session::Error::AlreadyOpen`]). Blocking file I/O on the log.
-pub async fn undo(
-    reader: &SessionReader<SessionRecord>,
-    sandbox: &dyn Sandbox,
-    turn: Option<u32>,
-) -> Result<Vec<PathBuf>, UndoError> {
-    let plan = undo_plan(reader, turn)?;
-    let turn = plan.turn;
-    if !plan.later.is_empty() {
-        return Err(UndoError::LaterTurns {
-            turns: plan.later_turns,
-            paths: plan
-                .later
-                .iter()
-                .map(|p| p.resolve(sandbox.root()))
-                .collect::<Result<_, _>>()?,
-        });
-    }
-    let mut writer = SessionWriter::<SessionRecord>::reopen(reader.path())?;
-    let disk = |path: &PathBuf, source: SandboxError| UndoError::Disk {
-        path: path.display().to_string(),
-        source,
-    };
-    // First what every file is now, checked against what the session left it at.
-    let mut planned = Vec::with_capacity(plan.targets.len());
-    let mut already = Vec::new();
-    let mut changed = Vec::new();
-    for t in plan.targets {
-        let full = t.path.resolve(sandbox.root())?;
-        let now = match sandbox.read(&full).await {
-            Ok(bytes) => Some(bytes),
-            Err(SandboxError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => None,
-            Err(e) => return Err(disk(&full, e)),
-        };
-        let now_mode = match &now {
-            Some(_) => Some(
-                sandbox
-                    .metadata(&full)
-                    .await
-                    .map_err(|e| disk(&full, e))?
-                    .mode
-                    & 0o7777,
-            ),
-            None => None,
-        };
-        let to = t.pre.as_ref().map(|b| reader.read_blob(b)).transpose()?;
-        if now == to && (to.is_none() || now_mode == t.mode) {
-            // Nothing to write; logged as undone all the same (its content is the blob
-            // it is restored to).
-            already.push(UndoneFile {
-                path: t.path,
-                from_blob: t.pre.clone(),
-                from_mode: now_mode,
-                to_mode: to.as_ref().and(t.mode),
-                to: t.pre,
-            });
-            continue;
-        }
-        let now_hash = now.as_deref().map(|b| blake3::hash(b).to_hex().to_string());
-        let mode_kept = now.is_none() || t.tip_mode.is_none() || now_mode == t.tip_mode;
-        if now_hash != t.tip || !mode_kept {
-            changed.push(full);
-            continue;
-        }
-        planned.push((t, full, now, to, now_mode));
-    }
-    if !changed.is_empty() {
-        changed.sort();
-        return Err(UndoError::Changed { paths: changed });
-    }
-    if planned.is_empty() && already.is_empty() {
-        return Ok(Vec::new());
-    }
-    // Then their current content, as blobs.
-    let mut blobbed = Vec::with_capacity(planned.len());
-    for (t, full, now, to, now_mode) in planned {
-        let from_blob = now.as_deref().map(|b| writer.blob(b)).transpose()?;
-        blobbed.push((t, full, to, from_blob, now_mode));
-    }
-    let mut files = already;
-    let mut done = Vec::with_capacity(blobbed.len());
-    let mut failed = None;
-    for (t, full, to, from_blob, from_mode) in blobbed {
-        let written = match &to {
-            Some(bytes) => sandbox.write_atomic(&full, bytes, t.mode).await,
-            None if from_blob.is_some() => sandbox.remove_file(&full).await,
-            None => Ok(()),
-        };
-        if let Err(e) = written {
-            failed = Some(disk(&full, e));
-            break;
-        }
-        files.push(UndoneFile {
-            path: t.path,
-            from_blob,
-            from_mode,
-            to: t.pre,
-            to_mode: to.as_ref().and(t.mode),
-        });
-        done.push(full);
-    }
-    writer.append(&SessionRecord::Undone {
-        turn,
-        files,
-        backup_ref: None,
-    })?;
-    writer.checkpoint()?;
-    match failed {
-        Some(e) => Err(e),
-        None => Ok(done),
-    }
-}
-
-/// What [`undo`] does for one user turn.
-struct UndoPlan {
-    turn: u32,
-    /// Its files, newest change first; changes an earlier undo of the turn reverted are
-    /// left out.
-    targets: Vec<Target>,
-    /// Of those, the files a later turn changed (and was not undone for), and those turns.
-    later: Vec<RelPath>,
-    later_turns: Vec<u32>,
-}
-
-/// The user turn to undo, its files and what the log says of them since.
-fn undo_plan(
-    reader: &SessionReader<SessionRecord>,
-    turn: Option<u32>,
-) -> Result<UndoPlan, UndoError> {
-    let mut current = 0u32;
-    let mut turns = 0u32;
-    // Per user turn: each path's earliest pre-image, in order of its latest change.
-    let mut changes: HashMap<u32, Vec<Target>> = HashMap::new();
-    // Per path: its content (and mode, if known) as the session last left it, and the
-    // turns that changed it (in order), less those an undo reverted.
-    let mut tips: HashMap<RelPath, (Option<String>, Option<u32>)> = HashMap::new();
-    let mut changed_in: HashMap<RelPath, Vec<u32>> = HashMap::new();
-    for rec in reader.records() {
-        match rec?.1 {
-            SessionRecord::TurnStart { turn, .. } => {
-                current = turn;
-                turns = turns.max(turn);
-            }
-            SessionRecord::ToolResult { effects, .. } => {
-                for e in effects {
-                    // An edit keeps the mode it found (none: it created the file, whose
-                    // mode is not logged).
-                    let (path, pre, mode, tip) = match e {
-                        PersistedEffect::Edited {
-                            path,
-                            pre_image_blob,
-                            pre_mode,
-                            post_hash,
-                            ..
-                        } => (
-                            path,
-                            pre_image_blob,
-                            pre_mode,
-                            (Some(post_hash.to_hex().to_string()), pre_mode),
-                        ),
-                        PersistedEffect::Deleted {
-                            path,
-                            pre_image_blob,
-                            pre_mode,
-                        } => (path, Some(pre_image_blob), Some(pre_mode), (None, None)),
-                        _ => continue,
-                    };
-                    let pre = pre.map(|b| BlobRef::parse(&b)).transpose()?;
-                    tips.insert(path.clone(), tip);
-                    let by = changed_in.entry(path.clone()).or_default();
-                    if by.last() != Some(&current) {
-                        by.push(current);
-                    }
-                    let list = changes.entry(current).or_default();
-                    let first = match list.iter().position(|t| t.path == path) {
-                        Some(i) => list.remove(i),
-                        None => Target {
-                            path,
-                            pre,
-                            mode,
-                            tip: None,
-                            tip_mode: None,
-                        },
-                    };
-                    list.push(first);
-                }
-            }
-            SessionRecord::Undone { turn, files, .. } => {
-                for f in files {
-                    // A blob reference is the blake3 hex of its content.
-                    tips.insert(
-                        f.path.clone(),
-                        (f.to.map(|b| b.as_str().to_string()), f.to_mode),
-                    );
-                    if let Some(by) = changed_in.get_mut(&f.path) {
-                        by.retain(|&t| t != turn);
-                    }
-                    if let Some(list) = changes.get_mut(&turn) {
-                        list.retain(|t| t.path != f.path);
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    let turn = turn.unwrap_or(turns);
-    if turn == 0 || turn > turns {
-        return Err(UndoError::NoSuchTurn { turn, turns });
-    }
-    let mut targets = changes.remove(&turn).unwrap_or_default();
-    targets.reverse();
-    let mut later = Vec::new();
-    let mut later_turns = Vec::new();
-    for t in &mut targets {
-        (t.tip, t.tip_mode) = tips.get(&t.path).cloned().unwrap_or_default();
-        let after: Vec<u32> = changed_in
-            .get(&t.path)
-            .into_iter()
-            .flatten()
-            .copied()
-            .filter(|&k| k > turn)
-            .collect();
-        if !after.is_empty() {
-            later.push(t.path.clone());
-            later_turns.extend(after);
-        }
-    }
-    later.sort();
-    later_turns.sort_unstable();
-    later_turns.dedup();
-    Ok(UndoPlan {
-        turn,
-        targets,
-        later,
-        later_turns,
-    })
 }
 
 #[cfg(test)]

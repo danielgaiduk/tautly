@@ -81,6 +81,7 @@ mode = "ask"
         model: Some(ModelId::from("anthropic/claude-opus-5-5")),
         mode: Some(Mode::Yolo),
         approve_memory: None,
+        checkpoints: None,
     };
     let cfg = f.load(cli).unwrap();
     assert_eq!(cfg.model.as_str(), "anthropic/claude-opus-5-5", "cli wins");

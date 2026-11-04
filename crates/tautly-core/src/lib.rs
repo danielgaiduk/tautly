@@ -7,6 +7,7 @@ mod approvals;
 pub mod attempts;
 pub mod auth;
 pub mod budget;
+pub mod checkpoint;
 pub mod config;
 pub mod diff;
 mod dispatch;
@@ -22,15 +23,18 @@ pub mod record;
 pub mod resume;
 pub mod routing;
 mod session;
+pub mod sessions;
 pub mod signals;
 pub mod turn;
+pub mod undo;
 pub mod workspace;
 
 pub use auth::{AuthError, KEYCHAIN_SERVICE, KeyLookup, KeyringStore, SecretStore, api_key};
 pub use budget::{Budget, BudgetState};
+pub use checkpoint::{CheckpointError, CheckpointRef, Checkpointer, RestorePlan, Skip};
 pub use config::{
-    BudgetConfig, BudgetLimits, CliOverrides, CompatEntry, Config, ConfigError, LoadedConfig,
-    ProviderEntry, ProvidersConfig, RoutingConfig, TelemetryConfig, config_home,
+    BudgetConfig, BudgetLimits, CheckpointConfig, CliOverrides, CompatEntry, Config, ConfigError,
+    LoadedConfig, ProviderEntry, ProvidersConfig, RoutingConfig, TelemetryConfig, config_home,
 };
 pub use engine::{Engine, EngineBuilder, EngineError};
 pub use evidence::{
