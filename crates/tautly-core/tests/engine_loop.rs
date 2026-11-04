@@ -635,6 +635,28 @@ async fn policy_deny_reports_rule() {
     assert_eq!(count(&events, "tool_started"), 0);
 }
 
+/// Review B-M4: bash commands do not inherit the provider key variables, the configured
+/// `api_key_env` ones included (`HOME` stands in for one here: setting a real key in this
+/// process would race the other tests).
+#[tokio::test]
+async fn bash_commands_do_not_see_provider_key_variables() {
+    let fx = Fx::new();
+    let mut cfg = config(Mode::Yolo);
+    cfg.providers.compat.push(tautly_core::CompatEntry {
+        name: "work".into(),
+        base_url: "https://llm.example.com/v1".parse().unwrap(),
+        api_key_env: Some("HOME".into()),
+    });
+    let command = "echo \"home:${HOME-unset} path:${PATH:+set}\"";
+    let mock = MockProvider::new(vec![
+        tools_step(vec![call("b1", "bash", json!({ "command": command }))]),
+        text_step("ok"),
+    ]);
+    let mut run = start(fx.builder(cfg, &mock));
+    let f = finished(&run.turn_with("go").await);
+    assert!(f[0].1.contains("home:unset path:set"), "{f:?}");
+}
+
 #[tokio::test]
 async fn mid_stream_drop_reissues_from_last_complete_message() {
     let fx = Fx::new();

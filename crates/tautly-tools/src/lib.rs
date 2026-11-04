@@ -470,6 +470,7 @@ pub struct ToolCx {
     approved_bases: Option<Vec<(PathBuf, Option<blake3::Hash>)>>,
     preview_diff: bool,
     side: Option<Arc<dyn SideModel>>,
+    env_remove: Arc<[String]>,
 }
 
 impl std::fmt::Debug for ToolCx {
@@ -499,6 +500,7 @@ impl ToolCx {
             approved_bases: None,
             preview_diff: true,
             side: None,
+            env_remove: Arc::from(Vec::new()),
         }
     }
 
@@ -532,6 +534,14 @@ impl ToolCx {
     /// The 1-based turn this call belongs to.
     pub fn with_turn(mut self, turn: u32) -> Self {
         self.turn = turn;
+        self
+    }
+
+    /// Variables `bash` removes from the environment its commands inherit: the provider
+    /// API keys (the defaults and every configured `api_key_env`), which repository code an
+    /// agent runs (`npm test`, a `build.rs`) must not see, as MCP servers do not.
+    pub fn with_env_remove(mut self, vars: Vec<String>) -> Self {
+        self.env_remove = Arc::from(vars);
         self
     }
 
@@ -596,6 +606,11 @@ impl ToolCx {
 
     pub fn process_groups(&self) -> &ProcessGroups {
         &self.groups
+    }
+
+    /// See [`with_env_remove`](Self::with_env_remove).
+    pub fn env_remove(&self) -> &[String] {
+        &self.env_remove
     }
 
     pub fn approved_bases(&self) -> Option<&[(PathBuf, Option<blake3::Hash>)]> {

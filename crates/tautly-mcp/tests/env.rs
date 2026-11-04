@@ -30,17 +30,24 @@ async fn server_env_has_no_provider_keys() {
             ("ECHO_MARKER".to_string(), "from-config".to_string()),
             // Even set explicitly, a provider key variable is removed.
             ("OPENAI_API_KEY".to_string(), "sk-explicit".to_string()),
+            // The engine's private pycache wins over the server's own (review S2-I1).
+            (
+                "PYTHONPYCACHEPREFIX".to_string(),
+                "repo-pycache".to_string(),
+            ),
         ]),
         cwd: None,
     };
     // What the engine passes: the default names plus every configured `api_key_env`.
     let mut strip: Vec<String> = PROVIDER_KEY_VARS.iter().map(|s| s.to_string()).collect();
     strip.push("MY_GATEWAY_KEY".into());
-    let hub = McpHub::start(
+    let pycache = "/private/tautly-pycache".to_string();
+    let hub = McpHub::start_with_env(
         vec![("echo".into(), spec, ServerSource::User)],
         Arc::clone(&sb),
         &McpConfig::default(),
         &strip,
+        &[("PYTHONPYCACHEPREFIX".to_string(), pycache.clone())],
     )
     .await;
     assert!(hub.wait_started(Duration::from_secs(20)).await);
@@ -63,5 +70,12 @@ async fn server_env_has_no_provider_keys() {
     assert!(!r.output.contains("sk-"), "{}", r.output);
     assert!(r.output.contains("ECHO_MARKER=from-config"));
     assert!(r.output.contains("TAUTLY_TEST_VISIBLE=inherited"));
+    assert!(
+        r.output
+            .lines()
+            .any(|l| l == format!("PYTHONPYCACHEPREFIX={pycache}")),
+        "{}",
+        r.output
+    );
     hub.shutdown().await;
 }

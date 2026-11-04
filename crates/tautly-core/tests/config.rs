@@ -1244,6 +1244,83 @@ edit_format = "str_replace"
     assert_eq!(f.load(cli).unwrap().model.as_str(), "compat:anything/x");
 }
 
+/// Review B-M2, probe P3: a value error in a project setting that carries no deny rule
+/// (limits, budget, model, compaction threshold, pins) drops that setting with a warning
+/// instead of stopping startup. A malformed `permissions` stays fatal (dropping a deny
+/// rule would loosen the policy), and the error says so and names the file.
+#[test]
+fn project_value_errors_outside_permissions_are_skipped_with_warnings() {
+    for (toml, key) in [
+        ("max_turns = 0\n", "max_turns"),
+        ("max_turns = -3\n", "max_turns"),
+        ("max_turns = 1.5\n", "max_turns"),
+        ("max_turns = \"many\"\n", "max_turns"),
+        ("max_turns = 99999999999\n", "max_turns"),
+        ("turn_timeout_s = 0\n", "turn_timeout_s"),
+        ("turn_timeout_s = \"x\"\n", "turn_timeout_s"),
+        ("model = 7\n", "model"),
+        ("compaction_threshold = \"low\"\n", "compaction_threshold"),
+        ("budget = 3\n", "budget"),
+        ("[budget]\nturn = 3\n", "budget.turn"),
+        ("[budget.turn]\nmax_usd = nan\n", "budget.turn.max_usd"),
+        ("[budget.turn]\nmax_usd = inf\n", "budget.turn.max_usd"),
+        (
+            "[budget.session]\nmax_usd = \"1\"\n",
+            "budget.session.max_usd",
+        ),
+        ("[budget.turn]\nmax_tokens = 0\n", "budget.turn.max_tokens"),
+        (
+            "[budget.turn]\nmax_tokens = 2.5\n",
+            "budget.turn.max_tokens",
+        ),
+        ("pins = \"one\"\n", "pins"),
+        ("pins = [\"kept\", 1]\n", "pins"),
+    ] {
+        let f = Fixture::new();
+        f.project(toml);
+        let loaded = f
+            .load_full(CliOverrides::default())
+            .unwrap_or_else(|e| panic!("{toml:?} stopped startup: {e}"));
+        assert!(
+            loaded
+                .warnings
+                .iter()
+                .any(|w| w.contains(&format!("`{key}`"))),
+            "{toml:?}: {:?}",
+            loaded.warnings
+        );
+        let c = &loaded.config;
+        assert_eq!(c.max_turns, 100, "{toml:?}");
+        assert_eq!(c.turn_timeout_s, None, "{toml:?}");
+        assert_eq!(c.budget.turn.max_usd, None, "{toml:?}");
+        assert_eq!(c.budget.turn.max_tokens, None, "{toml:?}");
+    }
+    // The valid pin next to a bad one is kept.
+    let f = Fixture::new();
+    f.project("pins = [\"kept\", 1]\n");
+    assert_eq!(f.load(CliOverrides::default()).unwrap().pins, ["kept"]);
+
+    // Deny rules stay fail-closed, with a message that names the file and says why.
+    for toml in [
+        "[permissions]\ndeny = [\"bash(\"]\n",
+        "[permissions]\ndeny = \"bash(rm*)\"\n",
+        "[permissions]\nmode = \"bogus\"\n",
+    ] {
+        let f = Fixture::new();
+        f.project(toml);
+        let err = f.load(CliOverrides::default()).unwrap_err();
+        let project_file = f.root().join(".tautly").join("config.toml");
+        assert!(
+            matches!(&err, ConfigError::Invalid { origin: Some(p), .. } if *p == project_file),
+            "{toml:?}: {err}"
+        );
+        assert!(
+            err.to_string().contains("permissions") && err.to_string().contains("never skipped"),
+            "{toml:?}: {err}"
+        );
+    }
+}
+
 #[test]
 fn restricting_comes_before_validating_so_dropped_keys_never_fail_the_load() {
     let f = Fixture::new();
@@ -1268,10 +1345,18 @@ max_usd = -5.0
 unknown = 1
 "#,
     );
-    // Only the value that survives restriction (the negative max_usd, which is a
-    // tightening of "unlimited") is validated, and that one is a real error.
-    let err = f.load(CliOverrides::default()).unwrap_err();
-    assert!(matches!(err, ConfigError::Invalid { .. }), "{err}");
+    // The negative max_usd (a "tightening" of unlimited) is a value error outside
+    // `permissions`: dropped with a warning too (review B-M2).
+    let loaded = f.load_full(CliOverrides::default()).unwrap();
+    assert_eq!(loaded.config.budget.turn.max_usd, None);
+    assert!(
+        loaded
+            .warnings
+            .iter()
+            .any(|w| w.contains("`budget.turn.max_usd`")),
+        "{:?}",
+        loaded.warnings
+    );
 
     let f = Fixture::new();
     f.project(

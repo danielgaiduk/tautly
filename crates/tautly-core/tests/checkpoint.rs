@@ -311,6 +311,32 @@ fn executable(path: &Path, text: &str) {
 
 // ----------------------------------------------------------------------- snapshots
 
+/// Review N7: checkpoint git does not inherit the session's provider key variables (the
+/// configured ones given with `with_env_remove`; `HOME` stands in for one, since setting a
+/// real key in this process would race the other tests).
+#[tokio::test]
+async fn checkpoint_git_does_not_see_provider_key_variables() {
+    let repo = Repo::with(&[("a.txt", "a\n")]);
+    let log = repo.home.path().join("env.log");
+    let shim = repo.home.path().join("git");
+    executable(
+        &shim,
+        &format!(
+            "#!/bin/sh\necho \"home=${{HOME-unset}}\" >> '{}'\nHOME=/tmp exec git \"$@\"\n",
+            log.display()
+        ),
+    );
+    let mut cp = repo
+        .checkpointer(CheckpointConfig::default())
+        .with_git(&shim)
+        .with_env_remove(vec!["HOME".into()]);
+    repo.write("b.txt", "b\n");
+    cp.snapshot_now().await.unwrap();
+    let seen = std::fs::read_to_string(&log).unwrap();
+    assert!(!seen.is_empty());
+    assert!(seen.lines().all(|l| l == "home=unset"), "{seen}");
+}
+
 #[tokio::test]
 async fn checkpoint_leaves_index_head_stash_and_branches_untouched() {
     let repo = Repo::with(&[("a.txt", "a\n"), ("b.txt", "b\n")]);
@@ -527,10 +553,13 @@ async fn timeout_skips_with_warning() {
     let repo = Repo::with(&[("a.txt", "a\n")]);
     let pid_file = repo.home.path().join("sleep.pid");
     let shim = repo.home.path().join("git");
+    // The configuration read goes to the real git (one that never ends is another case:
+    // `config_include_that_never_ends_turns_checkpoints_off_once`); the next call hangs.
     executable(
         &shim,
         &format!(
-            "#!/bin/sh\nsleep 30 &\necho $! > '{}'\nwait\n",
+            "#!/bin/sh\ncase \" $* \" in *\" config \"*) exec git \"$@\";; esac\n\
+             sleep 30 &\necho $! > '{}'\nwait\n",
             pid_file.display()
         ),
     );
@@ -839,6 +868,62 @@ async fn undo_reverts_bash_side_effects() {
         )),
         "{recs:?}"
     );
+}
+
+/// Review N8: a file over the 64 MiB undo read limit that the turn created is still
+/// undone. It is compared by a streaming hash, and its prior content is not kept in the
+/// log (`from_blob` none, with its mode), which the note says.
+#[tokio::test]
+async fn undo_handles_a_file_over_the_read_limit() {
+    let repo = Repo::with(&[("a.txt", "a\n")]);
+    let mut cfg = config();
+    // Hashing 65 MiB into the object store takes a while under load.
+    cfg.checkpoints.timeout_ms = 60_000;
+    let mock = MockProvider::new(vec![
+        tools_step(vec![bash(
+            "b1",
+            "head -c 68157440 /dev/zero > big.bin && printf 'b\\n' > a.txt",
+        )]),
+        text_step("done"),
+    ]);
+    let mut run = start(repo.builder(cfg, &mock));
+    run.turn_with("make it").await;
+    assert!(repo.path("big.bin").exists());
+    let answer = run.undo(None, false).await;
+    let (_, path) = run.engine.current_session();
+    run.stop().await;
+    let Event::Undone {
+        restored,
+        deleted,
+        note,
+        ..
+    } = answer
+    else {
+        panic!("{answer:?}")
+    };
+    assert_eq!(restored, ["a.txt"]);
+    assert_eq!(deleted, ["big.bin"]);
+    let note = note.unwrap_or_default();
+    assert!(
+        note.contains("over 64 MiB") && note.contains("big.bin"),
+        "{note}"
+    );
+    assert!(!repo.path("big.bin").exists());
+    assert_eq!(repo.read("a.txt").as_deref(), Some("a\n"));
+    let files = records_at(&path)
+        .into_iter()
+        .find_map(|r| match r {
+            SessionRecord::Undone { files, .. } => Some(files),
+            _ => None,
+        })
+        .expect("an Undone record");
+    let big = files
+        .iter()
+        .find(|f| f.path.as_str() == "big.bin")
+        .expect("big.bin logged");
+    assert_eq!(big.from_blob, None);
+    assert!(big.from_mode.is_some());
+    assert_eq!(big.to, None);
 }
 
 #[tokio::test]
@@ -1827,4 +1912,267 @@ async fn dot_git_symlink_takes_no_checkpoint_and_says_so() {
     assert_eq!(reasons, ["git_dir_symlink"]);
     // Nothing was written to the repository the link points at.
     assert!(real.refs("refs/tautly/").is_empty());
+}
+
+/// Review B-I2, probe P2: a checkout whose `.git` names another repository's git
+/// directories (a `commondir` in a `.git` directory, or a `.git` file) without git's
+/// back-link takes no checkpoints there, and engine-start pruning does not touch that
+/// repository's refs.
+#[tokio::test]
+async fn git_dir_another_repository_does_not_name_back_takes_no_checkpoint() {
+    let victim = Repo::with(&[("a.txt", "a\n")]);
+    let head = victim.git(&["rev-parse", "HEAD"]);
+    victim.git(&["update-ref", "refs/tautly/checkpoints/old/1", &head]);
+    let victim_git = victim.path(".git");
+    let p2 = Repo::bare_dir();
+    p2.write(".git/HEAD", "ref: refs/heads/main\n");
+    p2.write(".git/commondir", &format!("{}\n", victim_git.display()));
+    let file = Repo::bare_dir();
+    file.write(".git", &format!("gitdir: {}\n", victim_git.display()));
+    for hostile in [&p2, &file] {
+        hostile.write("a.txt", "a\n");
+        assert!(
+            Checkpointer::new(
+                hostile.sandbox(),
+                hostile.root(),
+                "s".into(),
+                CheckpointConfig::default()
+            )
+            .is_none()
+        );
+        let sb = hostile.sandbox();
+        assert!(
+            checkpoint::prune(sb.as_ref(), &hostile.root(), 0, None)
+                .await
+                .is_err()
+        );
+        let mock = MockProvider::new(vec![
+            tools_step(vec![bash("b1", "printf 'b\\n' > a.txt")]),
+            text_step("first"),
+        ]);
+        let mut run = start(hostile.builder(config(), &mock));
+        let events = run.turn_with("one").await;
+        let (_, path) = run.engine.current_session();
+        run.stop().await;
+        let skipped: Vec<String> = warnings(&events)
+            .into_iter()
+            .filter(|w| w.starts_with("checkpoint skipped"))
+            .collect();
+        assert_eq!(skipped, [skip_warning(&Skip::GitDirUnverified)]);
+        let reasons: Vec<String> = records_at(&path)
+            .into_iter()
+            .filter_map(|r| match r {
+                SessionRecord::CheckpointSkipped { reason, .. } => Some(reason),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(reasons, ["git_dir_unverified"]);
+    }
+    // The victim's refs are as they were: nothing added, nothing pruned.
+    assert_eq!(
+        victim.refs("refs/tautly/"),
+        ["refs/tautly/checkpoints/old/1"]
+    );
+}
+
+/// Review B-M1, probe P5: the spill store never enters a checkpoint, even when the
+/// repository committed a `.tautly/tmp/.gitignore` that un-ignores it (or tracks files
+/// there). The rest of `.tautly/` (a tracked config) is still snapshotted.
+#[tokio::test]
+async fn spill_store_never_enters_a_checkpoint() {
+    let repo = Repo::with(&[
+        ("a.txt", "a\n"),
+        (".tautly/tmp/.gitignore", ""),
+        (".tautly/tmp/tracked.txt", "committed\n"),
+        (".tautly/config.toml", "max_turns = 10\n"),
+    ]);
+    repo.write(
+        ".tautly/tmp/spill/0123456789abcdef.txt",
+        "OPENAI_API_KEY=sk-x\n",
+    );
+    repo.write(".tautly/tmp/tracked.txt", "changed\n");
+    repo.write(".tautly/config.toml", "max_turns = 5\n");
+    let mut cp = repo.checkpointer(CheckpointConfig::default());
+    let made = cp.snapshot_now().await.unwrap();
+    let files = repo.git(&["ls-tree", "-r", "--name-only", &made.commit]);
+    assert!(!files.contains(".tautly/tmp/"), "{files}");
+    assert!(files.contains(".tautly/config.toml"), "{files}");
+    let config = repo.git(&["show", &format!("{}:.tautly/config.toml", made.commit)]);
+    assert_eq!(config, "max_turns = 5");
+}
+
+/// Review B-M3, probe P4: a repository `include.path` naming a FIFO blocks every git
+/// call. The configuration read gives up within its own cap (not the operation's
+/// deadline). The first time is an ordinary timeout (a slow network filesystem may
+/// recover, review N6); the second in a row turns checkpoints off for the session, so
+/// later commands do not each wait out the timeout.
+#[tokio::test]
+async fn config_include_that_never_ends_turns_checkpoints_off_once() {
+    let repo = Repo::with(&[("a.txt", "a\n")]);
+    let fifo = repo.home.path().join("never.fifo");
+    let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+    // SAFETY: mkfifo with a valid NUL-terminated path.
+    assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o644) }, 0);
+    let mut git_config = std::fs::read_to_string(repo.path(".git/config")).unwrap();
+    git_config.push_str(&format!("[include]\n\tpath = {}\n", fifo.display()));
+    std::fs::write(repo.path(".git/config"), git_config).unwrap();
+
+    let mut cp = repo.checkpointer(CheckpointConfig::default());
+    let began = Instant::now();
+    assert_eq!(cp.snapshot_now().await, Err(Skip::Timeout));
+    assert_eq!(cp.snapshot_now().await, Err(Skip::ConfigTimeout));
+    assert!(
+        began.elapsed() < Duration::from_millis(5000),
+        "{:?}",
+        began.elapsed()
+    );
+
+    let mock = MockProvider::new(vec![
+        tools_step(vec![bash("b1", "true")]),
+        tools_step(vec![bash("b2", "true")]),
+        tools_step(vec![bash("b3", "true")]),
+        text_step("done"),
+    ]);
+    let began = Instant::now();
+    let mut run = start(repo.builder(config(), &mock));
+    let events = run.turn_with("go").await;
+    let elapsed = began.elapsed();
+    let (_, path) = run.engine.current_session();
+    run.stop().await;
+    let skipped: Vec<String> = warnings(&events)
+        .into_iter()
+        .filter(|w| w.starts_with("checkpoint skipped"))
+        .collect();
+    assert_eq!(
+        skipped,
+        [
+            skip_warning(&Skip::Timeout),
+            skip_warning(&Skip::ConfigTimeout)
+        ]
+    );
+    let reasons: Vec<String> = records_at(&path)
+        .into_iter()
+        .filter_map(|r| match r {
+            SessionRecord::CheckpointSkipped { reason, .. } => Some(reason),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(reasons, ["timeout", "config_timeout"]);
+    // Three commands and a turn end did not each wait for git: about 2 s each for the
+    // engine-start prune, the session-start checkpoint and the first command (with the old
+    // per-snapshot timeout it was 3 s for each of the five checkpoints, plus 60 s of prune).
+    assert!(elapsed < Duration::from_secs(13), "{elapsed:?}");
+
+    assert!(!repo.path(".git/refs/tautly").exists());
+}
+
+/// Review N3: a `.git` directory whose `refs` (or `refs/tautly`, `refs/tautly/checkpoints`,
+/// `objects`) is a symbolic link would make checkpoints write and delete refs in the
+/// repository it points at: no checkpoints, `git_dir_unverified`.
+#[tokio::test]
+async fn git_dir_with_linked_refs_or_objects_takes_no_checkpoint() {
+    let victim = Repo::with(&[("a.txt", "a\n")]);
+    let head = victim.git(&["rev-parse", "HEAD"]);
+    victim.git(&["update-ref", "refs/tautly/checkpoints/old/1", &head]);
+    let vgit = victim.path(".git");
+    let link = |from: PathBuf, to: PathBuf| std::os::unix::fs::symlink(to, from).unwrap();
+    type Layout<'a> = (&'a str, Box<dyn Fn(&Repo) + 'a>);
+    let layouts: Vec<Layout> = vec![
+        (
+            "refs and objects",
+            Box::new(|r: &Repo| {
+                link(r.path(".git/refs"), vgit.join("refs"));
+                link(r.path(".git/objects"), vgit.join("objects"));
+            }),
+        ),
+        (
+            "refs/tautly",
+            Box::new(|r: &Repo| link(r.path(".git/refs/tautly"), vgit.join("refs/tautly"))),
+        ),
+        (
+            "refs/tautly/checkpoints",
+            Box::new(|r: &Repo| {
+                std::fs::create_dir_all(r.path(".git/refs/tautly")).unwrap();
+                link(
+                    r.path(".git/refs/tautly/checkpoints"),
+                    vgit.join("refs/tautly/checkpoints"),
+                );
+            }),
+        ),
+        (
+            "objects",
+            Box::new(|r: &Repo| {
+                std::fs::rename(r.path(".git/objects"), r.path("own-objects")).unwrap();
+                link(r.path(".git/objects"), vgit.join("objects"));
+            }),
+        ),
+        // Review S2-M8: a session directory below `refs/tautly/checkpoints`, and
+        // `packed-refs` (git rewrites it through the link when deleting a ref).
+        (
+            "session dir",
+            Box::new(|r: &Repo| {
+                std::fs::create_dir_all(r.path(".git/refs/tautly/checkpoints")).unwrap();
+                link(
+                    r.path(".git/refs/tautly/checkpoints/old"),
+                    vgit.join("refs/tautly/checkpoints/old"),
+                );
+            }),
+        ),
+        (
+            "packed-refs",
+            Box::new(|r: &Repo| {
+                let _ = std::fs::remove_file(r.path(".git/packed-refs"));
+                link(r.path(".git/packed-refs"), vgit.join("packed-refs"));
+            }),
+        ),
+    ];
+    for (name, make) in layouts {
+        let hostile = Repo::with(&[("a.txt", "a\n")]);
+        if name == "refs and objects" {
+            std::fs::remove_dir_all(hostile.path(".git/refs")).unwrap();
+            std::fs::remove_dir_all(hostile.path(".git/objects")).unwrap();
+        }
+        make(&hostile);
+        assert!(
+            Checkpointer::new(
+                hostile.sandbox(),
+                hostile.root(),
+                "s".into(),
+                CheckpointConfig::default()
+            )
+            .is_none(),
+            "{name}"
+        );
+        let mock = MockProvider::new(vec![
+            tools_step(vec![bash("b1", "printf 'b\\n' > a.txt")]),
+            text_step("first"),
+        ]);
+        let mut run = start(hostile.builder(config(), &mock));
+        let events = run.turn_with("one").await;
+        run.stop().await;
+        let skipped: Vec<String> = warnings(&events)
+            .into_iter()
+            .filter(|w| w.starts_with("checkpoint skipped"))
+            .collect();
+        assert_eq!(skipped, [skip_warning(&Skip::GitDirUnverified)], "{name}");
+    }
+    assert_eq!(
+        victim.refs("refs/tautly/"),
+        ["refs/tautly/checkpoints/old/1"]
+    );
+}
+
+/// A real linked worktree keeps its checkpoints (in the shared repository).
+#[tokio::test]
+async fn linked_worktree_still_takes_checkpoints() {
+    let main = Repo::with(&[("a.txt", "a\n")]);
+    let top = tempfile::tempdir().unwrap();
+    let wt = top.path().canonicalize().unwrap().join("wt");
+    main.git(&["worktree", "add", "-q", "--detach", wt.to_str().unwrap()]);
+    let sb: Arc<dyn Sandbox> = Arc::new(LocalSandbox::new(wt.clone()).unwrap());
+    let mut cp = Checkpointer::new(sb, wt.clone(), "w".into(), CheckpointConfig::default())
+        .expect("a linked worktree has a checkpointer");
+    std::fs::write(wt.join("b.txt"), "b\n").unwrap();
+    cp.snapshot_now().await.unwrap();
+    assert_eq!(main.refs("refs/tautly/"), ["refs/tautly/checkpoints/w/1"]);
 }

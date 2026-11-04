@@ -66,7 +66,8 @@ pub async fn delete(
         .ok_or_else(|| DeleteError::NotFound(id.to_string()))?;
     // Held until the log is gone, so no engine opens it meanwhile.
     let lock = lock_if_idle(&log, id)?;
-    let refs = if std::fs::symlink_metadata(root.join(".git")).is_ok() {
+    // Only a repository checkpoints would have written to (see `checkpoint::git_dir`).
+    let refs = if checkpoint::git_dir(&root).is_some() {
         let excludes = log.parent().map(|d| d.join(checkpoint::EXCLUDES_DIR));
         checkpoint::delete_session_refs(sandbox, &root, id, excludes.as_deref()).await?
     } else {

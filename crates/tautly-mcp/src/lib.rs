@@ -15,6 +15,7 @@
 pub mod approvals;
 mod client;
 pub mod config;
+mod launch_files;
 pub mod names;
 mod text;
 mod tool;
