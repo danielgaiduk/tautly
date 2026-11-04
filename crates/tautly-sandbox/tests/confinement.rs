@@ -185,14 +185,38 @@ async fn spill_is_content_addressed_relative_and_gitignored() {
     assert_ne!(sb.spill(b"other").await.unwrap(), rel);
 }
 
+/// Review B-M1: a repository that commits its own `.tautly/tmp/.gitignore` (empty, or
+/// with other rules) must not un-ignore the spill store, whose files hold full command
+/// output: it is rewritten to `*`.
 #[tokio::test]
-async fn spill_keeps_existing_gitignore() {
+async fn spill_rewrites_a_gitignore_that_is_not_ignore_all() {
+    for committed in ["", "custom\n", "!*\n", "*\n!spill/\n"] {
+        let (t, sb) = sandbox();
+        std::fs::create_dir_all(t.path().join(".tautly/tmp")).unwrap();
+        std::fs::write(t.path().join(".tautly/tmp/.gitignore"), committed).unwrap();
+        sb.spill(b"x").await.unwrap();
+        let gi = std::fs::read_to_string(t.path().join(".tautly/tmp/.gitignore")).unwrap();
+        assert_eq!(gi, "*", "{committed:?}");
+    }
+}
+
+/// A `.tautly/tmp/.gitignore` that is a symbolic link (to a file of the repository, or
+/// dangling) is neither written through nor trusted: nothing is spilled.
+#[tokio::test]
+async fn spill_refuses_a_gitignore_that_is_a_link() {
     let (t, sb) = sandbox();
+    std::fs::write(t.path().join("README.md"), "readme\n").unwrap();
     std::fs::create_dir_all(t.path().join(".tautly/tmp")).unwrap();
-    std::fs::write(t.path().join(".tautly/tmp/.gitignore"), "custom\n").unwrap();
-    sb.spill(b"x").await.unwrap();
-    let gi = std::fs::read_to_string(t.path().join(".tautly/tmp/.gitignore")).unwrap();
-    assert_eq!(gi, "custom\n");
+    std::os::unix::fs::symlink("../../README.md", t.path().join(".tautly/tmp/.gitignore")).unwrap();
+    assert!(sb.spill(b"x").await.is_err());
+    assert_eq!(
+        std::fs::read_to_string(t.path().join("README.md")).unwrap(),
+        "readme\n"
+    );
+    std::fs::remove_file(t.path().join(".tautly/tmp/.gitignore")).unwrap();
+    std::os::unix::fs::symlink("../../NEW.md", t.path().join(".tautly/tmp/.gitignore")).unwrap();
+    assert!(sb.spill(b"y").await.is_err());
+    assert!(!t.path().join("NEW.md").exists());
 }
 
 #[tokio::test]

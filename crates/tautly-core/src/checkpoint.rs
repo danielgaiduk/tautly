@@ -10,7 +10,9 @@
 //!    rehash files whose stat data changed;
 //! 2. `ls-files --others --exclude-standard`, to skip the snapshot when untracked files
 //!    exceed the limits;
-//! 3. `add -A`, `write-tree`, `commit-tree -p <previous checkpoint or HEAD>`, `update-ref`.
+//! 3. `add -A` (then `rm --cached` of the spill store `.tautly/tmp`, whatever the ignore
+//!    rules say), `write-tree`, `commit-tree -p <previous checkpoint or HEAD>`,
+//!    `update-ref`.
 //!
 //! The user's index, HEAD, branches, stash and ignored files are never read or written:
 //! only objects and `refs/tautly/` change, except on an explicit restore, which writes the
@@ -78,6 +80,9 @@ const EMPTY_TREES: [&str; 2] = [
 ];
 /// A gitlink (submodule) entry's mode: never restored.
 const GITLINK: &str = "160000";
+/// Tautly's scratch directory in the work tree (the spill store): left out of every
+/// checkpoint.
+const SPILL_STORE: &str = ".tautly/tmp";
 
 /// A checkpoint taken (or reused).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1345,6 +1350,20 @@ impl Checkpointer {
             self.check_untracked(&git, deadline).await?;
         }
         git.run(&["add", "-A"], None, deadline).await?;
+        // The spill store (full command output) never goes in, whatever the repository's
+        // ignore rules say: a committed `.tautly/tmp/.gitignore` can un-ignore it, which
+        // no exclude rule of ours could outrank.
+        let spill = [
+            "rm",
+            "--cached",
+            "-r",
+            "-f",
+            "-q",
+            "--ignore-unmatch",
+            "--",
+            SPILL_STORE,
+        ];
+        git.run(&spill, None, deadline).await?;
         let tree = git.text(&["write-tree"], deadline).await?;
         Ok(TreeNow {
             tree,

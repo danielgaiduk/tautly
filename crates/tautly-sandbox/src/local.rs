@@ -40,11 +40,30 @@ impl LocalSandbox {
 }
 
 impl LocalSandbox {
-    /// Create `.tautly/tmp` with a `.gitignore` of `*` (unless one exists) and the spill
-    /// directory. Done once, and again only if the directory disappears.
+    /// Create `.tautly/tmp` with a `.gitignore` of exactly `*` and the spill directory.
+    /// Done once, and again only if the directory disappears.
+    ///
+    /// A `.gitignore` the repository committed with anything else (empty, `!*`) would
+    /// un-ignore the spill files, which hold full command output, so `git add -A` and
+    /// checkpoints would take them: it is rewritten. One that is not a regular file (a
+    /// symbolic link, which would be written through, or a FIFO) refuses the spill.
     async fn prepare_spill_dir(&self) -> Result<(), SandboxError> {
         let ignore = Path::new(".tautly/tmp/.gitignore");
-        if !tokio::fs::try_exists(self.resolve(ignore)?).await? {
+        let path = self.resolve(ignore)?;
+        self.guard_protected_target(ignore, &path)?;
+        let rewrite = match tokio::fs::symlink_metadata(self.root.join(ignore)).await {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+            Err(e) => return Err(e.into()),
+            Ok(m) if m.is_file() => {
+                m.len() != 1 || tokio::fs::read(self.root.join(ignore)).await? != b"*"
+            }
+            Ok(_) => {
+                return Err(SandboxError::Denied(
+                    ".tautly/tmp/.gitignore is not a regular file: output is not spilled".into(),
+                ));
+            }
+        };
+        if rewrite {
             self.write_atomic(ignore, b"*", None).await?;
         }
         let dir = Path::new(SPILL_DIR);

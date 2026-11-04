@@ -1890,6 +1890,32 @@ async fn git_dir_another_repository_does_not_name_back_takes_no_checkpoint() {
     );
 }
 
+/// Review B-M1, probe P5: the spill store never enters a checkpoint, even when the
+/// repository committed a `.tautly/tmp/.gitignore` that un-ignores it (or tracks files
+/// there). The rest of `.tautly/` (a tracked config) is still snapshotted.
+#[tokio::test]
+async fn spill_store_never_enters_a_checkpoint() {
+    let repo = Repo::with(&[
+        ("a.txt", "a\n"),
+        (".tautly/tmp/.gitignore", ""),
+        (".tautly/tmp/tracked.txt", "committed\n"),
+        (".tautly/config.toml", "max_turns = 10\n"),
+    ]);
+    repo.write(
+        ".tautly/tmp/spill/0123456789abcdef.txt",
+        "OPENAI_API_KEY=sk-x\n",
+    );
+    repo.write(".tautly/tmp/tracked.txt", "changed\n");
+    repo.write(".tautly/config.toml", "max_turns = 5\n");
+    let mut cp = repo.checkpointer(CheckpointConfig::default());
+    let made = cp.snapshot_now().await.unwrap();
+    let files = repo.git(&["ls-tree", "-r", "--name-only", &made.commit]);
+    assert!(!files.contains(".tautly/tmp/"), "{files}");
+    assert!(files.contains(".tautly/config.toml"), "{files}");
+    let config = repo.git(&["show", &format!("{}:.tautly/config.toml", made.commit)]);
+    assert_eq!(config, "max_turns = 5");
+}
+
 /// A real linked worktree keeps its checkpoints (in the shared repository).
 #[tokio::test]
 async fn linked_worktree_still_takes_checkpoints() {
