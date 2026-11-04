@@ -449,7 +449,21 @@ impl Config {
                     origin: Some(path.clone()),
                     message: e.to_string(),
                 })
-                .and_then(|cfg| cfg.check(Some(&path)))?;
+                .and_then(|cfg| cfg.check(Some(&path)))
+                .map_err(|e| match e {
+                    // Every other unusable project value was dropped above.
+                    ConfigError::Invalid { origin, message } if trust == Trust::Project => {
+                        ConfigError::Invalid {
+                            origin,
+                            message: format!(
+                                "{message} (a project config's `permissions` are never \
+                                 skipped: dropping a deny rule would loosen the policy; fix \
+                                 or remove this file)"
+                            ),
+                        }
+                    }
+                    e => e,
+                })?;
             deep_merge(&mut merged, layer);
         }
         deep_merge(&mut merged, cli_table(&cli));
@@ -647,7 +661,12 @@ const MIN_PROJECT_THRESHOLD: f64 = 0.5;
 ///   compaction nor raise the threshold);
 /// - `model` must be a priced model of the catalog the trusted layers produce, else a
 ///   repository could make every USD budget unenforceable;
-/// - `pins` are capped.
+/// - `pins` are capped;
+/// - a value the loader would reject in any of those settings (a limit that is not a
+///   positive number, a `model` that is not a string, a pin that is not a string) is
+///   dropped too, so a repository cannot stop startup with one. `permissions` is the
+///   exception: a malformed deny rule fails the load, since dropping it would loosen the
+///   policy.
 fn restrict_project_layer(
     layer: &mut Table,
     so_far: &Table,
@@ -668,6 +687,7 @@ fn restrict_project_layer(
             ignore(&key, "unknown setting");
         }
     }
+    drop_unusable_values(layer, &mut ignore);
 
     if let Some(Value::String(model)) = layer.get("model") {
         let catalog = trusted_catalog(so_far);
@@ -742,8 +762,7 @@ fn restrict_project_layer(
         let mut full = false;
         for pin in std::mem::take(pins) {
             let Value::String(text) = &pin else {
-                all.push(pin); // a type error, for the check to report
-                continue;
+                continue; // dropped by `drop_unusable_values`
             };
             if all.contains(&pin) {
                 continue; // an exact duplicate adds nothing
@@ -827,6 +846,90 @@ fn restrict_project_layer(
             path.display()
         ));
     }
+}
+
+/// Drop the project layer's values that would fail the load in settings that carry no
+/// deny rule (see [`restrict_project_layer`]), each with a warning.
+fn drop_unusable_values(layer: &mut Table, ignore: &mut impl FnMut(&str, &str)) {
+    let whole = "must be a whole number of at least 1";
+    let positive = |v: &Value| number(v).is_some_and(|n| n.is_finite() && n > 0.0);
+    if layer.get("model").is_some_and(|v| !v.is_str()) {
+        layer.remove("model");
+        ignore("model", "not a string");
+    }
+    for (key, max) in [
+        ("max_turns", i64::from(u32::MAX)),
+        ("turn_timeout_s", i64::MAX),
+    ] {
+        if layer.get(key).is_some_and(|v| !whole_number(v, max)) {
+            layer.remove(key);
+            ignore(key, whole);
+        }
+    }
+    if layer
+        .get("compaction_threshold")
+        .is_some_and(|v| number(v).is_none())
+    {
+        layer.remove("compaction_threshold");
+        ignore("compaction_threshold", "not a number");
+    }
+    match layer.get_mut("budget") {
+        Some(Value::Table(budget)) => {
+            for scope in ["turn", "session"] {
+                match budget.get_mut(scope) {
+                    Some(Value::Table(limits)) => {
+                        if limits.get("max_usd").is_some_and(|v| !positive(v)) {
+                            limits.remove("max_usd");
+                            ignore(
+                                &format!("budget.{scope}.max_usd"),
+                                "must be a positive number",
+                            );
+                        }
+                        if limits
+                            .get("max_tokens")
+                            .is_some_and(|v| !whole_number(v, i64::MAX))
+                        {
+                            limits.remove("max_tokens");
+                            ignore(&format!("budget.{scope}.max_tokens"), whole);
+                        }
+                    }
+                    Some(_) => {
+                        budget.remove(scope);
+                        ignore(&format!("budget.{scope}"), "not a table");
+                    }
+                    None => {}
+                }
+            }
+        }
+        Some(_) => {
+            layer.remove("budget");
+            ignore("budget", "not a table");
+        }
+        None => {}
+    }
+    match layer.get_mut("pins") {
+        Some(Value::Array(pins)) => {
+            let before = pins.len();
+            pins.retain(Value::is_str);
+            let bad = before - pins.len();
+            if bad > 0 {
+                ignore(
+                    "pins",
+                    &format!("dropped {bad} project pin(s) that are not strings"),
+                );
+            }
+        }
+        Some(_) => {
+            layer.remove("pins");
+            ignore("pins", "not a list of strings");
+        }
+        None => {}
+    }
+}
+
+/// An integer from 1 to `max`.
+fn whole_number(v: &Value, max: i64) -> bool {
+    matches!(v, Value::Integer(i) if (1..=max).contains(i))
 }
 
 /// Take the project layer's `[mcp.servers]` out of it: they never merge with the user's

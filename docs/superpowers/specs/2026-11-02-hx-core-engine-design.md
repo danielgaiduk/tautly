@@ -106,6 +106,8 @@ Dependencies only point downward (`tautly-acp → tautly-core`, `tautly-core →
 
 Any of these keys in the project layer, apart from `mcp.servers`, is dropped with a `Warning` (2.2).
 
+A project-layer value the loader would reject, in a setting that carries no deny rule (a limit or budget that is not a positive number, a `model` that is not a string, a pin that is not a string, `budget` that is not a table), is dropped with a `Warning` too, so a repository cannot stop startup with one. A malformed `permissions` (a deny rule that does not parse, a `mode` that is not a mode) and a project file that is not valid TOML still fail the load: dropping a deny rule would loosen the policy. The error names the file and says why it was not skipped.
+
 ## 3. Agent loop and protocol
 
 ### 3.1 Turn lifecycle
