@@ -347,7 +347,7 @@ pub(crate) struct Session {
     /// Wall-clock limit per user message.
     pub turn_timeout: Option<Duration>,
     /// Its background writer starts at [`Session::init`].
-    pub cost_ledger: CostLedger,
+    pub cost_ledger: Arc<CostLedger>,
     /// A dropped ledger row was reported; later ones are not.
     pub cost_ledger_reported: bool,
     /// The process groups this session's commands started (killed at shutdown).

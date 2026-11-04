@@ -257,6 +257,7 @@ impl EngineBuilder {
             config.model.as_str(),
         )));
         let groups = ProcessGroups::default();
+        let cost_ledger = Arc::new(CostLedger::new(data_home.join(LEDGER_FILE)));
         let checkpoints = config
             .checkpoints
             .enabled
@@ -320,7 +321,7 @@ impl EngineBuilder {
             session_id: session_id.clone(),
             budgets: Arc::clone(&budgets),
             turn_timeout: config.turn_timeout_s.map(Duration::from_secs),
-            cost_ledger: CostLedger::new(data_home.join(LEDGER_FILE)),
+            cost_ledger: Arc::clone(&cost_ledger),
             cost_ledger_reported: false,
             groups: groups.clone(),
             lost_write_paths: Default::default(),
@@ -343,6 +344,7 @@ impl EngineBuilder {
             current: Arc::clone(&current),
             budgets,
             groups: groups.clone(),
+            cost_ledger: Arc::clone(&session.cost_ledger),
         };
         runtime.spawn(actor.run(
             session,
@@ -471,6 +473,8 @@ struct Running {
     handle: JoinHandle<(Session, mpsc::UnboundedReceiver<Command>)>,
     cancel: CancellationToken,
     inbox: mpsc::UnboundedSender<Command>,
+    /// A user message's turn (its crash ends the turn); else a command's job.
+    turn: bool,
 }
 
 struct Actor {
@@ -483,6 +487,8 @@ struct Actor {
     current: Arc<Mutex<(String, PathBuf)>>,
     budgets: Arc<Mutex<Budgets>>,
     groups: ProcessGroups,
+    /// The session's cost ledger, flushed at shutdown.
+    cost_ledger: Arc<CostLedger>,
 }
 
 /// Collect the commands that arrive into `early` until a `Shutdown` (or the client going
@@ -617,7 +623,7 @@ impl Actor {
                         .await;
                 }
                 joined = async { (&mut running.as_mut().expect("guarded").handle).await }, if running.is_some() => {
-                    running = None;
+                    let turn = running.take().is_some_and(|r| r.turn);
                     match joined {
                         Ok((mut s, mut inbox)) => {
                             inbox.close();
@@ -626,7 +632,7 @@ impl Actor {
                             }
                             state = Some(s);
                         }
-                        Err(e) => self.crashed(e).await,
+                        Err(e) => self.crashed(e, turn).await,
                     }
                 }
             }
@@ -649,10 +655,9 @@ impl Actor {
         }
         self.with_log(|l| l.checkpoint()).await;
         // The episode's usage included: a client that exits once the event stream closes
-        // loses no row, unless the ledger is stuck.
-        if let Some(s) = state.as_ref() {
-            s.cost_ledger.flush(LEDGER_FLUSH).await;
-        }
+        // loses no row, unless the ledger is stuck. (Also after a crashed job lost the
+        // session: the actor keeps the ledger's handle.)
+        self.cost_ledger.flush(LEDGER_FLUSH).await;
     }
 
     /// A command from the channel: logged, then handled at once (shutdown, approvals,
@@ -763,6 +768,7 @@ impl Actor {
             inbox: inbox_rx,
             approvals: self.approvals.clone(),
         };
+        let turn = matches!(job, Job::Turn(_));
         let handle = tokio::spawn(async move {
             match job {
                 Job::Turn(text) => session.run_turn(text, &mut ctl).await,
@@ -775,6 +781,7 @@ impl Actor {
             handle,
             cancel,
             inbox: inbox_tx,
+            turn,
         }
     }
 
@@ -833,9 +840,11 @@ impl Actor {
         }
     }
 
-    /// A turn task panicked: an engine bug. The state it held is gone, but the log is
-    /// intact up to the crash (plus the panic's message), so the session can be resumed.
-    async fn crashed(&self, e: tokio::task::JoinError) {
+    /// A job panicked: an engine bug. The state it held is gone, but the log is intact up
+    /// to the crash (plus the panic's message), so the session can be resumed. Only a
+    /// user message's `turn` is ended (`TurnEnd`, `TurnFinished`): a command's job (a
+    /// compaction, a consolidation) started none.
+    async fn crashed(&self, e: tokio::task::JoinError, turn: bool) {
         let what = if e.is_panic() {
             let payload = e.into_panic();
             let text = payload
@@ -847,15 +856,15 @@ impl Actor {
         } else {
             format!("the turn stopped: {e}")
         };
-        let recs = [
-            SessionRecord::EngineError {
-                message: what.clone(),
-            },
-            SessionRecord::TurnEnd {
+        let mut recs = vec![SessionRecord::EngineError {
+            message: what.clone(),
+        }];
+        if turn {
+            recs.push(SessionRecord::TurnEnd {
                 reason: FinishReason::Error,
                 evidence: None,
-            },
-        ];
+            });
+        }
         self.with_log(move |l| {
             recs.iter().try_for_each(|r| l.append(r))?;
             l.checkpoint()
@@ -872,12 +881,14 @@ impl Actor {
                 hint: Some("resume the session to continue".into()),
             })
             .await;
-        self.events
-            .send_or_drop(Event::TurnFinished {
-                reason: FinishReason::Error,
-                evidence: None,
-            })
-            .await;
+        if turn {
+            self.events
+                .send_or_drop(Event::TurnFinished {
+                    reason: FinishReason::Error,
+                    evidence: None,
+                })
+                .await;
+        }
     }
 
     fn lost(&self) {

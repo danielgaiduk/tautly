@@ -235,11 +235,22 @@ impl Run {
     }
 
     /// Shut down and wait until the engine has stopped (its log is closed).
-    async fn stop(mut self) {
+    async fn stop(self) {
+        self.stop_events().await;
+    }
+
+    /// Shut down; the events until the stream closed.
+    async fn stop_events(mut self) -> Vec<Event> {
         self.send(Command::Shutdown).await;
-        let closed =
-            tokio::time::timeout(WAIT, async { while self.events.recv().await.is_some() {} }).await;
+        let mut out = Vec::new();
+        let closed = tokio::time::timeout(WAIT, async {
+            while let Some(ev) = self.events.recv().await {
+                out.push(ev);
+            }
+        })
+        .await;
         assert!(closed.is_ok(), "the engine did not stop");
+        out
     }
 }
 
@@ -1379,6 +1390,73 @@ async fn a_manual_compaction_can_be_cancelled() {
             .iter()
             .any(|r| matches!(r, SessionRecord::Compaction { .. }))
     );
+}
+
+/// A provider that panics on request `n` (0-based) and serves the mock otherwise: an
+/// engine bug in a job.
+struct PanicsOn {
+    mock: MockProvider,
+    n: usize,
+    seen: std::sync::atomic::AtomicUsize,
+}
+
+impl tautly_provider::Provider for PanicsOn {
+    fn name(&self) -> &str {
+        "mock"
+    }
+
+    fn stream(
+        &self,
+        req: CanonicalRequest,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> futures::stream::BoxStream<'static, Result<ProviderEvent, ProviderError>> {
+        let i = self.seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        assert_ne!(i, self.n, "probe: summary provider bug");
+        self.mock.stream(req, cancel)
+    }
+}
+
+/// Review A probe P7: a panic in a `Compact` job is no turn's end.
+#[tokio::test]
+async fn a_panic_in_a_compaction_job_logs_no_turn_end() {
+    let fx = Fx::new();
+    let mock = MockProvider::new((1..=3).map(|i| text_step(&format!("answer {i}"))).collect());
+    let provider = Arc::new(PanicsOn {
+        mock: mock.clone(),
+        n: 3,
+        seen: Default::default(),
+    });
+    let mut run = start(EngineBuilder {
+        provider: Some(provider),
+        ..fx.builder(config(Mode::Ask), &mock)
+    });
+    for i in 1..=3 {
+        run.turn_with(&format!("message {i}")).await;
+    }
+    run.send(Command::Compact).await;
+    let events = run
+        .until(|e| matches!(e, Event::Error { message, .. } if message.contains("panicked")))
+        .await;
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, Event::TurnFinished { .. })),
+        "{events:?}"
+    );
+    let path = run.engine.session_path().to_path_buf();
+    let rest = run.stop_events().await;
+    assert!(
+        !rest.iter().any(|e| matches!(e, Event::TurnFinished { .. })),
+        "{rest:?}"
+    );
+    let recs = records_at(&path);
+    let count = |f: fn(&SessionRecord) -> bool| recs.iter().filter(|r| f(r)).count();
+    assert_eq!(
+        count(|r| matches!(r, SessionRecord::TurnStart { .. })),
+        count(|r| matches!(r, SessionRecord::TurnEnd { .. })),
+        "{recs:?}"
+    );
+    assert_eq!(count(|r| matches!(r, SessionRecord::EngineError { .. })), 1);
 }
 
 // ------------------------------------------------------------------------------- undo
