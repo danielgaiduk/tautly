@@ -637,7 +637,8 @@ Every operation here creates a new branch or a new view. None truncates a log, a
 - **Partial states.** These cases give a *partial* state, reported with a note, and only tool edits are reverted:
   - no later checkpoint exists (a crash mid-turn, or outside git);
   - a `CheckpointSkipped` lies between the boundary and the chosen checkpoint (a command whose checkpoint was skipped, or a turn end skipped because the turn was cancelled, which lets the next turn's checkpoint, with human edits, be chosen);
-  - the chosen checkpoint is a `resume_start` one: the earlier session crashed after step N's results but before its turn-end checkpoint, and it holds whatever changed while no session ran (a `session_start` one is chosen only for the session's first boundaries, where it is exact).
+  - the chosen checkpoint is a `resume_start` one: the earlier session crashed after step N's results but before its turn-end checkpoint, and it holds whatever changed while no session ran (a `session_start` one is chosen only for the session's first boundaries, where it is exact);
+  - the chosen checkpoint has no `point` (written before the field existed, or by an older build resuming a newer log) or an `unknown` one, and step N's user turn has no `turn_end` checkpoint before it: it may be such a resume checkpoint, so it is read conservatively as partial.
 - **`expected_tip(session)`** is the files as the agent left them: the latest checkpoint plus later tool-edit post-images. A file whose disk hash differs from `expected_tip` was changed by someone else: a **human edit**.
 - **Working-tree lease.** Engines hold a shared `flock` on `<data home>/locks/<root-hash>.lock`. Rewind and switch need it exclusive. They are refused while another live session, in this process or another, uses the same working tree.
 
