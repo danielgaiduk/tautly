@@ -6,7 +6,7 @@ use std::sync::OnceLock;
 use tempfile::TempDir;
 
 /// The fixture binary next to the `tautly` binary, brought up to date once per test binary
-/// (`cargo test -p tautly-cli` alone does not rebuild another package's binary).
+/// (`cargo test -p tautly` alone does not rebuild another package's binary).
 fn fixture() -> &'static str {
     static PATH: OnceLock<String> = OnceLock::new();
     PATH.get_or_init(|| {

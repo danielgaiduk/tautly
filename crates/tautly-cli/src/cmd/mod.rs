@@ -110,11 +110,12 @@ impl Env {
         }
     }
 
-    /// The newest session that ran in this work tree.
+    /// The newest session that ran in this work tree and has a user turn.
     pub fn latest_session(&self) -> anyhow::Result<Option<LogSummary>> {
-        Ok(tautly_core::list_logs_here(&self.data_home, self.root())?
-            .into_iter()
-            .next())
+        Ok(tautly_core::sessions::latest_log_here(
+            &self.data_home,
+            self.root(),
+        )?)
     }
 }
 

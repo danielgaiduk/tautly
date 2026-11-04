@@ -139,10 +139,21 @@ impl Scratch {
 fn help_lists_the_commands() {
     let s = Scratch::new();
     let help = stdout(&s.run(&["--help"]));
+    // The subcommand lines ("  sessions  List, show ..."), not words in the prose.
+    let commands = help
+        .split("Commands:")
+        .nth(1)
+        .and_then(|rest| rest.split("\n\n").next())
+        .unwrap_or_default();
     for command in [
         "prompt", "sessions", "models", "undo", "memory", "index", "mcp",
     ] {
-        assert!(help.contains(command), "{command} missing from:\n{help}");
+        assert!(
+            commands
+                .lines()
+                .any(|l| l.starts_with(&format!("  {command} "))),
+            "{command} missing from:\n{help}"
+        );
     }
 }
 
@@ -223,6 +234,11 @@ fn models_dev() -> serde_json::Value {
                 "modalities": {"input": ["text", "image"], "output": ["text"]},
                 "cost": {"input": 2.5, "output": 12.0, "cache_read": 0.25, "cache_write": 3.0},
                 "limit": {"context": 123456, "output": 7777}
+            },
+            "claude-new-9": {
+                "id": "claude-new-9", "tool_call": true,
+                "cost": {"input": 4.0, "output": 20.0},
+                "limit": {"context": 100000, "output": 9000}
             }
         }},
         "openai": {"id": "openai", "models": {
@@ -268,16 +284,47 @@ async fn models_update_from_local_fixture_server() {
     assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
     let said = stdout(&out);
     assert!(
-        said.contains("1 updated") && said.contains("1 added"),
+        said.contains("1 updated") && said.contains("2 added"),
         "{said}"
     );
     let file = std::fs::read_to_string(s.home.path().join("models.toml")).unwrap();
+    // A built-in model keeps only what update changes: the rest stays the running
+    // version's. Models nobody knew get whole entries.
+    let sonnet_table: String = file
+        .split("\n[models.")
+        .find(|t| t.starts_with("\"anthropic/claude-sonnet-5-5\"]"))
+        .unwrap()
+        .to_string();
+    for frozen in [
+        "reasoning",
+        "edit_format",
+        "cache =",
+        "parallel_tools",
+        "tier",
+    ] {
+        assert!(
+            !sonnet_table.contains(frozen),
+            "{frozen} frozen in:\n{file}"
+        );
+    }
+    let gateway_table = file
+        .split("\n[models.")
+        .find(|t| t.starts_with("\"openai/gateway-1\"]"))
+        .unwrap();
+    assert!(gateway_table.contains("edit_format"), "{file}");
+    // Missing cache prices: 1.25x input for Anthropic, the input price for the others.
+    let table = |name: &str| {
+        file.split("\n[models.")
+            .find(|t| t.starts_with(name))
+            .unwrap_or_else(|| panic!("{name} missing from:\n{file}"))
+            .to_string()
+    };
     assert!(
-        file.contains("claude-sonnet-5-5") && file.contains("gateway-1"),
+        table("\"anthropic/claude-new-9\".price]").contains("cache_write = 5.0"),
         "{file}"
     );
     assert!(
-        !file.contains("no-price") && !file.contains("no-tools") && !file.contains("elsewhere"),
+        table("\"openai/gateway-1\".price]").contains("cache_write = 0.4"),
         "{file}"
     );
 
@@ -369,6 +416,39 @@ fn memory_list_without_entries_says_so() {
 }
 
 #[test]
+fn index_rebuild_refuses_while_a_session_holds_the_index() {
+    let s = Scratch::new();
+    s.write("a.rs", "fn one() {}\n");
+    assert_eq!(s.run(&["index", "status"]).status.code(), Some(0));
+    let dir = s.home.path().join("index");
+    let lock_file = std::fs::read_dir(&dir)
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .find(|p| p.to_string_lossy().ends_with(".db.lock"))
+        .expect("a session leaves the lock file");
+    let db = lock_file.with_extension("");
+    assert!(db.exists());
+    // What a running session does: hold the lock shared.
+    let held = std::fs::File::open(&lock_file).unwrap();
+    held.lock_shared().unwrap();
+    let out = s.run(&["index", "rebuild"]);
+    assert_eq!(out.status.code(), Some(1), "{}", stdout(&out));
+    assert!(
+        stderr(&out).contains("running tautly") && stderr(&out).contains("stop it"),
+        "{}",
+        stderr(&out)
+    );
+    assert!(db.exists(), "the database is untouched");
+    // Status (a reader) is fine meanwhile; once the session is gone, rebuild works.
+    assert_eq!(s.run(&["index", "status"]).status.code(), Some(0));
+    drop(held);
+    let out = s.run(&["index", "rebuild"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert!(stdout(&out).contains("files: 1"), "{}", stdout(&out));
+}
+
+#[test]
 fn index_status_reports_file_and_symbol_counts() {
     let s = Scratch::new();
     s.write("a.rs", "fn one() {}\nfn two() {}\n");
@@ -432,22 +512,63 @@ fn mcp_import_from_claude_json_preserves_comments() {
 }
 
 #[test]
-fn mcp_import_defaults_to_claude_json_in_home_else_mcp_json_here() {
+fn mcp_import_defaults_to_claude_json_and_will_not_trust_the_repository_unasked() {
+    use std::os::unix::fs::PermissionsExt as _;
+
     let s = Scratch::new();
     // Neither exists.
     let out = s.run(&["mcp", "import"]);
     assert_eq!(out.status.code(), Some(1));
     assert!(stderr(&out).contains(".claude.json"), "{}", stderr(&out));
-    // ./.mcp.json.
-    s.write(".mcp.json", r#"{"mcpServers": {"here": {"command": "x"}}}"#);
+
+    // The repository's .mcp.json is content a clone brought: without a terminal and without
+    // --from it is refused, after showing what it would make trusted.
+    s.write(
+        ".mcp.json",
+        r#"{"mcpServers": {"here": {"command": "x", "args": ["--serve"], "env": {"TOKEN": "s3cret"}}}}"#,
+    );
     let out = s.run(&["mcp", "import"]);
+    assert_eq!(out.status.code(), Some(1), "{}", stdout(&out));
+    let err = stderr(&out);
+    assert!(
+        err.contains("here: stdio: x --serve") && err.contains("TOKEN"),
+        "what it would import: {err}"
+    );
+    assert!(!err.contains("s3cret"), "values are not shown: {err}");
+    assert!(err.contains("--from"), "{err}");
+    assert!(!s.config().exists(), "nothing was written");
+    // Found in the work tree's root, not in the directory the command runs in.
+    // (The work tree's root is the repository's top: mark this directory as one.)
+    std::fs::create_dir(s.work.path().join(".git")).unwrap();
+    std::fs::create_dir(s.work.path().join("sub")).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_tautly"))
+        .args(["mcp", "import"])
+        .current_dir(s.work.path().join("sub"))
+        .env("TAUTLY_HOME", s.home.path())
+        .env("HOME", s.home.path())
+        .output()
+        .unwrap();
+    let root = s.work.path().canonicalize().unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        stderr(&out).contains(&root.join(".mcp.json").display().to_string()),
+        "{}",
+        stderr(&out)
+    );
+
+    // Naming the file is the user's choice: imported, with what runs shown.
+    let out = s.run(&["mcp", "import", "--from", ".mcp.json"]);
     assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert!(stdout(&out).contains("x --serve"), "{}", stdout(&out));
     assert!(
         std::fs::read_to_string(s.config())
             .unwrap()
             .contains("[mcp.servers.here]")
     );
-    // ~/.claude.json wins over it.
+
+    // ~/.claude.json is the user's own file: the default, imported without asking. A new
+    // config file is owner-only (it may hold tokens).
+    std::fs::remove_file(s.config()).unwrap();
     std::fs::write(
         s.home.path().join(".claude.json"),
         r#"{"mcpServers": {"homey": {"command": "y"}}}"#,
@@ -455,8 +576,11 @@ fn mcp_import_defaults_to_claude_json_in_home_else_mcp_json_here() {
     .unwrap();
     let out = s.run(&["mcp", "import"]);
     assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert!(stdout(&out).contains("homey: stdio: y"), "{}", stdout(&out));
     let config = std::fs::read_to_string(s.config()).unwrap();
     assert!(config.contains("[mcp.servers.homey]"), "{config}");
+    let mode = std::fs::metadata(s.config()).unwrap().permissions().mode();
+    assert_eq!(mode & 0o777, 0o600, "{mode:o}");
 }
 
 #[test]

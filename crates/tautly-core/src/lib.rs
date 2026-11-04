@@ -35,7 +35,7 @@ pub use checkpoint::{CheckpointError, CheckpointRef, Checkpointer, RestorePlan, 
 pub use config::{
     BudgetConfig, BudgetLimits, CheckpointConfig, CliOverrides, CompatEntry, Config, ConfigError,
     LoadedConfig, MODELS_FILE, ProviderEntry, ProvidersConfig, RoutingConfig, TelemetryConfig,
-    config_home,
+    config_home, parse_models_file,
 };
 pub use engine::{Engine, EngineBuilder, EngineError, session_root};
 pub use evidence::{
@@ -52,7 +52,7 @@ pub use protocol::{
 pub use provider_setup::{ProviderFactory, ProviderSetupError, known_provider, provider_label};
 pub use record::SessionRecord;
 pub use signals::{Signal, SignalPolicy, SignalRouter, handle_signals, install_signal_handlers};
-pub use workspace::{Workspace, Workspaces};
+pub use workspace::{IndexLockError, Workspace, Workspaces};
 // Types that appear in `Event` and `Command`, re-exported so clients need no other crate.
 pub use tautly_context::{Breakdown, MutationReason};
 pub use tautly_mcp::{McpConfig, ServerSource, ServerSpec};

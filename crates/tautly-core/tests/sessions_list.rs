@@ -36,7 +36,8 @@ fn lists_newest_first_with_first_line_cut_and_cost() {
     std::thread::sleep(Duration::from_millis(5));
     let b = session(data.path(), work.path(), Some(&long));
     std::thread::sleep(Duration::from_millis(5));
-    let c = session(data.path(), work.path(), None);
+    // A session that never got a message is not listed.
+    session(data.path(), work.path(), None);
     let ledger = Ledger::open(&data.path().join("ledger.sqlite")).unwrap();
     ledger
         .record(
@@ -49,13 +50,12 @@ fn lists_newest_first_with_first_line_cut_and_cost() {
 
     let all = sessions::list_in(data.path(), work.path(), 10);
     let ids: Vec<&str> = all.iter().map(|s| s.id.as_str()).collect();
-    assert_eq!(ids, [c.as_str(), b.as_str(), a.as_str()]);
-    assert_eq!(all[2].first_prompt, "fix the parser");
-    assert_eq!(all[1].first_prompt.chars().count(), 60);
-    assert_eq!(all[0].first_prompt, "");
-    assert_eq!(all[2].cost_usd, Some(0.25));
-    assert_eq!(all[1].cost_usd, None);
-    assert!(all[2].started <= SystemTime::now());
+    assert_eq!(ids, [b.as_str(), a.as_str()]);
+    assert_eq!(all[1].first_prompt, "fix the parser");
+    assert_eq!(all[0].first_prompt.chars().count(), 60);
+    assert_eq!(all[1].cost_usd, Some(0.25));
+    assert_eq!(all[0].cost_usd, None);
+    assert!(all[1].started <= SystemTime::now());
     assert_eq!(sessions::list_in(data.path(), work.path(), 2).len(), 2);
     assert_eq!(sessions::list_in(data.path(), work.path(), 0).len(), 0);
 }
@@ -85,4 +85,28 @@ fn another_work_tree_or_an_empty_data_home_lists_nothing() {
     session(data.path(), work.path(), Some("a"));
     assert!(sessions::list_in(data.path(), other.path(), 5).is_empty());
     assert!(sessions::list_in(&data.path().join("nope"), work.path(), 5).is_empty());
+}
+
+#[test]
+fn a_session_without_turns_is_not_the_latest() {
+    let (data, work) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+    let with_turn = session(data.path(), work.path(), Some("real work"));
+    std::thread::sleep(Duration::from_millis(5));
+    session(data.path(), work.path(), None);
+    assert_eq!(
+        sessions::latest_here(data.path(), work.path()).unwrap(),
+        Some(with_turn.clone())
+    );
+    assert_eq!(
+        sessions::latest_log_here(data.path(), work.path())
+            .unwrap()
+            .map(|s| s.id),
+        Some(with_turn)
+    );
+    let (data, work) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+    session(data.path(), work.path(), None);
+    assert_eq!(
+        sessions::latest_here(data.path(), work.path()).unwrap(),
+        None
+    );
 }

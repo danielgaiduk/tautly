@@ -788,6 +788,124 @@ fn undo_session_flag_names_the_session() {
 }
 
 #[test]
+fn consolidate_leaves_no_session_so_undo_and_continue_still_work() {
+    let s = Scratch::new();
+    s.write("a.txt", "old\n");
+    s.write(".tautly/memory/note-a.md", MEM_A);
+    let id = s.prompt(
+        "edit",
+        json!([write_content("a.txt", "new\n"), text("ok")]),
+        &[],
+    );
+    let out = consolidate(&s, r#"[{"delete": "note-a"}]"#, "y\n");
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert!(!s.exists(".tautly/memory/note-a.md"), "the change was made");
+    // The consolidation's own session is gone: the edit session is the only one listed...
+    let list = out_text(&s.run(&["sessions", "list"]));
+    let rows: Vec<&str> = list.lines().skip(1).collect();
+    assert_eq!(rows.len(), 1, "{list}");
+    assert!(rows[0].contains(&id), "{list}");
+    // ...and the newest, for `undo`...
+    let out = s.run(&["undo"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert_eq!(s.read("a.txt"), "old\n");
+    // ...and for `--continue`.
+    let again = s.prompt("again", json!([text("fine")]), &["--continue"]);
+    assert_eq!(again, id);
+}
+
+/// A `--rpc` server on a script, with a session that has run one turn of editing `a.txt`
+/// (and is still open); its stdin, stdout and the child.
+fn open_session(
+    s: &Scratch,
+) -> (
+    Child,
+    std::process::ChildStdin,
+    std::io::BufReader<std::process::ChildStdout>,
+) {
+    let script = s.script(
+        "rpc.json",
+        json!([write_content("a.txt", "new\n"), text("ok")]),
+    );
+    let mut child = s
+        .command(&["--rpc", "--approve", "auto-edit", "--mock-script", &script])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = std::io::BufReader::new(child.stdout.take().unwrap());
+    let init = json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}});
+    let send =
+        json!({"jsonrpc": "2.0", "id": 2, "method": "send_message", "params": {"text": "edit"}});
+    writeln!(stdin, "{init}").unwrap();
+    writeln!(stdin, "{send}").unwrap();
+    read_until(&mut stdout, |m| {
+        m["params"]["event"]["type"] == "turn_finished"
+    });
+    (child, stdin, stdout)
+}
+
+#[test]
+fn undo_refuses_a_session_a_running_tautly_holds() {
+    let s = Scratch::new();
+    s.write("a.txt", "old\n");
+    let (child, stdin, stdout) = open_session(&s);
+    assert_eq!(s.read("a.txt"), "new\n");
+    let out = s.run(&["undo"]);
+    assert_eq!(out.status.code(), Some(1), "{}", out_text(&out));
+    assert!(stderr(&out).contains("running tautly"), "{}", stderr(&out));
+    assert_eq!(s.read("a.txt"), "new\n", "nothing was written");
+    // Once the server is gone the same undo works.
+    drop(stdin);
+    drop(stdout);
+    let end = child.wait_with_output().unwrap();
+    assert_eq!(end.status.code(), Some(0), "{}", stderr(&end));
+    let out = s.run(&["undo"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert_eq!(s.read("a.txt"), "old\n");
+}
+
+#[test]
+fn undo_of_a_session_without_turns_says_so() {
+    let s = Scratch::new();
+    let script = s.script("rpc.json", json!([text("unused")]));
+    let mut child = s
+        .command(&["--rpc", "--mock-script", &script])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = std::io::BufReader::new(child.stdout.take().unwrap());
+    let init = json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}});
+    writeln!(stdin, "{init}").unwrap();
+    let seen = read_until(&mut stdout, |m| m["id"] == 1);
+    let id = seen.last().unwrap()["result"]["session_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    drop(stdin);
+    drop(stdout);
+    assert_eq!(child.wait_with_output().unwrap().status.code(), Some(0));
+    // Not listed, and not what `undo` picks...
+    assert!(out_text(&s.run(&["sessions", "list"])).contains("no sessions"));
+    let out = s.run(&["undo"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(stderr(&out).contains("nothing to undo"), "{}", stderr(&out));
+    // ...and named, it says why there is nothing to undo.
+    let out = s.run(&["undo", "--session", &id]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        stderr(&out).contains("has no user turns") && stderr(&out).contains(&id),
+        "{}",
+        stderr(&out)
+    );
+}
+
+#[test]
 fn memory_consolidate_with_nothing_to_do_says_so() {
     let s = Scratch::new();
     let out = consolidate(&s, "[]", "");

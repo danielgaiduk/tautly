@@ -103,6 +103,7 @@ async fn consolidate(env: &Env, cli: &Cli) -> anyhow::Result<i32> {
     let root = env.root().to_path_buf();
     let (engine, mut events) =
         tokio::task::spawn_blocking(move || settings.build(&root, None, true, None)).await??;
+    let session_id = engine.current_session().0;
     let _ = engine.send(EngineCommand::ConsolidateMemory).await;
     // The engine runs commands in order and answers `Diff` at once: its answer says the
     // consolidation is over, which has no event of its own.
@@ -118,18 +119,23 @@ async fn consolidate(env: &Env, cli: &Cli) -> anyhow::Result<i32> {
             } => proposals.push((proposal_id, change, replaces)),
             Event::Warning { message } => eprintln!("tautly: {message}"),
             Event::SessionDiff { .. } => break,
-            Event::Error { message, .. } if message.starts_with("diff:") => break,
+            // Consolidation reports its own problems as warnings, so an error is the
+            // answer to the barrier (`diff: ...`), or the session is lost (it would never
+            // answer): either way nothing more comes.
             Event::Error { message, hint, .. } => {
-                eprintln!("tautly: {message}");
-                if let Some(hint) = hint {
-                    eprintln!("tautly: {hint}");
+                if !message.starts_with("diff:") {
+                    eprintln!("tautly: {message}");
+                    if let Some(hint) = hint {
+                        eprintln!("tautly: {hint}");
+                    }
                 }
+                break;
             }
             _ => {}
         }
     }
 
-    let (mut applied, mut rejected) = (0, 0);
+    let (mut approved, mut rejected) = (Vec::new(), 0);
     let mut input = std::io::stdin().lock();
     let mut asking = true;
     let total = proposals.len();
@@ -150,7 +156,7 @@ async fn consolidate(env: &Env, cli: &Cli) -> anyhow::Result<i32> {
             }
         };
         if yes {
-            applied += 1;
+            approved.push(proposal_id.clone());
             let _ = engine
                 .send(EngineCommand::ApproveMemory { proposal_id })
                 .await;
@@ -162,17 +168,55 @@ async fn consolidate(env: &Env, cli: &Cli) -> anyhow::Result<i32> {
         }
     }
     let _ = engine.send(EngineCommand::Shutdown).await;
+    let mut warnings = Vec::new();
     while let Some(event) = events.recv().await {
         if let Event::Warning { message } = event {
             eprintln!("tautly: {message}");
+            warnings.push(message);
         }
     }
+    drop(engine);
+    // An approval the engine could not save stays pending (and says so): not applied.
+    let failed = approved
+        .iter()
+        .filter(|id| {
+            warnings.iter().any(|w| {
+                w.contains(id.as_str())
+                    && (w.contains("could not be saved") || w.contains("is pending"))
+            })
+        })
+        .count();
+    let applied = approved.len() - failed;
     if total == 0 {
         println!("the side model proposed no changes");
+    } else if failed > 0 {
+        println!("{applied} applied, {rejected} rejected, {failed} could not be saved");
     } else {
         println!("{applied} applied, {rejected} rejected");
     }
+    // The memory files are the result; the session that made the proposals has no turns
+    // and must not become the newest session (`undo`, `--continue`).
+    if let Err(e) = remove_session(env, &session_id).await {
+        eprintln!("tautly: could not remove the consolidation session {session_id}: {e}");
+    }
     Ok(0)
+}
+
+/// Delete session `id` once the engine has let go of its log (it does so as it stops).
+async fn remove_session(env: &Env, id: &str) -> anyhow::Result<()> {
+    let sandbox = env.workspace.sandbox();
+    let mut last = None;
+    for _ in 0..40 {
+        match tautly_core::sessions::delete(&env.data_home, sandbox.as_ref(), id).await {
+            Ok(_) => return Ok(()),
+            Err(e @ tautly_core::sessions::DeleteError::Running(_)) => {
+                last = Some(e);
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Err(last.map_or_else(|| anyhow::anyhow!("still running"), Into::into))
 }
 
 /// One proposal: what it writes and which entries it replaces or deletes.

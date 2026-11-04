@@ -10,7 +10,9 @@ use std::time::Duration;
 use anyhow::{Context as _, anyhow, bail};
 use clap::Subcommand;
 use serde_json::Value;
-use tautly_core::{Catalog, CliOverrides, Config, MODELS_FILE, ModelId, ModelInfo, Price};
+use tautly_core::{
+    Catalog, CliOverrides, Config, MODELS_FILE, ModelId, ModelInfo, Price, parse_models_file,
+};
 
 use super::Env;
 
@@ -92,21 +94,18 @@ async fn update(from: &str) -> anyhow::Result<i32> {
     let dir = tautly_core::config_home().map_err(|e| anyhow!("no config directory: {e}"))?;
     let file = dir.join(MODELS_FILE);
     let existing = match std::fs::read_to_string(&file) {
-        // A file with only comments has no `models` table: an empty catalog.
-        Ok(text) => Catalog::from_toml(&text)
-            .or_else(|_| Catalog::from_toml(&format!("{text}\n[models]\n")))
-            .with_context(|| {
-                format!(
-                    "{} is not a model catalog; fix or delete it, then update again",
-                    file.display()
-                )
-            })?,
+        Ok(text) => parse_models_file(&text).map_err(|e| {
+            anyhow!(
+                "{} is not a model catalog ({e}); fix or delete it, then update again",
+                file.display()
+            )
+        })?,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Catalog::default(),
         Err(e) => return Err(e).with_context(|| format!("cannot read {}", file.display())),
     };
     let doc = fetch(from).await?;
     let merged = merge(&Catalog::builtin(), &existing, &doc);
-    let text = render(from, &merged.entries)?;
+    let text = render(from, &Catalog::builtin(), &merged.entries)?;
     write_atomically(&file, &text)?;
     println!(
         "{} updated, {} added, {} unchanged (from {from})",
@@ -156,16 +155,26 @@ struct Merged {
     unchanged: u32,
 }
 
-/// The entries of `existing` (the current models.toml) with the models of `doc` applied: a
-/// model the catalog knows keeps its other fields and takes the document's window, output
-/// limit, image support and price; one it does not know is added with conservative
-/// capabilities (no reasoning or cache control, hashline edits, no parallel tools). Only
-/// models of providers Tautly has adapters for that can call tools and have a price and
-/// limits are used. An entry that equals the built-in one is not written.
+/// The entries of `existing` (the current models.toml, as the loader reads it) with the
+/// models of `doc` applied: a built-in model takes the document's window, output limit,
+/// image support and price over its built-in entry (the rest is the running version's, so
+/// `render` writes only these fields); a model only the file knows keeps its entry's other
+/// fields; one nobody knows is added with conservative capabilities (no reasoning or cache
+/// control, hashline edits, no parallel tools). Only models of providers Tautly has
+/// adapters for that can call tools and have a price and limits are used. An entry that
+/// equals the built-in one is not written.
 fn merge(builtin: &Catalog, existing: &Catalog, doc: &Value) -> Merged {
     let mut entries: BTreeMap<String, ModelInfo> = existing
         .ids()
-        .map(|id| (id.as_str().to_string(), existing.get(&id)))
+        .map(|id| {
+            let info = existing.get(&id);
+            let info = if builtin.contains(&id) {
+                persisted_over(builtin.get(&id), &info)
+            } else {
+                info
+            };
+            (id.as_str().to_string(), info)
+        })
         .collect();
     let (mut updated, mut added, mut unchanged) = (0, 0, 0);
     for provider in PROVIDERS {
@@ -179,15 +188,24 @@ fn merge(builtin: &Catalog, existing: &Catalog, doc: &Value) -> Merged {
         for (key, m) in models {
             let name = m.get("id").and_then(Value::as_str).unwrap_or(key);
             let id = format!("{provider}/{name}");
-            let Some(source) = Source::read(m).filter(|_| plain_id(&id)) else {
+            let Some(source) = Source::read(m, provider).filter(|_| plain_id(&id)) else {
                 continue;
             };
-            let known = entries.contains_key(&id) || builtin.contains(&ModelId::from(id.as_str()));
+            let model = ModelId::from(id.as_str());
+            let in_builtin = builtin.contains(&model);
+            let known = entries.contains_key(&id) || in_builtin;
+            // What the model is now (for the counts), and what to build on: a built-in
+            // model on its built-in entry, never on a copy of it from an older update.
             let before = entries
                 .get(&id)
                 .cloned()
-                .unwrap_or_else(|| builtin.get(&ModelId::from(id.as_str())));
-            let after = source.apply(before.clone(), known);
+                .unwrap_or_else(|| builtin.get(&model));
+            let base = if in_builtin {
+                builtin.get(&model)
+            } else {
+                before.clone()
+            };
+            let after = source.apply(base, known);
             match (known, after == before) {
                 (true, true) => unchanged += 1,
                 (true, false) => updated += 1,
@@ -209,6 +227,16 @@ fn merge(builtin: &Catalog, existing: &Catalog, doc: &Value) -> Merged {
     }
 }
 
+/// `base` (a built-in entry) with the fields `update` keeps for a built-in model taken from
+/// `entry`: the window, output limit, image support and price.
+fn persisted_over(mut base: ModelInfo, entry: &ModelInfo) -> ModelInfo {
+    base.caps.context_window = entry.caps.context_window;
+    base.caps.max_output = entry.caps.max_output;
+    base.caps.images = entry.caps.images;
+    base.price = entry.price;
+    base
+}
+
 /// The numbers of one models.dev model.
 struct Source {
     context: u32,
@@ -216,12 +244,15 @@ struct Source {
     images: Option<bool>,
     input: f64,
     price_output: f64,
-    cache_read: f64,
-    cache_write: f64,
+    cache_read: Option<f64>,
+    cache_write: Option<f64>,
+    /// The cache write price when the source gives none: Anthropic charges 1.25 times the
+    /// input price for a cache write, the others bill no extra.
+    default_cache_write: f64,
 }
 
 impl Source {
-    fn read(m: &Value) -> Option<Source> {
+    fn read(m: &Value, provider: &str) -> Option<Source> {
         if m.get("tool_call").and_then(Value::as_bool) == Some(false) {
             return None;
         }
@@ -246,9 +277,13 @@ impl Source {
                 .map(|a| a.iter().any(|v| v.as_str() == Some("image"))),
             input,
             price_output: cost("output")?,
-            // A cache price the source does not give is the plain input price.
-            cache_read: cost("cache_read").unwrap_or(input),
-            cache_write: cost("cache_write").unwrap_or(input),
+            cache_read: cost("cache_read"),
+            cache_write: cost("cache_write"),
+            default_cache_write: if provider == "anthropic" {
+                input * 1.25
+            } else {
+                input
+            },
         })
     }
 
@@ -260,19 +295,24 @@ impl Source {
         if let Some(images) = self.images {
             info.caps.images = images;
         }
-        if let Some(price) = info.price.as_mut().filter(|_| known) {
-            price.input = self.input;
-            price.output = self.price_output;
-            price.cache_read = self.cache_read;
-            price.cache_write = self.cache_write;
-        } else {
-            info.price = Some(Price {
-                input: self.input,
-                output: self.price_output,
-                cache_read: self.cache_read,
-                cache_write: self.cache_write,
-            });
-        }
+        // A cache price the source does not give stays what the entry has; for a new price
+        // it is the input price (a read) or the provider's usual write price.
+        let (read, write) = match info.price.filter(|_| known) {
+            Some(p) => (
+                self.cache_read.unwrap_or(p.cache_read),
+                self.cache_write.unwrap_or(p.cache_write),
+            ),
+            None => (
+                self.cache_read.unwrap_or(self.input),
+                self.cache_write.unwrap_or(self.default_cache_write),
+            ),
+        };
+        info.price = Some(Price {
+            input: self.input,
+            output: self.price_output,
+            cache_read: read,
+            cache_write: write,
+        });
         info
     }
 }
@@ -295,33 +335,45 @@ fn plain_id(id: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b"._:/-".contains(&b))
 }
 
-/// The file text: a header, then one `[models."<id>"]` table per entry. Checked by reading
-/// it back as a catalog.
-fn render(from: &str, entries: &BTreeMap<String, ModelInfo>) -> anyhow::Result<String> {
+/// The file text: a header, then one `[models."<id>"]` table per entry: the window, output
+/// limit, image support and price for a built-in model (its other fields are the running
+/// version's, see `tautly_core::parse_models_file`), the whole entry for any other. Checked
+/// by reading it back as the loader does.
+fn render(
+    from: &str,
+    builtin: &Catalog,
+    entries: &BTreeMap<String, ModelInfo>,
+) -> anyhow::Result<String> {
     let mut out = format!(
         "# Written by `tautly models update` from {from}.\n\
          # Entries here replace the built-in catalog's (and `[catalog_overrides]` in\n\
-         # config.toml replaces these); delete the file to go back to the built-in catalog.\n"
+         # config.toml replaces these); delete the file to go back to the built-in catalog.\n\
+         # An entry of a built-in model holds only what update changes (window, output limit,\n\
+         # images, prices): the rest comes from the built-in entry, and other edits belong in\n\
+         # `[catalog_overrides]` of config.toml.\n"
     );
     for (id, info) in entries {
         let c = &info.caps;
         let _ = write!(
             out,
-            "\n[models.{id:?}]\ncontext_window = {}\nmax_output = {}\nparallel_tools = {}\n\
-             reasoning = {:?}\ncache = {:?}\nimages = {}\nedit_format = {:?}\n",
-            c.context_window,
-            c.max_output,
-            c.parallel_tools,
-            name!(&c.reasoning),
-            name!(&c.cache),
-            c.images,
-            name!(&c.edit_format),
+            "\n[models.{id:?}]\ncontext_window = {}\nmax_output = {}\nimages = {}\n",
+            c.context_window, c.max_output, c.images
         );
-        if let Some(tier) = &info.tier {
-            let _ = writeln!(out, "tier = {:?}", name!(tier));
-        }
-        if let (Some(ttl), false) = (info.cache_ttl_s, name!(&c.cache) == "none") {
-            let _ = writeln!(out, "cache_ttl_s = {ttl}");
+        if !builtin.contains(&ModelId::from(id.as_str())) {
+            let _ = write!(
+                out,
+                "parallel_tools = {}\nreasoning = {:?}\ncache = {:?}\nedit_format = {:?}\n",
+                c.parallel_tools,
+                name!(&c.reasoning),
+                name!(&c.cache),
+                name!(&c.edit_format),
+            );
+            if let Some(tier) = &info.tier {
+                let _ = writeln!(out, "tier = {:?}", name!(tier));
+            }
+            if let (Some(ttl), false) = (info.cache_ttl_s, name!(&c.cache) == "none") {
+                let _ = writeln!(out, "cache_ttl_s = {ttl}");
+            }
         }
         if let Some(p) = info.price {
             let _ = write!(
@@ -332,7 +384,8 @@ fn render(from: &str, entries: &BTreeMap<String, ModelInfo>) -> anyhow::Result<S
             );
         }
     }
-    let parsed = Catalog::from_toml(&out).context("the new catalog does not read back")?;
+    let parsed =
+        parse_models_file(&out).map_err(|e| anyhow!("the new catalog does not read back: {e}"))?;
     for (id, info) in entries {
         let id = ModelId::from(id.as_str());
         if parsed.get(&id) != *info {

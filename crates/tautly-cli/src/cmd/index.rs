@@ -21,8 +21,10 @@ pub enum Cmd {
 pub async fn run(cmd: Cmd, env: &Env) -> anyhow::Result<i32> {
     let ws = &env.workspace;
     if matches!(cmd, Cmd::Rebuild) {
-        // Before anything opens it. (A session running in this work tree keeps its open
-        // handle on the removed file until it ends.)
+        // A running session holds the index's lock shared: with one running, the database
+        // is not deleted from under it. Held through the deletes, released before the
+        // rebuild below opens the index again.
+        let lock = ws.try_lock_index_exclusive()?;
         let db = ws.index_db();
         for suffix in ["", "-wal", "-shm"] {
             let mut file = db.clone().into_os_string();
@@ -36,6 +38,7 @@ pub async fn run(cmd: Cmd, env: &Env) -> anyhow::Result<i32> {
                 ),
             }
         }
+        drop(lock);
     }
     // Opening brings the index up to date with the files: the counts are the work tree's.
     ws.start();

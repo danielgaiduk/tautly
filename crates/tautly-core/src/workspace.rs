@@ -11,6 +11,8 @@
 //! [`Workspaces`] hands every session a process starts on one root the same workspace.
 
 use std::collections::HashMap;
+use std::fs::{File, OpenOptions};
+use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, RwLock, Weak};
@@ -23,6 +25,43 @@ use tokio::sync::watch;
 
 use crate::engine::{EngineError, session_root};
 
+/// Why the index database could not be locked exclusively.
+#[derive(Debug, thiserror::Error)]
+pub enum IndexLockError {
+    #[error("a running tautly is using this work tree's code index; stop it first")]
+    Busy,
+    #[error("cannot lock the code index: {0}")]
+    Io(#[from] std::io::Error),
+}
+
+/// `<db>.lock`, next to the index database.
+fn index_lock_path(db: &Path) -> PathBuf {
+    let mut name = db.as_os_str().to_os_string();
+    name.push(".lock");
+    PathBuf::from(name)
+}
+
+/// The lock file, created (owner-only) with its directory when it is missing.
+fn open_index_lock(path: &Path) -> std::io::Result<File> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(path)
+}
+
+/// Lock shared; waits while a rebuild holds the lock (it holds it only to delete files).
+fn lock_index_shared(path: &Path) -> std::io::Result<File> {
+    let file = open_index_lock(path)?;
+    file.lock_shared()?;
+    Ok(file)
+}
+
 /// What opening produced. Each part may be missing; `warnings` says why.
 pub(crate) struct Opened {
     pub index: Option<Arc<Index>>,
@@ -30,6 +69,10 @@ pub(crate) struct Opened {
     pub warnings: Vec<String>,
     /// Keeps the file watcher running for as long as the workspace lives.
     _watch: Mutex<Option<WatchHandle>>,
+    /// The shared lock on the index database's lock file, held for the workspace's life:
+    /// `tautly index rebuild` takes it exclusively, so it cannot delete the database under
+    /// a running session.
+    _index_lock: Option<File>,
 }
 
 pub struct Workspace {
@@ -68,6 +111,19 @@ impl Workspace {
         let mut warnings = Vec::new();
         let root = self.sandbox.root().to_path_buf();
         let db = self.index_db();
+        let lock_file = index_lock_path(&db);
+        let locked = tokio::task::spawn_blocking(move || lock_index_shared(&lock_file)).await;
+        let index_lock = match locked {
+            Ok(Ok(f)) => Some(f),
+            Ok(Err(e)) => {
+                warnings.push(format!(
+                    "code index lock unavailable ({e}); `tautly index rebuild` would not \
+                     notice this session"
+                ));
+                None
+            }
+            Err(_) => None,
+        };
         let sb = Arc::clone(&self.sandbox);
         let index = match tokio::task::spawn_blocking(move || Index::open(&db, sb)).await {
             Ok(Ok(index)) => Some(Arc::new(index)),
@@ -136,6 +192,7 @@ impl Workspace {
             memory,
             warnings,
             _watch: Mutex::new(handle),
+            _index_lock: index_lock,
         }
     }
 
@@ -149,6 +206,19 @@ impl Workspace {
             "{}.db",
             tautly_session::paths::project_hash(self.sandbox.root())
         ))
+    }
+
+    /// Take the index database's lock exclusively, without waiting: `tautly index rebuild`
+    /// holds the returned file while it deletes the database, so no running session (each
+    /// holds the lock shared from [`start`](Self::start) on) has it open. Dropping the
+    /// file releases the lock.
+    pub fn try_lock_index_exclusive(&self) -> Result<File, IndexLockError> {
+        let file = open_index_lock(&index_lock_path(&self.index_db()))?;
+        match file.try_lock() {
+            Ok(()) => Ok(file),
+            Err(std::fs::TryLockError::WouldBlock) => Err(IndexLockError::Busy),
+            Err(std::fs::TryLockError::Error(e)) => Err(IndexLockError::Io(e)),
+        }
     }
 
     pub fn sandbox(&self) -> &Arc<dyn Sandbox> {

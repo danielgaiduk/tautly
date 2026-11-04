@@ -950,8 +950,50 @@ fn retain_known(
 }
 
 /// The models file next to the user config file: `[models."provider/model"]` entries, as
-/// `tautly models update` writes them.
+/// `tautly models update` writes them. An entry of a built-in model may hold only some
+/// fields (`models update` writes the window, output limit, image support and prices): the
+/// rest comes from the built-in entry of the running version, so a later release's changes
+/// to a model's capabilities are not frozen out.
 pub const MODELS_FILE: &str = "models.toml";
+
+/// `models` with each entry of a built-in model laid over its current built-in entry,
+/// checked as a catalog.
+fn overlay_models(mut models: Table) -> Result<Table, String> {
+    if let Some(Value::Table(entries)) = models.get_mut("models") {
+        let builtin = match Value::try_from(Catalog::builtin()) {
+            Ok(Value::Table(mut t)) => match t.remove("models") {
+                Some(Value::Table(m)) => m,
+                _ => Table::new(),
+            },
+            _ => Table::new(),
+        };
+        for (id, entry) in entries.iter_mut() {
+            if let (Some(Value::Table(base)), Value::Table(over)) = (builtin.get(id), entry.clone())
+            {
+                let mut merged = base.clone();
+                deep_merge(&mut merged, over);
+                *entry = Value::Table(merged);
+            }
+        }
+    }
+    Value::Table(models.clone())
+        .try_into::<Catalog>()
+        .map_err(|e| e.to_string())?;
+    Ok(models)
+}
+
+/// The entries of a models file (`text`) as the configuration loader applies them: built-in
+/// models with their current built-in capabilities. A file with no entries is an empty
+/// catalog.
+pub fn parse_models_file(text: &str) -> Result<Catalog, String> {
+    let table: Table = toml::from_str(text).map_err(|e| e.to_string())?;
+    if table.is_empty() {
+        return Ok(Catalog::default());
+    }
+    Value::Table(overlay_models(table)?)
+        .try_into()
+        .map_err(|e: toml::de::Error| e.to_string())
+}
 
 /// Put the entries of the models file at `path` under `layer`'s `[catalog_overrides]` (the
 /// layer's own entries win). A file that cannot be read, or whose entries are not catalog
@@ -968,14 +1010,16 @@ fn add_models_file(layer: &mut Table, path: &Path, warnings: &mut Vec<String>) {
     if models.is_empty() {
         return;
     }
-    if Value::Table(models.clone()).try_into::<Catalog>().is_err() {
-        warnings.push(format!(
-            "{}: model catalog file not read: its entries are not valid catalog entries",
-            path.display()
-        ));
-        return;
-    }
-    let mut overrides = models;
+    let mut overrides = match overlay_models(models) {
+        Ok(t) => t,
+        Err(e) => {
+            warnings.push(format!(
+                "{}: model catalog file not read: its entries are not valid catalog entries ({e})",
+                path.display()
+            ));
+            return;
+        }
+    };
     if let Some(Value::Table(own)) = layer.remove("catalog_overrides") {
         deep_merge(&mut overrides, own);
     }

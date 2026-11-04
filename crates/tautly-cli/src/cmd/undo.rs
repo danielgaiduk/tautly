@@ -182,6 +182,9 @@ fn refusal(e: UndoError, args: &Args, session: &LogSummary) -> anyhow::Result<i3
             "session {} is open in a running tautly; use /undo there, or stop it first",
             session.id
         ),
+        UndoError::NoSuchTurn { turns: 0, .. } => {
+            bail!("nothing to undo: session {} has no user turns", session.id)
+        }
         other => Err(other.into()),
     }
 }
