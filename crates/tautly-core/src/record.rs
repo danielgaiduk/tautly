@@ -110,6 +110,12 @@ pub enum SessionRecord {
         #[serde(alias = "turn")]
         step: u32,
     },
+    /// Writes whose outcome is unknown: abandoned at their bound after a cancel, or found
+    /// changed later (the abandoned write landed). The files may hold anything; the write
+    /// generation moves, as it did live (a rebuild replays it into the attempt ledger).
+    /// Logged where it was noticed: inside the step whose write was abandoned, or at the
+    /// start of a later step.
+    WritesLost { paths: Vec<RelPath> },
     /// An undo of user turn `turn` (H7, written by Task 26): each file's content just
     /// before the undo (`from_blob`; none: it did not exist) and what it was set to (`to`;
     /// none: deleted), so the undone state can be restored.
@@ -342,6 +348,7 @@ const KNOWN_TYPES: &[&str] = &[
     "tool_call",
     "tool_result",
     "edit",
+    "writes_lost",
     "undone",
     "uncompacted",
     "compaction",
@@ -744,6 +751,9 @@ mod tests {
             },
             SessionRecord::Labeled {
                 label: "try-a".into(),
+            },
+            SessionRecord::WritesLost {
+                paths: vec![rel("a.txt")],
             },
             SessionRecord::ModelSet {
                 model: ModelId::from("openai/gpt-5"),

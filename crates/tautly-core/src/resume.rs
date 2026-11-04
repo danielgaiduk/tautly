@@ -420,6 +420,18 @@ impl Replay<'_> {
                 self.mutation(rec);
             }
             SessionRecord::Charged { model, usage, .. } => self.out.usage.push((model, usage)),
+            // Wherever it was noticed (inside a step, or at a later one's start), the
+            // files changed unseen: the write generation moves.
+            SessionRecord::WritesLost { paths } => {
+                for p in &paths {
+                    if let Ok(path) = p.resolve(&self.root) {
+                        self.out.seen.remove(&path);
+                    }
+                }
+                self.out
+                    .attempts
+                    .note_effects(&[AppliedEffect::Exec { may_write: true }]);
+            }
             SessionRecord::Checkpoint {
                 n, commit, tree, ..
             } => {
@@ -1422,6 +1434,48 @@ mod tests {
             }
         }
         out
+    }
+
+    /// The attempt ledger's write generation of a log holding `recs`.
+    fn generation_after(recs: &[SessionRecord]) -> u64 {
+        let home = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let mut w = SessionWriter::<SessionRecord>::create_in(
+            home.path(),
+            root.path(),
+            HeaderInit::default(),
+        )
+        .unwrap();
+        for r in recs {
+            w.append(r).unwrap();
+        }
+        w.checkpoint().unwrap();
+        let reader = SessionReader::<SessionRecord>::open(w.path()).unwrap();
+        rebuild(&reader, None).unwrap().attempts.generation()
+    }
+
+    #[test]
+    fn a_lost_write_moves_the_rebuilt_write_generation() {
+        let root = std::path::Path::new("/r");
+        let turn = |recs: Vec<SessionRecord>| {
+            let mut all = vec![SessionRecord::TurnStart {
+                turn: 1,
+                text: "go".into(),
+            }];
+            all.extend(recs);
+            all.push(SessionRecord::TurnEnd {
+                reason: FinishReason::Cancelled,
+                evidence: None,
+            });
+            all
+        };
+        let lost = SessionRecord::WritesLost {
+            paths: vec![tautly_session::RelPath::from_abs(root, &root.join("a.txt")).unwrap()],
+        };
+        assert_eq!(
+            generation_after(&turn(vec![lost])),
+            generation_after(&turn(vec![])) + 1
+        );
     }
 
     #[test]

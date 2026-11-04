@@ -36,7 +36,7 @@ use futures::future::join_all;
 use serde_json::Value;
 use tautly_provider::Content;
 use tautly_sandbox::{Decision, Effect, SPILL_DIR};
-use tautly_session::BlobRef;
+use tautly_session::{BlobRef, RelPath};
 use tautly_tools::AppliedEffect;
 use tautly_tools::{
     ContextOp, PersistedEffect, Preview, Tool, ToolCx, ToolResult, parse_context_op,
@@ -285,8 +285,7 @@ impl Session {
             let seen = self.quick_meta(p).await;
             self.lost_write_paths.insert(p.clone(), seen);
         }
-        self.ledger
-            .note_effects(&[AppliedEffect::Exec { may_write: true }]);
+        self.note_writes_lost(paths).await;
         self.memory.refresh_due = true;
         self.evidence.on_lost_write();
         let list: Vec<String> = paths.iter().map(|p| p.display().to_string()).collect();
@@ -316,14 +315,32 @@ impl Session {
                 self.reads.forget_path(&full);
             }
             self.reads.forget_path(&p);
-            self.ledger
-                .note_effects(&[AppliedEffect::Exec { may_write: true }]);
+            self.note_writes_lost(std::slice::from_ref(&p)).await;
             self.warn(format!(
                 "{} changed after its write was abandoned; undo cannot restore it",
                 p.display()
             ))
             .await;
         }
+    }
+
+    /// Writes to `paths` whose outcome is unknown: the write generation moves, logged as
+    /// `WritesLost` so a rebuilt attempt ledger moves too (paths a record cannot hold are
+    /// said instead).
+    async fn note_writes_lost(&mut self, paths: &[PathBuf]) {
+        self.ledger
+            .note_effects(&[AppliedEffect::Exec { may_write: true }]);
+        let mut logged = Vec::with_capacity(paths.len());
+        let mut skipped = Vec::new();
+        for p in paths {
+            let full = self.sandbox.resolve(p).unwrap_or_else(|_| p.clone());
+            match RelPath::from_abs(self.root(), &full) {
+                Some(rel) => logged.push(rel),
+                None => skipped.push(full),
+            }
+        }
+        self.untracked(skipped).await;
+        self.log(SessionRecord::WritesLost { paths: logged }).await;
     }
 
     /// `(mtime, len)` of `p`, or None when it is missing or does not answer quickly (a file

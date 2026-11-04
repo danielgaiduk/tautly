@@ -645,6 +645,17 @@ async fn a_write_that_lands_after_its_bound_is_noticed_at_the_next_step() {
             .any(|w| w.contains("late.txt changed after its write was abandoned")),
         "{second:?}"
     );
+    // Both are logged (the write generation moves; a rebuild replays it), review C M3.
+    let lost: Vec<Vec<String>> = records(&run.engine)
+        .into_iter()
+        .filter_map(|r| match r {
+            SessionRecord::WritesLost { paths } => {
+                Some(paths.iter().map(|p| p.as_str().to_string()).collect())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(lost, [["late.txt"], ["late.txt"]]);
 }
 
 #[tokio::test]
