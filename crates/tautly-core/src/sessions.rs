@@ -129,7 +129,8 @@ pub async fn delete_with(
                 source,
             },
         })?;
-        crate::worktree::remove(sandbox, &root, dir, force).await?;
+        let start = fork_start(&log)?;
+        crate::worktree::remove(sandbox, &root, dir, start.as_deref(), force).await?;
     }
     // Only a repository checkpoints would have written to (see `checkpoint::git_dir`).
     let refs = if checkpoint::git_dir(&root).is_some() {
@@ -149,6 +150,25 @@ pub async fn delete_with(
         refs,
         worktree,
     })
+}
+
+/// The commit a worktree fork's worktree began at: the `restored` checkpoint its log wrote
+/// after `Forked` (none: not found).
+fn fork_start(log: &Path) -> Result<Option<String>, DeleteError> {
+    let reader = tautly_session::SessionReader::<SessionRecord>::open(log)?;
+    let mut forked = false;
+    for rec in reader.records() {
+        match rec?.1 {
+            SessionRecord::Forked => forked = true,
+            SessionRecord::Checkpoint {
+                commit,
+                point: Some(crate::record::CheckpointPoint::Restored),
+                ..
+            } if forked => return Ok(Some(commit)),
+            _ => {}
+        }
+    }
+    Ok(None)
 }
 
 /// The newest session that ran in the work tree a session started in `start` runs on

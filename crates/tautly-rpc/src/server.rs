@@ -26,15 +26,18 @@
 //!   as a `set_budget` scope, is `-32602`). Each takes an optional `session_id`:
 //!   without one, the default session (or the only open session). The result is `null`
 //!   once the session has the command; what it does arrives as events.
-//! - `session/new {root, resume?, fork?: {session_id, at?, label?, worktree?, model?}}`
-//!   opens a session on the work tree `root` (absolute) belongs to and returns
+//! - `session/new {root, resume?, fork?: {session_id, at?, label?, worktree?, model?,
+//!   dir?}}` opens a session on the work tree `root` (absolute) belongs to and returns
 //!   `{session_id}`. Sessions on one root share a `Workspace` (code index, watcher, memory
 //!   store: opened once, closed with the last session). `fork` branches a session that is
 //!   not open here (its log up to step `at`) and opens the branch. With `worktree: true`
 //!   (spec 7.12.4) the branch is made from the log without starting the parent, in a new
 //!   git worktree holding the files of step `at` (default: the last), on `model` when
-//!   given; the session opens there, and the reply is `{session_id, worktree, note}`.
-//!   Outside git it is refused.
+//!   given; the session opens there, and the reply is `{session_id, worktree, note}`. The
+//!   worktree goes in `dir` (absolute; it must not exist or be empty, and must not be a
+//!   symbolic link), by default `<data home>/worktrees/<project-id>/<session-id>`. It is
+//!   refused outside git, and for a directory inside any worktree of the repository (the
+//!   default one too, when the data home is inside it: then give `dir`).
 //! - `session/tree {root, session_id?}` returns `{nodes}`: the sessions of the project
 //!   the work tree `root` (absolute) belongs to, as a tree in depth-first order (spec
 //!   7.12.3; each node `{session_id, parent: [id, step] | null, label, origin, created,
@@ -1170,7 +1173,7 @@ async fn fork_worktree(
     let (workspace, log) = found.map_err(failed)?;
     let request = tautly_core::worktree::ForkRequest {
         at: fork.at,
-        dir: None,
+        dir: fork.dir,
         label: fork.label,
         model: fork.model,
     };
@@ -1193,6 +1196,8 @@ struct ForkSpec {
     worktree: bool,
     /// The model a worktree fork continues on.
     model: Option<tautly_core::ModelId>,
+    /// Where a worktree fork's worktree goes (absolute; none: the default).
+    dir: Option<PathBuf>,
 }
 
 impl ForkSpec {
@@ -1238,12 +1243,24 @@ impl ForkSpec {
             }
             Some(_) => return Err(invalid("`fork.model` must be a model id")),
         };
+        let dir = match f.get("dir") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(d)) if worktree && Path::new(d).is_absolute() => {
+                Some(PathBuf::from(d))
+            }
+            Some(Value::String(_)) if worktree => {
+                return Err(invalid("`fork.dir` must be an absolute path"));
+            }
+            Some(Value::String(_)) => return Err(invalid("`fork.dir` needs `worktree: true`")),
+            Some(_) => return Err(invalid("`fork.dir` must be a path")),
+        };
         Ok(ForkSpec {
             session_id,
             at,
             label,
             worktree,
             model,
+            dir,
         })
     }
 }

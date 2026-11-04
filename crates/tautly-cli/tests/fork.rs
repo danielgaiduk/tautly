@@ -523,6 +523,25 @@ fn rpc_session_new_fork_worktree() {
     );
     let seen = read_until(&mut out, |m| m["id"] == 4);
     assert!(seen.last().unwrap()["error"].is_object(), "{seen:?}");
+    // Re-review N5: a directory of the client's choosing.
+    let mine = s.home.path().canonicalize().unwrap().join("rpc-wt");
+    send(
+        json!({"jsonrpc": "2.0", "id": 5, "method": "session/new", "params": {
+            "root": root,
+            "fork": {"session_id": id, "at": 3, "worktree": true, "dir": mine},
+        }}),
+    );
+    let seen = read_until(&mut out, |m| m["id"] == 5);
+    let reply = seen.last().unwrap();
+    assert_eq!(
+        reply["result"]["worktree"].as_str(),
+        Some(mine.to_str().unwrap()),
+        "{reply}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(mine.join("a.txt")).unwrap(),
+        "one\n"
+    );
     drop(stdin);
     let end = child.wait_with_output().unwrap();
     assert_eq!(end.status.code(), Some(0), "{}", stderr(&end));

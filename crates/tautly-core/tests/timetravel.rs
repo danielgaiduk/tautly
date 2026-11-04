@@ -1745,6 +1745,13 @@ async fn restore_backup_counts_a_mode_change_of_a_file_the_restore_created() {
     assert_eq!(repo.read("n.txt").as_deref(), Some("one\n"));
     run.stop().await;
     let path = repo.root().join("n.txt");
+    // N4: created with the default mode (the umask respected).
+    let default = tempfile::Builder::new()
+        .permissions(std::fs::Permissions::from_mode(0o666))
+        .tempfile()
+        .unwrap();
+    let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o7777;
+    assert_eq!(mode(&path), mode(default.path()));
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
     let done = restore_backup(&repo, &a, &opts(false, true, &[]))
         .await

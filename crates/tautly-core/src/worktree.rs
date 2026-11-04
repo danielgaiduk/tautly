@@ -79,6 +79,32 @@ pub enum WtError {
         .0.display()
     )]
     InsideRepository(PathBuf),
+    #[error(
+        "the default worktree directory {} is inside a worktree of the repository (the data \
+         home is); choose a directory elsewhere with --dir (over RPC, `fork.dir`), or move \
+         the data home with TAUTLY_HOME",
+        .0.display()
+    )]
+    DefaultDirInsideRepository(PathBuf),
+    #[error(
+        "{} is a symbolic link; give the directory itself",
+        .0.display()
+    )]
+    DirIsLink(PathBuf),
+    #[error(
+        "the worktree {} holds populated submodules ({}), whose repositories would go with \
+         it; --force removes it all the same",
+        dir.display(),
+        paths.join(", ")
+    )]
+    Submodules { dir: PathBuf, paths: Vec<String> },
+    #[error(
+        "the worktree {}'s HEAD {commit} has commits no branch or tag reaches, which would \
+         be lost; keep them with `git branch <name> {commit}` first, or --force removes it \
+         all the same",
+        dir.display()
+    )]
+    Unreachable { dir: PathBuf, commit: String },
     // Not `#[from]`/`#[source]`: the message already says the cause, and a chain printed
     // with `{:#}` would say it twice (review M4).
     #[error("git: {0}")]
@@ -196,6 +222,10 @@ async fn make(
         Ok(entries)
     })
     .await?;
+    // A link is neither followed nor, on a failure, removed (re-review N2).
+    if std::fs::symlink_metadata(dir).is_ok_and(|m| m.file_type().is_symlink()) {
+        return Err(WtError::DirIsLink(dir.to_path_buf()));
+    }
     refuse_inside_a_worktree(repo_root, dir)?;
     let made = cp
         .compose(&base, &entries, Checkpointer::housekeeping_deadline())
@@ -558,7 +588,13 @@ pub async fn fork_to_worktree(
         .dir
         .clone()
         .unwrap_or_else(|| default_dir(data_home, &project, &id));
-    let (worktree, made) = make(Arc::clone(&sb), &repo_root, &state, &dir, &id).await?;
+    let defaulted = req.dir.is_none();
+    let (worktree, made) = make(Arc::clone(&sb), &repo_root, &state, &dir, &id)
+        .await
+        .map_err(|e| match e {
+            WtError::InsideRepository(d) if defaulted => WtError::DefaultDirInsideRepository(d),
+            e => e,
+        })?;
     let restored = SessionRecord::Checkpoint {
         n: plan.cut.checkpoints.max_n + 1,
         commit: made.commit.clone(),
@@ -641,14 +677,27 @@ async fn adopt(
 /// worktree with modified or untracked files is refused ([`WtError::Dirty`]), and so is
 /// one with ignored files, which would go with it ([`WtError::Ignored`], naming them;
 /// review M8).
+///
+/// Also unless `force` (re-review N1, N3): one holding populated submodules is refused
+/// ([`WtError::Submodules`]), as git refuses it, and so is one whose HEAD is neither
+/// `start` (the commit the fork began at) nor reached by a branch or tag
+/// ([`WtError::Unreachable`], naming it): a commit made there would be lost.
 pub async fn remove(
     sb: &dyn Sandbox,
     repo_root: &Path,
     dir: &Path,
+    start: Option<&str>,
     force: bool,
 ) -> Result<(), WtError> {
     if !force {
+        let submodules = checkpoint::worktree_submodules(dir).await?;
         let (changed, ignored) = checkpoint::worktree_status(dir).await?;
+        if !submodules.is_empty() {
+            return Err(WtError::Submodules {
+                dir: dir.to_path_buf(),
+                paths: submodules,
+            });
+        }
         if !changed.is_empty() {
             return Err(WtError::Dirty(dir.to_path_buf()));
         }
@@ -656,6 +705,16 @@ pub async fn remove(
             return Err(WtError::Ignored {
                 dir: dir.to_path_buf(),
                 files: ignored,
+            });
+        }
+        // Read from git's files; the reachability by git in the main repository's context.
+        if let Some(head) = tautly_session::git_head(dir)
+            && start != Some(head.as_str())
+            && !checkpoint::reached_by_a_branch_or_tag(sb, repo_root, &head).await?
+        {
+            return Err(WtError::Unreachable {
+                dir: dir.to_path_buf(),
+                commit: head,
             });
         }
     }

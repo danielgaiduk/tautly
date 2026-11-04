@@ -828,3 +828,173 @@ async fn a_dir_inside_a_worktree_of_the_repository_is_refused() {
     assert!(!made.worktree.join("deeper").exists());
     assert_eq!(repo.git(&["status", "--porcelain"]).unwrap(), status);
 }
+
+// ------------------------------------------------------------- fix round 2 (Task 50)
+
+#[tokio::test]
+async fn a_populated_submodule_refuses_delete_and_its_filter_never_runs() {
+    // Re-review N1: a submodule's own configuration (its git dir under the fork's admin
+    // directory) is never read by tautly's status, and a worktree holding one is not
+    // removed without --force, as git itself refuses.
+    let repo = Repo::git_repo();
+    let (_, log) = two_turn_session(&repo).await;
+    let made = fork(&repo, &log, 3).await.unwrap();
+    let source = tempfile::tempdir().unwrap();
+    let src = source.path().canonicalize().unwrap();
+    git_in(&src, &["init", "-q", "-b", "main"]).unwrap();
+    std::fs::write(src.join(".gitattributes"), "*.txt filter=sf\n").unwrap();
+    std::fs::write(src.join("s.txt"), "sub\n").unwrap();
+    git_in(&src, &["add", "-A"]).unwrap();
+    git_in(&src, &["commit", "-q", "-m", "sub"]).unwrap();
+    git_in(
+        &made.worktree,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            "-q",
+            src.to_str().unwrap(),
+            "sub",
+        ],
+    )
+    .unwrap();
+    let sf = filter_script(&repo, "sf");
+    git_in(
+        &made.worktree.join("sub"),
+        &[
+            "config",
+            "filter.sf.clean",
+            &format!("'{}' clean", sf.display()),
+        ],
+    )
+    .unwrap();
+    let touch = || {
+        std::thread::sleep(Duration::from_millis(1100));
+        let p = made.worktree.join("sub/s.txt");
+        let text = std::fs::read(&p).unwrap();
+        std::fs::write(&p, text).unwrap();
+    };
+    // Git itself would run it.
+    touch();
+    git_in(&made.worktree, &["status", "--porcelain"]).unwrap();
+    assert_eq!(filter_markers(&repo), ["filter-sf-clean"]);
+    std::fs::remove_file(repo.home().join("filter-sf-clean")).unwrap();
+    touch();
+    let refused = delete(&repo, &repo.root(), &made.session_id, false).await;
+    match refused {
+        Err(tautly_core::sessions::DeleteError::Worktree(WtError::Submodules {
+            paths, ..
+        })) => {
+            assert_eq!(paths, ["sub"]);
+        }
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+    assert!(made.worktree.join("sub/s.txt").exists());
+    assert_eq!(
+        filter_markers(&repo),
+        Vec::<String>::new(),
+        "the submodule's filter ran"
+    );
+    delete(&repo, &repo.root(), &made.session_id, true)
+        .await
+        .unwrap();
+    assert!(!made.worktree.exists());
+    assert_eq!(filter_markers(&repo), Vec::<String>::new());
+}
+
+#[tokio::test]
+async fn a_commit_only_the_forks_head_reaches_refuses_delete() {
+    // Re-review N3: the fork's HEAD is detached; a commit made there would be lost.
+    let repo = Repo::git_repo();
+    let (_, log) = two_turn_session(&repo).await;
+    let made = fork(&repo, &log, 3).await.unwrap();
+    git_in(
+        &made.worktree,
+        &["commit", "-q", "--allow-empty", "-m", "mine"],
+    )
+    .unwrap();
+    let head = git_in(&made.worktree, &["rev-parse", "HEAD"]).unwrap();
+    let head = head.trim();
+    let refused = delete(&repo, &repo.root(), &made.session_id, false).await;
+    match refused {
+        Err(tautly_core::sessions::DeleteError::Worktree(
+            ref e @ WtError::Unreachable { ref commit, .. },
+        )) => {
+            assert_eq!(commit, head);
+            assert!(
+                e.to_string().contains(&format!("git branch <name> {head}")),
+                "{e}"
+            );
+        }
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+    assert!(made.worktree.exists());
+    // Once a branch holds it, it goes.
+    repo.git(&["branch", "keep", head]).unwrap();
+    delete(&repo, &repo.root(), &made.session_id, false)
+        .await
+        .unwrap();
+    assert!(!made.worktree.exists());
+    assert_eq!(repo.git(&["rev-parse", "keep"]).unwrap().trim(), head);
+}
+
+#[tokio::test]
+async fn a_symlink_dir_is_refused_and_left_alone() {
+    // Re-review N2: a link given as the directory (dangling or not) is never followed or
+    // removed.
+    let repo = Repo::git_repo();
+    let (_, log) = two_turn_session(&repo).await;
+    let target = repo.home().join("target");
+    std::fs::create_dir(&target).unwrap();
+    for (name, to) in [
+        ("live", target.clone()),
+        ("dangling", repo.home().join("nowhere")),
+    ] {
+        let link = repo.home().join(name);
+        std::os::unix::fs::symlink(&to, &link).unwrap();
+        let refused = worktree::fork_to_worktree(
+            repo.sandbox(),
+            &repo.home(),
+            &log,
+            ForkRequest {
+                at: Some(3),
+                dir: Some(link.clone()),
+                ..ForkRequest::default()
+            },
+        )
+        .await;
+        assert!(matches!(refused, Err(WtError::DirIsLink(_))), "{refused:?}");
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
+    assert_eq!(std::fs::read_dir(&target).unwrap().count(), 0);
+}
+
+#[tokio::test]
+async fn a_default_dir_inside_the_repository_names_dir_and_tautly_home() {
+    // Re-review N5: the data home is inside the project's own work tree.
+    let repo = Repo::git_repo();
+    let (_, log) = two_turn_session(&repo).await;
+    let home = repo.root().join(".data");
+    let refused = worktree::fork_to_worktree(
+        repo.sandbox(),
+        &home,
+        &log,
+        ForkRequest {
+            at: Some(3),
+            ..ForkRequest::default()
+        },
+    )
+    .await;
+    let e = refused.expect_err("refused");
+    let text = e.to_string();
+    assert!(
+        text.contains("--dir") && text.contains("TAUTLY_HOME"),
+        "{text}"
+    );
+}

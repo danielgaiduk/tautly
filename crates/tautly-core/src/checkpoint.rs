@@ -2272,7 +2272,10 @@ pub(crate) async fn worktree_status(
                     "-z",
                     "--untracked-files=all",
                     "--ignored=matching",
-                    "--ignore-submodules=none",
+                    // No child in a submodule: it would read the submodule's own
+                    // configuration, whose filters are not switched off (re-review N1).
+                    // Populated submodules are refused apart ([`worktree_submodules`]).
+                    "--ignore-submodules=all",
                 ],
                 None,
                 Checkpointer::housekeeping_deadline(),
@@ -2281,6 +2284,65 @@ pub(crate) async fn worktree_status(
     })
     .await?;
     Ok(parse_status(&out))
+}
+
+/// The populated submodules of the linked worktree `dir`: each gitlink of its index
+/// (`ls-files -s`, mode 160000) whose path holds a `.git`, as git's own `worktree remove`
+/// refuses them (re-review N1). Read in the worktree's context; nothing runs in a submodule.
+pub(crate) async fn worktree_submodules(dir: &Path) -> Result<Vec<String>, CheckpointError> {
+    let out = in_worktree(dir, async |git| {
+        Ok(git
+            .run(
+                &["ls-files", "-s", "-z"],
+                None,
+                Checkpointer::housekeeping_deadline(),
+            )
+            .await?)
+    })
+    .await?;
+    let mut found = Vec::new();
+    for entry in out.split(|&b| b == 0).filter(|e| !e.is_empty()) {
+        let Some(tab) = entry.iter().position(|&b| b == b'\t') else {
+            continue;
+        };
+        if !entry.starts_with(GITLINK.as_bytes()) {
+            continue;
+        }
+        let path = String::from_utf8_lossy(&entry[tab + 1..]).into_owned();
+        if plain_relative(Path::new(&path))
+            && std::fs::symlink_metadata(dir.join(&path).join(".git")).is_ok()
+        {
+            found.push(path);
+        }
+    }
+    Ok(found)
+}
+
+/// Whether a branch or tag of the repository at `root` reaches `commit`.
+pub(crate) async fn reached_by_a_branch_or_tag(
+    sb: &dyn Sandbox,
+    root: &Path,
+    commit: &str,
+) -> Result<bool, CheckpointError> {
+    let contains = format!("--contains={commit}");
+    with_plain_git(sb, root, async |git| {
+        let out = git
+            .run(
+                &[
+                    "for-each-ref",
+                    "--count=1",
+                    "--format=%(refname)",
+                    &contains,
+                    "refs/heads",
+                    "refs/tags",
+                ],
+                None,
+                Checkpointer::housekeeping_deadline(),
+            )
+            .await?;
+        Ok(!out.iter().all(u8::is_ascii_whitespace))
+    })
+    .await
 }
 
 /// `git status --porcelain=v1 -z` output: the changed and the ignored paths.
