@@ -12,14 +12,13 @@ use tautly_core::record::ApprovalKind;
 use tautly_core::{
     Command, Config, Engine, EngineBuilder, Event, McpState, PreExecHook, ServerSpec, SessionRecord,
 };
-use tautly_session::SessionReader;
-
 use tautly_mcp::approvals::key;
 use tautly_mcp::{APPROVALS_FILE, ApprovalStore};
 use tautly_provider::{
     CanonicalRequest, Catalog, MockProvider, MockTurn, ModelId, ProviderEvent, StopReason,
 };
 use tautly_sandbox::Mode;
+use tautly_session::SessionReader;
 use tempfile::TempDir;
 use tokio::sync::mpsc;
 
@@ -385,7 +384,6 @@ async fn repo_server_approval_request_and_answer_are_logged() {
     run.until_state("echo", McpState::Ready).await;
     run.shutdown().await;
     let logged = records(&path);
-
     let answered = logged.iter().position(|r| {
         *r == SessionRecord::Command(Command::Approve {
             request_id: request_id.clone(),

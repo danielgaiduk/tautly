@@ -36,7 +36,6 @@ use tautly_tools::{AppliedEffect, ToolResult};
 use tokio_util::sync::CancellationToken;
 
 use crate::protocol::{BudgetScope, Event, MAX_REPLACED_SHOWN};
-
 use crate::record::SessionRecord;
 use crate::session::Session;
 use crate::turn::TurnControl;

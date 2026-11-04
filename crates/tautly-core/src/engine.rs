@@ -543,7 +543,6 @@ impl Actor {
                 session.begin_checkpoints().await;
                 prune_checkpoints(&session);
                 session.mcp = McpSession::start(start.mcp, &session, self.approvals.clone()).await;
-
                 Some(session)
             }
             Err(why) => {
