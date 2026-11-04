@@ -574,3 +574,257 @@ async fn an_unknown_step_is_refused_before_anything_is_made() {
     );
     assert!(!repo.home().join("worktrees").exists());
 }
+
+// ------------------------------------------------------------- fix round 1 (Task 50)
+
+/// A filter script that leaves a marker `<home>/filter-<name>-<op>` and passes the content
+/// through; its path.
+fn filter_script(repo: &Repo, name: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let path = repo.home().join(format!("{name}.sh"));
+    let marker = repo.home().join(format!("filter-{name}"));
+    let script = format!("#!/bin/sh\ntouch '{}-'\"$1\"\ncat\n", marker.display());
+    std::fs::write(&path, script).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    path
+}
+
+/// The markers filter scripts left.
+fn filter_markers(repo: &Repo) -> Vec<String> {
+    let mut out: Vec<String> = std::fs::read_dir(repo.home())
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with("filter-"))
+        .collect();
+    out.sort();
+    out
+}
+
+/// `sessions delete` of `id` from the work tree `root`.
+async fn delete(
+    repo: &Repo,
+    root: &Path,
+    id: &str,
+    force: bool,
+) -> Result<tautly_core::sessions::Deleted, tautly_core::sessions::DeleteError> {
+    let sb = LocalSandbox::new(root.to_path_buf()).unwrap();
+    tautly_core::sessions::delete_with(&repo.home(), &sb, id, force).await
+}
+
+#[tokio::test]
+async fn worktree_scoped_filters_never_run_on_fork_or_delete() {
+    // Review C1: a filter the configuration defines only for linked worktrees
+    // (`includeIf gitdir:**/worktrees/**`, and a worktree's own `config.worktree`) is
+    // switched off as well: the worktree is checked out, and checked for changes, in its
+    // own configuration's context.
+    let repo = Repo::git_repo();
+    repo.write(".gitattributes", "*.txt filter=wt\n*.md filter=wt2\n");
+    repo.write("n.md", "note\n");
+    repo.git(&["add", "-A"]).unwrap();
+    repo.git(&["commit", "-q", "-m", "attributes"]).unwrap();
+    let (_, log) = two_turn_session(&repo).await;
+    let wt = filter_script(&repo, "wt");
+    let wt2 = filter_script(&repo, "wt2");
+    let include = repo.home().join("worktrees.inc");
+    std::fs::write(
+        &include,
+        format!(
+            "[filter \"wt\"]\n\tsmudge = '{0}' smudge\n\tclean = '{0}' clean\n\trequired = true\n",
+            wt.display()
+        ),
+    )
+    .unwrap();
+    repo.git(&[
+        "config",
+        "includeIf.gitdir:**/worktrees/**.path",
+        include.to_str().unwrap(),
+    ])
+    .unwrap();
+    // Git itself would run it in a linked worktree.
+    let probe = repo.home().join("probe");
+    repo.git(&[
+        "worktree",
+        "add",
+        "--detach",
+        probe.to_str().unwrap(),
+        "HEAD",
+    ])
+    .unwrap();
+    assert_eq!(filter_markers(&repo), ["filter-wt-smudge"]);
+    repo.git(&["worktree", "remove", "--force", probe.to_str().unwrap()])
+        .unwrap();
+    for m in filter_markers(&repo) {
+        std::fs::remove_file(repo.home().join(m)).unwrap();
+    }
+
+    let made = fork(&repo, &log, 3).await.unwrap();
+    assert_eq!(
+        filter_markers(&repo),
+        Vec::<String>::new(),
+        "a filter ran at fork"
+    );
+    assert_eq!(
+        std::fs::read_to_string(made.worktree.join("a.txt")).unwrap(),
+        "one\n"
+    );
+    // The worktree's own configuration defines another, for the delete's check.
+    repo.git(&["config", "extensions.worktreeConfig", "true"])
+        .unwrap();
+    git_in(
+        &made.worktree,
+        &[
+            "config",
+            "--worktree",
+            "filter.wt2.clean",
+            &format!("'{}' clean", wt2.display()),
+        ],
+    )
+    .unwrap();
+    // Rewritten later: the check must look at their content again.
+    std::thread::sleep(Duration::from_millis(1100));
+    for f in ["a.txt", "n.md"] {
+        let p = made.worktree.join(f);
+        let text = std::fs::read(&p).unwrap();
+        std::fs::write(&p, text).unwrap();
+    }
+    // Git itself would run the worktree's clean filter.
+    git_in(&made.worktree, &["status", "--porcelain"]).unwrap();
+    assert!(
+        filter_markers(&repo).contains(&"filter-wt2-clean".to_string()),
+        "{:?}",
+        filter_markers(&repo)
+    );
+    for m in filter_markers(&repo) {
+        std::fs::remove_file(repo.home().join(m)).unwrap();
+    }
+    std::thread::sleep(Duration::from_millis(1100));
+    for f in ["a.txt", "n.md"] {
+        let p = made.worktree.join(f);
+        let text = std::fs::read(&p).unwrap();
+        std::fs::write(&p, text).unwrap();
+    }
+    let done = delete(&repo, &repo.root(), &made.session_id, false)
+        .await
+        .unwrap();
+    assert_eq!(done.worktree.as_deref(), Some(made.worktree.as_path()));
+    assert!(!made.worktree.exists());
+    assert_eq!(
+        filter_markers(&repo),
+        Vec::<String>::new(),
+        "a filter ran at delete"
+    );
+}
+
+#[tokio::test]
+async fn delete_from_inside_the_fork_refuses_and_keeps_everything() {
+    // Review I1.
+    let repo = Repo::git_repo();
+    let (_, log) = two_turn_session(&repo).await;
+    let made = fork(&repo, &log, 3).await.unwrap();
+    let refused = delete(&repo, &made.worktree, &made.session_id, true).await;
+    match refused {
+        Err(e @ tautly_core::sessions::DeleteError::InsideWorktree(_)) => {
+            assert!(e.to_string().contains("another worktree"), "{e}");
+        }
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+    assert!(made.worktree.exists());
+    assert!(made.log.exists());
+}
+
+#[tokio::test]
+async fn delete_refuses_while_a_live_session_uses_the_worktree() {
+    // Review I2: a session (not the fork's own) running in the fork's worktree.
+    let repo = Repo::git_repo();
+    let (_, log) = two_turn_session(&repo).await;
+    let made = fork(&repo, &log, 3).await.unwrap();
+    let live = Run::start(EngineBuilder {
+        root: made.worktree.clone(),
+        ..repo.builder(&MockProvider::new(vec![]))
+    });
+    let refused = delete(&repo, &repo.root(), &made.session_id, true).await;
+    assert!(
+        matches!(
+            refused,
+            Err(tautly_core::sessions::DeleteError::WorktreeBusy(_))
+        ),
+        "{refused:?}"
+    );
+    assert!(made.worktree.exists());
+    assert!(made.log.exists());
+    live.stop().await;
+    let done = delete(&repo, &repo.root(), &made.session_id, false)
+        .await
+        .unwrap();
+    assert!(done.worktree.is_some());
+    assert!(!made.worktree.exists());
+}
+
+#[tokio::test]
+async fn delete_names_ignored_files_and_needs_force_for_them() {
+    // Review M8 (and M2: decided from tautly's own status, not git's message).
+    let repo = Repo::git_repo();
+    repo.write(".gitignore", "*.log\n");
+    repo.git(&["add", "-A"]).unwrap();
+    repo.git(&["commit", "-q", "-m", "ignore"]).unwrap();
+    let (_, log) = two_turn_session(&repo).await;
+    let made = fork(&repo, &log, 3).await.unwrap();
+    std::fs::write(made.worktree.join("notes.log"), "mine\n").unwrap();
+    let refused = delete(&repo, &repo.root(), &made.session_id, false).await;
+    match refused {
+        Err(tautly_core::sessions::DeleteError::Worktree(WtError::Ignored { files, .. })) => {
+            assert_eq!(files, ["notes.log"]);
+        }
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+    assert!(made.worktree.join("notes.log").exists());
+    // A modified file is a change.
+    std::fs::remove_file(made.worktree.join("notes.log")).unwrap();
+    std::fs::write(made.worktree.join("a.txt"), "edited\n").unwrap();
+    let refused = delete(&repo, &repo.root(), &made.session_id, false).await;
+    assert!(
+        matches!(
+            refused,
+            Err(tautly_core::sessions::DeleteError::Worktree(
+                WtError::Dirty(_)
+            ))
+        ),
+        "{refused:?}"
+    );
+    delete(&repo, &repo.root(), &made.session_id, true)
+        .await
+        .unwrap();
+    assert!(!made.worktree.exists());
+}
+
+#[tokio::test]
+async fn a_dir_inside_a_worktree_of_the_repository_is_refused() {
+    // Review M3.
+    let repo = Repo::git_repo();
+    let (_, log) = two_turn_session(&repo).await;
+    let at = |dir: PathBuf| ForkRequest {
+        at: Some(3),
+        dir: Some(dir),
+        ..ForkRequest::default()
+    };
+    let status = repo.git(&["status", "--porcelain"]).unwrap();
+    let inside = repo.root().join("inner");
+    let refused =
+        worktree::fork_to_worktree(repo.sandbox(), &repo.home(), &log, at(inside.clone())).await;
+    assert!(
+        matches!(refused, Err(WtError::InsideRepository(_))),
+        "{refused:?}"
+    );
+    assert!(!inside.exists());
+    let made = fork(&repo, &log, 3).await.unwrap();
+    let nested = made.worktree.join("deeper/wt");
+    let refused =
+        worktree::fork_to_worktree(repo.sandbox(), &repo.home(), &log, at(nested.clone())).await;
+    assert!(
+        matches!(refused, Err(WtError::InsideRepository(_))),
+        "{refused:?}"
+    );
+    assert!(!made.worktree.join("deeper").exists());
+    assert_eq!(repo.git(&["status", "--porcelain"]).unwrap(), status);
+}

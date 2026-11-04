@@ -60,6 +60,7 @@ pub async fn run(args: Args, env: &Env, cli: &Cli) -> anyhow::Result<i32> {
     if let Some(model) = &args.model {
         crate::check_model(model).map_err(anyhow::Error::msg)?;
     }
+    let mut settings = Settings::new(cli)?;
     let session = env.find_session(&args.session)?;
     let dir = match args.dir {
         Some(d) if d.is_relative() => Some(
@@ -84,6 +85,18 @@ pub async fn run(args: Args, env: &Env, cli: &Cli) -> anyhow::Result<i32> {
     .await?;
     if let Some(note) = &made.note {
         eprintln!("tautly: note: {}", printable(note));
+    }
+    // A model whose provider has no key is said now, not only when the fork resumes
+    // (review M7).
+    if let Some(model) = &args.model
+        && let Some(why) = settings.key_problem(&made.worktree, &ModelId::from(model.as_str()))
+    {
+        eprintln!(
+            "tautly: warning: the fork's model {} cannot be used now: {}; when the fork \
+             resumes it stays on the session's own model",
+            printable(model),
+            printable(&why)
+        );
     }
     let path = printable(&made.worktree.display().to_string());
     let id = printable(&made.session_id);
@@ -110,7 +123,6 @@ pub async fn run(args: Args, env: &Env, cli: &Cli) -> anyhow::Result<i32> {
         return Ok(0);
     };
     eprintln!("worktree: {path}  session: {id}");
-    let mut settings = Settings::new(cli)?;
     if let Some(approve) = args.approve {
         settings.overrides.mode = Some(match approve {
             Approve::AutoEdit => Mode::AutoEdit,

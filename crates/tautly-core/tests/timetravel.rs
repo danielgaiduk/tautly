@@ -1727,6 +1727,34 @@ async fn restore_backup_counts_a_mode_change_as_a_conflict() {
 }
 
 #[tokio::test]
+async fn restore_backup_counts_a_mode_change_of_a_file_the_restore_created() {
+    // Task 50 M6: outside git, a rewind recreates n.txt a human removed; the human then
+    // makes it executable. Putting the backup back (removing it) would lose that.
+    use std::os::unix::fs::PermissionsExt;
+    let repo = Repo::plain();
+    let mock = MockProvider::new(vec![
+        tools_step(vec![write("w1", "n.txt", "one\n")]),
+        text_step("first"),
+        tools_step(vec![write("w2", "n.txt", "two\n")]),
+        text_step("second"),
+    ]);
+    let mut run = run_two_turns(&repo, &mock).await;
+    let a = run.current().0;
+    std::fs::remove_file(repo.root().join("n.txt")).unwrap();
+    run.rewind(3, false, &["n.txt"]).await.done();
+    assert_eq!(repo.read("n.txt").as_deref(), Some("one\n"));
+    run.stop().await;
+    let path = repo.root().join("n.txt");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let done = restore_backup(&repo, &a, &opts(false, true, &[]))
+        .await
+        .unwrap();
+    assert_eq!(done.conflicts, ["n.txt"], "{done:?}");
+    assert!(done.removed.is_empty());
+    assert!(path.exists());
+}
+
+#[tokio::test]
 async fn restore_backup_never_overwrites_a_later_human_edit() {
     // N10 (review probe p27): the human edits after the restore finished.
     let (repo, a) = overwritten_outside_git().await;

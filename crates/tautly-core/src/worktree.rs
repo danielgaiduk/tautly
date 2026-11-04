@@ -1,13 +1,17 @@
 //! Fork at a step into an isolated git worktree (spec 7.12.4): `tautly fork <session> --at
 //! N` and `session/new {fork: {…, worktree: true}}`.
 //!
-//! - **The worktree** ([`create`]) is `git worktree add --detach <dir> <commit>`, where
-//!   `<commit>` is `state_at(N)`'s checkpoint with its overlay (the tool-edit reverts)
-//!   applied, composed as a commit of its own: the new worktree is checked out clean at
-//!   exactly the files of step N, and `git status` there shows only what happens after.
-//!   Git runs through the checkpoints' hardened path (`checkpoint::worktree_add`): no hook
-//!   (`post-checkout` included, whatever `core.hooksPath` says), filter, fsmonitor or
-//!   transport runs, and no provider key is in its environment. The original work tree,
+//! - **The worktree** ([`create`]) is `git worktree add --no-checkout --detach <dir>
+//!   <commit>`, where `<commit>` is `state_at(N)`'s checkpoint with its overlay (the
+//!   tool-edit reverts) applied, composed as a commit of its own; then a checkout (`read-tree
+//!   --reset -u HEAD`) by git rooted at the new worktree, so the filters its own
+//!   configuration defines (`includeIf "gitdir:…/worktrees/…"`, `config.worktree`) are found
+//!   and switched off too. The new worktree is clean at exactly the files of step N, and
+//!   `git status` there shows only what happens after. Git runs through the checkpoints'
+//!   hardened path: no hook (`post-checkout` included, whatever `core.hooksPath` says),
+//!   filter, fsmonitor or transport runs, and no provider key is in its environment. A
+//!   directory inside any worktree of the repository is refused, and what a failed add or
+//!   checkout made is removed again. The original work tree,
 //!   its index and HEAD are never touched; only objects, `refs/tautly/` and the new
 //!   worktree's administrative files are written. Outside git it is refused
 //!   ([`WtError::NotGit`]); so is a state with no checkpoint to start from
@@ -25,8 +29,10 @@
 //!   the fork there builds that root's own code index. Logged approvals are never consent:
 //!   no session rule is in a log, and the fork's engine decides every call by its own
 //!   policy.
-//! - **Cleanup** ([`remove`]): `git worktree remove`, which refuses a worktree with
-//!   modified or untracked files unless forced ([`WtError::Dirty`]).
+//! - **Cleanup** ([`remove`]): Tautly's own `git status` in the worktree's context first
+//!   (modified or untracked files: [`WtError::Dirty`]; ignored ones, which would go with it:
+//!   [`WtError::Ignored`]; both unless forced), then `git worktree remove --force`, so git
+//!   runs no check of its own there.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -61,21 +67,56 @@ pub enum WtError {
         .0.display()
     )]
     Dirty(PathBuf),
+    #[error(
+        "the worktree {} has ignored files that would be deleted with it ({}); --force \
+         removes it all the same",
+        dir.display(),
+        files.join(", ")
+    )]
+    Ignored { dir: PathBuf, files: Vec<String> },
+    #[error(
+        "{} is inside a worktree of the repository; choose a directory outside it",
+        .0.display()
+    )]
+    InsideRepository(PathBuf),
+    // Not `#[from]`/`#[source]`: the message already says the cause, and a chain printed
+    // with `{:#}` would say it twice (review M4).
     #[error("git: {0}")]
-    Git(#[from] CheckpointError),
+    Git(CheckpointError),
     #[error("{0}")]
-    Tt(#[from] TtError),
+    Tt(TtError),
     #[error("cannot read or write the session log: {0}")]
-    Session(#[from] tautly_session::Error),
+    Session(tautly_session::Error),
     #[error("a path in the session log cannot be used in the worktree: {0}")]
-    Path(#[from] ConfineError),
-    #[error("{}: {source}", path.display())]
-    Io {
-        path: PathBuf,
-        source: std::io::Error,
-    },
+    Path(ConfineError),
+    #[error("{}: {err}", path.display())]
+    Io { path: PathBuf, err: std::io::Error },
     #[error("{0}")]
     Other(String),
+}
+
+impl From<CheckpointError> for WtError {
+    fn from(e: CheckpointError) -> Self {
+        WtError::Git(e)
+    }
+}
+
+impl From<TtError> for WtError {
+    fn from(e: TtError) -> Self {
+        WtError::Tt(e)
+    }
+}
+
+impl From<tautly_session::Error> for WtError {
+    fn from(e: tautly_session::Error) -> Self {
+        WtError::Session(e)
+    }
+}
+
+impl From<ConfineError> for WtError {
+    fn from(e: ConfineError) -> Self {
+        WtError::Path(e)
+    }
 }
 
 /// `git -c core.hooksPath=/dev/null worktree add --detach <dir> <base>` (with the rest of
@@ -155,42 +196,152 @@ async fn make(
         Ok(entries)
     })
     .await?;
+    refuse_inside_a_worktree(repo_root, dir)?;
     let made = cp
         .compose(&base, &entries, Checkpointer::housekeeping_deadline())
         .await?;
-    make_dir(dir)?;
-    checkpoint::worktree_add(sb.as_ref(), repo_root, dir, &made.commit).await?;
-    let canonical = dir.canonicalize().map_err(|source| WtError::Io {
-        path: dir.to_path_buf(),
-        source,
-    })?;
-    Ok((canonical, made))
+    let made_dirs = make_dir(dir)?;
+    // Added without a checkout, then checked out in the new worktree's own configuration
+    // context (review C1); on any failure what was made goes again (review M5).
+    let added = async {
+        checkpoint::worktree_add(sb.as_ref(), repo_root, dir, &made.commit).await?;
+        checkpoint::worktree_checkout(dir).await?;
+        dir.canonicalize().map_err(|err| WtError::Io {
+            path: dir.to_path_buf(),
+            err,
+        })
+    }
+    .await;
+    match added {
+        Ok(canonical) => Ok((canonical, made)),
+        Err(e) => {
+            // Best effort: the error says what failed either way.
+            let _ = checkpoint::worktree_remove(sb.as_ref(), repo_root, dir).await;
+            made_dirs.undo();
+            Err(e)
+        }
+    }
+}
+
+/// The directories [`make_dir`] created (outermost first), and whether `dir` was there.
+#[derive(Debug)]
+struct MadeDirs {
+    dir: PathBuf,
+    existed: bool,
+    parents: Vec<PathBuf>,
+}
+
+impl MadeDirs {
+    /// Remove what was made: `dir` (emptied again when it was there) and the parents that
+    /// are empty again.
+    fn undo(&self) {
+        if self.existed {
+            if let Ok(entries) = std::fs::read_dir(&self.dir) {
+                for e in entries.flatten() {
+                    let p = e.path();
+                    let _ = match e.file_type() {
+                        Ok(t) if t.is_dir() => std::fs::remove_dir_all(&p),
+                        _ => std::fs::remove_file(&p),
+                    };
+                }
+            }
+        } else {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+        for p in self.parents.iter().rev() {
+            let _ = std::fs::remove_dir(p);
+        }
+    }
 }
 
 /// The worktree's parent directories (private, as the data home's are); `dir` itself
 /// must not exist, or be empty.
-fn make_dir(dir: &Path) -> Result<(), WtError> {
+fn make_dir(dir: &Path) -> Result<MadeDirs, WtError> {
     use std::os::unix::fs::DirBuilderExt;
-    let io = |source| WtError::Io {
+    let io = |err| WtError::Io {
         path: dir.to_path_buf(),
-        source,
+        err,
     };
     match std::fs::read_dir(dir) {
         Ok(mut entries) => {
             return match entries.next() {
                 Some(_) => Err(WtError::Exists(dir.to_path_buf())),
-                None => Ok(()),
+                None => Ok(MadeDirs {
+                    dir: dir.to_path_buf(),
+                    existed: true,
+                    parents: Vec::new(),
+                }),
             };
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(io(e)),
     }
+    let mut parents: Vec<PathBuf> = dir
+        .ancestors()
+        .skip(1)
+        .take_while(|p| std::fs::symlink_metadata(p).is_err())
+        .map(Path::to_path_buf)
+        .collect();
+    parents.reverse();
     if let Some(parent) = dir.parent() {
         std::fs::DirBuilder::new()
             .recursive(true)
             .mode(0o700)
             .create(parent)
             .map_err(io)?;
+    }
+    Ok(MadeDirs {
+        dir: dir.to_path_buf(),
+        existed: false,
+        parents,
+    })
+}
+
+/// `path` with its nearest existing ancestor resolved (links followed), the rest as given.
+fn resolved(path: &Path) -> PathBuf {
+    let mut rest = Vec::new();
+    let mut at = path;
+    loop {
+        if let Ok(real) = at.canonicalize() {
+            return rest.iter().rev().fold(real, |p, c| p.join(c));
+        }
+        match (at.parent(), at.file_name()) {
+            (Some(parent), Some(name)) => {
+                rest.push(name.to_os_string());
+                at = parent;
+            }
+            _ => return path.to_path_buf(),
+        }
+    }
+}
+
+/// Refuse a worktree directory inside any worktree of the repository at `repo_root` (the
+/// main one, a linked one): it would show up in that tree, and its checkpoints would meet
+/// a repository inside it (review M3). The worktrees are read from git's files (no git is
+/// run).
+fn refuse_inside_a_worktree(repo_root: &Path, dir: &Path) -> Result<(), WtError> {
+    let dir_real = resolved(dir);
+    let mut trees = vec![resolved(repo_root)];
+    if let Some(dirs) = tautly_session::git_dirs_at(&repo_root.join(".git")) {
+        // The main worktree, when the repository is its `.git` (not a bare one).
+        if dirs.common_dir.file_name().is_some_and(|n| n == ".git")
+            && let Some(main) = dirs.common_dir.parent()
+        {
+            trees.push(resolved(main));
+        }
+        if let Ok(entries) = std::fs::read_dir(dirs.common_dir.join("worktrees")) {
+            for e in entries.flatten() {
+                // `gitdir` names the worktree's `.git` file.
+                if let Ok(text) = std::fs::read_to_string(e.path().join("gitdir"))
+                    && let Some(tree) = Path::new(text.trim()).parent()
+                {
+                    trees.push(resolved(tree));
+                }
+            }
+        }
+    }
+    if trees.iter().any(|t| dir_real.starts_with(t)) {
+        return Err(WtError::InsideRepository(dir.to_path_buf()));
     }
     Ok(())
 }
@@ -440,7 +591,7 @@ pub async fn fork_to_worktree(
         Ok(path) => path,
         Err(e) => {
             // Best effort: the error says what failed either way.
-            let _ = checkpoint::worktree_remove(sb.as_ref(), &repo_root, &worktree, true).await;
+            let _ = checkpoint::worktree_remove(sb.as_ref(), &repo_root, &worktree).await;
             return Err(e);
         }
     };
@@ -484,20 +635,63 @@ async fn adopt(
     Ok(cp.adopt(id, &all).await?)
 }
 
-/// Remove the worktree at `dir` of the repository at `repo_root` (`git worktree remove`,
-/// hardened as checkpoints are). A worktree with modified or untracked files is refused
-/// ([`WtError::Dirty`]) unless `force`.
+/// Remove the worktree at `dir` of the repository at `repo_root` (`git worktree remove
+/// --force`, hardened as checkpoints are). Unless `force`, it is first checked with
+/// Tautly's own `git status` in the worktree's configuration context (review C1, M2): a
+/// worktree with modified or untracked files is refused ([`WtError::Dirty`]), and so is
+/// one with ignored files, which would go with it ([`WtError::Ignored`], naming them;
+/// review M8).
 pub async fn remove(
     sb: &dyn Sandbox,
     repo_root: &Path,
     dir: &Path,
     force: bool,
 ) -> Result<(), WtError> {
-    match checkpoint::worktree_remove(sb, repo_root, dir, force).await {
-        Ok(()) => Ok(()),
-        Err(CheckpointError::Git(why)) if !force && why.contains("modified or untracked") => {
-            Err(WtError::Dirty(dir.to_path_buf()))
+    if !force {
+        let (changed, ignored) = checkpoint::worktree_status(dir).await?;
+        if !changed.is_empty() {
+            return Err(WtError::Dirty(dir.to_path_buf()));
         }
-        Err(e) => Err(e.into()),
+        if !ignored.is_empty() {
+            return Err(WtError::Ignored {
+                dir: dir.to_path_buf(),
+                files: ignored,
+            });
+        }
+    }
+    checkpoint::worktree_remove(sb, repo_root, dir).await?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn what_a_failed_add_made_goes_again() {
+        // Review M5: the directory and the parents made for it.
+        let base = tempfile::tempdir().unwrap();
+        let dir = base.path().join("a/b/wt");
+        let made = make_dir(&dir).unwrap();
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("f"), "x").unwrap();
+        made.undo();
+        assert!(!base.path().join("a").exists());
+        // A directory that was there (empty) stays, emptied.
+        let there = base.path().join("there");
+        std::fs::create_dir(&there).unwrap();
+        let made = make_dir(&there).unwrap();
+        std::fs::write(there.join("f"), "x").unwrap();
+        made.undo();
+        assert!(there.exists());
+        assert_eq!(std::fs::read_dir(&there).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn status_lists_changes_and_ignored_files_but_not_the_scratch_store() {
+        let out = b" M a.txt\0?? new.txt\0R  to.txt\0from.txt\0!! notes.log\0!! .tautly/tmp/\0!! .tautly/tmp/spill/x\0";
+        let (changed, ignored) = checkpoint::parse_status(out);
+        assert_eq!(changed, ["a.txt", "new.txt", "to.txt"]);
+        assert_eq!(ignored, ["notes.log"]);
     }
 }

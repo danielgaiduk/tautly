@@ -56,7 +56,8 @@ pub enum Cmd {
     Delete {
         /// The full session id.
         id: String,
-        /// Remove a fork's worktree even when it has modified or untracked files.
+        /// Remove a fork's worktree even when it has modified, untracked or ignored files
+        /// (all of which go with it).
         #[arg(long)]
         force: bool,
     },

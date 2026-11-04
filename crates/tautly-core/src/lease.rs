@@ -57,6 +57,9 @@ impl Drop for ExclusiveGuard {
     }
 }
 
+/// How long [`Lease::try_exclusive`] tries a lock that looks held again.
+const TRANSIENT: Duration = Duration::from_millis(500);
+
 /// `<data home>/locks/<root hash>.lock`.
 pub fn lock_path(data_home: &Path, root: &Path) -> PathBuf {
     data_home.join("locks").join(format!(
@@ -153,12 +156,29 @@ impl Lease {
     /// The lease, exclusively, without waiting: [`LeaseError::Busy`] while another live
     /// session (an engine of this process sharing the workspace, or any holder of the lock
     /// file) uses the working tree, or another upgrade is under way.
+    ///
+    /// A lock that looks held is tried again for up to [`TRANSIENT`] (Task 50 M1): a child
+    /// that any thread of the process forks carries a copy of every open file until it
+    /// execs, so a lock let go just before (the previous upgrade's gate, a lease another
+    /// test or session closed) can stay held for that moment.
     pub fn try_exclusive(&self) -> Result<ExclusiveGuard, LeaseError> {
         if let Some(ws) = self.workspace.as_ref().and_then(Weak::upgrade)
             && ws.live_sessions() > 1
         {
             return Err(LeaseError::Busy);
         }
+        let until = Instant::now() + TRANSIENT;
+        loop {
+            match self.try_exclusive_once() {
+                Err(LeaseError::Busy) if Instant::now() < until => {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                other => return other,
+            }
+        }
+    }
+
+    fn try_exclusive_once(&self) -> Result<ExclusiveGuard, LeaseError> {
         let gate = open(&self.gate)?;
         match flock(&gate, libc::LOCK_EX | libc::LOCK_NB) {
             Ok(()) => {}
@@ -228,5 +248,23 @@ mod tests {
         assert!(matches!(a.try_exclusive(), Err(LeaseError::Busy)));
         drop(gate);
         assert!(a.try_exclusive().is_ok());
+    }
+
+    #[test]
+    fn a_lock_held_for_an_instant_does_not_refuse_the_upgrade() {
+        // Task 50 M1: a child forked by any thread of the process carries every open
+        // file until it execs, so a gate (or lease) lock let go just before can still be
+        // held for a moment by that copy.
+        let home = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let a = Lease::shared(home.path(), root.path()).unwrap();
+        let gate = open(&a.gate).unwrap();
+        flock(&gate, libc::LOCK_EX).unwrap();
+        let held = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(60));
+            drop(gate);
+        });
+        assert!(a.try_exclusive().is_ok());
+        held.join().unwrap();
     }
 }

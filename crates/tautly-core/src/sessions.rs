@@ -37,8 +37,27 @@ pub enum DeleteError {
     },
     #[error("cannot delete the session's checkpoint refs: {0}")]
     Checkpoint(#[from] CheckpointError),
+    /// Not a `#[source]`: the message says it (review M4).
     #[error("cannot remove the fork's worktree: {0}")]
-    Worktree(#[from] crate::worktree::WtError),
+    Worktree(crate::worktree::WtError),
+    #[error(
+        "this is run inside the fork's own worktree {}: run it from another worktree of \
+         the repository (the main one, say), since it removes {}",
+        .0.display(),
+        .0.display()
+    )]
+    InsideWorktree(PathBuf),
+    #[error(
+        "another live session uses the fork's worktree {}; close it first",
+        .0.display()
+    )]
+    WorktreeBusy(PathBuf),
+}
+
+impl From<crate::worktree::WtError> for DeleteError {
+    fn from(e: crate::worktree::WtError) -> Self {
+        DeleteError::Worktree(e)
+    }
 }
 
 /// Delete session `id` of the project the sandbox root belongs to (`tautly sessions
@@ -52,8 +71,9 @@ pub async fn delete(
 }
 
 /// Delete session `id` of the project the sandbox root belongs to: the worktree of a
-/// worktree fork (spec 7.12.4; `git worktree remove`, which refuses one with modified or
-/// untracked files unless `force`), its checkpoint refs (`refs/tautly/checkpoints/<id>/`,
+/// worktree fork (spec 7.12.4; [`crate::worktree::remove`], which refuses one with
+/// modified, untracked or ignored files unless `force`; refused from inside that worktree,
+/// and while a live session holds its working-tree lease), its checkpoint refs (`refs/tautly/checkpoints/<id>/`,
 /// when the root is in a git work tree), then its log and last-request file. Blobs are
 /// shared by the project's sessions and kept (blob garbage collection is post-v1); so are
 /// its branches, whose logs hold their own copies and whose checkpoints have refs of their
@@ -86,11 +106,29 @@ pub async fn delete_with(
     let header = tautly_session::SessionReader::<SessionRecord>::open(&log)?
         .header()
         .clone();
-    let worktree = (header.origin == tautly_session::Origin::WhatIf
-        && header.root != root
-        && header.root.exists())
-    .then_some(header.root);
+    let fork = header.origin == tautly_session::Origin::WhatIf;
+    if fork && header.root == root {
+        // It could not remove the worktree it runs in (review I1).
+        return Err(DeleteError::InsideWorktree(root));
+    }
+    let worktree = (fork && header.root.exists()).then_some(header.root);
     if let Some(dir) = &worktree {
+        // Not while a live session uses it (review I2): its working-tree lease, held
+        // exclusively for the removal.
+        let busy = || DeleteError::WorktreeBusy(dir.clone());
+        let lease = crate::lease::Lease::try_shared(data_home, dir)
+            .map_err(|source| DeleteError::Io {
+                path: dir.clone(),
+                source,
+            })?
+            .ok_or_else(busy)?;
+        let _alone = lease.try_exclusive().map_err(|e| match e {
+            crate::lease::LeaseError::Busy => busy(),
+            crate::lease::LeaseError::Io(source) => DeleteError::Io {
+                path: dir.clone(),
+                source,
+            },
+        })?;
         crate::worktree::remove(sandbox, &root, dir, force).await?;
     }
     // Only a repository checkpoints would have written to (see `checkpoint::git_dir`).

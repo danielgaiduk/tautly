@@ -294,6 +294,29 @@ impl Settings {
         false
     }
 
+    /// Why `model` cannot be set up for a session on `root` now because its provider has no
+    /// key (with the setup hint), if so; nothing for a scripted provider or another problem
+    /// (which the session reports itself). This may read the keychain (blocking).
+    fn key_problem(&self, root: &Path, model: &ModelId) -> Option<String> {
+        if self.scripted() {
+            return None;
+        }
+        let config = Config::load(root, self.overrides.clone()).ok()?.config;
+        match provider_for_with(
+            &config,
+            model,
+            Arc::new(config.effective_catalog()),
+            &local::env,
+            &*self.secrets.store,
+        ) {
+            Err(e @ ProviderSetupError::MissingKey { .. }) => Some(format!(
+                "{e} (hint: {})",
+                setup_hint_with(&KeyVars::from_config(&config))
+            )),
+            _ => None,
+        }
+    }
+
     /// Set the model when no layer or flag names one and detection is on, announcing it on
     /// stderr the first time. Detection reads the key variables the configuration names
     /// (as the session will). Nothing found is an error with the setup hint. This may read

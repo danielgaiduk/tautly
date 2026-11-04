@@ -53,8 +53,21 @@ impl Scratch {
             .env("TAUTLY_HOME", self.home.path())
             .env("HOME", self.home.path())
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            // The keychain is a file that does not exist: empty, never the real one.
+            .env(
+                "TAUTLY_TEST_SECRET_STORE",
+                self.home.path().join("secrets.json"),
+            )
             .env_remove("XDG_CONFIG_HOME")
             .env_remove("XDG_DATA_HOME");
+        for var in [
+            "ANTHROPIC_API_KEY",
+            "OPENAI_API_KEY",
+            "GEMINI_API_KEY",
+            "OPENROUTER_API_KEY",
+        ] {
+            c.env_remove(var);
+        }
         c
     }
 
@@ -406,6 +419,41 @@ fn sessions_delete_removes_clean_worktree_refuses_dirty_without_force() {
     let out = s.run(&["sessions", "delete", &fork, "--force"]);
     assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
     assert!(!wt.exists());
+}
+
+#[test]
+fn delete_from_inside_the_fork_is_refused_with_a_hint() {
+    // Review I1.
+    let s = Scratch::new();
+    let id = s.parent();
+    let (wt, fork) = s.fork(&id, "3");
+    let out = s
+        .command(&["sessions", "delete", &fork])
+        .current_dir(&wt)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1), "{}", stdout(&out));
+    assert!(
+        stderr(&out).contains("another worktree"),
+        "{}",
+        stderr(&out)
+    );
+    assert!(wt.exists());
+    assert_eq!(s.run(&["sessions", "show", &fork]).status.code(), Some(0));
+}
+
+#[test]
+fn a_model_without_a_key_is_warned_about_at_fork_time() {
+    // Review M7: no key for its provider (no key variable, an empty keychain).
+    let s = Scratch::new();
+    let id = s.parent();
+    let out = s.run(&["fork", &id, "--at", "3", "--model", "openai/gpt-5"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let said = stderr(&out);
+    assert!(
+        said.contains("warning") && said.contains("openai"),
+        "{said}"
+    );
 }
 
 #[test]

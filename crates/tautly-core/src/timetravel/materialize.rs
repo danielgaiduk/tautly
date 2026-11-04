@@ -19,6 +19,9 @@ const WHY_DIR: &str = "a directory is in the way";
 const WHY_UNKEPT: &str =
     "the git snapshot cannot hold it and its content cannot be kept (a link, or over 64 MiB)";
 
+/// The mode of a file a restore creates from a blob of the log.
+const NEW_FILE_MODE: u32 = 0o644;
+
 /// The note of a materialize with git checkpoints.
 const NOTE_GIT: &str = "ignored files and submodules are not restored";
 
@@ -628,9 +631,11 @@ pub(crate) async fn materialize_inner(
                 Src::Absent => Some(Wrote::Absent),
                 Src::Base => None,
             };
-            // A blob is written over a file with that file's mode (see `write`).
+            // A blob is written over a file with that file's mode, else as a new file with
+            // `NEW_FILE_MODE` (see `write`; Task 50 M6).
             let wrote_mode = match (&p.src, &p.disk) {
                 (Src::Blob(_), Disk::File { mode, .. }) => Some(*mode),
+                (Src::Blob(_), _) => Some(NEW_FILE_MODE),
                 _ => None,
             };
             files.push(BackupFile {
@@ -752,7 +757,13 @@ async fn write(
             reader = Some(SessionReader::<SessionRecord>::open(&target.log)?);
         }
         let bytes = reader.as_ref().expect("opened").read_blob(b)?;
-        sb.write_atomic(&full, &bytes, None)
+        // Over a file, with its mode; a new one with a known mode, so what was written can
+        // be told from a later `chmod` (Task 50 M6).
+        let mode = match p.disk {
+            Disk::File { .. } | Disk::Large { .. } => None,
+            _ => Some(NEW_FILE_MODE),
+        };
+        sb.write_atomic(&full, &bytes, mode)
             .await
             .map_err(|source| TtError::Disk {
                 path: full.display().to_string(),
