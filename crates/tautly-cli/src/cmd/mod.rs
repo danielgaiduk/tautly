@@ -1,12 +1,13 @@
 //! The utility commands (`tautly prompt|sessions|models|fork|undo|memory|index|mcp|stats|
-//! receipt ...`): each reads or changes what a session leaves behind, in the work tree of
-//! the current directory, without a model turn (`memory consolidate` and `fork --prompt`
-//! aside).
+//! receipt|compare ...`): each reads or changes what a session leaves behind, in the work
+//! tree of the current directory, without a model turn (`memory consolidate` and `fork
+//! --prompt` aside).
 //!
 //! Output goes to stdout, problems to stderr; the exit code is 0, or 1 when the command
 //! failed (a refused undo, an unknown session, ...). Usage errors exit 2, as clap does.
 
 pub mod auth;
+mod compare;
 pub mod doctor;
 mod fork;
 mod index;
@@ -70,6 +71,9 @@ pub enum Command {
     Stats(stats::Args),
     /// One session's turns, spend and savings estimates (the latest by default).
     Receipt(receipt::Args),
+    /// Compare two to five sessions side by side (cost, steps, wall time, outcome, files),
+    /// counted from their fork point when they share one.
+    Compare(compare::Args),
 }
 
 /// Run `command`; the exit code.
@@ -86,6 +90,7 @@ pub async fn run(command: Command, cli: &Cli) -> anyhow::Result<i32> {
         Command::Mcp { cmd } => mcp::run(cmd, &env).await,
         Command::Stats(args) => stats::run(args, &env),
         Command::Receipt(args) => receipt::run(args, &env),
+        Command::Compare(args) => compare::run(args, &env),
     }
 }
 

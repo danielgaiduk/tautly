@@ -254,7 +254,7 @@ fn rows(s: &Summary, evidence: Option<&TestEvidence>) -> Vec<(&'static str, Stri
 }
 
 /// The last turn's test evidence, without its command (which may name paths).
-fn last_test(evidence: Option<&TestEvidence>) -> String {
+pub(super) fn last_test(evidence: Option<&TestEvidence>) -> String {
     let Some(e) = evidence else {
         return "none in the last turn".to_string();
     };
