@@ -2129,7 +2129,7 @@ impl Session {
     /// background, so neither MCP start nor the first command waits for it. It takes the
     /// checkpoint lock before this returns, so every later checkpoint (the first command's
     /// included) comes after it; a turn's tool calls wait for it
-    /// ([`settle_start_checkpoint`](Self::settle_start_checkpoint)). When none can be
+    /// ([`settle_start_checkpoint_or`](Self::settle_start_checkpoint_or)). When none can be
     /// taken (no git, `.git` a symbolic link), a warning and a `CheckpointSkipped` record
     /// instead. A remote a push to would publish the checkpoint refs to (see
     /// [`Checkpointer::publishing_remotes`]) is warned about first, once.
@@ -2164,18 +2164,11 @@ impl Session {
         }));
     }
 
-    /// Wait for the session-start checkpoint, if it is still being taken: before the
-    /// first tool call (whose edits it must not see) and before anything between turns.
-    pub(crate) async fn settle_start_checkpoint(&mut self) {
-        if let StartCheckpoint::Running(job) = std::mem::take(&mut self.start_checkpoint) {
-            let _ = job.await;
-        }
-    }
-
-    /// [`settle_start_checkpoint`](Self::settle_start_checkpoint), unless `cancel` fires
-    /// first (a turn's `Cancel` or `Shutdown`, spec 8): the checkpoint then goes on in the
-    /// background and is waited for later (or abandoned at shutdown). True when it is
-    /// settled.
+    /// Wait for the session-start checkpoint, if it is still being taken: before a turn's
+    /// first tool call (whose edits it must not see), and before an undo or fork reads the
+    /// log. Unless `cancel` fires first (`Cancel` or `Shutdown`, spec 8): the checkpoint
+    /// then goes on in the background and is waited for later (or abandoned at shutdown).
+    /// True when it is settled.
     pub(crate) async fn settle_start_checkpoint_or(&mut self, cancel: &CancellationToken) -> bool {
         let StartCheckpoint::Running(job) = &mut self.start_checkpoint else {
             return true;

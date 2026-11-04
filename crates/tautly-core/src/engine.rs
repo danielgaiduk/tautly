@@ -459,12 +459,23 @@ pub(crate) fn last_request_path(session_path: &Path) -> PathBuf {
     session_path.with_extension("last-request.json")
 }
 
-/// What runs as a task, with its own cancellation: a user message's turn, a manual
-/// compaction (a summary request) or a memory consolidation (a side-model request).
+/// What runs as a task, with its own cancellation, while the actor goes on reading
+/// commands (`Cancel`, `Shutdown`): a user message's turn, a manual compaction (a summary
+/// request), a memory consolidation (a side-model request), an undo (git steps) or a fork
+/// (a log copy and rebuild, and maybe a provider build). An undo and a fork first wait for
+/// the session-start checkpoint, since they read the log.
 enum Job {
     Turn(String),
     Compact,
     Consolidate,
+    Undo {
+        turn: Option<u32>,
+        dry_run: bool,
+    },
+    Fork {
+        at: Option<u32>,
+        label: Option<String>,
+    },
 }
 
 /// The task in flight (a turn or a compaction). It hands back the session and the inbox,
@@ -538,8 +549,16 @@ impl Actor {
         for w in start.config_warnings {
             self.events.try_emit(Event::Warning { message: w });
         }
+        // Commands sent while a resumed session sets up its model (a keychain prompt may
+        // hold it) are kept; a `Shutdown` among them abandons that.
+        let mut early = Vec::new();
         let started = if start.resume {
-            session.resume(&start.config_pins).await
+            session
+                .resume(
+                    &start.config_pins,
+                    until_shutdown(&mut commands, &mut early),
+                )
+                .await
         } else {
             session.init(&start.config_pins).await;
             Ok(())
@@ -567,6 +586,11 @@ impl Actor {
         let mut running: Option<Running> = None;
         let mut queue: VecDeque<Command> = VecDeque::new();
         let mut stopping = false;
+        for cmd in early {
+            let lost = state.is_none();
+            self.received(cmd, lost, None, &mut queue, &mut stopping)
+                .await;
+        }
         loop {
             if running.is_none() && !stopping {
                 while let Some(cmd) = queue.pop_front() {
@@ -574,6 +598,8 @@ impl Actor {
                         Command::SendMessage { text } => Job::Turn(text),
                         Command::Compact => Job::Compact,
                         Command::ConsolidateMemory => Job::Consolidate,
+                        Command::Undo { turn, dry_run } => Job::Undo { turn, dry_run },
+                        Command::Fork { at, label } => Job::Fork { at, label },
                         Command::SetModel { model } => {
                             match state.as_mut() {
                                 Some(s) => {
@@ -581,8 +607,11 @@ impl Actor {
                                     // taking commands meanwhile, and let a `Shutdown` abandon
                                     // the switch.
                                     let mut early = Vec::new();
+                                    let unbound = s.events.clone();
+                                    s.events = unbound.replying();
                                     s.set_model(model, until_shutdown(&mut commands, &mut early))
                                         .await;
+                                    s.events = unbound;
                                     for cmd in early {
                                         self.received(cmd, false, None, &mut queue, &mut stopping)
                                             .await;
@@ -630,6 +659,8 @@ impl Actor {
                             while let Ok(cmd) = inbox.try_recv() {
                                 s.context_command(cmd).await;
                             }
+                            // A fork continues on its branch (`current` is the job's).
+                            self.session_id.clone_from(&s.session_id);
                             state = Some(s);
                         }
                         Err(e) => self.crashed(e, turn).await,
@@ -769,11 +800,20 @@ impl Actor {
             approvals: self.approvals.clone(),
         };
         let turn = matches!(job, Job::Turn(_));
+        let current = Arc::clone(&self.current);
         let handle = tokio::spawn(async move {
             match job {
                 Job::Turn(text) => session.run_turn(text, &mut ctl).await,
                 Job::Compact => session.compact_command(&ctl).await,
                 Job::Consolidate => session.consolidate_command(&ctl).await,
+                Job::Undo { turn, dry_run } => session.undo_job(turn, dry_run, &ctl).await,
+                Job::Fork { at, label } => {
+                    let on_branch = move |id: &str, path: &Path| {
+                        *current.lock().unwrap_or_else(PoisonError::into_inner) =
+                            (id.to_string(), path.to_path_buf());
+                    };
+                    session.fork_job(at, label, &ctl, on_branch).await
+                }
             }
             (session, ctl.inbox)
         });
@@ -793,38 +833,23 @@ impl Actor {
         }
     }
 
-    /// A command that runs between turns.
+    /// A short command that runs between turns, in the actor. Its answer waits (a bounded
+    /// time) for a client that is behind.
     async fn idle_command(&mut self, session: &mut Session, cmd: Command) {
-        // A fork or undo reads the log, which must have the session-start checkpoint.
-        session.settle_start_checkpoint().await;
+        let unbound = session.events.clone();
+        session.events = unbound.replying();
+        self.idle_command_inner(session, cmd).await;
+        session.events = unbound;
+    }
+
+    async fn idle_command_inner(&mut self, session: &mut Session, cmd: Command) {
         match cmd {
             Command::Pin { .. }
             | Command::Unpin { .. }
             | Command::ApproveMemory { .. }
             | Command::RejectMemory { .. } => session.context_command(cmd).await,
             Command::Diff { turn } => session.diff(turn).await,
-            Command::Fork { at, label } => match session.fork(at, label).await {
-                Ok((id, path)) => {
-                    self.session_id.clone_from(&id);
-                    *self.current.lock().unwrap_or_else(PoisonError::into_inner) =
-                        (id.clone(), path);
-                    self.events
-                        .send_or_drop(Event::SessionChanged { session_id: id })
-                        .await;
-                }
-                Err(why) => {
-                    self.events
-                        .send_or_drop(Event::Error {
-                            kind: ErrorKind::Internal,
-                            message: format!("fork: {why}"),
-                            retryable: false,
-                            hint: None,
-                        })
-                        .await;
-                }
-            },
             Command::Uncompact => session.uncompact_command().await,
-            Command::Undo { turn, dry_run } => session.undo_command(turn, dry_run).await,
             other => {
                 let name = serde_json::to_value(&other)
                     .ok()

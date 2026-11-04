@@ -36,6 +36,7 @@ use crate::checkpoint::{self, Change, CheckpointError, Checkpointer, Skip};
 use crate::protocol::{ErrorKind, Event};
 use crate::record::{SessionRecord, UndoneFile};
 use crate::session::{Log, Session};
+use crate::turn::TurnControl;
 
 /// `note` when the turn ran commands and checkpoints restored them.
 pub const NOTE_GIT: &str = "ignored files and submodules are not restored";
@@ -1215,10 +1216,30 @@ fn undo_plan(
 // ------------------------------------------------------------------ the engine's undo
 
 impl Session {
+    /// `Command::Undo`, as a job the client can cancel while it waits for the
+    /// session-start checkpoint (the undo reads it from the log). Once the undo starts it
+    /// runs to its end (each git step is bounded), so no file is left half restored.
+    pub(crate) async fn undo_job(&mut self, turn: Option<u32>, dry_run: bool, ctl: &TurnControl) {
+        let unbound = self.events.clone();
+        self.events = unbound.bound(ctl.cancel.clone());
+        if self.settle_start_checkpoint_or(&ctl.cancel).await && !ctl.cancel.is_cancelled() {
+            self.undo_command(turn, dry_run).await;
+        } else {
+            self.emit(Event::Error {
+                kind: ErrorKind::Tool,
+                message: "undo cancelled: nothing was changed".into(),
+                retryable: false,
+                hint: None,
+            })
+            .await;
+        }
+        self.events = unbound;
+    }
+
     /// `Command::Undo` (between turns): undo user turn `turn` of this session through its
     /// own log, answered with `Undone` or an `Error`. The files it wrote are no longer
     /// known as the model last saw them.
-    pub(crate) async fn undo_command(&mut self, turn: Option<u32>, dry_run: bool) {
+    async fn undo_command(&mut self, turn: Option<u32>, dry_run: bool) {
         // Make everything logged so far readable.
         self.checkpoint().await;
         let path = self.log.path();

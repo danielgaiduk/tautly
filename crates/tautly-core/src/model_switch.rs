@@ -222,13 +222,19 @@ impl Session {
     /// `ReasoningStripped` records the rebuild already applied to the context. Announced
     /// with `ModelChanged`. When that model cannot be used now (no key, say) the session
     /// stays on its own model, which is logged as a `ModelSet`, with a `Warning`; the next
-    /// step start strips another provider's reasoning as after any switch. The provider is
-    /// built before the session takes commands, so a keychain prompt holds them.
-    pub(crate) async fn restore_model(&mut self, model: ModelId) {
+    /// step start strips another provider's reasoning as after any switch. The provider
+    /// build may wait on a keychain prompt: `stop` (a `Shutdown`, or the fork's cancel)
+    /// abandons it, and the session stays on its own model the same way.
+    pub(crate) async fn restore_model(&mut self, model: ModelId, stop: impl Future<Output = ()>) {
         if model == self.model {
             return;
         }
-        match self.build_provider(&model).await {
+        let built = tokio::select! {
+            biased;
+            built = self.build_provider(&model) => built,
+            () = stop => Err(ProviderSetupError::Other("the session is shutting down".into())),
+        };
+        match built {
             Ok((provider, side, side_note)) => {
                 self.install_model(&model, provider, side, side_note).await;
                 self.emit(Event::ModelChanged {

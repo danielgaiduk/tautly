@@ -1416,6 +1416,65 @@ impl tautly_provider::Provider for PanicsOn {
     }
 }
 
+/// Review A M3: the answer to a command the client asked for waits (a bounded time) for
+/// a client that is behind, instead of being dropped from a full channel.
+#[tokio::test]
+async fn replies_to_commands_wait_for_a_client_that_is_behind() {
+    let fx = Fx::new();
+    let mock = MockProvider::new(vec![text_step("one")]);
+    let mut run = start(fx.builder(config(Mode::Ask), &mock));
+    run.turn_with("one").await;
+    // Fill the event channel without reading it: each refused `SetBudget` is a warning.
+    for _ in 0..300 {
+        run.send(Command::SetBudget {
+            scope: BudgetScope::Session,
+            max_usd: Some(-1.0),
+            max_tokens: None,
+        })
+        .await;
+    }
+    run.send(Command::Undo {
+        turn: None,
+        dry_run: true,
+    })
+    .await;
+    run.send(Command::SetModel {
+        model: ModelId::from(MODEL),
+    })
+    .await;
+    run.send(Command::Compact).await;
+    run.send(Command::Uncompact).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let mut events = Vec::new();
+    let answered = |events: &[Event]| {
+        let warned = |s: &str| {
+            events
+                .iter()
+                .any(|e| matches!(e, Event::Warning { message } if message.contains(s)))
+        };
+        events.iter().any(|e| matches!(e, Event::Undone { .. }))
+            && events
+                .iter()
+                .any(|e| matches!(e, Event::ModelChanged { .. }))
+            && warned("nothing to compact")
+            && warned("nothing to restore")
+    };
+    let end = Instant::now() + Duration::from_secs(5);
+    while !answered(&events) && Instant::now() < end {
+        if let Ok(Some(ev)) =
+            tokio::time::timeout(Duration::from_millis(200), run.events.recv()).await
+        {
+            events.push(ev);
+        }
+    }
+    let tail: Vec<&Event> = events
+        .iter()
+        .filter(|e| !matches!(e, Event::Warning { message } if message.contains("SetBudget")))
+        .collect();
+    assert!(answered(&events), "{tail:?}");
+    run.stop().await;
+}
+
 /// Review A probe P7: a panic in a `Compact` job is no turn's end.
 #[tokio::test]
 async fn a_panic_in_a_compaction_job_logs_no_turn_end() {

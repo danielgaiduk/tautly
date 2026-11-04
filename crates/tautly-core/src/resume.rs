@@ -73,7 +73,7 @@ use crate::budget::Budget;
 use crate::dispatch::signature;
 use crate::ledger::{LEDGER_FILE, Ledger};
 use crate::mcp::MCP_TOOL_PREFIX;
-use crate::protocol::{BudgetScope, Command, Event, FinishReason};
+use crate::protocol::{BudgetScope, Command, ErrorKind, Event, FinishReason};
 use crate::provider_setup::provider_label;
 use crate::record::SessionRecord;
 use crate::session::{PrefixLog, Session};
@@ -908,7 +908,11 @@ impl Session {
     /// and close a turn the log ends in (a crash) with its missing `TurnEnd` before
     /// anything else is written; then take the rebuilt state and restore the rest
     /// ([`resume_start`](Self::resume_start)). An error leaves the session unusable.
-    pub(crate) async fn resume(&mut self, config_pins: &[String]) -> Result<(), String> {
+    pub(crate) async fn resume(
+        &mut self,
+        config_pins: &[String],
+        stop: impl std::future::Future<Output = ()>,
+    ) -> Result<(), String> {
         let path = self.log.path();
         let log = self.log.clone();
         let calibration = self.calibration();
@@ -938,7 +942,7 @@ impl Session {
         }
         let mut resumed = self.adopt(rebuilt);
         if let Some(model) = resumed.model.take() {
-            self.restore_model(model).await;
+            self.restore_model(model, stop).await;
         }
         self.resume_start(resumed, config_pins).await;
         self.show_pending_proposals().await;
@@ -1092,6 +1096,43 @@ impl Session {
         }
     }
 
+    /// `Command::Fork`, as a job the client can cancel while it waits for the
+    /// session-start checkpoint (the branch copies the log) and while the branch's model is
+    /// set up. Answered with `SessionChanged` (after `on_branch` is told the branch's id and
+    /// log) or an `Error`.
+    pub(crate) async fn fork_job(
+        &mut self,
+        at: Option<u32>,
+        label: Option<String>,
+        ctl: &TurnControl,
+        on_branch: impl FnOnce(&str, &std::path::Path),
+    ) {
+        let unbound = self.events.clone();
+        self.events = unbound.bound(ctl.cancel.clone());
+        let made =
+            if self.settle_start_checkpoint_or(&ctl.cancel).await && !ctl.cancel.is_cancelled() {
+                self.fork(at, label, ctl.cancel.cancelled()).await
+            } else {
+                Err("cancelled; no branch was made".to_string())
+            };
+        match made {
+            Ok((id, path)) => {
+                on_branch(&id, &path);
+                self.emit(Event::SessionChanged { session_id: id }).await;
+            }
+            Err(why) => {
+                self.emit(Event::Error {
+                    kind: ErrorKind::Internal,
+                    message: format!("fork: {why}"),
+                    retryable: false,
+                    hint: None,
+                })
+                .await;
+            }
+        }
+        self.events = unbound;
+    }
+
     /// `Command::Fork`: a new session whose log is this one's up to the end of step `at`
     /// (default: the tip), copied verbatim, with `origin: fork`, `label` and the parent
     /// `(id, offset of the step's end)`; the session continues on it with the context
@@ -1102,6 +1143,7 @@ impl Session {
         &mut self,
         at: Option<u32>,
         label: Option<String>,
+        stop: impl std::future::Future<Output = ()>,
     ) -> Result<(String, PathBuf), String> {
         self.checkpoint().await;
         let parent_path = self.log.path();
@@ -1169,7 +1211,7 @@ impl Session {
             self.warn(format!("fork: {w}")).await;
         }
         if let Some(model) = resumed.model {
-            self.restore_model(model).await;
+            self.restore_model(model, stop).await;
         }
         Ok((id, path))
     }
@@ -1198,6 +1240,14 @@ impl Session {
     /// `Command::Compact` (between turns, as a task the user can cancel): collect and
     /// compact now, as one epoch, reason `manual`.
     pub(crate) async fn compact_command(&mut self, ctl: &TurnControl) {
+        // Its answer waits for room until the user cancels (as a turn's events do).
+        let unbound = self.events.clone();
+        self.events = unbound.bound(ctl.cancel.clone());
+        self.compact_now(ctl).await;
+        self.events = unbound;
+    }
+
+    async fn compact_now(&mut self, ctl: &TurnControl) {
         let mut applied = false;
         if let Some(rec) = self.context.collect(Some(MutationReason::Manual)) {
             self.collected(rec).await;

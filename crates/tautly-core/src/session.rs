@@ -53,6 +53,9 @@ const FINISH_GRACE: Duration = Duration::from_secs(5);
 ///   turn's sink is overflowing and every further event is dropped at once, except
 ///   `TurnFinished`, which (with the drop warning just before it) waits [`FINISH_GRACE`]
 ///   once, so a busy but reading client still learns that the turn ended.
+/// - A [`replying`](EventSink::replying) sink (the session's while it answers a command
+///   between turns) waits [`SEND_GRACE`] for room; once one has timed out every further
+///   event of that answer is dropped at once.
 /// - An unbound sink (the actor's, and the session's between turns) never waits.
 ///
 /// Dropped events are counted and announced with a warning when there is room.
@@ -60,8 +63,10 @@ const FINISH_GRACE: Duration = Duration::from_secs(5);
 pub(crate) struct EventSink {
     tx: mpsc::Sender<Event>,
     cancel: Option<CancellationToken>,
+    /// Waits [`SEND_GRACE`] on a full channel (an answer the client asked for).
+    replying: bool,
     dropped: Arc<AtomicU64>,
-    /// Set for the turn once a post-cancel send timed out.
+    /// Set for the turn (or the answer) once a send timed out.
     overflowing: Arc<AtomicBool>,
 }
 
@@ -70,6 +75,7 @@ impl EventSink {
         EventSink {
             tx,
             cancel: None,
+            replying: false,
             dropped: Arc::default(),
             overflowing: Arc::default(),
         }
@@ -79,6 +85,18 @@ impl EventSink {
     pub fn bound(&self, cancel: CancellationToken) -> Self {
         EventSink {
             cancel: Some(cancel),
+            replying: false,
+            overflowing: Arc::default(),
+            ..self.clone()
+        }
+    }
+
+    /// This sink, for the answer to a command the client sent (between turns, from the
+    /// actor): each event waits [`SEND_GRACE`] for room, until one times out.
+    pub fn replying(&self) -> Self {
+        EventSink {
+            cancel: None,
+            replying: true,
             overflowing: Arc::default(),
             ..self.clone()
         }
@@ -86,6 +104,16 @@ impl EventSink {
 
     pub async fn emit(&self, ev: Event) {
         let Some(cancel) = &self.cancel else {
+            if self.replying && !self.overflowing.load(Ordering::Relaxed) {
+                self.announce_dropped();
+                if let Err(mpsc::error::SendTimeoutError::Timeout(_)) =
+                    self.tx.send_timeout(ev, SEND_GRACE).await
+                {
+                    self.overflowing.store(true, Ordering::Relaxed);
+                    self.dropped.fetch_add(1, Ordering::Relaxed);
+                }
+                return;
+            }
             return self.try_emit(ev);
         };
         if !cancel.is_cancelled() {

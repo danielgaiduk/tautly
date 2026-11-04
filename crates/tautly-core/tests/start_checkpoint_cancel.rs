@@ -200,6 +200,28 @@ async fn at_the_turn_end(git: &Path) {
     );
 }
 
+/// Review A M5: `Undo` and `Fork` wait for the start checkpoint (they read the log), as
+/// jobs: a `Shutdown` sent meanwhile is read and stops them.
+async fn shutdown_while_a_command_waits(git: &Path, cmd: Command) {
+    let (dir, home) = repo(git);
+    let mock = MockProvider::new(vec![]);
+    let mut run = Run::start(dir.path(), home.path(), &mock);
+    run.engine.send(cmd.clone()).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let t0 = Instant::now();
+    run.engine.send(Command::Shutdown).await.unwrap();
+    while tokio::time::timeout(WAIT, run.events.recv())
+        .await
+        .expect("the engine did not stop")
+        .is_some()
+    {}
+    let took = t0.elapsed();
+    assert!(
+        took < Duration::from_millis(1000),
+        "{cmd:?}: the engine stopped {took:?} after Shutdown"
+    );
+}
+
 #[test]
 fn cancel_while_the_session_start_checkpoint_is_taken_ends_the_turn_within_200ms() {
     let git = real_git();
@@ -229,5 +251,21 @@ fn cancel_while_the_session_start_checkpoint_is_taken_ends_the_turn_within_200ms
     rt.block_on(async {
         before_the_first_tool_call(&git).await;
         at_the_turn_end(&git).await;
+        shutdown_while_a_command_waits(
+            &git,
+            Command::Undo {
+                turn: None,
+                dry_run: true,
+            },
+        )
+        .await;
+        shutdown_while_a_command_waits(
+            &git,
+            Command::Fork {
+                at: None,
+                label: None,
+            },
+        )
+        .await;
     });
 }
