@@ -3221,6 +3221,7 @@ dependencies = [
  "rpassword",
  "rusqlite",
  "serde_json",
+ "tautly-acp",
  "tautly-core",
  "tautly-index",
  "tautly-provider",
@@ -3231,6 +3232,21 @@ dependencies = [
  "tempfile",
  "tokio",
  "wiremock",
+]
+
+[[package]]
+name = "tautly-acp"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "serde",
+ "serde_json",
+ "tautly-core",
+ "tautly-provider",
+ "tautly-rpc",
+ "tempfile",
+ "thiserror",
+ "tokio",
 ]
 
 [[package]]
@@ -3494,6 +3510,7 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]

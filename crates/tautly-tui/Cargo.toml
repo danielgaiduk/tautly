@@ -21,5 +21,7 @@ async-trait.workspace = true
 tautly-provider = { path = "../tautly-provider" }
 tautly-sandbox = { path = "../tautly-sandbox" }
 regex.workspace = true
+# A provider that panics, for the lost-session test.
+tokio-util.workspace = true
 tempfile.workspace = true
 tokio.workspace = true

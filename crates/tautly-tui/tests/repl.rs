@@ -1478,6 +1478,115 @@ async fn failed_resume_falls_back_without_claiming_success() {
 }
 
 // ---------------------------------------------------------------------------------------
+// `/compact` (Task 46 re-review N4)
+
+/// The mock model with a small window, so a manual compaction summarizes.
+fn small_window_config() -> Config {
+    let mut cfg = config(Mode::Ask, false);
+    cfg.catalog_overrides = Some(
+        Catalog::from_toml(&format!(
+            r#"[models."{MODEL}"]
+context_window = 16000
+max_output = 1000
+parallel_tools = false
+reasoning = "none"
+cache = "none"
+images = false
+edit_format = "str_replace"
+"#
+        ))
+        .unwrap(),
+    );
+    cfg
+}
+
+#[tokio::test]
+async fn compact_returns_to_the_prompt_after_the_summary() {
+    let fx = Fx::new();
+    for i in 1..=4 {
+        std::fs::write(
+            fx.dir.path().join(format!("f{i}.txt")),
+            format!("file {i}\n"),
+        )
+        .unwrap();
+    }
+    let mut script: Vec<MockTurn> = (1..=4)
+        .map(|i| {
+            step(vec![call(
+                &format!("r{i}"),
+                "read",
+                json!({"path": format!("f{i}.txt")}),
+            )])
+        })
+        .collect();
+    script.push(text_step("first done"));
+    script.push(text_step("SUMMARY-ONE"));
+    script.push(text_step("AFTER-COMPACT"));
+    let mock = MockProvider::new(script);
+    let ran = run(
+        &fx,
+        vec![text("read them"), text("/compact"), text("next")],
+        small_window_config(),
+        &mock,
+    )
+    .await;
+    // The summary was asked for, and the next message ran after it.
+    assert_eq!(mock.requests().len(), 7, "{}", ran.out);
+    let compacted = ran
+        .out
+        .find("compacted")
+        .unwrap_or_else(|| panic!("{}", ran.out));
+    let after = ran.out.find("AFTER-COMPACT").unwrap();
+    assert!(compacted < after, "{}", ran.out);
+}
+
+/// A provider whose first request panics: the turn crashes and the session is lost.
+struct PanicsFirst(MockProvider);
+
+impl tautly_provider::Provider for PanicsFirst {
+    fn name(&self) -> &str {
+        "mock"
+    }
+
+    fn stream(
+        &self,
+        req: tautly_provider::CanonicalRequest,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> futures::stream::BoxStream<'static, Result<ProviderEvent, tautly_provider::ProviderError>>
+    {
+        assert!(!self.0.requests().is_empty(), "probe: provider bug");
+        self.0.stream(req, cancel)
+    }
+}
+
+#[tokio::test]
+async fn compact_on_a_lost_session_returns_to_the_prompt() {
+    let fx = Fx::new();
+    let mock = MockProvider::new(vec![text_step("never")]);
+    let (root, home) = (fx.root(), fx.home.path().to_path_buf());
+    let cfg = config(Mode::Ask, false);
+    let f: EngineFactory = Box::new(move |resume| {
+        EngineBuilder {
+            provider: Some(Arc::new(PanicsFirst(mock.clone()))),
+            data_home: Some(home.clone()),
+            interactive: true,
+            resume,
+            ..EngineBuilder::new(cfg.clone(), root.clone())
+        }
+        .build()
+    });
+    // Without the compaction's end the REPL would wait at `/compact` and time out.
+    let ran = run_with(
+        vec![text("crash"), text("/compact"), text("/compact")],
+        f,
+        fx.opts(),
+    )
+    .await;
+    assert!(ran.out.contains("takes no more commands"), "{}", ran.out);
+    assert_eq!(ran.prompts.len(), 4, "{:?}\n{}", ran.prompts, ran.out);
+}
+
+// ---------------------------------------------------------------------------------------
 // Time travel
 
 /// A scripted source that, on the line `!edit <path> <text>`, writes `<text>` (and a

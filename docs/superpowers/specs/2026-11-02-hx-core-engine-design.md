@@ -123,7 +123,7 @@ Every step is appended to the session log before its effects are surfaced, so an
 
 ### 3.2 Events (engine → client)
 Typed, serde-serializable, versioned:
-`TurnStarted`, `TextDelta`, `ReasoningDelta`, `ToolCallProposed`, `ToolApprovalRequested{request_id, call_id, tool, args, reason, diff?}`, `ToolStarted`, `ToolOutputDelta`, `ToolFinished{…, blocked, diff?}`, `Usage{role, tokens_in, tokens_out, cache_read, cache_write, cost_usd, quota?}` (`role` ∈ `main | side`), `ContextStatus{used, budget, breakdown, warnings}`, `Compacted{removed_turns, summary, reason}`, `ContextCollected{elided_results, tokens_freed, reason}`, `MemoryProposed{proposal_id, change}` (`change` = an entry to upsert and/or entry ids to delete), `SessionChanged{session_id}`, `TurnReceipt{…}` (7.11.1), `ModelChanged{model, provider}` (7.11.5), `SessionDiff{turn?, files, unified, truncated}` (7.11.4), `Undone{turn, restored, deleted, dry_run, backup_ref?, note?}` (7.11.11), `McpServerApprovalRequested{request_id, server, source, launch}`, `McpServerStatus{server, state, tools, message?}` (7.11.10), `TurnFinished{reason, evidence?}` (7.11.7), `Rewound{at, branch, report}`, `Switched{branch, report}`, `Replayed{offset, t_ms, event}`, `ReplayFinished{session_id, events, cancelled}`, `UserMessage{text}` (7.12), `Error{kind, message, retryable, hint}`, `Warning{message}`.
+`TurnStarted`, `TextDelta`, `ReasoningDelta`, `ToolCallProposed`, `ToolApprovalRequested{request_id, call_id, tool, args, reason, diff?}`, `ToolStarted`, `ToolOutputDelta`, `ToolFinished{…, blocked, diff?}`, `Usage{role, tokens_in, tokens_out, cache_read, cache_write, cost_usd, quota?}` (`role` ∈ `main | side`), `ContextStatus{used, budget, breakdown, warnings}`, `Compacted{removed_turns, summary, reason}`, `ContextCollected{elided_results, tokens_freed, reason}`, `CompactFinished{applied, tokens_freed}` (the last event of each `Compact` command, whatever happened), `MemoryProposed{proposal_id, change}` (`change` = an entry to upsert and/or entry ids to delete), `SessionChanged{session_id}`, `TurnReceipt{…}` (7.11.1), `ModelChanged{model, provider}` (7.11.5), `SessionDiff{turn?, files, unified, truncated}` (7.11.4), `Undone{turn, restored, deleted, dry_run, backup_ref?, note?}` (7.11.11), `McpServerApprovalRequested{request_id, server, source, launch}`, `McpServerStatus{server, state, tools, message?}` (7.11.10), `TurnFinished{reason, evidence?}` (7.11.7), `Rewound{at, branch, report}`, `Switched{branch, report}`, `Replayed{offset, t_ms, event}`, `ReplayFinished{session_id, events, cancelled}`, `UserMessage{text}` (7.12), `Error{kind, message, retryable, hint}`, `Warning{message}`.
 
 `TurnFinished.reason` ∈ `completed | cancelled | budget | max_turns | timeout | error`. At the end of a turn `TurnReceipt` comes right before `TurnFinished`, for every reason.
 
@@ -527,15 +527,15 @@ At each directory level where `AGENTS.md` is read (root and ancestors, 6.1), a d
   - At the prompt, Ctrl+C clears the line and Ctrl+D on an empty line exits.
 
 #### 7.11.9 ACP bridge (`tautly acp`)
-- Speaks the Agent Client Protocol over stdio: wire `protocolVersion` 1, schema v1.29.1 (agentclientprotocol.com; `agent-client-protocol` crate 1.15.1, checked 2026-11-03). It drives `Engine`s directly, like the RPC server, and shares one `Workspace` per root (3.4). `initialize` advertises `loadSession: true`, embedded-context prompts, and images when the default model takes them. `authMethods` is empty: keys come from env or keychain, and a missing key fails `session/new` with the 7.11.2 hint.
+- Speaks the Agent Client Protocol over stdio: wire `protocolVersion` 1. The wire types are hand-written in `tautly-acp` (no ACP crate dependency) and validated against `agent-client-protocol-schema` 1.12.0: the 1.15.1 schema crate was under two weeks old at implementation, and 1.12.0 turns on `serde_json/preserve_order`, which would change JSON key order for the whole binary (Task 46 ruling). The JSON-RPC framing is `tautly-rpc`'s. It drives `Engine`s directly, like the RPC server, and shares one `Workspace` per root (3.4). `initialize` advertises `loadSession: true` and embedded-context prompts; `image: false` in v1, since `SendMessage` carries text only (image blocks are refused). `authMethods` is empty: keys come from env or keychain, and a missing key fails `session/new` with the 7.11.2 hint.
 - **Sessions and prompts:**
 
   | ACP | Engine |
   |---|---|
   | `session/new {cwd, mcpServers}` | Engine at the git top level of `cwd`. Client-supplied MCP servers count as user-trusted: they come from the user's editor config |
   | `session/load` | `resume`, replaying user and agent messages and final tool calls as `session/update` |
-  | `session/prompt` | `SendMessage`. Text blocks are joined; resource blocks are inlined as fenced text with their URI; images pass when the model takes them |
-  | `session/prompt` starting with `/compact`, `/undo`, `/diff`, `/cost` or `/pin` | The matching command. These are advertised via `available_commands_update` |
+  | `session/prompt` | `SendMessage`. Text blocks are joined; resource blocks are inlined as fenced text with their URI; image, audio and binary blocks are refused in v1 |
+  | `session/prompt` starting with `/compact`, `/undo`, `/diff`, `/cost` or `/pin` | The matching command. These are advertised via `available_commands_update`. `/compact` answers at `CompactFinished`; `/undo` runs a dry run first and asks with `session/request_permission` |
   | `session/set_config_option {configId: "model"}` | `SetModel`. The `model` option (category `model`) lists models with keys |
 
 - **Stop reasons:** `completed` → `end_turn`, `max_turns` → `max_turn_requests`, `cancelled` → `cancelled`. `budget` and `timeout` → `end_turn` preceded by a notice. `error` → a JSON-RPC error.
@@ -555,11 +555,11 @@ At each directory level where `AGENTS.md` is read (root and ancestors, 6.1), a d
   - `ToolFinished` → `completed`/`failed`, with text content (≤ 8 KB) and a `diff` content `{path, oldText, newText}` per edited file when both texts are ≤ 256 KB (else the unified `DiffPreview` as text).
   - `Usage`/`ContextStatus` → `usage_update {used, size, cost{amount, currency: "USD"}}`.
   - `TurnReceipt` and evidence → a `notice` when the client supports `session.notices`.
-- **Permissions** go through `session/request_permission`:
+- **Permissions** go through `session/request_permission`. Titles and names are escaped as single lines; commands, arguments, launch lines, memory bodies and diff texts are escaped (3.4), and multi-line text goes in a code fence longer than any backtick run in it, since editors render it as markdown:
   - `ToolApprovalRequested` → options `allow_once`, `allow_always` (= the exact-target `session_rule`, 7.11.8) and `reject_once`; the preview goes in as `diff` content.
   - `McpServerApprovalRequested` and `MemoryProposed` → `allow_once`/`reject_once`.
   - Outcome `cancelled` → `Deny`.
-- `session/cancel` → `Cancel`. The bridge answers outstanding permission requests as denied and responds to the prompt with `cancelled`.
+- `session/cancel` → `Cancel`. The bridge answers outstanding tool-call and memory permission requests as denied (and denies, without asking, any that arrive before the turn ends) and responds to the prompt with `cancelled`. A pending repository MCP server approval stays open (its denial would last for the session, 7.11.10).
 - Client `fs/*` and `terminal/*` methods are not used in v1. Tautly reads the disk through its sandbox, so unsaved editor buffers are not seen.
 
 #### 7.11.10 MCP client, tools only (`tautly-mcp`)

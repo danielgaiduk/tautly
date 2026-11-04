@@ -95,12 +95,22 @@ impl Incoming {
 /// the error; no id at all for a malformed *notification* (an object with a string
 /// `method` and no `id`), which JSON-RPC never answers.
 pub fn parse(line: &[u8]) -> Result<Incoming, (Option<Value>, Error)> {
-    let value: Value = serde_json::from_slice(line).map_err(|e| {
+    parse_value(parse_json(line)?)
+}
+
+/// The JSON of one line; a parse error is answered with id null.
+pub fn parse_json(line: &[u8]) -> Result<Value, (Option<Value>, Error)> {
+    serde_json::from_slice(line).map_err(|e| {
         (
             Some(Value::Null),
             Error::new(PARSE_ERROR, format!("parse error: {e}")),
         )
-    })?;
+    })
+}
+
+/// [`parse`] for a line already read as JSON (a peer that also sends responses looks at
+/// the value first).
+pub fn parse_value(value: Value) -> Result<Incoming, (Option<Value>, Error)> {
     let Value::Object(mut obj) = value else {
         let what = if value.is_array() {
             "batches are not supported"

@@ -137,6 +137,10 @@ fn every_event() -> Vec<Event> {
             tokens_freed: 3200,
             reason: MutationReason::ColdCache,
         },
+        Event::CompactFinished {
+            applied: true,
+            tokens_freed: 2900,
+        },
         Event::MemoryProposed {
             proposal_id: "prop_1".into(),
             change: memory_change(),
@@ -272,6 +276,7 @@ fn every_event() -> Vec<Event> {
             | Event::ContextStatus { .. }
             | Event::Compacted { .. }
             | Event::ContextCollected { .. }
+            | Event::CompactFinished { .. }
             | Event::MemoryProposed { .. }
             | Event::SessionChanged { .. }
             | Event::TurnReceipt { .. }
@@ -871,7 +876,7 @@ fn timestamps_are_unix_seconds_on_the_wire() {
     let events = every_event();
     let usage = serde_json::to_value(&events[8]).unwrap();
     assert_eq!(usage["quota"]["reset_at"], 1_700_000_060_u64);
-    let proposed = serde_json::to_value(&events[12]).unwrap();
+    let proposed = serde_json::to_value(&events[13]).unwrap();
     assert_eq!(proposed["change"]["upsert"]["created"], 1_700_000_000_u64);
     assert_eq!(
         proposed["change"]["upsert"]["verified"],
@@ -888,7 +893,7 @@ fn timestamps_are_unix_seconds_on_the_wire() {
         upsert: Some(MemoryEntry {
             created: UNIX_EPOCH + Duration::from_millis(1_700_000_000_999),
             verified: Some(UNIX_EPOCH + Duration::from_secs(1_700_000_100)),
-            ..match &events[12] {
+            ..match &events[13] {
                 Event::MemoryProposed { change, .. } => change.upsert.clone().unwrap(),
                 _ => unreachable!(),
             }

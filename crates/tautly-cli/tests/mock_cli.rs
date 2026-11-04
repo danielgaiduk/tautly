@@ -190,6 +190,57 @@ fn rpc_mode_serves_json_rpc_on_stdio() {
     assert_eq!(said, "over rpc");
 }
 
+#[test]
+fn acp_mode_speaks_acp_on_stdio() {
+    let s = Scratch::new();
+    let script = s.script("s.json", json!([text("over acp")]));
+    let mut child = s
+        .command(&["--mock-script", &script, "acp"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = std::io::BufReader::new(child.stdout.take().unwrap());
+    let cwd = s.work.path().canonicalize().unwrap();
+    let mut send = |m: Value| writeln!(stdin, "{m}").unwrap();
+    send(json!({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                "params": {"protocolVersion": 1, "clientCapabilities": {}}}));
+    send(json!({"jsonrpc": "2.0", "id": 2, "method": "session/new",
+                "params": {"cwd": cwd, "mcpServers": []}}));
+    let mut msgs = read_until(&mut stdout, |m| m["id"] == 2);
+    let sid = msgs.last().unwrap()["result"]["sessionId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{msgs:?}"))
+        .to_string();
+    send(
+        json!({"jsonrpc": "2.0", "id": 3, "method": "session/prompt",
+                "params": {"sessionId": sid, "prompt": [{"type": "text", "text": "hi"}]}}),
+    );
+    msgs.extend(read_until(&mut stdout, |m| m["id"] == 3));
+    assert_eq!(
+        msgs.last().unwrap()["result"]["stopReason"],
+        "end_turn",
+        "{msgs:?}"
+    );
+    // A disconnect: the session shuts down and the process exits 0.
+    drop(send);
+    drop(stdin);
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    // Stdout carries protocol frames only.
+    msgs.extend(lines(&out));
+    assert!(msgs.iter().all(|m| m["jsonrpc"] == "2.0"), "{msgs:?}");
+    assert_eq!(msgs[0]["result"]["protocolVersion"], 1);
+    let said: String = msgs
+        .iter()
+        .filter(|m| m["params"]["update"]["sessionUpdate"] == "agent_message_chunk")
+        .map(|m| m["params"]["update"]["content"]["text"].as_str().unwrap())
+        .collect();
+    assert_eq!(said, "over acp");
+}
+
 /// Send `signal` (`TERM`, `INT`) to the child.
 fn kill(child: &Child, signal: &str) {
     let status = Command::new("kill")

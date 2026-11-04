@@ -135,6 +135,11 @@ expression: events
     "reason": "cold_cache"
   },
   {
+    "type": "compact_finished",
+    "applied": true,
+    "tokens_freed": 2900
+  },
+  {
     "type": "memory_proposed",
     "proposal_id": "prop_1",
     "change": {

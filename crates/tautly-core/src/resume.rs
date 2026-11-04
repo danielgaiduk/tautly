@@ -1325,11 +1325,20 @@ impl Session {
         // Its answer waits for room until the user cancels (as a turn's events do).
         let unbound = self.events.clone();
         self.events = unbound.bound(ctl.cancel.clone());
-        self.compact_now(ctl).await;
+        let before = self.assemble().1.used;
+        let after = self.compact_now(ctl).await;
         self.events = unbound;
+        // Its end, whatever happened (sent even after a cancel: the client waits for it).
+        self.events
+            .emit_last(Event::CompactFinished {
+                applied: after.is_some(),
+                tokens_freed: after.map_or(0, |a| before.saturating_sub(a)),
+            })
+            .await;
     }
 
-    async fn compact_now(&mut self, ctl: &TurnControl) {
+    /// The context's tokens after the compaction, or None when nothing was applied.
+    async fn compact_now(&mut self, ctl: &TurnControl) -> Option<u32> {
         let mut applied = false;
         if let Some(rec) = self.context.collect(Some(MutationReason::Manual)) {
             self.collected(rec).await;
@@ -1344,7 +1353,7 @@ impl Session {
                 .await;
         }
         if !applied {
-            return;
+            return None;
         }
         if let Some(text) = self.pending_memory_index.take() {
             self.context.memory_index = Some(text.clone()).filter(|t| !t.trim().is_empty());
@@ -1358,6 +1367,7 @@ impl Session {
         self.checkpoint().await;
         let (_, status) = self.assemble();
         self.emit(Event::context_status(&status)).await;
+        Some(status.used)
     }
 
     /// `Command::Uncompact` (between turns): undo the latest compaction if the context
