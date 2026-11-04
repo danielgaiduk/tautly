@@ -436,9 +436,15 @@ impl Replay<'_> {
                 self.mutation(rec);
             }
             SessionRecord::Charged { model, usage, .. } => self.out.usage.push((model, usage)),
-            // Wherever it was noticed (inside a step, or at a later one's start), the
-            // files changed unseen: the write generation moves.
-            SessionRecord::WritesLost { paths } => {
+            // The files changed unseen: the write generation moves. One noticed at a
+            // step start (`late`) belongs to that step, like its epoch.
+            SessionRecord::WritesLost { paths, late } => {
+                if late {
+                    self.close_step();
+                    if self.running && self.beyond() {
+                        return Flow::Stop;
+                    }
+                }
                 for p in &paths {
                     if let Ok(path) = p.resolve(&self.root) {
                         self.out.seen.remove(&path);
@@ -1454,6 +1460,11 @@ mod tests {
 
     /// The attempt ledger's write generation of a log holding `recs`.
     fn generation_after(recs: &[SessionRecord]) -> u64 {
+        generation_at(recs, None)
+    }
+
+    /// The same, of `rebuild(until)`.
+    fn generation_at(recs: &[SessionRecord], until: Option<u32>) -> u64 {
         let home = tempfile::tempdir().unwrap();
         let root = tempfile::tempdir().unwrap();
         let mut w = SessionWriter::<SessionRecord>::create_in(
@@ -1467,7 +1478,7 @@ mod tests {
         }
         w.checkpoint().unwrap();
         let reader = SessionReader::<SessionRecord>::open(w.path()).unwrap();
-        rebuild(&reader, None).unwrap().attempts.generation()
+        rebuild(&reader, until).unwrap().attempts.generation()
     }
 
     #[test]
@@ -1487,10 +1498,68 @@ mod tests {
         };
         let lost = SessionRecord::WritesLost {
             paths: vec![tautly_session::RelPath::from_abs(root, &root.join("a.txt")).unwrap()],
+            late: false,
         };
         assert_eq!(
             generation_after(&turn(vec![lost])),
             generation_after(&turn(vec![])) + 1
+        );
+    }
+
+    /// A provider step `step` answered with text.
+    fn text_step(step: u32) -> Vec<SessionRecord> {
+        let blob = BlobRef::parse(&"a".repeat(64)).unwrap();
+        vec![
+            SessionRecord::Request {
+                hash: blob,
+                turn: 1,
+                step,
+                model: ModelId::from("mock/m"),
+                blocks: crate::record::BlockHashes {
+                    stable: String::new(),
+                    pinned: String::new(),
+                    history: String::new(),
+                    tail: String::new(),
+                },
+            },
+            SessionRecord::Provider(tautly_provider::ProviderEvent::TextDelta("ok".into())),
+            SessionRecord::Provider(tautly_provider::ProviderEvent::Done {
+                stop: tautly_provider::StopReason::EndTurn,
+            }),
+        ]
+    }
+
+    /// Re-review N3: a late write noticed at step 3's start is past a cut at step 2.
+    #[test]
+    fn a_lost_write_noticed_after_the_cut_is_left_out() {
+        let root = std::path::Path::new("/r");
+        let lost = SessionRecord::WritesLost {
+            paths: vec![tautly_session::RelPath::from_abs(root, &root.join("a.txt")).unwrap()],
+            late: true,
+        };
+        let log = |with_lost: bool| {
+            let mut all = vec![SessionRecord::TurnStart {
+                turn: 1,
+                text: "go".into(),
+            }];
+            all.extend(text_step(2));
+            if with_lost {
+                all.push(lost.clone());
+            }
+            all.extend(text_step(3));
+            all.push(SessionRecord::TurnEnd {
+                reason: FinishReason::Completed,
+                evidence: None,
+            });
+            all
+        };
+        assert_eq!(
+            generation_at(&log(true), Some(2)),
+            generation_at(&log(false), Some(2))
+        );
+        assert_eq!(
+            generation_at(&log(true), None),
+            generation_at(&log(false), None) + 1
         );
     }
 

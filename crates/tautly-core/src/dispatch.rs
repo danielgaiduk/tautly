@@ -285,7 +285,7 @@ impl Session {
             let seen = self.quick_meta(p).await;
             self.lost_write_paths.insert(p.clone(), seen);
         }
-        self.note_writes_lost(paths).await;
+        self.note_writes_lost(paths, false).await;
         self.memory.refresh_due = true;
         self.evidence.on_lost_write();
         let list: Vec<String> = paths.iter().map(|p| p.display().to_string()).collect();
@@ -315,7 +315,7 @@ impl Session {
                 self.reads.forget_path(&full);
             }
             self.reads.forget_path(&p);
-            self.note_writes_lost(std::slice::from_ref(&p)).await;
+            self.note_writes_lost(std::slice::from_ref(&p), true).await;
             self.warn(format!(
                 "{} changed after its write was abandoned; undo cannot restore it",
                 p.display()
@@ -326,8 +326,8 @@ impl Session {
 
     /// Writes to `paths` whose outcome is unknown: the write generation moves, logged as
     /// `WritesLost` so a rebuilt attempt ledger moves too (paths a record cannot hold are
-    /// said instead).
-    async fn note_writes_lost(&mut self, paths: &[PathBuf]) {
+    /// said instead). `late`: noticed at a step start (the abandoned write landed).
+    async fn note_writes_lost(&mut self, paths: &[PathBuf], late: bool) {
         self.ledger
             .note_effects(&[AppliedEffect::Exec { may_write: true }]);
         let mut logged = Vec::with_capacity(paths.len());
@@ -340,7 +340,11 @@ impl Session {
             }
         }
         self.untracked(skipped).await;
-        self.log(SessionRecord::WritesLost { paths: logged }).await;
+        self.log(SessionRecord::WritesLost {
+            paths: logged,
+            late,
+        })
+        .await;
     }
 
     /// `(mtime, len)` of `p`, or None when it is missing or does not answer quickly (a file
