@@ -1251,6 +1251,72 @@ async fn context_overflow_compacts_and_retries_once() {
     assert_eq!(mock.requests().len(), before + 6);
 }
 
+/// The records between the last `TurnStart` and the `Request` after the last
+/// `Compaction`, by type.
+fn after_last_compaction(recs: &[SessionRecord]) -> Vec<&SessionRecord> {
+    let at = recs
+        .iter()
+        .rposition(|r| matches!(r, SessionRecord::Compaction { .. }))
+        .expect("a compaction");
+    recs[at + 1..]
+        .iter()
+        .take_while(|r| !matches!(r, SessionRecord::Request { .. }))
+        .collect()
+}
+
+/// Review A M6: the overflow retry's compaction breaks the cached prefix outside the
+/// epoch; the retried step's epoch takes the pending pins with it, so it breaks once.
+#[tokio::test]
+async fn an_overflow_compaction_folds_pending_pins_into_the_same_prefix_break() {
+    let fx = Fx::new();
+    let mut cfg = compaction_fixture(&fx);
+    // A warm cache (and a window that never asks for threshold compaction).
+    cfg.catalog_overrides = Some(
+        Catalog::from_toml(&format!(
+            r#"[models."{MODEL}"]
+context_window = 200000
+max_output = 8000
+parallel_tools = true
+reasoning = "none"
+cache = "explicit"
+images = false
+edit_format = "str_replace"
+"#
+        ))
+        .unwrap(),
+    );
+    let mut script = four_reads();
+    script.push(text_step("first done"));
+    script.push(MockTurn::Error(ProviderError::ContextOverflow(
+        "too long".into(),
+    )));
+    script.push(text_step("SUMMARY-ONE"));
+    script.push(text_step("second done"));
+    let mock = MockProvider::new(script);
+    let mut run = start(fx.builder(cfg, &mock));
+    run.turn_with("first").await;
+    run.send(Command::Pin {
+        text: "PIN-AFTER-TURN-ONE".into(),
+    })
+    .await;
+    let events = run.turn_with("second").await;
+    assert_eq!(
+        finish_reason(&events),
+        FinishReason::Completed,
+        "{events:?}"
+    );
+    let path = run.engine.session_path().to_path_buf();
+    run.stop().await;
+    let recs = records_at(&path);
+    let between = after_last_compaction(&recs);
+    assert!(
+        between
+            .iter()
+            .any(|r| matches!(r, SessionRecord::PinsFolded)),
+        "{between:?}"
+    );
+}
+
 #[tokio::test]
 async fn uncompact_command_restores() {
     let fx = Fx::new();

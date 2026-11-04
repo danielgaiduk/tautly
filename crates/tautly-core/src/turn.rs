@@ -408,6 +408,9 @@ impl Session {
                         self.warn(format!("{e}; compacting the context and retrying once"))
                             .await;
                         if self.compact(MutationReason::Forced, ctl).await {
+                            // The prefix broke outside the epoch: the retried step's epoch
+                            // takes the pending pins and memory index with it (spec 7.7).
+                            self.context.force_cold_epoch();
                             continue;
                         }
                         if ctl.cancel.is_cancelled() {

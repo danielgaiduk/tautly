@@ -553,6 +553,9 @@ impl Session {
                  new descriptions); the cached prompt prefix is rebuilt once for this turn"
             ))
             .await;
+            // Tools lead the prefix, so nothing cached survives: the step's epoch applies
+            // whatever is pending (pins, the memory index) in this same break (spec 7.7).
+            self.context.force_cold_epoch();
         }
         self.tools = tools;
         self.specs = specs;

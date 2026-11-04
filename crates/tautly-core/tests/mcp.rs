@@ -1202,6 +1202,66 @@ async fn dead_server_tools_removed_at_next_user_turn() {
     run.shutdown().await;
 }
 
+/// Review A M6 / C M1: a changed MCP tool set breaks the cached prefix at a turn start;
+/// the step's epoch takes the pending pins with it, so the prefix breaks once.
+#[tokio::test]
+async fn a_tool_set_change_folds_pending_pins_into_the_same_prefix_break() {
+    let fx = Fx::new();
+    let mut cfg = with_user_server(Mode::Yolo, &[]);
+    // A warm cache: without the forced epoch the pins would wait for a later one.
+    cfg.catalog_overrides = Some(
+        Catalog::from_toml(&format!(
+            r#"[models."{MODEL}"]
+context_window = 200000
+max_output = 8000
+parallel_tools = true
+reasoning = "none"
+cache = "explicit"
+images = false
+edit_format = "str_replace"
+"#
+        ))
+        .unwrap(),
+    );
+    let mock = MockProvider::new(vec![
+        tools_step(vec![call("c1", "mcp__echo__exit", json!({}))]),
+        text_step("turn 1"),
+        text_step("turn 2"),
+    ]);
+    let mut run = start(fx.builder(cfg, &mock));
+    let events = run.turn_with("one").await;
+    let failed = |e: &Event| matches!(e, Event::McpServerStatus { server, state: McpState::Failed, .. } if server == "echo");
+    if !events.iter().any(failed) {
+        run.until(failed).await;
+    }
+    run.send(Command::Pin {
+        text: "PIN-AFTER-TURN-ONE".into(),
+    })
+    .await;
+    run.turn_with("two").await;
+    let path = run.engine.session_path().to_path_buf();
+    run.shutdown().await;
+    let recs: Vec<SessionRecord> = SessionReader::<SessionRecord>::open(&path)
+        .unwrap()
+        .records()
+        .map(|r| r.unwrap().1)
+        .collect();
+    let start = recs
+        .iter()
+        .rposition(|r| matches!(r, SessionRecord::TurnStart { .. }))
+        .unwrap();
+    let before_request: Vec<&SessionRecord> = recs[start..]
+        .iter()
+        .take_while(|r| !matches!(r, SessionRecord::Request { .. }))
+        .collect();
+    assert!(
+        before_request
+            .iter()
+            .any(|r| matches!(r, SessionRecord::PinsFolded)),
+        "{before_request:?}"
+    );
+}
+
 #[tokio::test]
 async fn mcp_json_fifo_does_not_block_startup() {
     let fx = Fx::new();
