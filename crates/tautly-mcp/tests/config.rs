@@ -182,6 +182,18 @@ fn launch_shows_repository_values_escaped_and_cut() {
 }
 
 #[test]
+fn printable_multiline_keeps_lines_and_escapes_the_rest() {
+    use tautly_mcp::printable_multiline;
+    assert_eq!(printable_multiline("a\nb\tc \\d ü"), "a\nb\tc \\d ü");
+    assert_eq!(printable_multiline("x\r\ny"), "x\\r\ny");
+    assert_eq!(printable_multiline("\u{1b}[2K\u{7}"), "\\u{1b}[2K\\u{7}");
+    assert_eq!(
+        printable_multiline("a\u{202e}b\u{200b}"),
+        "a\\u{202e}b\\u{200b}"
+    );
+}
+
+#[test]
 fn printable_escapes_control_and_invisible_characters() {
     assert_eq!(printable("plain text, ü ok"), "plain text, ü ok");
     assert_eq!(printable("a\u{1b}[31mb"), "a\\u{1b}[31mb");

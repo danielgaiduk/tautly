@@ -1,0 +1,69 @@
+[package]
+name = "tautly"
+description = "The `tautly` command: one-shot (`-p`), JSON-RPC (`--rpc`) and utility commands"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[[bin]]
+name = "tautly"
+path = "src/main.rs"
+
+[features]
+# `--mock-script FILE`: a scripted provider instead of a real one (golden and perf tests).
+mock = ["dep:tautly-provider"]
+
+[dependencies]
+tautly-core = { path = "../tautly-core" }
+tautly-rpc = { path = "../tautly-rpc" }
+tautly-provider = { path = "../tautly-provider", optional = true }
+# `tautly doctor`: the code index's state and where its database lives.
+tautly-index = { path = "../tautly-index" }
+tautly-session = { path = "../tautly-session" }
+anyhow.workspace = true
+clap.workspace = true
+reqwest.workspace = true
+rpassword.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["io-std", "signal"] }
+
+[dev-dependencies]
+tempfile.workspace = true
+serde_json.workspace = true
+insta.workspace = true
+tokio.workspace = true
+wiremock.workspace = true
+# A real index database for the doctor's read-only index check.
+tautly-sandbox = { path = "../tautly-sandbox" }
+rusqlite.workspace = true
+
+# These need the `mock` feature: it lets a test choose a file instead of the OS keychain
+# (`TAUTLY_TEST_SECRET_STORE`) and the Ollama port (`TAUTLY_TEST_OLLAMA_PORT`), so no test
+# ever reads the real keychain or a real local Ollama.
+[[test]]
+name = "mock_cli"
+required-features = ["mock"]
+
+[[test]]
+name = "first_run"
+required-features = ["mock"]
+
+[[test]]
+name = "auth"
+required-features = ["mock"]
+
+[[test]]
+name = "doctor"
+required-features = ["mock"]
+
+# `cargo binstall tautly` downloads the cargo-dist archive of the host (or the nearest musl)
+# target from the GitHub release instead of building (spec 7.11.3). The names match what
+# `dist plan` produces (`tautly-<target>.tar.xz`, binary at the archive's
+# `tautly-<target>/tautly`); scripts/check-dist-plan.sh keeps the two in step.
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-{ target }{ archive-suffix }"
+bin-dir = "{ name }-{ target }/{ bin }{ binary-ext }"
+pkg-fmt = "txz"

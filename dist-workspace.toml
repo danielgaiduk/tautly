@@ -1,0 +1,48 @@
+[workspace]
+members = ["cargo:."]
+
+# Release configuration for cargo-dist (spec 7.11.3). `.github/workflows/release.yml` is
+# generated from this file by `dist generate`; never edit that file by hand.
+[dist]
+cargo-dist-version = "0.34.0"
+ci = "github"
+installers = ["shell", "homebrew"]
+targets = [
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+    "x86_64-unknown-linux-musl",
+    "aarch64-unknown-linux-musl",
+]
+checksum = "sha256"
+install-path = "CARGO_HOME"
+# The release workflow runs on version tags only; pull requests are covered by the `dist-plan` job
+# in ci.yml.
+pr-run-mode = "skip"
+# TODO(release): create the tap repository `<owner>/homebrew-tap` and the repository secret
+# HOMEBREW_TAP_TOKEN, and replace OWNER (see docs/release.md).
+tap = "OWNER/homebrew-tap"
+publish-jobs = ["homebrew"]
+display-name = "Tautly"
+
+# Linux binaries are static (musl). The keychain backend is keyring's pure-Rust Secret Service
+# (zbus), which is what lets them link statically (crates/tautly-core/Cargo.toml). If that ever
+# stops linking on musl, switch the two Linux targets above to the `-gnu` triples, drop
+# [dist.dependencies.apt], update scripts/check-dist-plan.sh and the binstall template, and say so
+# in the release notes (spec 7.11.3).
+[dist.dependencies.apt]
+musl-tools = { stage = ["build"], targets = ["x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl"] }
+
+[dist.github-custom-runners]
+global = "ubuntu-latest"
+
+[dist.github-custom-runners.aarch64-apple-darwin]
+runner = "macos-14"
+
+[dist.github-custom-runners.x86_64-apple-darwin]
+runner = "macos-14"
+
+[dist.github-custom-runners.x86_64-unknown-linux-musl]
+runner = "ubuntu-latest"
+
+[dist.github-custom-runners.aarch64-unknown-linux-musl]
+runner = "ubuntu-24.04-arm"

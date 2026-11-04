@@ -22,5 +22,5 @@ mod tool;
 pub use approvals::{APPROVALS_FILE, ApprovalStore};
 pub use client::{MAX_TOTAL_TOOLS, McpHub, McpState, ServerStatus};
 pub use config::{McpConfig, PROVIDER_KEY_VARS, ServerSource, ServerSpec};
-pub use text::printable;
+pub use text::{printable, printable_multiline};
 pub use tool::{DESCRIPTION_CAP, RESULT_CAP, SCHEMA_CAP};
