@@ -803,3 +803,378 @@ async fn set_config_option_model_sends_set_model_and_returns_options() {
     assert_eq!(r["error"]["code"], -32602, "{r}");
     acp.finish().await;
 }
+
+// --- review fixes (Task 46 fix round 1) ---
+
+/// I1: approval text is escaped (control and bidi characters as visible escapes) and the
+/// command is fenced with more backticks than any run in it, so markdown in it shows as
+/// text.
+#[tokio::test]
+async fn approval_text_is_escaped_and_fenced() {
+    let fx = Fx::new();
+    let command = "echo ```x``` <!-- hidden --> [a](b)\u{1b}[2K\rshown\u{202e}evil";
+    let mock = MockProvider::new(vec![
+        tools_step(vec![bash("c1", command)]),
+        text_step("done"),
+    ]);
+    let (f, _) = factory(&fx, config(Mode::Ask), vec![mock]);
+    let mut acp = Acp::start(f);
+    let id = acp.open(&fx.root()).await;
+    let mut asked = Vec::new();
+    acp.prompt_answering(&id, "go", |p| {
+        asked.push(p.clone());
+        Some(select("reject_once"))
+    })
+    .await;
+    let req = &asked[0];
+    let text = req["toolCall"]["content"][0]["content"]["text"]
+        .as_str()
+        .unwrap();
+    assert!(
+        text.starts_with("````\n") && text.ends_with("\n````"),
+        "{text}"
+    );
+    assert!(
+        text.contains(r"<!-- hidden --> [a](b)\u{1b}[2K\rshown\u{202e}evil"),
+        "{text}"
+    );
+    let title = req["toolCall"]["title"].as_str().unwrap();
+    for t in [text, title] {
+        assert!(
+            !t.chars()
+                .any(|c| c == '\u{1b}' || c == '\r' || c == '\u{202e}'),
+            "{t:?}"
+        );
+    }
+    assert!(title.starts_with("bash: echo ```x```"), "{title}");
+    // The tool call's title is escaped the same way.
+    let call = &acp.updates_of("tool_call")[0];
+    assert_eq!(call["title"], req["toolCall"]["title"]);
+    acp.finish().await;
+}
+
+/// I2: `/compact` answers once the compaction is over: after the summary the side model
+/// wrote, with its result.
+#[tokio::test]
+async fn compact_runs_a_real_summary_before_answering() {
+    let fx = Fx::new();
+    for i in 1..=4 {
+        fx.write(&format!("f{i}.txt"), &format!("file {i}\n"));
+    }
+    let mut cfg = config(Mode::Ask);
+    cfg.catalog_overrides = Some(catalog_window(16_000, 1_000));
+    let mut script: Vec<MockTurn> = (1..=4)
+        .map(|i| tools_step(vec![read(&format!("r{i}"), &format!("f{i}.txt"))]))
+        .collect();
+    script.push(text_step("first done"));
+    script.push(text_step("SUMMARY-ONE"));
+    let mock = MockProvider::new(script);
+    let (f, _) = factory(&fx, cfg, vec![mock.clone()]);
+    let mut acp = Acp::start(f);
+    let id = acp.open(&fx.root()).await;
+    acp.prompt(&id, "read them").await;
+    let before = mock.requests().len();
+    let resp = acp.prompt(&id, "/compact").await;
+    assert_eq!(stop_reason(&resp), "end_turn");
+    // The summary request was made before the answer, and its result is in it.
+    assert_eq!(mock.requests().len(), before + 1);
+    let text = acp.agent_text();
+    assert!(text.contains("compacted"), "{text}");
+    assert!(text.contains("tokens freed"), "{text}");
+    // Nothing left to compact: the warning is the answer.
+    let resp = acp.prompt(&id, "/compact").await;
+    assert_eq!(stop_reason(&resp), "end_turn");
+    assert!(acp.agent_text().contains("nothing to compact"));
+    acp.finish().await;
+}
+
+#[tokio::test]
+async fn two_sessions_prompt_at_once() {
+    let fx = Fx::new();
+    let (f, _) = factory(
+        &fx,
+        config(Mode::Ask),
+        vec![
+            MockProvider::new(vec![text_step("from A")]),
+            MockProvider::new(vec![text_step("from B")]),
+        ],
+    );
+    let mut acp = Acp::start(f);
+    let a = acp.open(&fx.root()).await;
+    let b = acp.new_session(&fx.root(), json!([])).await;
+    let pa = acp
+        .send(
+            "session/prompt",
+            json!({"sessionId": a, "prompt": [{"type": "text", "text": "a"}]}),
+        )
+        .await;
+    let pb = acp
+        .send(
+            "session/prompt",
+            json!({"sessionId": b, "prompt": [{"type": "text", "text": "b"}]}),
+        )
+        .await;
+    let ra = acp.response(pa).await;
+    let rb = acp.response(pb).await;
+    assert_eq!(stop_reason(&ra), "end_turn");
+    assert_eq!(stop_reason(&rb), "end_turn");
+    let said = |id: &str| -> String {
+        updates_for(&acp, id)
+            .iter()
+            .filter(|u| u["sessionUpdate"] == "agent_message_chunk")
+            .map(|u| u["content"]["text"].as_str().unwrap().to_string())
+            .collect()
+    };
+    assert_eq!(said(&a), "from A");
+    assert_eq!(said(&b), "from B");
+    acp.finish().await;
+}
+
+#[tokio::test]
+async fn eof_with_a_pending_permission_denies_and_exits() {
+    let fx = Fx::new();
+    let mock = MockProvider::new(vec![
+        tools_step(vec![bash("c1", "touch one.txt")]),
+        text_step("never"),
+    ]);
+    let (f, _) = factory(&fx, config(Mode::Ask), vec![mock]);
+    let mut acp = Acp::start(f);
+    let id = acp.open(&fx.root()).await;
+    acp.send(
+        "session/prompt",
+        json!({"sessionId": id, "prompt": [{"type": "text", "text": "go"}]}),
+    )
+    .await;
+    acp.until_request("session/request_permission").await;
+    // The editor goes away without answering: the bridge still ends, the call denied.
+    acp.finish().await;
+    assert!(!fx.dir.path().join("one.txt").exists());
+}
+
+#[tokio::test]
+async fn session_load_replays_edit_diffs_and_cost() {
+    let fx = Fx::new();
+    fx.write("a.txt", "old\n");
+    let mock = MockProvider::new(vec![
+        tools_step(vec![read("r1", "a.txt")]),
+        tools_step(vec![edit("e1", "a.txt", "old", "new")]),
+        text_step("edited"),
+    ]);
+    let (f, _) = factory(&fx, config(Mode::AutoEdit), vec![mock]);
+    let mut acp = Acp::start(Arc::clone(&f));
+    let id = acp.open(&fx.root()).await;
+    acp.prompt(&id, "edit").await;
+    acp.finish().await;
+
+    let mut again = Acp::with(Bridge::new(f).data_home(fx.home.path()));
+    again.initialize(json!({})).await;
+    let r = again
+        .call(
+            "session/load",
+            json!({"sessionId": id, "cwd": fx.root(), "mcpServers": []}),
+        )
+        .await;
+    assert!(r.get("error").is_none(), "{r}");
+    let calls = again.updates_of("tool_call");
+    let e1 = calls.iter().find(|c| c["toolCallId"] == "e1").unwrap();
+    let diff = e1["content"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["type"] == "diff")
+        .unwrap_or_else(|| panic!("{e1}"));
+    assert_eq!(diff["oldText"], "old\n");
+    assert_eq!(diff["newText"], "new\n");
+    // The session's earlier spend carries on (three steps of 100 in, 10 out at $1/$2 per M).
+    again.prompt(&id, "/cost").await;
+    assert!(
+        again.agent_text().contains("session: $0.0004"),
+        "{}",
+        again.agent_text()
+    );
+    again.finish().await;
+}
+
+/// M1: only an object advertises notices.
+#[tokio::test]
+async fn notices_false_is_no_notice_support() {
+    let fx = Fx::new();
+    fx.write("a.txt", "a");
+    let mut cfg = config(Mode::Ask);
+    cfg.budget.turn.max_tokens = Some(100);
+    let mock = MockProvider::new(vec![tools_step(vec![read("r1", "a.txt")])]);
+    let (f, _) = factory(&fx, cfg, vec![mock]);
+    let mut acp = Acp::start(f);
+    acp.initialize(json!({"session": {"notices": false}})).await;
+    let id = acp.new_session(&fx.root(), json!([])).await;
+    assert_eq!(stop_reason(&acp.prompt(&id, "go").await), "end_turn");
+    assert!(acp.updates_of("notice").is_empty());
+    assert!(acp.agent_text().contains("budget"));
+    acp.finish().await;
+}
+
+/// M4: a switch asked for during a turn answers at once; when it then fails, the real
+/// model is put back with a `config_option_update`.
+#[tokio::test]
+async fn set_config_option_during_a_turn_reverts_when_the_switch_fails() {
+    let fx = Fx::new();
+    let mock = MockProvider::new(vec![
+        tools_step(vec![bash("c1", "echo hi")]),
+        text_step("done"),
+    ]);
+    let (f, _) = factory(&fx, config(Mode::Ask), vec![mock]);
+    let lister = Arc::new(|_: &std::path::Path| {
+        Some(ModelChoices {
+            current: MODEL.to_string(),
+            available: vec![MODEL.to_string(), "mock/unknown".to_string()],
+        })
+    });
+    let mut acp = Acp::with(Bridge::new(f).models(lister));
+    let id = acp.open(&fx.root()).await;
+    let prompt = acp
+        .send(
+            "session/prompt",
+            json!({"sessionId": id, "prompt": [{"type": "text", "text": "go"}]}),
+        )
+        .await;
+    let asked = acp.until_request("session/request_permission").await;
+    // Busy: answered at once with the model asked for.
+    let r = acp
+        .call(
+            "session/set_config_option",
+            json!({"sessionId": id, "configId": "model", "value": "mock/unknown"}),
+        )
+        .await;
+    assert_eq!(
+        r["result"]["configOptions"][0]["currentValue"], "mock/unknown",
+        "{r}"
+    );
+    acp.respond(&asked["id"], select("allow_once")).await;
+    assert_eq!(stop_reason(&acp.response(prompt).await), "end_turn");
+    // The switch runs after the turn and fails (no such provider): the real model is back.
+    acp.prompt(&id, "/diff").await;
+    let updates = acp.updates_of("config_option_update");
+    assert_eq!(
+        updates.last().unwrap()["configOptions"][0]["currentValue"],
+        MODEL,
+        "{updates:?}"
+    );
+    acp.finish().await;
+}
+
+/// M9: `/undo` shows its dry run for approval, then undoes.
+#[tokio::test]
+async fn undo_asks_with_the_dry_run_first() {
+    let fx = Fx::new();
+    fx.write("a.txt", "old\n");
+    let mock = MockProvider::new(vec![
+        tools_step(vec![read("r1", "a.txt")]),
+        tools_step(vec![edit("e1", "a.txt", "old", "new")]),
+        text_step("edited"),
+    ]);
+    let (f, _) = factory(&fx, config(Mode::AutoEdit), vec![mock]);
+    let mut acp = Acp::start(f);
+    let id = acp.open(&fx.root()).await;
+    acp.prompt(&id, "edit").await;
+    assert_eq!(fx.read("a.txt"), "new\n");
+    let mut asked = Vec::new();
+    let resp = acp
+        .prompt_answering(&id, "/undo", |p| {
+            asked.push(p.clone());
+            Some(select("allow_once"))
+        })
+        .await;
+    assert_eq!(stop_reason(&resp), "end_turn");
+    assert_eq!(asked.len(), 1);
+    assert_eq!(asked[0]["toolCall"]["title"], "Undo turn 1");
+    assert!(
+        asked[0]["toolCall"]["content"][0]["content"]["text"]
+            .as_str()
+            .unwrap()
+            .contains("restore a.txt"),
+        "{}",
+        asked[0]
+    );
+    assert_eq!(fx.read("a.txt"), "old\n");
+    assert!(
+        acp.agent_text().contains("undid turn 1"),
+        "{}",
+        acp.agent_text()
+    );
+    acp.finish().await;
+}
+
+/// M3: a cancel leaves a repository MCP server's approval open; answering it later still
+/// counts.
+#[tokio::test]
+async fn cancel_leaves_a_pending_mcp_approval_open() {
+    let fx = Fx::new();
+    fx.write(
+        ".tautly/config.toml",
+        "[mcp.servers.repo]\ncommand = \"/no/such/server\"\n",
+    );
+    let mut cfg = config(Mode::Ask);
+    let loaded = tautly_core::Config::load_from(None, &fx.root(), Default::default()).unwrap();
+    cfg.project_mcp_servers = loaded.config.project_mcp_servers;
+    let (f, _) = factory(&fx, cfg, vec![]);
+    let mut acp = Acp::start(f);
+    acp.initialize(json!({"session": {"notices": {}}})).await;
+    let id = acp.new_session(&fx.root(), json!([])).await;
+    let mcp = acp.until_request("session/request_permission").await;
+    acp.notify("session/cancel", json!({"sessionId": id})).await;
+    acp.respond(&mcp["id"], select("allow_once")).await;
+    // Approved: the server is started (and fails: no such command).
+    loop {
+        let msg = acp.next().await;
+        let title = msg["params"]["update"]["title"].as_str().unwrap_or("");
+        if title.contains("MCP server `repo` failed") {
+            break;
+        }
+    }
+    acp.finish().await;
+}
+
+/// M10: an editor's MCP server starts trusted (no approval), its tools are offered, and
+/// its process is gone once the editor disconnects.
+#[tokio::test]
+async fn client_mcp_server_starts_trusted_and_is_reaped_at_eof() {
+    let fx = Fx::new();
+    let pid_file = fx.home.path().join("pids");
+    let mock = MockProvider::new(vec![text_step("hi")]);
+    let (f, _) = factory(&fx, config(Mode::Ask), vec![mock.clone()]);
+    let mut acp = Acp::start(f);
+    acp.initialize(json!({"session": {"notices": {}}})).await;
+    let id = acp
+        .new_session(
+            &fx.root(),
+            json!([{"name": "editor", "command": mcp_fixture(), "args": [],
+                    "env": [{"name": "ECHO_PID_FILE", "value": pid_file}]}]),
+        )
+        .await;
+    loop {
+        let msg = acp.next().await;
+        let title = msg["params"]["update"]["title"].as_str().unwrap_or("");
+        assert!(!title.contains("failed"), "{msg}");
+        if title.contains("MCP server `editor` ready") {
+            break;
+        }
+    }
+    assert_eq!(stop_reason(&acp.prompt(&id, "hello").await), "end_turn");
+    assert!(acp.permission_requests().is_empty());
+    assert!(
+        format!("{:?}", mock.requests()[0]).contains("mcp__editor__echo"),
+        "the editor's tools are offered"
+    );
+    let pids: Vec<u32> = std::fs::read_to_string(&pid_file)
+        .unwrap()
+        .lines()
+        .filter_map(|l| l.trim().parse().ok())
+        .collect();
+    assert!(!pids.is_empty() && pids.iter().all(|p| alive(*p)));
+    acp.finish().await;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while pids.iter().any(|p| alive(*p)) && std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(!pids.iter().any(|p| alive(*p)), "left running: {pids:?}");
+}

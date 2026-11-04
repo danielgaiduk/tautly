@@ -567,6 +567,7 @@ async fn acp(cli: &Cli) -> anyhow::Result<i32> {
         })
     };
     let start = cli.start_commands();
+    let data_home = settings.data_home.clone();
     let factory = shared_factory(workspaces, move |root, resume, mcp, workspace| {
         let (engine, events) = settings
             .build_with(&root, resume, true, Some(workspace), mcp)
@@ -586,6 +587,7 @@ async fn acp(cli: &Cli) -> anyhow::Result<i32> {
     };
     let served = Bridge::new(factory)
         .models(models)
+        .data_home(data_home)
         .stop_on(stop)
         .serve(tokio::io::stdin(), tokio::io::stdout())
         .await;

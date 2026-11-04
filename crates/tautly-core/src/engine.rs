@@ -528,6 +528,8 @@ struct Running {
     turn: bool,
     /// A fork: commands other than [`Actor::urgent`] ones wait for its end.
     fork: bool,
+    /// A `Compact`: its crash still ends it with `CompactFinished`.
+    compact: bool,
 }
 
 struct Actor {
@@ -684,7 +686,12 @@ impl Actor {
                             running = Some(self.spawn_job(s, job));
                             break;
                         }
-                        None => self.lost(),
+                        None => {
+                            self.lost();
+                            if matches!(job, Job::Compact) {
+                                self.compact_failed();
+                            }
+                        }
                     }
                 }
             }
@@ -714,7 +721,7 @@ impl Actor {
                         .await;
                 }
                 joined = async { (&mut running.as_mut().expect("guarded").handle).await }, if running.is_some() => {
-                    let turn = running.take().is_some_and(|r| r.turn);
+                    let (turn, compact) = running.take().map_or((false, false), |r| (r.turn, r.compact));
                     match joined {
                         Ok((mut s, mut inbox)) => {
                             inbox.close();
@@ -725,7 +732,12 @@ impl Actor {
                             self.session_id.clone_from(&s.session_id);
                             state = Some(s);
                         }
-                        Err(e) => self.crashed(e, turn).await,
+                        Err(e) => {
+                            self.crashed(e, turn).await;
+                            if compact {
+                                self.compact_failed();
+                            }
+                        }
                     }
                     let held = std::mem::take(&mut held);
                     if stopping && !held.is_empty() {
@@ -909,6 +921,7 @@ impl Actor {
         };
         let turn = matches!(job, Job::Turn(_));
         let fork = matches!(job, Job::Fork { .. });
+        let compact = matches!(job, Job::Compact);
         let current = Arc::clone(&self.current);
         let handle = tokio::spawn(async move {
             match job {
@@ -932,6 +945,7 @@ impl Actor {
             inbox: inbox_tx,
             turn,
             fork,
+            compact,
         }
     }
 
@@ -1043,6 +1057,14 @@ impl Actor {
             ),
             retryable: false,
             hint: Some("resume the session to continue".into()),
+        });
+    }
+
+    /// The end of a `Compact` that could not run (or crashed): nothing applied.
+    fn compact_failed(&self) {
+        self.events.try_emit(Event::CompactFinished {
+            applied: false,
+            tokens_freed: 0,
         });
     }
 }

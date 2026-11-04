@@ -75,6 +75,7 @@ pub use tautly_tools::{DiffPreview, SaveKind, Saved};
 // `tautly-cli` depends on this crate alone.
 pub use tautly_context::prompt::system as system_prompt;
 pub use tautly_mcp::config::{import_into_toml, parse_mcp_json};
+pub use tautly_mcp::names::is_valid_server_name;
 pub use tautly_mcp::{McpHub, ServerStatus, printable, printable_multiline};
 pub use tautly_provider::{Catalog, ModelInfo, Price};
 pub use tautly_session::{

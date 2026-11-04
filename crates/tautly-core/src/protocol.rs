@@ -248,6 +248,14 @@ pub enum Event {
         tokens_freed: u32,
         reason: MutationReason,
     },
+    /// The end of a [`Command::Compact`], sent exactly once per command, last: `applied`
+    /// when it collected or compacted anything (else it was cancelled, had nothing to do
+    /// or failed, said by a `Warning` or `Error` before this), `tokens_freed` the context
+    /// tokens it freed.
+    CompactFinished {
+        applied: bool,
+        tokens_freed: u32,
+    },
     /// A memory entry to write and/or entries to delete, waiting for
     /// [`Command::ApproveMemory`] or [`Command::RejectMemory`]. Sent only when the user is
     /// asked: a proposal saved without asking (`approve_memory`) or rejected because nobody

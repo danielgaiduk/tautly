@@ -314,3 +314,114 @@ fn permission_answers() {
         }
     );
 }
+
+// --- review fixes (Task 46 fix round 1) ---
+
+#[test]
+fn fenced_and_single_line_escape_and_cannot_be_closed_early() {
+    let text = "a ``` b\n<!-- x --> \u{1b}[31mred\u{7f}\u{85}\u{200b}\u{202e}\tend";
+    let f = map::fenced(text);
+    assert!(f.starts_with("````\n") && f.ends_with("\n````"), "{f}");
+    assert!(
+        f.contains(r"<!-- x --> \u{1b}[31mred\u{7f}\u{85}\u{200b}\u{202e}"),
+        "{f}"
+    );
+    assert!(f.contains("\tend"), "tabs and newlines stay: {f}");
+    assert!(!f.chars().any(|c| c.is_control() && c != '\n' && c != '\t'));
+    assert_eq!(map::single_line("a\nb\t\u{1b}"), r"a\nb\t\u{1b}");
+    // Titles are single lines.
+    assert_eq!(
+        tool_title("bash", &json!({"command": "x\u{1b}[2K\ry"})),
+        r"bash: x\u{1b}[2K\ry"
+    );
+    // Diff texts keep lines and tabs, escape the rest.
+    let Some(ToolCallContent::Diff { new_text, .. }) =
+        diff_content(Path::new("/r/a"), None, "ok\n\u{1b}[2Jgone\r\n")
+    else {
+        panic!()
+    };
+    assert_eq!(new_text, "ok\n\\u{1b}[2Jgone\\r\n");
+}
+
+#[test]
+fn applied_diffs_rebuild_both_sides_from_disk_and_hash() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    std::fs::write(root.join("a.txt"), "one\nTWO\nthree\n").unwrap();
+    std::fs::write(root.join("new.txt"), "fresh\n").unwrap();
+    let hash = |t: &str| blake3_hex(t);
+    let unified = "--- a/a.txt\n+++ b/a.txt\n@@ -1,3 +1,3 @@\n one\n-two\n+TWO\n three\n\
+                   --- /dev/null\n+++ b/new.txt\n@@ -0,0 +1 @@\n+fresh\n\
+                   --- a/gone.txt\n+++ /dev/null\n@@ -1 +0,0 @@\n-bye\n";
+    let written = vec![
+        (root.join("a.txt"), Some(hash("one\nTWO\nthree\n"))),
+        (root.join("new.txt"), Some(hash("fresh\n"))),
+        (root.join("gone.txt"), None),
+    ];
+    let got = map::applied_diffs(&root, unified, &written).unwrap();
+    assert_eq!(
+        got,
+        vec![
+            ToolCallContent::Diff {
+                path: root.join("a.txt"),
+                old_text: Some("one\ntwo\nthree\n".into()),
+                new_text: "one\nTWO\nthree\n".into(),
+            },
+            ToolCallContent::Diff {
+                path: root.join("new.txt"),
+                old_text: None,
+                new_text: "fresh\n".into(),
+            },
+            ToolCallContent::Diff {
+                path: root.join("gone.txt"),
+                old_text: Some("bye\n".into()),
+                new_text: String::new(),
+            },
+        ]
+    );
+    // Changed since the call wrote it: not rebuilt from disk.
+    std::fs::write(root.join("a.txt"), "one\nTWO\nthree\nmore\n").unwrap();
+    assert_eq!(map::applied_diffs(&root, unified, &written), None);
+}
+
+/// A text's hash as an effect's `post_hash` carries it (blake3, lowercase hex).
+fn blake3_hex(text: &str) -> String {
+    blake3::hash(text.as_bytes()).to_hex().to_string()
+}
+
+#[test]
+fn previews_do_not_read_through_links_out_of_the_root() {
+    let dir = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    std::fs::write(outside.path().join("secret"), "one\n").unwrap();
+    std::os::unix::fs::symlink(outside.path().join("secret"), root.join("link")).unwrap();
+    let unified = "--- a/link\n+++ b/link\n@@ -1 +1 @@\n-one\n+two\n";
+    assert_eq!(map::preview_diffs(&root, unified), None);
+}
+
+#[test]
+fn invalid_editor_server_names_are_skipped() {
+    let stdio = |name: &str| McpServer::Stdio {
+        name: name.into(),
+        command: "/bin/srv".into(),
+        args: vec![],
+        env: vec![],
+    };
+    let (specs, skipped) = map::client_mcp(vec![stdio("gh__x"), stdio("ok-name")]);
+    assert_eq!(specs.len(), 1);
+    assert_eq!(specs[0].0, "ok-name");
+    assert!(skipped[0].contains("gh__x"), "{skipped:?}");
+}
+
+#[test]
+fn only_an_object_advertises_notices() {
+    let init = |caps: serde_json::Value| -> tautly_acp::schema::InitializeParams {
+        serde_json::from_value(json!({"protocolVersion": 1, "clientCapabilities": caps})).unwrap()
+    };
+    assert!(init(json!({"session": {"notices": {}}})).notices());
+    for no in [json!(false), json!(true), json!("supported"), json!(null)] {
+        assert!(!init(json!({"session": {"notices": no}})).notices(), "{no}");
+    }
+    assert!(!init(json!({})).notices());
+}

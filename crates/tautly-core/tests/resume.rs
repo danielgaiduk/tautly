@@ -1455,6 +1455,53 @@ async fn a_compact_that_changes_nothing_keeps_the_next_epoch_warm() {
     );
 }
 
+/// Task 46 review I2: every `Compact` ends with exactly one `CompactFinished`, last: after
+/// the summary when it compacts, after the warning when there is nothing to do.
+#[tokio::test]
+async fn compact_ends_with_one_compact_finished() {
+    let fx = Fx::new();
+    let cfg = compaction_fixture(&fx);
+    let mut script = four_reads();
+    script.push(text_step("first done"));
+    script.push(text_step("SUMMARY-ONE"));
+    let mock = MockProvider::new(script);
+    let mut run = start(fx.builder(cfg, &mock));
+    run.turn_with("first").await;
+    run.send(Command::Compact).await;
+    let events = run
+        .until(|e| matches!(e, Event::CompactFinished { .. }))
+        .await;
+    let compacted = events
+        .iter()
+        .position(|e| matches!(e, Event::Compacted { .. }))
+        .unwrap_or_else(|| panic!("{events:?}"));
+    assert!(compacted < events.len() - 1);
+    assert!(
+        matches!(events.last(), Some(Event::CompactFinished { applied: true, tokens_freed })
+            if *tokens_freed > 0),
+        "{events:?}"
+    );
+    // Again: nothing left to compact, so a warning, then the end.
+    run.send(Command::Compact).await;
+    let events = run
+        .until(|e| matches!(e, Event::CompactFinished { .. }))
+        .await;
+    assert!(
+        events.iter().any(
+            |e| matches!(e, Event::Warning { message } if message.contains("nothing to compact"))
+        ),
+        "{events:?}"
+    );
+    assert!(matches!(
+        events.last(),
+        Some(Event::CompactFinished {
+            applied: false,
+            tokens_freed: 0
+        })
+    ));
+    run.stop().await;
+}
+
 /// Review A M6: the overflow retry's compaction breaks the cached prefix outside the
 /// epoch; the retried step's epoch takes the pending pins with it, so it breaks once.
 #[tokio::test]

@@ -207,9 +207,10 @@ pub struct InitializeParams {
 }
 
 impl InitializeParams {
-    /// The client presents `notice` session updates (`clientCapabilities.session.notices`).
+    /// The client presents `notice` session updates: `clientCapabilities.session.notices` is
+    /// an object (as in the official schema; `true` or a string is not).
     pub fn notices(&self) -> bool {
-        !self.client_capabilities["session"]["notices"].is_null()
+        self.client_capabilities["session"]["notices"].is_object()
     }
 }
 

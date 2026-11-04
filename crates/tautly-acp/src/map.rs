@@ -4,7 +4,7 @@
 use std::path::{Component, Path, PathBuf};
 
 use serde_json::{Value, json};
-use tautly_core::{FinishReason, ServerSpec};
+use tautly_core::{FinishReason, ServerSpec, is_valid_server_name, printable, printable_multiline};
 
 use crate::schema::{
     ContentBlock, McpServer, StopReason, ToolCallContent, ToolCallLocation, ToolKind,
@@ -47,16 +47,35 @@ pub fn stop_reason(r: FinishReason) -> Option<StopReason> {
 }
 
 /// `diff` content for a file whose text was `old` (None: created) and is `new`; None when
-/// either side is over [`MAX_DIFF_TEXT`].
+/// either side is over [`MAX_DIFF_TEXT`]. Control characters other than newline and tab
+/// (CR, ESC, DEL, C1) and invisible ones (bidi overrides, zero-width) are shown escaped
+/// (spec 3.4), so a file cannot hide or redraw part of the diff the user approves.
 pub fn diff_content(path: &Path, old: Option<&str>, new: &str) -> Option<ToolCallContent> {
     if new.len() > MAX_DIFF_TEXT || old.is_some_and(|o| o.len() > MAX_DIFF_TEXT) {
         return None;
     }
     Some(ToolCallContent::Diff {
         path: path.to_path_buf(),
-        old_text: old.map(str::to_string),
-        new_text: new.to_string(),
+        old_text: old.map(printable_multiline),
+        new_text: printable_multiline(new),
     })
+}
+
+/// `text` as a fenced code block, escaped (spec 3.4: control and invisible characters as
+/// visible escapes) and fenced with more backticks than any run in it, so a client that
+/// renders markdown shows it whole and literally: no HTML, link or comment syntax inside
+/// can hide part of it, and no backtick run can close the fence early.
+pub fn fenced(text: &str) -> String {
+    let text = printable_multiline(text);
+    let fence = "`".repeat(longest_backtick_run(&text).max(2) + 1);
+    let nl = if text.ends_with('\n') { "" } else { "\n" };
+    format!("{fence}\n{text}{nl}{fence}")
+}
+
+/// A single-line field (a title, a name, a rule) for display: every control character,
+/// newline and tab included, and every invisible one escaped (spec 3.4).
+pub fn single_line(text: &str) -> String {
+    printable(text)
 }
 
 /// The argument a title names, in order of preference.
@@ -65,8 +84,13 @@ const TARGET_KEYS: &[&str] = &[
 ];
 
 /// `<tool>: <target>`, the target being the call's path, command, pattern, URL or query
-/// (first line, at most 80 characters); just the tool when it has none.
+/// (first line, at most 80 characters); just the tool when it has none. Escaped as a
+/// single line ([`single_line`]).
 pub fn tool_title(tool: &str, args: &Value) -> String {
+    printable(&raw_title(tool, args))
+}
+
+fn raw_title(tool: &str, args: &Value) -> String {
     let target = TARGET_KEYS
         .iter()
         .find_map(|k| args.get(*k).and_then(Value::as_str))
@@ -100,10 +124,11 @@ pub fn locations(root: &Path, args: &Value) -> Vec<ToolCallLocation> {
         .collect()
 }
 
-/// A tool's output as text content, cut to [`MAX_OUTPUT_TEXT`] bytes (with a marker).
+/// A tool's output as text content: cut to [`MAX_OUTPUT_TEXT`] bytes (with a marker),
+/// escaped and fenced ([`fenced`]).
 pub fn output_content(output: &str) -> ToolCallContent {
     if output.len() <= MAX_OUTPUT_TEXT {
-        return ToolCallContent::text(output);
+        return ToolCallContent::text(fenced(output));
     }
     let mut end = MAX_OUTPUT_TEXT;
     while !output.is_char_boundary(end) {
@@ -111,9 +136,18 @@ pub fn output_content(output: &str) -> ToolCallContent {
     }
     ToolCallContent::text(format!(
         "{}\n… output cut ({} bytes in all)",
-        &output[..end],
+        fenced(&output[..end]),
         output.len()
     ))
+}
+
+/// What an approval shows of a call that has no diff: the whole command (every line) or
+/// the arguments as JSON, escaped and fenced.
+pub fn call_text(tool: &str, args: &Value) -> String {
+    match args.get("command").and_then(Value::as_str) {
+        Some(c) if tool == "bash" => fenced(c),
+        _ => fenced(&serde_json::to_string_pretty(args).unwrap_or_default()),
+    }
 }
 
 /// The text of a user message from prompt blocks: text blocks joined, embedded text
@@ -246,6 +280,16 @@ pub fn client_mcp(servers: Vec<McpServer>) -> (Vec<(String, ServerSpec)>, Vec<St
     let mut specs = Vec::new();
     let mut skipped = Vec::new();
     for server in servers {
+        // As for repository servers: a name like `gh__x` would give tools the `mcp__gh__`
+        // prefix that rules for another server match.
+        if !is_valid_server_name(server.name()) {
+            skipped.push(format!(
+                "MCP server `{}` from the editor is not a valid server name (letters, digits \
+                 and `-`, parts joined by single `_`); it is not started",
+                printable(server.name())
+            ));
+            continue;
+        }
         let raw = match &server {
             McpServer::Stdio {
                 command, args, env, ..
@@ -287,10 +331,10 @@ pub fn preview_diffs(root: &Path, unified: &str) -> Option<Vec<ToolCallContent>>
         let rel = file.new_path.as_deref().or(file.old_path.as_deref())?;
         let path = confined(root, rel)?;
         let old = match &file.old_path {
-            Some(_) => Some(std::fs::read_to_string(&path).ok()?),
+            Some(_) => Some(read_confined(root, &path)?),
             None => None,
         };
-        let new = apply(old.as_deref().unwrap_or(""), &file.hunks)?;
+        let new = apply(old.as_deref().unwrap_or(""), &file.hunks, false)?;
         let new = if file.new_path.is_some() {
             new
         } else {
@@ -299,6 +343,53 @@ pub fn preview_diffs(root: &Path, unified: &str) -> Option<Vec<ToolCallContent>>
         out.push(diff_content(&path, old.as_deref(), &new)?);
     }
     (!out.is_empty()).then_some(out)
+}
+
+/// A file a finished call changed, as its effect says: root-relative path and the blake3
+/// (lowercase hex) of what was written; None for a deleted file.
+pub type Written = (PathBuf, Option<String>);
+
+/// `diff` contents for a finished edit from its applied (untruncated) unified diff: each
+/// file's text now on disk, checked against the hash the call wrote, with the diff undone
+/// to get the text before. None when the diff is truncated, a file changed since (or
+/// cannot be read), or a side is too large; the caller then reads the session log.
+/// Blocking file I/O.
+pub fn applied_diffs(
+    root: &Path,
+    unified: &str,
+    written: &[Written],
+) -> Option<Vec<ToolCallContent>> {
+    let files = parse_unified(unified)?;
+    let mut out = Vec::with_capacity(files.len());
+    for file in files {
+        let rel = file.new_path.as_deref().or(file.old_path.as_deref())?;
+        let path = confined(root, rel)?;
+        let (_, hash) = written
+            .iter()
+            .find(|(p, _)| p == Path::new(rel) || *p == path)?;
+        let new = match (&file.new_path, hash) {
+            (Some(_), Some(hash)) => {
+                let text = read_confined(root, &path)?;
+                (blake3::hash(text.as_bytes()).to_hex().as_str() == hash).then_some(text)?
+            }
+            (None, None) => String::new(),
+            _ => return None,
+        };
+        let old = apply(&new, &file.hunks, true)?;
+        let old = file.old_path.as_ref().map(|_| old);
+        out.push(diff_content(&path, old.as_deref(), &new)?);
+    }
+    (!out.is_empty()).then_some(out)
+}
+
+/// A file's text, read only when its real path (links followed) is still under `root`:
+/// a link in the repository cannot make an approval show another file.
+fn read_confined(root: &Path, path: &Path) -> Option<String> {
+    let real = path.canonicalize().ok()?;
+    let root = root.canonicalize().ok()?;
+    real.starts_with(&root)
+        .then(|| std::fs::read_to_string(&real).ok())
+        .flatten()
 }
 
 /// `path` (root-relative, or absolute) as an absolute path under `root`.
@@ -326,10 +417,13 @@ struct FileDiff {
     hunks: Vec<Hunk>,
 }
 
-/// `@@ -old_start,… @@` and its lines (`' '`, `'-'`, `'+'` with the text after the tag,
-/// newline included; a line followed by `\ No newline at end of file` has none).
+/// `@@ -old_start,… +new_start,… @@` (1-based line each side starts at; for an empty side,
+/// the line after which it applies plus one) and its lines (`' '`, `'-'`, `'+'` with the
+/// text after the tag, newline included; a line followed by `\ No newline at end of file`
+/// has none).
 struct Hunk {
     old_start: usize,
+    new_start: usize,
     lines: Vec<(char, String)>,
 }
 
@@ -397,15 +491,13 @@ fn parse_unified(unified: &str) -> Option<Vec<FileDiff>> {
             let (old, rest) = rest.split_once(" +")?;
             let (new, _) = rest.split_once(" @@")?;
             let (old_start, old_count) = range(old)?;
-            let (_, new_count) = range(new)?;
+            let (new_start, new_count) = range(new)?;
             (old_left, new_left) = (old_count, new_count);
+            // An empty side (`-0,0`, `+5,0`) names the line it follows.
+            let start = |s: usize, n: usize| if n == 0 { s + 1 } else { s };
             files.last_mut()?.hunks.push(Hunk {
-                // `-0,0` (nothing before) applies at the top.
-                old_start: if old_count == 0 {
-                    old_start + 1
-                } else {
-                    old_start
-                },
+                old_start: start(old_start, old_count),
+                new_start: start(new_start, new_count),
                 lines: Vec::new(),
             });
         }
@@ -413,22 +505,29 @@ fn parse_unified(unified: &str) -> Option<Vec<FileDiff>> {
     (old_left == 0 && new_left == 0).then_some(files)
 }
 
-/// `old` with `hunks` applied; None when a context or removed line does not match.
-fn apply(old: &str, hunks: &[Hunk]) -> Option<String> {
+/// `old` with `hunks` applied (with `reverse`, undone: `old` is the new side); None when a
+/// context or removed line does not match.
+fn apply(old: &str, hunks: &[Hunk], reverse: bool) -> Option<String> {
+    let (added, removed) = if reverse { ('-', '+') } else { ('+', '-') };
     let old_lines: Vec<&str> = old.split_inclusive('\n').collect();
     let mut out = String::with_capacity(old.len());
     let mut at = 0usize;
     for hunk in hunks {
-        let start = hunk.old_start.saturating_sub(1);
+        let from = if reverse {
+            hunk.new_start
+        } else {
+            hunk.old_start
+        };
+        let start = from.saturating_sub(1);
         if start < at || start > old_lines.len() {
             return None;
         }
         old_lines[at..start].iter().for_each(|l| out.push_str(l));
         at = start;
         for (tag, text) in &hunk.lines {
-            match tag {
-                '+' => out.push_str(text),
-                _ => {
+            match *tag {
+                t if t == added => out.push_str(text),
+                t if t == removed || t == ' ' => {
                     if old_lines.get(at) != Some(&text.as_str()) {
                         return None;
                     }
@@ -437,6 +536,7 @@ fn apply(old: &str, hunks: &[Hunk]) -> Option<String> {
                     }
                     at += 1;
                 }
+                _ => return None,
             }
         }
     }

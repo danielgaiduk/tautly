@@ -6,12 +6,16 @@
 //! outcome, an option that was not offered (an `allow_always` for an MCP server too: a
 //! session rule is for tool calls only) or no answer at all denies.
 //!
-//! Text in these requests is the model's or the repository's, sent as it is: the client
-//! renders it and escapes what it shows (spec 3.4).
+//! Text in these requests is the model's or the repository's. It is escaped before it
+//! goes out (spec 3.4): single-line fields (titles, names, rules) with every control and
+//! invisible character as a visible escape, multi-line text (commands, launch lines,
+//! memory bodies) escaped and fenced ([`map::fenced`]), so a client that renders markdown
+//! shows it whole and literally.
 
 use serde_json::{Value, json};
 use tautly_core::{Command, MemoryChange};
 
+use crate::map::{fenced, single_line};
 use crate::schema::{
     PermissionOption, PermissionOptionKind, PermissionOutcome, PermissionResponse, ToolCallContent,
     ToolCallUpdate, ToolKind,
@@ -48,7 +52,7 @@ pub fn tool_options(rule: Option<&str>) -> Vec<PermissionOption> {
     if let Some(rule) = rule {
         options.push(option(
             ALLOW_ALWAYS,
-            format!("Allow for this session: {rule}"),
+            format!("Allow for this session: {}", single_line(rule)),
             PermissionOptionKind::AllowAlways,
         ));
     }
@@ -138,11 +142,13 @@ pub fn mcp_request(
 ) -> Value {
     let call = ToolCallUpdate {
         tool_call_id: format!("mcp:{request_id}"),
+        // `server` and `launch` come escaped from the engine (`printable`).
         title: Some(format!(
-            "Start MCP server `{server}` declared by the repository ({source})"
+            "Start MCP server `{server}` declared by the repository ({})",
+            single_line(source)
         )),
         kind: Some(ToolKind::Execute),
-        content: Some(vec![ToolCallContent::text(launch)]),
+        content: Some(vec![ToolCallContent::text(fenced(launch))]),
         ..ToolCallUpdate::default()
     };
     params(session_id, call, yes_no_options())
@@ -152,8 +158,11 @@ pub fn mcp_request(
 /// `memory:<proposal id>`.
 pub fn memory_request(session_id: &str, proposal_id: &str, change: &MemoryChange) -> Value {
     let title = match &change.upsert {
-        Some(entry) => format!("Save to project memory: {}", entry.title),
-        None => format!("Delete from project memory: {}", change.delete.join(", ")),
+        Some(entry) => format!("Save to project memory: {}", single_line(&entry.title)),
+        None => format!(
+            "Delete from project memory: {}",
+            single_line(&change.delete.join(", "))
+        ),
     };
     let mut text = String::new();
     if let Some(entry) = &change.upsert {
@@ -171,7 +180,7 @@ pub fn memory_request(session_id: &str, proposal_id: &str, change: &MemoryChange
         tool_call_id: format!("memory:{proposal_id}"),
         title: Some(title),
         kind: Some(ToolKind::Think),
-        content: Some(vec![ToolCallContent::text(text)]),
+        content: Some(vec![ToolCallContent::text(fenced(&text))]),
         ..ToolCallUpdate::default()
     };
     params(session_id, call, yes_no_options())

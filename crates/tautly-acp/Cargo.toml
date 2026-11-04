@@ -14,8 +14,11 @@ tokio = { workspace = true, features = ["io-util"] }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+# Checks a finished edit's file against the hash it wrote.
+blake3.workspace = true
 
 [dev-dependencies]
 tautly-provider = { path = "../tautly-provider" }
 tempfile.workspace = true
+blake3.workspace = true
 tokio.workspace = true

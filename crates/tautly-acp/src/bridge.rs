@@ -19,8 +19,8 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use serde_json::{Value, json};
 use tautly_core::{
-    Command, DiffPreview, Engine, Event, FinishReason, McpState, MemoryChange, ProviderEvent,
-    SessionReader, SessionRecord, TestEvidence, printable,
+    Command, DiffPreview, EffectView, Engine, ErrorKind, Event, FinishReason, McpState,
+    MemoryChange, ProviderEvent, SessionReader, SessionRecord, TestEvidence, printable,
 };
 use tautly_rpc::jsonrpc::{
     self, Error, INVALID_PARAMS, INVALID_REQUEST, Line, MAX_LINE, METHOD_NOT_FOUND,
@@ -52,6 +52,7 @@ const OUTPUT_CAPACITY: usize = 1024;
 pub struct Bridge {
     factory: AcpEngineFactory,
     models: Option<ModelLister>,
+    data_home: Option<PathBuf>,
     stop: Option<Pin<Box<dyn Future<Output = ()> + Send>>>,
 }
 
@@ -60,8 +61,16 @@ impl Bridge {
         Bridge {
             factory,
             models: None,
+            data_home: None,
             stop: None,
         }
+    }
+
+    /// The data home whose cost ledger holds a loaded session's earlier spend, so its
+    /// `usage_update` cost goes on from there (none: from 0).
+    pub fn data_home(mut self, data_home: impl Into<PathBuf>) -> Bridge {
+        self.data_home = Some(data_home.into());
+        self
     }
 
     /// What the `model` config option offers (none: no config options).
@@ -89,6 +98,7 @@ impl Bridge {
             out,
             factory: self.factory,
             models: self.models,
+            data_home: self.data_home,
             next_id: AtomicU64::new(1),
             state: Mutex::default(),
         });
@@ -149,10 +159,18 @@ async fn read_loop(
                 if line.iter().all(u8::is_ascii_whitespace) {
                     continue;
                 }
-                if conn.route_response(&line) {
+                let value = match jsonrpc::parse_json(&line) {
+                    Ok(v) => v,
+                    Err((id, err)) => {
+                        let id = id.unwrap_or(Value::Null);
+                        conn.send(jsonrpc::error_response(&id, &err)).await;
+                        continue;
+                    }
+                };
+                let Some(value) = conn.route_response(value) else {
                     continue;
-                }
-                match jsonrpc::parse(&line) {
+                };
+                match jsonrpc::parse_value(value) {
                     Err((Some(id), err)) => conn.send(jsonrpc::error_response(&id, &err)).await,
                     Err((None, _)) => {}
                     Ok(jsonrpc::Incoming::Notification { method, params }) => {
@@ -177,6 +195,7 @@ struct Conn {
     out: mpsc::Sender<String>,
     factory: AcpEngineFactory,
     models: Option<ModelLister>,
+    data_home: Option<PathBuf>,
     next_id: AtomicU64,
     state: Mutex<ConnState>,
 }
@@ -231,15 +250,15 @@ impl Conn {
         lock(&self.state).notices
     }
 
-    /// A response to one of our requests: handed to whoever waits for it. False when the
-    /// line is not a response.
-    fn route_response(&self, line: &[u8]) -> bool {
-        let Ok(Value::Object(msg)) = serde_json::from_slice::<Value>(line) else {
-            return false;
+    /// A response to one of our requests is handed to whoever waits for it (None);
+    /// anything else is given back.
+    fn route_response(&self, value: Value) -> Option<Value> {
+        let Value::Object(msg) = &value else {
+            return Some(value);
         };
         if msg.contains_key("method") || !(msg.contains_key("result") || msg.contains_key("error"))
         {
-            return false;
+            return Some(value);
         }
         let waiter = msg
             .get("id")
@@ -249,7 +268,7 @@ impl Conn {
             // An error answer is no answer: whoever asked treats it as a refusal.
             let _ = waiter.send(msg.get("result").cloned().unwrap_or(Value::Null));
         }
-        true
+        None
     }
 
     /// Ask the client; its result, or None when it answered with an error or went away.
@@ -421,9 +440,16 @@ impl Conn {
         if replaying {
             let log = session.engine.session_path().to_path_buf();
             let root = session.root.clone();
-            let updates = tokio::task::spawn_blocking(move || replay(&log, &root))
-                .await
-                .unwrap_or_default();
+            let (home, id) = (self.data_home.clone(), session.id.clone());
+            let (updates, spent) = tokio::task::spawn_blocking(move || {
+                (
+                    replay(&log, &root),
+                    home.and_then(|h| ledger_spend(&h, &id)),
+                )
+            })
+            .await
+            .unwrap_or_default();
+            lock(&session.st).cost_usd = spent.unwrap_or(0.0);
             for u in updates {
                 self.update(&session.id, u).await;
             }
@@ -465,17 +491,19 @@ impl Conn {
             None => (Until::Turn, Command::SendMessage { text }),
             Some(Slash::Compact) => (Until::Compact, Command::Compact),
             Some(Slash::Diff(turn)) => (Until::Diff, Command::Diff { turn }),
+            // A dry run first: the editor is asked before anything is undone (spec
+            // 7.11.8's `/undo`).
             Some(Slash::Undo(turn)) => (
-                Until::Undone,
+                Until::UndoPreview,
                 Command::Undo {
                     turn,
-                    dry_run: false,
+                    dry_run: true,
                 },
             ),
             Some(Slash::Pin(text)) => {
                 // The engine applies it (between turns, or at the next step) and warns
                 // only when it refuses.
-                let shown = format!("pinning: {text}");
+                let shown = format!("pinning: {}", map::single_line(&text));
                 session.send(Command::Pin { text }).await?;
                 self.update(&session.id, chunk(&shown)).await;
                 return Ok(done(StopReason::EndTurn));
@@ -518,7 +546,8 @@ impl Conn {
 
     /// `session/set_config_option {configId: "model"}`: `SetModel` now; the answer once
     /// the engine has switched (at once when idle; while a turn runs the switch waits for
-    /// the next turn, and the answer shows the requested model).
+    /// the next turn, and the answer shows the requested model: should the switch fail
+    /// then, a `config_option_update` puts the real model back).
     async fn set_config(self: Arc<Self>, p: SetConfigParams) -> Result<Reply, Error> {
         let session = self.session(&p.session_id)?;
         if p.config_id != "model" {
@@ -534,9 +563,10 @@ impl Conn {
         let busy = {
             let mut st = lock(&session.st);
             let busy = st.waiter.is_some();
-            if !busy {
-                st.model_waiter = Some(tx);
-            }
+            st.switch = Some(ModelSwitch {
+                model: model.clone(),
+                reply: (!busy).then_some(tx),
+            });
             busy
         };
         session
@@ -591,9 +621,21 @@ impl Conn {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Until {
     Turn,
+    /// Ends with `CompactFinished`.
     Compact,
     Diff,
+    /// `/undo`'s dry run: its `Undone` is shown to the editor for approval.
+    UndoPreview,
+    /// The editor is being asked whether to undo.
+    UndoAsk,
     Undone,
+}
+
+/// A `SetModel` the bridge sent: the model, and who waits for the answer (none when it
+/// was sent during a turn and answered at once).
+struct ModelSwitch {
+    model: String,
+    reply: Option<oneshot::Sender<Result<(), String>>>,
 }
 
 struct Waiter {
@@ -622,7 +664,7 @@ struct Session {
 #[derive(Default)]
 struct SessionState {
     waiter: Option<Waiter>,
-    model_waiter: Option<oneshot::Sender<Result<(), String>>>,
+    switch: Option<ModelSwitch>,
     /// Approval requests the client has not answered, by request (or proposal) id.
     approvals: HashMap<String, Pending>,
     models: Option<ModelChoices>,
@@ -721,8 +763,10 @@ impl Session {
             .map_err(|e| Error::new(INTERNAL_ERROR, e.to_string()))
     }
 
-    /// `session/cancel`: every open approval request is answered as denied, the turn is
-    /// cancelled, and the prompt answers `cancelled` (a command's prompt at once).
+    /// `session/cancel`: every open tool-call approval and memory proposal is answered as
+    /// denied (and any that still comes before the turn ends is denied without asking),
+    /// the turn is cancelled, and the prompt answers `cancelled` (a command's prompt at
+    /// once).
     async fn cancel(&self) {
         let open: Vec<(String, Pending)> = {
             let mut st = lock(&self.st);
@@ -732,7 +776,18 @@ impl Session {
             if let Some(w) = st.waiter.take_if(|w| w.until != Until::Turn) {
                 let _ = w.reply.send(Ok(StopReason::Cancelled));
             }
-            st.approvals.drain().collect()
+            // A repository MCP server's approval is not the turn's: a denial would last
+            // for the session (spec 7.11.10), so it stays open.
+            let open: Vec<(String, Pending)> = st
+                .approvals
+                .iter()
+                .filter(|(_, kind)| **kind != Pending::Mcp)
+                .map(|(id, kind)| (id.clone(), *kind))
+                .collect();
+            for (id, _) in &open {
+                st.approvals.remove(id);
+            }
+            open
         };
         for (id, kind) in open {
             let _ = self.engine.send(deny(&id, kind)).await;
@@ -743,6 +798,25 @@ impl Session {
     /// Whether approval `id` is still open (and now answered by the caller).
     fn take_approval(&self, id: &str) -> bool {
         lock(&self.st).approvals.remove(id).is_some()
+    }
+
+    /// Record approval `id` as asked; false (nothing recorded) when the running turn was
+    /// cancelled, so the caller denies it without asking.
+    fn open_approval(&self, id: &str, kind: Pending) -> bool {
+        let mut st = lock(&self.st);
+        if st.waiter.as_ref().is_some_and(|w| w.cancelled) {
+            return false;
+        }
+        st.approvals.insert(id.to_string(), kind);
+        true
+    }
+
+    /// Whether the running prompt waits for `until`.
+    fn waiting_for(&self, until: Until) -> bool {
+        lock(&self.st)
+            .waiter
+            .as_ref()
+            .is_some_and(|w| w.until == until)
     }
 }
 
@@ -765,7 +839,7 @@ async fn forward(conn: Arc<Conn>, s: Arc<Session>, mut events: mpsc::Receiver<Ev
             .reply
             .send(Err(Error::new(INTERNAL_ERROR, "the session has stopped")));
     }
-    st.model_waiter.take();
+    st.switch.take();
 }
 
 /// Something the user should know: a notice when the client shows them, else (when
@@ -829,9 +903,10 @@ async fn on_event(conn: &Arc<Conn>, s: &Arc<Session>, ev: Event) {
             diff,
             ..
         } => {
-            lock(&s.st)
-                .approvals
-                .insert(request_id.clone(), Pending::Tool);
+            if !s.open_approval(&request_id, Pending::Tool) {
+                let _ = s.engine.send(deny(&request_id, Pending::Tool)).await;
+                return;
+            }
             let (conn, s) = (Arc::clone(conn), Arc::clone(s));
             tokio::spawn(async move {
                 ask_tool(&conn, &s, request_id, call_id, tool, args, diff).await;
@@ -855,15 +930,11 @@ async fn on_event(conn: &Arc<Conn>, s: &Arc<Session>, ev: Event) {
             ..
         } => {
             let mut content = vec![map::output_content(&output)];
-            let edited = effects.iter().any(|e| {
-                matches!(
-                    e,
-                    tautly_core::EffectView::Edited { .. }
-                        | tautly_core::EffectView::Deleted { .. }
-                )
-            });
+            let edited = effects
+                .iter()
+                .any(|e| matches!(e, EffectView::Edited { .. } | EffectView::Deleted { .. }));
             if edited && !is_error {
-                content.extend(finished_diffs(s, &call_id, diff).await);
+                content.extend(finished_diffs(s, &call_id, &effects, diff).await);
             }
             let status = if is_error || blocked {
                 ToolCallStatus::Failed
@@ -889,28 +960,34 @@ async fn on_event(conn: &Arc<Conn>, s: &Arc<Session>, ev: Event) {
             }
         }
         Event::ContextStatus { used, budget, .. } => {
-            let (update, compact) = {
+            let update = {
                 let mut st = lock(&s.st);
                 st.context = Some((used, budget));
-                (st.usage_update(), st.take_waiter(Until::Compact))
+                st.usage_update()
             };
             if let Some(u) = update {
                 conn.update(&s.id, u).await;
             }
-            if let Some(w) = compact {
-                conn.update(&s.id, chunk("context collected")).await;
-                let _ = w.reply.send(Ok(StopReason::EndTurn));
-            }
         }
         Event::Compacted { removed_turns, .. } => {
             let text = format!("compacted {removed_turns} turns of the conversation");
+            if s.waiting_for(Until::Compact) {
+                conn.update(&s.id, chunk(&format!("{text}\n"))).await;
+            } else {
+                tell(conn, s, "info", &text, None, false).await;
+            }
+        }
+        Event::CompactFinished {
+            applied,
+            tokens_freed,
+        } => {
             let waiter = lock(&s.st).take_waiter(Until::Compact);
-            match waiter {
-                Some(w) => {
+            if let Some(w) = waiter {
+                if applied {
+                    let text = format!("context compacted: {tokens_freed} tokens freed");
                     conn.update(&s.id, chunk(&text)).await;
-                    let _ = w.reply.send(Ok(StopReason::EndTurn));
                 }
-                None => tell(conn, s, "info", &text, None, false).await,
+                let _ = w.reply.send(Ok(StopReason::EndTurn));
             }
         }
         Event::MemoryProposed {
@@ -918,9 +995,10 @@ async fn on_event(conn: &Arc<Conn>, s: &Arc<Session>, ev: Event) {
             change,
             ..
         } => {
-            lock(&s.st)
-                .approvals
-                .insert(proposal_id.clone(), Pending::Memory);
+            if !s.open_approval(&proposal_id, Pending::Memory) {
+                let _ = s.engine.send(deny(&proposal_id, Pending::Memory)).await;
+                return;
+            }
             let (conn, s) = (Arc::clone(conn), Arc::clone(s));
             tokio::spawn(async move { ask_memory(&conn, &s, proposal_id, change).await });
         }
@@ -956,31 +1034,77 @@ async fn on_event(conn: &Arc<Conn>, s: &Arc<Session>, ev: Event) {
             let title = format!("MCP server `{server}` failed");
             tell(conn, s, "warning", &title, message, false).await;
         }
+        Event::McpServerStatus {
+            server,
+            state: McpState::Ready,
+            tools,
+            ..
+        } if conn.notices() => {
+            let title = format!("MCP server `{server}` ready ({tools} tools)");
+            tell(conn, s, "info", &title, None, false).await;
+        }
         ev @ Event::TurnReceipt { .. } => {
             lock(&s.st).receipt = Some(ev);
         }
         Event::TurnFinished { reason, evidence } => turn_finished(conn, s, reason, evidence).await,
-        Event::Error { message, hint, .. } => {
+        Event::Error {
+            kind,
+            message,
+            hint,
+            ..
+        } => {
+            // A failed model switch is the switch's answer, never the turn's or a
+            // command's: its message names the model (`cannot switch to <model>: ...`).
+            let switch = {
+                let mut st = lock(&s.st);
+                st.switch.take_if(|sw| {
+                    kind == ErrorKind::ProviderFatal
+                        && message.starts_with(&format!("cannot switch to {}:", sw.model))
+                })
+            };
             let text = match hint {
                 Some(h) => format!("{message}\nhint: {h}"),
                 None => message,
             };
-            let (command, model) = {
+            if let Some(sw) = switch {
+                match sw.reply {
+                    Some(reply) => {
+                        let _ = reply.send(Err(text));
+                    }
+                    None => {
+                        // Answered at once during a turn: put the real model back.
+                        let options = lock(&s.st).models.as_ref().map(config_options);
+                        if let Some(o) = options {
+                            conn.update(
+                                &s.id,
+                                json!({"sessionUpdate": "config_option_update", "configOptions": o}),
+                            )
+                            .await;
+                        }
+                        tell(conn, s, "error", &text, None, true).await;
+                    }
+                }
+                return;
+            }
+            let (command, compacting) = {
                 let mut st = lock(&s.st);
                 st.last_error = Some(text.clone());
-                let command = st.waiter.take_if(|w| w.until != Until::Turn);
-                let model = if st.waiter.is_none() {
-                    st.model_waiter.take()
-                } else {
-                    None
-                };
-                (command, model)
+                let command = st.waiter.take_if(|w| {
+                    matches!(w.until, Until::Diff | Until::UndoPreview | Until::Undone)
+                });
+                (
+                    command,
+                    st.waiter
+                        .as_ref()
+                        .is_some_and(|w| w.until == Until::Compact),
+                )
             };
             if let Some(w) = command {
                 conn.update(&s.id, chunk(&format!("error: {text}"))).await;
                 let _ = w.reply.send(Ok(StopReason::EndTurn));
-            } else if let Some(m) = model {
-                let _ = m.send(Err(text));
+            } else if compacting {
+                // Shown; the compaction still ends with `CompactFinished`.
+                conn.update(&s.id, chunk(&format!("error: {text}\n"))).await;
             } else {
                 tell(conn, s, "error", &text, None, false).await;
             }
@@ -991,7 +1115,7 @@ async fn on_event(conn: &Arc<Conn>, s: &Arc<Session>, ev: Event) {
                 let text = if files.is_empty() {
                     "no changes by Tautly's tools in this scope".to_string()
                 } else {
-                    format!("```diff\n{unified}\n```")
+                    map::fenced(&unified)
                 };
                 conn.update(&s.id, chunk(&text)).await;
                 let _ = w.reply.send(Ok(StopReason::EndTurn));
@@ -1002,21 +1126,42 @@ async fn on_event(conn: &Arc<Conn>, s: &Arc<Session>, ev: Event) {
             restored,
             deleted,
             note,
+            dry_run,
             ..
         } => {
+            let list = undo_list(&restored, &deleted, note.as_deref());
+            if dry_run {
+                let nothing = restored.is_empty() && deleted.is_empty();
+                let asking = {
+                    let mut st = lock(&s.st);
+                    match &mut st.waiter {
+                        Some(w) if w.until == Until::UndoPreview && !nothing => {
+                            w.until = Until::UndoAsk;
+                            true
+                        }
+                        _ => false,
+                    }
+                };
+                if asking {
+                    let (conn, s) = (Arc::clone(conn), Arc::clone(s));
+                    tokio::spawn(async move { ask_undo(&conn, &s, turn, list).await });
+                    return;
+                }
+                let waiter = lock(&s.st).take_waiter(Until::UndoPreview);
+                if let Some(w) = waiter {
+                    let text = format!("nothing to undo in turn {turn}{list}");
+                    conn.update(&s.id, chunk(&text)).await;
+                    let _ = w.reply.send(Ok(StopReason::EndTurn));
+                }
+                return;
+            }
             let waiter = lock(&s.st).take_waiter(Until::Undone);
             if let Some(w) = waiter {
-                let mut text = format!(
-                    "undid turn {turn}: {} restored, {} deleted",
+                let text = format!(
+                    "undid turn {turn}: {} restored, {} deleted{list}",
                     restored.len(),
                     deleted.len()
                 );
-                for p in restored.iter().chain(&deleted) {
-                    text.push_str(&format!("\n- {p}"));
-                }
-                if let Some(n) = note {
-                    text.push_str(&format!("\n{n}"));
-                }
                 conn.update(&s.id, chunk(&text)).await;
                 let _ = w.reply.send(Ok(StopReason::EndTurn));
             }
@@ -1028,7 +1173,8 @@ async fn on_event(conn: &Arc<Conn>, s: &Arc<Session>, ev: Event) {
                     m.current = model.as_str().to_string();
                     config_options(m)
                 });
-                (options, st.model_waiter.take())
+                let switch = st.switch.take_if(|sw| sw.model == model.as_str());
+                (options, switch.and_then(|sw| sw.reply))
             };
             if let Some(o) = options {
                 conn.update(
@@ -1042,13 +1188,12 @@ async fn on_event(conn: &Arc<Conn>, s: &Arc<Session>, ev: Event) {
             }
         }
         Event::Warning { message } => {
-            let waiter = lock(&s.st).take_waiter(Until::Compact);
-            match waiter {
-                Some(w) => {
-                    conn.update(&s.id, chunk(&message)).await;
-                    let _ = w.reply.send(Ok(StopReason::EndTurn));
-                }
-                None => tell(conn, s, "warning", &message, None, false).await,
+            // During `/compact`, the user asked: shown in the answer (which still ends
+            // with `CompactFinished`).
+            if s.waiting_for(Until::Compact) {
+                conn.update(&s.id, chunk(&format!("{message}\n"))).await;
+            } else {
+                tell(conn, s, "warning", &message, None, false).await;
             }
         }
         _ => {}
@@ -1176,14 +1321,9 @@ async fn ask_tool(
             Some((truncated, text)) => (!truncated)
                 .then(|| map::preview_diffs(&root, &text))
                 .flatten()
-                .unwrap_or_else(|| vec![ToolCallContent::text(text)]),
-            // No diff: the whole call, every line of a command.
-            None => vec![ToolCallContent::text(
-                match a.get("command").and_then(Value::as_str) {
-                    Some(c) if t == "bash" => c.to_string(),
-                    _ => serde_json::to_string_pretty(&a).unwrap_or_default(),
-                },
-            )],
+                .unwrap_or_else(|| vec![ToolCallContent::text(map::fenced(&text))]),
+            // No diff: the whole call, every line of a command, escaped and fenced.
+            None => vec![ToolCallContent::text(map::call_text(&t, &a))],
         };
         (rule, content)
     })
@@ -1221,17 +1361,36 @@ async fn ask_memory(conn: &Conn, s: &Session, proposal_id: String, change: Memor
     }
 }
 
-/// The `diff` contents of a finished edit, from the texts the session log holds for the
-/// call (before and after); the applied unified diff as text when a file is too large,
-/// not text, or not in the log.
+/// The `diff` contents of a finished edit: from its applied diff and the files on disk
+/// when they are still as the call wrote them (the common case, no log read); else from
+/// the texts the session log holds for the call (a truncated diff, a file changed since);
+/// else the applied unified diff as text (a file too large or not text).
 async fn finished_diffs(
     s: &Session,
     call_id: &str,
+    effects: &[EffectView],
     diff: Option<DiffPreview>,
 ) -> Vec<ToolCallContent> {
     let log = s.engine.current_session().1;
     let (root, id) = (s.root.clone(), call_id.to_string());
+    let written: Vec<map::Written> = effects
+        .iter()
+        .filter_map(|e| match e {
+            EffectView::Edited {
+                path, post_hash, ..
+            } => Some((path.clone(), Some(post_hash.clone()))),
+            EffectView::Deleted { path } => Some((path.clone(), None)),
+            _ => None,
+        })
+        .collect();
+    let applied = diff
+        .as_ref()
+        .filter(|d| !d.truncated)
+        .map(|d| d.unified.clone());
     let texts = tokio::task::spawn_blocking(move || {
+        if let Some(found) = applied.and_then(|u| map::applied_diffs(&root, &u, &written)) {
+            return Some(found);
+        }
         let files = call_edits(&log, &id)?;
         files
             .into_iter()
@@ -1252,7 +1411,7 @@ async fn finished_diffs(
     .filter(|v| !v.is_empty());
     match (texts, diff) {
         (Some(t), _) => t,
-        (None, Some(d)) => vec![ToolCallContent::text(d.unified)],
+        (None, Some(d)) => vec![ToolCallContent::text(map::fenced(&d.unified))],
         (None, None) => Vec::new(),
     }
 }
@@ -1390,4 +1549,84 @@ fn replay(log: &Path, root: &Path) -> Vec<Value> {
     }
     flush(&mut open, &mut out);
     out
+}
+
+/// What session `id` has cost so far, from the cost ledger under `data_home` (None: no
+/// ledger, or nothing priced). Blocking.
+fn ledger_spend(data_home: &Path, id: &str) -> Option<f64> {
+    let file = data_home.join(tautly_core::ledger::LEDGER_FILE);
+    if !file.exists() {
+        return None;
+    }
+    let totals = tautly_core::Ledger::open(&file)
+        .ok()?
+        .session_totals(id)
+        .ok()?;
+    (totals.requests > totals.unpriced).then_some(totals.usd)
+}
+
+/// The files an undo restores and deletes, and its note, as lines to show (paths escaped).
+fn undo_list(restored: &[String], deleted: &[String], note: Option<&str>) -> String {
+    let mut text = String::new();
+    for p in restored {
+        text.push_str(&format!("\n- restore {}", map::single_line(p)));
+    }
+    for p in deleted {
+        text.push_str(&format!("\n- delete {}", map::single_line(p)));
+    }
+    if let Some(n) = note {
+        text.push_str(&format!("\n{}", map::single_line(n)));
+    }
+    text
+}
+
+/// `/undo` after its dry run: ask the editor; on `allow_once` undo for real (the prompt
+/// then waits for that `Undone`), else end the prompt. A cancel meanwhile has already
+/// answered the prompt.
+async fn ask_undo(conn: &Conn, s: &Session, turn: u32, list: String) {
+    let call = ToolCallUpdate {
+        tool_call_id: format!("undo:{turn}"),
+        title: Some(format!("Undo turn {turn}")),
+        kind: Some(crate::schema::ToolKind::Edit),
+        content: Some(vec![ToolCallContent::text(map::fenced(list.trim_start()))]),
+        ..ToolCallUpdate::default()
+    };
+    let params = json!({
+        "sessionId": s.id,
+        "toolCall": call,
+        "options": permission::yes_no_options(),
+    });
+    let result = conn.ask("session/request_permission", params).await;
+    let approved = permission::answer(result.as_ref(), None) == Answer::Once;
+    let waiter = {
+        let mut st = lock(&s.st);
+        match st.waiter.take_if(|w| w.until == Until::UndoAsk) {
+            Some(mut w) if approved => {
+                w.until = Until::Undone;
+                st.waiter = Some(w);
+                None
+            }
+            other => other,
+        }
+    };
+    match waiter {
+        Some(w) => {
+            conn.update(&s.id, chunk("undo not done")).await;
+            let _ = w.reply.send(Ok(StopReason::EndTurn));
+        }
+        None if approved && s.waiting_for(Until::Undone) => {
+            let undo = Command::Undo {
+                turn: Some(turn),
+                dry_run: false,
+            };
+            if s.send(undo).await.is_err()
+                && let Some(w) = lock(&s.st).take_waiter(Until::Undone)
+            {
+                let _ = w
+                    .reply
+                    .send(Err(Error::new(INTERNAL_ERROR, "the session has stopped")));
+            }
+        }
+        None => {}
+    }
 }

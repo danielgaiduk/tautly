@@ -27,11 +27,17 @@ pub const OTHER_MODEL: &str = "openai/test-other";
 pub const WAIT: Duration = Duration::from_secs(30);
 
 pub fn catalog() -> Catalog {
+    catalog_window(200_000, 8000)
+}
+
+/// The mock models with a `window`-token context and `max_output` (a small window makes
+/// a compaction summarize).
+pub fn catalog_window(window: u32, max_output: u32) -> Catalog {
     let entry = |id: &str| {
         format!(
             r#"[models."{id}"]
-context_window = 200000
-max_output = 8000
+context_window = {window}
+max_output = {max_output}
 parallel_tools = true
 reasoning = "none"
 cache = "none"
@@ -279,6 +285,14 @@ impl Acp {
         id: u64,
         mut answer: impl FnMut(&Value) -> Option<Value>,
     ) -> Value {
+        // It may have come while waiting for another response.
+        if let Some(i) = self
+            .seen
+            .iter()
+            .position(|m| m.get("method").is_none() && m["id"] == json!(id))
+        {
+            return self.seen.remove(i);
+        }
         loop {
             let msg = self.next().await;
             if msg.get("method").is_none() && msg["id"] == json!(id) {
@@ -409,6 +423,43 @@ impl Acp {
             .unwrap();
         served.unwrap();
     }
+}
+
+/// The `echo_server` MCP fixture, built once.
+pub fn mcp_fixture() -> String {
+    static PATH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    PATH.get_or_init(|| {
+        let exe = std::env::current_exe().unwrap();
+        let dir = exe.parent().unwrap().parent().unwrap();
+        let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
+        let status = std::process::Command::new(cargo)
+            .args(["build", "-p", "tautly-mcp-fixture", "--bin", "echo_server"])
+            .status()
+            .unwrap();
+        assert!(status.success(), "could not build the echo_server fixture");
+        let bin = dir.join("echo_server");
+        assert!(bin.exists(), "no fixture at {}", bin.display());
+        bin.to_string_lossy().into_owned()
+    })
+    .clone()
+}
+
+/// Whether process `pid` is alive.
+pub fn alive(pid: u32) -> bool {
+    std::process::Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+/// The updates seen for session `id`.
+pub fn updates_for(acp: &Acp, id: &str) -> Vec<Value> {
+    acp.seen
+        .iter()
+        .filter(|m| m["method"] == "session/update" && m["params"]["sessionId"] == id)
+        .map(|m| m["params"]["update"].clone())
+        .collect()
 }
 
 /// A permission result selecting `option`.
