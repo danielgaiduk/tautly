@@ -21,9 +21,10 @@
 //! - **Episodes.** Private (in the data home), so no approval. After each compaction the
 //!   episode is the side model's summary of what was compacted; at session end the side
 //!   model writes the whole session's, replacing it, if the model replied at all.
-//! - **Budgets.** The session-end episode and consolidation are side-model requests the
-//!   user did not ask for turn by turn: with a budget used up they are not sent (a warning
-//!   says so), as no main request would be.
+//! - **Budgets.** The session-end episode is a side-model request nobody asked for: with
+//!   any budget used up it is not sent (a warning says so), as no main request would be.
+//!   An explicit consolidation runs outside any turn, so only a used-up session budget
+//!   holds it back.
 
 use std::sync::{Arc, PoisonError, RwLock};
 use std::time::Duration;
@@ -34,7 +35,8 @@ use tautly_provider::{Content, Role};
 use tautly_tools::{AppliedEffect, ToolResult};
 use tokio_util::sync::CancellationToken;
 
-use crate::protocol::{Event, MAX_REPLACED_SHOWN};
+use crate::protocol::{BudgetScope, Event, MAX_REPLACED_SHOWN};
+
 use crate::record::SessionRecord;
 use crate::session::Session;
 use crate::turn::TurnControl;
@@ -462,8 +464,9 @@ impl Session {
                 .await;
             return;
         };
-        if self.budget_exhausted().await.is_some() {
-            self.warn("memory consolidation not run: the budget is used up")
+        // Asked for by the user, outside any turn: the last turn's spend is no reason.
+        if self.budget_exhausted().await == Some(BudgetScope::Session) {
+            self.warn("memory consolidation not run: the session budget is used up")
                 .await;
             return;
         }
