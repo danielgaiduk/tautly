@@ -8,9 +8,12 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use serde_json::{Value, json};
+use tautly_core::record::ApprovalKind;
 use tautly_core::{
-    Command, Config, Engine, EngineBuilder, Event, McpState, PreExecHook, ServerSpec,
+    Command, Config, Engine, EngineBuilder, Event, McpState, PreExecHook, ServerSpec, SessionRecord,
 };
+use tautly_session::SessionReader;
+
 use tautly_mcp::approvals::key;
 use tautly_mcp::{APPROVALS_FILE, ApprovalStore};
 use tautly_provider::{
@@ -338,6 +341,57 @@ async fn repo_server_not_spawned_without_approval() {
         gone(&started).await,
         "{started:?} still running after shutdown"
     );
+}
+
+fn records(path: &Path) -> Vec<SessionRecord> {
+    let reader = SessionReader::<SessionRecord>::open(path).unwrap();
+    reader.records().map(|r| r.unwrap().1).collect()
+}
+
+#[tokio::test]
+async fn repo_server_approval_request_and_answer_are_logged() {
+    let fx = Fx::new();
+    fx.project_server("echo", &[]);
+    let (cfg, _) = fx.loaded(Mode::Ask);
+    let mock = MockProvider::new(vec![]);
+    let mut run = start(EngineBuilder {
+        interactive: true,
+        ..fx.builder(cfg, &mock)
+    });
+    let events = run
+        .until(|e| matches!(e, Event::McpServerApprovalRequested { .. }))
+        .await;
+    let (request_id, ..) = approval_request(&events).unwrap();
+    // Logged durably before the event was shown (H8).
+    let path = run.engine.session_path().to_path_buf();
+    let logged = records(&path);
+    let asked = logged.iter().position(|r| {
+        matches!(
+            r,
+            SessionRecord::ApprovalRequested {
+                request_id: id,
+                kind: ApprovalKind::McpServer,
+                call_id: None,
+                reason,
+            } if *id == request_id && reason.contains("`echo`") && reason.contains("project")
+        )
+    });
+    assert!(asked.is_some(), "{logged:?}");
+
+    run.send(Command::Approve {
+        request_id: request_id.clone(),
+    })
+    .await;
+    run.until_state("echo", McpState::Ready).await;
+    run.shutdown().await;
+    let logged = records(&path);
+
+    let answered = logged.iter().position(|r| {
+        *r == SessionRecord::Command(Command::Approve {
+            request_id: request_id.clone(),
+        })
+    });
+    assert!(answered > asked, "{logged:?}");
 }
 
 #[tokio::test]

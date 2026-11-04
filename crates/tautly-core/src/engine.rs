@@ -539,13 +539,8 @@ impl Actor {
             Ok(()) => {
                 session.begin_checkpoints().await;
                 prune_checkpoints(&session);
-                session.mcp = McpSession::start(
-                    start.mcp,
-                    Arc::clone(&session.sandbox),
-                    session.events.clone(),
-                    self.approvals.clone(),
-                )
-                .await;
+                session.mcp = McpSession::start(start.mcp, &session, self.approvals.clone()).await;
+
                 Some(session)
             }
             Err(why) => {
