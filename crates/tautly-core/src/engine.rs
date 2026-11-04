@@ -363,6 +363,8 @@ impl EngineBuilder {
             start_checkpoint,
             data_home,
             header_init: init,
+            receipt: None,
+            gc_elided: Vec::new(),
         };
         let current = Arc::new(Mutex::new((session_id.clone(), session_path.clone())));
         let actor = Actor {

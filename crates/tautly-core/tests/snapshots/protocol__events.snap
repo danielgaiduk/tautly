@@ -177,6 +177,31 @@ expression: events
     "session_id": "01J0SESSION"
   },
   {
+    "type": "turn_receipt",
+    "turn": 3,
+    "model": "anthropic/claude-opus-5-5",
+    "tokens_in": 1200,
+    "tokens_out": 300,
+    "cache_read": 4800,
+    "cache_write": 200,
+    "side_tokens": 150,
+    "cost_usd": 0.0125,
+    "wall_ms": 4200,
+    "cache_hit_ratio": 0.8,
+    "steps": 2,
+    "tool_calls": 3,
+    "saved": {
+      "index": 900,
+      "diff_reads": 120,
+      "context_gc": 3000,
+      "filters": 0,
+      "cache_read_tokens": 4800,
+      "cache_usd": 0.0126,
+      "total_usd": 0.0168
+    },
+    "estimated": true
+  },
+  {
     "type": "turn_finished",
     "reason": "max_turns"
   },

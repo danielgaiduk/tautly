@@ -59,6 +59,14 @@ fn normalized(out: &str, fx: &Fx) -> String {
                 ev[key] = json!("[n]");
             }
         }
+        if ev["type"] == "turn_receipt" {
+            ev["wall_ms"] = json!("[ms]");
+            if ev["estimated"] == true {
+                for key in ["tokens_in", "tokens_out"] {
+                    ev[key] = json!("[n]");
+                }
+            }
+        }
         if ev["type"] == "context_status" {
             for key in ["used", "budget", "breakdown"] {
                 ev[key] = json!("[n]");

@@ -285,6 +285,7 @@ async fn text_only_turn_completes() {
             "text_delta",
             "usage",
             "context_status",
+            "turn_receipt",
             "turn_finished"
         ],
         "{events:?}"
@@ -1823,11 +1824,12 @@ async fn a_reader_stalled_after_cancel_still_gets_turn_finished() {
     tokio::time::sleep(Duration::from_secs(2)).await;
     let events = run.until(|e| matches!(e, Event::TurnFinished { .. })).await;
     assert_eq!(finish_reason(&events), FinishReason::Cancelled);
-    // The drops are announced right before it.
+    // The drops are announced right before the turn's receipt, which precedes it.
     let n = events.len();
     assert!(
-        matches!(&events[n - 2], Event::Warning { message } if message.contains("dropped")),
+        matches!(&events[n - 3], Event::Warning { message } if message.contains("dropped"))
+            && matches!(&events[n - 2], Event::TurnReceipt { .. }),
         "{:?}",
-        &events[n.saturating_sub(3)..]
+        &events[n.saturating_sub(4)..]
     );
 }

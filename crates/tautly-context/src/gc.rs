@@ -35,6 +35,12 @@ fn stub(turn: u32) -> String {
     format!("{STUB_PREFIX}{turn}]")
 }
 
+/// Whether a tool result's `output` is a stub [`Context::collect`] left in place of an
+/// elided result.
+pub fn is_elided_stub(output: &str) -> bool {
+    output.starts_with(STUB_PREFIX)
+}
+
 /// What [`Context::collect`] removed, enough to undo it with [`Context::restore_gc`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GcRecord {

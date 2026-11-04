@@ -11,7 +11,8 @@ use crate::cap::{OUTPUT_CAP, cap_text};
 use crate::reread::small_diff;
 use crate::spec::{decode_text, parse_args, tool_spec};
 use crate::{
-    AppliedEffect, LineRange, MAX_READ_LINES, PrevRead, Shown, Tool, ToolCx, ToolError, ToolResult,
+    AppliedEffect, LineRange, MAX_READ_LINES, PrevRead, SaveKind, Saved, Shown, Tool, ToolCx,
+    ToolError, ToolResult,
 };
 
 /// Most targets in one batched read.
@@ -95,6 +96,10 @@ struct Lines {
     pending: Option<Pending>,
     /// How the lines were shown, unless the output cap cuts them.
     shown: Shown,
+    /// Bytes of the whole file, and of the selected lines (terminators included): what a
+    /// plain read would have returned, for the savings estimate (spec 7.11.1).
+    file_bytes: usize,
+    range_bytes: usize,
 }
 
 /// What the tracker records for a read, committed only if the model gets all of the output.
@@ -117,6 +122,17 @@ impl Lines {
     fn commit(&self, cx: &ToolCx) {
         if let Some(Pending(prev)) = &self.pending {
             cx.reads().supersede(&self.full, self.range, prev.clone());
+        }
+    }
+
+    /// What a re-read answered `unchanged` or with a diff saved: a full read of the range
+    /// minus the `returned` bytes. `None` for any other read, or one the cap cut.
+    fn diff_saving(&self, cut: bool, returned: usize) -> Option<Saved> {
+        match self.shown {
+            Shown::Unchanged { .. } | Shown::Diff { .. } if !cut => {
+                Saved::of(SaveKind::DiffRead, self.range_bytes, returned)
+            }
+            _ => None,
         }
     }
 
@@ -196,6 +212,15 @@ async fn read_lines(
         &[]
     };
     let content = shown.join("\n");
+    let range_bytes = if end >= start {
+        text.split_inclusive('\n')
+            .skip(start - 1)
+            .take(end + 1 - start)
+            .map(str::len)
+            .sum()
+    } else {
+        0
+    };
     let hashline = cx.edit_format() == EditFormat::Hashline;
     let mut text = shown
         .iter()
@@ -279,6 +304,8 @@ async fn read_lines(
         text,
         pending,
         shown: how,
+        file_bytes: bytes.len(),
+        range_bytes,
     })
 }
 
@@ -309,6 +336,8 @@ struct Section {
     header: String,
     /// The read lines, or the reason this target could not be read.
     body: Result<Lines, String>,
+    /// A symbol target: the index found the lines, so the saving is the whole file's.
+    symbol: bool,
 }
 
 async fn read_target(target: &Target, force_full: bool, sb: &dyn Sandbox, cx: &ToolCx) -> Section {
@@ -323,6 +352,7 @@ async fn read_target(target: &Target, force_full: bool, sb: &dyn Sandbox, cx: &T
             Section {
                 header: format!("== {header} =="),
                 body,
+                symbol: false,
             }
         }
         Target::Symbol(t) => symbol_section(t, force_full, sb, cx).await,
@@ -338,6 +368,7 @@ async fn symbol_section(
     let mut section = Section {
         header: format!("== symbol {} ==", t.symbol),
         body: Err(String::new()),
+        symbol: true,
     };
     let Some(index) = cx.index().filter(|i| i.is_ready()) else {
         section.body = Err(
@@ -405,8 +436,9 @@ impl Section {
 /// sections get their full size, and what is left is split evenly among the larger ones,
 /// so the result does not depend on the order of the targets.
 ///
-/// Also returns, per section, whether its body was cut by the cap.
-fn assemble(sections: &[Section]) -> (String, Vec<bool>) {
+/// Also returns, per section, whether its body was cut by the cap and how many bytes of
+/// the output it took (header and body, without separators).
+fn assemble(sections: &[Section]) -> (String, Vec<(bool, usize)>) {
     const SEPARATOR: &str = "\n\n";
     let full: Vec<String> = sections.iter().map(|s| s.body_text(usize::MAX)).collect();
     let size = |i: usize| sections[i].header.len() + 1 + full[i].len();
@@ -425,15 +457,16 @@ fn assemble(sections: &[Section]) -> (String, Vec<bool>) {
         if i > 0 {
             out.push_str(SEPARATOR);
         }
+        let from = out.len();
         out.push_str(&section.header);
         out.push('\n');
-        cut.push(size(i) > allowed[i]);
         if size(i) <= allowed[i] {
             out.push_str(&full[i]);
         } else {
             let cap = allowed[i].saturating_sub(section.header.len() + 1 + NOTE_ALLOWANCE);
             out.push_str(&section.body_text(cap));
         }
+        cut.push((size(i) > allowed[i], out.len() - from));
     }
     (out, cut)
 }
@@ -514,6 +547,7 @@ impl Tool for ReadTool {
                             lines.commit(cx);
                         }
                         let mut r = ToolResult::ok(output);
+                        r.meta.saved = lines.diff_saving(truncated, r.output.len());
                         r.effects.push(lines.effect(truncated));
                         r
                     }
@@ -557,9 +591,9 @@ async fn read_batch(
     if cx.cancel().is_cancelled() {
         return ToolResult::error("cancelled");
     }
-    let (output, cut) = assemble(&sections);
+    let (output, emitted) = assemble(&sections);
     // Baselines are committed only now that the output is about to be returned.
-    for (section, cut) in sections.iter().zip(&cut) {
+    for (section, (cut, _)) in sections.iter().zip(&emitted) {
         if let Ok(lines) = &section.body {
             if *cut {
                 cx.reads().forget(&lines.full, lines.range);
@@ -573,10 +607,41 @@ async fn read_batch(
     } else {
         ToolResult::ok(output)
     };
-    for (section, cut) in sections.iter().zip(&cut) {
+    for (section, (cut, _)) in sections.iter().zip(&emitted) {
         if let Ok(lines) = &section.body {
             result.effects.push(lines.effect(*cut));
         }
     }
+    result.meta.saved = batch_saving(&sections, &emitted);
     result
+}
+
+/// What a batched read saved: each symbol target its whole file minus its section, each
+/// re-read path target answered `unchanged` or with a diff its range minus its section.
+/// `ToolMeta` holds one kind, so a batch that saved both reports the larger, which never
+/// overstates the estimate.
+fn batch_saving(sections: &[Section], emitted: &[(bool, usize)]) -> Option<Saved> {
+    let (mut index, mut diff_reads) = (0u32, 0u32);
+    for (section, &(cut, returned)) in sections.iter().zip(emitted) {
+        let Ok(lines) = &section.body else { continue };
+        let saved = if section.symbol {
+            Saved::of(SaveKind::Index, lines.file_bytes, returned)
+        } else {
+            lines.diff_saving(cut, returned)
+        };
+        match saved {
+            Some(Saved {
+                kind: SaveKind::Index,
+                bytes,
+            }) => index = index.saturating_add(bytes),
+            Some(Saved { bytes, .. }) => diff_reads = diff_reads.saturating_add(bytes),
+            None => {}
+        }
+    }
+    let (kind, bytes) = if index >= diff_reads {
+        (SaveKind::Index, index)
+    } else {
+        (SaveKind::DiffRead, diff_reads)
+    };
+    (bytes > 0).then_some(Saved { kind, bytes })
 }

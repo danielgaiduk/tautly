@@ -203,6 +203,69 @@ fn session_totals_use_an_index_new_ledgers_and_migrated_ones_alike() {
 }
 
 #[test]
+fn a_v3_ledger_migrates_to_receipts_and_reopens() {
+    use tautly_core::{Event, Savings};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("v3.sqlite");
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE usage (id INTEGER PRIMARY KEY, at_ms INTEGER NOT NULL, \
+             session TEXT NOT NULL, model TEXT NOT NULL, input INTEGER NOT NULL, \
+             output INTEGER NOT NULL, cache_read INTEGER NOT NULL, \
+             cache_write INTEGER NOT NULL, cost_usd REAL, \
+             estimated INTEGER NOT NULL DEFAULT 0); \
+             CREATE INDEX usage_at ON usage(at_ms); \
+             CREATE INDEX usage_session ON usage(session); \
+             INSERT INTO usage VALUES (1, 1, 's', 'm', 10, 2, 0, 0, 0.5, 0); \
+             PRAGMA user_version = 3;",
+        )
+        .unwrap();
+    }
+    let receipt = Event::TurnReceipt {
+        turn: 1,
+        model: ModelId::from("m"),
+        tokens_in: 10,
+        tokens_out: 2,
+        cache_read: 0,
+        cache_write: 0,
+        side_tokens: 0,
+        cost_usd: Some(0.5),
+        wall_ms: 7,
+        cache_hit_ratio: None,
+        steps: 1,
+        tool_calls: 0,
+        saved: Savings::default(),
+        estimated: false,
+    };
+    {
+        let ledger = Ledger::open(&path).unwrap();
+        assert_eq!(
+            ledger.session_totals("s").unwrap().input,
+            10,
+            "old rows survive"
+        );
+        ledger
+            .record_receipt("s", "p", dir.path(), &receipt)
+            .unwrap();
+    }
+    let version: i64 = rusqlite::Connection::open(&path)
+        .unwrap()
+        .pragma_query_value(None, "user_version", |r| r.get(0))
+        .unwrap();
+    assert_eq!(version, 4);
+    // Reopening migrates nothing again and keeps both tables' rows.
+    let ledger = Ledger::open(&path).unwrap();
+    let rows = ledger.session_receipts("s").unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        (rows[0].turn, rows[0].wall_ms, rows[0].project.as_str()),
+        (1, 7, "p")
+    );
+    assert_eq!(ledger.session_totals("s").unwrap().requests, 1);
+}
+
+#[test]
 fn the_ledger_file_is_private() {
     use std::os::unix::fs::PermissionsExt;
     let dir = tempfile::tempdir().unwrap();

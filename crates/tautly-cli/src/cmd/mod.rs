@@ -1,4 +1,5 @@
-//! The utility commands (`tautly prompt|sessions|models|undo|memory|index|mcp ...`): each
+//! The utility commands (`tautly prompt|sessions|models|undo|memory|index|mcp|stats|receipt
+//! ...`): each
 //! reads or changes what a session leaves behind, in the work tree of the current
 //! directory, without a model turn (`memory consolidate` aside).
 //!
@@ -12,7 +13,9 @@ mod mcp;
 mod memory;
 mod models;
 mod prompt;
+mod receipt;
 mod sessions;
+mod stats;
 mod undo;
 
 use std::path::{Path, PathBuf};
@@ -59,6 +62,10 @@ pub enum Command {
         #[command(subcommand)]
         cmd: mcp::Cmd,
     },
+    /// Spend and savings estimates from the cost ledger, by day, model or project.
+    Stats(stats::Args),
+    /// One session's turns, spend and savings estimates (the latest by default).
+    Receipt(receipt::Args),
 }
 
 /// Run `command`; the exit code.
@@ -72,6 +79,8 @@ pub async fn run(command: Command, cli: &Cli) -> anyhow::Result<i32> {
         Command::Memory { cmd } => memory::run(cmd, &env, cli).await,
         Command::Index { cmd } => index::run(cmd, &env).await,
         Command::Mcp { cmd } => mcp::run(cmd, &env).await,
+        Command::Stats(args) => stats::run(args, &env),
+        Command::Receipt(args) => receipt::run(args, &env),
     }
 }
 
@@ -153,6 +162,53 @@ fn utc(t: SystemTime) -> String {
     )
 }
 
+/// `n` with thousands separators: `12,345`.
+fn thousands(n: u64) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// A USD amount with four decimals (`-$0.0012` when negative), or `-` when unknown.
+fn usd(v: Option<f64>) -> String {
+    match v {
+        Some(v) if v < 0.0 => format!("-${:.4}", -v),
+        Some(v) => format!("${v:.4}"),
+        None => "-".to_string(),
+    }
+}
+
+/// A duration in milliseconds, short: `850ms`, `4.2s`, `3m05s`, `1h02m`.
+fn duration(ms: u64) -> String {
+    let secs = ms / 1000;
+    match secs {
+        0 => format!("{ms}ms"),
+        1..60 => format!("{:.1}s", ms as f64 / 1000.0),
+        60..3600 => format!("{}m{:02}s", secs / 60, secs % 60),
+        _ => format!("{}h{:02}m", secs / 3600, secs % 3600 / 60),
+    }
+}
+
+/// A ratio as a whole percentage, or `-`.
+fn percent(ratio: Option<f64>) -> String {
+    ratio.map_or_else(|| "-".to_string(), |r| format!("{:.0}%", r * 100.0))
+}
+
+/// The cost ledger, if one exists (a command that only reads it never creates it).
+fn open_ledger(env: &Env) -> anyhow::Result<Option<tautly_core::Ledger>> {
+    let path = env.data_home.join(tautly_core::ledger::LEDGER_FILE);
+    if !path.exists() {
+        return Ok(None);
+    }
+    Ok(Some(tautly_core::Ledger::open(&path)?))
+}
+
 /// `text` cut to `max` characters, with `…` when something was cut.
 fn cut(text: &str, max: usize) -> String {
     if text.chars().count() <= max {
@@ -182,6 +238,23 @@ mod tests {
             utc(UNIX_EPOCH + Duration::from_secs(1_709_164_800)),
             "2024-02-29 00:00"
         );
+    }
+
+    #[test]
+    fn numbers_money_and_durations_format_compactly() {
+        assert_eq!(thousands(0), "0");
+        assert_eq!(thousands(999), "999");
+        assert_eq!(thousands(1000), "1,000");
+        assert_eq!(thousands(1_234_567), "1,234,567");
+        assert_eq!(usd(Some(0.01234)), "$0.0123");
+        assert_eq!(usd(Some(-0.5)), "-$0.5000");
+        assert_eq!(usd(None), "-");
+        assert_eq!(duration(850), "850ms");
+        assert_eq!(duration(4_200), "4.2s");
+        assert_eq!(duration(185_000), "3m05s");
+        assert_eq!(duration(3_720_000), "1h02m");
+        assert_eq!(percent(Some(0.376)), "38%");
+        assert_eq!(percent(None), "-");
     }
 
     #[test]

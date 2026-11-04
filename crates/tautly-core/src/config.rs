@@ -120,6 +120,23 @@ pub struct Config {
     /// command line only).
     #[serde(default)]
     pub checkpoints: CheckpointConfig,
+    /// `[receipts]`: how turn receipts are shown (spec 7.11.1; user layer and command
+    /// line only).
+    #[serde(default)]
+    pub receipts: ReceiptsConfig,
+}
+
+/// `[receipts]` (spec 7.11.1): the REPL shows each turn's receipt as a footer line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct ReceiptsConfig {
+    pub footer: bool,
+}
+
+impl Default for ReceiptsConfig {
+    fn default() -> Self {
+        ReceiptsConfig { footer: true }
+    }
 }
 
 /// `[checkpoints]` (spec 7.11.11): snapshots of the work tree before every command and at
@@ -215,6 +232,7 @@ impl Default for Config {
             mcp: McpConfig::default(),
             project_mcp_servers: BTreeMap::new(),
             checkpoints: CheckpointConfig::default(),
+            receipts: ReceiptsConfig::default(),
         }
     }
 }
@@ -326,6 +344,8 @@ pub struct CliOverrides {
     pub approve_memory: Option<bool>,
     /// `--no-checkpoints` (`Some(false)`): sets `checkpoints.enabled`.
     pub checkpoints: Option<bool>,
+    /// Sets `receipts.footer`.
+    pub receipts_footer: Option<bool>,
 }
 
 /// Directory of the user config file: `TAUTLY_HOME` as is (tests), else
@@ -708,6 +728,8 @@ const USER_ONLY_KEYS: &[&str] = &[
     "evidence",
     // A repository could otherwise turn off what undoes its commands (spec 7.11.11).
     "checkpoints",
+    // How the user's own spend is shown is the user's choice (spec 7.11.1).
+    "receipts",
 ];
 
 /// Everything else a project file may set (some of it only to tighten).
@@ -1275,6 +1297,11 @@ fn cli_table(cli: &CliOverrides) -> Table {
         let mut checkpoints = Table::new();
         checkpoints.insert("enabled".into(), Value::Boolean(enabled));
         t.insert("checkpoints".into(), Value::Table(checkpoints));
+    }
+    if let Some(footer) = cli.receipts_footer {
+        let mut receipts = Table::new();
+        receipts.insert("footer".into(), Value::Boolean(footer));
+        t.insert("receipts".into(), Value::Table(receipts));
     }
     t
 }

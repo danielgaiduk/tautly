@@ -127,6 +127,46 @@ pub struct ToolMeta {
     /// by `bash` for recognized test tools, whatever the output's size).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub counts: Option<TestCounts>,
+    /// What this result saved against a plain harness with the same 30 KB output cap
+    /// (spec 7.11.1): an estimate the engine sums into the turn's receipt.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub saved: Option<Saved>,
+}
+
+/// Which mechanism a [`Saved`] estimate credits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SaveKind {
+    /// `outline`, `symbol` and symbol `read` targets: the whole file was not returned.
+    Index,
+    /// A re-read answered `unchanged` or with a diff (spec 7.2).
+    DiffRead,
+    /// A command's output was summarized by an output filter (spec 7.3).
+    Filter,
+    /// A kind this version does not know (read back from a newer log): counted nowhere.
+    #[serde(other)]
+    Unknown,
+}
+
+/// Bytes one result saved: what a plain harness would have returned (capped at 30 KB)
+/// minus what was returned. `bytes` is never above the cap, so a `u32` holds it (and keeps
+/// `ToolResult`, the error type of many helpers, small).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Saved {
+    pub kind: SaveKind,
+    pub bytes: u32,
+}
+
+impl Saved {
+    /// `counterfactual` bytes, capped at the output cap, minus `returned`; `None` when
+    /// that saves nothing.
+    pub(crate) fn of(kind: SaveKind, counterfactual: usize, returned: usize) -> Option<Saved> {
+        let bytes = counterfactual.min(cap::OUTPUT_CAP).saturating_sub(returned);
+        (bytes > 0).then_some(Saved {
+            kind,
+            bytes: u32::try_from(bytes).unwrap_or(u32::MAX),
+        })
+    }
 }
 
 /// What a test tool's output said: tests passed, and tests failed or errored (a crashed

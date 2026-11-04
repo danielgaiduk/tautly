@@ -20,6 +20,7 @@ mod memory;
 mod model_switch;
 pub mod protocol;
 mod provider_setup;
+pub mod receipt;
 pub mod record;
 pub mod resume;
 pub mod routing;
@@ -35,14 +36,14 @@ pub use budget::{Budget, BudgetState};
 pub use checkpoint::{CheckpointError, CheckpointRef, Checkpointer, RestorePlan, Skip};
 pub use config::{
     BudgetConfig, BudgetLimits, CheckpointConfig, CliOverrides, CompatEntry, Config, ConfigError,
-    LoadedConfig, MODELS_FILE, ProviderEntry, ProvidersConfig, RoutingConfig, TelemetryConfig,
-    config_home, parse_models_file,
+    LoadedConfig, MODELS_FILE, ProviderEntry, ProvidersConfig, ReceiptsConfig, RoutingConfig,
+    TelemetryConfig, config_home, parse_models_file,
 };
 pub use engine::{Engine, EngineBuilder, EngineError, session_root};
 pub use evidence::{
     DEFAULT_TEST_COMMANDS, EvidenceConfig, EvidenceTracker, TestEvidence, TestMatcher,
 };
-pub use ledger::{Ledger, LedgerError, Totals};
+pub use ledger::{GroupBy, Ledger, LedgerError, StatsRow, StoredReceipt, Totals};
 pub use mcp::{
     Approval, McpPlan, NoPreExec, PlannedServer, PreExecHook, plan_servers, provider_key_vars,
 };
@@ -53,6 +54,7 @@ pub use protocol::{
 pub use provider_setup::{
     ProviderFactory, ProviderSetupError, known_provider, provider_for_with, provider_label,
 };
+pub use receipt::{ReceiptBuilder, Savings};
 pub use record::SessionRecord;
 pub use signals::{Signal, SignalPolicy, SignalRouter, handle_signals, install_signal_handlers};
 pub use workspace::{IndexLockError, Workspace, Workspaces};
@@ -60,7 +62,7 @@ pub use workspace::{IndexLockError, Workspace, Workspaces};
 pub use tautly_context::{Breakdown, MutationReason};
 pub use tautly_mcp::{McpConfig, ServerSource, ServerSpec};
 pub use tautly_memory::{MemAnchor, MemoryChange, MemoryEntry};
-pub use tautly_provider::{ModelId, ProviderEvent, Quota};
+pub use tautly_provider::{ModelId, ProviderEvent, Quota, RawUsage};
 // What a client needs to fill `CliOverrides` and to find the data directory.
 pub use tautly_sandbox::Mode;
 pub use tautly_session::paths::data_home;

@@ -125,6 +125,9 @@ pub struct Rebuilt {
     pub(crate) memory_seq: u32,
     /// The git checkpoints the log names.
     pub(crate) checkpoints: LoggedCheckpoints,
+    /// Each replayed collection: the call ids it elided and the tokens it freed (what
+    /// `Session::gc_elided` holds live), so receipts keep crediting them (spec 7.11.1).
+    pub(crate) gc_elided: Vec<(Vec<String>, u32)>,
 }
 
 /// The checkpoints of a log (spec 7.11.11), for the checkpointer that continues it.
@@ -216,6 +219,7 @@ pub(crate) fn rebuild_with(
             start_pins: false,
             memory_proposals: Vec::new(),
             memory_seq: 0,
+            gc_elided: Vec::new(),
         },
         root,
         step: None,
@@ -527,7 +531,15 @@ impl Replay<'_> {
     /// An epoch, set-up or user record that changes the context.
     fn mutation(&mut self, rec: SessionRecord) {
         match rec {
-            SessionRecord::GcApplied { elided, .. } => {
+            SessionRecord::GcApplied {
+                elided,
+                tokens_freed,
+                ..
+            } => {
+                self.out.gc_elided.push((
+                    elided.iter().map(|(id, _)| id.clone()).collect(),
+                    tokens_freed,
+                ));
                 let unknown = self.ctx().reapply_gc(&elided);
                 if unknown > 0 {
                     self.warn(format!(
@@ -1019,6 +1031,8 @@ impl Session {
         self.context = context;
         self.ledger = r.attempts;
         self.latest_compaction = r.latest_compaction;
+        // Replaced, not extended: a fork or rewind continues its own log's collections.
+        self.gc_elided = r.gc_elided;
         self.user_turn = r.turn_count;
         self.prefix_log = PrefixLog::default();
         if let Some(p) = r.prefix.clone() {

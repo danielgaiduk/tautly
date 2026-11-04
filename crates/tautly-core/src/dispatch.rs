@@ -620,6 +620,9 @@ impl Session {
             result.is_error,
             turn,
         );
+        if ran && let Some(r) = &mut self.receipt {
+            r.tool(&result.meta);
+        }
         let event = Event::ToolFinished {
             call_id: call.id.clone(),
             tool: call.name.clone(),

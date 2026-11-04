@@ -7,7 +7,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 use tautly_session::{BlobRef, ConfineError, RelPath};
 
-use crate::{AppliedEffect, LineRange, Shown, TestCounts, ToolMeta};
+use crate::{AppliedEffect, LineRange, Saved, Shown, TestCounts, ToolMeta};
 
 /// `#[serde(with = "...")]` for a `blake3::Hash`: a 64-digit lowercase hex string.
 pub(crate) mod hash_hex {
@@ -94,6 +94,8 @@ struct MetaRepr {
     error_kind: Option<String>,
     #[serde(default)]
     counts: Option<TestCounts>,
+    #[serde(default)]
+    saved: Option<Saved>,
 }
 
 impl<'de> Deserialize<'de> for ToolMeta {
@@ -109,6 +111,7 @@ impl<'de> Deserialize<'de> for ToolMeta {
                     .unwrap_or(UNKNOWN_KIND)
             }),
             counts: r.counts,
+            saved: r.saved,
         })
     }
 }

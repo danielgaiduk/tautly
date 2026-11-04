@@ -197,6 +197,8 @@ impl Cli {
             }),
             approve_memory: self.approve_memory.then_some(true),
             checkpoints: self.no_checkpoints.then_some(false),
+            // No flag yet: the REPL (Task 30) adds one for its receipt footer.
+            receipts_footer: None,
         }
     }
 

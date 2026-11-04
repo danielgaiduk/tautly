@@ -18,6 +18,7 @@
 //! always ends with `TurnEnd`. A context overflow reported by the provider triggers one
 //! compaction (`forced`) and one retry of the step (spec 6.4).
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::PoisonError;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -25,6 +26,7 @@ use std::time::{Duration, Instant};
 
 use futures::StreamExt;
 use tautly_context::compact::DEFAULT_KEEP_RECENT;
+use tautly_context::gc;
 use tautly_context::schedule::{self, MutationReason};
 use tautly_context::{CompactError, ContextStatus, GcRecord, TokenEstimator, Turn};
 use tautly_provider::{
@@ -37,11 +39,12 @@ use tokio_util::sync::CancellationToken;
 
 use crate::approvals::Approvals;
 use crate::checkpoint::Point;
-use crate::ledger::Row;
+use crate::ledger::{ReceiptRow, Row};
 use crate::memory::OVER_BUDGET_WARNING;
 use crate::model_switch::rejects_reasoning;
 use crate::protocol::{BudgetScope, Command, ErrorKind, Event, FinishReason, UsageRole};
 use crate::provider_setup::provider_label;
+use crate::receipt::ReceiptBuilder;
 use crate::record::{CheckpointPoint, SessionRecord};
 use crate::routing::{Side, model_failed};
 use crate::session::Session;
@@ -299,6 +302,11 @@ impl Session {
             text: text.clone(),
         })
         .await;
+        self.receipt = Some(ReceiptBuilder::new(
+            self.user_turn,
+            self.model.clone(),
+            Instant::now(),
+        ));
         self.emit(Event::TurnStarted).await;
         // The tool set changes only here, so the turn's requests share one prefix.
         self.refresh_mcp_tools(&ctl.cancel).await;
@@ -343,7 +351,55 @@ impl Session {
         })
         .await;
         self.checkpoint().await;
+        self.emit_receipt().await;
         self.emit(Event::TurnFinished { reason, evidence }).await;
+    }
+
+    /// The running turn's receipt, priced at the main model's price: queued for the cost
+    /// ledger, then shown (spec 7.11.1).
+    async fn emit_receipt(&mut self) {
+        let Some(builder) = self.receipt.take() else {
+            return;
+        };
+        let receipt = builder.finish(self.info.price.as_ref(), Instant::now());
+        let row = ReceiptRow {
+            session: self.session_id.clone(),
+            root: self.root().to_path_buf(),
+            receipt: receipt.clone(),
+        };
+        if let Err(why) = self.cost_ledger.record_receipt(row) {
+            self.ledger_row_lost(why).await;
+        }
+        self.emit(receipt).await;
+    }
+
+    /// Tokens the session's collections elided that are still out of the context: those
+    /// of results still in the history as stubs (a compaction removes results, an
+    /// `Uncompact` restores them).
+    fn elided_out_of_context(&self) -> u64 {
+        let stubs: HashSet<&str> = self
+            .context
+            .history
+            .iter()
+            .flat_map(|t| &t.messages)
+            .flat_map(|m| &m.content)
+            .filter_map(|c| match c {
+                Content::ToolResult { id, output, .. } if gc::is_elided_stub(output) => {
+                    Some(id.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        self.gc_elided
+            .iter()
+            .map(|(ids, freed)| {
+                let out = ids.iter().filter(|id| stubs.contains(id.as_str())).count();
+                // A collection's tokens, in the share of its results still elided.
+                (u64::from(*freed) * out as u64)
+                    .checked_div(ids.len() as u64)
+                    .unwrap_or(0)
+            })
+            .sum()
     }
 
     async fn steps(&mut self, ctl: &mut TurnControl) -> FinishReason {
@@ -381,6 +437,10 @@ impl Session {
             }
             let turn = self.context.next_turn();
             self.log_request(&req, turn).await;
+            let elided = self.elided_out_of_context();
+            if let Some(r) = &mut self.receipt {
+                r.request(turn, elided);
+            }
             let sent_at = Instant::now();
             let retry_without_reasoning = std::mem::take(&mut self.reasoning_retry);
             let resp = match self.stream(req, u64::from(status.used), ctl).await {
@@ -660,6 +720,10 @@ impl Session {
 
     /// Log and announce a collection, and forget the read baselines it took away.
     pub(crate) async fn collected(&mut self, rec: GcRecord) {
+        self.gc_elided.push((
+            rec.elided.iter().map(|e| e.call_id.clone()).collect(),
+            rec.tokens_freed,
+        ));
         for p in &rec.forgotten_paths {
             self.reads.forget_path(p);
         }
@@ -928,6 +992,14 @@ impl Session {
             .await;
         }
         let cost = cost_usd(&u, price);
+        // Usage outside a user turn (a consolidation between turns) is on no receipt; the
+        // ledger's usage rows still count it.
+        if let Some(r) = &mut self.receipt {
+            r.usage(role, &u, cost);
+            if estimated {
+                r.estimated();
+            }
+        }
         // Queued for the background writer: never waits (not even on the cancel path).
         let row = Row {
             session: self.session_id.clone(),

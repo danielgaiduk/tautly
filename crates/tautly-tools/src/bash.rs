@@ -16,7 +16,7 @@ use crate::cap::{OUTPUT_CAP, cap_text};
 use crate::filters;
 use crate::procs::{GroupGuard, group_alive, killpg};
 use crate::spec::{parse_args, tool_spec};
-use crate::{AppliedEffect, TestCounts, Tool, ToolCx, ToolError, ToolResult};
+use crate::{AppliedEffect, SaveKind, Saved, TestCounts, Tool, ToolCx, ToolError, ToolResult};
 
 const DEFAULT_TIMEOUT_S: u64 = 120;
 const MAX_TIMEOUT_S: u64 = 600;
@@ -410,6 +410,7 @@ impl Tool for BashTool {
         } else {
             filtered_output(summary.as_ref(), &full, exit_code, sb).await
         };
+        let was_filtered = filtered.is_some();
         // A summary already names the spilled file; otherwise the cap spills when it cuts.
         let (mut text, spilled) = match filtered {
             Some(summary) => (summary, None),
@@ -423,6 +424,10 @@ impl Tool for BashTool {
         }
         text.push_str(&trailer);
         let mut r = ToolResult::ok(text);
+        // A plain harness would have returned the capped raw output (spec 7.11.1).
+        if was_filtered {
+            r.meta.saved = Saved::of(SaveKind::Filter, full.len(), r.output.len());
+        }
         r.is_error = is_error;
         r.meta.exit_code = exit_code;
         r.meta.counts = summary

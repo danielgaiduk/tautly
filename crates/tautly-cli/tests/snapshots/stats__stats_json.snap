@@ -1,0 +1,46 @@
+---
+source: crates/tautly-cli/tests/stats.rs
+expression: "serde_json::to_string_pretty(&v).unwrap()"
+---
+{
+  "by": "model",
+  "rows": [
+    {
+      "cache_hit_ratio": 0.125,
+      "cost_usd": 0.105,
+      "estimated": 0,
+      "key": "m/a",
+      "saved_tokens": 464,
+      "saved_usd": 0.025,
+      "tokens": 13050,
+      "turns": 2,
+      "unpriced": 0,
+      "wall_ms": 11000
+    },
+    {
+      "cache_hit_ratio": 0.0,
+      "cost_usd": 0.02,
+      "estimated": 0,
+      "key": "m/b",
+      "saved_tokens": 15,
+      "saved_usd": null,
+      "tokens": 2200,
+      "turns": 2,
+      "unpriced": 0,
+      "wall_ms": 3500
+    },
+    {
+      "cache_hit_ratio": 0.0,
+      "cost_usd": null,
+      "estimated": 1,
+      "key": "m/small",
+      "saved_tokens": 0,
+      "saved_usd": null,
+      "tokens": 330,
+      "turns": 0,
+      "unpriced": 1,
+      "wall_ms": 0
+    }
+  ],
+  "since": "all"
+}

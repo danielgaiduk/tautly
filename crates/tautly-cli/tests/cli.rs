@@ -146,7 +146,7 @@ fn help_lists_the_commands() {
         .and_then(|rest| rest.split("\n\n").next())
         .unwrap_or_default();
     for command in [
-        "prompt", "sessions", "models", "undo", "memory", "index", "mcp",
+        "prompt", "sessions", "models", "undo", "memory", "index", "mcp", "stats", "receipt",
     ] {
         assert!(
             commands
