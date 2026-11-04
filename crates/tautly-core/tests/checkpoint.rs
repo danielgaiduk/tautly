@@ -1921,8 +1921,9 @@ async fn spill_store_never_enters_a_checkpoint() {
 
 /// Review B-M3, probe P4: a repository `include.path` naming a FIFO blocks every git
 /// call. The configuration read gives up within its own cap (not the operation's
-/// deadline), and checkpoints are then off for the session with one warning, so later
-/// commands do not each wait out the timeout.
+/// deadline). The first time is an ordinary timeout (a slow network filesystem may
+/// recover, review N6); the second in a row turns checkpoints off for the session, so
+/// later commands do not each wait out the timeout.
 #[tokio::test]
 async fn config_include_that_never_ends_turns_checkpoints_off_once() {
     let repo = Repo::with(&[("a.txt", "a\n")]);
@@ -1936,9 +1937,10 @@ async fn config_include_that_never_ends_turns_checkpoints_off_once() {
 
     let mut cp = repo.checkpointer(CheckpointConfig::default());
     let began = Instant::now();
+    assert_eq!(cp.snapshot_now().await, Err(Skip::Timeout));
     assert_eq!(cp.snapshot_now().await, Err(Skip::ConfigTimeout));
     assert!(
-        began.elapsed() < Duration::from_millis(2900),
+        began.elapsed() < Duration::from_millis(5000),
         "{:?}",
         began.elapsed()
     );
@@ -1959,7 +1961,13 @@ async fn config_include_that_never_ends_turns_checkpoints_off_once() {
         .into_iter()
         .filter(|w| w.starts_with("checkpoint skipped"))
         .collect();
-    assert_eq!(skipped, [skip_warning(&Skip::ConfigTimeout)]);
+    assert_eq!(
+        skipped,
+        [
+            skip_warning(&Skip::Timeout),
+            skip_warning(&Skip::ConfigTimeout)
+        ]
+    );
     let reasons: Vec<String> = records_at(&path)
         .into_iter()
         .filter_map(|r| match r {
@@ -1967,9 +1975,12 @@ async fn config_include_that_never_ends_turns_checkpoints_off_once() {
             _ => None,
         })
         .collect();
-    assert_eq!(reasons, ["config_timeout"]);
-    // Three commands and a turn end did not each wait for git.
-    assert!(elapsed < Duration::from_secs(8), "{elapsed:?}");
+    assert_eq!(reasons, ["timeout", "config_timeout"]);
+    // Three commands and a turn end did not each wait for git: about 2 s each for the
+    // engine-start prune, the session-start checkpoint and the first command (with the old
+    // per-snapshot timeout it was 3 s for each of the five checkpoints, plus 60 s of prune).
+    assert!(elapsed < Duration::from_secs(13), "{elapsed:?}");
+
     assert!(!repo.path(".git/refs/tautly").exists());
 }
 

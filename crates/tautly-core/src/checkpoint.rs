@@ -128,8 +128,8 @@ pub enum Skip {
     #[error("the work tree's .git is a symbolic link (checkpoints are off for this session)")]
     GitDirSymlink,
     /// Reading the repository's git configuration did not finish in
-    /// [`CONFIG_READ_TIMEOUT`]: an include that never ends (a FIFO), which every later git
-    /// call would wait on too.
+    /// [`CONFIG_READ_TIMEOUT`] for the second snapshot in a row: an include that never ends
+    /// (a FIFO), which every later git call would wait on too.
     #[error(
         "reading the repository's git configuration took too long (an include that never \
          ends?); checkpoints are off for this session"
@@ -1060,6 +1060,8 @@ pub struct Checkpointer {
     /// Where each checkpoint's exclude rules are kept (none: not kept, and undo uses the
     /// rules as they are then).
     excludes: Option<ExcludesStore>,
+    /// Snapshots in a row whose configuration read ran out of [`CONFIG_READ_TIMEOUT`].
+    config_timeouts: u32,
 }
 
 impl Checkpointer {
@@ -1094,6 +1096,7 @@ impl Checkpointer {
             last: None,
             version: GitVersion::new(),
             excludes: None,
+            config_timeouts: 0,
         })
     }
 
@@ -1271,7 +1274,28 @@ impl Checkpointer {
         Instant::now() + HOUSEKEEPING_TIMEOUT
     }
 
+    /// [`Checkpointer::take_once`], with a configuration read that runs out of its cap
+    /// counted: the first time is an ordinary [`Skip::Timeout`] (a slow network or synced
+    /// filesystem may recover), the second in a row [`Skip::ConfigTimeout`], which turns
+    /// checkpoints off for the session.
     async fn take(&mut self, backup: bool) -> Result<CheckpointRef, Skip> {
+        match self.take_once(backup).await {
+            Err(Skip::ConfigTimeout) => {
+                self.config_timeouts += 1;
+                Err(if self.config_timeouts >= 2 {
+                    Skip::ConfigTimeout
+                } else {
+                    Skip::Timeout
+                })
+            }
+            other => {
+                self.config_timeouts = 0;
+                other
+            }
+        }
+    }
+
+    async fn take_once(&mut self, backup: bool) -> Result<CheckpointRef, Skip> {
         let deadline = self.deadline();
         let now = self.tree_now(true, deadline).await?;
         // The same tree, kept with the same exclude rules (which undo reads back).

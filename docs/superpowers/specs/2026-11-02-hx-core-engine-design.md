@@ -604,7 +604,7 @@ At each directory level where `AGENTS.md` is read (root and ancestors, 6.1), a d
 - **Bounds:** the checkpoint is skipped with a `Warning` (`checkpoint skipped: <reason>`; the session records `CheckpointSkipped`) when:
   - git is missing, or the tree is bare;
   - the snapshot takes longer than `timeout_ms` (3,000; git is killed);
-  - reading the repository's git configuration takes longer than 2 s, whatever the operation's deadline (an `include.path` naming a FIFO blocks every git call): checkpoints are then off for the session, with one warning (`config_timeout`), instead of every command waiting out `timeout_ms` and every restore 60 s;
+  - reading the repository's git configuration takes longer than 2 s, whatever the operation's deadline (an `include.path` naming a FIFO blocks every git call): the first time is an ordinary `timeout` skip (a slow network or synced filesystem may recover); the second snapshot in a row that runs out turns checkpoints off for the session, with one warning (`config_timeout`), instead of every command waiting out `timeout_ms` and every restore 60 s;
   - untracked files exceed `max_untracked_mb` (200) or `max_untracked_files` (20,000), checked with `git ls-files --others --exclude-standard` first.
 
   The session log records `Checkpoint{n, commit, tree, head?, dirty, turn, step}` (6.5).
