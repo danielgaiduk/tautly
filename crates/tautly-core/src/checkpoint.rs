@@ -2070,21 +2070,9 @@ fn plain_relative(p: &Path) -> bool {
 /// not resolved, so a shim that dispatches on its name still sees `git`.
 ///
 /// When `root` is a linked worktree (a fork's, a bisect's), entries inside the main work
-/// tree are skipped as well: they are what an in-repository toolchain on `PATH` (direnv's
-/// `PATH_add bin`, an activated `.venv/bin`) looks like (CP5 review I2).
+/// tree are skipped as well, by the same rule (CP5 review I2).
 pub(crate) fn git_on_path(root: &Path) -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    let main = tautly_session::git_dirs_at(&root.join(".git"))
-        .filter(|d| d.git_dir != d.common_dir)
-        .and_then(|d| d.common_dir.parent().map(Path::to_path_buf));
-    std::env::split_paths(&path).find_map(|dir| {
-        let entry = std::env::join_paths([&dir]).ok()?;
-        let git = tautly_sandbox::which_outside("git", &entry, root)?;
-        match &main {
-            Some(main) => tautly_sandbox::which_outside("git", &entry, main).map(|_| git),
-            None => Some(git),
-        }
-    })
+    tautly_sandbox::which_outside("git", &std::env::var_os("PATH")?, root)
 }
 
 /// Whether the root's `.git` is a symbolic link. Checkpoints are then not taken: they

@@ -8,7 +8,8 @@ use std::path::{Path, PathBuf};
 /// work tree at `root` cannot have put there. Skipped: an empty or relative entry (a
 /// program runs with the root as its working directory, so `bin` or an empty entry would
 /// name one the repository ships), an entry inside the root by name or once links are
-/// resolved, and a candidate whose resolved path is inside the root.
+/// resolved, and a candidate whose resolved path is inside the root. When the root is a
+/// linked worktree, "inside" also means inside its main work tree ([`main_work_tree`]).
 ///
 /// The candidate is returned as found (`<entry>/<name>`, links not resolved), so a
 /// multi-call shim that dispatches on its name (a `git` link to `mise`) keeps working;
@@ -27,7 +28,12 @@ pub fn which_outside_or_skipped(
     root: &Path,
 ) -> Result<PathBuf, Option<PathBuf>> {
     let real_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
-    let inside = |p: &Path| p.starts_with(root) || p.starts_with(&real_root);
+    let main = main_work_tree(root);
+    let inside = |p: &Path| {
+        p.starts_with(root)
+            || p.starts_with(&real_root)
+            || main.as_deref().is_some_and(|m| p.starts_with(m))
+    };
     let mut skipped = None;
     for dir in std::env::split_paths(path) {
         let candidate = dir.join(name);
@@ -53,6 +59,26 @@ pub fn which_outside_or_skipped(
         }
     }
     Err(skipped)
+}
+
+/// When `root` is a linked worktree (a fork's, a bisect's), its main work tree: its `.git`
+/// file names `<common>/worktrees/<name>`, whose `commondir` leads to `<common>`, the main
+/// tree's `.git`. Its PATH entries are an in-repository toolchain too (CP5 review I2). Read
+/// without following links and without verifying git's back-link: it only widens what is
+/// skipped.
+fn main_work_tree(root: &Path) -> Option<PathBuf> {
+    let small = |p: &Path| {
+        let m = std::fs::symlink_metadata(p).ok()?;
+        (m.is_file() && m.len() <= 4096)
+            .then(|| std::fs::read_to_string(p).ok())
+            .flatten()
+    };
+    let dot_git = small(&root.join(".git"))?;
+    let git_dir = root.join(dot_git.lines().next()?.strip_prefix("gitdir:")?.trim());
+    let common = small(&git_dir.join("commondir"))?;
+    let common = git_dir.join(common.trim()).canonicalize().ok()?;
+    // A bare or separate repository has no work tree around it (its parent may be `~`).
+    (common.file_name()? == ".git").then(|| common.parent().map(Path::to_path_buf))?
 }
 
 /// A regular file with an execute bit (links followed).
