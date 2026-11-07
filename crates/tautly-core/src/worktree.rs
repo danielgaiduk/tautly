@@ -533,11 +533,13 @@ fn fork_log(
     let model = fork.model.filter(|m| plan.cut.model.as_ref() != Some(m));
     let written = (|| {
         child.copy_from(reader.path(), plan.count)?;
-        child.append(&SessionRecord::Forked)?;
+        // Both are written for the copy, at its last record's time.
+        child.append_at_last(&SessionRecord::Forked)?;
         if plan.cut.incomplete_turn {
-            child.append(&SessionRecord::TurnEnd {
+            child.append_at_last(&SessionRecord::TurnEnd {
                 reason: crate::FinishReason::Cancelled,
                 evidence: None,
+                synthetic: true,
             })?;
         }
         for rec in &fork.tail {

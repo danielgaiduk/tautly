@@ -363,6 +363,7 @@ impl Session {
         self.log(SessionRecord::TurnEnd {
             reason,
             evidence: evidence.clone(),
+            synthetic: false,
         })
         .await;
         self.checkpoint().await;

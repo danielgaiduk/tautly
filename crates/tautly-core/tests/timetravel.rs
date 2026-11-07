@@ -2080,3 +2080,54 @@ async fn a_log_holding_a_null_replay_speed_resumes_forks_rewinds_and_compares() 
         tautly_core::compare::summarize_at(&reader(&log), None, &Catalog::default(), None).unwrap();
     assert_eq!(s.user_turns, 2);
 }
+
+// ------------------------------------------- cp5 review C M2: synthetic turn ends
+
+/// Each record line's `(type, t, data)`.
+fn typed_lines(path: &Path) -> Vec<(String, u64, Value)> {
+    raw_lines(path)[1..]
+        .iter()
+        .map(|l| {
+            let v: Value = serde_json::from_str(l).unwrap();
+            let ty = v["data"]["type"].as_str().unwrap().to_string();
+            (ty, v["t"].as_u64().unwrap(), v["data"]["data"].clone())
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn synthetic_turn_ends_are_marked_and_stamped_at_the_last_record() {
+    let repo = Repo::git_repo();
+    let mut run = unanswered(&repo, NoResponse::Crash).await;
+    let log = run.current().1;
+    // Answered once the resume (which closes the crashed turn) is done.
+    run.rewind(3, true, &[]).await.done();
+    let lines = typed_lines(&log);
+    let end = lines
+        .iter()
+        .position(|(ty, _, d)| ty == "turn_end" && d["synthetic"] == true)
+        .expect("the crashed turn's end");
+    assert_eq!(lines[end].2["reason"], "error");
+    assert_eq!(lines[end].0, "turn_end");
+    assert_eq!(lines[end - 1].0, "request", "{lines:?}");
+    assert_eq!(lines[end].1, lines[end - 1].1, "stamped at the last record");
+    // Real turn ends are not marked.
+    assert!(
+        lines[..end]
+            .iter()
+            .any(|(ty, _, d)| ty == "turn_end" && d.get("synthetic").is_none())
+    );
+
+    // A branch cut inside a turn: `Forked` and the closing end, at the copy's last time.
+    run.rewind(3, false, &[]).await.done();
+    let branch = typed_lines(&run.current().1);
+    let forked = branch.iter().position(|(ty, _, _)| ty == "forked").unwrap();
+    let (ty, t, d) = &branch[forked + 1];
+    assert_eq!(
+        (ty.as_str(), &d["reason"], &d["synthetic"]),
+        ("turn_end", &json!("cancelled"), &json!(true))
+    );
+    assert_eq!(*t, branch[forked - 1].1);
+    assert_eq!(branch[forked].1, branch[forked - 1].1);
+    run.stop().await;
+}

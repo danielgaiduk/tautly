@@ -255,6 +255,11 @@ pub enum SessionRecord {
         /// so a receipt on a resumed session can show it.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         evidence: Option<TestEvidence>,
+        /// Not the turn's own end: written for it afterwards, by a resume after a crash
+        /// (`error`) or a branch whose copy ends inside the turn (`cancelled`), stamped with
+        /// the time of the log's last record. Wall times leave it out.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        synthetic: bool,
     },
     /// A record type this version does not know (read only; never written).
     #[serde(skip)]
@@ -768,6 +773,7 @@ mod tests {
             SessionRecord::TurnEnd {
                 reason: FinishReason::Completed,
                 evidence: None,
+                synthetic: false,
             },
         ];
         for r in recs {
@@ -1091,6 +1097,7 @@ mod tests {
             SessionRecord::TurnEnd {
                 reason: FinishReason::Error,
                 evidence: None,
+                synthetic: false,
             },
         ];
         assert_eq!(all.len(), KNOWN_TYPES.len());

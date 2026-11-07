@@ -84,6 +84,7 @@ impl Scratch {
             SessionRecord::TurnEnd {
                 reason: FinishReason::Completed,
                 evidence: None,
+                synthetic: false,
             },
         ] {
             w.append(&r).unwrap();

@@ -606,6 +606,48 @@ async fn resume_restores_budget_spend_and_set_budget() {
     run.stop().await;
 }
 
+#[tokio::test]
+async fn resume_takes_the_larger_of_the_ledger_and_the_log() {
+    // cp5 review C M3: ledger rows lost at a crash (they are queued) must not let a
+    // resumed session overspend; the fsynced log holds them.
+    let fx = Fx::new();
+    let cfg = || config(Mode::Ask);
+    let mock = MockProvider::new((0..3).map(|_| text_step("ok")).collect());
+    let mut run = start(fx.builder(cfg(), &mock));
+    run.send(Command::SetBudget {
+        scope: BudgetScope::Session,
+        max_usd: None,
+        max_tokens: Some(500),
+    })
+    .await;
+    for i in 0..3 {
+        run.turn_with(&format!("turn {i}")).await;
+    }
+    let id = run.engine.session_id().to_string();
+    run.stop().await;
+    fx.ledger_rows(3).await;
+    // Two of the three rows were lost.
+    let db = rusqlite::Connection::open(fx.home.path().join("ledger.sqlite")).unwrap();
+    db.execute(
+        "DELETE FROM usage WHERE rowid IN (SELECT rowid FROM usage LIMIT 2)",
+        [],
+    )
+    .unwrap();
+    drop(db);
+    assert_eq!(fx.ledger().session_totals(&id).unwrap().tokens(), 110);
+
+    // 330 spent (the log), not 110: 110 more is past 80% of 500.
+    let mock = MockProvider::new(vec![text_step("ok")]);
+    let mut run = start(fx.resume(cfg(), &mock, &id));
+    let events = run.turn_with("turn 3").await;
+    let w = warnings(&events);
+    assert!(
+        w.iter().any(|w| w.contains("session budget 88% used")),
+        "{w:?}"
+    );
+    run.stop().await;
+}
+
 /// Review C M11: a cut at step N leaves out an undo done after it, as `state_at(N)` (the
 /// files before that undo) does: the rebuilt context is told nothing is stale.
 #[tokio::test]

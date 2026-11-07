@@ -90,6 +90,7 @@ impl Scratch {
         w.append(&SessionRecord::TurnEnd {
             reason: tautly_core::FinishReason::Completed,
             evidence,
+            synthetic: false,
         })
         .unwrap();
         w.checkpoint().unwrap();

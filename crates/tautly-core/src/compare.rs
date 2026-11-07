@@ -338,6 +338,8 @@ struct Tally {
     user_turns: u32,
     steps: BTreeSet<u32>,
     turn_start: Option<u64>,
+    /// The time of the last record counted, a synthetic turn end's excepted.
+    last_t: u64,
     wall_ms: u64,
     /// The open step's model and its response's latest (cumulative) usage.
     model: Option<ModelId>,
@@ -373,6 +375,7 @@ impl Tally {
             user_turns: 0,
             steps: BTreeSet::new(),
             turn_start: None,
+            last_t: 0,
             wall_ms: 0,
             model: None,
             response: None,
@@ -420,16 +423,31 @@ impl Tally {
     }
 
     fn see(&mut self, t_ms: u64, rec: &SessionRecord, wrote: Vec<WriteValue>) {
+        if !matches!(
+            rec,
+            SessionRecord::TurnEnd {
+                synthetic: true,
+                ..
+            }
+        ) {
+            self.last_t = self.last_t.max(t_ms);
+        }
         match rec {
             SessionRecord::TurnStart { .. } => {
                 self.close_response();
                 self.user_turns += 1;
                 self.turn_start = Some(t_ms);
             }
-            SessionRecord::TurnEnd { evidence, .. } => {
+            SessionRecord::TurnEnd {
+                evidence,
+                synthetic,
+                ..
+            } => {
                 self.close_response();
+                // A turn closed afterwards (a crash, a cut) ran until its last record.
+                let end = if *synthetic { self.last_t } else { t_ms };
                 if let Some(start) = self.turn_start.take() {
-                    self.wall_ms = self.wall_ms.saturating_add(t_ms.saturating_sub(start));
+                    self.wall_ms = self.wall_ms.saturating_add(end.saturating_sub(start));
                 }
                 if let Some(e) = evidence {
                     self.evidence = Some(e.clone());

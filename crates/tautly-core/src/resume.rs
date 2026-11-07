@@ -1020,9 +1020,10 @@ impl Session {
             let reader = SessionReader::<SessionRecord>::open(&path).map_err(err)?;
             let rebuilt = rebuild_with(&reader, None, Some(&calibration)).map_err(err)?;
             let closed = if rebuilt.incomplete_turn {
-                log.append(&SessionRecord::TurnEnd {
+                log.append_at_last(&SessionRecord::TurnEnd {
                     reason: FinishReason::Error,
                     evidence: None,
+                    synthetic: true,
                 })
                 .and_then(|()| log.checkpoint())
                 .err()
@@ -1135,9 +1136,9 @@ impl Session {
         self.restore_guard(resumed.seen).await;
     }
 
-    /// Count what the session spent before against its budgets: the cost ledger's rows of
-    /// this session (discarded attempts included), else the usage in the log, each priced
-    /// by the model it was spent on.
+    /// Count what the session spent before against its budgets: each figure the larger of
+    /// the cost ledger's rows of this session (discarded attempts included) and the usage
+    /// in the log, each priced by the model it was spent on.
     async fn restore_spend(&mut self, logged: Vec<(ModelId, RawUsage)>) {
         let path = self.data_home.join(LEDGER_FILE);
         let id = self.session_id.clone();
@@ -1145,16 +1146,27 @@ impl Session {
             Ledger::open(&path).and_then(|l| l.session_totals(&id))
         })
         .await;
-        let (usage, usd) = match totals {
-            Ok(Ok(t)) if t.requests > 0 || logged.is_empty() => (
-                RawUsage {
-                    input: t.input,
-                    output: t.output,
-                    cache_read: t.cache_read,
-                    cache_write: t.cache_write,
-                },
-                t.usd,
-            ),
+        let mut usage = RawUsage::default();
+        let mut usd = 0.0;
+        for (model, u) in &logged {
+            usage.input += u.input;
+            usage.output += u.output;
+            usage.cache_read += u.cache_read;
+            usage.cache_write += u.cache_write;
+            let price = self.setup.catalog.get(model).price;
+            usd += cost_usd(u, price.as_ref()).unwrap_or(0.0);
+        }
+        // Both are lower bounds: ledger rows are queued and may be lost at a crash (or
+        // with a ledger moved aside), and the log holds no discarded attempts of a
+        // response that broke off. Each figure is the larger (cp5 review C M3).
+        match totals {
+            Ok(Ok(t)) if t.requests > 0 || logged.is_empty() => {
+                usage.input = usage.input.max(t.input);
+                usage.output = usage.output.max(t.output);
+                usage.cache_read = usage.cache_read.max(t.cache_read);
+                usage.cache_write = usage.cache_write.max(t.cache_write);
+                usd = usd.max(t.usd);
+            }
             other => {
                 let why = match other {
                     Ok(Err(e)) => e.to_string(),
@@ -1166,19 +1178,8 @@ impl Session {
                      rebuilt from the session log"
                 ))
                 .await;
-                let mut sum = RawUsage::default();
-                let mut usd = 0.0;
-                for (model, u) in &logged {
-                    sum.input += u.input;
-                    sum.output += u.output;
-                    sum.cache_read += u.cache_read;
-                    sum.cache_write += u.cache_write;
-                    let price = self.setup.catalog.get(model).price;
-                    usd += cost_usd(u, price.as_ref()).unwrap_or(0.0);
-                }
-                (sum, usd)
             }
-        };
+        }
         let mut b = self.budgets.lock().unwrap_or_else(PoisonError::into_inner);
         b.spend(&usage, Some(usd));
         b.start_turn();
@@ -1524,11 +1525,13 @@ pub(crate) fn branch(
         SessionWriter::<SessionRecord>::create_in(data_home, root, init).map_err(err)?;
     let written = (|| {
         child.copy_from(parent, count)?;
-        child.append(&SessionRecord::Forked)?;
+        // Both are written for the copy, at its last record's time.
+        child.append_at_last(&SessionRecord::Forked)?;
         if close_turn {
-            child.append(&SessionRecord::TurnEnd {
+            child.append_at_last(&SessionRecord::TurnEnd {
                 reason: FinishReason::Cancelled,
                 evidence: None,
+                synthetic: true,
             })?;
         }
         for rec in &tail {
@@ -1605,6 +1608,7 @@ mod tests {
             all.push(SessionRecord::TurnEnd {
                 reason: FinishReason::Cancelled,
                 evidence: None,
+                synthetic: false,
             });
             all
         };
@@ -1662,6 +1666,7 @@ mod tests {
             all.push(SessionRecord::TurnEnd {
                 reason: FinishReason::Completed,
                 evidence: None,
+                synthetic: false,
             });
             all
         };

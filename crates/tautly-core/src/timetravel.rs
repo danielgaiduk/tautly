@@ -1151,9 +1151,10 @@ impl Session {
                     // A session that stopped mid-turn gets its missing `TurnEnd`, as on
                     // resume.
                     if r.incomplete_turn {
-                        writer.append(&SessionRecord::TurnEnd {
+                        writer.append_at_last(&SessionRecord::TurnEnd {
                             reason: FinishReason::Error,
                             evidence: None,
+                            synthetic: true,
                         })?;
                         writer.checkpoint()?;
                     }

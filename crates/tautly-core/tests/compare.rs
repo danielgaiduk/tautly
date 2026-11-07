@@ -139,6 +139,7 @@ impl Log {
             SessionRecord::TurnEnd {
                 reason: FinishReason::Completed,
                 evidence,
+                synthetic: false,
             },
         )
     }
@@ -602,6 +603,28 @@ fn cost_is_the_logged_usage_and_the_ledger_its_own_figure() {
 }
 
 #[test]
+fn a_synthetic_turn_end_adds_no_wall_time() {
+    // cp5 review C M2: a crashed turn closed at resume ran until its last record.
+    let h = Home::new();
+    let mut s = h.log(HeaderInit::default());
+    s.turn(1_000, 1, "go");
+    s.request(1_100, 1, 2, "m/a");
+    s.usage(1_250, 10, 1);
+    s.at(
+        90_000,
+        SessionRecord::TurnEnd {
+            reason: FinishReason::Error,
+            evidence: None,
+            synthetic: true,
+        },
+    );
+    s.turn(100_000, 2, "again");
+    s.end(100_500, None);
+    let s = s.done();
+    assert_eq!(sum(&s.reader(), None).wall_ms, 250 + 500);
+}
+
+#[test]
 fn ledger_is_not_used_for_a_range_that_is_not_the_sessions_own() {
     let h = Home::new();
     let (p, _) = parent(&h);
@@ -757,6 +780,7 @@ fn a_mid_turn_fork_counts_the_rest_of_the_parents_turn() {
         SessionRecord::TurnEnd {
             reason: FinishReason::Cancelled,
             evidence: None,
+            synthetic: false,
         },
     );
     e.turn(30_000, 2, "again");

@@ -225,9 +225,20 @@ impl<R: Serialize> SessionWriter<R> {
     /// Buffer one record, stamped with the current time (clamped so `t` never goes back);
     /// returns its 0-based offset.
     pub fn append(&mut self, rec: &R) -> Result<u64> {
+        let t = now_ms();
+        self.append_stamped(rec, t)
+    }
+
+    /// [`append`](Self::append), stamped with the previous record's time instead of now:
+    /// for a record written on behalf of the past (a synthetic turn end).
+    pub fn append_at_last(&mut self, rec: &R) -> Result<u64> {
+        self.append_stamped(rec, 0)
+    }
+
+    fn append_stamped(&mut self, rec: &R, t_ms: u64) -> Result<u64> {
         self.check_usable()?;
         let offset = self.next_offset;
-        let t = self.stamp(now_ms());
+        let t = self.stamp(t_ms);
         let line = encode(&LineRef::Record {
             offset,
             t,

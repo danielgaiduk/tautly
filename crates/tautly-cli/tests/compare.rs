@@ -132,6 +132,7 @@ impl Log {
             SessionRecord::TurnEnd {
                 reason: FinishReason::Completed,
                 evidence,
+                synthetic: false,
             },
         )
     }

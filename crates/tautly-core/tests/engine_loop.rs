@@ -715,7 +715,8 @@ async fn records_appended_before_events_visible() {
                     recs.last(),
                     Some(&SessionRecord::TurnEnd {
                         reason,
-                        evidence: None
+                        evidence: None,
+                        synthetic: false,
                     })
                 );
                 assert!(matches!(

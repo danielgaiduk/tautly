@@ -530,6 +530,7 @@ fn paced_log(fx: &Fx) -> String {
             SessionRecord::TurnEnd {
                 reason: tautly_core::FinishReason::Completed,
                 evidence: None,
+                synthetic: false,
             },
         ),
     ];
@@ -608,6 +609,7 @@ async fn speed_zero_is_instant() {
             SessionRecord::TurnEnd {
                 reason: tautly_core::FinishReason::Completed,
                 evidence: None,
+                synthetic: false,
             },
         ),
     ];
@@ -642,6 +644,7 @@ fn two_turns(fx: &Fx) -> (String, PathBuf) {
     let end = || SessionRecord::TurnEnd {
         reason: tautly_core::FinishReason::Completed,
         evidence: None,
+        synthetic: false,
     };
     let recs = vec![
         (
