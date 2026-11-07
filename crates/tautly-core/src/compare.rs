@@ -227,7 +227,7 @@ fn step_through(log: &Path, offset: u64) -> Option<u32> {
         }
         steps.see(&rec);
         if at == offset {
-            return Some(steps.last);
+            return Some(steps.last());
         }
     }
     None
@@ -261,12 +261,12 @@ fn step_cut(reader: &SessionReader<SessionRecord>, n: u32) -> Result<Option<u64>
     let mut last = None;
     for rec in reader.records() {
         let (at, rec) = rec?;
-        steps.see(&rec);
+        let owner = steps.see(&rec);
         let starts = matches!(
             rec,
             SessionRecord::TurnStart { .. } | SessionRecord::Request { .. }
         );
-        if starts && steps.last > n {
+        if starts && owner.is_some_and(|(s, _)| s > n) {
             return Ok(at.checked_sub(1));
         }
         last = Some(at);

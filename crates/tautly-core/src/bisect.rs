@@ -433,7 +433,7 @@ fn prepass_in(recs: &[(u64, SessionRecord)], test: &str) -> Option<(u32, u32)> {
     // Each call's step, and whether it is a run of the command.
     let mut calls: HashMap<&str, (u32, bool)> = HashMap::new();
     for (_, rec) in recs {
-        let before = steps.last;
+        let before = steps.last();
         let owner = steps.see(rec);
         match rec {
             SessionRecord::Request { step, .. } => {
@@ -479,7 +479,7 @@ fn prepass_in(recs: &[(u64, SessionRecord)], test: &str) -> Option<(u32, u32)> {
                 }
             }
             SessionRecord::WritesLost { .. } => {
-                if let Some(runs) = by_step.get_mut(&steps.last) {
+                if let Some(runs) = by_step.get_mut(&steps.last()) {
                     runs.wrote = true;
                 }
             }

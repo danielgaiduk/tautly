@@ -66,7 +66,7 @@ use crate::protocol::{ErrorKind, Event, FinishReason};
 use crate::record::{CheckpointPoint, SessionRecord};
 use crate::resume::{Continue, Rebuilt, ResumeError, branch, discard, rebuild, rebuild_with};
 use crate::session::Session;
-use crate::turn::TurnControl;
+use crate::turn::{Response, TurnControl};
 use crate::undo::{LiveLog, UndoError, UndoLog};
 
 /// The note of a state with no checkpoint after its boundary.
@@ -212,11 +212,20 @@ impl From<Skip> for TtError {
 /// Steps as the context turn counter numbers them (spec 7.12.1): a user message is the
 /// step after the last one, a provider step is its `Request`'s. A step's records are its
 /// `Request`, `Provider`, `ToolCall`, `ToolResult` and `Edit` records, and a user
-/// message's `TurnStart`.
+/// message's `TurnStart`. A request uses up its number only once its response puts
+/// something into the history ([`Response::answered`], the rule rebuild and the live loop
+/// follow): one with no response (cancelled, failed, cut off by a crash) shares its number
+/// with the step after it. The one numbering of tree, `state_at`, `step_at_offset`,
+/// replay, compare, bisect, rewind and fork.
 #[derive(Default)]
 pub(crate) struct StepCounter {
-    pub last: u32,
+    /// The last step that used up its number.
+    done: u32,
     open: Option<(u32, u32)>,
+    /// The open step's response so far.
+    resp: Response,
+    /// The open step logged a `ToolCall`.
+    called: bool,
 }
 
 impl StepCounter {
@@ -224,25 +233,48 @@ impl StepCounter {
     pub fn see(&mut self, rec: &SessionRecord) -> Option<(u32, u32)> {
         match rec {
             SessionRecord::TurnStart { turn, .. } => {
-                self.last = self.last.saturating_add(1);
-                self.open = None;
-                Some((self.last, *turn))
+                self.close();
+                self.done = self.done.saturating_add(1);
+                Some((self.done, *turn))
             }
             SessionRecord::Request { step, turn, .. } => {
-                self.last = *step;
+                self.close();
                 self.open = Some((*step, *turn));
                 self.open
             }
             SessionRecord::TurnEnd { .. } => {
-                self.open = None;
+                self.close();
                 None
             }
-            SessionRecord::Provider(_)
-            | SessionRecord::ToolCall { .. }
-            | SessionRecord::ToolResult { .. }
-            | SessionRecord::Edit { .. } => self.open,
+            SessionRecord::Provider(ev) => {
+                if self.open.is_some() {
+                    self.resp.push(ev.clone());
+                }
+                self.open
+            }
+            // Logged only for a response whose calls entered the history.
+            SessionRecord::ToolCall { .. } => {
+                self.called |= self.open.is_some();
+                self.open
+            }
+            SessionRecord::ToolResult { .. } | SessionRecord::Edit { .. } => self.open,
             _ => None,
         }
+    }
+
+    /// The last step so far: the open one once its response is answered.
+    pub fn last(&self) -> u32 {
+        match self.open {
+            Some((step, _)) if self.called || self.resp.answered() => step,
+            _ => self.done,
+        }
+    }
+
+    fn close(&mut self) {
+        self.done = self.last();
+        self.open = None;
+        self.called = false;
+        self.resp = Response::default();
     }
 }
 
@@ -265,7 +297,7 @@ fn walk(reader: &SessionReader<SessionRecord>) -> Result<Walked, TtError> {
     Ok(Walked {
         recs,
         owner,
-        last_step: steps.last,
+        last_step: steps.last(),
     })
 }
 
@@ -285,7 +317,7 @@ pub fn step_at_offset(reader: &SessionReader<SessionRecord>, offset: u64) -> u32
         }
         steps.see(&rec);
     }
-    steps.last
+    steps.last()
 }
 
 /// Values in log order, each path's earliest kept.
@@ -768,7 +800,7 @@ fn log_tip(reader: &SessionReader<SessionRecord>) -> Result<(u32, u32, u32), TtE
         }
         steps.see(&rec);
     }
-    Ok((n, turn, steps.last))
+    Ok((n, turn, steps.last()))
 }
 
 /// What a rewind or switch made: the report, and when applied the log the session

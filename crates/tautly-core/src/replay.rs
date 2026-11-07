@@ -395,8 +395,8 @@ impl Events<'_> {
         };
         let at = (entry.offset, entry.t_ms);
         self.last = at;
-        self.steps.see(&entry.rec);
-        let shown = self.steps.last >= self.from_step;
+        let owner = self.steps.see(&entry.rec);
+        let shown = owner.map_or(self.steps.last(), |(s, _)| s) >= self.from_step;
         if let SessionRecord::Provider(ev) = entry.rec {
             if shown {
                 self.provider(at, ev);

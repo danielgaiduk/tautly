@@ -179,15 +179,26 @@ impl Response {
     /// A response cut off (output limit) right after a reasoning item keeps no dangling
     /// reasoning: providers reject a reasoning item that leads nowhere.
     pub fn finish(mut self) -> Self {
-        if self.stop == Some(StopReason::MaxTokens)
+        if self.dangling() {
+            self.content.pop();
+        }
+        self
+    }
+
+    fn dangling(&self) -> bool {
+        self.stop == Some(StopReason::MaxTokens)
             && matches!(
                 self.content.last(),
                 Some(Content::Reasoning { .. } | Content::RedactedReasoning { .. })
             )
-        {
-            self.content.pop();
-        }
-        self
+    }
+
+    /// The response (once finished) puts something into the history, so its step uses up
+    /// a step number (spec 7.12.1). The one rule the live loop, rebuild and
+    /// `StepCounter` share: a request with no such response shares its number with the
+    /// step after it.
+    pub fn answered(&self) -> bool {
+        self.content.len() > usize::from(self.dangling())
     }
 }
 

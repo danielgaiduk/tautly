@@ -111,7 +111,12 @@ impl Log {
         )
     }
 
+    /// A response of text and its usage (an answered step).
     fn usage(&mut self, t: u64, input: u64, output: u64) -> u64 {
+        self.at(
+            t,
+            SessionRecord::Provider(ProviderEvent::TextDelta("ok".into())),
+        );
         self.at(
             t,
             SessionRecord::Provider(ProviderEvent::Usage(usage(input, output))),

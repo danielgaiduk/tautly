@@ -1867,3 +1867,168 @@ async fn shutdown_during_the_lease_wait_returns_at_once() {
     assert!(t0.elapsed() < Duration::from_secs(3), "{:?}", t0.elapsed());
     drop(held);
 }
+
+// ------------------------------------------- cp5 review C I1: one step numbering
+
+#[derive(Debug, Clone, Copy)]
+enum NoResponse {
+    Cancel,
+    Error,
+    Crash,
+}
+
+/// Turn one is answered (step 1 its message, 2 its text); turn two's request (logged as
+/// step 4) gets no response, `how`. The run continues on that session; its next answer is
+/// `third`.
+async fn unanswered(repo: &Repo, how: NoResponse) -> Run {
+    let second = match how {
+        NoResponse::Error => MockTurn::Error(tautly_provider::ProviderError::InvalidRequest(
+            "refused".into(),
+        )),
+        NoResponse::Cancel | NoResponse::Crash => MockTurn::Stall,
+    };
+    let mock = MockProvider::new(vec![text_step("first"), second, text_step("third")]);
+    let mut run = Run::start(repo.builder(&mock));
+    let id = run.engine.session_id().to_string();
+    run.turn_with("one").await;
+    let log = run.current().1;
+    run.engine
+        .send(Command::SendMessage { text: "two".into() })
+        .await
+        .unwrap();
+    if !matches!(how, NoResponse::Error) {
+        // The request stalls once sent.
+        run.until(|e| matches!(e, Event::TurnStarted)).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        run.engine.send(Command::Cancel).await.unwrap();
+    }
+    run.until(|e| matches!(e, Event::TurnFinished { .. })).await;
+    if !matches!(how, NoResponse::Crash) {
+        return run;
+    }
+    // A crash: the log ends on the request.
+    run.stop().await;
+    let lines = raw_lines(&log);
+    let request = lines
+        .iter()
+        .rposition(|l| l.contains(r#""type":"request""#))
+        .unwrap();
+    std::fs::write(&log, lines[..=request].join("\n") + "\n").unwrap();
+    Run::start(EngineBuilder {
+        resume: Some(id),
+        ..repo.builder(&MockProvider::new(vec![text_step("third")]))
+    })
+}
+
+/// Fork the current session at `at`: the branch's id, or the error.
+async fn fork_at(run: &mut Run, at: u32) -> Result<String, String> {
+    run.engine
+        .send(Command::Fork {
+            at: Some(at),
+            label: None,
+        })
+        .await
+        .unwrap();
+    let seen = run
+        .until(|e| matches!(e, Event::SessionChanged { .. } | Event::Error { .. }))
+        .await;
+    match seen.last().unwrap() {
+        Event::SessionChanged { session_id } => Ok(session_id.clone()),
+        Event::Error { message, .. } => Err(message.clone()),
+        _ => unreachable!(),
+    }
+}
+
+fn user_texts(rebuilt: &tautly_core::resume::Rebuilt) -> Vec<String> {
+    rebuilt
+        .context
+        .history
+        .iter()
+        .flat_map(|t| &t.messages)
+        .filter(|m| m.role == tautly_provider::Role::User)
+        .flat_map(|m| &m.content)
+        .filter_map(|c| match c {
+            tautly_provider::Content::Text(t) => Some(t.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn a_request_with_no_response_shares_its_number_with_the_next_step() {
+    for how in [NoResponse::Cancel, NoResponse::Error, NoResponse::Crash] {
+        let repo = Repo::git_repo();
+        let mut run = unanswered(&repo, how).await;
+        let (id, log) = run.current();
+        // The tip every surface shows is the one rewind and fork cut at.
+        let tip = step_at_offset(&reader(&log), u64::MAX);
+        assert_eq!(tip, 3, "{how:?}");
+        let rebuilt = rebuild(&reader(&log), Some(tip)).unwrap();
+        assert_eq!(user_texts(&rebuilt), ["one", "two"], "{how:?}");
+        assert!(rebuild(&reader(&log), Some(tip + 1)).is_err(), "{how:?}");
+        let nodes = tree::build(repo.home(), &repo.project(), None).unwrap();
+        let node = nodes.iter().find(|n| n.session_id == id).unwrap();
+        assert_eq!(node.steps, tip, "{how:?}");
+        assert!(state_at(&reader(&log), tip).is_ok(), "{how:?}");
+
+        // The shown tip rewinds and forks.
+        let (branch, _) = run.rewind(tip, false, &[]).await.done();
+        assert!(!branch.is_empty(), "{how:?}");
+        let b = reader(&run.current().1);
+        let (_, offset) = b.header().parent.clone().unwrap();
+        assert_eq!(step_at_offset(&b, offset), tip, "{how:?}");
+        let forked = fork_at(&mut run, tip).await;
+        assert!(forked.is_ok(), "{how:?}: {forked:?}");
+
+        // The next message is step 4 on both numberings.
+        run.turn_with("three").await;
+        let log = run.current().1;
+        let r = reader(&log);
+        assert_eq!(step_at_offset(&r, u64::MAX), 5, "{how:?}");
+        assert_eq!(
+            user_texts(&rebuild(&r, Some(4)).unwrap()),
+            ["one", "two", "three"],
+            "{how:?}"
+        );
+        assert_eq!(
+            user_texts(&rebuild(&r, Some(3)).unwrap()),
+            ["one", "two"],
+            "{how:?}"
+        );
+        run.stop().await;
+    }
+}
+
+#[tokio::test]
+async fn a_request_with_no_response_mid_log_keeps_every_boundary_in_step() {
+    // Turn two's request is cancelled; turn three is answered. Every boundary rebuilds and
+    // restores at the step the counters agree on.
+    let repo = Repo::git_repo();
+    let mut run = unanswered(&repo, NoResponse::Cancel).await;
+    run.turn_with("three").await;
+    let log = run.current().1;
+    run.stop().await;
+    let r = reader(&log);
+    let mut at_start = BTreeMap::new();
+    for rec in r.records() {
+        let (at, rec) = rec.unwrap();
+        if let SessionRecord::TurnStart { text, .. } = rec {
+            at_start.insert(text, step_at_offset(&r, at));
+        }
+    }
+    assert_eq!(at_start["two"], 3);
+    assert_eq!(at_start["three"], 4);
+    assert_eq!(step_at_offset(&r, u64::MAX), 5);
+    for at in 0..=5 {
+        let s = state_at(&r, at);
+        assert!(s.is_ok(), "state_at({at}): {s:?}");
+        let texts = user_texts(&rebuild(&r, Some(at)).unwrap());
+        let expected: &[&str] = match at {
+            0 => &[],
+            1 | 2 => &["one"],
+            3 => &["one", "two"],
+            _ => &["one", "two", "three"],
+        };
+        assert_eq!(texts, expected, "rebuild({at})");
+    }
+}

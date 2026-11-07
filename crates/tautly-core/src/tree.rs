@@ -119,7 +119,7 @@ fn node(path: &Path) -> Option<TreeNode> {
         };
         steps.see(&rec);
         if fork_at.is_some_and(|o| at <= o) {
-            parent_step = steps.last;
+            parent_step = steps.last();
         }
         match rec {
             SessionRecord::Labeled { label: l } => label = Some(l),
@@ -130,7 +130,7 @@ fn node(path: &Path) -> Option<TreeNode> {
             _ => {}
         }
     }
-    let steps = steps.last;
+    let steps = steps.last();
     let parent = header.parent.map(|(id, _)| (id, parent_step));
     Some(TreeNode {
         session_id: header.session_id,
