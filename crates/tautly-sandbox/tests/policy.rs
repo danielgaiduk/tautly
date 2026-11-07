@@ -78,6 +78,37 @@ fn protected_paths_ask_even_in_yolo() {
         assert!(asks(p(Mode::Yolo).decide("write", &write(f), None)), "{f}");
     }
 }
+/// CP5 review C1 follow-up: git reads `.gitconfig` once a common setup step includes it
+/// (`include.path = ../.gitconfig`), so it is protected at any depth, as `.git/config` is.
+#[test]
+fn gitconfig_is_protected_at_any_depth() {
+    let yolo = p(Mode::Yolo);
+    for f in [
+        ".gitconfig",
+        "sub/dir/.gitconfig",
+        ".GitConfig",
+        ".git/config",
+    ] {
+        assert!(is_protected(std::path::Path::new(f)), "{f}");
+        for tool in ["write", "edit"] {
+            assert!(asks(yolo.decide(tool, &write(f), None)), "{tool} {f}");
+        }
+    }
+    assert!(asks(yolo.decide(
+        "bash",
+        &exec("echo"),
+        Some("echo '[hook \"x\"]' >> .gitconfig")
+    )));
+    // Neighbours are not.
+    for f in [
+        ".gitignore",
+        ".gitattributes",
+        "docs/gitconfig.md",
+        ".gitconfig.example",
+    ] {
+        assert!(!is_protected(std::path::Path::new(f)), "{f}");
+    }
+}
 #[test]
 fn protected_redirect_in_bash_asks_in_yolo() {
     assert!(asks(p(Mode::Yolo).decide(

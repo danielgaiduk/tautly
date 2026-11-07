@@ -8,6 +8,8 @@ const PROTECTED_DIRS: &[&str] = &[".git", ".tautly", ".vscode", ".idea"];
 /// Files protected by basename, at any depth.
 const PROTECTED_FILES: &[&str] = &[
     ".envrc",
+    // Git reads it once a setup step includes it (`include.path = ../.gitconfig`).
+    ".gitconfig",
     "makefile",
     "gnumakefile",
     "package.json",
