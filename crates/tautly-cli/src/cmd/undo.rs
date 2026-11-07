@@ -35,7 +35,7 @@ pub async fn run(args: Args, env: &Env) -> anyhow::Result<i32> {
     // are still taken does not matter to reading old ones.
     let config = Config::load(env.root(), CliOverrides::default())?;
     for warning in &config.warnings {
-        eprintln!("tautly: {warning}");
+        eprintln!("tautly: {}", tautly_core::printable_multiline(warning));
     }
     let mut checkpoints = checkpointer(env, &session, config.config.checkpoints);
     // The working-tree lease, exclusive across the check and the write: no live session's

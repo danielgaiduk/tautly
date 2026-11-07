@@ -46,7 +46,7 @@ pub async fn run(cmd: Cmd, env: &Env) -> anyhow::Result<i32> {
 fn list(env: &Env) -> anyhow::Result<i32> {
     let loaded = Config::load(env.root(), CliOverrides::default())?;
     for warning in &loaded.warnings {
-        eprintln!("tautly: {warning}");
+        eprintln!("tautly: {}", tautly_core::printable_multiline(warning));
     }
     let overrides = loaded.config.catalog_overrides;
     let mut catalog = Catalog::builtin();

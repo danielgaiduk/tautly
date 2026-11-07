@@ -563,6 +563,47 @@ fn undo_restores_file() {
     assert!(shown.contains("undone"), "{shown}");
 }
 
+/// CP5 review M1: repository text reaches the terminal escaped on every channel: a
+/// project config key (dropped with a warning) on `-p`, `mcp list` and `models list`, a
+/// TOML error's quoted line, a first prompt in `sessions list`, a file name `undo` names.
+#[test]
+fn repository_text_never_reaches_the_terminal_raw() {
+    let s = Scratch::new();
+    let esc = '\u{1b}';
+    let config = s.work.path().join(".tautly/config.toml");
+    std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+    std::fs::write(&config, "\"\\u001b]0;owned\\u0007\\u001b[2Jfake\" = 1\n").unwrap();
+    let script = s.script("s.json", json!([text("hi")]));
+    for args in [
+        &["-p", "hi", "--mock-script", script.as_str()][..],
+        &["mcp", "list"],
+        &["models", "list"],
+    ] {
+        let err = stderr(&s.run(args));
+        assert!(err.contains("fake"), "{args:?}: no warning: {err}");
+        assert!(!err.contains(esc), "{args:?}: {err:?}");
+    }
+    std::fs::write(&config, "model = \"x\u{1b}]0;owned\u{7}\u{1b}[2J\n").unwrap();
+    let out = s.run(&["-p", "hi", "--mock-script", &script]);
+    assert_ne!(out.status.code(), Some(0));
+    assert!(!stderr(&out).contains(esc), "{:?}", stderr(&out));
+    std::fs::remove_file(&config).unwrap();
+
+    let name = "a\u{1b}[2J.txt";
+    s.prompt(
+        "\u{1b}]0;owned\u{7}edit",
+        json!([write_content(name, "new\n"), text("ok")]),
+        &[],
+    );
+    let list = s.run(&["sessions", "list"]);
+    assert!(out_text(&list).contains("edit"), "{}", out_text(&list));
+    assert!(!out_text(&list).contains(esc), "{:?}", out_text(&list));
+    let undo = s.run(&["undo"]);
+    assert_eq!(undo.status.code(), Some(0), "{}", stderr(&undo));
+    assert!(out_text(&undo).contains("deleted a"), "{}", out_text(&undo));
+    assert!(!out_text(&undo).contains(esc), "{:?}", out_text(&undo));
+}
+
 /// CP5 review M3: `tautly undo` takes the working-tree lease exclusively, so it refuses
 /// (writing nothing) while a live session uses the work tree.
 #[test]

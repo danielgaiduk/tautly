@@ -460,7 +460,11 @@ fn main() -> ExitCode {
     let code = match runtime.block_on(run(cli)) {
         Ok(code) => code,
         Err(e) => {
-            eprintln!("tautly: {e:#}");
+            // A configuration error quotes the repository's file (CP5 review M1).
+            eprintln!(
+                "tautly: {}",
+                tautly_core::printable_multiline(&format!("{e:#}"))
+            );
             1
         }
     };
