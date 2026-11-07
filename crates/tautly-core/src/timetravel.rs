@@ -63,7 +63,7 @@ use self::materialize::{fail, materialize_inner};
 use crate::checkpoint::{CheckpointError, Checkpointer, Point, Skip};
 use crate::lease::{ExclusiveGuard, LeaseError};
 use crate::protocol::{ErrorKind, Event, FinishReason};
-use crate::record::{CheckpointPoint, SessionRecord};
+use crate::record::{CheckpointPoint, RestoreBy, RestoreOutcome, SessionRecord};
 use crate::resume::{Continue, Rebuilt, ResumeError, branch, discard, rebuild, rebuild_with};
 use crate::session::Session;
 use crate::turn::{Response, TurnControl};
@@ -974,7 +974,7 @@ impl Session {
                     &expected,
                     &overwrite,
                     dry_run,
-                    Some(&mut live as &mut dyn UndoLog),
+                    Some((&mut live as &mut dyn UndoLog, RestoreBy::Rewind)),
                 )
                 .await?;
                 let materialize::Applied {
@@ -1118,7 +1118,7 @@ impl Session {
                     &expected,
                     &overwrite,
                     dry_run,
-                    Some(&mut both as &mut dyn UndoLog),
+                    Some((&mut both as &mut dyn UndoLog, RestoreBy::Switch)),
                 )
                 .await?;
                 let materialize::Applied {
@@ -1229,8 +1229,7 @@ fn ended(live: &mut dyn UndoLog, report: &mut MaterializeReport) {
         return;
     }
     let rec = SessionRecord::RestoreEnded {
-        applied: true,
-        rolled_back: false,
+        outcome: RestoreOutcome::Applied,
     };
     if live.record(&rec).is_err() {
         let note = "the session log could not record the restore's end";

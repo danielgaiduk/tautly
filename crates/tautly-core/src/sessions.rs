@@ -391,7 +391,7 @@ pub async fn restore_backup(
     id: &str,
     opts: &RestoreBackupOptions,
 ) -> Result<BackupRestored, BackupError> {
-    use crate::record::{BackupFile, Wrote};
+    use crate::record::{BackupFile, RestoreBy, RestoreOutcome, Wrote};
     use crate::undo::{Disk, MAX_DISK_READ, read_disk};
     let root = sandbox.root().to_path_buf();
     let lease = crate::lease::Lease::try_shared(data_home, &root)?
@@ -412,7 +412,7 @@ pub async fn restore_backup(
     for rec in reader.records() {
         match rec?.1 {
             SessionRecord::RestoreBegun {
-                restore_backup: true,
+                by: RestoreBy::RestoreBackup,
                 ..
             } if !opts.include_own => {
                 passed = true;
@@ -422,23 +422,19 @@ pub async fn restore_backup(
                 backup_ref,
                 files,
                 paths,
-                restore_backup,
+                by,
             } => {
-                last = Some((backup_ref, files, paths, restore_backup));
+                last = Some((backup_ref, files, paths, by == RestoreBy::RestoreBackup));
                 ended = None;
                 passed = false;
                 skipped_own = false;
             }
-            SessionRecord::RestoreEnded {
-                applied,
-                rolled_back,
-            } if !passed => {
-                ended = Some(if applied {
-                    "it was applied"
-                } else if rolled_back {
-                    "it was put back already"
-                } else {
-                    "it failed"
+            SessionRecord::RestoreEnded { outcome } if !passed => {
+                ended = Some(match outcome {
+                    RestoreOutcome::Applied => "it was applied",
+                    RestoreOutcome::RolledBack => "it was put back already",
+                    RestoreOutcome::Failed => "it failed",
+                    RestoreOutcome::Unknown => "it ended",
                 });
             }
             _ => {}
@@ -462,7 +458,7 @@ pub async fn restore_backup(
         f.path.resolve(&root)?;
         let rel = PathBuf::from(f.path.as_str());
         let name = f.path.as_str().to_string();
-        if f.existed && f.blob.is_none() {
+        if f.existed && f.from_blob.is_none() {
             done.not_kept.push(name);
             continue;
         }
@@ -476,12 +472,12 @@ pub async fn restore_backup(
         let b3 = |bytes: &[u8]| blake3::hash(bytes).to_hex().to_string();
         // The mode the restore left (Task 49 M-R3c): recorded, or for an older record, a
         // file's own (a rewind writes a kept file's content over it with its mode).
-        let wrote_mode = f.wrote_mode.or(match &f.wrote {
-            Some(Wrote::Blob(_)) if f.existed && !own => f.mode,
+        let wrote_mode = f.to_mode.or(match &f.to {
+            Some(Wrote::Blob(_)) if f.existed && !own => f.from_mode,
             _ => None,
         });
         let mode_kept = |m: &u32| wrote_mode.is_none_or(|w| w == *m);
-        let as_written = match (&f.wrote, &disk) {
+        let as_written = match (&f.to, &disk) {
             (Some(Wrote::Absent), Disk::Absent) => true,
             (Some(Wrote::Blob(b)), Disk::File { bytes, mode }) => {
                 b3(bytes) == b.as_str() && mode_kept(mode)
@@ -491,7 +487,7 @@ pub async fn restore_backup(
             }
             _ => false,
         };
-        let back_already = match (&f.blob, &disk) {
+        let back_already = match (&f.from_blob, &disk) {
             (None, Disk::Absent) => true,
             (Some(b), Disk::File { bytes, .. }) => b3(bytes) == b.as_str(),
             _ => false,
@@ -528,21 +524,21 @@ pub async fn restore_backup(
         kept.push(BackupFile {
             path: f.path.clone(),
             existed,
-            blob,
-            mode,
-            wrote: Some(match &f.blob {
+            from_blob: blob,
+            from_mode: mode,
+            to: Some(match &f.from_blob {
                 Some(b) => Wrote::Blob(b.clone()),
                 None => Wrote::Absent,
             }),
             // Written with the backup's mode, else over the file with its own.
-            wrote_mode: f.blob.as_ref().and(f.mode.or(mode)),
+            to_mode: f.from_blob.as_ref().and(f.from_mode.or(mode)),
         });
     }
     writer.append(&SessionRecord::RestoreBegun {
         backup_ref: None,
         files: kept,
         paths: planned.iter().map(|(f, _)| f.path.clone()).collect(),
-        restore_backup: true,
+        by: RestoreBy::RestoreBackup,
     })?;
     writer.checkpoint()?;
     let mut failed = None;
@@ -555,9 +551,9 @@ pub async fn restore_backup(
                 break;
             }
         };
-        let wrote = match &f.blob {
+        let wrote = match &f.from_blob {
             Some(blob) => match reader.read_blob(blob) {
-                Ok(bytes) => sandbox.write_atomic(&full, &bytes, f.mode).await,
+                Ok(bytes) => sandbox.write_atomic(&full, &bytes, f.from_mode).await,
                 Err(e) => {
                     failed = Some(e.into());
                     break;
@@ -581,8 +577,10 @@ pub async fn restore_backup(
         }
     }
     writer.append(&SessionRecord::RestoreEnded {
-        applied: failed.is_none(),
-        rolled_back: false,
+        outcome: match failed {
+            None => RestoreOutcome::Applied,
+            Some(_) => RestoreOutcome::Failed,
+        },
     })?;
     writer.checkpoint()?;
     match failed {

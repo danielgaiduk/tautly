@@ -536,7 +536,8 @@ async fn rewind_creates_branch_and_leaves_old_log_unmodified_except_tip_checkpoi
         added[2]["data"]["backup_ref"].as_str(),
         report.backup_ref.as_deref()
     );
-    assert_eq!(added[3]["data"]["applied"], true);
+    assert_eq!(added[2]["data"]["by"], "rewind");
+    assert_eq!(added[3]["data"]["outcome"], "applied");
 
     // The branch: origin rewind, parent (old session, offset of step 3's end).
     let branch_log = run.current().1;
@@ -977,14 +978,14 @@ async fn tree_lists_parent_step_label_origin_live_current() {
     assert_eq!(nodes[0].session_id, a);
     assert_eq!(nodes[0].parent, None);
     assert_eq!(nodes[0].origin, Origin::User);
-    assert_eq!(nodes[0].steps, 6);
+    assert_eq!(nodes[0].last_step, 6);
     assert_eq!(nodes[0].last_prompt, "two");
     assert!(!nodes[0].live && !nodes[0].current);
     assert_eq!(nodes[1].session_id, b);
     assert_eq!(nodes[1].parent, Some((a.clone(), 3)));
     assert_eq!(nodes[1].label.as_deref(), Some("try-b"));
     assert_eq!(nodes[1].origin, Origin::Rewind);
-    assert_eq!(nodes[1].steps, 3);
+    assert_eq!(nodes[1].last_step, 3);
     assert_eq!(nodes[1].last_prompt, "one");
     assert!(nodes[1].live && nodes[1].current);
 
@@ -1240,7 +1241,7 @@ async fn a_failed_branch_puts_the_files_back() {
     // The old log says how it ended.
     let last: Value = serde_json::from_str(raw_lines(&log).last().unwrap()).unwrap();
     assert_eq!(last["data"]["type"], "restore_ended", "{last}");
-    assert_eq!(last["data"]["data"]["rolled_back"], true);
+    assert_eq!(last["data"]["data"]["outcome"], "rolled_back");
     run.stop().await;
 }
 
@@ -1269,7 +1270,7 @@ async fn outside_git_an_overwrite_keeps_the_content_in_the_session_log() {
         .expect("a RestoreBegun record");
     let file = &begun["data"]["data"]["files"][0];
     assert_eq!(file["path"], "a.txt");
-    let blob = tautly_session::BlobRef::parse(file["blob"].as_str().unwrap()).unwrap();
+    let blob = tautly_session::BlobRef::parse(file["from_blob"].as_str().unwrap()).unwrap();
     assert_eq!(reader(&log).read_blob(&blob).unwrap(), b"human\n");
     // The branch's assertion records are marked as such (M5).
     let branch_log = run.current().1;
@@ -1491,7 +1492,7 @@ async fn an_ignored_file_is_kept_in_the_log_before_a_git_overwrite() {
         .unwrap();
     let file = &begun["data"]["data"]["files"][0];
     assert_eq!(file["path"], "gen.log", "{begun}");
-    let blob = tautly_session::BlobRef::parse(file["blob"].as_str().unwrap()).unwrap();
+    let blob = tautly_session::BlobRef::parse(file["from_blob"].as_str().unwrap()).unwrap();
     assert_eq!(reader(&log).read_blob(&blob).unwrap(), b"the human's\n");
     assert_eq!(begun["data"]["data"]["paths"], json!(["gen.log"]));
     run.stop().await;
@@ -1968,7 +1969,7 @@ async fn a_request_with_no_response_shares_its_number_with_the_next_step() {
         assert!(rebuild(&reader(&log), Some(tip + 1)).is_err(), "{how:?}");
         let nodes = tree::build(repo.home(), &repo.project(), None).unwrap();
         let node = nodes.iter().find(|n| n.session_id == id).unwrap();
-        assert_eq!(node.steps, tip, "{how:?}");
+        assert_eq!(node.last_step, tip, "{how:?}");
         assert!(state_at(&reader(&log), tip).is_ok(), "{how:?}");
 
         // The shown tip rewinds and forks.
@@ -2031,4 +2032,51 @@ async fn a_request_with_no_response_mid_log_keeps_every_boundary_in_step() {
         };
         assert_eq!(texts, expected, "rebuild({at})");
     }
+}
+
+// ------------------------------------------- cp5 review C I2: unreadable payloads
+
+#[tokio::test]
+async fn a_log_holding_a_null_replay_speed_resumes_forks_rewinds_and_compares() {
+    let repo = Repo::git_repo();
+    let mock = MockProvider::new(vec![
+        tools_step(vec![write("w1", "a.txt", "one\n")]),
+        text_step("first"),
+    ]);
+    let mut run = Run::start(repo.builder(&mock));
+    let id = run.engine.session_id().to_string();
+    run.turn_with("one").await;
+    let log = run.current().1;
+    run.stop().await;
+    // What a build before the freeze logged for `replay {speed: 1e39}`.
+    let mut line: Value = serde_json::from_str(raw_lines(&log).last().unwrap()).unwrap();
+    line["data"] = json!({"type": "command", "data": {"type": "replay", "session_id": null,
+        "speed": null, "from_step": null}});
+    line["offset"] = json!(line["offset"].as_u64().unwrap() + 1);
+    let mut text = std::fs::read_to_string(&log).unwrap();
+    text.push_str(&format!("{line}\n"));
+    std::fs::write(&log, text).unwrap();
+
+    let mut run = Run::start(EngineBuilder {
+        resume: Some(id),
+        ..repo.builder(&MockProvider::new(vec![
+            tools_step(vec![write("w2", "a.txt", "two\n")]),
+            text_step("second"),
+        ]))
+    });
+    run.engine
+        .send(Command::SendMessage { text: "two".into() })
+        .await
+        .unwrap();
+    let evs = run.until(|e| matches!(e, Event::TurnFinished { .. })).await;
+    assert_eq!(repo.read("a.txt").as_deref(), Some("two\n"), "{evs:#?}");
+    let (_, report) = run.rewind(3, false, &[]).await.done();
+    assert!(report.applied, "{report:?}");
+    assert_eq!(repo.read("a.txt").as_deref(), Some("one\n"));
+    let forked = fork_at(&mut run, 2).await;
+    assert!(forked.is_ok(), "{forked:?}");
+    run.stop().await;
+    let s =
+        tautly_core::compare::summarize_at(&reader(&log), None, &Catalog::default(), None).unwrap();
+    assert_eq!(s.user_turns, 2);
 }

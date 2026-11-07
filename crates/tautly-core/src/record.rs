@@ -216,18 +216,17 @@ pub enum SessionRecord {
         /// Every path it is about to write (the snapshot holds the rest of the tree too).
         #[serde(default)]
         paths: Vec<RelPath>,
-        /// Written by `tautly sessions restore-backup` itself (what it replaced), not by a
-        /// rewind or switch: a later `restore-backup` puts it back only when asked
-        /// (`--include-own`, Task 49 M-R3b).
-        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-        restore_backup: bool,
-    },
-    /// The end of the restore a `RestoreBegun` started: whether the files are now the
-    /// target's (`applied`), else whether they were put back (`rolled_back`).
-    RestoreEnded {
-        applied: bool,
+        /// What wrote it. One `tautly sessions restore-backup` wrote (what it replaced) is
+        /// put back by a later `restore-backup` only when asked (`--include-own`, Task 49
+        /// M-R3b). Logs of the builds before this field (`restore_backup: bool`) read as
+        /// `restore_backup` or `unknown`.
         #[serde(default)]
-        rolled_back: bool,
+        by: RestoreBy,
+    },
+    /// The end of the restore a `RestoreBegun` started.
+    RestoreEnded {
+        #[serde(default)]
+        outcome: RestoreOutcome,
     },
     /// The session switched to `model` (`Command::SetModel`, spec 7.11.5); requests from
     /// here on go to it. The last one wins over the header's model.
@@ -303,34 +302,84 @@ pub enum CheckpointPoint {
     Unknown,
 }
 
+/// What a [`SessionRecord::RestoreBegun`] was written by.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RestoreBy {
+    Rewind,
+    Switch,
+    /// `tautly sessions restore-backup`.
+    RestoreBackup,
+    /// Not known: written before the field (a rewind or a switch), or by a newer version.
+    #[default]
+    #[serde(other)]
+    Unknown,
+}
+
+/// How a restore ended ([`SessionRecord::RestoreEnded`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RestoreOutcome {
+    /// The files are now the target's.
+    Applied,
+    /// It failed, and the files written were put back.
+    RolledBack,
+    /// It failed, and the files written were not (all) put back.
+    Failed,
+    /// An outcome this version does not know (read only).
+    #[default]
+    #[serde(other)]
+    Unknown,
+}
+
 /// One file of a [`SessionRecord::RestoreBegun`]: its content before the restore wrote
-/// it.
+/// it (`from_*`) and what the restore wrote (`to*`), named as [`UndoneFile`]'s are. Logs of
+/// the builds before the rename (`blob`, `mode`, `wrote`, `wrote_mode`) still read.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BackupFile {
     pub path: RelPath,
-    /// It existed (with `blob` none: it could not be kept, a link or over 64 MiB).
+    /// It existed (with `from_blob` none: it could not be kept, a link or over 64 MiB).
     pub existed: bool,
-    pub blob: Option<BlobRef>,
-    #[serde(default)]
-    pub mode: Option<u32>,
+    #[serde(alias = "blob")]
+    pub from_blob: Option<BlobRef>,
+    #[serde(default, alias = "mode")]
+    pub from_mode: Option<u32>,
     /// What the restore wrote there (none: not known), so putting the backup back can
     /// tell a later human edit (Task 49 N10).
-    #[serde(default)]
-    pub wrote: Option<Wrote>,
+    #[serde(default, alias = "wrote")]
+    pub to: Option<Wrote>,
     /// The permission bits the restore wrote there (none: not known), so a later
     /// mode-only change is told apart too (Task 49 M-R3c).
-    #[serde(default)]
-    pub wrote_mode: Option<u32>,
+    #[serde(default, alias = "wrote_mode")]
+    pub to_mode: Option<u32>,
 }
 
 /// What a restore wrote at a path.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Wrote {
     /// This content.
     Blob(BlobRef),
     /// It deleted the file.
     Absent,
+    /// A form this version does not know (read only): treated as not known.
+    Unknown,
+}
+
+impl<'de> Deserialize<'de> for Wrote {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "snake_case")]
+        enum Known {
+            Blob(BlobRef),
+            Absent,
+        }
+        Ok(match serde_json::from_value(Value::deserialize(d)?) {
+            Ok(Known::Blob(b)) => Wrote::Blob(b),
+            Ok(Known::Absent) => Wrote::Absent,
+            Err(_) => Wrote::Unknown,
+        })
+    }
 }
 
 /// One file of an [`SessionRecord::Undone`].
@@ -448,17 +497,60 @@ impl Serialize for SessionRecord {
     }
 }
 
+/// The record types written without a payload: a newer version may give them one, which
+/// this version ignores (spec 6.5: unit records may gain fields).
+const UNIT_TYPES: &[&str] = &["pins_folded", "reasoning_stripped", "forked"];
+
+/// A line that is valid JSON reads as a record whatever its payload (spec 6.5): an unknown
+/// type, or a known one whose payload this version cannot read (a newer shape, a value it
+/// never writes), reads as `Unknown` (a command's as `Command::Unknown`), never as a
+/// corrupt log. Payloads of the builds before the format freeze are upgraded first.
 impl<'de> Deserialize<'de> for SessionRecord {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        let value = Value::deserialize(d)?;
-        let known = value
+        let mut value = Value::deserialize(d)?;
+        let Some(ty) = value
             .get("type")
             .and_then(Value::as_str)
-            .is_some_and(|t| KNOWN_TYPES.contains(&t));
-        if !known {
+            .filter(|t| KNOWN_TYPES.contains(t))
+            .map(str::to_string)
+        else {
             return Ok(SessionRecord::Unknown);
+        };
+        if let Some(obj) = value.as_object_mut() {
+            if UNIT_TYPES.contains(&ty.as_str()) {
+                obj.remove("data");
+            } else if let Some(Value::Object(data)) = obj.get_mut("data") {
+                upgrade(&ty, data);
+            }
         }
-        SessionRecord::deserialize(value).map_err(serde::de::Error::custom)
+        Ok(match SessionRecord::deserialize(value) {
+            Ok(rec) => rec,
+            Err(_) if ty == "command" => SessionRecord::Command(Command::Unknown),
+            Err(_) => SessionRecord::Unknown,
+        })
+    }
+}
+
+/// Payload fields written by builds before the format freeze, in their frozen form.
+fn upgrade(ty: &str, data: &mut serde_json::Map<String, Value>) {
+    let flag = |data: &mut serde_json::Map<String, Value>, k: &str| {
+        data.remove(k).and_then(|v| v.as_bool()) == Some(true)
+    };
+    match ty {
+        "restore_begun" if !data.contains_key("by") => {
+            if flag(data, "restore_backup") {
+                data.insert("by".into(), "restore_backup".into());
+            }
+        }
+        "restore_ended" if !data.contains_key("outcome") && data.contains_key("applied") => {
+            let outcome = match (flag(data, "applied"), flag(data, "rolled_back")) {
+                (true, _) => "applied",
+                (false, true) => "rolled_back",
+                (false, false) => "failed",
+            };
+            data.insert("outcome".into(), outcome.into());
+        }
+        _ => {}
     }
 }
 
@@ -685,8 +777,13 @@ mod tests {
         let future: SessionRecord =
             serde_json::from_str(r#"{"type":"from_the_future","data":{"x":1}}"#).unwrap();
         assert_eq!(future, SessionRecord::Unknown);
-        // A known type with a bad payload is still an error.
-        assert!(serde_json::from_str::<SessionRecord>(r#"{"type":"request","data":7}"#).is_err());
+        // A known type with a payload this version cannot read is not a corrupt log.
+        assert_eq!(
+            serde_json::from_str::<SessionRecord>(r#"{"type":"request","data":7}"#).unwrap(),
+            SessionRecord::Unknown
+        );
+        // A line that is not JSON is.
+        assert!(serde_json::from_str::<SessionRecord>(r#"{"type":"request","#).is_err());
     }
 
     #[test]
@@ -715,6 +812,125 @@ mod tests {
             checkpoint,
             SessionRecord::Checkpoint { point: None, .. }
         ));
+    }
+
+    #[test]
+    fn unit_records_and_nested_enums_accept_a_newer_versions_fields() {
+        // cp5 review C I3: unit records may gain fields; `Wrote` may gain variants.
+        let read = |line: &str| -> SessionRecord {
+            serde_json::from_str(line).unwrap_or_else(|e| panic!("{line}: {e}"))
+        };
+        assert_eq!(
+            read(r#"{"type":"forked","data":{"at":3}}"#),
+            SessionRecord::Forked
+        );
+        assert_eq!(
+            read(r#"{"type":"forked","data":{}}"#),
+            SessionRecord::Forked
+        );
+        assert_eq!(
+            read(r#"{"type":"pins_folded","data":{"n":1}}"#),
+            SessionRecord::PinsFolded
+        );
+        assert_eq!(
+            read(r#"{"type":"reasoning_stripped","data":{"why":"x"}}"#),
+            SessionRecord::ReasoningStripped
+        );
+        let begun = read(
+            r#"{"type":"restore_begun","data":{"backup_ref":null,"files":[{"path":"a",
+                "existed":true,"from_blob":null,"to":{"link":"b"},"later":1}],"paths":[],
+                "by":"teleport","extra":true}}"#,
+        );
+        let SessionRecord::RestoreBegun { files, by, .. } = begun else {
+            panic!("{begun:?}")
+        };
+        assert_eq!(files[0].to, Some(Wrote::Unknown));
+        assert_eq!(by, RestoreBy::Unknown);
+        assert_eq!(
+            read(r#"{"type":"restore_ended","data":{"outcome":"half","why":"x"}}"#),
+            SessionRecord::RestoreEnded {
+                outcome: RestoreOutcome::Unknown
+            }
+        );
+        assert_eq!(
+            read(r#"{"type":"command","data":{"type":"cancel","reason":"x"}}"#),
+            SessionRecord::Command(Command::Cancel)
+        );
+    }
+
+    #[test]
+    fn a_payload_this_version_cannot_read_is_unknown_not_corrupt() {
+        // cp5 review C I2: a non-finite speed was logged as `null`.
+        let read = |line: &str| -> SessionRecord {
+            serde_json::from_str(line).unwrap_or_else(|e| panic!("{line}: {e}"))
+        };
+        assert_eq!(
+            read(r#"{"type":"command","data":{"type":"replay","session_id":null,"speed":null}}"#),
+            SessionRecord::Command(Command::Unknown)
+        );
+        assert_eq!(
+            read(r#"{"type":"turn_start","data":{"turn":"one"}}"#),
+            SessionRecord::Unknown
+        );
+    }
+
+    #[test]
+    fn restore_records_of_the_builds_before_the_freeze_still_read() {
+        // M8: renamed fields and the bools that became enums.
+        let blob = "b".repeat(64);
+        let begun: SessionRecord = serde_json::from_str(&format!(
+            r#"{{"type":"restore_begun","data":{{"backup_ref":null,"files":[{{"path":"a",
+                "existed":true,"blob":"{blob}","mode":420,"wrote":"absent","wrote_mode":384}}],
+                "paths":["a"],"restore_backup":true}}}}"#
+        ))
+        .unwrap();
+        let SessionRecord::RestoreBegun { files, by, .. } = begun else {
+            panic!("{begun:?}")
+        };
+        assert_eq!(
+            files[0],
+            BackupFile {
+                path: rel("a"),
+                existed: true,
+                from_blob: Some(BlobRef::parse(&blob).unwrap()),
+                from_mode: Some(0o644),
+                to: Some(Wrote::Absent),
+                to_mode: Some(0o600),
+            }
+        );
+        assert_eq!(by, RestoreBy::RestoreBackup);
+        let unmarked: SessionRecord = serde_json::from_str(
+            r#"{"type":"restore_begun","data":{"backup_ref":"r","files":[],"paths":[]}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            unmarked,
+            SessionRecord::RestoreBegun {
+                by: RestoreBy::Unknown,
+                ..
+            }
+        ));
+        for (old, outcome) in [
+            (r#"{"applied":true}"#, RestoreOutcome::Applied),
+            (
+                r#"{"applied":true,"rolled_back":false}"#,
+                RestoreOutcome::Applied,
+            ),
+            (
+                r#"{"applied":false,"rolled_back":true}"#,
+                RestoreOutcome::RolledBack,
+            ),
+            (
+                r#"{"applied":false,"rolled_back":false}"#,
+                RestoreOutcome::Failed,
+            ),
+            (r#"{"applied":false}"#, RestoreOutcome::Failed),
+        ] {
+            let rec: SessionRecord =
+                serde_json::from_str(&format!(r#"{{"type":"restore_ended","data":{old}}}"#))
+                    .unwrap();
+            assert_eq!(rec, SessionRecord::RestoreEnded { outcome }, "{old}");
+        }
     }
 
     #[test]
@@ -846,16 +1062,15 @@ mod tests {
                 files: vec![BackupFile {
                     path: rel("a"),
                     existed: true,
-                    blob: Some(BlobRef::parse(&"b".repeat(64)).unwrap()),
-                    mode: Some(0o644),
-                    wrote: Some(Wrote::Absent),
-                    wrote_mode: Some(0o600),
+                    from_blob: Some(BlobRef::parse(&"b".repeat(64)).unwrap()),
+                    from_mode: Some(0o644),
+                    to: Some(Wrote::Absent),
+                    to_mode: Some(0o600),
                 }],
-                restore_backup: true,
+                by: RestoreBy::RestoreBackup,
             },
             SessionRecord::RestoreEnded {
-                applied: false,
-                rolled_back: true,
+                outcome: RestoreOutcome::RolledBack,
             },
             SessionRecord::WritesLost {
                 paths: vec![rel("a.txt")],

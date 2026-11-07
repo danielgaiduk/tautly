@@ -10,7 +10,7 @@ use tautly_session::{BlobRef, RelPath, SessionReader};
 
 use super::{FileState, TtError};
 use crate::checkpoint::{self, Checkpointer};
-use crate::record::{BackupFile, SessionRecord, Wrote};
+use crate::record::{BackupFile, RestoreBy, RestoreOutcome, SessionRecord, Wrote};
 use crate::undo::{Disk, MAX_DISK_READ, UndoLog, read_disk};
 
 /// Why a path is blocked (never written).
@@ -384,7 +384,8 @@ pub async fn materialize(
     )
 }
 
-/// [`materialize`], logging to `log` (the session the restore leaves, when there is one):
+/// [`materialize`], logging to `log` (the session the restore leaves, when there is one,
+/// and what restores):
 /// a `RestoreBegun` before the first write (with each file's content before, outside git),
 /// and a `RestoreEnded` when a write fails. Returns how to put the files back.
 pub(crate) async fn materialize_inner(
@@ -394,8 +395,12 @@ pub(crate) async fn materialize_inner(
     expected: &FileState,
     overwrite: &[RelPath],
     dry_run: bool,
-    mut log: Option<&mut dyn UndoLog>,
+    log: Option<(&mut dyn UndoLog, RestoreBy)>,
 ) -> Result<Applied, TtError> {
+    let (mut log, by) = match log {
+        Some((log, by)) => (Some(log), by),
+        None => (None, RestoreBy::Unknown),
+    };
     let root = sb.root().to_path_buf();
     let deadline = Checkpointer::housekeeping_deadline();
     let overwrite: Vec<PathBuf> = overwrite
@@ -654,10 +659,10 @@ pub(crate) async fn materialize_inner(
             files.push(BackupFile {
                 path,
                 existed,
-                blob,
-                mode,
-                wrote,
-                wrote_mode,
+                from_blob: blob,
+                from_mode: mode,
+                to: wrote,
+                to_mode: wrote_mode,
             });
         }
         let paths = planned
@@ -671,7 +676,7 @@ pub(crate) async fn materialize_inner(
             backup_ref: report.backup_ref.clone(),
             files,
             paths,
-            restore_backup: false,
+            by,
         })?;
     }
     let written = write(sb, cp.as_deref(), target, tbase.as_deref(), &planned).await;
@@ -701,8 +706,10 @@ pub(crate) async fn fail(
     if let Some(log) = log {
         // Best effort: the error below says what happened either way.
         let _ = log.record(&SessionRecord::RestoreEnded {
-            applied: false,
-            rolled_back: rolled_back.is_ok(),
+            outcome: match rolled_back {
+                Ok(()) => RestoreOutcome::RolledBack,
+                Err(_) => RestoreOutcome::Failed,
+            },
         });
     }
     TtError::Failed {

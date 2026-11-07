@@ -36,8 +36,8 @@ pub struct TreeNode {
     pub origin: Origin,
     /// When it started, in Unix seconds.
     pub created: u64,
-    /// Its last step.
-    pub steps: u32,
+    /// Its last step's number (spec 7.12.1; not a count of provider steps).
+    pub last_step: u32,
     /// The first line of its last user message (at most 200 characters; empty: none).
     pub last_prompt: String,
     /// What it spent, from the cost ledger (none: no priced request).
@@ -130,7 +130,7 @@ fn node(path: &Path) -> Option<TreeNode> {
             _ => {}
         }
     }
-    let steps = steps.last();
+    let last_step = steps.last();
     let parent = header.parent.map(|(id, _)| (id, parent_step));
     Some(TreeNode {
         session_id: header.session_id,
@@ -141,7 +141,7 @@ fn node(path: &Path) -> Option<TreeNode> {
             .created
             .duration_since(UNIX_EPOCH)
             .map_or(0, |d| d.as_secs()),
-        steps,
+        last_step,
         last_prompt,
         cost_usd: None,
         live: held(path),
@@ -219,7 +219,7 @@ pub fn lines(nodes: &[TreeNode]) -> Vec<String> {
             "{}{} {name}  step {} · {origin} · {cost} · {}",
             "  ".repeat(d),
             if n.current { '*' } else { ' ' },
-            n.steps,
+            n.last_step,
             crate::printable(&prompt)
         ));
     }
@@ -237,7 +237,7 @@ mod tests {
             label: None,
             origin: Origin::User,
             created,
-            steps: 1,
+            last_step: 1,
             last_prompt: String::new(),
             cost_usd: None,
             live: false,

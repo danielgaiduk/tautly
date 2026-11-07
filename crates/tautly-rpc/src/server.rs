@@ -167,6 +167,14 @@ pub fn command_for(method: &str, params: &Value) -> Result<Command, Error> {
             INVALID_PARAMS,
             format!("invalid params for `{method}`: a value this server does not know"),
         )),
+        // A non-finite speed would be logged as `null` (cp5 review C I2).
+        Command::Replay { speed, .. } if !tautly_core::replay::speed_ok(speed) => Err(Error::new(
+            INVALID_PARAMS,
+            format!(
+                "invalid params for `{method}`: the speed must be a number from 0 to {}",
+                tautly_core::replay::MAX_SPEED
+            ),
+        )),
         command => Ok(command),
     }
 }

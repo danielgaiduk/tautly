@@ -88,6 +88,15 @@ pub fn events(reader: &SessionReader<SessionRecord>, from_step: Option<u32>) -> 
     }
 }
 
+/// The fastest replay speed accepted.
+pub const MAX_SPEED: f32 = 1000.0;
+
+/// A replay speed a client may ask for: a finite number from 0 (instant) to
+/// [`MAX_SPEED`]. Anything else is refused where commands come in (cp5 review C I2).
+pub fn speed_ok(speed: f32) -> bool {
+    (0.0..=MAX_SPEED).contains(&speed)
+}
+
 /// The pause before an event written at `t` after one written at `prev` (Unix
 /// milliseconds): the gap divided by `speed`, at most [`MAX_GAP`]; none when `speed` is 0
 /// (or not a positive number) or the clock went back.
@@ -511,10 +520,10 @@ impl Session {
             events,
             cancelled,
         };
-        if !(speed.is_finite() && speed >= 0.0) {
-            sink.emit(replay_error(
-                "the replay speed must be a number of at least 0",
-            ))
+        if !speed_ok(speed) {
+            sink.emit(replay_error(&format!(
+                "the replay speed must be a number from 0 to {MAX_SPEED}"
+            )))
             .await;
             return sink.emit_last(finish(shown, 0, false)).await;
         }

@@ -696,7 +696,7 @@ Every operation here creates a new branch or a new view. None truncates a log, a
 #### 7.12.2 Rewind as fork
 - `Command::Rewind{at, label?, dry_run, overwrite}` (REPL `/rewind <step>`):
   1. Take a checkpoint of the current tree and append it to the current session, so its tip stays restorable.
-  2. Create a branch: a new session with `origin: rewind`, `parent: (current, offset of step at)`, the records up to that step copied verbatim, and child checkpoint refs.
+  2. Create a branch: a new session with `origin: rewind`, `parent: (current, offset of the last record copied)`, `parent_step: at`, the records up to that step copied verbatim, and child checkpoint refs.
   3. Materialize `state_at(at)` in place.
   4. Continue on the branch (`SessionChanged`). The old branch's log gets only the `Rewind` command, that tip checkpoint, and the restore's `RestoreBegun` and `RestoreEnded`; nothing in it is changed.
 - **Materializing** changes only the paths where the target state differs from `expected_tip`.
@@ -712,7 +712,7 @@ Every operation here creates a new branch or a new view. None truncates a log, a
     - The CLI shows what it would do first. It asks y/N on a terminal; otherwise it needs `--yes`.
   - A blocked path's note says why it is blocked: a link or file above it, a directory in the way, or content that can be neither held nor kept. Outside git, or with checkpoints off, the engine instead keeps each overwritten file's bytes in the session's blob store, in a `RestoreBegun{backup_ref?, files}` record. When a file cannot be kept (a link, or a file over 64 MiB), the report's `backup` is none and the REPL does not promise a backup.
   - A path below a symbolic link or a file, or one where a directory is in the way, is **blocked**: it is never written, whatever `overwrite` lists, and nothing is written while any blocked path is left. Each write first checks that the path resolves to itself.
-  - The current log records the command, the tip checkpoint, then `RestoreBegun` (before the first write) and `RestoreEnded{applied, rolled_back}`. A resume warns about a `RestoreBegun` with no end, naming the backup. A failure after files were written puts them back and says whether that worked, and which snapshot holds the files from before.
+  - The current log records the command, the tip checkpoint, then `RestoreBegun` (before the first write) and `RestoreEnded{outcome}` (`applied`, `rolled_back` or `failed`). A resume warns about a `RestoreBegun` with no end, naming the backup. A failure after files were written puts them back and says whether that worked, and which snapshot holds the files from before.
   - A step that does not exist is refused before anything is logged. `at = 0` copies the records before the first step; the parent offset is the last of them.
   - The branch ends with a `restored` checkpoint of exactly the materialized files. Outside git, it ends instead with an `Edit{asserted: true}` per overlay file, which turn diffs and undo ignore. A switch appends a `restored` checkpoint to the session it switches to.
 - **The answer is `Rewound{at, branch, report}`**, where `report` is `{restored, deleted, conflicts, blocked, dry_run, applied, backup?, backup_ref?, note?}`. `blocked` lists paths that can never be written (something is in the way). `backup` is `git` or `log`, or none when nothing would be kept. The REPL first sends a dry run and shows what would be restored, deleted and in conflict. It asks y/n, and on conflicts asks separately before sending `overwrite` with the paths.
@@ -721,13 +721,13 @@ Every operation here creates a new branch or a new view. None truncates a log, a
 
 #### 7.12.3 Session tree and switching
 - **Branches are first-class.** Each session's header gives its parent `(session, record offset)` (the offset of the last record the branch copied; the step is the one in force at that record, `step_at_offset`), `label` and `origin`. `Fork{at?, label?}` (REPL `/fork [label]`) creates a conversation-only branch at step `at` (default: the tip) without touching files. `Label{label}` (`/label <name>`) renames the current branch.
-- **`session/tree {root}`** (RPC), `tautly sessions tree` and `/tree` list the project's sessions (H10) as a tree. Each node is `{session_id, parent?, label?, origin, created, steps, last_prompt, cost_usd?, live, current}`. The REPL prints one indented line per branch: `* <label or id8>  step N · <origin> · $cost · <last prompt, 40 chars>`, with `*` marking the current branch.
+- **`session/tree {root}`** (RPC), `tautly sessions tree` and `/tree` list the project's sessions (H10) as a tree. Each node is `{session_id, parent?, label?, origin, created, last_step, last_prompt, cost_usd?, live, current}`. The REPL prints one indented line per branch: `* <label or id8>  step N · <origin> · $cost · <last prompt, 40 chars>`, with `*` marking the current branch.
 - **`Command::Switch{session_id, dry_run, overwrite}`** (`/switch <label|id|n>`) materializes the target branch's tip (`expected_tip(target)`) in place, with the same conflict rules and backup as rewind. It then continues that session (`Switched{branch, report}`, `SessionChanged`). Switching back and forth restores each tip exactly.
 
 #### 7.12.4 Fork at a step into an isolated worktree
 - **Command:** `tautly fork <session> --at N [--model M] [--prompt TEXT] [--label L] [--dir PATH] [--approve auto-edit|yolo] [--budget-usd N] [--output json|text]`.
 - **Worktree:** it creates `git worktree add --detach <dir> <commit>`, where `<commit>` is `state_at(N)`'s checkpoint with the tool-edit reverts applied, composed as a commit of its own (Task 50), so the worktree starts clean at exactly that state. Git runs with hooks disabled, through the checkpoints' hardened git. `<dir>` defaults to `<data home>/worktrees/<project-id>/<session-id>`. A state with no checkpoint to start from is refused with its note.
-- **Session:** a new session (`origin: what_if`, parent `(session, step N)`, `root` = the worktree) holding the records up to step N. Root-relative paths make them valid there. It shares blobs with its parent (H10). `--model` applies `SetModel` before the first message.
+- **Session:** a new session (`origin: what_if`, parent `(session, offset of the last record copied)` and `parent_step: N`, `root` = the worktree) holding the records up to step N. Root-relative paths make them valid there. It shares blobs with its parent (H10). `--model` applies `SetModel` before the first message.
 - **Running:**
   - Without `--prompt` it prints the worktree path, the session id and the resume command.
   - With `--prompt` it runs one-shot in the worktree under the headless rules (3.4).

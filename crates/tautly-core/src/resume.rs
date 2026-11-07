@@ -514,8 +514,11 @@ impl Replay<'_> {
                 backup_ref,
                 files,
                 paths,
-                restore_backup,
-            } => self.restoring = Some((backup_ref, paths, !files.is_empty(), restore_backup)),
+                by,
+            } => {
+                let own = by == crate::record::RestoreBy::RestoreBackup;
+                self.restoring = Some((backup_ref, paths, !files.is_empty(), own))
+            }
             SessionRecord::RestoreEnded { .. } => self.restoring = None,
             SessionRecord::Unknown => self.unknown += 1,
         }
