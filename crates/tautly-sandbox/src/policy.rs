@@ -470,7 +470,7 @@ impl Policy {
     fn deny_hits(&self, r: &Rule, tool: &str, c: &SimpleCommand) -> bool {
         let forms: Vec<String> = deny_argvs(&c.argv)
             .into_iter()
-            .flat_map(|a| [a.join(" "), quoted_words(a)])
+            .flat_map(|a| [a.join(" "), quoted_words(&a)])
             .chain(std::iter::once(command_line(c)))
             .collect();
         let Some(red) = &r.redirect else {
@@ -717,18 +717,126 @@ fn quoted_words(argv: &[String]) -> String {
 /// and `time` prefixes removed ([`unwrap_prefixes`]); and, when the command starts with a
 /// wrapper that runs the rest of its argv (`sudo`, `env`, `nohup`, `nice`, `timeout`, …),
 /// every suffix starting at a non-option word, so `deny bash(git push*)` refuses
-/// `timeout 5 git push` and `env FOO=1 git push`. Deliberately broad (a deny rule may
-/// refuse an odd command, never miss a wrapped one); allow rules never use these forms.
-fn deny_argvs(argv: &[String]) -> Vec<&[String]> {
-    let mut out = vec![argv, unwrap_prefixes(argv)];
+/// `timeout 5 git push` and `env FOO=1 git push`. Each of those is also tried with
+/// `argv[0]` reduced to its basename (`/usr/bin/git push`), then for `git` without its
+/// global options (`git -C . --no-pager push`), and for `rm` with its flags in every order
+/// and grouping (`rm -fr`, `rm -r -f`, `rm --recursive --force` read as `rm -rf`; CP5
+/// review M2). Deliberately broad (a deny rule may refuse an odd command, never miss a
+/// wrapped one); allow rules never use these forms.
+fn deny_argvs(argv: &[String]) -> Vec<Vec<String>> {
+    let mut written = vec![argv, unwrap_prefixes(argv)];
     if argv.first().is_some_and(|w| WRAPPERS.contains(&base(w))) {
-        out.extend(
+        written.extend(
             (1..argv.len())
                 .filter(|&i| !argv[i].starts_with('-'))
                 .map(|i| &argv[i..]),
         );
     }
+    let mut out = Vec::new();
+    for a in written.into_iter().filter(|a| !a.is_empty()) {
+        out.push(a.to_vec());
+        let mut short = a.to_vec();
+        short[0] = base(&a[0]).to_string();
+        match short[0].as_str() {
+            "git" => out.push(without_git_options(&short)),
+            "rm" => out.extend(rm_spellings(&short)),
+            _ => {}
+        }
+        out.push(short);
+    }
     out
+}
+
+/// `git <args>` without the global options before its subcommand (`-C <dir>`, `-c k=v`,
+/// `--git-dir[=]…`, `--no-pager`, …): any leading option word, and the value of those that
+/// take one as the next word.
+fn without_git_options(argv: &[String]) -> Vec<String> {
+    const VALUED: &[&str] = &[
+        "-C",
+        "-c",
+        "--git-dir",
+        "--work-tree",
+        "--namespace",
+        "--config-env",
+        "--super-prefix",
+        "--exec-path",
+    ];
+    let mut i = 1;
+    while let Some(w) = argv.get(i).filter(|w| w.starts_with('-')) {
+        i += if VALUED.contains(&w.as_str()) { 2 } else { 1 };
+    }
+    let mut out = vec![argv[0].clone()];
+    out.extend(argv.iter().skip(i).cloned());
+    out
+}
+
+/// `rm <options> <operands>` with its short flags (and the long forms of `-r`, `-f`, `-d`,
+/// `-v`) gathered, in every order, as one cluster and as separate words: so `rm -rf*` and
+/// `rm -r -f*` both match whichever way the command spells them. Other long options stay
+/// after the flags. More than four distinct flags: only their written order.
+fn rm_spellings(argv: &[String]) -> Vec<Vec<String>> {
+    let mut flags: Vec<char> = Vec::new();
+    let mut other = Vec::new();
+    let mut i = 1;
+    while let Some(w) = argv.get(i) {
+        let long = match w.as_str() {
+            "--recursive" => Some('r'),
+            "--force" => Some('f'),
+            "--dir" => Some('d'),
+            "--verbose" => Some('v'),
+            _ => None,
+        };
+        if w == "--" || !w.starts_with('-') || w == "-" {
+            break;
+        } else if let Some(c) = long {
+            flags.push(c);
+        } else if w.starts_with("--") {
+            other.push(w.clone());
+        } else {
+            flags.extend(w[1..].chars());
+        }
+        i += 1;
+    }
+    let mut seen = std::collections::HashSet::new();
+    flags.retain(|c| seen.insert(*c));
+    let orders = if flags.len() <= 4 {
+        permutations(&flags)
+    } else {
+        vec![flags]
+    };
+    let rest = &argv[i..];
+    orders
+        .into_iter()
+        .filter(|o| !o.is_empty())
+        .flat_map(|o| {
+            let cluster = vec![format!("-{}", o.iter().collect::<String>())];
+            let split = o.iter().map(|c| format!("-{c}")).collect::<Vec<_>>();
+            [cluster, split].map(|f| {
+                let mut v = vec![argv[0].clone()];
+                v.extend(f);
+                v.extend(other.iter().cloned());
+                v.extend(rest.iter().cloned());
+                v
+            })
+        })
+        .collect()
+}
+
+/// Every order of `items`.
+fn permutations(items: &[char]) -> Vec<Vec<char>> {
+    if items.len() <= 1 {
+        return vec![items.to_vec()];
+    }
+    (0..items.len())
+        .flat_map(|i| {
+            let mut rest = items.to_vec();
+            let first = rest.remove(i);
+            permutations(&rest).into_iter().map(move |mut p| {
+                p.insert(0, first);
+                p
+            })
+        })
+        .collect()
 }
 
 /// `w` as a shell word: as it is, or in single quotes (a `'` written `'\''`) when it is

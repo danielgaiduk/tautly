@@ -1680,6 +1680,57 @@ fn deny_rules_see_through_wrapper_prefixes() {
     assert!(asks(allow.decide("bash", &sh, Some("time cargo test"))));
 }
 
+// --- CP5 review M2: path-qualified programs, git's global options, xargs, rm clusters ---
+#[test]
+fn deny_rules_catch_more_spellings() {
+    let sh = exec("sh");
+    let pol = with_rules(Mode::Yolo, &[], &["bash(git push*)", "bash(rm -rf*)"]);
+    for raw in [
+        "/usr/bin/git push",
+        "./git push",
+        "git -C . push",
+        "git --no-pager push",
+        "git -P push",
+        "git -c k=v push",
+        "git --git-dir=.git --work-tree=. push",
+        "git --git-dir .git push",
+        "git -C sub -c a=b --no-pager push origin",
+        "timeout 5 /usr/bin/git -C sub push",
+        "rm -rf src",
+        "rm -fr src",
+        "rm -r -f src",
+        "rm -f -r src",
+        "rm -vfr src",
+        "rm -f -v -r src",
+        "rm --recursive --force src",
+        "rm --force -r src",
+        "/bin/rm -fr src",
+        "sudo rm -fr src",
+    ] {
+        assert!(
+            matches!(pol.decide("bash", &sh, Some(raw)), Decision::Deny { .. }),
+            "{raw}"
+        );
+    }
+    // `xargs` runs its input as part of a command: it asks, in yolo too.
+    for raw in [
+        "echo push | xargs git",
+        "xargs rm -rf < list",
+        "nice xargs ls",
+    ] {
+        assert!(asks(pol.decide("bash", &sh, Some(raw))), "{raw}");
+    }
+    for raw in [
+        "git -C . status",
+        "/usr/bin/git status",
+        "git --no-pager log",
+        "rm -f a.o",
+        "rm -r build",
+    ] {
+        assert_eq!(pol.decide("bash", &sh, Some(raw)), Decision::Allow, "{raw}");
+    }
+}
+
 // --- re-review 4 T30-N11: `0<&3` ---
 #[test]
 fn exact_deny_rule_is_not_dodged_by_a_descriptor_number() {

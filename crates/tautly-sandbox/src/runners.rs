@@ -365,6 +365,8 @@ fn runs_unseen_code(a: &[String]) -> Option<&'static str> {
     match name {
         _ if EVALUATORS.contains(&name) => Some("runs a string as code"),
         _ if SHELL_RUNNERS.contains(&name) => Some("runs its arguments through a shell"),
+        // Its command line is completed from stdin, which no rule sees (CP5 review M2).
+        "xargs" => Some("runs its input as part of a command"),
         "env" if has_flag("S") || a[1..].iter().any(|w| w.starts_with("--split-string")) => {
             Some("splits a string into a command")
         }
@@ -376,19 +378,6 @@ fn runs_unseen_code(a: &[String]) -> Option<&'static str> {
         "bind" if has_flag("x") => Some("binds a key to a shell command"),
         _ => interpreter_source(a).and_then(Result::err),
     }
-}
-
-/// `xargs` appends words read from stdin to its command, so a wrapper, shell or
-/// interpreter anywhere in its argv may receive a whole command line we never see.
-fn xargs_feeds_a_runner(argv: &[String]) -> bool {
-    base(&argv[0]) == "xargs"
-        && argv[1..].iter().any(|w| {
-            let b = base(w);
-            WRAPPERS.contains(&b)
-                || SHELL_RUNNERS.contains(&b)
-                || EVALUATORS.contains(&b)
-                || interp(b).is_some()
-        })
 }
 
 /// Reject commands that execute code we cannot see, directly or through a
@@ -409,9 +398,6 @@ pub(crate) fn reject_unanalyzable(argv: &[String]) -> Result<(), Unparseable> {
         }
         if argv[1..].iter().any(|w| w.contains(['$', '`'])) {
             return Some("may run a dynamic command");
-        }
-        if xargs_feeds_a_runner(argv) {
-            return Some("passes its input to a command runner");
         }
         // Conservative: through a wrapper, any later word may be the inner command.
         (1..argv.len()).find_map(|i| runs_unseen_code(&argv[i..]))
