@@ -518,7 +518,11 @@ impl Session {
             .await;
             return sink.emit_last(finish(shown, 0, false)).await;
         }
-        // What this session logged so far is on disk before it is read.
+        // What this session logged so far, background checkpoints included, is on disk
+        // before it is read.
+        if !self.settle_start_checkpoint_or(&ctl.cancel).await {
+            return sink.emit_last(finish(shown, 0, true)).await;
+        }
         self.checkpoint().await;
         let current = (self.session_id.clone(), self.log.path());
         let (home, root) = (self.data_home.clone(), self.root().to_path_buf());

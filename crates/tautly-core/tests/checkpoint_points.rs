@@ -514,3 +514,80 @@ async fn a_skipped_turn_end_makes_the_next_checkpoint_partial() {
         &recs[end..]
     );
 }
+
+/// Wait for the first event `pick` accepts.
+async fn wait_for(events: &mut mpsc::Receiver<Event>, pick: impl Fn(&Event) -> bool) -> Event {
+    loop {
+        let ev = tokio::time::timeout(WAIT, events.recv())
+            .await
+            .expect("timed out waiting for an event")
+            .expect("event channel closed");
+        if pick(&ev) {
+            return ev;
+        }
+    }
+}
+
+/// Cancel a turn at its first tool call, and wait for its `TurnFinished`.
+async fn cancelled_turn(run: &mut Run) {
+    run.engine
+        .send(Command::SendMessage { text: "one".into() })
+        .await
+        .unwrap();
+    wait_for(&mut run.events, |e| matches!(e, Event::ToolStarted { .. })).await;
+    run.engine.send(Command::Cancel).await.unwrap();
+    wait_for(&mut run.events, |e| matches!(e, Event::TurnFinished { .. })).await;
+}
+
+fn is_turn_end_checkpoint(r: &SessionRecord) -> bool {
+    matches!(
+        r,
+        SessionRecord::Checkpoint {
+            point: Some(CheckpointPoint::TurnEnd),
+            turn: 1,
+            ..
+        }
+    )
+}
+
+#[tokio::test]
+async fn a_fork_right_after_a_cancel_leaves_the_recovered_checkpoint_in_the_parent() {
+    // Review CP5-A I2: a cancelled turn's end checkpoint is recovered in the background;
+    // a fork sent at once must wait for it, so its record lands in the parent.
+    let repo = Repo::new();
+    let mock = MockProvider::new(vec![tools_step(vec![bash("b1", "sleep 30")])]);
+    let mut run = Run::start(repo.builder(&mock));
+    let parent = run.engine.session_path().to_path_buf();
+    cancelled_turn(&mut run).await;
+    run.engine
+        .send(Command::Fork {
+            at: None,
+            label: None,
+        })
+        .await
+        .unwrap();
+    wait_for(&mut run.events, |e| {
+        matches!(e, Event::SessionChanged { .. } | Event::Error { .. })
+    })
+    .await;
+    let branch = run.engine.current_session().1;
+    assert_ne!(branch, parent);
+    run.stop().await;
+    let parent_recs = records(&parent);
+    let end = parent_recs
+        .iter()
+        .position(|r| matches!(r, SessionRecord::TurnEnd { .. }))
+        .unwrap();
+    assert!(
+        parent_recs[end..].iter().any(is_turn_end_checkpoint),
+        "parent: {:?}",
+        &parent_recs[end..]
+    );
+    // At most the parent's record as copied, never a second one of the branch's own.
+    let branch_recs = records(&branch);
+    let n = branch_recs
+        .iter()
+        .filter(|r| is_turn_end_checkpoint(r))
+        .count();
+    assert!(n <= 1, "branch: {branch_recs:?}");
+}
