@@ -1,7 +1,7 @@
 //! The working-tree lease (spec 7.12.1): every engine holds a shared `flock` on
 //! `<data home>/locks/<root hash>.lock` for as long as it runs; an undo, a rewind or a
-//! branch switch needs it exclusive, so it is refused while another live session, in this process or
-//! another, uses the same working tree.
+//! branch switch needs it exclusive, so it is refused while another live session, in this
+//! process or another, uses the same working tree.
 //!
 //! `flock` locks belong to an open file: each engine opens the lock file itself, so two
 //! engines of one process exclude each other like two processes do. Converting the shared
