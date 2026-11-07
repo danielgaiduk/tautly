@@ -128,6 +128,31 @@ fn truncated_last_line_is_skipped_and_flagged() {
 }
 
 #[test]
+fn a_reader_stops_at_the_length_it_saw_at_open_unless_it_follows() {
+    // cp5 review C M5: a live writer appends while the log is read.
+    let env = Env::new();
+    let mut w = env.writer();
+    w.append(&msg("one")).unwrap();
+    w.checkpoint().unwrap();
+    let path = w.path().to_path_buf();
+    let r = SessionReader::<Rec>::open(&path).unwrap();
+    let follower = SessionReader::<Rec>::open(&path).unwrap().follow();
+    w.append(&msg("two")).unwrap();
+    w.checkpoint().unwrap();
+    // A line caught mid-write.
+    let mut f = OpenOptions::new().append(true).open(&path).unwrap();
+    f.write_all(br#"{"type":"record","offset":2,"data":{"kind":"msg","te"#)
+        .unwrap();
+    drop(f);
+    let got = r.records().collect::<Result<Vec<_>, _>>().unwrap();
+    assert_eq!(got, vec![(0, msg("one"))]);
+    let followed: Vec<_> = follower.records().collect();
+    assert_eq!(followed.len(), 3, "{followed:?}");
+    assert_eq!(*followed[1].as_ref().unwrap(), (1, msg("two")));
+    assert!(followed[2].is_err());
+}
+
+#[test]
 fn unparseable_final_line_with_newline_is_also_a_truncated_tail() {
     let env = Env::new();
     let mut w = env.writer();
