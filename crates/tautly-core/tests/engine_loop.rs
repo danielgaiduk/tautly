@@ -1233,7 +1233,7 @@ async fn start_up_warnings_are_reported() {
     });
     let first = run.next().await;
     assert!(
-        matches!(&first, Event::SessionChanged { session_id } if session_id == run.engine.session_id()),
+        matches!(&first, Event::SessionChanged { id: _, session_id } if session_id == run.engine.session_id()),
         "{first:?}"
     );
     run.say("go").await;
@@ -1714,6 +1714,30 @@ async fn after_a_turn_panic_every_command_is_answered_and_the_panic_is_logged() 
         matches!(&ev, Event::Error { message, .. } if message.contains("takes no more")),
         "{ev:?}"
     );
+    // Review CP5-A I1: a message and a replay still get the end their clients wait for.
+    run.say("again").await;
+    let seen = run.until(|e| matches!(e, Event::TurnFinished { .. })).await;
+    assert_eq!(finish_reason(&seen), FinishReason::Error);
+    assert!(
+        !seen.iter().any(|e| matches!(e, Event::TurnStarted)),
+        "{seen:?}"
+    );
+    run.engine
+        .send(Command::Replay {
+            id: None,
+            session_id: None,
+            speed: 0.0,
+            from_step: None,
+        })
+        .await
+        .unwrap();
+    let seen = run
+        .until(|e| matches!(e, Event::ReplayFinished { .. }))
+        .await;
+    assert!(
+        matches!(seen.last(), Some(Event::ReplayFinished { events: 0, .. })),
+        "{seen:?}"
+    );
 }
 
 #[tokio::test]
@@ -1760,6 +1784,83 @@ async fn a_pin_queued_behind_a_message_reaches_that_turn() {
     assert_eq!(reqs.len(), 3);
     let second = serde_json::to_string(&reqs[2].messages).unwrap();
     assert!(second.contains("queued pin"), "{second}");
+}
+
+#[tokio::test]
+async fn a_command_flood_is_refused_past_capacity_and_shutdown_reports_the_rest() {
+    // Review CP5-A M1 (bounded queue and inbox, refusals), M2 (dropped at shutdown) and
+    // M4 (a withdrawn approval is announced).
+    let fx = Fx::new();
+    let mock = MockProvider::new(vec![tools_step(vec![call(
+        "w1",
+        "write",
+        json!({"path": "o.txt", "content": "x"}),
+    )])]);
+    let mut run = start(EngineBuilder {
+        interactive: true,
+        ..fx.builder(config(Mode::Ask), &mock)
+    });
+    run.say("first").await;
+    let events = run
+        .until(|e| matches!(e, Event::ToolApprovalRequested { .. }))
+        .await;
+    let Some(Event::ToolApprovalRequested { request_id, .. }) = events.last() else {
+        unreachable!()
+    };
+    let request_id = request_id.clone();
+    // The turn waits: pins go to its inbox (64), compactions to the queue (64).
+    for i in 0..80 {
+        run.engine
+            .send(Command::Pin {
+                text: format!("pin {i}"),
+            })
+            .await
+            .unwrap();
+    }
+    for i in 0..70 {
+        run.engine
+            .send(Command::Compact {
+                id: Some(format!("c{i}")),
+            })
+            .await
+            .unwrap();
+    }
+    run.engine.send(Command::Shutdown).await.unwrap();
+    let mut rest = Vec::new();
+    while let Some(ev) = tokio::time::timeout(WAIT, run.events.recv())
+        .await
+        .expect("the engine did not stop")
+    {
+        rest.push(ev);
+    }
+    let refused = |e: &Event| matches!(e, Event::Error { message, .. } if message.contains("too many commands"));
+    let refusals: Vec<_> = rest.iter().filter(|e| refused(e)).collect();
+    assert_eq!(refusals.len(), 16 + 6, "{rest:?}");
+    // A refused compaction still ends, with its own id.
+    let ended: Vec<_> = rest
+        .iter()
+        .filter_map(|e| match e {
+            Event::CompactFinished { id, .. } => id.clone(),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(ended, (64..70).map(|i| format!("c{i}")).collect::<Vec<_>>());
+    assert!(
+        rest.iter().any(|e| matches!(e, Event::Warning { message }
+            if message.contains("64 queued commands were not run"))),
+        "{rest:?}"
+    );
+    assert!(
+        rest.iter()
+            .any(|e| matches!(e, Event::ApprovalWithdrawn { request_id: r } if *r == request_id)),
+        "{rest:?}"
+    );
+    // Refused commands are not logged.
+    let pins = records(&run.engine)
+        .iter()
+        .filter(|r| matches!(r, SessionRecord::Command(Command::Pin { .. })))
+        .count();
+    assert_eq!(pins, 64);
 }
 
 fn flood(deltas: usize, bash_calls: usize) -> MockTurn {

@@ -127,6 +127,8 @@ const COMMAND_METHODS: &[&str] = &[
 
 /// Lines waiting for the output before producers wait.
 const OUTPUT_CAPACITY: usize = 1024;
+/// The correlation id of the `Fork` a `session/new {fork}` sends.
+const FORK_ID: &str = "session/new";
 
 /// The command a method names, from its params (by name; `session_id` is the transport's
 /// and is ignored). Method names are the commands' wire names, so `send_message
@@ -656,7 +658,9 @@ async fn forward(
             },
         };
         let renamed = match &ev {
-            Event::SessionChanged { session_id } if *session_id != id => Some(session_id.clone()),
+            Event::SessionChanged { id: _, session_id } if *session_id != id => {
+                Some(session_id.clone())
+            }
             _ => None,
         };
         // Routed by the new id before the client can learn it.
@@ -1098,6 +1102,7 @@ async fn session_new(
                 shared.open(root, Some(parent.clone()), interactive).await?;
             let sent = engine
                 .send(Command::Fork {
+                    id: Some(FORK_ID.into()),
                     at: fork.at,
                     label: fork.label,
                 })
@@ -1108,10 +1113,14 @@ async fn session_new(
             while failure.is_none() && branch.is_none() {
                 match events.recv().await {
                     None => failure = Some("the session stopped".into()),
-                    Some(Event::SessionChanged { session_id }) if session_id == parent => {}
-                    Some(Event::SessionChanged { session_id }) => {
+                    // The fork's answer echoes its id; the resumed parent's own start does not.
+                    Some(Event::SessionChanged { id: None, .. }) => {}
+                    Some(Event::SessionChanged { id: _, session_id }) => {
                         branch = Some(session_id.clone());
-                        early.push(Event::SessionChanged { session_id });
+                        early.push(Event::SessionChanged {
+                            id: None,
+                            session_id,
+                        });
                     }
                     Some(Event::Error { message, .. }) => failure = Some(message),
                     Some(ev) => early.push(ev),

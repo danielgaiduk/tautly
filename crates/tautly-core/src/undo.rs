@@ -89,6 +89,7 @@ impl UndoReport {
                 .collect()
         };
         Event::Undone {
+            id: None,
             turn: self.turn,
             restored: rel(&self.restored),
             deleted: rel(&self.deleted),
@@ -1286,6 +1287,7 @@ impl Session {
             self.undo_command(turn, dry_run).await;
         } else {
             self.emit(Event::Error {
+                id: None,
                 kind: ErrorKind::Tool,
                 message: "undo cancelled: nothing was changed".into(),
                 retryable: false,
@@ -1374,6 +1376,7 @@ impl Session {
             _ => None,
         };
         self.emit(Event::Error {
+            id: None,
             kind: ErrorKind::Tool,
             message: format!("undo: {e}"),
             retryable: false,

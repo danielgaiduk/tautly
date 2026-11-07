@@ -448,26 +448,34 @@ impl Session {
     }
 
     /// `ConsolidateMemory` (between turns, as a task `Cancel` stops): the side model
-    /// proposes merges and deletions; each is a proposal of its own.
+    /// proposes merges and deletions; each is a proposal of its own. Ends with
+    /// `ConsolidateFinished`.
     pub(crate) async fn consolidate_command(&mut self, ctl: &TurnControl) {
         let unbound = self.events.clone();
         self.events = unbound.bound(ctl.cancel.clone());
-        self.consolidate(ctl).await;
+        let (applied, failed) = self.consolidate(ctl).await;
+        self.events
+            .emit_last(Event::ConsolidateFinished {
+                id: None,
+                applied,
+                failed,
+            })
+            .await;
         self.events = unbound;
     }
 
-    async fn consolidate(&mut self, ctl: &TurnControl) {
+    async fn consolidate(&mut self, ctl: &TurnControl) -> (u32, u32) {
         let _ = self.workspace.opened().await;
         let Some(store) = self.store() else {
             self.warn("memory consolidation: project memory is not available in this session")
                 .await;
-            return;
+            return (0, 0);
         };
         // Asked for by the user, outside any turn: the last turn's spend is no reason.
         if self.budget_exhausted().await == Some(BudgetScope::Session) {
             self.warn("memory consolidation not run: the session budget is used up")
                 .await;
-            return;
+            return (0, 0);
         }
         // Entries at about four bytes per token, within the side model's window.
         let room = u32::try_from(self.side.runner.max_input_bytes() / 4).unwrap_or(u32::MAX);
@@ -480,7 +488,7 @@ impl Session {
         let Ok(Some(request)) = request else {
             self.warn("memory consolidation: there are no memory entries")
                 .await;
-            return;
+            return (0, 0);
         };
         let runner = Arc::clone(&self.side.runner);
         let reply = tokio::select! {
@@ -492,11 +500,11 @@ impl Session {
             Some(Ok(reply)) => reply,
             Some(Err(e)) => {
                 self.warn(format!("memory consolidation failed: {e}")).await;
-                return;
+                return (0, 0);
             }
             None => {
                 self.warn("memory consolidation cancelled").await;
-                return;
+                return (0, 0);
             }
         };
         let parsed = tokio::task::spawn_blocking(move || {
@@ -508,25 +516,33 @@ impl Session {
             Ok(Ok(changes)) => changes,
             Ok(Err(e)) => {
                 self.warn(format!("memory consolidation failed: {e}")).await;
-                return;
+                return (0, 0);
             }
             Err(e) => {
                 self.warn(format!("memory consolidation failed: {e}")).await;
-                return;
+                return (0, 0);
             }
         };
         if changes.is_empty() {
             self.warn("memory consolidation: the side model proposed no changes")
                 .await;
-            return;
+            return (0, 0);
         }
+        let (mut applied, mut failed) = (0, 0);
         for change in changes {
-            let (events, _) = self.propose(change).await;
+            let (events, note) = self.propose(change).await;
+            // `propose`'s note for the model says what became of the change.
+            if note.starts_with("saved") {
+                applied += 1;
+            } else if note.starts_with("not saved") {
+                failed += 1;
+            }
             self.checkpoint().await;
             for ev in events {
                 self.emit(ev).await;
             }
         }
+        (applied, failed)
     }
 
     /// Write this session's episode (replacing an earlier one) with the side model, from

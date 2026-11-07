@@ -1219,10 +1219,15 @@ impl Session {
         match made {
             Ok((id, path)) => {
                 on_branch(&id, &path);
-                self.emit(Event::SessionChanged { session_id: id }).await;
+                self.emit(Event::SessionChanged {
+                    id: None,
+                    session_id: id,
+                })
+                .await;
             }
             Err(why) => {
                 self.emit(Event::Error {
+                    id: None,
                     kind: ErrorKind::Internal,
                     message: format!("fork: {why}"),
                     retryable: false,
@@ -1373,6 +1378,7 @@ impl Session {
         // Its end, whatever happened (sent even after a cancel: the client waits for it).
         self.events
             .emit_last(Event::CompactFinished {
+                id: None,
                 applied: after.is_some(),
                 tokens_freed: after.map_or(0, |a| before.saturating_sub(a)),
             })

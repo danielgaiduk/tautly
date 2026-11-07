@@ -418,6 +418,7 @@ fn undo_with_global_excludes(symlinked: bool) {
         while !matches!(next(&mut events).await, Event::TurnFinished { .. }) {}
         engine
             .send(Command::Undo {
+                id: None,
                 turn: None,
                 dry_run: false,
             })

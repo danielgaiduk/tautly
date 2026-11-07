@@ -168,6 +168,7 @@ impl Session {
                     _ => None,
                 };
                 Event::Error {
+                    id: None,
                     kind: ErrorKind::Internal,
                     message: format!("diff: {e}"),
                     retryable: false,

@@ -221,6 +221,7 @@ impl Run {
     /// The `SessionChanged` of a fork.
     async fn fork(&mut self, at: Option<u32>, label: &str) -> String {
         self.send(Command::Fork {
+            id: None,
             at,
             label: Some(label.into()),
         })
@@ -229,7 +230,7 @@ impl Run {
             .until(|e| matches!(e, Event::SessionChanged { .. } | Event::Error { .. }))
             .await;
         match events.last() {
-            Some(Event::SessionChanged { session_id }) => session_id.clone(),
+            Some(Event::SessionChanged { id: _, session_id }) => session_id.clone(),
             other => panic!("the fork failed: {other:?}"),
         }
     }
@@ -627,6 +628,7 @@ async fn a_cut_before_a_later_undo_leaves_the_undo_out() {
     let before = rebuild_at(&path, None);
     let last = before.context.next_turn() - 1;
     run.send(Command::Undo {
+        id: None,
         turn: Some(1),
         dry_run: false,
     })
@@ -874,6 +876,7 @@ async fn fork_creates_child_with_parent_offset() {
     assert_eq!(
         serde_json::from_str::<Command>(r#"{"type":"fork"}"#).unwrap(),
         Command::Fork {
+            id: None,
             at: None,
             label: None
         }
@@ -1060,6 +1063,7 @@ async fn fork_with_nothing_to_branch_from_is_refused() {
     let mut run = start(fx.builder(config(Mode::Ask), &mock));
     let parent = run.engine.session_path().to_path_buf();
     run.send(Command::Fork {
+        id: None,
         at: None,
         label: None,
     })
@@ -1386,7 +1390,7 @@ async fn a_manual_compact_or_uncompact_makes_the_next_epoch_cold() {
         let mock = MockProvider::new(script);
         let mut run = start(fx.builder(cfg, &mock));
         run.turn_with("first").await;
-        run.send(Command::Compact).await;
+        run.send(Command::Compact { id: None }).await;
         run.until(|e| matches!(e, Event::Compacted { .. })).await;
         if uncompact {
             // A request after the compaction warms the cache again.
@@ -1433,7 +1437,7 @@ async fn a_compact_that_changes_nothing_keeps_the_next_epoch_warm() {
     let mock = MockProvider::new(vec![text_step("first done"), text_step("second done")]);
     let mut run = start(fx.builder(cfg, &mock));
     run.turn_with("first").await;
-    run.send(Command::Compact).await;
+    run.send(Command::Compact { id: None }).await;
     run.until(
         |e| matches!(e, Event::Warning { message } if message.contains("nothing to compact")),
     )
@@ -1467,7 +1471,7 @@ async fn compact_ends_with_one_compact_finished() {
     let mock = MockProvider::new(script);
     let mut run = start(fx.builder(cfg, &mock));
     run.turn_with("first").await;
-    run.send(Command::Compact).await;
+    run.send(Command::Compact { id: None }).await;
     let events = run
         .until(|e| matches!(e, Event::CompactFinished { .. }))
         .await;
@@ -1477,12 +1481,12 @@ async fn compact_ends_with_one_compact_finished() {
         .unwrap_or_else(|| panic!("{events:?}"));
     assert!(compacted < events.len() - 1);
     assert!(
-        matches!(events.last(), Some(Event::CompactFinished { applied: true, tokens_freed })
+        matches!(events.last(), Some(Event::CompactFinished { id: _, applied: true, tokens_freed })
             if *tokens_freed > 0),
         "{events:?}"
     );
     // Again: nothing left to compact, so a warning, then the end.
-    run.send(Command::Compact).await;
+    run.send(Command::Compact { id: None }).await;
     let events = run
         .until(|e| matches!(e, Event::CompactFinished { .. }))
         .await;
@@ -1495,6 +1499,7 @@ async fn compact_ends_with_one_compact_finished() {
     assert!(matches!(
         events.last(),
         Some(Event::CompactFinished {
+            id: None,
             applied: false,
             tokens_freed: 0
         })
@@ -1585,7 +1590,7 @@ async fn uncompact_command_restores() {
     );
     let full = mock.requests().last().unwrap().clone();
 
-    run.send(Command::Compact).await;
+    run.send(Command::Compact { id: None }).await;
     let events = run
         .until(|e| matches!(e, Event::Compacted { .. } | Event::Error { .. }))
         .await;
@@ -1665,7 +1670,7 @@ async fn a_manual_compaction_can_be_cancelled() {
         matches!(e, Event::ContextStatus { warnings, .. }
             if warnings.iter().any(|w| w.contains("compacting")))
     };
-    run.send(Command::Compact).await;
+    run.send(Command::Compact { id: None }).await;
     run.until(compacting).await;
     run.send(Command::Cancel).await;
     let quick = Duration::from_secs(5);
@@ -1683,7 +1688,7 @@ async fn a_manual_compaction_can_be_cancelled() {
     run.turn_with("next").await;
     assert!(text_of(mock.requests().last().unwrap()).contains("answer 1"));
 
-    run.send(Command::Compact).await;
+    run.send(Command::Compact { id: None }).await;
     run.until(compacting).await;
     let path = run.engine.session_path().to_path_buf();
     tokio::time::timeout(quick, run.stop())
@@ -1738,15 +1743,17 @@ async fn replies_to_commands_wait_for_a_client_that_is_behind() {
         .await;
     }
     run.send(Command::Undo {
+        id: None,
         turn: None,
         dry_run: true,
     })
     .await;
     run.send(Command::SetModel {
+        id: None,
         model: ModelId::from(MODEL),
     })
     .await;
-    run.send(Command::Compact).await;
+    run.send(Command::Compact { id: None }).await;
     run.send(Command::Uncompact).await;
     tokio::time::sleep(Duration::from_millis(100)).await;
     let mut events = Vec::new();
@@ -1797,7 +1804,7 @@ async fn a_lost_session_still_answers_compact_and_set_model() {
     });
     run.say("crash").await;
     run.until(|e| matches!(e, Event::TurnFinished { .. })).await;
-    run.send(Command::Compact).await;
+    run.send(Command::Compact { id: None }).await;
     let events = run
         .until(|e| matches!(e, Event::CompactFinished { .. }))
         .await;
@@ -1810,11 +1817,13 @@ async fn a_lost_session_still_answers_compact_and_set_model() {
     assert!(matches!(
         events.last(),
         Some(Event::CompactFinished {
+            id: None,
             applied: false,
             tokens_freed: 0
         })
     ));
     run.send(Command::SetModel {
+        id: None,
         model: ModelId::from("mock/other"),
     })
     .await;
@@ -1843,7 +1852,7 @@ async fn a_panic_in_a_compaction_job_logs_no_turn_end() {
     for i in 1..=3 {
         run.turn_with(&format!("message {i}")).await;
     }
-    run.send(Command::Compact).await;
+    run.send(Command::Compact { id: None }).await;
     let events = run
         .until(|e| matches!(e, Event::Error { message, .. } if message.contains("panicked")))
         .await;

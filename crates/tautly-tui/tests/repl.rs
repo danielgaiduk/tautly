@@ -236,13 +236,40 @@ async fn run(fx: &Fx, lines: Vec<Line>, cfg: Config, mock: &MockProvider) -> Ran
 }
 
 /// The commands a session log recorded.
+/// The logged commands, without their correlation ids (each command that takes one was
+/// sent with its own: checked here).
 fn logged_commands(log: &Path) -> Vec<Command> {
     let reader = SessionReader::<SessionRecord>::open(log).unwrap();
-    reader
+    let cmds: Vec<Command> = reader
         .records()
         .filter_map(|r| match r.ok()?.1 {
             SessionRecord::Command(c) => Some(c),
             _ => None,
+        })
+        .collect();
+    let mut ids = std::collections::HashSet::new();
+    cmds.into_iter()
+        .map(|c| {
+            let mut v = serde_json::to_value(&c).unwrap();
+            if let Some(id) = v.as_object_mut().unwrap().remove("id") {
+                assert!(ids.insert(id.clone()), "id {id} used twice");
+            } else {
+                assert!(
+                    !matches!(
+                        c,
+                        Command::Undo { .. }
+                            | Command::Fork { .. }
+                            | Command::Rewind { .. }
+                            | Command::Switch { .. }
+                            | Command::Replay { .. }
+                            | Command::Compact { .. }
+                            | Command::SetModel { .. }
+                            | Command::ConsolidateMemory { .. }
+                    ),
+                    "sent without an id: {c:?}"
+                );
+            }
+            serde_json::from_value(v).unwrap()
         })
         .collect()
 }
@@ -820,27 +847,32 @@ async fn slash_commands_map() {
         .collect();
     let want = vec![
         Command::SetModel {
+            id: None,
             model: ModelId::from("compat:nowhere/x"),
         },
         Command::Diff { turn: Some(2) },
         Command::Diff { turn: None },
         Command::Undo {
+            id: None,
             turn: None,
             dry_run: true,
         },
         Command::Undo {
-            turn: None,
+            id: None,
+            turn: Some(1), // the turn the dry run showed
             dry_run: false,
         },
         Command::Undo {
+            id: None,
             turn: None,
             dry_run: true,
         },
-        Command::Compact,
+        Command::Compact { id: None },
         Command::Pin { text: "a".into() },
         Command::Unpin { text: "a".into() },
-        Command::ConsolidateMemory,
+        Command::ConsolidateMemory { id: None },
         Command::Fork {
+            id: None,
             at: None,
             label: None,
         },
@@ -1066,10 +1098,30 @@ struct Live {
 }
 
 fn live(fx: &Fx, mock: &MockProvider) -> Live {
+    live_on(fx, mock, None)
+}
+
+/// A workspace whose index and memory store are open (a session then writes its episode
+/// at shutdown, with the side model).
+async fn ready_workspace(fx: &Fx) -> Arc<Workspace> {
+    let sb: Arc<dyn Sandbox> = Arc::new(LocalSandbox::new(fx.root()).unwrap());
+    let ws = Workspace::new(sb, fx.home.path());
+    ws.start();
+    assert!(ws.wait_ready(WAIT).await, "index never became ready");
+    for _ in 0..300 {
+        if ws.memory().is_some() {
+            return ws;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("memory never opened");
+}
+
+fn live_on(fx: &Fx, mock: &MockProvider, ws: Option<Arc<Workspace>>) -> Live {
     let (lines, source) = ScriptedSource::channel();
     let (sigint, signals) = mpsc::unbounded_channel();
     let out = Buf::default();
-    let f = factory(fx, config(Mode::Ask, false), mock, None, &Built::default());
+    let f = factory(fx, config(Mode::Ask, false), mock, ws, &Built::default());
     let done = tokio::spawn(run_repl(
         f,
         source,
@@ -1147,6 +1199,63 @@ async fn ctrl_c_once_cancels_twice_within_2s_exits() {
         .expect("Ctrl+D did not exit")
         .unwrap()
         .unwrap();
+}
+
+#[tokio::test]
+async fn a_ctrl_c_while_the_session_closes_exits_at_once() {
+    // Review CP5-A M6: the session's episode (a side request) stalls its shutdown.
+    let fx = Fx::new();
+    let mock = MockProvider::new(vec![text_step("hello there"), MockTurn::Stall]);
+    let l = live_on(&fx, &mock, Some(ready_workspace(&fx).await));
+    l.lines.send(text("hi")).unwrap();
+    wait_for(&l.out, "hello there", 1).await;
+    drop(l.lines);
+    wait_requests(&mock, 2).await;
+    let begin = Instant::now();
+    l.sigint.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(2), l.done)
+        .await
+        .expect("the REPL waited for the session after a Ctrl+C")
+        .unwrap()
+        .unwrap();
+    assert!(begin.elapsed() < Duration::from_secs(2));
+}
+
+#[tokio::test]
+async fn after_a_ctrl_c_exit_the_close_is_bounded() {
+    // The second Ctrl+C exits; the session's slow shutdown is waited for 3 s at most.
+    let fx = Fx::new();
+    let mock = MockProvider::new(vec![
+        text_step("hello there"),
+        MockTurn::Stall,
+        MockTurn::Stall,
+    ]);
+    let l = live_on(&fx, &mock, Some(ready_workspace(&fx).await));
+    l.lines.send(text("hi")).unwrap();
+    wait_for(&l.out, "hello there", 1).await;
+    l.lines.send(text("go")).unwrap();
+    wait_requests(&mock, 2).await;
+    l.sigint.send(()).unwrap();
+    wait_for(&l.out, "turn cancelled", 1).await;
+    let begin = Instant::now();
+    l.lines.send(Line::CtrlC).unwrap();
+    tokio::time::timeout(Duration::from_secs(6), l.done)
+        .await
+        .expect("the close was not bounded")
+        .unwrap()
+        .unwrap();
+    assert!(
+        begin.elapsed() < Duration::from_secs(5),
+        "{:?}",
+        begin.elapsed()
+    );
+    // The episode was asked for, and stalls: the close did not wait for it.
+    assert_eq!(mock.requests().len(), 3);
+    assert!(
+        l.out.text().contains("Ctrl+C to stop now"),
+        "{}",
+        l.out.text()
+    );
 }
 
 #[tokio::test]
@@ -1361,6 +1470,7 @@ fn session_ids_are_escaped() {
     let mut st = RenderState::default();
     let opts = plain();
     let changed = |id: &str| Event::SessionChanged {
+        id: None,
         session_id: id.into(),
     };
     render::event(&changed("01A"), &mut st, &opts);
@@ -1720,12 +1830,14 @@ async fn repl_rewind_dry_run_then_apply_and_tree_switch_label() {
         got,
         vec![
             Command::Rewind {
+                id: None,
                 at: 3,
                 label: None,
                 dry_run: true,
                 overwrite: vec![],
             },
             Command::Rewind {
+                id: None,
                 at: 3,
                 label: None,
                 dry_run: false,
@@ -1802,6 +1914,7 @@ fn a_replayed_model_switch_does_not_change_the_model() {
         offset: 3,
         t_ms: 0,
         event: Box::new(Event::ModelChanged {
+            id: None,
             model: ModelId::from("mock/old"),
             provider: "mock".into(),
         }),

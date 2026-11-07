@@ -251,6 +251,7 @@ async fn a_pin_sent_during_a_fork_is_logged_in_the_branch(git: &Path) {
         .unwrap();
     run.engine
         .send(Command::Fork {
+            id: None,
             at: None,
             label: None,
         })
@@ -264,7 +265,8 @@ async fn a_pin_sent_during_a_fork_is_logged_in_the_branch(git: &Path) {
         .await
         .unwrap();
     let first = run.engine.session_id().to_string();
-    while !matches!(run.next().await, Event::SessionChanged { session_id } if session_id != first) {
+    while !matches!(run.next().await, Event::SessionChanged { id: _, session_id } if session_id != first)
+    {
     }
     let (_, branch) = run.engine.current_session();
     assert_ne!(branch, parent);
@@ -273,7 +275,7 @@ async fn a_pin_sent_during_a_fork_is_logged_in_the_branch(git: &Path) {
     assert_eq!(pins(&branch), ["BEFORE", "DURING"]);
 }
 
-/// Re-review 2 M1: commands held while a fork runs are bounded (a warning for each one
+/// Re-review 2 M1: commands held while a fork runs are bounded (an error for each one
 /// dropped past the bound), and those a `Shutdown` leaves unrun are said once.
 async fn commands_held_during_a_fork_are_bounded_and_unrun_ones_said(git: &Path) {
     let (dir, home) = repo(git);
@@ -287,6 +289,7 @@ async fn commands_held_during_a_fork_are_bounded_and_unrun_ones_said(git: &Path)
         .unwrap();
     run.engine
         .send(Command::Fork {
+            id: None,
             at: None,
             label: None,
         })
@@ -315,7 +318,14 @@ async fn commands_held_during_a_fork_are_bounded_and_unrun_ones_said(git: &Path)
             .filter(|e| matches!(e, Event::Warning { message } if message.contains(s)))
             .count()
     };
-    assert_eq!(warned("while a fork runs"), 6, "{events:?}");
+    // Past the bound each is refused (CP5-A M1), unlogged.
+    let refused = events
+        .iter()
+        .filter(
+            |e| matches!(e, Event::Error { message, .. } if message.contains("too many commands")),
+        )
+        .count();
+    assert_eq!(refused, 6, "{events:?}");
     assert_eq!(warned("not run"), 1, "{events:?}");
 }
 
@@ -351,6 +361,7 @@ fn cancel_while_the_session_start_checkpoint_is_taken_ends_the_turn_within_200ms
         shutdown_while_a_command_waits(
             &git,
             Command::Undo {
+                id: None,
                 turn: None,
                 dry_run: true,
             },
@@ -361,6 +372,7 @@ fn cancel_while_the_session_start_checkpoint_is_taken_ends_the_turn_within_200ms
         shutdown_while_a_command_waits(
             &git,
             Command::Fork {
+                id: None,
                 at: None,
                 label: None,
             },

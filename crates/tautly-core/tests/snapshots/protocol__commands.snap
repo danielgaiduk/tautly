@@ -132,6 +132,12 @@ expression: every_command()
     "from_step": 4
   },
   {
+    "type": "undo",
+    "id": "u-1",
+    "turn": 1,
+    "dry_run": true
+  },
+  {
     "type": "shutdown"
   }
 ]

@@ -276,7 +276,7 @@ fn methods_map_to_commands() {
                 max_tokens: None,
             },
         ),
-        ("compact", json!({}), Command::Compact),
+        ("compact", json!({}), Command::Compact { id: None }),
         ("uncompact", json!({}), Command::Uncompact),
         (
             "pin",
@@ -306,11 +306,16 @@ fn methods_map_to_commands() {
                 proposal_id: "p1".into(),
             },
         ),
-        ("consolidate_memory", json!({}), Command::ConsolidateMemory),
+        (
+            "consolidate_memory",
+            json!({}),
+            Command::ConsolidateMemory { id: None },
+        ),
         (
             "fork",
             json!({"at": 3, "label": "try b"}),
             Command::Fork {
+                id: None,
                 at: Some(3),
                 label: Some("try b".into()),
             },
@@ -319,6 +324,7 @@ fn methods_map_to_commands() {
             "fork",
             json!({}),
             Command::Fork {
+                id: None,
                 at: None,
                 label: None,
             },
@@ -327,6 +333,7 @@ fn methods_map_to_commands() {
             "set_model",
             json!({"model": "openai/gpt-5"}),
             Command::SetModel {
+                id: None,
                 model: ModelId::from("openai/gpt-5"),
             },
         ),
@@ -336,6 +343,7 @@ fn methods_map_to_commands() {
             "undo",
             json!({"dry_run": true}),
             Command::Undo {
+                id: None,
                 turn: None,
                 dry_run: true,
             },
@@ -344,6 +352,7 @@ fn methods_map_to_commands() {
             "undo",
             json!({"turn": 1}),
             Command::Undo {
+                id: None,
                 turn: Some(1),
                 dry_run: false,
             },
@@ -352,6 +361,7 @@ fn methods_map_to_commands() {
             "rewind",
             json!({"at": 3, "dry_run": true}),
             Command::Rewind {
+                id: None,
                 at: 3,
                 label: None,
                 dry_run: true,
@@ -362,6 +372,7 @@ fn methods_map_to_commands() {
             "rewind",
             json!({"at": 2, "label": "b", "overwrite": ["a.txt"]}),
             Command::Rewind {
+                id: None,
                 at: 2,
                 label: Some("b".into()),
                 dry_run: false,
@@ -372,6 +383,7 @@ fn methods_map_to_commands() {
             "switch",
             json!({"target": "01X", "session_id": "s1"}),
             Command::Switch {
+                id: None,
                 session_id: "01X".into(),
                 dry_run: false,
                 overwrite: vec![],
@@ -388,6 +400,7 @@ fn methods_map_to_commands() {
             "replay",
             json!({"target": "01X", "session_id": "s1", "speed": 0, "from_step": 3}),
             Command::Replay {
+                id: None,
                 session_id: Some("01X".into()),
                 speed: 0.0,
                 from_step: Some(3),
@@ -398,6 +411,7 @@ fn methods_map_to_commands() {
             "replay",
             json!({"session_id": "s1"}),
             Command::Replay {
+                id: None,
                 session_id: None,
                 speed: 1.0,
                 from_step: None,

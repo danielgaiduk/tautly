@@ -561,15 +561,17 @@ async fn a_fork_right_after_a_cancel_leaves_the_recovered_checkpoint_in_the_pare
     cancelled_turn(&mut run).await;
     run.engine
         .send(Command::Fork {
+            id: Some("f-1".into()),
             at: None,
             label: None,
         })
         .await
         .unwrap();
-    wait_for(&mut run.events, |e| {
+    let answer = wait_for(&mut run.events, |e| {
         matches!(e, Event::SessionChanged { .. } | Event::Error { .. })
     })
     .await;
+    assert_eq!(answer.reply_id(), Some("f-1"), "{answer:?}");
     let branch = run.engine.current_session().1;
     assert_ne!(branch, parent);
     run.stop().await;

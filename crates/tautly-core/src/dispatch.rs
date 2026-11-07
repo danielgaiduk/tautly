@@ -504,6 +504,7 @@ impl Session {
             v = rx => v.unwrap_or(Verdict::Denied { reason: None }),
             () = ctl.cancel.cancelled() => {
                 ctl.approvals.withdraw(&request_id);
+                self.emit(Event::ApprovalWithdrawn { request_id }).await;
                 return Err(Outcome::cancelled());
             }
         };

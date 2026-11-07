@@ -243,7 +243,12 @@ impl Run {
 
     /// Send `Undo` and wait for its answer (`Undone`, or the `Error`).
     async fn undo(&mut self, turn: Option<u32>, dry_run: bool) -> Event {
-        self.send(Command::Undo { turn, dry_run }).await;
+        self.send(Command::Undo {
+            id: None,
+            turn,
+            dry_run,
+        })
+        .await;
         let evs = self
             .until(|e| matches!(e, Event::Undone { .. } | Event::Error { .. }))
             .await;
@@ -256,6 +261,7 @@ impl Run {
 
     async fn fork_at(&mut self, at: Option<u32>) -> String {
         self.send(Command::Fork {
+            id: None,
             at,
             label: Some("branch".into()),
         })
@@ -265,7 +271,7 @@ impl Run {
             .await;
         assert!(warnings(&evs).is_empty(), "{evs:?}");
         match evs.last() {
-            Some(Event::SessionChanged { session_id }) => session_id.clone(),
+            Some(Event::SessionChanged { id: _, session_id }) => session_id.clone(),
             other => panic!("the fork failed: {other:?}"),
         }
     }
@@ -781,6 +787,7 @@ async fn non_git_dir_has_no_checkpointer_and_undo_notes_it() {
     run.turn_with("go").await;
     match run.undo(None, false).await {
         Event::Undone {
+            id: _,
             turn,
             restored,
             deleted,
@@ -836,6 +843,7 @@ async fn undo_reverts_bash_side_effects() {
     let (_, path) = run.engine.current_session();
     run.stop().await;
     let Event::Undone {
+        id: None,
         turn,
         restored,
         deleted,

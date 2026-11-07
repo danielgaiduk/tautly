@@ -256,6 +256,9 @@ pub enum Event {
     /// session (a crashed turn) cannot run. Like `TurnFinished`, it waits a bounded time
     /// (5 s) for a client that is behind, then is dropped.
     CompactFinished {
+        /// The `id` of the command this answers, when it carried one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
         applied: bool,
         tokens_freed: u32,
     },
@@ -279,6 +282,9 @@ pub enum Event {
         replaces: Vec<MemoryEntry>,
     },
     SessionChanged {
+        /// The `id` of the command this answers, when it carried one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
         session_id: String,
     },
     /// What user turn `turn` (1-based) spent and saved (spec 7.11.1), sent right before its
@@ -317,6 +323,9 @@ pub enum Event {
         evidence: Option<TestEvidence>,
     },
     Error {
+        /// The `id` of the command this answers, when it carried one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
         kind: ErrorKind,
         message: String,
         retryable: bool,
@@ -334,6 +343,9 @@ pub enum Event {
     /// The answer to a successful [`Command::SetModel`]: the model requests go to from now
     /// on, and its provider (`anthropic`, `openai`, `google` or `compat:<name>`).
     ModelChanged {
+        /// The `id` of the command this answers, when it carried one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
         model: ModelId,
         provider: String,
     },
@@ -357,6 +369,9 @@ pub enum Event {
     /// the ref of the snapshot taken just before (`git` can restore it), and a `note` on
     /// what was not undone.
     Undone {
+        /// The `id` of the command this answers, when it carried one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
         turn: u32,
         restored: Vec<String>,
         deleted: Vec<String>,
@@ -370,6 +385,9 @@ pub enum Event {
     /// new session the engine continues on when it was applied (then
     /// [`Event::SessionChanged`] follows), else empty.
     Rewound {
+        /// The `id` of the command this answers, when it carried one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
         at: u32,
         branch: String,
         report: MaterializeReport,
@@ -378,6 +396,9 @@ pub enum Event {
     /// to (or, without `report.applied`, the one that would be); [`Event::SessionChanged`]
     /// follows when it was applied.
     Switched {
+        /// The `id` of the command this answers, when it carried one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
         branch: String,
         report: MaterializeReport,
     },
@@ -401,9 +422,33 @@ pub enum Event {
     /// which need not be the one the event is sent on): `events` [`Event::Replayed`] were
     /// sent; `cancelled` when a `Cancel` stopped it.
     ReplayFinished {
+        /// The `id` of the command this answers, when it carried one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
         session_id: String,
         events: u32,
         cancelled: bool,
+    },
+    /// The end of a [`Command::ConsolidateMemory`], sent exactly once per command, last
+    /// (after its `MemoryProposed` events and warnings), waiting a bounded time like
+    /// `CompactFinished`: `applied` changes were saved without asking (`approve_memory`),
+    /// `failed` could not be saved or were refused (headless). Changes asked about were
+    /// sent as `MemoryProposed` before this.
+    ConsolidateFinished {
+        /// The `id` of the command this answers, when it carried one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        #[serde(default)]
+        applied: u32,
+        #[serde(default)]
+        failed: u32,
+    },
+    /// The approval request `request_id` (a [`Event::ToolApprovalRequested`] or
+    /// [`Event::McpServerApprovalRequested`]) is no longer waiting: its turn was cancelled
+    /// (or timed out, or hit a budget) or the session is shutting down. A client closes
+    /// the question it shows; an answer to it now only gets a warning.
+    ApprovalWithdrawn {
+        request_id: String,
     },
     /// The user's message that started a turn. Sent only inside [`Event::Replayed`] (a
     /// live client knows what it sent).
@@ -416,6 +461,44 @@ pub enum Event {
 }
 
 impl Event {
+    /// The `id` echoed from the command this event answers.
+    pub fn reply_id(&self) -> Option<&str> {
+        match self {
+            Event::CompactFinished { id, .. }
+            | Event::SessionChanged { id, .. }
+            | Event::Error { id, .. }
+            | Event::ModelChanged { id, .. }
+            | Event::Undone { id, .. }
+            | Event::Rewound { id, .. }
+            | Event::Switched { id, .. }
+            | Event::ReplayFinished { id, .. }
+            | Event::ConsolidateFinished { id, .. } => id.as_deref(),
+            _ => None,
+        }
+    }
+
+    /// Set the echoed `id` (when this event can carry one and has none yet).
+    pub fn set_reply_id(&mut self, reply: &str) {
+        if let Event::CompactFinished { id, .. }
+        | Event::SessionChanged { id, .. }
+        | Event::Error { id, .. }
+        | Event::ModelChanged { id, .. }
+        | Event::Undone { id, .. }
+        | Event::Rewound { id, .. }
+        | Event::Switched { id, .. }
+        | Event::ReplayFinished { id, .. }
+        | Event::ConsolidateFinished { id, .. } = self
+            && id.is_none()
+        {
+            *id = Some(reply.to_string());
+        }
+    }
+
+    /// Whether this answers the command whose correlation id is `want` (None: any).
+    pub fn answers(&self, want: Option<&str>) -> bool {
+        want.is_none() || self.reply_id() == want
+    }
+
     /// A [`Event::ContextStatus`] from the context crate's status.
     pub fn context_status(status: &ContextStatus) -> Event {
         Event::ContextStatus {
@@ -492,7 +575,11 @@ pub enum Command {
         max_usd: Option<f64>,
         max_tokens: Option<u64>,
     },
-    Compact,
+    Compact {
+        /// The client's correlation id, echoed as `id` on this command's answer.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+    },
     Uncompact,
     Pin {
         text: String,
@@ -507,12 +594,19 @@ pub enum Command {
     RejectMemory {
         proposal_id: String,
     },
-    ConsolidateMemory,
+    ConsolidateMemory {
+        /// The client's correlation id, echoed as `id` on this command's answer.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+    },
     /// Branch the conversation (spec 7.12.3): a new session whose log is this one's
     /// records up to the end of step `at` (default: the tip), copied verbatim, with
     /// `origin: fork` and `label`. Files are not touched. Answered with
     /// [`Event::SessionChanged`] naming the branch, on which the engine continues.
     Fork {
+        /// The client's correlation id, echoed as `id` on this command's answer.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
         #[serde(default)]
         at: Option<u32>,
         #[serde(default)]
@@ -527,6 +621,9 @@ pub enum Command {
     /// the next user turn. Answered with [`Event::ModelChanged`], or an `Error` that leaves
     /// the model as it was.
     SetModel {
+        /// The client's correlation id, echoed as `id` on this command's answer.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
         model: ModelId,
     },
     /// Revert the file changes of user turn `turn` (1-based; default: the last), its
@@ -534,6 +631,9 @@ pub enum Command {
     /// turn to end. Answered with [`Event::Undone`], or an `Error` (nothing changed) when a
     /// file was changed since by someone else or by a later turn that is not undone.
     Undo {
+        /// The client's correlation id, echoed as `id` on this command's answer.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
         #[serde(default)]
         turn: Option<u32>,
         #[serde(default)]
@@ -548,6 +648,9 @@ pub enum Command {
     /// write. Refused while another live session uses the working tree. Waits for a
     /// running turn to end. Answered with [`Event::Rewound`], or an `Error`.
     Rewind {
+        /// The client's correlation id, echoed as `id` on this command's answer.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
         at: u32,
         #[serde(default)]
         label: Option<String>,
@@ -560,6 +663,9 @@ pub enum Command {
     /// materialized in place under the same conflict rules, backup and lease as
     /// [`Command::Rewind`]. Answered with [`Event::Switched`], or an `Error`.
     Switch {
+        /// The client's correlation id, echoed as `id` on this command's answer.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
         session_id: String,
         #[serde(default)]
         dry_run: bool,
@@ -575,9 +681,12 @@ pub enum Command {
     /// records' timestamps (each gap divided by `speed` and capped at 2 s; `speed` 0 is
     /// instant), from step `from_step` on (default: the start), then
     /// [`Event::ReplayFinished`]. Read-only: no provider request, no tool, no file
-    /// access beyond the log and its blobs. Idle only: while anything runs it is answered
-    /// with an `Error`. `Cancel` stops it.
+    /// access beyond the log and its blobs. Idle only: while anything runs (a turn, a job, the start-up, a `SetModel`
+    /// provider build) it is answered with an `Error`. `Cancel` stops it.
     Replay {
+        /// The client's correlation id, echoed as `id` on this command's answer.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
         #[serde(default)]
         session_id: Option<String>,
         #[serde(default = "one")]
@@ -598,6 +707,21 @@ fn one() -> f32 {
 }
 
 impl Command {
+    /// The client's correlation id, on the commands that have a terminal answer.
+    pub fn id(&self) -> Option<&str> {
+        match self {
+            Command::Undo { id, .. }
+            | Command::Fork { id, .. }
+            | Command::Rewind { id, .. }
+            | Command::Switch { id, .. }
+            | Command::Replay { id, .. }
+            | Command::Compact { id }
+            | Command::SetModel { id, .. }
+            | Command::ConsolidateMemory { id } => id.as_deref(),
+            _ => None,
+        }
+    }
+
     /// The command as the session log records it: an `Approve` without its
     /// `session_rule`, which is consent for this process only and never stored (spec 5.5).
     pub fn for_log(&self) -> Command {

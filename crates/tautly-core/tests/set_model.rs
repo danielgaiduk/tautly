@@ -233,7 +233,11 @@ impl Run {
 
     /// `SetModel`, then the events up to its answer (`ModelChanged` or an `Error`).
     async fn set_model(&mut self, model: &str) -> Vec<Event> {
-        self.send(Command::SetModel { model: m(model) }).await;
+        self.send(Command::SetModel {
+            id: None,
+            model: m(model),
+        })
+        .await;
         self.until(|e| matches!(e, Event::ModelChanged { .. } | Event::Error { .. }))
             .await
     }
@@ -319,6 +323,7 @@ async fn set_model_idle_applies_immediately_and_emits_model_changed() {
     assert_eq!(
         answer.last(),
         Some(&Event::ModelChanged {
+            id: None,
             model: m("openai/o1"),
             provider: "openai".into(),
         }),
@@ -370,6 +375,7 @@ async fn set_model_during_turn_applies_at_next_user_turn() {
     };
     // Mid-turn: queued, not applied.
     run.send(Command::SetModel {
+        id: None,
         model: m("openai/o1"),
     })
     .await;
@@ -428,6 +434,7 @@ async fn unknown_model_or_missing_key_errors_and_keeps_model() {
         let answer = run.set_model(model).await;
         match answer.last() {
             Some(Event::Error {
+                id: _,
                 kind: ErrorKind::ProviderFatal,
                 retryable: false,
                 hint: Some(hint),
@@ -1169,6 +1176,7 @@ async fn shutdown_does_not_wait_for_a_slow_provider_build() {
         ..fx.builder(config("anthropic/a1"), &mock)
     });
     run.send(Command::SetModel {
+        id: None,
         model: m("openai/o1"),
     })
     .await;
@@ -1207,6 +1215,67 @@ async fn shutdown_does_not_wait_for_a_slow_provider_build() {
             .iter()
             .any(|r| matches!(r, SessionRecord::ModelSet { .. }))
     );
+}
+
+#[tokio::test]
+async fn a_replay_during_a_provider_build_is_refused_and_answers_echo_ids() {
+    // Review CP5-A M9 (refused, not queued behind the switch) and M4 (correlation ids).
+    use std::sync::Mutex;
+    let fx = Fx::new();
+    let mock = MockProvider::new(vec![]);
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let (entered_tx, release_rx) = (Mutex::new(entered_tx), Mutex::new(release_rx));
+    let built = mock.clone();
+    let slow: ProviderFactory = Arc::new(move |_: &ModelId| {
+        let _ = entered_tx.lock().unwrap().send(());
+        let _ = release_rx.lock().unwrap().recv();
+        Ok(Arc::new(built.clone()) as Arc<dyn Provider>)
+    });
+    let mut run = start(EngineBuilder {
+        provider_factory: Some(slow),
+        ..fx.builder(config("anthropic/a1"), &mock)
+    });
+    run.send(Command::SetModel {
+        id: Some("sm-1".into()),
+        model: m("openai/o1"),
+    })
+    .await;
+    tokio::task::spawn_blocking(move || entered_rx.recv_timeout(WAIT))
+        .await
+        .unwrap()
+        .expect("the factory never ran");
+    run.send(Command::Replay {
+        id: Some("r-1".into()),
+        session_id: None,
+        speed: 0.0,
+        from_step: None,
+    })
+    .await;
+    // Time for the actor to take the replay while the build still waits (the commands
+    // that arrive meanwhile are handled once it ends).
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let _ = release_tx.send(());
+    let (mut changed, mut busy) = (false, false);
+    while !(changed && busy) {
+        match run.next().await {
+            Event::ModelChanged { id, .. } => {
+                assert_eq!(id.as_deref(), Some("sm-1"));
+                changed = true;
+            }
+            Event::Error { id, message, .. } => {
+                assert_eq!(message, tautly_core::replay::REPLAY_BUSY);
+                assert_eq!(id.as_deref(), Some("r-1"));
+                busy = true;
+            }
+            _ => {}
+        }
+    }
+    // Nothing was queued: no replay follows.
+    run.send(Command::Shutdown).await;
+    while let Some(ev) = run.events.recv().await {
+        assert!(!matches!(ev, Event::ReplayFinished { .. }), "{ev:?}");
+    }
 }
 
 // ----------------------------------------------------------- resume and fork after a switch
@@ -1453,6 +1522,7 @@ async fn a_fork_before_a_later_switch_is_on_the_model_of_its_cut() {
     run.set_model("anthropic/a2").await;
     // Steps: 1 "one", 2 its answer, (switch to o1), 3 "two", 4 its answer, (switch to a2).
     run.send(Command::Fork {
+        id: None,
         at: Some(2),
         label: None,
     })

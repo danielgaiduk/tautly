@@ -233,6 +233,7 @@ impl Events<'_> {
             SessionRecord::ModelSet { model } => {
                 self.model = Some(model.clone());
                 vec![Event::ModelChanged {
+                    id: None,
                     provider: provider_label(&model),
                     model,
                 }]
@@ -507,6 +508,7 @@ impl Session {
             .clone()
             .unwrap_or_else(|| self.session_id.clone());
         let finish = |session_id: String, events: u32, cancelled: bool| Event::ReplayFinished {
+            id: None,
             session_id,
             events,
             cancelled,
@@ -603,6 +605,7 @@ impl Session {
 
 fn replay_error(message: &str) -> Event {
     Event::Error {
+        id: None,
         kind: ErrorKind::Internal,
         message: message.to_string(),
         retryable: false,
