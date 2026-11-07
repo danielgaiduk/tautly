@@ -25,6 +25,8 @@ tautly-provider = { path = "../tautly-provider", optional = true }
 # `tautly doctor`: the code index's state and where its database lives.
 tautly-index = { path = "../tautly-index" }
 tautly-session = { path = "../tautly-session" }
+# `tautly doctor`: git found on PATH as checkpoints find it (`which_outside`).
+tautly-sandbox = { path = "../tautly-sandbox" }
 anyhow.workspace = true
 clap.workspace = true
 futures.workspace = true
@@ -40,7 +42,6 @@ insta.workspace = true
 tokio.workspace = true
 wiremock.workspace = true
 # A real index database for the doctor's read-only index check.
-tautly-sandbox = { path = "../tautly-sandbox" }
 rusqlite.workspace = true
 # The REPL test drives the binary through a pseudo-terminal (openpty).
 libc.workspace = true

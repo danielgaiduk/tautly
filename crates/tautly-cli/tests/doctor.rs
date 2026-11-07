@@ -225,6 +225,44 @@ async fn doctor_missing_git_is_warn_not_fail() {
     assert!(git[0].contains("checkpoints"), "{text}");
 }
 
+/// CP5 review I1: a `git` the repository ships, reached through a relative or empty `PATH`
+/// entry, is never run; when it is the only one, the warning names it as skipped.
+#[tokio::test(flavor = "multi_thread")]
+async fn doctor_never_runs_a_repository_git() {
+    use std::os::unix::fs::PermissionsExt;
+    let s = Scratch::new();
+    let marker = s.work.path().join("repo-git-ran");
+    let fake = format!(
+        "#!/bin/sh\necho ran >> '{}'\necho 'git version 9.9 (repo)'\n",
+        marker.display()
+    );
+    std::fs::create_dir(s.work.path().join("bin")).unwrap();
+    for p in ["bin/git", "git"] {
+        let p = s.work.path().join(p);
+        std::fs::write(&p, &fake).unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let real = std::env::split_paths(&std::env::var_os("PATH").unwrap())
+        .find(|d| d.join("git").is_file())
+        .unwrap();
+    for (path, level) in [
+        (format!(":bin:{}", real.display()), "ok"),
+        (":bin".to_string(), "warn"),
+    ] {
+        let mut cmd = s.command(&["doctor", "--offline"]);
+        cmd.env("ANTHROPIC_API_KEY", ANTHROPIC_KEY)
+            .env("PATH", &path);
+        let text = stdout(&run(cmd).await);
+        let git = lines(&text, level, "git");
+        assert_eq!(git.len(), 1, "PATH={path}: {text}");
+        assert!(!git[0].contains("9.9"), "PATH={path}: {text}");
+        if level == "warn" {
+            assert!(git[0].contains("skipped"), "{text}");
+        }
+    }
+    assert!(!marker.exists(), "the repository's git ran");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn doctor_reports_pending_repo_mcp_approval_as_warn() {
     let s = Scratch::new();
