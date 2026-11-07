@@ -747,7 +747,7 @@ Every operation here creates a new branch or a new view. None truncates a log, a
   | `ToolCall` | `ToolCallProposed` |
   | `ApprovalRequested` (a tool's) | `ToolApprovalRequested` (no `diff`; id prefixed `replayed:`) |
   | `ToolResult` | `ToolFinished` (output from its blob, no `diff`) |
-  | provider usage | `Usage` (the response's last, after its discarded attempts; priced by its step's `Request.model`) |
+  | provider usage | `Usage` (the response's last, after its discarded attempts; priced by its step's `Request.model` at the current catalog) |
   | `Charged` | `Usage` (priced by its own `model`; `estimated` kept) |
   | `Compaction` | `Compacted` |
   | `GcApplied` | `ContextCollected` |
@@ -759,19 +759,19 @@ Every operation here creates a new branch or a new view. None truncates a log, a
 - **Read-only:** no provider request, no tool execution, no file access beyond the log and its blobs. It works without an API key. Replayed approval request ids cannot be answered. `Cancel` stops a replay.
 
 #### 7.12.6 Compare
-- `tautly compare <a> <b> [<c>…] [--json]` takes 2–5 sessions. When the sessions share a fork point, figures count from it; otherwise they cover whole sessions. Compare reads only the logs, their blobs and the cost ledger: no provider, tool or disk access.
+- `tautly compare <a> <b> [<c>…] [--json]` takes 2–5 sessions. When the sessions share a fork point, figures count from it; otherwise each session counts its own records: a branch from its header's parent offset (its copied prefix is its parent's work, as resume, tree, stats and receipts count it), a root session whole (cp5 review C I4). Compare reads only the logs, their blobs and the cost ledger: no provider, tool or disk access.
 - **Fork point (Task 52 fix round 1).**
   - Each session's parent chain is walked through its headers' `parent` (the parent and the offset of the last record copied). Copies keep their source's offsets, so what a session holds of an ancestor ends at the smallest offset along its chain: a rewind into a copied prefix copies less than its parent did.
   - Two sessions meet at the nearest session both chains hold, at the earlier of the two offsets. That offset names the same record in every log that holds it. Its step is read from the ancestor's log, or from a branch's copy when the ancestor's log is gone or unreadable.
-  - With 3–5 sessions, the first session's fork point with each other one is taken. All of these lie on the first session's chain, so the earliest is common to all. When any pair has no fork point, whole sessions are compared.
+  - With 3–5 sessions, the first session's fork point with each other one is taken. All of these lie on the first session's chain, so the earliest is common to all. When any pair has no fork point, each session counts its own records.
   - Every session is cut at that record. A turn open at the cut counts its wall time from the first record after it.
 - **One column per session:**
   - label (a label two sessions share is followed by an id prefix);
   - models used;
   - user turns, and steps (distinct `Request.step` values: a retry repeats its step);
   - tokens (input, output, cache read) and cost.
-    - The cost comes from the ledger by session, which includes discarded attempts. It is used only when the counted range is exactly the session's own records: the cut is its header's parent offset, or it has no parent and the whole session is compared.
-    - Otherwise, or with no ledger rows, the logged usage is used: each complete response's last usage and its discarded attempts at its step's model, plus every `Charged` record (side-model and estimated usage), each priced by its own model in the effective catalog.
+    - Every column's tokens and cost come from one source, the logged usage priced at the current catalog (cp5 review C M11): each complete response's last usage and its discarded attempts at its step's model, plus every `Charged` record (side-model and estimated usage), each priced by its own model in the effective catalog.
+    - The ledger's figure for the session (at the prices of when it was spent, discarded attempts included) is shown as its own, labelled line (`ledger cost`, JSON `ledger_usd`), only when the counted range is exactly the session's own records: the cut is its header's parent offset, or it has no parent and the whole session is compared.
     - Estimates and unpriced models are marked;
   - wall time: the sum of `TurnEnd.t − TurnStart.t` (a `SendMessage` is logged on arrival and may overlap a running turn, C-M7);
   - tool calls, blocked calls and edit failures (failed `edit` and `write` calls);

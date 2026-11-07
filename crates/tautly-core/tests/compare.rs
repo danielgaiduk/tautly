@@ -531,7 +531,7 @@ fn evidence_is_the_last_test_run_and_goes_stale_after_later_edits() {
 }
 
 #[test]
-fn cost_from_ledger_includes_discarded_attempts_else_logged_usage() {
+fn cost_is_the_logged_usage_and_the_ledger_its_own_figure() {
     let h = Home::new();
     let mut s = h.log(HeaderInit::default());
     s.turn(1_000, 1, "go");
@@ -571,8 +571,10 @@ fn cost_from_ledger_includes_discarded_attempts_else_logged_usage() {
     let ledger = Ledger::open(&h.data().join("ledger.sqlite")).unwrap();
     let empty = summarize(&reader, Some(&ledger), &catalog(), None).unwrap();
     assert_eq!(empty.cost_usd, logged.cost_usd);
+    assert_eq!(empty.ledger_usd, None);
 
-    // The ledger, discarded attempts included.
+    // The ledger (its historical prices, discarded attempts included) is its own figure;
+    // every column's cost stays the logged usage at the current catalog (M11).
     ledger
         .record(&s.id, &ModelId::from("m/a"), &usage(1_000, 100), Some(0.05))
         .unwrap();
@@ -583,13 +585,9 @@ fn cost_from_ledger_includes_discarded_attempts_else_logged_usage() {
         .record_estimated(&s.id, &ModelId::from("m/small"), &usage(200, 20), None)
         .unwrap();
     let led = summarize(&reader, Some(&ledger), &catalog(), None).unwrap();
-    assert!((led.cost_usd.unwrap() - 0.06).abs() < 1e-12, "{led:?}");
-    assert_eq!((led.tokens_in, led.tokens_out), (2_100, 120));
-    assert!(led.cost_estimated);
-    assert!(
-        led.cost_partial,
-        "an unpriced row leaves the amount partial"
-    );
+    assert!((led.ledger_usd.unwrap() - 0.06).abs() < 1e-12, "{led:?}");
+    assert_eq!(led.cost_usd, logged.cost_usd);
+    assert_eq!((led.tokens_in, led.tokens_out), (1_700, 120));
 
     // A model the catalog has no price for: the priced part, marked partial.
     let mut u = h.log(HeaderInit::default());
@@ -613,9 +611,10 @@ fn ledger_is_not_used_for_a_range_that_is_not_the_sessions_own() {
         .unwrap();
     let reader = p.reader();
     let whole = summarize(&reader, Some(&ledger), &catalog(), None).unwrap();
-    assert_eq!(whole.cost_usd, Some(9.0));
+    assert_eq!(whole.ledger_usd, Some(9.0));
     // From step 2 on the parent spent nothing; its ledger rows are all before.
     let after = summarize(&reader, Some(&ledger), &catalog(), Some(2)).unwrap();
+    assert_eq!(after.ledger_usd, None);
     assert_eq!(after.cost_usd, Some(0.0));
 }
 
@@ -803,13 +802,12 @@ fn a_branchs_ledger_rows_count_from_its_own_fork_and_the_parents_do_not() {
     let cut = fork_cut(p.reader().header(), b.reader().header(), h.data()).unwrap();
     assert_eq!(cut.offset, last);
     let sb = summarize_at(&b.reader(), Some(&ledger), &catalog(), Some(cut.offset)).unwrap();
-    assert_eq!(sb.cost_usd, Some(0.07));
+    assert_eq!(sb.ledger_usd, Some(0.07));
+    // Both columns priced alike: the logged usage at the current catalog (M11).
+    assert!((sb.cost_usd.unwrap() - 12.0 / 1e6).abs() < 1e-12, "{sb:?}");
     let sp = summarize_at(&p.reader(), Some(&ledger), &catalog(), Some(cut.offset)).unwrap();
-    assert_eq!(
-        sp.cost_usd,
-        Some(0.0),
-        "the parent's rows are before the cut"
-    );
+    assert_eq!(sp.ledger_usd, None, "the parent's rows are before the cut");
+    assert_eq!(sp.cost_usd, Some(0.0));
 }
 
 #[test]

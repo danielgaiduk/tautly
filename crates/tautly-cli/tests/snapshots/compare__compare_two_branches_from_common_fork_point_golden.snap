@@ -11,6 +11,7 @@ tokens in      2,000                                 4,000
 tokens out     200                                   400
 cache read     0                                     0
 cost           $0.0024                               $0.0045 (est.)
+ledger cost    -                                     -
 wall time      4.2s                                  6.0s
 tool calls     2                                     0
 blocked        0                                     0
@@ -21,6 +22,7 @@ diff           +3 -1                                 +2 -0
 
 figures count from the fork point: session <p> at step 2
 files and diff count tool edits only; changes made by commands are not in the logs
+cost prices the logged usage at the current catalog; ledger cost is what the cost ledger recorded, at the prices of the time (own records only)
 (est.): some usage is the engine's estimate
 
 file      touched by

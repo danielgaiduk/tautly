@@ -72,6 +72,12 @@ pub struct BranchSummary {
     pub cost_estimated: bool,
     /// Some usage was on a model without a known price: `cost_usd` covers the rest.
     pub cost_partial: bool,
+    /// What the cost ledger recorded for the counted range, at the prices of when it was
+    /// spent (discarded attempts included): only when that range is exactly the session's
+    /// own records, and some of it was priced. Every other figure is from the log, priced
+    /// at the current catalog; this is shown as its own, labelled line (cp5 review C M11).
+    #[serde(default)]
+    pub ledger_usd: Option<f64>,
     /// `Σ(TurnEnd.t − TurnStart.t)`.
     pub wall_ms: u64,
     /// Tool calls that ran.
@@ -274,12 +280,12 @@ fn step_cut(reader: &SessionReader<SessionRecord>, n: u32) -> Result<Option<u64>
     Ok(last)
 }
 
-/// The figures of `reader`'s session after record `cut` (none: the whole session), with
-/// cost from `ledger` when it covers exactly that range (the session's own records: `cut`
-/// is its header's parent offset, or it has no parent and `cut` is none), else from the
-/// logged usage priced with `catalog` (`Config::effective_catalog`). A turn open at the
-/// cut counts its wall time from the first record after it. Blocking I/O (the log, its
-/// blobs, the ledger).
+/// The figures of `reader`'s session after record `cut` (none: the whole session), the
+/// cost from the logged usage priced with `catalog` (`Config::effective_catalog`), and the
+/// ledger's historical figure beside it when the ledger covers exactly that range (the
+/// session's own records: `cut` is its header's parent offset, or it has no parent and
+/// `cut` is none). A turn open at the cut counts its wall time from the first record after
+/// it. Blocking I/O (the log, its blobs, the ledger).
 pub fn summarize_at(
     reader: &SessionReader<SessionRecord>,
     ledger: Option<&Ledger>,
@@ -555,23 +561,12 @@ impl Tally {
             e.edits_since = e.edits_since.saturating_add(self.edits_after_test);
             e.execs_since = e.execs_since.saturating_add(self.execs_after_test);
         }
-        let mut cost = self.logged_cost(catalog);
+        let cost = self.logged_cost(catalog);
+        let mut ledger_usd = None;
         if own_range && let Some(l) = ledger {
             match l.session_totals(&self.session_id) {
-                Ok(t) if t.requests > 0 => {
-                    cost = Cost {
-                        tokens_in: t.input,
-                        tokens_out: t.output,
-                        cache_read: t.cache_read,
-                        usd: (t.requests > t.unpriced).then_some(t.usd),
-                        estimated: t.estimated > 0,
-                        partial: t.unpriced > 0,
-                    }
-                }
-                Ok(_) => {}
-                Err(e) => notes.push(format!(
-                    "the cost ledger could not be read ({e}); the cost is from the session log"
-                )),
+                Ok(t) => ledger_usd = (t.requests > t.unpriced).then_some(t.usd),
+                Err(e) => notes.push(format!("the cost ledger could not be read ({e})")),
             }
         }
         BranchSummary {
@@ -586,6 +581,7 @@ impl Tally {
             cost_usd: cost.usd,
             cost_estimated: cost.estimated,
             cost_partial: cost.partial,
+            ledger_usd,
             wall_ms: self.wall_ms,
             tool_calls: self.tool_calls,
             blocked: self.blocked,

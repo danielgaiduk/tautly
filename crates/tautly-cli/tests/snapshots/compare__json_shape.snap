@@ -25,7 +25,7 @@ expression: "redact(&serde_json::to_string_pretty(&v).unwrap(), &t)"
     }
   ],
   "fork_point": {
-    "offset": 4,
+    "offset": 5,
     "session_id": "<p>",
     "step": 2
   },
@@ -54,6 +54,7 @@ expression: "redact(&serde_json::to_string_pretty(&v).unwrap(), &t)"
         "both.txt"
       ],
       "label": "try-a",
+      "ledger_usd": null,
       "models": [
         "m/a"
       ],
@@ -91,6 +92,7 @@ expression: "redact(&serde_json::to_string_pretty(&v).unwrap(), &t)"
         "both.txt"
       ],
       "label": "try-b\u001b[31m",
+      "ledger_usd": null,
       "models": [
         "m/a",
         "m/small"
@@ -116,6 +118,7 @@ expression: "redact(&serde_json::to_string_pretty(&v).unwrap(), &t)"
       "evidence": null,
       "files": [],
       "label": null,
+      "ledger_usd": null,
       "models": [],
       "notes": [],
       "removed": 0,
