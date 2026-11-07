@@ -565,6 +565,36 @@ async fn config_declared_hooks_never_run() {
     }
 }
 
+/// CP5 review M3: `/undo` takes the working-tree lease exclusively around its check and
+/// write, so it refuses (writing nothing) while another live session uses the work tree.
+#[tokio::test]
+async fn undo_refuses_while_another_session_uses_the_work_tree() {
+    let repo = Repo::with(&[("a.txt", "a\n")]);
+    let mock = MockProvider::new(vec![
+        tools_step(vec![write("w1", "a.txt", "b\n")]),
+        text_step("done"),
+    ]);
+    let mut run = start(repo.builder(config(), &mock));
+    run.turn_with("go").await;
+    let other = tautly_core::Lease::shared(repo.home.path(), &repo.root()).unwrap();
+    let answer = run.undo(None, false).await;
+    match &answer {
+        Event::Error { message, .. } => {
+            assert!(message.contains("another live session"), "{message}")
+        }
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+    assert_eq!(repo.read("a.txt").as_deref(), Some("b\n"));
+    // A dry run writes nothing, so it still answers.
+    let dry = run.undo(None, true).await;
+    assert!(matches!(dry, Event::Undone { .. }), "{dry:?}");
+    drop(other);
+    let answer = run.undo(None, false).await;
+    run.stop().await;
+    assert!(matches!(answer, Event::Undone { .. }), "{answer:?}");
+    assert_eq!(repo.read("a.txt").as_deref(), Some("a\n"));
+}
+
 #[tokio::test]
 async fn core_worktree_cannot_redirect_checkpoints_or_undo() {
     let repo = Repo::with(&[("a.txt", "a\n")]);

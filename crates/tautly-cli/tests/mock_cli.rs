@@ -563,6 +563,31 @@ fn undo_restores_file() {
     assert!(shown.contains("undone"), "{shown}");
 }
 
+/// CP5 review M3: `tautly undo` takes the working-tree lease exclusively, so it refuses
+/// (writing nothing) while a live session uses the work tree.
+#[test]
+fn undo_refuses_while_a_live_session_uses_the_work_tree() {
+    let s = Scratch::new();
+    s.write("a.txt", "old\n");
+    s.prompt(
+        "edit",
+        json!([write_content("a.txt", "new\n"), text("ok")]),
+        &[],
+    );
+    let root = s.work.path().canonicalize().unwrap();
+    let live = tautly_core::Lease::shared(s.home.path(), &root).unwrap();
+    let out = s.run(&["undo"]);
+    assert_ne!(out.status.code(), Some(0), "{}", out_text(&out));
+    assert!(stderr(&out).contains("running tautly"), "{}", stderr(&out));
+    assert_eq!(s.read("a.txt"), "new\n");
+    let dry = s.run(&["undo", "--dry-run"]);
+    assert_eq!(dry.status.code(), Some(0), "{}", stderr(&dry));
+    drop(live);
+    let out = s.run(&["undo"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert_eq!(s.read("a.txt"), "old\n");
+}
+
 #[test]
 fn undo_deletes_a_file_the_turn_created_and_takes_a_turn_number() {
     let s = Scratch::new();

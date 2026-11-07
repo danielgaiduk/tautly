@@ -38,6 +38,20 @@ pub async fn run(args: Args, env: &Env) -> anyhow::Result<i32> {
         eprintln!("tautly: {warning}");
     }
     let mut checkpoints = checkpointer(env, &session, config.config.checkpoints);
+    // The working-tree lease, exclusive across the check and the write: no live session's
+    // tool may write in between (CP5 review M3). A dry run writes nothing.
+    let busy =
+        || anyhow!("a running tautly uses this work tree; use /undo there, or stop it first");
+    let lease = match args.dry_run {
+        true => None,
+        false => {
+            Some(tautly_core::Lease::try_shared(&env.data_home, env.root())?.ok_or_else(busy)?)
+        }
+    };
+    let _alone = match lease.as_ref().map(tautly_core::Lease::try_exclusive) {
+        Some(Err(tautly_core::LeaseError::Busy)) => return Err(busy()),
+        other => other.transpose()?,
+    };
     let done = tautly_core::undo::undo(
         &reader,
         env.workspace.sandbox().as_ref(),
