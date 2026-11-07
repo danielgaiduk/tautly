@@ -2131,3 +2131,49 @@ async fn synthetic_turn_ends_are_marked_and_stamped_at_the_last_record() {
     assert_eq!(branch[forked].1, branch[forked - 1].1);
     run.stop().await;
 }
+
+// ------------------------------------- cp5 review C M7, M9: branch edges and headers
+
+#[tokio::test]
+async fn fork_at_zero_accepts_what_rewind_zero_accepts_and_headers_name_the_step() {
+    let repo = Repo::git_repo();
+    let mock = two_turns();
+    let mut run = run_two_turns(&repo, &mock).await;
+    run.rewind(4, false, &[]).await.done();
+    let b = reader(&run.current().1);
+    assert_eq!(b.header().parent_step, Some(4));
+    // From that branch, whose copy holds nothing kept before step 1 (review probe p9).
+    let forked = fork_at(&mut run, 0).await;
+    assert!(forked.is_ok(), "{forked:?}");
+    let f = reader(&run.current().1);
+    let (_, offset) = f.header().parent.clone().unwrap();
+    assert_eq!(f.header().parent_step, Some(0));
+    assert_eq!(step_at_offset(&f, offset), 0);
+    // A fork at the tip names it.
+    run.turn_with("again").await;
+    run.engine
+        .send(Command::Fork {
+            at: None,
+            label: None,
+        })
+        .await
+        .unwrap();
+    run.until(|e| matches!(e, Event::SessionChanged { .. }))
+        .await;
+    let tip = reader(&run.current().1);
+    let (parent, offset) = tip.header().parent.clone().unwrap();
+    let parent_log = logs(repo.home())
+        .into_iter()
+        .find(|p| reader(p).header().session_id == parent)
+        .unwrap();
+    let parent_tip = step_at_offset(&reader(&parent_log), u64::MAX);
+    assert_eq!(tip.header().parent_step, Some(parent_tip));
+    assert_eq!(step_at_offset(&tip, offset), parent_tip);
+    let nodes = tree::build(repo.home(), &repo.project(), None).unwrap();
+    let node = nodes
+        .iter()
+        .find(|n| n.session_id == tip.header().session_id)
+        .unwrap();
+    assert_eq!(node.parent, Some((parent, parent_tip)));
+    run.stop().await;
+}

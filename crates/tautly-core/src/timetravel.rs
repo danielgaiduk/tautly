@@ -1,4 +1,4 @@
-//! Time travel (spec 7.12): the files at a step boundary ([`state_at`]), the files the
+//! T    state.base = base.map(|(_, commit)| commit);me travel (spec 7.12): the files at a step             if base_at.is_none_or(|b| *offset > b) {oundary ([`state_at`]), the files the
 //! agent left ([`expected_tip`]), and materializing one in place of the other without
 //! clobbering human edits ([`materialize`]); plus the engine's `Rewind` and `Switch`.
 //!
@@ -51,6 +51,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use tautly_provider::ProviderEvent;
 use tautly_sandbox::SandboxError;
 use tautly_session::{
     BlobRef, ConfineError, HeaderInit, Origin, RelPath, SessionReader, SessionWriter,
@@ -247,8 +248,10 @@ impl StepCounter {
                 None
             }
             SessionRecord::Provider(ev) => {
-                if self.open.is_some() {
-                    self.resp.push(ev.clone());
+                if self.open.is_some()
+                    && let Some(ev) = slim_event(ev)
+                {
+                    self.resp.push(ev);
                 }
                 self.open
             }
@@ -278,6 +281,58 @@ impl StepCounter {
     }
 }
 
+/// `ev` as far as step numbering needs it: content events emptied (their kind and count
+/// decide whether a response is answered), `Done` kept (a cut-off reasoning item is
+/// dropped), usage and the rest left out.
+fn slim_event(ev: &ProviderEvent) -> Option<ProviderEvent> {
+    Some(match ev {
+        ProviderEvent::TextDelta(_) => ProviderEvent::TextDelta(String::new()),
+        ProviderEvent::ReasoningDelta(_) => ProviderEvent::ReasoningDelta(String::new()),
+        ProviderEvent::ReasoningSignature(_) => ProviderEvent::ReasoningSignature(String::new()),
+        ProviderEvent::RedactedReasoning(_) => ProviderEvent::RedactedReasoning(String::new()),
+        ProviderEvent::ToolCall { id, name, .. } => ProviderEvent::ToolCall {
+            id: id.clone(),
+            name: name.clone(),
+            input_json: String::new(),
+        },
+        ProviderEvent::Done { stop } => ProviderEvent::Done { stop: stop.clone() },
+        _ => return None,
+    })
+}
+
+/// A record as [`Boundaries`] keeps it: what `state_at` and the bisect pre-pass read, with
+/// the bulk (provider text, other tools' arguments, prompts) left out, so a walk does not
+/// hold the log (cp5 review C M7). None: not needed.
+fn slim(rec: SessionRecord) -> Option<SessionRecord> {
+    Some(match rec {
+        // Every one is kept: a step's last record decides its boundary.
+        SessionRecord::Provider(ev) => {
+            SessionRecord::Provider(slim_event(&ev).unwrap_or(ProviderEvent::Unknown))
+        }
+        SessionRecord::ToolCall { id, name, args } => {
+            let args = if name == "bash" {
+                args
+            } else {
+                serde_json::Value::Null
+            };
+            SessionRecord::ToolCall { id, name, args }
+        }
+        SessionRecord::TurnStart { turn, .. } => SessionRecord::TurnStart {
+            turn,
+            text: String::new(),
+        },
+        rec @ (SessionRecord::Request { .. }
+        | SessionRecord::ToolResult { .. }
+        | SessionRecord::Edit { .. }
+        | SessionRecord::Undone { .. }
+        | SessionRecord::WritesLost { .. }
+        | SessionRecord::TurnEnd { .. }
+        | SessionRecord::Checkpoint { .. }
+        | SessionRecord::CheckpointSkipped { .. }) => rec,
+        _ => return None,
+    })
+}
+
 /// A log's records with their offsets and the step each belongs to.
 struct Walked {
     recs: Vec<(u64, SessionRecord)>,
@@ -291,8 +346,11 @@ fn walk(reader: &SessionReader<SessionRecord>) -> Result<Walked, TtError> {
     let mut owner = Vec::new();
     for rec in reader.records() {
         let (at, rec) = rec?;
-        owner.push(steps.see(&rec));
-        recs.push((at, rec));
+        let o = steps.see(&rec);
+        if let Some(rec) = slim(rec) {
+            owner.push(o);
+            recs.push((at, rec));
+        }
     }
     Ok(Walked {
         recs,
@@ -564,12 +622,17 @@ pub(crate) fn ran_command(rec: &SessionRecord) -> bool {
 /// compared with the checkpoint's) and makes the state partial. Also gathers what
 /// [`materialize`] needs to tell human changes apart. Blocking I/O (the log).
 pub fn expected_tip(reader: &SessionReader<SessionRecord>) -> Result<FileState, TtError> {
-    let recs: Vec<(u64, SessionRecord)> = reader.records().collect::<Result<_, _>>()?;
     let mut state = FileState::new(reader.path());
-    let base_at = recs.iter().rposition(|(_, r)| {
-        matches!(r, SessionRecord::Checkpoint { point, .. }
-            if *point != Some(CheckpointPoint::BeforeRestore))
-    });
+    // Two passes over the log rather than holding it (cp5 review C M7): the base first.
+    let mut base: Option<(u64, String)> = None;
+    for rec in reader.records() {
+        if let (offset, SessionRecord::Checkpoint { commit, point, .. }) = rec?
+            && point != Some(CheckpointPoint::BeforeRestore)
+        {
+            base = Some((offset, commit));
+        }
+    }
+    let base_at = base.as_ref().map(|(offset, _)| *offset);
     let mut overlay: BTreeMap<RelPath, Option<BlobRef>> = BTreeMap::new();
     let mut unknown = std::collections::BTreeSet::new();
     let mut written: BTreeMap<RelPath, Option<BlobRef>> = BTreeMap::new();
@@ -583,7 +646,9 @@ pub fn expected_tip(reader: &SessionReader<SessionRecord>) -> Result<FileState, 
     // pair counts whatever commands ran in it (Task 49 N1).
     let mut cut = false;
     let mut end_checkpointed = false;
-    for (i, (offset, rec)) in recs.iter().enumerate() {
+    for rec in reader.records() {
+        let (offset, rec) = rec?;
+        let (offset, rec) = (&offset, &rec);
         match rec {
             SessionRecord::Checkpoint {
                 point: Some(CheckpointPoint::TurnEnd),
@@ -630,7 +695,7 @@ pub fn expected_tip(reader: &SessionReader<SessionRecord>) -> Result<FileState, 
                     written.remove(&path);
                 }
             }
-            if base_at.is_none_or(|b| i > b) {
+            if base_at.is_none_or(|b| *offset > b) {
                 match value {
                     Some(v) => {
                         overlay.insert(path.clone(), v);
@@ -644,10 +709,7 @@ pub fn expected_tip(reader: &SessionReader<SessionRecord>) -> Result<FileState, 
             }
         }
     }
-    state.base = base_at.map(|i| match &recs[i].1 {
-        SessionRecord::Checkpoint { commit, .. } => commit.clone(),
-        _ => unreachable!("found as a checkpoint"),
-    });
+    state.base = base.map(|(_, commit)| commit);
     state.overlay = overlay.into_iter().collect();
     state.written = written.into_iter().collect();
     state.partial = (!unknown.is_empty()).then(|| {
@@ -989,6 +1051,7 @@ impl Session {
                         branch_tip(cp.as_deref(), &reader, &target, &expected, at, &cut).await?;
                     let init = HeaderInit {
                         parent: Some((parent_id, count - 1)),
+                        parent_step: Some(at),
                         model: reader.header().model.clone(),
                         ..init
                     };

@@ -116,6 +116,10 @@ pub struct Config {
     /// approval before it starts (spec 7.11.10).
     #[serde(skip)]
     pub project_mcp_servers: BTreeMap<String, ServerSpec>,
+    /// [`hash`](Self::hash) of the files [`load_from`](Self::load_from) read (none: not
+    /// read from files).
+    #[serde(skip)]
+    pub layers_hash: Option<String>,
     /// `[checkpoints]`: git checkpoints of the work tree (spec 7.11.11; user layer and
     /// command line only).
     #[serde(default)]
@@ -231,6 +235,7 @@ impl Default for Config {
             evidence: EvidenceConfig::default(),
             mcp: McpConfig::default(),
             project_mcp_servers: BTreeMap::new(),
+            layers_hash: None,
             checkpoints: CheckpointConfig::default(),
             receipts: ReceiptsConfig::default(),
         }
@@ -393,16 +398,19 @@ pub struct LoadedConfig {
 }
 
 impl Config {
-    /// blake3 hex of the effective configuration, for the session header (spec 6.5 H3):
-    /// equal for equal configurations, whatever order the files listed keys in. It hashes
-    /// the canonical JSON form: serialized through `serde_json::Value`, whose objects keep
-    /// their keys sorted. It holds no secrets (keys come from the environment or the
-    /// keychain, never from configuration).
+    /// The session header's `config_hash` (spec 6.5): blake3 hex of what the user and
+    /// project configuration files (and the command line's overrides) set, merged, as
+    /// canonical JSON (`serde_json::Value` keeps object keys sorted), so equal for equal
+    /// settings whatever the files' layout. Not hashed: the running version's built-in
+    /// values and catalog, and the models file (`tautly models update`), so an upgrade or
+    /// a catalog update leaves it alone (cp5 review C M10). A configuration not read from
+    /// files hashes its own serialized form. It holds no secrets (keys come from the
+    /// environment or the keychain, never from configuration).
     pub fn hash(&self) -> String {
-        let canonical = serde_json::to_value(self)
-            .and_then(|v| serde_json::to_vec(&v))
-            .unwrap_or_default();
-        blake3::hash(&canonical).to_hex().to_string()
+        match &self.layers_hash {
+            Some(h) => h.clone(),
+            None => canonical_hash(self),
+        }
     }
 
     /// The `[[providers.compat]]` entries plus the built-in `openrouter`
@@ -503,6 +511,9 @@ impl Config {
         }
 
         let mut merged = Table::new();
+        // What the files set as it takes effect, without the models file: what `hash`
+        // hashes.
+        let mut own = Table::new();
         let mut project_mcp_servers = BTreeMap::new();
         for (path, trust) in layers.into_iter().flatten() {
             let layer = match (read_layer(&path, trust == Trust::User), trust) {
@@ -527,8 +538,10 @@ impl Config {
             };
             // The user's model catalog file (`tautly models update`) sits next to the user
             // file; the user file's own `[catalog_overrides]` win over it.
+            let mut plain = None;
             let layer = if trust == Trust::User {
                 let mut layer = layer.unwrap_or_default();
+                plain = Some(layer.clone());
                 add_models_file(&mut layer, &path.with_file_name(MODELS_FILE), &mut warnings);
                 (!layer.is_empty()).then_some(layer)
             } else {
@@ -539,6 +552,7 @@ impl Config {
             };
             if trust == Trust::Project {
                 restrict_project_layer(&mut layer, &merged, &path, &mut warnings);
+                plain = Some(layer.clone());
                 project_mcp_servers = take_project_servers(&mut layer, &path, &mut warnings);
             }
             // Check the layer alone so a bad value names the file it came from.
@@ -563,11 +577,13 @@ impl Config {
                     }
                     e => e,
                 })?;
+            deep_merge(&mut own, plain.unwrap_or_else(|| layer.clone()));
             deep_merge(&mut merged, layer);
         }
         // Defaults are not in `merged`: a `model` there came from a file (or the flag).
         let model_explicit = merged.contains_key("model") || cli.model.is_some();
         deep_merge(&mut merged, cli_table(&cli));
+        deep_merge(&mut own, cli_table(&cli));
 
         let mut cfg: Config = Value::Table(merged)
             .try_into()
@@ -577,6 +593,7 @@ impl Config {
             })?;
         cfg.validate()?;
         cfg.project_mcp_servers = project_mcp_servers;
+        cfg.layers_hash = Some(canonical_hash(&own));
         if cfg.telemetry.enabled {
             warnings.push(TELEMETRY_WARNING.to_string());
         }
@@ -1194,6 +1211,14 @@ pub fn parse_models_file(text: &str) -> Result<Catalog, String> {
     Value::Table(overlay_models(table)?)
         .try_into()
         .map_err(|e: toml::de::Error| e.to_string())
+}
+
+/// blake3 hex of `value` as canonical JSON (object keys sorted).
+fn canonical_hash(value: &impl Serialize) -> String {
+    let canonical = serde_json::to_value(value)
+        .and_then(|v| serde_json::to_vec(&v))
+        .unwrap_or_default();
+    blake3::hash(&canonical).to_hex().to_string()
 }
 
 /// Put the entries of the models file at `path` under `layer`'s `[catalog_overrides]` (the

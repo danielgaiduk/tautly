@@ -52,3 +52,31 @@ fn an_unknown_model_needs_a_full_entry_and_empty_files_are_empty_catalogs() {
     assert_eq!(parse_models_file("# nothing\n").unwrap().ids().count(), 0);
     assert!(parse_models_file("not [toml").is_err());
 }
+
+#[test]
+fn the_config_hash_is_the_user_and_project_layers_without_the_models_file() {
+    // cp5 review C M10 (spec 6.5): not moved by `tautly models update` (the models file)
+    // or by the built-in values of the running version; moved by what the files set.
+    let dir = TempDir::new().unwrap();
+    let project = dir.path().join("project");
+    fs::create_dir_all(project.join(".tautly")).unwrap();
+    let user = dir.path().join("config.toml");
+    let hash = || {
+        Config::load_from(Some(&user), &project, CliOverrides::default())
+            .unwrap()
+            .config
+            .hash()
+    };
+    fs::write(&user, "max_turns = 30\n").unwrap();
+    let plain = hash();
+    fs::write(dir.path().join("models.toml"), PARTIAL).unwrap();
+    assert_eq!(hash(), plain, "the models file is not hashed");
+    // Equal for equal settings, whatever the file layout.
+    fs::write(&user, "# a comment\nmax_turns   =   30\n").unwrap();
+    assert_eq!(hash(), plain);
+    fs::write(&user, "max_turns = 31\n").unwrap();
+    assert_ne!(hash(), plain);
+    fs::write(&user, "max_turns = 30\n").unwrap();
+    fs::write(project.join(".tautly/config.toml"), "max_turns = 10\n").unwrap();
+    assert_ne!(hash(), plain, "the project layer is hashed");
+}

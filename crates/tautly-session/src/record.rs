@@ -42,11 +42,17 @@ pub struct Header {
     /// The model the session started with.
     #[serde(default)]
     pub model: Option<String>,
-    /// blake3 of the effective configuration.
+    /// blake3 of what the user and project configuration files set (spec 6.5; not the
+    /// built-in values or the models file), written by the engine.
     #[serde(default)]
     pub config_hash: Option<String>,
     #[serde(default)]
     pub tags: Vec<String>,
+    /// For a fork: the step it branched at (`parent`'s offset names the last record it
+    /// copied). None in logs written before this field, or not a fork: read the step
+    /// from the copy then.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_step: Option<u32>,
 }
 
 /// Why a session exists.
@@ -89,6 +95,8 @@ pub struct HeaderInit {
     pub model: Option<String>,
     pub config_hash: Option<String>,
     pub tags: Vec<String>,
+    /// For a fork: the step it branched at.
+    pub parent_step: Option<u32>,
 }
 
 /// One record as read back, with where and when it was written.

@@ -320,6 +320,7 @@ fn new_header(ulid: Ulid, root: &Path, init: HeaderInit) -> Header {
         model: init.model,
         config_hash: init.config_hash,
         tags: init.tags,
+        parent_step: init.parent_step,
     }
 }
 

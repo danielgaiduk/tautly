@@ -1264,16 +1264,19 @@ impl Session {
         let made = tokio::task::spawn_blocking(move || -> Result<_, String> {
             let parent = SessionReader::<SessionRecord>::open(&parent_path).map_err(err)?;
             let cut = rebuild(&parent, at).map_err(err)?;
-            // The parent offset names the last record copied: with none, a branch would
-            // read as one cut after record 0.
-            let end = cut.end_offset.ok_or_else(|| {
+            // As a rewind counts it (`at = 0` copies the set-up before the first step,
+            // cp5 review C M9). The parent offset names the last record copied: with none,
+            // a branch would read as one cut after record 0.
+            let step = cut.context.next_turn() - 1;
+            let count = crate::timetravel::copy_count(&parent, step, &cut).ok_or_else(|| {
                 "there is nothing to branch from yet: the session has no records before \
                  that point"
                     .to_string()
             })?;
             // The branch's records start from the parent's first model.
             let init = HeaderInit {
-                parent: Some((parent_id, end)),
+                parent: Some((parent_id, count - 1)),
+                parent_step: Some(step),
                 model: parent.header().model.clone(),
                 ..init
             };
@@ -1282,7 +1285,7 @@ impl Session {
                 &root,
                 init,
                 &parent_path,
-                end + 1,
+                count,
                 cut.incomplete_turn,
                 Vec::new(),
             )?;

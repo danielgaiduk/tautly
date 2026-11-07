@@ -132,6 +132,7 @@ fn header_carries_project_label_origin_git_version_model_config_hash_tags() {
         model: Some("anthropic/claude-x".into()),
         config_hash: Some("c0ffee".into()),
         tags: vec!["eval".into(), "nightly".into()],
+        parent_step: Some(4),
     };
     let w = SessionWriter::<Msg>::create_in(data.path(), project.path(), init).unwrap();
     let path = w.path().to_path_buf();
@@ -156,6 +157,7 @@ fn header_carries_project_label_origin_git_version_model_config_hash_tags() {
     assert_eq!(h.model.as_deref(), Some("anthropic/claude-x"));
     assert_eq!(h.config_hash.as_deref(), Some("c0ffee"));
     assert_eq!(h.tags, ["eval", "nightly"]);
+    assert_eq!(h.parent_step, Some(4));
     assert_eq!(h.root, project.path().canonicalize().unwrap());
     let raw = &lines(&path)[0];
     assert_eq!(raw["origin"], "what_if");
@@ -194,6 +196,7 @@ fn old_header_without_new_fields_reads_with_defaults() {
     assert_eq!(h.model, None);
     assert_eq!(h.config_hash, None);
     assert!(h.tags.is_empty());
+    assert_eq!(h.parent_step, None);
     assert_eq!(reader.records().count(), 1);
 
     // An origin from a newer version reads as Unknown.
