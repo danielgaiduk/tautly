@@ -35,6 +35,10 @@ fn marker_is_a_word(src: &str) -> bool {
     if !src.contains('@') || src.contains('#') || src.contains("((") || src.contains("[[") {
         return false;
     }
+    // A quoted assignment value (`X='… @ …'`) may hold it without passing it on.
+    if ["='", "=\"", "=$'", "=\\"].iter().any(|q| src.contains(q)) {
+        return false;
+    }
     if let Some(i) = src.find("<<") {
         // Heredoc bodies start on the line after the operator; its delimiter may be quoted.
         let line_end = src[i..].find('\n').map_or(src.len(), |n| i + n);
