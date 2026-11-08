@@ -53,7 +53,7 @@ use tautly_sandbox::LocalSandbox;
 use tokio::io::{AsyncBufReadExt as _, AsyncRead, BufReader};
 
 use super::bisect::Signals;
-use super::{thousands, usd};
+use super::{cost_cell, pct, tokens, usd};
 use crate::Cli;
 
 /// Tokens per solved task may exceed the baseline by this share (spec 9.1).
@@ -852,26 +852,9 @@ fn summarize(runs: &[TaskResult], trials: u32) -> Summary {
     }
 }
 
-/// A ratio as a percentage with one decimal, or `-`.
-fn pct(r: Option<f64>) -> String {
-    r.map_or_else(|| "-".to_string(), |r| format!("{:.1}%", r * 100.0))
-}
-
-/// A token count, rounded, with separators, or `-`.
-fn tokens(v: Option<f64>) -> String {
-    v.map_or_else(|| "-".to_string(), |v| thousands(v.round() as u64))
-}
-
 /// `amount` with the marks of `s`: `?` when it covers only the priced part, `(est.)`.
 fn cost(s: &Summary, amount: f64) -> String {
-    let mut c = usd(Some(amount));
-    if s.cost_partial {
-        c.push('?');
-    }
-    if s.cost_estimated {
-        c.push_str(" (est.)");
-    }
-    c
+    cost_cell(Some(amount), s.cost_partial, s.cost_estimated)
 }
 
 /// The run's summary, for the terminal.

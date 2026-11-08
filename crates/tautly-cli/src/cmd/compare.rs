@@ -25,7 +25,7 @@ use tautly_core::compare::{
 use tautly_core::{Catalog, CliOverrides, Config, SessionReader, SessionRecord, printable};
 
 use super::receipt::last_test;
-use super::{Env, duration, open_ledger, thousands, usd};
+use super::{Env, cost_cell, duration, open_ledger, thousands, usd};
 
 #[derive(Debug, clap::Args)]
 pub struct Args {
@@ -316,15 +316,6 @@ fn touched_by(ix: &[usize], names: &[String]) -> String {
     }
 }
 
-/// The cost cell: the amount, `?` when it covers only the priced part, `(est.)` when some
-/// usage was estimated.
 fn cost(s: &BranchSummary) -> String {
-    let mut c = usd(s.cost_usd);
-    if s.cost_partial && s.cost_usd.is_some() {
-        c.push('?');
-    }
-    if s.cost_estimated {
-        c.push_str(" (est.)");
-    }
-    c
+    cost_cell(s.cost_usd, s.cost_partial, s.cost_estimated)
 }
