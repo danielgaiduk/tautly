@@ -18,9 +18,9 @@ install-path = "CARGO_HOME"
 # The release workflow runs on version tags only; pull requests are covered by the `dist-plan` job
 # in ci.yml.
 pr-run-mode = "skip"
-# TODO(release): create the tap repository `<owner>/homebrew-tap` and the repository secret
-# HOMEBREW_TAP_TOKEN, and replace OWNER (see docs/release.md).
-tap = "OWNER/homebrew-tap"
+# TODO(release): create the tap repository `danielgaiduk/homebrew-tap` and the repository secret
+# HOMEBREW_TAP_TOKEN (see docs/release.md).
+tap = "danielgaiduk/homebrew-tap"
 publish-jobs = ["homebrew"]
 display-name = "Tautly"
 
