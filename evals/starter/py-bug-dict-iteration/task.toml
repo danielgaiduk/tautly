@@ -1,0 +1,6 @@
+id = "py-bug-dict-iteration"
+prompt = "`remove_empty` in cleanup.py raises `RuntimeError: dictionary changed size during iteration`. Fix it so it removes the keys whose value is empty and returns the same dict."
+timeout_s = 600
+budget_usd = 1.0
+tags = ["python", "bug"]
+approve = "yolo"

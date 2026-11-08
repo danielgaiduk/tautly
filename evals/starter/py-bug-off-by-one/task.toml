@@ -1,0 +1,6 @@
+id = "py-bug-off-by-one"
+prompt = "`last_n` in listutil.py returns one item too many. Fix it so `last_n(items, n)` returns the last n items (an empty list for n = 0)."
+timeout_s = 600
+budget_usd = 1.0
+tags = ["python", "bug"]
+approve = "yolo"

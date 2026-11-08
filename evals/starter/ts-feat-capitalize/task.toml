@@ -1,0 +1,6 @@
+id = "ts-feat-capitalize"
+prompt = "Add an exported function `capitalize(s: string): string` to src/strings.ts that upper-cases the first character and leaves the rest as is (empty string stays empty)."
+timeout_s = 600
+budget_usd = 1.0
+tags = ["typescript", "feature"]
+approve = "yolo"

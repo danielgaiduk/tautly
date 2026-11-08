@@ -1,0 +1,174 @@
+[
+ [
+  {
+   "tool_call": {
+    "id": "c0",
+    "name": "read",
+    "input_json": "{\"path\": \"stats.py\"}"
+   }
+  },
+  {
+   "usage": {
+    "input": 300,
+    "output": 80,
+    "cache_read": 2800,
+    "cache_write": 0
+   }
+  },
+  {
+   "done": {
+    "stop": "tool_use"
+   }
+  }
+ ],
+ [
+  {
+   "tool_call": {
+    "id": "c1",
+    "name": "outline",
+    "input_json": "{\"path\": \"stats.py\"}"
+   }
+  },
+  {
+   "usage": {
+    "input": 450,
+    "output": 120,
+    "cache_read": 3200,
+    "cache_write": 0
+   }
+  },
+  {
+   "done": {
+    "stop": "tool_use"
+   }
+  }
+ ],
+ [
+  {
+   "tool_call": {
+    "id": "c2",
+    "name": "symbol",
+    "input_json": "{\"name\": \"average\"}"
+   }
+  },
+  {
+   "usage": {
+    "input": 600,
+    "output": 160,
+    "cache_read": 3600,
+    "cache_write": 0
+   }
+  },
+  {
+   "done": {
+    "stop": "tool_use"
+   }
+  }
+ ],
+ [
+  {
+   "tool_call": {
+    "id": "c3",
+    "name": "edit",
+    "input_json": "{\"path\": \"stats.py\", \"old_text\": \"    return sum(values) // len(values)\", \"new_text\": \"    return sum(values) / len(values)\"}"
+   }
+  },
+  {
+   "usage": {
+    "input": 750,
+    "output": 80,
+    "cache_read": 4000,
+    "cache_write": 0
+   }
+  },
+  {
+   "done": {
+    "stop": "tool_use"
+   }
+  }
+ ],
+ [
+  {
+   "tool_call": {
+    "id": "c4",
+    "name": "read",
+    "input_json": "{\"path\": \"stats.py\"}"
+   }
+  },
+  {
+   "usage": {
+    "input": 900,
+    "output": 120,
+    "cache_read": 4400,
+    "cache_write": 0
+   }
+  },
+  {
+   "done": {
+    "stop": "tool_use"
+   }
+  }
+ ],
+ [
+  {
+   "tool_call": {
+    "id": "c5",
+    "name": "bash",
+    "input_json": "{\"command\": \"python3 -m unittest -q test_stats\"}"
+   }
+  },
+  {
+   "usage": {
+    "input": 1050,
+    "output": 160,
+    "cache_read": 4800,
+    "cache_write": 0
+   }
+  },
+  {
+   "done": {
+    "stop": "tool_use"
+   }
+  }
+ ],
+ [
+  {
+   "tool_call": {
+    "id": "c6",
+    "name": "recall",
+    "input_json": "{\"query\": \"how are tests run in this repository\"}"
+   }
+  },
+  {
+   "usage": {
+    "input": 1200,
+    "output": 80,
+    "cache_read": 5200,
+    "cache_write": 0
+   }
+  },
+  {
+   "done": {
+    "stop": "tool_use"
+   }
+  }
+ ],
+ [
+  {
+   "text_delta": "Done: the change is made and the tests pass."
+  },
+  {
+   "usage": {
+    "input": 1350,
+    "output": 40,
+    "cache_read": 5600,
+    "cache_write": 0
+   }
+  },
+  {
+   "done": {
+    "stop": "end_turn"
+   }
+  }
+ ]
+]

@@ -3220,6 +3220,7 @@ dependencies = [
  "reqwest 0.12.28",
  "rpassword",
  "rusqlite",
+ "serde",
  "serde_json",
  "tautly-acp",
  "tautly-core",
@@ -3231,6 +3232,7 @@ dependencies = [
  "tautly-tui",
  "tempfile",
  "tokio",
+ "toml",
  "wiremock",
 ]
 

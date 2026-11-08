@@ -1,0 +1,6 @@
+id = "go-feat-stringer"
+prompt = "Give `Color` in color.go a `String() string` method: \"red\", \"green\", \"blue\", and \"Color(n)\" for any other value n."
+timeout_s = 600
+budget_usd = 1.0
+tags = ["go", "feature"]
+approve = "yolo"

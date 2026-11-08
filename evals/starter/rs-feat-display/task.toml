@@ -1,0 +1,6 @@
+id = "rs-feat-display"
+prompt = "Implement `std::fmt::Display` for `Point` in src/lib.rs so it formats as `(x, y)`, e.g. `(1, -2)`."
+timeout_s = 600
+budget_usd = 1.0
+tags = ["rust", "feature"]
+approve = "yolo"

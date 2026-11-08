@@ -23,6 +23,21 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo clippy -p tautly --all-targets --features mock -- -D warnings
 
+  # Performance gates (spec 9.1). The token regression gate replays the scripted starter
+  # sessions (evals/replay, mock provider, deterministic) and fails when tokens per solved
+  # task exceed evals/baseline.json by more than 10%. The benchmark kit's report generator
+  # runs on its committed fixture; live benchmark runs (benchmarks/tokens/run.sh) are manual.
+  perf:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build -p tautly --features mock
+      - run: ./target/debug/tautly eval --replay evals/replay
+      - run: ./target/debug/tautly eval report benchmarks/tokens/fixtures/sample.json --markdown
+      - run: bash -n benchmarks/tokens/run.sh
+
   # Hooks declared in configuration (`hook.<name>.command`/`event`) arrived in git 2.54, and
   # `core.hooksPath=/dev/null` does not switch them off, so checkpoint git disables each one it
   # finds (CP5 review C1). Runner images may ship an older git, on which the regression tests

@@ -107,6 +107,30 @@ impl Catalog {
         self.models.extend(overrides.models);
     }
 
+    /// Make `id` edit with `format` (`--edit-format`). A model not in the catalog gets an
+    /// entry with the conservative capabilities and no price, as [`get`](Self::get) says.
+    pub fn set_edit_format(&mut self, id: &ModelId, format: EditFormat) {
+        let entry = self
+            .models
+            .entry(id.as_str().to_string())
+            .or_insert_with(|| {
+                let c = Capabilities::conservative();
+                Entry {
+                    context_window: c.context_window,
+                    max_output: c.max_output,
+                    parallel_tools: c.parallel_tools,
+                    reasoning: c.reasoning,
+                    cache: c.cache,
+                    images: c.images,
+                    edit_format: c.edit_format,
+                    price: None,
+                    cache_ttl_s: None,
+                    tier: None,
+                }
+            });
+        entry.edit_format = format;
+    }
+
     pub fn contains(&self, id: &ModelId) -> bool {
         self.models.contains_key(id.as_str())
     }

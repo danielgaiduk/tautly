@@ -1,0 +1,6 @@
+id = "rs-config-feature-flag"
+prompt = "`cargo test --features fast` fails with \"the package does not contain this feature: fast\". The code already uses the feature; declare it in Cargo.toml (not enabled by default)."
+timeout_s = 600
+budget_usd = 1.0
+tags = ["rust", "config"]
+approve = "yolo"

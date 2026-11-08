@@ -1,0 +1,6 @@
+id = "ts-bug-range-inclusive"
+prompt = "`range(a, b)` in src/range.ts is documented as inclusive of both ends but leaves out b. Fix it (and return an empty array when a > b)."
+timeout_s = 600
+budget_usd = 1.0
+tags = ["typescript", "bug"]
+approve = "yolo"

@@ -1,0 +1,6 @@
+id = "py-config-ini-section"
+prompt = "The app fails at start with `configparser.NoSectionError: No section: 'server'`. Fix the configuration file settings.ini (not the code) so `python3 app.py` prints the configured address."
+timeout_s = 600
+budget_usd = 1.0
+tags = ["python", "config"]
+approve = "yolo"

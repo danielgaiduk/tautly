@@ -41,9 +41,9 @@ use tautly_core::detect::{
     Detected, KeyVars, OllamaProbe, detect_with, setup_hint_with, wants_detection,
 };
 use tautly_core::{
-    BudgetScope, CliOverrides, Command, Config, Engine, EngineBuilder, Event, LoadedConfig, Mode,
-    ModelId, ProviderSetupError, Workspaces, install_signal_handlers, install_termination_handlers,
-    provider_for_with,
+    BudgetScope, CliOverrides, Command, Config, EditFormat, Engine, EngineBuilder, Event,
+    LoadedConfig, Mode, ModelId, ProviderSetupError, Workspaces, install_signal_handlers,
+    install_termination_handlers, provider_for_with,
 };
 use tautly_rpc::{EngineFactory, OutputFormat, Server, run_oneshot};
 use tokio::io::BufReader;
@@ -119,6 +119,11 @@ struct Cli {
     #[arg(long)]
     rpc: bool,
 
+    /// The edit tool's format (str_replace, patch or hashline) instead of the model's own
+    /// (`tautly eval --edit-format` passes it to each run).
+    #[arg(long, value_name = "FORMAT", value_parser = parse_edit_format, hide = true)]
+    edit_format: Option<EditFormat>,
+
     /// Take no git checkpoints before commands (undo then reverts only the agent's edits).
     #[arg(long)]
     no_checkpoints: bool,
@@ -159,6 +164,18 @@ enum Output {
 enum Approve {
     AutoEdit,
     Yolo,
+}
+
+/// `str_replace`, `patch` or `hashline`.
+fn parse_edit_format(s: &str) -> Result<EditFormat, String> {
+    match s {
+        "str_replace" => Ok(EditFormat::StrReplace),
+        "patch" => Ok(EditFormat::Patch),
+        "hashline" => Ok(EditFormat::Hashline),
+        _ => Err(format!(
+            "`{s}` is not an edit format (str_replace, patch or hashline)"
+        )),
+    }
 }
 
 fn parse_usd(s: &str) -> Result<f64, String> {
@@ -247,6 +264,8 @@ impl Cli {
 #[derive(Clone)]
 struct Settings {
     overrides: CliOverrides,
+    /// `--edit-format`: applied to the session's model in its catalog.
+    edit_format: Option<EditFormat>,
     data_home: PathBuf,
     approve_mcp: bool,
     secrets: local::Secrets,
@@ -274,6 +293,7 @@ impl Settings {
         }
         Ok(Settings {
             overrides: cli.overrides(),
+            edit_format: cli.edit_format,
             data_home: tautly_core::data_home().context("cannot find the data directory")?,
             approve_mcp: cli.approve_mcp,
             secrets: local::secrets(),
@@ -377,6 +397,12 @@ impl Settings {
     ) -> anyhow::Result<(Engine, mpsc::Receiver<Event>)> {
         let mut loaded = Config::load(root, self.overrides.clone())?;
         self.detect_model(&mut loaded)?;
+        if let Some(format) = self.edit_format {
+            let config = &mut loaded.config;
+            let mut catalog = config.effective_catalog();
+            catalog.set_edit_format(&config.model, format);
+            config.catalog_overrides = Some(catalog);
+        }
         let mut builder = EngineBuilder {
             resume,
             interactive,
