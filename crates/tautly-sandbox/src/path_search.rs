@@ -8,8 +8,10 @@ use std::path::{Path, PathBuf};
 /// work tree at `root` cannot have put there. Skipped: an empty or relative entry (a
 /// program runs with the root as its working directory, so `bin` or an empty entry would
 /// name one the repository ships), an entry inside the root by name or once links are
-/// resolved, and a candidate whose resolved path is inside the root. When the root is a
-/// linked worktree, "inside" also means inside its main work tree ([`main_work_tree`]).
+/// resolved, and a candidate whose resolved path is inside the root. "Inside" also means
+/// inside any work tree of the root's repository: a path one of whose ancestors has a
+/// `.git` resolving to the root's common git directory ([`common_dir`]): the main tree of
+/// a linked worktree, a sibling worktree, or the submodule checkout a fork was made from.
 ///
 /// The candidate is returned as found (`<entry>/<name>`, links not resolved), so a
 /// multi-call shim that dispatches on its name (a `git` link to `mise`) keeps working;
@@ -28,12 +30,13 @@ pub fn which_outside_or_skipped(
     root: &Path,
 ) -> Result<PathBuf, Option<PathBuf>> {
     let real_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
-    let main = main_work_tree(root);
-    let inside = |p: &Path| {
-        p.starts_with(root)
-            || p.starts_with(&real_root)
-            || main.as_deref().is_some_and(|m| p.starts_with(m))
+    let common = common_dir(&real_root);
+    let same_repository = |p: &Path| {
+        common
+            .as_ref()
+            .is_some_and(|c| p.ancestors().any(|a| common_dir(a).as_ref() == Some(c)))
     };
+    let inside = |p: &Path| p.starts_with(root) || p.starts_with(&real_root) || same_repository(p);
     let mut skipped = None;
     for dir in std::env::split_paths(path) {
         let candidate = dir.join(name);
@@ -61,24 +64,30 @@ pub fn which_outside_or_skipped(
     Err(skipped)
 }
 
-/// When `root` is a linked worktree (a fork's, a bisect's), its main work tree: its `.git`
-/// file names `<common>/worktrees/<name>`, whose `commondir` leads to `<common>`, the main
-/// tree's `.git`. Its PATH entries are an in-repository toolchain too (CP5 review I2). Read
-/// without following links and without verifying git's back-link: it only widens what is
-/// skipped.
-fn main_work_tree(root: &Path) -> Option<PathBuf> {
+/// The common git directory of the work tree at `dir` (canonical), if `dir` has a `.git`:
+/// that directory itself; or, for a `gitdir:` file, the directory it names, or where that
+/// directory's `commondir` leads (a linked worktree's). So a main work tree, its linked
+/// worktrees, and a submodule checkout (`<super>/.git/modules/<name>`) with its own linked
+/// worktrees each resolve to their repository's one common directory (CP5 review I2,
+/// re-review N3). The `.git` is not followed when it is a link, only small files are read,
+/// and git's back-links are not verified: it only widens what is skipped.
+fn common_dir(dir: &Path) -> Option<PathBuf> {
     let small = |p: &Path| {
         let m = std::fs::symlink_metadata(p).ok()?;
         (m.is_file() && m.len() <= 4096)
             .then(|| std::fs::read_to_string(p).ok())
             .flatten()
     };
-    let dot_git = small(&root.join(".git"))?;
-    let git_dir = root.join(dot_git.lines().next()?.strip_prefix("gitdir:")?.trim());
-    let common = small(&git_dir.join("commondir"))?;
-    let common = git_dir.join(common.trim()).canonicalize().ok()?;
-    // A bare or separate repository has no work tree around it (its parent may be `~`).
-    (common.file_name()? == ".git").then(|| common.parent().map(Path::to_path_buf))?
+    let dot_git = dir.join(".git");
+    if std::fs::symlink_metadata(&dot_git).is_ok_and(|m| m.is_dir()) {
+        return dot_git.canonicalize().ok();
+    }
+    let text = small(&dot_git)?;
+    let git_dir = dir.join(text.lines().next()?.strip_prefix("gitdir:")?.trim());
+    match small(&git_dir.join("commondir")) {
+        Some(common) => git_dir.join(common.trim()).canonicalize().ok(),
+        None => git_dir.canonicalize().ok(),
+    }
 }
 
 /// A regular file with an execute bit (links followed).

@@ -264,6 +264,108 @@ async fn bare_commands_in_a_linked_worktree_skip_the_main_tree() {
     assert!(err.to_string().contains("not found on PATH"), "{err}");
 }
 
+/// CP5 re-review N3: the same holds when the session is rooted in a submodule checkout
+/// (whose git directory is `<super>/.git/modules/<name>`, not a `.git`): a fork worktree
+/// of it skips PATH entries inside the submodule checkout, and so does a sibling worktree.
+#[tokio::test]
+async fn bare_commands_in_a_submodule_fork_skip_the_submodule_checkout() {
+    use std::os::unix::fs::PermissionsExt;
+    use tautly_sandbox::SpawnSpec;
+    use tokio::io::AsyncReadExt;
+    let top = tempfile::tempdir().unwrap();
+    let top = top.path().canonicalize().unwrap();
+    let (upstream, sup) = (top.join("upstream"), top.join("super"));
+    let (fork, sibling, tools) = (top.join("fork"), top.join("sibling"), top.join("tools"));
+    let git = |dir: &Path, args: &[&str]| {
+        std::fs::create_dir_all(dir).unwrap();
+        let ok = std::process::Command::new("git")
+            .current_dir(dir)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .args(["-c", "user.name=T", "-c", "user.email=t@example.com"])
+            .args(["-c", "protocol.file.allow=always"])
+            .args(args)
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok, "git {args:?}");
+    };
+    let script = |path: &Path, says: &str| {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, format!("#!/bin/sh\necho {says}\n")).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    };
+    git(&upstream, &["init", "-q"]);
+    script(&upstream.join("bin/mytool"), "REPO");
+    git(&upstream, &["add", "-A"]);
+    git(&upstream, &["commit", "-q", "-m", "i"]);
+    git(&sup, &["init", "-q"]);
+    git(
+        &sup,
+        &["submodule", "add", "-q", upstream.to_str().unwrap(), "sub"],
+    );
+    let sub = sup.join("sub");
+    git(
+        &sub,
+        &["worktree", "add", "-q", "--detach", fork.to_str().unwrap()],
+    );
+    git(
+        &sub,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "--detach",
+            sibling.to_str().unwrap(),
+        ],
+    );
+    script(&tools.join("mytool"), "OUTSIDE");
+    let sb = LocalSandbox::new(fork.clone()).unwrap();
+    let run = |path: String| {
+        let sb = sb.clone();
+        async move {
+            let mut child = sb
+                .spawn(SpawnSpec {
+                    argv: vec!["mytool".into()],
+                    cwd: ".".into(),
+                    env: vec![("PATH".into(), path)],
+                    env_remove: vec![],
+                    new_process_group: true,
+                })
+                .await?;
+            let mut out = String::new();
+            child
+                .stdout
+                .take()
+                .unwrap()
+                .read_to_string(&mut out)
+                .await
+                .unwrap();
+            Ok::<_, SandboxError>(out.trim().to_string())
+        }
+    };
+    for repo_bin in [sub.join("bin"), sibling.join("bin")] {
+        let path = format!("{}:{}", repo_bin.display(), tools.display());
+        assert_eq!(
+            run(path).await.unwrap(),
+            "OUTSIDE",
+            "{}",
+            repo_bin.display()
+        );
+    }
+    // An unrelated repository's entries are not skipped.
+    assert_eq!(
+        run(format!(
+            "{}:{}",
+            upstream.join("bin").display(),
+            tools.display()
+        ))
+        .await
+        .unwrap(),
+        "REPO"
+    );
+}
+
 #[tokio::test]
 async fn write_atomic_new_file_gets_umask_default_mode() {
     use std::os::unix::fs::MetadataExt;
