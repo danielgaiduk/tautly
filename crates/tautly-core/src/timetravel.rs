@@ -63,7 +63,7 @@ pub use self::materialize::{MaterializeReport, materialize};
 use self::materialize::{fail, materialize_inner};
 use crate::checkpoint::{CheckpointError, Checkpointer, Point, Skip};
 use crate::lease::{ExclusiveGuard, LeaseError};
-use crate::protocol::{ErrorKind, Event, FinishReason};
+use crate::protocol::{Command, ErrorKind, Event, FinishReason};
 use crate::record::{CheckpointPoint, RestoreBy, RestoreOutcome, SessionRecord};
 use crate::resume::{Continue, Rebuilt, ResumeError, branch, discard, rebuild, rebuild_with};
 use crate::session::Session;
@@ -229,8 +229,8 @@ pub(crate) struct StepCounter {
     open: Option<(u32, u32)>,
     /// The open step's response so far.
     resp: Response,
-    /// The open step logged a `ToolCall`.
-    called: bool,
+    /// A user turn is running (between its `TurnStart` and `TurnEnd`).
+    running: bool,
 }
 
 impl StepCounter {
@@ -239,6 +239,7 @@ impl StepCounter {
         match rec {
             SessionRecord::TurnStart { turn, .. } => {
                 self.close();
+                self.running = true;
                 self.done = self.done.saturating_add(1);
                 Some((self.done, *turn))
             }
@@ -247,7 +248,28 @@ impl StepCounter {
                 self.open = Some((*step, *turn));
                 self.open
             }
-            SessionRecord::TurnEnd { .. } => {
+            // What rebuild ends a step at (`close_step`): the records written before the
+            // next step's request. A response event after one belongs to no step.
+            SessionRecord::TurnEnd { .. }
+            | SessionRecord::Forked
+            | SessionRecord::ModelSet { .. }
+            | SessionRecord::GcApplied { .. }
+            | SessionRecord::Compaction { .. }
+            | SessionRecord::PinsFolded
+            | SessionRecord::MemoryIndexApplied { .. }
+            | SessionRecord::PrefixApplied { .. }
+            | SessionRecord::StartPins { .. }
+            | SessionRecord::Uncompacted { .. }
+            | SessionRecord::Undone { .. }
+            | SessionRecord::WritesLost { late: true, .. } => {
+                self.running &= !matches!(rec, SessionRecord::TurnEnd { .. });
+                self.close();
+                None
+            }
+            // A pin sent between turns is part of what the next step is built from.
+            SessionRecord::Command(Command::Pin { .. } | Command::Unpin { .. })
+                if !self.running =>
+            {
                 self.close();
                 None
             }
@@ -259,12 +281,11 @@ impl StepCounter {
                 }
                 self.open
             }
-            // Logged only for a response whose calls entered the history.
-            SessionRecord::ToolCall { .. } => {
-                self.called |= self.open.is_some();
-                self.open
-            }
-            SessionRecord::ToolResult { .. } | SessionRecord::Edit { .. } => self.open,
+            // A `ToolCall` answers nothing by itself: its call is the response's
+            // `Provider` event, as rebuild reads it.
+            SessionRecord::ToolCall { .. }
+            | SessionRecord::ToolResult { .. }
+            | SessionRecord::Edit { .. } => self.open,
             _ => None,
         }
     }
@@ -272,7 +293,7 @@ impl StepCounter {
     /// The last step so far: the open one once its response is answered.
     pub fn last(&self) -> u32 {
         match self.open {
-            Some((step, _)) if self.called || self.resp.answered() => step,
+            Some((step, _)) if self.resp.answered() => step,
             _ => self.done,
         }
     }
@@ -280,7 +301,6 @@ impl StepCounter {
     fn close(&mut self) {
         self.done = self.last();
         self.open = None;
-        self.called = false;
         self.resp = Response::default();
     }
 }

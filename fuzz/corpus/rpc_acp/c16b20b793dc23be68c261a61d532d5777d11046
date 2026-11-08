@@ -1,0 +1,5 @@
+{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": 1}}
+{"jsonrpc": "2.0", "id": 2, "method": "session/new", "params": {"cwd": "/tmp", "mcpServers": []}}
+{"jsonrpc": "2.0", "id": 3, "method": "session/prompt", "params": {"sessionId": "x", "prompt": [{"type": "text", "text": "hi"}]}}
+{"jsonrpc": "2.0", "method": "session/cancel", "params": {"sessionId": "x"}}
+{"jsonrpc": "2.0", "id": 4, "method": "session/set_config_option", "params": {"sessionId": "x", "configId": "model", "value": "m"}}

@@ -752,6 +752,40 @@ fn argv_that_can_drop_the_bytecode_prefix_is_never_remembered() {
     }
 }
 
+/// Fuzzing (mcp_launch): a `-m` module of thousands of parts (a repository's config may
+/// hold 256 KiB) made one candidate path per parent package, each as long as the module,
+/// so 40 KB of `a.a.a…` took gigabytes. A module Python could not import that way (deeper
+/// than any real package, or longer than a path) and a command line naming more
+/// candidates than the bounds cover are not keyed by content: never remembered, asked at
+/// every start, and the key is computed in bounded time.
+#[test]
+fn a_huge_module_or_command_line_is_bounded_and_never_remembered() {
+    use tautly_mcp::approvals::approval_key;
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().canonicalize().unwrap();
+    let deep = format!("{}a", "a.".repeat(20_000));
+    let many = "x ".repeat(60_000);
+    // Review I1: `/` instead of `.`, 60 times in one 246 KB shell word.
+    let slashes = format!("python3 -m {}a > ", "a/".repeat(2047)).repeat(60);
+    let specs = [
+        stdio("sh", &["-c", &slashes], &[]),
+        stdio("python3", &["-m", &deep], &[]),
+        stdio("python3", &[&format!("-m{deep}")], &[]),
+        stdio("sh", &["-c", &format!("python3 -m {deep}")], &[]),
+        stdio("python3", &["-m", &format!("{}a", "p.".repeat(100))], &[]),
+        stdio("sh", &["-c", &many], &[]),
+    ];
+    for spec in &specs {
+        let started = std::time::Instant::now();
+        let k = approval_key(&repo, "s", spec);
+        assert!(!k.rememberable);
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+    }
+    // A real package depth is still keyed and remembered.
+    let k = approval_key(&repo, "s", &stdio("python3", &["-m", "a.b.c.d.e.f.g"], &[]));
+    assert!(k.rememberable);
+}
+
 /// quality Q1: a launch file over the bounds, a directory with more entries than the file
 /// budget, or a FIFO named as the script can never be remembered: each start keys
 /// differently, so a stored approval never matches and the server is asked about again.

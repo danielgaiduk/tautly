@@ -1259,6 +1259,90 @@ fn leading_descriptor_of_a_redirect_is_not_an_argv_word() {
     assert_eq!(parse_commands("cmd 0").unwrap()[0].argv, ["cmd", "0"]);
 }
 
+// ---- Fuzzing (shell_policy): a prefix word with no command after it ----
+
+/// `command`, `builtin` and `time` (with or without their options) and no command after
+/// them run nothing: the parse keeps the words as written and never indexes past them.
+#[test]
+fn a_bare_prefix_word_parses() {
+    for s in [
+        "time",
+        "command",
+        "builtin",
+        "command -p",
+        "time -p",
+        "A=1; time",
+        "x | command --",
+    ] {
+        let cmds = parse_commands(s).unwrap_or_else(|e| panic!("{s:?}: {e}"));
+        assert!(!cmds.last().unwrap().argv.is_empty(), "{s:?}");
+    }
+}
+
+/// Fuzzing (shell_policy): a redirection with no command still opens its target (`< f`
+/// reads it, and bash connects for `< /dev/tcp/host/port`), so like a write it fails
+/// closed rather than vanish from the parse.
+#[test]
+fn a_read_redirection_without_a_command_is_unparseable() {
+    for s in [
+        "< f",
+        " < f \nc",
+        "c; < /dev/tcp/example.com/80",
+        "{ c; } && < f",
+        "2< f",
+    ] {
+        assert!(
+            parse_commands(s).is_err(),
+            "{s:?} parsed as {:?}",
+            parse_commands(s)
+        );
+    }
+    assert!(parse_commands("c < f").is_ok());
+}
+
+/// Fuzzing (shell_policy): `[a = b ]` is the command `[a` in bash (the bracket is part of
+/// the word), but the grammar reads a test: it is unparseable rather than a harmless `[[`.
+#[test]
+fn a_bracket_glued_to_a_word_is_not_a_test() {
+    // Review C1: bash ends the `[` command at a newline (or form feed) after it, and runs
+    // the next line as its own command; the grammar reads one test.
+    for s in [
+        "[a = b ]",
+        "[[a = b ]]",
+        "x && [rm -rf ]",
+        "[\nrm -rf x ]",
+        "ls; [\nrm -rf x ]",
+        "[ -f a ] && [\nrm -rf x ]",
+        "[ a\nrm -rf x ]",
+        "[\x0crm -rf x ]",
+    ] {
+        assert!(
+            parse_commands(s).is_err(),
+            "{s:?} parsed as {:?}",
+            parse_commands(s)
+        );
+    }
+    for s in ["[ a = b ]", "[[ a = b ]]", "[\ta ]"] {
+        assert!(parse_commands(s).is_ok(), "{s:?}");
+    }
+}
+
+/// Fuzzing (shell_policy): an assignment whose value is a lone `$` (`ex=$ cmd`) is bash's
+/// literal `$`, and `cmd` still runs with it in its environment: the command after it is
+/// in the parse, or the input is unparseable.
+#[test]
+fn a_lone_dollar_value_does_not_hide_the_command() {
+    for s in ["ex=$ rm -rf x", "a | ex=$ rm -rf x", "a=$ b=1 rm x"] {
+        if let Ok(cmds) = parse_commands(s) {
+            assert!(
+                cmds.iter()
+                    .any(|c| c.argv.first().is_some_and(|w| w == "rm")),
+                "{s:?} parsed as {cmds:?}"
+            );
+        }
+    }
+}
+
 // ---- quality Q1: arithmetic literals, fail-closed arms, printf -v and option parsing ----
 
 #[test]

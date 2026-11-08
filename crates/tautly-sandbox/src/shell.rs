@@ -6,9 +6,11 @@
 //! statically is reported as [`Unparseable`].
 
 use std::path::PathBuf;
+use std::time::Duration;
 
-use tree_sitter::{Node, Parser};
+use tree_sitter::{Node, Parser, Tree};
 
+use crate::deadline::{Refusal, Worker};
 use crate::runners::{base, reject_unanalyzable, runs_module};
 use crate::shell_state::{Cwd, unwrap_prefixes};
 
@@ -45,15 +47,18 @@ pub struct Unparseable(pub String);
 /// recursive walk far from the stack limit on crafted input.
 const MAX_DEPTH: usize = 256;
 
+/// Longest the grammar may take on one input (normal commands take microseconds). Its
+/// error recovery can run for minutes on a short crafted input, where no progress
+/// callback is consulted, so the parse runs on a worker thread that is abandoned at this
+/// deadline.
+const PARSE_DEADLINE: Duration = Duration::from_secs(2);
+
+/// The one thread every parse runs on (so at most one parse is ever stuck).
+static PARSER: Worker = Worker::new(PARSE_DEADLINE);
+
 /// Parse `src` into the flat list of simple commands it would run.
 pub fn parse_commands(src: &str) -> Result<Vec<SimpleCommand>, Unparseable> {
-    let mut parser = Parser::new();
-    parser
-        .set_language(&tree_sitter_bash::LANGUAGE.into())
-        .map_err(|e| Unparseable(format!("bash grammar unavailable: {e}")))?;
-    let tree = parser
-        .parse(src, None)
-        .ok_or_else(|| Unparseable("parser produced no tree".into()))?;
+    let tree = parse_tree(src)?;
     let root = tree.root_node();
     if root.has_error() {
         return Err(Unparseable(describe_error(root, src)));
@@ -72,6 +77,33 @@ pub fn parse_commands(src: &str) -> Result<Vec<SimpleCommand>, Unparseable> {
         }
     }
     Ok(out)
+}
+
+/// The grammar's tree of `src`, parsed on the [`PARSER`] thread within
+/// [`PARSE_DEADLINE`].
+fn parse_tree(src: &str) -> Result<Tree, Unparseable> {
+    let owned = src.to_string();
+    let parsed = PARSER.run(move || {
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_bash::LANGUAGE.into())
+            .map_err(|e| format!("bash grammar unavailable: {e}"))?;
+        parser
+            .parse(&owned, None)
+            .ok_or_else(|| "parser produced no tree".to_string())
+    });
+    match parsed {
+        Ok(tree) => tree.map_err(Unparseable),
+        Err(Refusal::Stuck) => Err(Unparseable(
+            "an earlier command's parse is still running past its deadline".into(),
+        )),
+        Err(Refusal::TimedOut) => Err(Unparseable(format!(
+            "parsing took too long (over {} s): the input is too complex to analyze",
+            PARSE_DEADLINE.as_secs()
+        ))),
+        Err(Refusal::Panicked) => Err(Unparseable("the shell parser failed".into())),
+        Err(Refusal::Unavailable) => Err(Unparseable("cannot start the shell parser".into())),
+    }
 }
 
 /// Bash deletes a backslash-newline pair before tokenizing, so `.g\<nl>it` is the
@@ -255,7 +287,25 @@ fn walk(
             // `[ … ]` is the ordinary `[` command, so `>` and `<` inside it are redirects
             // (`[ a > Z ]` truncates `Z`); only `[[ … ]]` compares. The grammar reads both
             // as comparisons, so a single-bracket test holding one fails closed.
+            // `[a` is a word to bash (the command `[a`), not a test: the bracket must be
+            // followed by a space or tab. A newline (or form feed) instead ends the `[`
+            // command, and bash runs the next line as a command of its own.
+            let glued = node
+                .child(0)
+                .is_some_and(|c| !matches!(src.get(c.end_byte()), Some(b' ' | b'\t')));
+            if glued {
+                return Err(Unparseable(
+                    "`[` not followed by a space or tab: bash runs what follows as a command"
+                        .into(),
+                ));
+            }
             let single = node.child(0).is_some_and(|c| text(c, src) == "[");
+            // `[` is an ordinary command: a newline anywhere in it ends it there.
+            if single && text(node, src).contains(['\n', '\x0c']) {
+                return Err(Unparseable(
+                    "newline inside `[ … ]`: bash ends the `[` command there".into(),
+                ));
+            }
             if single && holds_redirect(node, src) {
                 return Err(Unparseable(
                     "redirect inside `[ … ]`: the `[` command, unlike `[[ … ]]`, redirects on \
@@ -287,6 +337,7 @@ fn walk(
         // A bare assignment changes how every later command in the input runs.
         "variable_assignment" => {
             let t = text(node, src);
+            reject_lone_dollar(t)?;
             let name = t.split(['=', '[', '+']).next().unwrap_or(t);
             if is_dangerous_env(name) {
                 return Err(Unparseable(format!(
@@ -428,6 +479,7 @@ fn walk_command(
         match child.kind() {
             "command_name" => argv.push(unquote(child, src)),
             "variable_assignment" => {
+                reject_lone_dollar(text(child, src))?;
                 assignments.push(text(child, src).to_string());
                 rest.push(child);
             }
@@ -446,7 +498,8 @@ fn walk_command(
         }
     }
     if argv.is_empty() {
-        if redirects.iter().any(|r| r.write) {
+        // Even a read opens its target (`< /dev/tcp/host/port` connects).
+        if !redirects.is_empty() {
             return Err(Unparseable("redirection without a command".into()));
         }
     } else {
@@ -581,7 +634,7 @@ fn walk_redirected(
         reject_fed_modules(&out[start..])?;
     }
     if out.len() == start {
-        if redirects.iter().any(|r| r.write) {
+        if !redirects.is_empty() {
             return Err(Unparseable("redirection without a command".into()));
         }
     } else {
@@ -993,11 +1046,39 @@ fn check_expansion(t: &str) -> Result<(), Unparseable> {
     Ok(())
 }
 
+/// An assignment holding an unquoted `$` before whitespace: bash ends the word there
+/// (`ex=$ rm -rf x` runs `rm`), while the grammar reads the next word into the value,
+/// hiding the command name. Fails closed on any such `$` outside quotes.
+fn reject_lone_dollar(t: &str) -> Result<(), Unparseable> {
+    let b = t.as_bytes();
+    let (mut single, mut double, mut i) = (false, false, 0);
+    while i < b.len() {
+        match b[i] {
+            b'\\' if !single => i += 1,
+            b'\'' if !double => single = !single,
+            b'"' if !single => double = !double,
+            b'$' if !single && !double && b.get(i + 1).is_some_and(u8::is_ascii_whitespace) => {
+                return Err(Unparseable(format!(
+                    "`$` before whitespace in the assignment `{}`",
+                    snippet(t)
+                )));
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    Ok(())
+}
+
 /// Builtins that take variable *names* evaluate any subscript in them, so a
 /// dynamic or code-bearing name hides commands. Also `let`, integer/nameref
 /// declarations and `mapfile -C` callbacks.
 fn reject_dynamic_names(argv: &[String]) -> Result<(), Unparseable> {
-    let cmd = base(&argv[0]);
+    // Empty behind a bare prefix (`command`, `time -p`): nothing runs.
+    let Some(first) = argv.first() else {
+        return Ok(());
+    };
+    let cmd = base(first);
     let args = &argv[1..];
     let names: Vec<&str> = match cmd {
         "let" => return Err(hidden("`let` arithmetic")),
@@ -1067,7 +1148,10 @@ fn reject_dangerous_name(name: &str) -> Result<(), Unparseable> {
 fn reject_dynamic_numbers(argv: &[String]) -> Result<(), Unparseable> {
     const ARITH_TESTS: &[&str] = &["-eq", "-ne", "-lt", "-le", "-gt", "-ge"];
     let dynamic = |w: &String| w.contains(['$', '`']);
-    let cmd = base(&argv[0]);
+    let Some(first) = argv.first() else {
+        return Ok(());
+    };
+    let cmd = base(first);
     let args = &argv[1..];
     let bad = match cmd {
         "test" | "[" => {

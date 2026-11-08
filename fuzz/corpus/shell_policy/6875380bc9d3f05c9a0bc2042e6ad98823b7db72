@@ -1,0 +1,3 @@
+cat <<EOF > o.txt
+x
+EOF

@@ -1875,3 +1875,25 @@ fn dotdot_spellings_of_protected_paths_ask_with_the_normalized_name() {
         assert!(r.contains("outside workspace"), "{path}: {r}");
     }
 }
+
+/// Review C1: `[` then a newline runs the next line as a command. A deny rule on it
+/// still holds in Yolo, no exact rule is offered, and the session rule `bash(\[\[)` an
+/// earlier offer could have named never allows it.
+#[test]
+fn a_bracket_then_newline_cannot_slip_a_command_past_the_policy() {
+    for cmd in ["[\nrm -rf x ]", "[ -f a ] && [\nrm -rf x ]"] {
+        let yolo = with_rules(Mode::Yolo, &[], &["bash(rm *)"]);
+        assert!(
+            !matches!(yolo.decide("bash", &exec(cmd), Some(cmd)), Decision::Allow),
+            "{cmd:?}"
+        );
+        assert_eq!(
+            yolo.exact_rule("bash", &exec(cmd), Some(cmd)),
+            None,
+            "{cmd:?}"
+        );
+        let mut ask = p(Mode::Ask);
+        ask.add_session_allow("bash(\\[\\[)").unwrap();
+        assert!(asks(ask.decide("bash", &exec(cmd), Some(cmd))), "{cmd:?}");
+    }
+}

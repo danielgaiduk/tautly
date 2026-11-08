@@ -1,0 +1,3 @@
+cmd a <<EOF
+x
+EOF

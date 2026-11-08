@@ -197,7 +197,7 @@ impl Cwd {
 
 /// The command that actually runs behind `builtin` (`--`), `command` (`-p`, `--`) and
 /// `time` (`-p`) prefixes. `command -v`/`-V` only look a name up, so they are
-/// returned as is.
+/// returned as is. Empty when nothing follows the prefixes (`command`, `time -p`).
 pub(crate) fn unwrap_prefixes(argv: &[String]) -> &[String] {
     let mut a = argv;
     loop {

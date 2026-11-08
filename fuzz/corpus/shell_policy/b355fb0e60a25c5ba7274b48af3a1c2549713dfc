@@ -1,0 +1,1 @@
+sudo env FOO=1 time nohup nice rm

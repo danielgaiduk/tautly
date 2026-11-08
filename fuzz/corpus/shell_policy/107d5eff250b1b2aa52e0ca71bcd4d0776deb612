@@ -1,0 +1,4 @@
+cmd <(cmd2 <<EOF @
+x
+EOF
+)

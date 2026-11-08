@@ -1,5 +1,6 @@
 //! Filesystem, process and network confinement for Tautly.
 
+mod deadline;
 mod effect;
 mod local;
 mod path_search;

@@ -1,0 +1,3 @@
+cat <<EOF
+hello > not_a_file
+EOF

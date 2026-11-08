@@ -1,0 +1,3 @@
+cmd <<EOF 2> g @
+x
+EOF

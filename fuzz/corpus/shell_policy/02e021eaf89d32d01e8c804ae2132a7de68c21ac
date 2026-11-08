@@ -1,0 +1,4 @@
+cmd <<EOF
+x
+EOF
+@

@@ -1,0 +1,1 @@
+echo ${FOO:=x} ${PATH:-x} ${HOME:+y} ${CDPATH} ${#PATH}

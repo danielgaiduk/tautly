@@ -1,0 +1,87 @@
+# Fuzz targets for the parsers that read untrusted input (see README.md). Its own
+# workspace, so the main workspace and its CI never need the nightly toolchain
+# libFuzzer requires.
+[package]
+name = "tautly-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[workspace]
+members = ["."]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+serde_json = "1"
+tempfile = "3"
+tokio = { version = "1", features = ["rt", "io-util"] }
+tautly-sandbox = { path = "../crates/tautly-sandbox" }
+tautly-session = { path = "../crates/tautly-session" }
+tautly-core = { path = "../crates/tautly-core" }
+tautly-provider = { path = "../crates/tautly-provider" }
+tautly-tools = { path = "../crates/tautly-tools" }
+tautly-rpc = { path = "../crates/tautly-rpc" }
+tautly-acp = { path = "../crates/tautly-acp" }
+tautly-mcp = { path = "../crates/tautly-mcp" }
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "shell_policy"
+path = "fuzz_targets/shell_policy.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "session_reader"
+path = "fuzz_targets/session_reader.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "timetravel"
+path = "fuzz_targets/timetravel.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "config_project"
+path = "fuzz_targets/config_project.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rpc_acp"
+path = "fuzz_targets/rpc_acp.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "mcp_launch"
+path = "fuzz_targets/mcp_launch.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "escaping"
+path = "fuzz_targets/escaping.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "edit_apply"
+path = "fuzz_targets/edit_apply.rs"
+test = false
+doc = false
+bench = false

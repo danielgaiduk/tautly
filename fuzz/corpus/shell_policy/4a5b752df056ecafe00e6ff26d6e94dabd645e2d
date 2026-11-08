@@ -1,0 +1,1 @@
+echo $(cd sub); cd x | true; pwd

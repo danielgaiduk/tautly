@@ -1,0 +1,7 @@
+{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocol_version": 1}}
+{"jsonrpc": "2.0", "id": 2, "method": "session/new", "params": {}}
+{"jsonrpc": "2.0", "id": 3, "method": "send_message", "params": {"text": "hi"}}
+{"jsonrpc": "2.0", "id": 4, "method": "set_budget", "params": {"scope": "week", "max_usd": 1}}
+{"jsonrpc": "2.0", "id": 5, "method": "replay", "params": {"target": "x", "speed": Infinity}}
+{"jsonrpc": "2.0", "method": "cancel"}
+{"jsonrpc": "2.0", "id": 6, "method": "shutdown"}
