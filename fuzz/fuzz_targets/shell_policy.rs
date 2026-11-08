@@ -56,7 +56,7 @@ fn marker_is_a_word(src: &str) -> bool {
                 | "["
         )
     };
-    let words: Vec<&str> = src.split(|c: char| c.is_whitespace()).collect();
+    let words: Vec<&str> = src.split_whitespace().collect();
     if words.iter().any(|w| keyword(w)) {
         return false;
     }
