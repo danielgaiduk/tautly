@@ -111,6 +111,13 @@ patterns for what must never run (`bash(rm -*r*)`, `bash(git*push*)`) and keep `
 disposable environments. Allow rules never use these extra forms (`bash(cargo test)` does
 not allow `time cargo test`).
 
+**What `bash(git *)` covers.** It allows ordinary git subcommands, but never the
+invocations that change what git runs: `git config` that may write, `git -c`, and the
+global options `--config-env`, `--exec-path`, `--git-dir` and `--work-tree` (as
+`--opt=value` or `--opt value`) always ask, as does a `GIT_*` assignment in front of the
+command. Configuration git reads from the work tree (`.git/`, `.gitconfig`) is protected,
+so the agent cannot plant hooks there either.
+
 ## Session rules ("allow for this session")
 
 When the REPL or an editor asks about a call, you can allow it **for this session**. The
