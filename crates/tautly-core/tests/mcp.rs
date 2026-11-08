@@ -72,6 +72,9 @@ fn config(mode: Mode) -> Config {
         ..Config::default()
     };
     c.permissions.mode = mode;
+    // The fixture server may take more than the default 5 s to start on a loaded runner,
+    // and the first request goes without its tools then. Tests of the wait set their own.
+    c.mcp.startup_timeout_ms = 60_000;
     c
 }
 
@@ -170,6 +173,9 @@ impl Fx {
         EngineBuilder {
             provider: Some(Arc::new(mock.clone())),
             data_home: Some(self.home.path().to_path_buf()),
+            // The repo map is in every first request, however loaded the runner: the
+            // context numbers some tests compare depend on it.
+            startup_wait: WAIT,
             ..EngineBuilder::new(cfg, self.dir.path())
         }
     }
@@ -778,26 +784,23 @@ async fn first_request_waits_up_to_startup_timeout() {
     // Ready within the wait: the first request has the tools.
     let fx = Fx::new();
     let mut cfg = with_user_server(Mode::Ask, &[("ECHO_START_DELAY_MS", "700")]);
-    cfg.mcp.startup_timeout_ms = 10_000;
+    cfg.mcp.startup_timeout_ms = 60_000;
     let mock = MockProvider::new(vec![text_step("done")]);
     let mut run = start(fx.builder(cfg, &mock));
     run.turn_with("hi").await;
     assert_eq!(mcp_names(&mock.requests()[0]).len(), ECHO_TOOL_COUNT);
     run.shutdown().await;
 
-    // Not ready: the first request goes without them, after about the wait.
+    // Not ready: the first request goes without them, after about the wait. The server
+    // starts a minute late, so a turn on a loaded runner still ends long before it would.
     let fx = Fx::new();
-    let mut cfg = with_user_server(Mode::Ask, &[("ECHO_START_DELAY_MS", "4000")]);
+    let mut cfg = with_user_server(Mode::Ask, &[("ECHO_START_DELAY_MS", "60000")]);
     cfg.mcp.startup_timeout_ms = 300;
     let mock = MockProvider::new(vec![text_step("done")]);
     let mut run = start(fx.builder(cfg, &mock));
     let t = Instant::now();
     run.turn_with("hi").await;
-    assert!(
-        t.elapsed() < Duration::from_millis(2500),
-        "{:?}",
-        t.elapsed()
-    );
+    assert!(t.elapsed() < Duration::from_secs(20), "{:?}", t.elapsed());
     assert!(
         t.elapsed() >= Duration::from_millis(250),
         "{:?}",

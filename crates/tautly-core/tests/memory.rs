@@ -171,7 +171,7 @@ impl Fx {
         let sb: Arc<dyn Sandbox> = Arc::new(LocalSandbox::new(self.root()).unwrap());
         let ws = Workspace::new(sb, self.home.path());
         ws.start();
-        assert!(ws.wait_ready(WAIT).await, "index never became ready");
+        assert!(ws.wait_ready_or_failed().await, "index never became ready");
         // The memory store opens right after the index.
         for _ in 0..300 {
             if ws.memory().is_some() {
@@ -186,6 +186,8 @@ impl Fx {
     async fn ready(&self, cfg: Config, mock: &MockProvider) -> EngineBuilder {
         EngineBuilder {
             workspace: Some(self.ready_workspace().await),
+            // The memory index in the first request, however loaded the runner.
+            startup_wait: WAIT,
             ..self.builder(cfg, mock)
         }
     }
@@ -601,6 +603,7 @@ async fn stale_flag_appears_at_next_cache_epoch() {
     ]);
     let mut run = start(EngineBuilder {
         workspace: Some(ws),
+        startup_wait: WAIT,
         ..fx.builder(cfg, &mock)
     });
     let events = run.turn_with("change alpha").await;
@@ -1073,12 +1076,19 @@ async fn consolidation_prompt_fits_the_side_model_window() {
 #[tokio::test]
 async fn shutdown_stops_background_commands_before_the_episode() {
     let fx = Fx::new();
+    // Unique to this run, so another copy of this binary running at the same time has
+    // no process `pgrep` could mistake for this one.
+    let secs = format!(
+        "317.{:09}",
+        std::time::UNIX_EPOCH.elapsed().unwrap().subsec_nanos()
+    );
+    let pattern = format!("^sleep {secs}$");
     let mock = MockProvider::new(vec![
         // A background child that outlives its call (a dev server, say).
         tools_step(vec![call(
             "c1",
             "bash",
-            json!({"command": "sleep 317 >/dev/null 2>&1 &"}),
+            json!({"command": format!("sleep {secs} >/dev/null 2>&1 &")}),
         )]),
         text_step("started"),
         // The session-end episode, which takes its time.
@@ -1086,7 +1096,7 @@ async fn shutdown_stops_background_commands_before_the_episode() {
     ]);
     let mut run = start(fx.ready(config(Mode::Yolo), &mock).await);
     run.turn_with("start the server").await;
-    assert!(running("^sleep 317$"), "the background child should run");
+    assert!(running(&pattern), "the background child should run");
     run.send(Command::Shutdown).await;
     let deadline = Instant::now() + WAIT;
     while mock.requests().len() < 3 {
@@ -1095,7 +1105,7 @@ async fn shutdown_stops_background_commands_before_the_episode() {
     }
     // The episode is being written; background commands were stopped before it.
     assert!(
-        !running("^sleep 317$"),
+        !running(&pattern),
         "the background child outlived the session into its episode"
     );
     let closed =

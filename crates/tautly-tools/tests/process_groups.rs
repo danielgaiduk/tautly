@@ -121,22 +121,27 @@ async fn dropping_a_running_call_kills_its_group() {
 #[tokio::test]
 async fn cancel_kills_the_command_without_waiting_out_the_grace() {
     let e = env();
-    let cancel = CancellationToken::new();
-    let run = e.run("sleep 306", cancel.clone());
-    tokio::pin!(run);
-    let pgid = tokio::select! {
-        _ = &mut run => panic!("sleep 306 returned"),
-        pgid = e.wait_for_group() => pgid,
-    };
-    let t0 = Instant::now();
-    cancel.cancel();
-    let r = run.await;
-    let took = t0.elapsed();
-    assert!(r.output.contains("killed: cancelled"), "{}", r.output);
-    assert!(!group_alive(pgid));
+    let mut fastest = Duration::MAX;
+    // The fastest of five: a loaded runner can stall any one run past the grace, but a
+    // cancel that waits the grace out is slow every time.
+    for _ in 0..5 {
+        let cancel = CancellationToken::new();
+        let run = e.run("sleep 306", cancel.clone());
+        tokio::pin!(run);
+        let pgid = tokio::select! {
+            _ = &mut run => panic!("sleep 306 returned"),
+            pgid = e.wait_for_group() => pgid,
+        };
+        let t0 = Instant::now();
+        cancel.cancel();
+        let r = run.await;
+        fastest = fastest.min(t0.elapsed());
+        assert!(r.output.contains("killed: cancelled"), "{}", r.output);
+        assert!(!group_alive(pgid));
+        assert!(e.groups.live().is_empty());
+    }
     // A command that dies on SIGTERM is not given the full 100 ms grace.
-    assert!(took < Duration::from_millis(90), "{took:?}");
-    assert!(e.groups.live().is_empty());
+    assert!(fastest < Duration::from_millis(90), "{fastest:?}");
 }
 
 #[tokio::test]

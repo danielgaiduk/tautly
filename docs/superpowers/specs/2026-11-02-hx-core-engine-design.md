@@ -221,7 +221,7 @@ trait Tool: Send + Sync {
 | `read` | Line ranges; emits hashline anchors when the active edit format is `hashline`; images for capable models; re-reads return `unchanged`/diff (7.2) unless `full: true` |
 | `edit` | Per-model edit format (5.3) |
 | `write` | Create/overwrite a file |
-| `bash` | Runs via sandbox in its own process group; default timeout 120 s; output > 2 KB passed through output filters (7.3), else/fallback capped at 30 KB (head + tail kept); full output spilled to a temp file referenced in the result. The command inherits the user's environment minus shell-state variables (`CDPATH`, `BASH_ENV`, `ENV`, `SHELLOPTS`, `BASHOPTS`, `PROMPT_COMMAND`, `PS4`) and minus the provider key variables MCP servers are denied (7.11.10: `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`, `OPENROUTER_API_KEY` and every configured `api_key_env`): the commands an agent runs (`npm test`, a `build.rs`) are often repository code. A command that needs a key gets it from the user's own shell, not from tautly's environment |
+| `bash` | Runs via sandbox in its own process group; default timeout 120 s; output > 2 KB passed through output filters (7.3), else/fallback capped at 30 KB (head + tail kept); full output spilled to a temp file referenced in the result. Output over 4 MB skips the filters and streams to the spill file (7.3). The command inherits the user's environment minus shell-state variables (`CDPATH`, `BASH_ENV`, `ENV`, `SHELLOPTS`, `BASHOPTS`, `PROMPT_COMMAND`, `PS4`) and minus the provider key variables MCP servers are denied (7.11.10: `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`, `OPENROUTER_API_KEY` and every configured `api_key_env`): the commands an agent runs (`npm test`, a `build.rs`) are often repository code. A command that needs a key gets it from the user's own shell, not from tautly's environment |
 | `grep`, `glob` | ripgrep crates (`grep-searcher`, `ignore`); `.gitignore`-aware |
 | `outline`, `symbol`, `refs` | Code-index queries (7.1) |
 | `find` | One ranked search over paths, symbols and text (7.10) |
@@ -415,6 +415,7 @@ Cost ledger (SQLite, `PRAGMA user_version` 4): table `usage` (one row per charge
 - Parsers for: `cargo test|build|check|clippy`, `pytest`, `jest`/`vitest`, `go test`, `tsc`, `eslint`. Detected from the parsed command (5.5 parser).
 - Applied when raw output exceeds 2 KB. Result: counts (passed/failed/errors/warnings) plus each failure or diagnostic (name, `file:line`, message, ≤ 20 lines each), plus the path of the spilled full output.
 - Parse failure falls back to the 30 KB head + tail cap. `raw: true` disables filtering.
+- Output over 4 MB is not filtered: it streams to the spill file as it arrives (buffered; the spill keeps at most 1 GiB, then ends with a truncation marker) and only its head and tail stay in memory, so the result is the 30 KB head + tail cap plus the spill path. A spill whose write fails is deleted and not named.
 
 ### 7.4 Memory (`tautly-memory`)
 - **Project memory:** one markdown file per entry in `.tautly/memory/`, named after its title (see the Obsidian bullet; shareable via git). Frontmatter: `id`, `title`, `kind` (`convention | fact | gotcha | command`), `anchors: [{path, symbol?, hash}]`, `created`, `verified`. Body ≤ 300 tokens.
@@ -914,13 +915,19 @@ Every operation here creates a new branch or a new view. None truncates a log, a
 4. **Protocol** — `tautly -p` golden-file tests over the JSON event stream.
 
 ### 9.1 CI performance gates (merge-blocking)
-- Cold start < 50 ms (`hyperfine`, release build, `tautly --version` and `tautly -p` against `MockProvider` to first event).
-- Idle RSS < 30 MB.
-- 4-hour simulated session (mock provider, accelerated clock): RSS within ±10% of the 10-minute mark.
-- 100 MB tool output: RSS bounded, output spilled to disk.
+The gates are `benches/perf/startup.sh` and the `#[ignore]` tests of the `tautly-perf` crate (`benches/perf/`), run by the CI `perf` job in release on Linux and macOS; every number goes to the job summary.
+- Cold start, median of 40 runs, release build with `--mock-script` (no provider detection): `tautly --version` (`hyperfine -N`) and `tautly -p` to its first event (the first JSON line). Gated relative to the merge-base's binary measured in the same run: at most 1.10× its median + 2 ms. The absolute target < 50 ms is reported, and enforced on Linux only once CI shows the headroom (`TAUTLY_ENFORCE_ABSOLUTE=1`).
+- Idle RSS < 30 MB (`tautly --rpc`, 2 s after `initialize`).
+- 4-hour simulated session (mock provider; simulated time counted in turns, one user turn per 30 s, reading, grepping, editing and compacting): RSS within ±10% of the 10-minute mark, and the live heap's fitted growth over the 4 h < 10%.
+- 100 MB tool output: peak RSS growth < 20 MB, the whole output spilled to disk; 109 MB of short lines in < 10 s.
 - Release binary size tracked and reported (not gated).
-- Index build of a generated 10,000-file repository < 10 s; single-file reindex < 50 ms.
-- Selective `grep` via the trigram index on a generated 100,000-file repository < 50 ms; `glob` from the live tree < 5 ms.
+- Index build of a generated 10,000-file repository < 10 s; single-file reindex (500 lines) < 50 ms, median of 20; on 20,000 files a reindex started during the repo map's `top_referenced(20)` < 50 ms every time (the query reads on its own connection).
+- Selective `grep` via the trigram index on a generated 100,000-file repository < 50 ms; `glob` from the live tree < 5 ms (median of 20); `Index::open` with its tree of 100,000 files < 20 MB RSS (fresh process); a no-op post-bash freshness check with a live watcher < 50 ms and cookie-based (no refresh).
+- A flood of 2,000 commands during a turn: refused past the queues' capacity, log growth < 512 KiB, RSS growth < 16 MB.
+- ACP `session/load` of a 200 MB log: RSS growth < 64 MB (fresh process).
+- Log size: a session with ten 200 KB `write` calls has its `.jsonl` plus the blobs it added, minus the post-images, under 1.3× the post-images + 64 KiB.
+- The compaction cut search at 5,000 step-turns < 250 ms (it was quadratic).
+- Recorded, not gated: a checkpoint of a clean 10,000-file repository (target < 300 ms) and an unchanged-tree reuse (target < 5 ms), median of 20, and the per-step latency checkpoints add.
 - Token regression: tokens per solved task on the starter set (scripted mock replay, deterministic) must not exceed the committed baseline by more than 10%.
 
 ### 9.2 Eval runner (interface for sub-project 5)

@@ -1,0 +1,4 @@
+[
+  [{"text_delta": "hello"}, {"done": {"stop": "end_turn"}}],
+  [{"text_delta": "# Said hello\n\nThe user said hi."}, {"done": {"stop": "end_turn"}}]
+]

@@ -1,0 +1,62 @@
+[package]
+name = "tautly-perf"
+description = "Performance gates for the Tautly agent harness (run in release with `-- --ignored`)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+# The gates live in benches/perf/ (spec 9.1). Every gate is `#[ignore]`: the CI `perf` job
+# runs them in release with `cargo test --release -p tautly -p tautly-perf --features
+# tautly/mock -- --ignored --test-threads=1` (the selection of its build step: no rebuild).
+
+[dependencies]
+libc.workspace = true
+
+[dev-dependencies]
+tautly-core = { path = "../tautly-core" }
+tautly-provider = { path = "../tautly-provider" }
+tautly-index = { path = "../tautly-index" }
+tautly-context = { path = "../tautly-context" }
+tautly-sandbox = { path = "../tautly-sandbox" }
+tautly-tools = { path = "../tautly-tools" }
+tautly-acp = { path = "../tautly-acp" }
+tokio.workspace = true
+tokio-util.workspace = true
+futures.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+blake3.workspace = true
+
+[[test]]
+name = "soak"
+path = "../../benches/perf/soak.rs"
+
+[[test]]
+name = "big_output"
+path = "../../benches/perf/big_output.rs"
+
+[[test]]
+name = "index"
+path = "../../benches/perf/index.rs"
+
+[[test]]
+name = "workspace"
+path = "../../benches/perf/workspace.rs"
+
+[[test]]
+name = "engine"
+path = "../../benches/perf/engine.rs"
+
+[[test]]
+name = "acp_load"
+path = "../../benches/perf/acp_load.rs"
+
+[[test]]
+name = "checkpoint"
+path = "../../benches/perf/checkpoint.rs"
+
+[[test]]
+name = "context"
+path = "../../benches/perf/context.rs"

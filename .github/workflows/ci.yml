@@ -11,17 +11,63 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --workspace
-      # The `tautly` binary end to end on a scripted provider (`--mock-script`).
-      - run: cargo test -p tautly --features mock
+      # One run, with the `tautly` binary's scripted provider (`--mock-script`) on, so its
+      # end-to-end tests run too without building the workspace a second time.
+      - run: cargo test --workspace --features tautly/mock
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo clippy -p tautly --all-targets --features mock -- -D warnings
+
+  # Performance gates (spec 9.1, Task 33), release build on both OSes: cold start and idle
+  # RSS (benches/perf/startup.sh, relative to the merge-base's binary), then the in-process
+  # gates in benches/perf/ (crate tautly-perf, all `#[ignore]`, one at a time so timings and
+  # RSS are not shared). Each measurement is also written to the job summary.
+  perf:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install hyperfine
+        run: |
+          if [ "$RUNNER_OS" = macOS ]; then brew install hyperfine
+          else sudo apt-get update && sudo apt-get install -y hyperfine; fi
+      - name: Merge base
+        id: base
+        run: echo "sha=$(git merge-base HEAD origin/${{ github.base_ref || 'main' }})" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@v4
+        id: baseline
+        with:
+          path: baseline/tautly
+          key: tautly-baseline-${{ runner.os }}-${{ steps.base.outputs.sha }}
+      - name: Build the merge-base binary
+        if: steps.baseline.outputs.cache-hit != 'true'
+        run: |
+          git worktree add ../base "${{ steps.base.outputs.sha }}"
+          if (cd ../base && cargo build --release -p tautly --features mock); then
+            mkdir -p baseline && cp ../base/target/release/tautly baseline/tautly
+          else
+            echo "::warning::the merge-base binary did not build; the relative start-up gate is skipped"
+          fi
+      # One feature selection for the build and the gates, so nothing is built twice.
+      - run: cargo test --release -p tautly -p tautly-perf --features tautly/mock --no-run
+      - run: bash benches/perf/startup.sh
+        env:
+          TAUTLY_BASELINE_BIN: baseline/tautly
+      - run: cargo test --release -p tautly -p tautly-perf --features tautly/mock -- --ignored --test-threads=1 --nocapture
 
   # Hooks declared in configuration (`hook.<name>.command`/`event`) arrived in git 2.54, and
   # `core.hooksPath=/dev/null` does not switch them off, so checkpoint git disables each one it
@@ -31,6 +77,7 @@ jobs:
   # really exercise config-based hooks somewhere.
   config-hooks:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -45,6 +92,7 @@ jobs:
   # sha256 checksums, binstall names, release.yml in sync with dist-workspace.toml.
   dist-plan:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -58,6 +106,7 @@ jobs:
   # target is first built by the release workflow.
   musl-static:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

@@ -250,10 +250,16 @@ impl TreeView {
         let matcher = glob.compile_matcher();
         let base = self.inner.key(base);
         let skip = dir_prefix(&base).len();
+        // Only the directory the pattern's literal leading components name can match
+        // (spec 9.1: glob from the tree < 5 ms on 100,000 files).
+        let under = match literal_dir(pattern) {
+            lit if lit.is_empty() => base.clone(),
+            lit => join(&base, &lit),
+        };
         let mut out: Vec<String> = Vec::new();
         {
             let data = self.data();
-            for (dir, files) in data.dirs_at_or_under(&base) {
+            for (dir, files) in data.dirs_at_or_under(&under) {
                 for (name, _) in files {
                     let key = join(dir, name);
                     if matcher.is_match(Path::new(&key[skip..])) {
@@ -338,6 +344,20 @@ impl TreeView {
 }
 
 /// A pattern without a `/` matches at any depth, like gitignore.
+/// The leading directory components of `pattern` that hold no glob syntax (`"src/a"` for
+/// `"src/a/**/*.rs"`); empty when there are none or the pattern matches at any depth.
+fn literal_dir(pattern: &str) -> String {
+    let Some((dirs, _file)) = pattern.rsplit_once('/') else {
+        return String::new();
+    };
+    dirs.split('/')
+        .take_while(|c| {
+            !c.is_empty() && *c != "." && *c != ".." && !c.contains(['*', '?', '[', '{', '\\'])
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
 fn anchor(pattern: &str) -> String {
     if pattern.contains('/') {
         pattern.to_string()
@@ -388,5 +408,16 @@ mod tests {
         assert!(!t.contains_or_under("a"));
         assert!(t.contains_or_under(""));
         assert_eq!(t.keys_under(""), ["top.rs"]);
+    }
+
+    #[test]
+    fn literal_dir_stops_at_glob_syntax() {
+        assert_eq!(literal_dir("src/a/**/*.rs"), "src/a");
+        assert_eq!(literal_dir("src/main.rs"), "src");
+        assert_eq!(literal_dir("*.rs"), "");
+        assert_eq!(literal_dir("**/x/*.rs"), "");
+        assert_eq!(literal_dir("src/{a,b}/*.rs"), "src");
+        assert_eq!(literal_dir("./src/*.rs"), "");
+        assert_eq!(literal_dir("/abs/*.rs"), "");
     }
 }

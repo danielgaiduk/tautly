@@ -159,6 +159,9 @@ fn config() -> Config {
         ..Config::default()
     };
     c.permissions.mode = Mode::Yolo;
+    // A snapshot that times out turns checkpoints off for the session; under load
+    // that would change what these tests see. Tests of the limit set their own.
+    c.checkpoints.timeout_ms = 120_000;
     c
 }
 

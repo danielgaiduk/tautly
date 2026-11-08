@@ -110,7 +110,7 @@ impl Fx {
         let sb: Arc<dyn Sandbox> = Arc::new(LocalSandbox::new(self.root()).unwrap());
         let ws = Workspace::new(sb, self.home.path());
         ws.start();
-        assert!(ws.wait_ready(WAIT).await, "index never became ready");
+        assert!(ws.wait_ready_or_failed().await, "index never became ready");
         ws
     }
 }
@@ -214,6 +214,8 @@ async fn prefix_applied_logged_before_first_request_with_agents_md_and_repo_map_
     let mock = MockProvider::new(vec![text_step("ok")]);
     let mut run = start(EngineBuilder {
         workspace: Some(ws),
+        // The repo map in the first request, however loaded the runner.
+        startup_wait: WAIT,
         ..fx.builder(config(Mode::Ask), &mock)
     });
     assert_eq!(run.turn_with("hi").await, FinishReason::Completed);

@@ -123,7 +123,7 @@ impl Fx {
         let sb: Arc<dyn Sandbox> = Arc::new(LocalSandbox::new(self.root()).unwrap());
         let ws = Workspace::new(sb, self.home.path());
         ws.start();
-        assert!(ws.wait_ready(WAIT).await, "index never became ready");
+        assert!(ws.wait_ready_or_failed().await, "index never became ready");
         ws
     }
 }
@@ -1276,6 +1276,7 @@ async fn first_request_carries_repo_map_and_memory_index_when_ready() {
     let mock = MockProvider::new(vec![text_step("ok"), text_step("ok")]);
     let mut run = start(EngineBuilder {
         workspace: Some(ws),
+        startup_wait: WAIT,
         ..fx.builder(config(Mode::Ask), &mock)
     });
     run.turn_with("one").await;
@@ -1536,11 +1537,8 @@ async fn a_failed_index_refresh_is_reported_once() {
     let sb: Arc<dyn Sandbox> = Arc::new(NoWalk(LocalSandbox::new(fx.root()).unwrap()));
     let ws = Workspace::new(sb, fx.home.path());
     ws.start();
-    let deadline = Instant::now() + WAIT;
-    while ws.index().and_then(|i| i.last_error()).is_none() {
-        assert!(Instant::now() < deadline, "the refresh never failed");
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    assert!(!ws.wait_ready_or_failed().await, "the refresh did not fail");
+    assert!(ws.index().and_then(|i| i.last_error()).is_some());
     let mock = MockProvider::new(vec![
         tools_step(vec![call("c1", "read", json!({"path": "a.txt"}))]),
         text_step("ok"),
@@ -1955,8 +1953,11 @@ async fn a_reader_stalled_after_cancel_still_gets_turn_finished() {
     let mock = MockProvider::new(vec![flood(400, 0)]);
     let mut run = start(fx.builder(config(Mode::Ask), &mock));
     run.say("go").await;
-    // Past the start-up wait, with the stream blocked on a full channel.
-    tokio::time::sleep(Duration::from_millis(1000)).await;
+    // Past the start-up wait, with the stream blocked on a full channel (waited for, not
+    // assumed after a second: under load the start-up wait alone can take longer).
+    while run.events.capacity() > 0 {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
     run.engine.send(Command::Cancel).await.unwrap();
     // A busy client: it reads again only after two seconds.
     tokio::time::sleep(Duration::from_secs(2)).await;
