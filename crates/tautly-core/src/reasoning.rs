@@ -28,9 +28,11 @@ impl ReasoningLevel {
     /// What a request to a model of reasoning `style` carries: nothing when off or when
     /// the model cannot reason; an effort for effort-style models; the level's token
     /// budget (4k, 12k, 32k; adapters cap it below the output limit) for budget-style
-    /// ones.
+    /// ones. Where thinking cannot be turned off (`effort_always`), off is the lowest
+    /// effort.
     pub fn resolve(self, style: ReasoningStyle) -> Option<Reasoning> {
         let effort = match self {
+            ReasoningLevel::Off if style == ReasoningStyle::EffortAlways => Effort::Low,
             ReasoningLevel::Off => return None,
             ReasoningLevel::Low => Effort::Low,
             ReasoningLevel::Auto | ReasoningLevel::Medium => Effort::Medium,
@@ -38,7 +40,9 @@ impl ReasoningLevel {
         };
         match style {
             ReasoningStyle::None => None,
-            ReasoningStyle::Effort => Some(Reasoning::Effort(effort)),
+            ReasoningStyle::Effort | ReasoningStyle::EffortAlways => {
+                Some(Reasoning::Effort(effort))
+            }
             ReasoningStyle::Budget => Some(Reasoning::Budget(effort.budget_tokens())),
         }
     }

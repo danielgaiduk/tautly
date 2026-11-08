@@ -20,13 +20,15 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use tautly_provider::{
     Block, CanonicalRequest, Catalog, Content, Message, ModelId, ModelInfo, Provider,
-    ProviderError, ProviderEvent, RawUsage, Retrying, Role, SideModel, Tier,
+    ProviderError, ProviderEvent, RawUsage, Reasoning, ReasoningStyle, Retrying, Role, SideModel,
+    Tier,
 };
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::Config;
 use crate::provider_setup::ProviderSetupError;
+use crate::reasoning::ReasoningLevel;
 use crate::turn::partial_usage;
 
 /// What one side-model request billed.
@@ -98,6 +100,8 @@ pub struct SideRunner {
     pub usage: mpsc::Sender<SideUsage>,
     window: u32,
     failure: Arc<Mutex<Option<String>>>,
+    /// What every request carries: side work runs with reasoning "off" (spec 4.7).
+    reasoning: Option<Reasoning>,
 }
 
 impl SideRunner {
@@ -114,7 +118,14 @@ impl SideRunner {
             usage,
             window,
             failure: Arc::default(),
+            reasoning: None,
         }
+    }
+
+    /// The side model's reasoning style: side work runs "off" (spec 4.7).
+    pub fn with_style(mut self, style: ReasoningStyle) -> SideRunner {
+        self.reasoning = ReasoningLevel::Off.resolve(style);
+        self
     }
 }
 
@@ -178,7 +189,7 @@ impl SideModel for SideRunner {
                 content: vec![Content::Text(user.to_string())],
             }],
             max_output: max_tokens,
-            reasoning: None,
+            reasoning: self.reasoning.clone(),
             cache_breakpoints: Vec::new(),
             volatile_tail: false,
         };
@@ -236,7 +247,8 @@ impl Side {
             model.clone(),
             tx,
             info.caps.context_window,
-        );
+        )
+        .with_style(info.caps.reasoning);
         let failure = Arc::clone(&runner.failure);
         Side {
             provider,

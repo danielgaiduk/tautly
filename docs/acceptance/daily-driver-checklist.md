@@ -199,9 +199,25 @@ means applying the documented `volatile_tail` placement for that adapter: the wo
 goes inside the last tool result, with the last cache breakpoint on the block before it.
 Open an issue for that adapter. Do not change adapters on a single failure.
 
-These tests check the prompt cache only. **Reasoning continuity is not checked here.** The
-engine does not enable reasoning yet, and the real check comes with the
-reasoning-enablement lane.
+These tests check the prompt cache only. **Reasoning continuity is not checked here yet.**
+The engine now enables reasoning (spec 4.7, default `auto`); the live reasoning check
+comes with the live smoke suite's continuity test.
+
+**Verify Gemini 3 thinking by hand.** Tautly sends Gemini 3 a `thinkingBudget`
+(4,096 / 12,288 / 32,768 tokens for low / medium / high), not a `thinkingLevel`. Google
+documents the budget as still accepted for backward compatibility, but no real call has
+checked it. In the section 5 Gemini session, run `/reasoning high` before the task, then
+confirm:
+- no request is rejected for its thinking settings;
+- the stream shows reasoning text;
+- the receipt's output tokens include the thoughts (they are more than the answer alone).
+
+If Gemini 3 rejects the budget or ignores it, open an issue: the fix is to map the levels
+to `thinkingLevel` for Gemini 3.
+
+| Gemini 3 thinking check | Result | Issue |
+|---|---|---|
+| `thinkingBudget` accepted, thoughts streamed and counted | | |
 
 | Test | anthropic | openai | google | ollama |
 |---|---|---|---|---|

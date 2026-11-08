@@ -44,6 +44,7 @@ use crate::memory::OVER_BUDGET_WARNING;
 use crate::model_switch::rejects_reasoning;
 use crate::protocol::{BudgetScope, Command, ErrorKind, Event, FinishReason, UsageRole};
 use crate::provider_setup::provider_label;
+use crate::reasoning::ReasoningLevel;
 use crate::receipt::ReceiptBuilder;
 use crate::record::{BLOB_INPUT, CheckpointPoint, INLINE_INPUT_MAX, SessionRecord};
 use crate::routing::{Side, model_failed};
@@ -722,6 +723,18 @@ impl Session {
     /// The cache epoch at a step start; returns the request to send.
     async fn epoch(&mut self, ctl: &TurnControl) -> (CanonicalRequest, ContextStatus) {
         let (req, status) = self.assemble();
+        // A reasoning change alters Anthropic's thinking parameters, which invalidates its
+        // message cache: count this step as a cold epoch (spec 4.7).
+        let changed = self
+            .sent_reasoning
+            .replace(req.reasoning.clone())
+            .is_some_and(|before| before != req.reasoning);
+        let (req, status) = if changed && provider_label(&self.model) == "anthropic" {
+            self.context.force_cold_epoch();
+            self.assemble()
+        } else {
+            (req, status)
+        };
         let now = Instant::now();
         let ttl = self
             .info
@@ -824,11 +837,13 @@ impl Session {
         let mut announced = false;
         let (summary, removed) = loop {
             // The request is sized for the side model's window.
-            let (req, removed) = self.context.compaction_request(
+            let (mut req, removed) = self.context.compaction_request(
                 &self.side.model,
                 &self.side.info.caps,
                 DEFAULT_KEEP_RECENT,
             );
+            // Side work runs with reasoning "off" (spec 4.7).
+            req.reasoning = ReasoningLevel::Off.resolve(self.side.info.caps.reasoning);
             if removed == 0 {
                 return false;
             }

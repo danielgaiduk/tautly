@@ -36,6 +36,15 @@ fn auto_is_medium_for_models_that_reason_and_off_otherwise() {
     ] {
         assert_eq!(level.resolve(ReasoningStyle::Budget), want, "{level}");
     }
+    // Thinking that cannot be turned off: "off" is the lowest effort.
+    for (level, want) in [
+        (Auto, effort(Effort::Medium)),
+        (Low, effort(Effort::Low)),
+        (High, effort(Effort::High)),
+        (Off, effort(Effort::Low)),
+    ] {
+        assert_eq!(level.resolve(ReasoningStyle::EffortAlways), want, "{level}");
+    }
     // A model that cannot reason gets nothing, whatever was asked.
     for level in [Auto, Off, Low, Medium, High] {
         assert_eq!(level.resolve(ReasoningStyle::None), None, "{level}");
@@ -62,8 +71,9 @@ fn levels_parse_and_print_by_name() {
 }
 
 #[test]
-fn the_built_in_catalog_marks_current_anthropic_models_as_effort_style() {
-    // Their API rejects a fixed thinking budget; effort is the control (spec 4.7).
+fn the_built_in_catalog_marks_current_anthropic_models_as_always_thinking_effort_style() {
+    // Their API rejects a fixed thinking budget; effort is the control, and omitting
+    // `thinking` leaves it on (spec 4.7).
     let catalog = Catalog::builtin();
     for id in [
         "anthropic/claude-sonnet-5-5",
@@ -72,7 +82,7 @@ fn the_built_in_catalog_marks_current_anthropic_models_as_effort_style() {
         "anthropic/claude-fable-5-1",
     ] {
         let caps = catalog.get(&ModelId::from(id)).caps;
-        assert_eq!(caps.reasoning, ReasoningStyle::Effort, "{id}");
+        assert_eq!(caps.reasoning, ReasoningStyle::EffortAlways, "{id}");
     }
 }
 

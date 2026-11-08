@@ -390,6 +390,7 @@ impl EngineBuilder {
             provider,
             setup: ModelSetup::new(config.clone(), Arc::clone(&catalog), Some(provider_factory)),
             reasoning_retry: false,
+            sent_reasoning: None,
             model: config.model.clone(),
             info,
             side,
@@ -429,6 +430,7 @@ impl EngineBuilder {
             end_recovery: None,
         };
         let current = Arc::new(Mutex::new((session_id.clone(), session_path.clone())));
+        let reasoning = Arc::clone(&session.reasoning);
         let actor = Actor {
             _live: session.workspace.enter(),
             log: session.log.clone(),
@@ -438,7 +440,7 @@ impl EngineBuilder {
             session_id: session_id.clone(),
             current: Arc::clone(&current),
             budgets,
-            reasoning: Arc::clone(&session.reasoning),
+            reasoning: Arc::clone(&reasoning),
             groups: groups.clone(),
             cost_ledger: Arc::clone(&session.cost_ledger),
         };
@@ -466,6 +468,7 @@ impl EngineBuilder {
                 session_path,
                 current,
                 groups,
+                reasoning,
             },
             event_rx,
         ))
@@ -516,9 +519,20 @@ pub struct Engine {
     /// The session the engine is on now (a fork moves it to the branch).
     current: Arc<Mutex<(String, PathBuf)>>,
     groups: ProcessGroups,
+    /// Shared with the session (`SetReasoning`).
+    reasoning: Arc<Mutex<ReasoningLevel>>,
 }
 
 impl Engine {
+    /// The session's reasoning level now (spec 4.7): the configured one until a
+    /// `SetReasoning` is applied.
+    pub fn reasoning(&self) -> ReasoningLevel {
+        *self
+            .reasoning
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
     /// Hand a command to the session; an error only when the session has stopped.
     pub async fn send(&self, cmd: Command) -> Result<(), EngineError> {
         self.commands

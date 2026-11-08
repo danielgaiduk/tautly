@@ -695,6 +695,46 @@ async fn a_side_model_summary_is_sized_priced_and_recorded_as_the_side_model() {
     assert!((side_rows[0].1.unwrap() - 0.1).abs() < 1e-9, "{rows:?}");
 }
 
+/// Spec 4.7: a reasoning change that alters an Anthropic request's thinking parameters
+/// starts a cold epoch, like a model switch; on another provider, or when the parameters
+/// stay the same, the cache stays warm.
+#[tokio::test]
+async fn a_reasoning_change_on_anthropic_starts_a_cold_epoch() {
+    use tautly_core::ReasoningLevel;
+    for (model, level, cold_expected) in [
+        ("anthropic/a1", ReasoningLevel::High, true),
+        // `auto` already resolves to `medium`: nothing changes on the wire.
+        ("anthropic/a1", ReasoningLevel::Medium, false),
+        ("openai/o1", ReasoningLevel::High, false),
+    ] {
+        let fx = Fx::new();
+        let small: String = (0..20).map(|i| format!("line {i}\n")).collect();
+        fx.write("small.txt", &small);
+        let read = || call("r", "read", json!({"path": "small.txt", "full": true}));
+        let mock = MockProvider::new(vec![
+            tools_step(vec![read()]),
+            tools_step(vec![read()]),
+            reply("read twice"),
+            reply("after"),
+        ]);
+        let mut run = start(fx.builder(config(model), &mock));
+        let t1 = run.turn_with("read it twice").await;
+        assert_eq!(finish_reason(&t1), FinishReason::Completed, "{t1:?}");
+        run.send(Command::SetReasoning { level }).await;
+        let t2 = run.turn_with("after the change").await;
+        let cold = t2.iter().any(|e| {
+            matches!(
+                e,
+                Event::ContextCollected {
+                    reason: MutationReason::ColdCache,
+                    ..
+                }
+            )
+        });
+        assert_eq!(cold, cold_expected, "{model} {level}: {t2:?}");
+    }
+}
+
 #[tokio::test]
 async fn first_request_after_switch_is_cold_epoch() {
     let fx = Fx::new();
