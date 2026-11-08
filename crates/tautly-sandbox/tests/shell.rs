@@ -1300,6 +1300,20 @@ fn a_read_redirection_without_a_command_is_unparseable() {
     assert!(parse_commands("c < f").is_ok());
 }
 
+/// Fuzzing (shell_policy): on this 899-byte input tree-sitter's error recovery runs for
+/// minutes, inside `ts_parser__condense_stack` / `ts_stack_merge`, where the parse
+/// progress callback is never consulted, so it cannot be cancelled from here. A model's
+/// command like this hangs the policy check. Open: needs isolating the parse (a worker
+/// with a deadline, or a process) or an upstream fix; run with `--ignored`.
+#[test]
+#[ignore = "open: tree-sitter-bash parse takes minutes on this input (fuzz finding)"]
+fn a_parse_that_runs_too_long_is_unparseable() {
+    let src = std::str::from_utf8(include_bytes!("fixtures/slow_parse.sh")).unwrap();
+    let started = std::time::Instant::now();
+    assert!(parse_commands(src).is_err());
+    assert!(started.elapsed() < std::time::Duration::from_secs(10));
+}
+
 /// Fuzzing (shell_policy): `[a = b ]` is the command `[a` in bash (the bracket is part of
 /// the word), but the grammar reads a test: it is unparseable rather than a harmless `[[`.
 #[test]
