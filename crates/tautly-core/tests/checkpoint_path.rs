@@ -161,7 +161,10 @@ fn missing_git_warns_once_and_logs_a_skip() {
     let (events, path) = with_path(empty.path(), async {
         let (engine, mut events) = engine(repo.path(), home.path(), vec![text_step("hi")]);
         engine
-            .send(Command::SendMessage { text: "hi".into() })
+            .send(Command::SendMessage {
+                id: None,
+                text: "hi".into(),
+            })
             .await
             .unwrap();
         let mut seen = Vec::new();
@@ -220,7 +223,10 @@ fn session_start_checkpoint_does_not_delay_the_first_command() {
         let (engine, mut events) = engine(repo.path(), home.path(), vec![text_step("hi")]);
         let began = Instant::now();
         engine
-            .send(Command::SendMessage { text: "hi".into() })
+            .send(Command::SendMessage {
+                id: None,
+                text: "hi".into(),
+            })
             .await
             .unwrap();
         while !matches!(next(&mut events).await, Event::TurnStarted) {}
@@ -311,7 +317,10 @@ fn old_git_in_a_partial_clone_warns_once_and_logs_one_skip() {
         let mut seen = Vec::new();
         for text in ["one", "two"] {
             engine
-                .send(Command::SendMessage { text: text.into() })
+                .send(Command::SendMessage {
+                    id: None,
+                    text: text.into(),
+                })
                 .await
                 .unwrap();
             loop {
@@ -404,7 +413,10 @@ fn undo_with_global_excludes(symlinked: bool) {
             ],
         );
         engine
-            .send(Command::SendMessage { text: "go".into() })
+            .send(Command::SendMessage {
+                id: None,
+                text: "go".into(),
+            })
             .await
             .unwrap();
         let began = Instant::now();
@@ -418,6 +430,7 @@ fn undo_with_global_excludes(symlinked: bool) {
         while !matches!(next(&mut events).await, Event::TurnFinished { .. }) {}
         engine
             .send(Command::Undo {
+                id: None,
                 turn: None,
                 dry_run: false,
             })
@@ -479,7 +492,10 @@ fn write_step(id: &str, path: &str, content: &str) -> MockTurn {
 /// Send `text` and wait for the turn's end.
 async fn turn(engine: &Engine, events: &mut mpsc::Receiver<Event>, text: &str) {
     engine
-        .send(Command::SendMessage { text: text.into() })
+        .send(Command::SendMessage {
+            id: None,
+            text: text.into(),
+        })
         .await
         .unwrap();
     while !matches!(next(events).await, Event::TurnFinished { .. }) {}

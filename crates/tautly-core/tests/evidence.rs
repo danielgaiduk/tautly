@@ -391,6 +391,7 @@ fn old_turn_finished_json_without_evidence_parses() {
     assert_eq!(
         e,
         Event::TurnFinished {
+            id: None,
             reason: FinishReason::Completed,
             evidence: None
         }
@@ -413,6 +414,7 @@ fn old_turn_finished_json_without_evidence_parses() {
         execs_since: 0,
     };
     let e = Event::TurnFinished {
+        id: None,
         reason: FinishReason::Completed,
         evidence: Some(evidence),
     };
@@ -503,7 +505,10 @@ async fn turn(
     text: &str,
 ) -> Option<TestEvidence> {
     engine
-        .send(Command::SendMessage { text: text.into() })
+        .send(Command::SendMessage {
+            id: None,
+            text: text.into(),
+        })
         .await
         .unwrap();
     loop {
@@ -511,7 +516,12 @@ async fn turn(
             .await
             .expect("timed out")
             .expect("event channel closed");
-        if let Event::TurnFinished { reason, evidence } = ev {
+        if let Event::TurnFinished {
+            id: _,
+            reason,
+            evidence,
+        } = ev
+        {
             assert_eq!(reason, FinishReason::Completed);
             return evidence;
         }

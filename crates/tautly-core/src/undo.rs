@@ -35,7 +35,7 @@ use tautly_tools::{AppliedEffect, PersistedEffect};
 
 use crate::checkpoint::{self, Change, CheckpointError, Checkpointer, Skip};
 use crate::protocol::{ErrorKind, Event};
-use crate::record::{SessionRecord, UndoneFile};
+use crate::record::{CheckpointPoint, SessionRecord, UndoneFile};
 use crate::session::{Log, Session};
 use crate::turn::TurnControl;
 
@@ -89,6 +89,7 @@ impl UndoReport {
                 .collect()
         };
         Event::Undone {
+            id: None,
             turn: self.turn,
             restored: rel(&self.restored),
             deleted: rel(&self.deleted),
@@ -283,6 +284,8 @@ struct TurnRecs {
     ran_commands: bool,
     /// A checkpoint of the turn was skipped.
     skipped: bool,
+    /// Its end checkpoint was skipped by a cancel (and not recovered after it).
+    end_skipped: bool,
 }
 
 impl TurnRecs {
@@ -313,10 +316,14 @@ impl Scan {
             max_n: 0,
         };
         let mut current = 0u32;
+        // The turn that just ended with its end checkpoint skipped by a cancel: its end is
+        // recovered in the background and logged after its `TurnEnd` (Task 49 N1).
+        let mut recovering = 0u32;
         for rec in reader.records() {
             match rec?.1 {
                 SessionRecord::TurnStart { turn, .. } => {
                     current = turn;
+                    recovering = 0;
                     scan.turns = scan.turns.max(turn);
                 }
                 SessionRecord::TurnEnd { .. } => {
@@ -327,7 +334,24 @@ impl Scan {
                     {
                         *end = true;
                     }
+                    if scan.per_turn.get(&current).is_some_and(|t| t.end_skipped) {
+                        recovering = current;
+                    }
                     current = 0;
+                }
+                // The recovered end of a cancelled turn: that turn's end after all.
+                SessionRecord::Checkpoint {
+                    n,
+                    commit,
+                    turn,
+                    point: Some(CheckpointPoint::TurnEnd),
+                    ..
+                } if current == 0 && recovering > 0 && turn == recovering => {
+                    scan.max_n = scan.max_n.max(n);
+                    let t = scan.per_turn.entry(turn).or_default();
+                    t.events.push(Ev::Checkpoint { commit, end: true });
+                    t.end_skipped = false;
+                    recovering = 0;
                 }
                 // A turn's own: the session-start checkpoint, taken in the background, can
                 // be logged after the next turn's `TurnStart`.
@@ -340,8 +364,18 @@ impl Scan {
                         t.events.push(Ev::Checkpoint { commit, end: false });
                     }
                 }
-                SessionRecord::CheckpointSkipped { turn, .. } if current > 0 && turn == current => {
-                    scan.per_turn.entry(current).or_default().skipped = true;
+                SessionRecord::CheckpointSkipped {
+                    turn,
+                    reason,
+                    point,
+                    ..
+                } if current > 0 && turn == current => {
+                    let t = scan.per_turn.entry(current).or_default();
+                    if reason == "cancelled" && point == Some(CheckpointPoint::TurnEnd) {
+                        t.end_skipped = true;
+                    } else {
+                        t.skipped = true;
+                    }
                 }
                 SessionRecord::ToolResult { effects, .. } if current > 0 => {
                     let t = scan.per_turn.entry(current).or_default();
@@ -691,7 +725,7 @@ impl GitUndo<'_> {
         if self.recs.ran_commands {
             notes.push(NOTE_GIT.to_string());
         }
-        if self.recs.skipped {
+        if self.recs.skipped || self.recs.end_skipped {
             notes.push(NOTE_SKIPPED.to_string());
         }
         if !kept.is_empty() {
@@ -1286,6 +1320,7 @@ impl Session {
             self.undo_command(turn, dry_run).await;
         } else {
             self.emit(Event::Error {
+                id: None,
                 kind: ErrorKind::Tool,
                 message: "undo cancelled: nothing was changed".into(),
                 retryable: false,
@@ -1380,6 +1415,7 @@ impl Session {
             _ => None,
         };
         self.emit(Event::Error {
+            id: None,
             kind: ErrorKind::Tool,
             message: format!("undo: {e}"),
             retryable: false,

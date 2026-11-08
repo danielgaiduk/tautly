@@ -330,5 +330,15 @@ expression: events
   {
     "type": "user_message",
     "text": "fix the bug"
+  },
+  {
+    "type": "consolidate_finished",
+    "id": "c-7",
+    "applied": 1,
+    "failed": 0
+  },
+  {
+    "type": "approval_withdrawn",
+    "request_id": "approval-3"
   }
 ]

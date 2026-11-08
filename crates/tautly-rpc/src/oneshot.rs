@@ -68,7 +68,10 @@ pub async fn run_oneshot_to(
     };
     let mut code = None;
     if engine
-        .send(Command::SendMessage { text: prompt })
+        .send(Command::SendMessage {
+            id: None,
+            text: prompt,
+        })
         .await
         .is_ok()
     {

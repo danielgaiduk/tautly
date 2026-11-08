@@ -127,6 +127,8 @@ const COMMAND_METHODS: &[&str] = &[
 
 /// Lines waiting for the output before producers wait.
 const OUTPUT_CAPACITY: usize = 1024;
+/// The correlation id of the `Fork` a `session/new {fork}` sends.
+const FORK_ID: &str = "session/new";
 
 /// The command a method names, from its params (by name; `session_id` is the transport's
 /// and is ignored). Method names are the commands' wire names, so `send_message
@@ -656,7 +658,9 @@ async fn forward(
             },
         };
         let renamed = match &ev {
-            Event::SessionChanged { session_id } if *session_id != id => Some(session_id.clone()),
+            Event::SessionChanged { id: _, session_id } if *session_id != id => {
+                Some(session_id.clone())
+            }
             _ => None,
         };
         // Routed by the new id before the client can learn it.
@@ -798,7 +802,7 @@ impl Conn {
                 return Flow::Stop;
             }
             _ => {
-                let result = self.command(&method, &params).await;
+                let result = self.command(&method, &params, id.as_ref()).await;
                 self.shared.reply(id.as_ref(), result).await;
             }
         }
@@ -926,8 +930,20 @@ impl Conn {
         })
     }
 
-    async fn command(&self, method: &str, params: &Value) -> Result<Value, Error> {
-        let cmd = command_for(method, params)?;
+    async fn command(
+        &self,
+        method: &str,
+        params: &Value,
+        rid: Option<&Value>,
+    ) -> Result<Value, Error> {
+        let mut cmd = command_for(method, params)?;
+        // Without `params.id`, the request's own id correlates the answer (re-review N4).
+        if let Some(rid) = rid {
+            cmd.set_default_id(match rid {
+                Value::String(s) => s.clone(),
+                other => other.to_string(),
+            });
+        }
         let (key, engine) = self.shared.session_key(params)?;
         if let Command::Approve {
             request_id,
@@ -1098,6 +1114,7 @@ async fn session_new(
                 shared.open(root, Some(parent.clone()), interactive).await?;
             let sent = engine
                 .send(Command::Fork {
+                    id: Some(FORK_ID.into()),
                     at: fork.at,
                     label: fork.label,
                 })
@@ -1108,10 +1125,14 @@ async fn session_new(
             while failure.is_none() && branch.is_none() {
                 match events.recv().await {
                     None => failure = Some("the session stopped".into()),
-                    Some(Event::SessionChanged { session_id }) if session_id == parent => {}
-                    Some(Event::SessionChanged { session_id }) => {
+                    // The fork's answer echoes its id; the resumed parent's own start does not.
+                    Some(Event::SessionChanged { id: None, .. }) => {}
+                    Some(Event::SessionChanged { id: _, session_id }) => {
                         branch = Some(session_id.clone());
-                        early.push(Event::SessionChanged { session_id });
+                        early.push(Event::SessionChanged {
+                            id: None,
+                            session_id,
+                        });
                     }
                     Some(Event::Error { message, .. }) => failure = Some(message),
                     Some(ev) => early.push(ev),

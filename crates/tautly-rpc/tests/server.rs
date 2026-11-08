@@ -248,7 +248,10 @@ fn methods_map_to_commands() {
         (
             "send_message",
             json!({"text": "hi", "session_id": "s1"}),
-            Command::SendMessage { text: "hi".into() },
+            Command::SendMessage {
+                id: None,
+                text: "hi".into(),
+            },
         ),
         (
             "approve",
@@ -276,7 +279,7 @@ fn methods_map_to_commands() {
                 max_tokens: None,
             },
         ),
-        ("compact", json!({}), Command::Compact),
+        ("compact", json!({}), Command::Compact { id: None }),
         ("uncompact", json!({}), Command::Uncompact),
         (
             "pin",
@@ -306,11 +309,16 @@ fn methods_map_to_commands() {
                 proposal_id: "p1".into(),
             },
         ),
-        ("consolidate_memory", json!({}), Command::ConsolidateMemory),
+        (
+            "consolidate_memory",
+            json!({}),
+            Command::ConsolidateMemory { id: None },
+        ),
         (
             "fork",
             json!({"at": 3, "label": "try b"}),
             Command::Fork {
+                id: None,
                 at: Some(3),
                 label: Some("try b".into()),
             },
@@ -319,6 +327,7 @@ fn methods_map_to_commands() {
             "fork",
             json!({}),
             Command::Fork {
+                id: None,
                 at: None,
                 label: None,
             },
@@ -327,15 +336,31 @@ fn methods_map_to_commands() {
             "set_model",
             json!({"model": "openai/gpt-5"}),
             Command::SetModel {
+                id: None,
                 model: ModelId::from("openai/gpt-5"),
             },
         ),
-        ("diff", json!({"turn": 2}), Command::Diff { turn: Some(2) }),
-        ("diff", json!({}), Command::Diff { turn: None }),
+        (
+            "diff",
+            json!({"turn": 2}),
+            Command::Diff {
+                id: None,
+                turn: Some(2),
+            },
+        ),
+        (
+            "diff",
+            json!({}),
+            Command::Diff {
+                id: None,
+                turn: None,
+            },
+        ),
         (
             "undo",
             json!({"dry_run": true}),
             Command::Undo {
+                id: None,
                 turn: None,
                 dry_run: true,
             },
@@ -344,6 +369,7 @@ fn methods_map_to_commands() {
             "undo",
             json!({"turn": 1}),
             Command::Undo {
+                id: None,
                 turn: Some(1),
                 dry_run: false,
             },
@@ -352,6 +378,7 @@ fn methods_map_to_commands() {
             "rewind",
             json!({"at": 3, "dry_run": true}),
             Command::Rewind {
+                id: None,
                 at: 3,
                 label: None,
                 dry_run: true,
@@ -362,6 +389,7 @@ fn methods_map_to_commands() {
             "rewind",
             json!({"at": 2, "label": "b", "overwrite": ["a.txt"]}),
             Command::Rewind {
+                id: None,
                 at: 2,
                 label: Some("b".into()),
                 dry_run: false,
@@ -372,6 +400,7 @@ fn methods_map_to_commands() {
             "switch",
             json!({"target": "01X", "session_id": "s1"}),
             Command::Switch {
+                id: None,
                 session_id: "01X".into(),
                 dry_run: false,
                 overwrite: vec![],
@@ -388,6 +417,7 @@ fn methods_map_to_commands() {
             "replay",
             json!({"target": "01X", "session_id": "s1", "speed": 0, "from_step": 3}),
             Command::Replay {
+                id: None,
                 session_id: Some("01X".into()),
                 speed: 0.0,
                 from_step: Some(3),
@@ -398,6 +428,7 @@ fn methods_map_to_commands() {
             "replay",
             json!({"session_id": "s1"}),
             Command::Replay {
+                id: None,
                 session_id: None,
                 speed: 1.0,
                 from_step: None,
@@ -408,7 +439,10 @@ fn methods_map_to_commands() {
         (
             "send_message",
             json!({"type": "shutdown", "text": "x"}),
-            Command::SendMessage { text: "x".into() },
+            Command::SendMessage {
+                id: None,
+                text: "x".into(),
+            },
         ),
     ];
     for (method, params, want) in cases {
@@ -456,7 +490,13 @@ async fn events_become_notifications_ndjson() {
     );
     let events = c.until_type(&sid, "turn_finished").await;
     assert_eq!(events.last().unwrap().1["reason"], "completed");
+    // Re-review CP5-ENG N4: without `params.id` the request's id is the correlation id.
+    assert_eq!(events.last().unwrap().1["id"], "2");
     assert_eq!(text_of(&events, &sid), "it says hello");
+    // An explicit `params.id` wins.
+    c.ok("diff", json!({"id": "mine"})).await;
+    let diffed = c.until_type(&sid, "session_diff").await;
+    assert_eq!(diffed.last().unwrap().1["id"], "mine");
     for kind in [
         "turn_started",
         "tool_call_proposed",

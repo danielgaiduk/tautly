@@ -2635,7 +2635,7 @@ impl CheckpointJob {
         if let Ok(Err(failure)) = tokio::task::spawn_blocking(move || log.append(&rec)).await
             && let Some(ev) = failure.event()
         {
-            self.events.emit(ev).await;
+            self.events.untagged().emit(ev).await;
         }
     }
 }
@@ -2703,9 +2703,9 @@ impl Session {
         self.end_recovery = Some(tokio::spawn(async move {
             let mut st = shared.lock().await;
             let taken = job.run(&mut st, Point::TurnEnd, None).await;
-            drop(st);
-            // Durable at once: no turn is running to flush it.
+            // Durable at once, inside the lock: a reader that takes the lock sees it.
             let _ = tokio::task::spawn_blocking(move || log.checkpoint()).await;
+            drop(st);
             taken
         }));
     }
@@ -2772,19 +2772,27 @@ impl Session {
     /// first tool call (whose edits it must not see), and before an undo or fork reads the
     /// log. Unless `cancel` fires first (`Cancel` or `Shutdown`, spec 8): the checkpoint
     /// then goes on in the background and is waited for later (or abandoned at shutdown).
-    /// True when it is settled.
+    /// A cancelled turn's end checkpoint being recovered is waited for too (every job that
+    /// reads or moves the log calls this, review CP5-A I2); its outcome is kept for the
+    /// next turn's [`settle_turn_end`](Self::settle_turn_end). True when both are settled.
     pub(crate) async fn settle_start_checkpoint_or(&mut self, cancel: &CancellationToken) -> bool {
-        let StartCheckpoint::Running(job) = &mut self.start_checkpoint else {
-            return true;
-        };
-        tokio::select! {
-            biased;
-            _ = job => {
-                self.start_checkpoint = StartCheckpoint::Idle;
-                true
+        if let StartCheckpoint::Running(job) = &mut self.start_checkpoint {
+            tokio::select! {
+                biased;
+                _ = job => self.start_checkpoint = StartCheckpoint::Idle,
+                () = cancel.cancelled() => return false,
             }
-            () = cancel.cancelled() => false,
         }
+        if let Some(job) = &mut self.end_recovery {
+            let taken = tokio::select! {
+                biased;
+                r = job => r.unwrap_or(false),
+                () = cancel.cancelled() => return false,
+            };
+            // A finished handle cannot be awaited again: keep its outcome in a fresh one.
+            self.end_recovery = Some(tokio::spawn(std::future::ready(taken)));
+        }
+        true
     }
 
     /// At shutdown: let a cancelled turn's end checkpoint still being taken finish, for at

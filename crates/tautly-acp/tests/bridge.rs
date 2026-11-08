@@ -1179,3 +1179,39 @@ async fn client_mcp_server_starts_trusted_and_is_reaped_at_eof() {
     }
     assert!(!pids.iter().any(|p| alive(*p)), "left running: {pids:?}");
 }
+
+/// Review CP5-A I1: a session that could not start (the working-tree lease held past the
+/// start wait) answers a prompt with a JSON-RPC error instead of never ending it.
+#[tokio::test]
+async fn a_prompt_on_a_session_that_could_not_start_ends_with_an_error() {
+    let fx = Fx::new();
+    let lease = tautly_core::Lease::shared(fx.home.path(), &fx.root()).unwrap();
+    let held = lease.try_exclusive().unwrap();
+    let home = fx.home.path().to_path_buf();
+    let f = tautly_acp::shared_factory(fx.workspaces.clone(), move |root, resume, mcp, ws| {
+        tautly_core::EngineBuilder {
+            provider: Some(Arc::new(MockProvider::new(vec![text_step("never")]))),
+            data_home: Some(home.clone()),
+            workspace: Some(ws),
+            interactive: true,
+            resume,
+            client_mcp: mcp,
+            lease_wait: std::time::Duration::from_millis(100),
+            ..tautly_core::EngineBuilder::new(config(Mode::Ask), root)
+        }
+        .build()
+    });
+    let mut acp = Acp::start(f);
+    let id = acp.open(&fx.root()).await;
+    let r = acp.prompt(&id, "hi").await;
+    assert!(r.get("result").is_none(), "{r}");
+    assert!(
+        r["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("takes no more commands"),
+        "{r}"
+    );
+    drop(held);
+    acp.finish().await;
+}

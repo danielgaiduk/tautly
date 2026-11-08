@@ -107,10 +107,12 @@ async fn consolidate(env: &Env, cli: &Cli) -> anyhow::Result<i32> {
     let (engine, mut events) =
         tokio::task::spawn_blocking(move || settings.build(&root, None, true, None)).await??;
     let session_id = engine.current_session().0;
-    let _ = engine.send(EngineCommand::ConsolidateMemory).await;
-    // The engine runs commands in order and answers `Diff` at once: its answer says the
-    // consolidation is over, which has no event of its own.
-    let _ = engine.send(EngineCommand::Diff { turn: None }).await;
+    let id = "consolidate";
+    let _ = engine
+        .send(EngineCommand::ConsolidateMemory {
+            id: Some(id.into()),
+        })
+        .await;
 
     let mut proposals = Vec::new();
     while let Some(event) = events.recv().await {
@@ -121,18 +123,13 @@ async fn consolidate(env: &Env, cli: &Cli) -> anyhow::Result<i32> {
                 replaces,
             } => proposals.push((proposal_id, change, replaces)),
             Event::Warning { message } => eprintln!("tautly: {}", printable(&message)),
-            Event::SessionDiff { .. } => break,
-            // Consolidation reports its own problems as warnings, so an error is the
-            // answer to the barrier (`diff: ...`), or the session is lost (it would never
-            // answer): either way nothing more comes.
+            // Last, also after an error (a lost session answers with both).
+            ref ev @ Event::ConsolidateFinished { .. } if ev.answers(Some(id)) => break,
             Event::Error { message, hint, .. } => {
-                if !message.starts_with("diff:") {
-                    eprintln!("tautly: {}", printable(&message));
-                    if let Some(hint) = hint {
-                        eprintln!("tautly: {}", printable(&hint));
-                    }
+                eprintln!("tautly: {}", printable(&message));
+                if let Some(hint) = hint {
+                    eprintln!("tautly: {}", printable(&hint));
                 }
-                break;
             }
             _ => {}
         }

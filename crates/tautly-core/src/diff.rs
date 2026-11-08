@@ -110,6 +110,7 @@ pub async fn session_diff(
         })
         .collect();
     Ok(Event::SessionDiff {
+        id: None,
         turn,
         files,
         unified: diff.unified,
@@ -168,6 +169,7 @@ impl Session {
                     _ => None,
                 };
                 Event::Error {
+                    id: None,
                     kind: ErrorKind::Internal,
                     message: format!("diff: {e}"),
                     retryable: false,

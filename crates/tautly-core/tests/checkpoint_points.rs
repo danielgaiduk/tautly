@@ -137,7 +137,10 @@ impl Run {
 
     async fn turn_with(&mut self, text: &str) {
         self.engine
-            .send(Command::SendMessage { text: text.into() })
+            .send(Command::SendMessage {
+                id: None,
+                text: text.into(),
+            })
             .await
             .unwrap();
         loop {
@@ -456,7 +459,10 @@ async fn a_skipped_turn_end_makes_the_next_checkpoint_partial() {
     ]);
     let mut run = Run::start(repo.builder(&mock));
     run.engine
-        .send(Command::SendMessage { text: "one".into() })
+        .send(Command::SendMessage {
+            id: None,
+            text: "one".into(),
+        })
         .await
         .unwrap();
     loop {
@@ -513,4 +519,141 @@ async fn a_skipped_turn_end_makes_the_next_checkpoint_partial() {
         "{:?}",
         &recs[end..]
     );
+}
+
+/// Wait for the first event `pick` accepts.
+async fn wait_for(events: &mut mpsc::Receiver<Event>, pick: impl Fn(&Event) -> bool) -> Event {
+    loop {
+        let ev = tokio::time::timeout(WAIT, events.recv())
+            .await
+            .expect("timed out waiting for an event")
+            .expect("event channel closed");
+        if pick(&ev) {
+            return ev;
+        }
+    }
+}
+
+/// Cancel a turn at its first tool call, and wait for its `TurnFinished`.
+async fn cancelled_turn(run: &mut Run) {
+    run.engine
+        .send(Command::SendMessage {
+            id: None,
+            text: "one".into(),
+        })
+        .await
+        .unwrap();
+    wait_for(&mut run.events, |e| matches!(e, Event::ToolStarted { .. })).await;
+    run.engine.send(Command::Cancel).await.unwrap();
+    wait_for(&mut run.events, |e| matches!(e, Event::TurnFinished { .. })).await;
+}
+
+fn is_turn_end_checkpoint(r: &SessionRecord) -> bool {
+    matches!(
+        r,
+        SessionRecord::Checkpoint {
+            point: Some(CheckpointPoint::TurnEnd),
+            turn: 1,
+            ..
+        }
+    )
+}
+
+#[tokio::test]
+async fn a_fork_right_after_a_cancel_leaves_the_recovered_checkpoint_in_the_parent() {
+    // Review CP5-A I2: a cancelled turn's end checkpoint is recovered in the background;
+    // a fork sent at once must wait for it, so its record lands in the parent.
+    let repo = Repo::new();
+    let mock = MockProvider::new(vec![tools_step(vec![bash("b1", "sleep 30")])]);
+    let mut run = Run::start(repo.builder(&mock));
+    let parent = run.engine.session_path().to_path_buf();
+    cancelled_turn(&mut run).await;
+    run.engine
+        .send(Command::Fork {
+            id: Some("f-1".into()),
+            at: None,
+            label: None,
+        })
+        .await
+        .unwrap();
+    let answer = wait_for(&mut run.events, |e| {
+        matches!(e, Event::SessionChanged { .. } | Event::Error { .. })
+    })
+    .await;
+    assert_eq!(answer.reply_id(), Some("f-1"), "{answer:?}");
+    let branch = run.engine.current_session().1;
+    assert_ne!(branch, parent);
+    run.stop().await;
+    let parent_recs = records(&parent);
+    let end = parent_recs
+        .iter()
+        .position(|r| matches!(r, SessionRecord::TurnEnd { .. }))
+        .unwrap();
+    assert!(
+        parent_recs[end..].iter().any(is_turn_end_checkpoint),
+        "parent: {:?}",
+        &parent_recs[end..]
+    );
+    // At most the parent's record as copied, never a second one of the branch's own.
+    let branch_recs = records(&branch);
+    let n = branch_recs
+        .iter()
+        .filter(|r| is_turn_end_checkpoint(r))
+        .count();
+    assert!(n <= 1, "branch: {branch_recs:?}");
+}
+
+#[tokio::test]
+async fn undo_after_a_cancel_reverts_the_cancelled_commands_writes() {
+    // Re-review CP5-ENG concern 4: the recovered turn-end checkpoint (logged after the
+    // `TurnEnd`) is the turn's end for undo, so Ctrl-C then `/undo` reverts the command.
+    let repo = Repo::new();
+    let mock = MockProvider::new(vec![tools_step(vec![bash(
+        "b1",
+        "echo x > f.txt; echo changed > a.txt; sleep 30",
+    )])]);
+    let mut run = Run::start(repo.builder(&mock));
+    run.engine
+        .send(Command::SendMessage {
+            id: None,
+            text: "one".into(),
+        })
+        .await
+        .unwrap();
+    wait_for(&mut run.events, |e| matches!(e, Event::ToolStarted { .. })).await;
+    let f = repo.root().join("f.txt");
+    let deadline = tokio::time::Instant::now() + WAIT;
+    while !(f.exists()
+        && std::fs::read_to_string(repo.root().join("a.txt")).unwrap() == "changed\n")
+    {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the command never wrote"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    run.engine.send(Command::Cancel).await.unwrap();
+    wait_for(&mut run.events, |e| matches!(e, Event::TurnFinished { .. })).await;
+    run.engine
+        .send(Command::Undo {
+            id: None,
+            turn: None,
+            dry_run: false,
+        })
+        .await
+        .unwrap();
+    let ev = wait_for(&mut run.events, |e| {
+        matches!(e, Event::Undone { .. } | Event::Error { .. })
+    })
+    .await;
+    let Event::Undone { note, .. } = &ev else {
+        panic!("{ev:?}")
+    };
+    assert!(!note.as_deref().unwrap_or("").contains("skipped"), "{ev:?}");
+    assert!(!f.exists(), "{ev:?}");
+    assert_eq!(
+        std::fs::read_to_string(repo.root().join("a.txt")).unwrap(),
+        "zero\n"
+    );
+    run.stop().await;
 }

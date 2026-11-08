@@ -344,7 +344,10 @@ impl Run {
     /// Events through `TurnFinished`.
     async fn turn_with(&mut self, text: &str) -> Vec<Event> {
         self.engine
-            .send(Command::SendMessage { text: text.into() })
+            .send(Command::SendMessage {
+                id: None,
+                text: text.into(),
+            })
             .await
             .unwrap();
         let mut out = Vec::new();

@@ -193,7 +193,11 @@ async fn session_rule_allows_matching_call() {
         text_step("done"),
     ]);
     let mut run = fx.start(config(&[]), &mock, None);
-    run.send(Command::SendMessage { text: "go".into() }).await;
+    run.send(Command::SendMessage {
+        id: None,
+        text: "go".into(),
+    })
+    .await;
     let mut seen = Vec::new();
     let id = run
         .until_ask_or_end(&mut seen)
@@ -222,7 +226,11 @@ async fn session_rule_not_persisted_and_gone_after_resume() {
     let mut run = fx.start(config(&[]), &mock, None);
     let id = run.engine.session_id().to_string();
     let log = run.engine.session_path().to_path_buf();
-    run.send(Command::SendMessage { text: "go".into() }).await;
+    run.send(Command::SendMessage {
+        id: None,
+        text: "go".into(),
+    })
+    .await;
     let mut seen = Vec::new();
     let req = run.until_ask_or_end(&mut seen).await.expect("asks");
     run.approve(req, Some("bash(echo hi)")).await;
@@ -239,6 +247,7 @@ async fn session_rule_not_persisted_and_gone_after_resume() {
     let mock = MockProvider::new(vec![step(bash("b2", "echo hi")), text_step("done")]);
     let mut run = fx.start(config(&[]), &mock, Some(id));
     run.send(Command::SendMessage {
+        id: None,
         text: "again".into(),
     })
     .await;
@@ -259,7 +268,11 @@ async fn deny_rule_beats_session_rule() {
         text_step("done"),
     ]);
     let mut run = fx.start(config(&["bash(echo bye*)"]), &mock, None);
-    run.send(Command::SendMessage { text: "go".into() }).await;
+    run.send(Command::SendMessage {
+        id: None,
+        text: "go".into(),
+    })
+    .await;
     let mut seen = Vec::new();
     let req = run.until_ask_or_end(&mut seen).await.expect("asks");
     run.approve(req, Some("bash(echo*)")).await;
@@ -297,7 +310,11 @@ async fn protected_path_still_asks_with_session_rule() {
         text_step("done"),
     ]);
     let mut run = fx.start(config(&[]), &mock, None);
-    run.send(Command::SendMessage { text: "go".into() }).await;
+    run.send(Command::SendMessage {
+        id: None,
+        text: "go".into(),
+    })
+    .await;
     let mut seen = Vec::new();
     let req = run.until_ask_or_end(&mut seen).await.expect("e1 asks");
     run.approve(req, Some("edit(Cargo.toml)")).await;
@@ -323,7 +340,11 @@ async fn non_matching_session_rule_approves_once_and_warns() {
         text_step("done"),
     ]);
     let mut run = fx.start(config(&[]), &mock, None);
-    run.send(Command::SendMessage { text: "go".into() }).await;
+    run.send(Command::SendMessage {
+        id: None,
+        text: "go".into(),
+    })
+    .await;
     let mut seen = Vec::new();
     // A rule for another command, then one that does not parse: each approves this call
     // once, with a warning, and adds nothing.
@@ -372,7 +393,11 @@ async fn exact_rule_does_not_cover_a_write_redirect() {
         text_step("done"),
     ]);
     let mut run = fx.start(config(&[]), &mock, None);
-    run.send(Command::SendMessage { text: "go".into() }).await;
+    run.send(Command::SendMessage {
+        id: None,
+        text: "go".into(),
+    })
+    .await;
     let mut seen = Vec::new();
     let req = run.until_ask_or_end(&mut seen).await.expect("b1 asks");
     run.approve(req, Some("bash(echo hi)")).await;
@@ -394,7 +419,11 @@ async fn broad_session_rule_says_so() {
         text_step("done"),
     ]);
     let mut run = fx.start(config(&[]), &mock, None);
-    run.send(Command::SendMessage { text: "go".into() }).await;
+    run.send(Command::SendMessage {
+        id: None,
+        text: "go".into(),
+    })
+    .await;
     let mut seen = Vec::new();
     let req = run.until_ask_or_end(&mut seen).await.expect("b1 asks");
     run.approve(req, Some("bash")).await;

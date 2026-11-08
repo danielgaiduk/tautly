@@ -386,7 +386,7 @@ pub fn event(e: &Event, st: &mut RenderState, opts: &ReplOptions) -> Option<Stri
         Event::MemoryProposed {
             change, replaces, ..
         } => Some(st.line(memory_text(change, replaces.len()))),
-        Event::SessionChanged { session_id } => {
+        Event::SessionChanged { id: _, session_id } => {
             let first = st.session.is_none();
             st.session = Some(session_id.clone());
             (!first).then(|| {
@@ -406,7 +406,11 @@ pub fn event(e: &Event, st: &mut RenderState, opts: &ReplOptions) -> Option<Stri
             let text = footer(&r, st.ctx, session);
             Some(st.line(paint(DIM, &text)))
         }
-        Event::TurnFinished { reason, evidence } => {
+        Event::TurnFinished {
+            id: _,
+            reason,
+            evidence,
+        } => {
             let mut lines = Vec::new();
             match reason {
                 FinishReason::Completed => {}
@@ -467,7 +471,11 @@ pub fn event(e: &Event, st: &mut RenderState, opts: &ReplOptions) -> Option<Stri
             out.push_str(&diff_text(unified, opts.color));
             Some(st.line(out))
         }
-        Event::ModelChanged { model, provider } => {
+        Event::ModelChanged {
+            id: _,
+            model,
+            provider,
+        } => {
             st.model = Some(model.as_str().to_string());
             Some(st.line(format!(
                 "model: {} ({})",
@@ -489,6 +497,7 @@ pub fn event(e: &Event, st: &mut RenderState, opts: &ReplOptions) -> Option<Stri
             )))
         }
         Event::Undone {
+            id: _,
             turn,
             restored,
             deleted,
@@ -530,7 +539,11 @@ pub fn event(e: &Event, st: &mut RenderState, opts: &ReplOptions) -> Option<Stri
         Event::Rewound { at, report, .. } => {
             Some(st.line(materialized(&format!("rewind to step {at}"), report)))
         }
-        Event::Switched { branch, report } => {
+        Event::Switched {
+            id: _,
+            branch,
+            report,
+        } => {
             let short: String = branch.chars().take(8).collect();
             Some(st.line(materialized(
                 &format!("switch to {}", printable(&short)),
@@ -555,7 +568,11 @@ pub fn event(e: &Event, st: &mut RenderState, opts: &ReplOptions) -> Option<Stri
         }
         Event::Replayed { event: logged, .. } => match &**logged {
             // A logged switch is history: the session's model stays what it is.
-            Event::ModelChanged { model, provider } => Some(st.line(format!(
+            Event::ModelChanged {
+                id: _,
+                model,
+                provider,
+            } => Some(st.line(format!(
                 "model: {} ({})",
                 printable(model.as_str()),
                 printable(provider)

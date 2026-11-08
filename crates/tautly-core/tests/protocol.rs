@@ -138,6 +138,7 @@ fn every_event() -> Vec<Event> {
             reason: MutationReason::ColdCache,
         },
         Event::CompactFinished {
+            id: None,
             applied: true,
             tokens_freed: 2900,
         },
@@ -158,6 +159,7 @@ fn every_event() -> Vec<Event> {
             }],
         },
         Event::SessionChanged {
+            id: None,
             session_id: "01J0SESSION".into(),
         },
         Event::TurnReceipt {
@@ -185,16 +187,19 @@ fn every_event() -> Vec<Event> {
             estimated: true,
         },
         Event::TurnFinished {
+            id: None,
             reason: FinishReason::MaxTurns,
             evidence: None,
         },
         Event::Error {
+            id: None,
             kind: ErrorKind::ProviderTransient,
             message: "429 from provider".into(),
             retryable: true,
             hint: Some("retrying in 2s".into()),
         },
         Event::SessionDiff {
+            id: None,
             turn: Some(2),
             files: vec![
                 DiffFile {
@@ -214,6 +219,7 @@ fn every_event() -> Vec<Event> {
             truncated: false,
         },
         Event::ModelChanged {
+            id: None,
             model: ModelId::from("compat:local/llama"),
             provider: "compat:local".into(),
         },
@@ -233,6 +239,7 @@ fn every_event() -> Vec<Event> {
             message: None,
         },
         Event::Undone {
+            id: None,
             turn: 2,
             restored: vec!["src/lib.rs".into()],
             deleted: vec!["new.txt".into()],
@@ -241,6 +248,7 @@ fn every_event() -> Vec<Event> {
             note: Some("ignored files and submodules are not restored".into()),
         },
         Event::Rewound {
+            id: None,
             at: 3,
             branch: "01JBRANCH".into(),
             report: MaterializeReport {
@@ -256,6 +264,7 @@ fn every_event() -> Vec<Event> {
             },
         },
         Event::Switched {
+            id: None,
             branch: "01J0".into(),
             report: MaterializeReport {
                 conflicts: vec!["notes.md".into()],
@@ -271,12 +280,21 @@ fn every_event() -> Vec<Event> {
             }),
         },
         Event::ReplayFinished {
+            id: None,
             session_id: "01J0".into(),
             events: 42,
             cancelled: false,
         },
         Event::UserMessage {
             text: "fix the bug".into(),
+        },
+        Event::ConsolidateFinished {
+            id: Some("c-7".into()),
+            applied: 1,
+            failed: 0,
+        },
+        Event::ApprovalWithdrawn {
+            request_id: "approval-3".into(),
         },
     ];
     for e in &events {
@@ -310,6 +328,8 @@ fn every_event() -> Vec<Event> {
             | Event::Replayed { .. }
             | Event::ReplayFinished { .. }
             | Event::UserMessage { .. }
+            | Event::ConsolidateFinished { .. }
+            | Event::ApprovalWithdrawn { .. }
             | Event::Unknown => {}
         }
     }
@@ -319,6 +339,7 @@ fn every_event() -> Vec<Event> {
 fn every_command() -> Vec<Command> {
     let commands = vec![
         Command::SendMessage {
+            id: None,
             text: "fix the bug".into(),
         },
         Command::Approve {
@@ -344,7 +365,7 @@ fn every_command() -> Vec<Command> {
             max_usd: None,
             max_tokens: Some(50_000),
         },
-        Command::Compact,
+        Command::Compact { id: None },
         Command::Uncompact,
         Command::Pin {
             text: "never touch generated/".into(),
@@ -358,41 +379,55 @@ fn every_command() -> Vec<Command> {
         Command::RejectMemory {
             proposal_id: "prop_1".into(),
         },
-        Command::ConsolidateMemory,
+        Command::ConsolidateMemory { id: None },
         Command::Fork {
+            id: None,
             at: None,
             label: None,
         },
         Command::Fork {
+            id: None,
             at: Some(5),
             label: Some("try-b".into()),
         },
-        Command::Diff { turn: None },
-        Command::Diff { turn: Some(3) },
+        Command::Diff {
+            id: None,
+            turn: None,
+        },
+        Command::Diff {
+            id: None,
+            turn: Some(3),
+        },
         Command::SetModel {
+            id: None,
             model: ModelId::from("openai/gpt-5"),
         },
         Command::Undo {
+            id: None,
             turn: None,
             dry_run: false,
         },
         Command::Undo {
+            id: None,
             turn: Some(2),
             dry_run: true,
         },
         Command::Rewind {
+            id: None,
             at: 3,
             label: Some("try-b".into()),
             dry_run: true,
             overwrite: vec![],
         },
         Command::Rewind {
+            id: None,
             at: 2,
             label: None,
             dry_run: false,
             overwrite: vec!["notes.md".into()],
         },
         Command::Switch {
+            id: None,
             session_id: "01J0".into(),
             dry_run: false,
             overwrite: vec![],
@@ -401,14 +436,21 @@ fn every_command() -> Vec<Command> {
             label: "main".into(),
         },
         Command::Replay {
+            id: None,
             session_id: None,
             speed: 1.0,
             from_step: None,
         },
         Command::Replay {
+            id: None,
             session_id: Some("01J0".into()),
             speed: 0.0,
             from_step: Some(4),
+        },
+        Command::Undo {
+            id: Some("u-1".into()),
+            turn: Some(1),
+            dry_run: true,
         },
         Command::Shutdown,
     ];
@@ -419,13 +461,13 @@ fn every_command() -> Vec<Command> {
             | Command::Deny { .. }
             | Command::Cancel
             | Command::SetBudget { .. }
-            | Command::Compact
+            | Command::Compact { .. }
             | Command::Uncompact
             | Command::Pin { .. }
             | Command::Unpin { .. }
             | Command::ApproveMemory { .. }
             | Command::RejectMemory { .. }
-            | Command::ConsolidateMemory
+            | Command::ConsolidateMemory { .. }
             | Command::Fork { .. }
             | Command::Diff { .. }
             | Command::SetModel { .. }
@@ -474,6 +516,7 @@ fn event_json_shape_is_stable() {
 #[test]
 fn turn_finished_with_evidence_has_a_stable_shape() {
     let e = Event::TurnFinished {
+        id: None,
         reason: FinishReason::Completed,
         evidence: Some(tautly_core::TestEvidence {
             command: "cargo test -p tautly-core".into(),
@@ -828,6 +871,7 @@ fn unknown_events_and_values_read_as_unknown_not_as_errors() {
     assert_eq!(
         e,
         Event::TurnFinished {
+            id: None,
             reason: FinishReason::Unknown,
             evidence: None,
         }
@@ -961,4 +1005,35 @@ fn timestamps_are_unix_seconds_on_the_wire() {
             ..
         }
     ));
+}
+
+#[test]
+fn correlation_ids_are_additive() {
+    // Older clients and logs: no `id` reads as None, and None is not written.
+    let c: Command = serde_json::from_value(json!({"type": "compact"})).unwrap();
+    assert_eq!(c, Command::Compact { id: None });
+    assert_eq!(
+        serde_json::to_value(&c).unwrap(),
+        json!({"type": "compact"})
+    );
+    let c: Command =
+        serde_json::from_value(json!({"type": "consolidate_memory", "id": "m1"})).unwrap();
+    assert_eq!(c.id(), Some("m1"));
+    let e: Event = serde_json::from_value(json!({
+        "type": "error", "kind": "internal", "message": "x", "retryable": false, "hint": null
+    }))
+    .unwrap();
+    assert_eq!(e.reply_id(), None);
+    let mut e = e;
+    e.set_reply_id("u1");
+    assert!(e.answers(Some("u1")) && !e.answers(Some("u2")) && e.answers(None));
+    let w: Event = serde_json::from_value(json!({"type": "consolidate_finished"})).unwrap();
+    assert_eq!(
+        w,
+        Event::ConsolidateFinished {
+            id: None,
+            applied: 0,
+            failed: 0
+        }
+    );
 }

@@ -3,7 +3,8 @@
 //! tool runs; only the log and its blobs are read.
 //!
 //! Text output is the REPL's rendering (everything escaped for the terminal); `json`
-//! prints the replayed events, one JSON object per line. Each pause is the logged gap
+//! prints the RPC `replay` stream: one `replayed` object per line (`offset`, `t_ms` and
+//! the logged `event`), then `replay_finished`. Each pause is the logged gap
 //! divided by `--speed` (default 1), at most 2 s; `--speed 0` prints at once. A log that
 //! cannot be read to its end (a corrupt record) exits 1 after what could be replayed.
 
@@ -33,7 +34,8 @@ pub struct Args {
     /// Start at step N (the numbers `tautly sessions show` gives).
     #[arg(long, value_name = "N")]
     from_step: Option<u32>,
-    /// What to print: the REPL's rendering (default), or every event as JSON lines.
+    /// What to print: the REPL's rendering (default), or JSON lines: each event wrapped
+    /// as `replayed` (offset, time, event), then `replay_finished`.
     #[arg(long, value_enum, default_value_t = Output::Text)]
     output: Output,
 }
@@ -68,7 +70,7 @@ pub async fn run(args: Args, env: &Env) -> anyhow::Result<i32> {
     };
     let mut st = RenderState::default();
     let mut stdout = std::io::stdout();
-    let mut prev = None;
+    let (mut prev, mut sent) = (None, 0u32);
     let mut events = replay::events(&reader, args.from_step).priced(catalog);
     for (offset, t_ms, event) in events.by_ref() {
         if let Some(p) = prev {
@@ -79,22 +81,33 @@ pub async fn run(args: Args, env: &Env) -> anyhow::Result<i32> {
             }
         }
         prev = Some(t_ms);
+        sent += 1;
+        let wrapped = Event::Replayed {
+            offset,
+            t_ms,
+            event: Box::new(event),
+        };
         match args.output {
-            Output::Json => writeln!(stdout, "{}", serde_json::to_string(&event)?)?,
+            Output::Json => writeln!(stdout, "{}", serde_json::to_string(&wrapped)?)?,
             Output::Text => {
-                let wrapped = Event::Replayed {
-                    offset,
-                    t_ms,
-                    event: Box::new(event),
-                };
                 if let Some(text) = render::event(&wrapped, &mut st, &opts) {
                     stdout.write_all(text.as_bytes())?;
                 }
             }
         }
     }
-    if args.output == Output::Text {
-        stdout.write_all(st.break_line().as_bytes())?;
+    match args.output {
+        Output::Text => stdout.write_all(st.break_line().as_bytes())?,
+        // The end record, as the RPC `replay` stream sends it.
+        Output::Json => {
+            let end = Event::ReplayFinished {
+                id: None,
+                session_id: session.id.clone(),
+                events: sent,
+                cancelled: false,
+            };
+            writeln!(stdout, "{}", serde_json::to_string(&end)?)?;
+        }
     }
     stdout.flush()?;
     // The log broke off (its warning was the last event): not a complete replay.

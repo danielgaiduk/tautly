@@ -559,15 +559,15 @@ enum Job {
 /// The task in flight (a turn or a compaction). It hands back the session and the inbox,
 /// whose leftovers (sent after the turn's last step start) are applied once it ends.
 struct Running {
-    handle: JoinHandle<(Session, mpsc::UnboundedReceiver<Command>)>,
+    handle: JoinHandle<(Session, mpsc::Receiver<Command>)>,
     cancel: CancellationToken,
-    inbox: mpsc::UnboundedSender<Command>,
-    /// A user message's turn (its crash ends the turn); else a command's job.
-    turn: bool,
+    /// Holds at most [`COMMAND_CAPACITY`]; past that a command is refused.
+    inbox: mpsc::Sender<Command>,
+    /// The command that started it: a crash still sends the answer its client waits for
+    /// (a user message's turn is ended).
+    cmd: Command,
     /// A fork: commands other than [`Actor::urgent`] ones wait for its end.
     fork: bool,
-    /// A `Compact`: its crash still ends it with `CompactFinished`.
-    compact: bool,
 }
 
 struct Actor {
@@ -588,18 +588,91 @@ struct Actor {
 
 /// Collect the commands that arrive into `early` until a `Shutdown` (or the client going
 /// away, which means the same) is among them. Cancel-safe: a received command is stored
-/// before the next await, so dropping this future loses none. The caller handles `early`
-/// (logging each) afterwards, so their `Command` records follow what the interrupted
-/// command logged.
-async fn until_shutdown(commands: &mut mpsc::Receiver<Command>, early: &mut Vec<Command>) {
+/// (or refused, without waiting) before the next await, so dropping this future loses
+/// none. Past [`COMMAND_CAPACITY`] a command other than `Shutdown` is refused, unlogged,
+/// through `events`. The caller handles `early` (logging each) afterwards, so their
+/// `Command` records follow what the interrupted command logged.
+async fn until_shutdown(
+    commands: &mut mpsc::Receiver<Command>,
+    early: &mut Vec<Command>,
+    events: &EventSink,
+    session_id: &str,
+) {
     loop {
         let cmd = commands.recv().await.unwrap_or(Command::Shutdown);
         let stop = cmd == Command::Shutdown;
+        if !stop && early.len() >= COMMAND_CAPACITY {
+            for ev in refusal(&cmd, &too_many(), None, session_id) {
+                events.try_emit(ev);
+            }
+            continue;
+        }
         early.push(cmd);
         if stop {
             return;
         }
     }
+}
+
+fn too_many() -> String {
+    format!("too many commands are queued (more than {COMMAND_CAPACITY}); this one was not run")
+}
+
+/// The events that end a command the engine does not run (`why`): an `Error` (for a
+/// event its client waits for, if it has one. The end event echoes the command's correlation
+/// id, and so does the `Error` when it is the answer ([`Command::error_answers`]).
+/// event its client waits for, if it has one. Both echo the command's correlation id.
+fn refusal(cmd: &Command, why: &str, hint: Option<&str>, session_id: &str) -> Vec<Event> {
+    let id = cmd.id().map(str::to_string);
+    let (kind, message) = match cmd {
+        Command::SetModel { model, .. } => (
+            ErrorKind::ProviderFatal,
+            format!("cannot switch to {model}: {why}"),
+        ),
+        _ => (ErrorKind::Internal, why.to_string()),
+    };
+    let mut out = vec![Event::Error {
+        id: if cmd.error_answers() { id } else { None },
+        kind,
+        message,
+        retryable: false,
+        hint: hint.map(str::to_string),
+    }];
+    out.extend(failed_answer(cmd, session_id));
+    out
+}
+
+/// The end event a client waits for after a command that did not run (or whose job
+/// crashed): nothing was applied. None for commands whose `Error` is their answer.
+fn failed_answer(cmd: &Command, session_id: &str) -> Option<Event> {
+    let id = cmd.id().map(str::to_string);
+    Some(match cmd {
+        Command::SendMessage { .. } => Event::TurnFinished {
+            id,
+            reason: FinishReason::Error,
+            evidence: None,
+        },
+        Command::Replay {
+            session_id: replayed,
+            ..
+        } => Event::ReplayFinished {
+            id,
+            session_id: replayed.clone().unwrap_or_else(|| session_id.to_string()),
+            events: 0,
+            cancelled: false,
+        },
+        Command::Compact { .. } => Event::CompactFinished {
+            id,
+            applied: false,
+            tokens_freed: 0,
+        },
+        Command::ConsolidateMemory { .. } => Event::ConsolidateFinished {
+            id,
+            applied: 0,
+            failed: 0,
+        },
+        _ => return None,
+    })
 }
 
 /// What the actor does at session start.
@@ -632,6 +705,7 @@ impl Actor {
         start: Start,
     ) {
         self.events.try_emit(Event::SessionChanged {
+            id: None,
             session_id: self.session_id.clone(),
         });
         session.workspace.start();
@@ -645,7 +719,7 @@ impl Actor {
         let mut unleased = None;
         if start.lease_pending {
             let deadline = tokio::time::Instant::now() + start.lease_wait;
-            let stop = until_shutdown(&mut commands, &mut early);
+            let stop = until_shutdown(&mut commands, &mut early, &self.events, &self.session_id);
             tokio::pin!(stop);
             loop {
                 let (home, root) = (session.data_home.clone(), session.root().to_path_buf());
@@ -691,7 +765,7 @@ impl Actor {
             session
                 .resume(
                     &start.config_pins,
-                    until_shutdown(&mut commands, &mut early),
+                    until_shutdown(&mut commands, &mut early, &self.events, &self.session_id),
                 )
                 .await
         } else {
@@ -705,6 +779,7 @@ impl Actor {
                 let unleased = session.lease.is_none();
                 self.events
                     .send_or_drop(Event::Error {
+                        id: None,
                         kind: ErrorKind::Internal,
                         message: if unleased {
                             format!("cannot start the session: {why}")
@@ -727,9 +802,10 @@ impl Actor {
         // Commands that arrived while a fork ran, for after it.
         let mut held: Vec<Command> = Vec::new();
         let mut stopping = false;
+        // A replay sent during start-up is refused like one sent while a turn runs.
         for cmd in early {
             let lost = state.is_none();
-            self.received(cmd, lost, None, &mut queue, &mut stopping)
+            self.received(cmd, lost, None, true, &mut queue, &mut stopping)
                 .await;
         }
         // Nothing more starts for a session that is already shutting down.
@@ -741,17 +817,22 @@ impl Actor {
         loop {
             if running.is_none() && !stopping {
                 while let Some(cmd) = queue.pop_front() {
-                    let job = match cmd {
-                        Command::SendMessage { text } => Job::Turn(text),
-                        Command::Compact => Job::Compact,
-                        Command::ConsolidateMemory => Job::Consolidate,
-                        Command::Undo { turn, dry_run } => Job::Undo { turn, dry_run },
-                        Command::Fork { at, label } => Job::Fork { at, label },
+                    let Some(s) = state.as_mut() else {
+                        self.refuse_lost(&cmd).await;
+                        continue;
+                    };
+                    let job = match cmd.clone() {
+                        Command::SendMessage { id: _, text } => Job::Turn(text),
+                        Command::Compact { .. } => Job::Compact,
+                        Command::ConsolidateMemory { .. } => Job::Consolidate,
+                        Command::Undo { turn, dry_run, .. } => Job::Undo { turn, dry_run },
+                        Command::Fork { at, label, .. } => Job::Fork { at, label },
                         Command::Rewind {
                             at,
                             label,
                             dry_run,
                             overwrite,
+                            ..
                         } => Job::Rewind {
                             at,
                             label,
@@ -762,6 +843,7 @@ impl Actor {
                             session_id,
                             dry_run,
                             overwrite,
+                            ..
                         } => Job::Switch {
                             session_id,
                             dry_run,
@@ -771,61 +853,60 @@ impl Actor {
                             session_id,
                             speed,
                             from_step,
+                            ..
                         } => Job::Replay {
                             session_id,
                             speed,
                             from_step,
                         },
-                        Command::SetModel { model } => {
-                            match state.as_mut() {
-                                Some(s) => {
-                                    // The provider build may wait on a keychain prompt: keep
-                                    // taking commands meanwhile, and let a `Shutdown` abandon
-                                    // the switch.
-                                    let mut early = Vec::new();
-                                    let unbound = s.events.clone();
-                                    s.events = unbound.replying();
-                                    s.set_model(model, until_shutdown(&mut commands, &mut early))
-                                        .await;
-                                    s.events = unbound;
-                                    for cmd in early {
-                                        self.received(cmd, false, None, &mut queue, &mut stopping)
-                                            .await;
-                                    }
-                                    if stopping {
-                                        break;
-                                    }
-                                }
-                                None => {
-                                    self.lost();
-                                    self.switch_refused(&model);
-                                }
+                        Command::SetModel { model, .. } => {
+                            // The provider build may wait on a keychain prompt: keep taking
+                            // commands meanwhile (a replay among them is refused), and let a
+                            // `Shutdown` abandon the switch.
+                            let mut early = Vec::new();
+                            let unbound = s.events.clone();
+                            s.events = unbound.replying().tagged(&cmd);
+                            let stop = until_shutdown(
+                                &mut commands,
+                                &mut early,
+                                &self.events,
+                                &self.session_id,
+                            );
+                            s.set_model(model, stop).await;
+                            s.events = unbound;
+                            for cmd in early {
+                                self.received(cmd, false, None, true, &mut queue, &mut stopping)
+                                    .await;
+                            }
+                            if stopping {
+                                break;
                             }
                             continue;
                         }
                         other => {
-                            match state.as_mut() {
-                                Some(s) => self.idle_command(s, other).await,
-                                None => self.lost(),
-                            }
+                            self.idle_command(s, other).await;
                             continue;
                         }
                     };
-                    match state.take() {
-                        Some(s) => {
-                            running = Some(self.spawn_job(s, job));
-                            break;
-                        }
-                        None => {
-                            self.lost();
-                            if matches!(job, Job::Compact) {
-                                self.compact_failed().await;
-                            }
-                        }
-                    }
+                    let s = state.take().expect("checked above");
+                    running = Some(self.spawn_job(s, job, cmd));
+                    break;
                 }
             }
             if stopping && running.is_none() {
+                if !queue.is_empty() {
+                    // Logged as they arrived, but never run.
+                    let n = queue.len();
+                    self.events
+                        .send_or_drop(Event::Warning {
+                            message: format!(
+                                "{n} queued command{} {} not run: the session is shutting down",
+                                if n == 1 { "" } else { "s" },
+                                if n == 1 { "was" } else { "were" }
+                            ),
+                        })
+                        .await;
+                }
                 break;
             }
             tokio::select! {
@@ -841,21 +922,19 @@ impl Actor {
                         if held.len() < COMMAND_CAPACITY {
                             held.push(cmd);
                         } else {
-                            self.events.try_emit(Event::Warning {
-                                message: format!(
-                                    "a command was dropped: more than {COMMAND_CAPACITY} \
-                                     arrived while a fork runs"
-                                ),
-                            });
+                            for ev in refusal(&cmd, &too_many(), None, &self.session_id) {
+                                self.events.try_emit(ev);
+                            }
                         }
                         continue;
                     }
                     let lost = state.is_none() && running.is_none();
-                    self.received(cmd, lost, running.as_ref(), &mut queue, &mut stopping)
+                    let busy = running.is_some();
+                    self.received(cmd, lost, running.as_ref(), busy, &mut queue, &mut stopping)
                         .await;
                 }
                 joined = async { (&mut running.as_mut().expect("guarded").handle).await }, if running.is_some() => {
-                    let (turn, compact) = running.take().map_or((false, false), |r| (r.turn, r.compact));
+                    let started = running.take().map(|r| r.cmd);
                     match joined {
                         Ok((mut s, mut inbox)) => {
                             inbox.close();
@@ -867,9 +946,8 @@ impl Actor {
                             state = Some(s);
                         }
                         Err(e) => {
-                            self.crashed(e, turn).await;
-                            if compact {
-                                self.compact_failed().await;
+                            if let Some(cmd) = started {
+                                self.crashed(e, &cmd).await;
                             }
                         }
                     }
@@ -892,7 +970,7 @@ impl Actor {
                     } else {
                         for cmd in held {
                             let lost = state.is_none();
-                            self.received(cmd, lost, None, &mut queue, &mut stopping)
+                            self.received(cmd, lost, None, false, &mut queue, &mut stopping)
                                 .await;
                         }
                     }
@@ -924,12 +1002,15 @@ impl Actor {
     }
 
     /// A command from the channel: logged, then handled at once (shutdown, approvals,
-    /// cancel, budgets, pins for the running turn) or queued for when no turn runs.
+    /// cancel, budgets, pins for the running turn) or queued for when no turn runs. `busy`:
+    /// something runs (a job, the start-up, a `SetModel` build), so a `Replay` is refused.
+    /// A command the queue or the turn's inbox has no room for is refused, unlogged.
     async fn received(
         &self,
         cmd: Command,
         lost: bool,
         running: Option<&Running>,
+        busy: bool,
         queue: &mut VecDeque<Command>,
         stopping: &mut bool,
     ) {
@@ -941,7 +1022,8 @@ impl Actor {
         } = &cmd
             && self.approvals.kind(request_id) == Some(ApprovalFor::McpServer)
         {
-            self.events.try_emit(Event::Error {
+            self.answer_later(vec![Event::Error {
+                id: None,
                 kind: ErrorKind::Policy,
                 message: format!(
                     "session_rule applies to tool calls only: the MCP server approval `{}` \
@@ -950,7 +1032,30 @@ impl Actor {
                 ),
                 retryable: false,
                 hint: Some("approve or deny it without a session_rule".into()),
-            });
+            }]);
+            return;
+        }
+        let to_inbox = matches!(
+            cmd,
+            Command::Pin { .. }
+                | Command::Unpin { .. }
+                | Command::ApproveMemory { .. }
+                | Command::RejectMemory { .. }
+        ) && running.is_some();
+        let queued = !lost
+            && !to_inbox
+            && !Self::urgent(&cmd)
+            && !matches!(cmd, Command::SetBudget { .. } | Command::Unknown)
+            && !(busy && matches!(cmd, Command::Replay { .. }));
+        let full = if to_inbox {
+            running.is_some_and(|r| r.inbox.capacity() == 0)
+        } else {
+            queued && queue.len() >= COMMAND_CAPACITY
+        };
+        if full {
+            for ev in refusal(&cmd, &too_many(), None, &self.session_id) {
+                self.events.try_emit(ev);
+            }
             return;
         }
         self.with_log({
@@ -961,20 +1066,21 @@ impl Actor {
         match cmd {
             Command::Shutdown => {
                 *stopping = true;
-                self.approvals.deny_all("the session is shutting down");
+                // Stop first, then say which approvals no longer wait.
+                let withdrawn = self.approvals.deny_all("the session is shutting down");
                 self.shutdown.cancel();
+                self.answer_later(
+                    withdrawn
+                        .into_iter()
+                        .map(|request_id| Event::ApprovalWithdrawn { request_id })
+                        .collect(),
+                );
             }
-            // After a crashed turn every command gets the same answer, plus the answer a
-            // client waits for: a `Compact` its end, a `SetModel` its refusal.
-            _ if lost => {
-                self.lost();
-                match cmd {
-                    Command::Compact => self.compact_failed().await,
-                    Command::SetModel { model } => self.switch_refused(&model),
-                    _ => {}
-                }
-            }
+            // After a crashed turn (or a failed start) every command gets the same answer,
+            // plus the end its client waits for.
+            _ if lost => self.refuse_lost(&cmd).await,
             Command::Unknown => self.events.try_emit(Event::Error {
+                id: None,
                 kind: ErrorKind::Internal,
                 message: "this engine does not know this command (sent by a newer client?); \
                           it was ignored"
@@ -1009,17 +1115,21 @@ impl Actor {
             | Command::RejectMemory { .. })
                 if running.is_some() =>
             {
+                // Room was checked above; only the actor sends.
                 if let Some(r) = running {
-                    let _ = r.inbox.send(cmd);
+                    let _ = r.inbox.try_send(cmd);
                 }
             }
             // A replay is a view of a log, never queued behind live work (spec 7.12.5).
-            Command::Replay { .. } if running.is_some() => self.events.try_emit(Event::Error {
-                kind: ErrorKind::Internal,
-                message: crate::replay::REPLAY_BUSY.into(),
-                retryable: false,
-                hint: None,
-            }),
+            Command::Replay { id, .. } if busy => {
+                self.answer_later(vec![Event::Error {
+                    id,
+                    kind: ErrorKind::Internal,
+                    message: crate::replay::REPLAY_BUSY.into(),
+                    retryable: false,
+                    hint: None,
+                }]);
+            }
             other => queue.push_back(other),
         }
     }
@@ -1061,27 +1171,29 @@ impl Actor {
         }
     }
 
-    fn spawn_job(&self, mut session: Session, job: Job) -> Running {
+    fn spawn_job(&self, mut session: Session, job: Job, cmd: Command) -> Running {
         let cancel = self.shutdown.child_token();
-        let (inbox_tx, inbox_rx) = mpsc::unbounded_channel();
+        let (inbox_tx, inbox_rx) = mpsc::channel(COMMAND_CAPACITY);
+        let answering = session.events.tagged(&cmd);
         let mut ctl = TurnControl {
             cancel: cancel.clone(),
             inbox: inbox_rx,
             approvals: self.approvals.clone(),
         };
-        let turn = matches!(job, Job::Turn(_));
         // A fork, rewind or switch moves the log: what arrives meanwhile waits for it.
         let fork = matches!(
             job,
             Job::Fork { .. } | Job::Rewind { .. } | Job::Switch { .. }
         );
-        let compact = matches!(job, Job::Compact);
         let current = Arc::clone(&self.current);
         let moved = move |id: &str, path: &Path| {
             *current.lock().unwrap_or_else(PoisonError::into_inner) =
                 (id.to_string(), path.to_path_buf());
         };
         let handle = tokio::spawn(async move {
+            // The job's answer echoes the command's correlation id (`EventSink::tagged`).
+            let unbound = session.events.clone();
+            session.events = answering;
             match job {
                 Job::Turn(text) => session.run_turn(text, &mut ctl).await,
                 Job::Compact => session.compact_command(&ctl).await,
@@ -1113,15 +1225,15 @@ impl Actor {
                     from_step,
                 } => session.replay_job(session_id, speed, from_step, &ctl).await,
             }
+            session.events = unbound;
             (session, ctl.inbox)
         });
         Running {
             handle,
             cancel,
             inbox: inbox_tx,
-            turn,
+            cmd,
             fork,
-            compact,
         }
     }
 
@@ -1145,7 +1257,7 @@ impl Actor {
     /// time) for a client that is behind.
     async fn idle_command(&mut self, session: &mut Session, cmd: Command) {
         let unbound = session.events.clone();
-        session.events = unbound.replying();
+        session.events = unbound.replying().tagged(&cmd);
         self.idle_command_inner(session, cmd).await;
         session.events = unbound;
     }
@@ -1156,7 +1268,7 @@ impl Actor {
             | Command::Unpin { .. }
             | Command::ApproveMemory { .. }
             | Command::RejectMemory { .. } => session.context_command(cmd).await,
-            Command::Diff { turn } => session.diff(turn).await,
+            Command::Diff { id: _, turn } => session.diff(turn).await,
             Command::Uncompact => session.uncompact_command().await,
             Command::Label { label } => {
                 session.log(SessionRecord::Labeled { label }).await;
@@ -1168,6 +1280,7 @@ impl Actor {
                     .and_then(|v| v["type"].as_str().map(str::to_string))
                     .unwrap_or_default();
                 self.events.try_emit(Event::Error {
+                    id: None,
                     kind: ErrorKind::Internal,
                     message: format!("the `{name}` command is not supported yet"),
                     retryable: false,
@@ -1179,9 +1292,11 @@ impl Actor {
 
     /// A job panicked: an engine bug. The state it held is gone, but the log is intact up
     /// to the crash (plus the panic's message), so the session can be resumed. Only a
-    /// user message's `turn` is ended (`TurnEnd`, `TurnFinished`): a command's job (a
-    /// compaction, a consolidation) started none.
-    async fn crashed(&self, e: tokio::task::JoinError, turn: bool) {
+    /// user message's turn is ended (`TurnEnd`, `TurnFinished`): a command's job (a
+    /// compaction, a consolidation) started none, but still gets the end its client waits
+    /// for (`CompactFinished`, `ReplayFinished`, ...).
+    async fn crashed(&self, e: tokio::task::JoinError, cmd: &Command) {
+        let turn = matches!(cmd, Command::SendMessage { .. });
         let what = if e.is_panic() {
             let payload = e.into_panic();
             let text = payload
@@ -1207,8 +1322,10 @@ impl Actor {
             l.checkpoint()
         })
         .await;
-        self.events
+        let events = self.events.tagged(cmd);
+        events
             .send_or_drop(Event::Error {
+                id: None,
                 kind: ErrorKind::Internal,
                 message: format!(
                     "engine bug in session {}: {what}; the session log is intact",
@@ -1218,49 +1335,37 @@ impl Actor {
                 hint: Some("resume the session to continue".into()),
             })
             .await;
-        if turn {
-            self.events
-                .send_or_drop(Event::TurnFinished {
-                    reason: FinishReason::Error,
-                    evidence: None,
-                })
-                .await;
+        if let Some(end) = failed_answer(cmd, &self.session_id) {
+            events.emit_last(end).await;
         }
     }
 
-    fn lost(&self) {
-        self.events.try_emit(Event::Error {
-            kind: ErrorKind::Internal,
-            message: format!(
-                "session {} stopped after an internal error and takes no more commands",
-                self.session_id
-            ),
-            retryable: false,
-            hint: Some("resume the session to continue".into()),
-        });
+    /// The answer to a command a lost session (a crashed job, a failed start) cannot run:
+    /// an `Error`, then the end its client waits for (`TurnFinished{error}` for a message,
+    /// `ReplayFinished`, `CompactFinished`, `ConsolidateFinished`; for a `SetModel` the
+    /// error is its `cannot switch to <model>:` refusal), through
+    /// [`answer_later`](Self::answer_later).
+    async fn refuse_lost(&self, cmd: &Command) {
+        let why = format!(
+            "session {} stopped after an internal error and takes no more commands",
+            self.session_id
+        );
+        let hint = Some("resume the session to continue");
+        self.answer_later(refusal(cmd, &why, hint, &self.session_id));
     }
 
-    /// The answer to a `SetModel` a lost session cannot run: the refusal a client waiting
-    /// for the switch recognises (`cannot switch to <model>:`, as `set_model` words it).
-    fn switch_refused(&self, model: &ModelId) {
-        self.events.try_emit(Event::Error {
-            kind: ErrorKind::ProviderFatal,
-            message: format!(
-                "cannot switch to {model}: the session stopped after an internal error"
-            ),
-            retryable: false,
-            hint: Some("resume the session to continue".into()),
+    /// Answers a client waits for, sent in order off the actor: each waits a bounded time
+    /// for room (a busy client still gets it) while the actor goes on reading `Cancel` and
+    /// `Shutdown` (re-review N1).
+    fn answer_later(&self, events: Vec<Event>) {
+        if events.is_empty() {
+            return;
+        }
+        let sink = self.events.clone();
+        tokio::spawn(async move {
+            for ev in events {
+                sink.emit_last(ev).await;
+            }
         });
-    }
-
-    /// The end of a `Compact` that could not run (or crashed): nothing applied. Waits for
-    /// room like a turn's `TurnFinished` (the client waits for it).
-    async fn compact_failed(&self) {
-        self.events
-            .emit_last(Event::CompactFinished {
-                applied: false,
-                tokens_freed: 0,
-            })
-            .await;
     }
 }
