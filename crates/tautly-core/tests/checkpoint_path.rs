@@ -492,7 +492,10 @@ fn write_step(id: &str, path: &str, content: &str) -> MockTurn {
 /// Send `text` and wait for the turn's end.
 async fn turn(engine: &Engine, events: &mut mpsc::Receiver<Event>, text: &str) {
     engine
-        .send(Command::SendMessage { text: text.into() })
+        .send(Command::SendMessage {
+            id: None,
+            text: text.into(),
+        })
         .await
         .unwrap();
     while !matches!(next(events).await, Event::TurnFinished { .. }) {}
