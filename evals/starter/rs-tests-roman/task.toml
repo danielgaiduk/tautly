@@ -1,0 +1,6 @@
+id = "rs-tests-roman"
+prompt = "Write integration tests for `to_roman` in src/lib.rs in a new file tests/roman.rs. Cover 1, 4, 9, 14, 40, 90, 400, 1994 and 3999."
+timeout_s = 600
+budget_usd = 1.0
+tags = ["rust", "tests"]
+approve = "yolo"

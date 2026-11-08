@@ -1257,6 +1257,19 @@ impl Checkpointer {
         Instant::now() + Duration::from_millis(self.cfg.timeout_ms)
     }
 
+    /// The commit HEAD names, by the hardened git; none when HEAD is unborn or git
+    /// failed (`tautly eval` records it after a task's setup, for its verify script).
+    pub async fn head_commit(&self) -> Option<String> {
+        let git = Git {
+            index: None,
+            ..self.git()
+        };
+        match git.head(self.deadline()).await {
+            Ok(Some((commit, _tree))) => Some(commit),
+            _ => None,
+        }
+    }
+
     /// A checkpoint of the work tree as it is now, `write_gen` being the session's write
     /// generation: the previous one when nothing changed since (the same generation and
     /// `watcher_changed` false, without running git; or the same tree). Bounded by

@@ -24,10 +24,15 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo clippy -p tautly --all-targets --features mock -- -D warnings
 
-  # Performance gates (spec 9.1, Task 33), release build on both OSes: cold start and idle
+  # Performance gates (spec 9.1), release build on both OSes: cold start and idle
   # RSS (benches/perf/startup.sh, relative to the merge-base's binary), then the in-process
   # gates in benches/perf/ (crate tautly-perf, all `#[ignore]`, one at a time so timings and
-  # RSS are not shared). Each measurement is also written to the job summary.
+  # RSS are not shared). Each measurement is also written to the job summary. Then the token
+  # regression gate on the same release binary: the scripted starter sessions
+  # (evals/replay, mock provider, no scripted usage, so the engine's own request estimates
+  # count) must all pass and stay within 10% of evals/baseline.json in tokens per solved
+  # task. On Linux, the benchmark kit's report generator runs on its committed fixture and
+  # its script is syntax-checked; live benchmark runs (benchmarks/tokens/run.sh) are manual.
   perf:
     strategy:
       fail-fast: false
@@ -68,6 +73,43 @@ jobs:
         env:
           TAUTLY_BASELINE_BIN: baseline/tautly
       - run: cargo test --release -p tautly -p tautly-perf --features tautly/mock -- --ignored --test-threads=1 --nocapture
+      # Built by the test build above (the binary the integration tests run).
+      - run: ./target/release/tautly eval --replay evals/replay --jobs 4
+      - if: runner.os == 'Linux'
+        run: ./target/release/tautly eval report benchmarks/tokens/fixtures/sample.json --markdown
+      - if: runner.os == 'Linux'
+        run: bash -n benchmarks/tokens/run.sh
+
+  # Every starter task must fail before it is solved, with all four toolchains present
+  # (a missing `go` or an old Node would make a task fail for the wrong reason).
+  eval-tasks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22.18"
+      - run: go version && node --version && python3 --version
+      - name: verify fails on every unmodified setup
+        run: |
+          set -u
+          fail=0
+          for d in evals/starter/*/; do
+            dir=$(mktemp -d)
+            if ! (cd "$dir" && bash "$GITHUB_WORKSPACE/$d/setup.sh" >/dev/null); then
+              echo "setup failed: $d"; fail=1; continue
+            fi
+            if (cd "$dir" && bash "$GITHUB_WORKSPACE/$d/verify.sh" >/dev/null 2>&1); then
+              echo "verify passes before solving: $d"; fail=1
+            fi
+            rm -rf "$dir"
+          done
+          exit $fail
 
   # Hooks declared in configuration (`hook.<name>.command`/`event`) arrived in git 2.54, and
   # `core.hooksPath=/dev/null` does not switch them off, so checkpoint git disables each one it

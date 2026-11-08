@@ -1,0 +1,6 @@
+id = "rs-extract-method"
+prompt = "Turn the free function `area(r: &Rect)` in src/lib.rs into a method `Rect::area(&self)` and remove the free function."
+timeout_s = 600
+budget_usd = 1.0
+tags = ["rust", "refactor"]
+approve = "yolo"

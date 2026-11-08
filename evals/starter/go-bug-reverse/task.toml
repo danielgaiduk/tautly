@@ -1,0 +1,6 @@
+id = "go-bug-reverse"
+prompt = "`Reverse` in reverse.go leaves the middle of the slice unchanged for even lengths and swaps the wrong elements. Fix it to reverse the slice in place."
+timeout_s = 600
+budget_usd = 1.0
+tags = ["go", "bug"]
+approve = "yolo"

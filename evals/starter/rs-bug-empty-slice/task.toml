@@ -1,0 +1,6 @@
+id = "rs-bug-empty-slice"
+prompt = "`max_of` in src/lib.rs panics on an empty slice although it returns an Option. Fix it to return None for an empty slice."
+timeout_s = 600
+budget_usd = 1.0
+tags = ["rust", "bug"]
+approve = "yolo"

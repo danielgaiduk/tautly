@@ -34,6 +34,11 @@ reqwest.workspace = true
 rpassword.workspace = true
 serde_json.workspace = true
 tokio = { workspace = true, features = ["io-std", "signal"] }
+# `tautly eval`: task files, results JSON, temporary work trees, process groups of runs.
+serde.workspace = true
+toml.workspace = true
+tempfile.workspace = true
+libc.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
@@ -75,6 +80,10 @@ required-features = ["mock"]
 
 [[test]]
 name = "bisect"
+required-features = ["mock"]
+
+[[test]]
+name = "eval"
 required-features = ["mock"]
 
 # `cargo binstall tautly` downloads the cargo-dist archive of the host (or the nearest musl)

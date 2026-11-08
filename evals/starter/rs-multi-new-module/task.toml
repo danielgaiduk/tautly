@@ -1,0 +1,6 @@
+id = "rs-multi-new-module"
+prompt = "Add a module `math` (in src/math.rs) with `pub fn gcd(a: u64, b: u64) -> u64` and `pub fn lcm(a: u64, b: u64) -> u64`, declare it in src/lib.rs and re-export both functions from the crate root."
+timeout_s = 600
+budget_usd = 1.0
+tags = ["rust", "multi-file"]
+approve = "yolo"

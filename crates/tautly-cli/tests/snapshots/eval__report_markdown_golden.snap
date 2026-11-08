@@ -1,0 +1,9 @@
+---
+source: crates/tautly-cli/tests/eval.rs
+expression: stdout(&out)
+---
+| Model | Pass rate | Tokens per solved task | Cache hit ratio | Cost per trial |
+|---|---:|---:|---:|---:|
+| anthropic/claude-sonnet-5-5 | 82.0% ± 2.0% | 18,343 | 61.2% | $2.1404 |
+| openai/gpt-5 (patch) | 77.3% ± 3.1% | 22,104 | 45.5% | $1.3376 (est.) |
+| google/gemini-3-pro | 74.0% ± 4.0% | 25,877 | 39.8% | $1.1840 |

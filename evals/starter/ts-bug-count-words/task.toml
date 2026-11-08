@@ -1,0 +1,6 @@
+id = "ts-bug-count-words"
+prompt = "`countWords` in src/words.ts returns 1 for an empty or blank string and miscounts runs of spaces. Fix it."
+timeout_s = 600
+budget_usd = 1.0
+tags = ["typescript", "bug"]
+approve = "yolo"

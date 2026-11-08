@@ -1,0 +1,152 @@
+[
+ [
+  {
+   "tool_call": {
+    "id": "c0",
+    "name": "read",
+    "input_json": "{\"path\": \"billing.py\"}"
+   }
+  },
+  {
+   "done": {
+    "stop": "tool_use"
+   }
+  }
+ ],
+ [
+  {
+   "tool_call": {
+    "id": "c1",
+    "name": "read",
+    "input_json": "{\"path\": \"invoice.py\"}"
+   }
+  },
+  {
+   "done": {
+    "stop": "tool_use"
+   }
+  }
+ ],
+ [
+  {
+   "tool_call": {
+    "id": "c2",
+    "name": "outline",
+    "input_json": "{\"path\": \"billing.py\"}"
+   }
+  },
+  {
+   "done": {
+    "stop": "tool_use"
+   }
+  }
+ ],
+ [
+  {
+   "tool_call": {
+    "id": "c3",
+    "name": "symbol",
+    "input_json": "{\"name\": \"calc\"}"
+   }
+  },
+  {
+   "done": {
+    "stop": "tool_use"
+   }
+  }
+ ],
+ [
+  {
+   "tool_call": {
+    "id": "c4",
+    "name": "edit",
+    "input_json": "{\"path\": \"billing.py\", \"old_text\": \"def calc(prices, tax=0.0):\", \"new_text\": \"def calculate_total(prices, tax=0.0):\"}"
+   }
+  },
+  {
+   "done": {
+    "stop": "tool_use"
+   }
+  }
+ ],
+ [
+  {
+   "tool_call": {
+    "id": "c5",
+    "name": "edit",
+    "input_json": "{\"path\": \"invoice.py\", \"old_text\": \"from billing import calc\", \"new_text\": \"from billing import calculate_total\"}"
+   }
+  },
+  {
+   "done": {
+    "stop": "tool_use"
+   }
+  }
+ ],
+ [
+  {
+   "tool_call": {
+    "id": "c6",
+    "name": "edit",
+    "input_json": "{\"path\": \"invoice.py\", \"old_text\": \"    return calc(\", \"new_text\": \"    return calculate_total(\"}"
+   }
+  },
+  {
+   "done": {
+    "stop": "tool_use"
+   }
+  }
+ ],
+ [
+  {
+   "tool_call": {
+    "id": "c7",
+    "name": "read",
+    "input_json": "{\"path\": \"billing.py\"}"
+   }
+  },
+  {
+   "done": {
+    "stop": "tool_use"
+   }
+  }
+ ],
+ [
+  {
+   "tool_call": {
+    "id": "c8",
+    "name": "bash",
+    "input_json": "{\"command\": \"python3 -m unittest -q test_billing\"}"
+   }
+  },
+  {
+   "done": {
+    "stop": "tool_use"
+   }
+  }
+ ],
+ [
+  {
+   "tool_call": {
+    "id": "c9",
+    "name": "recall",
+    "input_json": "{\"query\": \"how are tests run in this repository\"}"
+   }
+  },
+  {
+   "done": {
+    "stop": "tool_use"
+   }
+  }
+ ],
+ [
+  {
+   "text_delta": "Done: the change is made and the tests pass."
+  },
+  {
+   "done": {
+    "stop": "end_turn"
+   }
+  }
+ ]
+]

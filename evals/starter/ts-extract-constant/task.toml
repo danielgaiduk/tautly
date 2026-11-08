@@ -1,0 +1,6 @@
+id = "ts-extract-constant"
+prompt = "The tax rate 0.2 appears three times in src/prices.ts. Replace the copies with one exported constant `TAX_RATE`; results must not change."
+timeout_s = 600
+budget_usd = 1.0
+tags = ["typescript", "refactor"]
+approve = "yolo"
