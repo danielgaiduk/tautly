@@ -206,17 +206,21 @@ impl Context {
         // Largest cut up to the wanted one that is valid and whose transcript fits. The cost
         // of a turn is the sum of its chunks' estimates, which never undercounts the joined
         // text.
-        let mut cut = self.history.len().saturating_sub(keep_recent);
+        let cut = self.history.len().saturating_sub(keep_recent);
         let chunks: Vec<String> = self.history[..cut].iter().map(render_turn).collect();
         let costs: Vec<u32> = chunks.iter().map(|c| est.estimate(c)).collect();
-        let removed = loop {
-            cut = self.settle(cut);
-            let cost = costs[..cut].iter().fold(0u32, |a, c| a.saturating_add(*c));
-            if cut == 0 || cost <= budget {
-                break cut;
-            }
-            cut -= 1;
-        };
+        // The longest prefix that fits, then the largest valid cut within it: settling only
+        // moves a cut down, so it still fits. (Settling at each cut down from the wanted one
+        // was quadratic in the history; perf gate `context`.)
+        let mut total = 0u32;
+        let fits = costs
+            .iter()
+            .take_while(|c| {
+                total = total.saturating_add(**c);
+                total <= budget
+            })
+            .count();
+        let removed = self.settle(fits);
 
         let mut transcript = String::from(OPEN);
         for chunk in &chunks[..removed] {

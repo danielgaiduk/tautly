@@ -29,8 +29,15 @@ const TERM_GRACE: Duration = Duration::from_millis(100);
 const KILL_POLL: Duration = Duration::from_millis(5);
 /// Absolute cap on how long to keep reading pipes after the shell exits (background children may hold them).
 const DRAIN_GRACE: Duration = Duration::from_millis(200);
-/// Upper bound on output kept in memory; the rest is drained and discarded.
+/// The same cap when no process is left in the command's group: the pipes end as soon as
+/// what was written is read, unless a process that left the group (setsid) holds them.
+const EOF_DRAIN: Duration = Duration::from_secs(5);
+/// Upper bound on output kept in memory when the sandbox offers no spill file to stream
+/// to; the rest is drained and discarded.
 const MAX_CAPTURE: usize = 16 * 1024 * 1024;
+/// Output beyond this streams to a spill file, keeping only its head and tail in memory
+/// (spec 9.1: 100 MB of output, bounded RSS). Such output is not summarized by the filters.
+const STREAM_AT: usize = 4 * 1024 * 1024;
 /// Longest piece of output read as one unit; longer lines are split, so a
 /// newline-free flood never sits in memory whole.
 const MAX_CHUNK: usize = 64 * 1024;
@@ -193,19 +200,107 @@ async fn read_chunk<R: AsyncBufRead + Unpin>(r: &mut R) -> std::io::Result<Vec<u
 }
 
 struct Capture<'a> {
+    /// All of the output, or only its head once it streams to a spill file.
     buf: Vec<u8>,
     tx: Option<&'a mpsc::Sender<String>>,
+    sb: &'a dyn Sandbox,
+    stream: Option<Streamed>,
+    /// The sandbox offers no spill file (or failed to make one): keep up to MAX_CAPTURE.
+    in_memory: bool,
+}
+
+/// Output past [`STREAM_AT`], written to a spill file as it arrives.
+struct Streamed {
+    path: PathBuf,
+    file: tautly_sandbox::SpillWriter,
+    total: u64,
+    /// The last bytes seen (at least [`OUTPUT_CAP`] once there are that many).
+    tail: Vec<u8>,
+    /// A write failed: the file is incomplete and is not offered.
+    broken: bool,
 }
 
 impl Capture<'_> {
-    fn push(&mut self, line: Vec<u8>) {
+    async fn push(&mut self, line: Vec<u8>) {
         if let Some(tx) = self.tx {
             // Bounded and lossy by design: never block the command on a slow consumer.
             let _ = tx.try_send(String::from_utf8_lossy(&line).into_owned());
         }
-        let room = MAX_CAPTURE.saturating_sub(self.buf.len());
-        self.buf.extend_from_slice(&line[..line.len().min(room)]);
+        if self.stream.is_none() && !self.in_memory && self.buf.len() + line.len() > STREAM_AT {
+            match self.sb.spill_stream().await {
+                Ok(Some((path, file))) => {
+                    let mut s = Streamed {
+                        path,
+                        file,
+                        total: 0,
+                        tail: Vec::new(),
+                        broken: false,
+                    };
+                    // Only the head of what was held so far stays in memory.
+                    let head = self.buf[..OUTPUT_CAP.min(self.buf.len())].to_vec();
+                    s.write(&std::mem::take(&mut self.buf)).await;
+                    self.buf = head;
+                    self.stream = Some(s);
+                }
+                _ => self.in_memory = true,
+            }
+        }
+        match &mut self.stream {
+            Some(s) => s.write(&line).await,
+            None => {
+                let room = MAX_CAPTURE.saturating_sub(self.buf.len());
+                self.buf.extend_from_slice(&line[..line.len().min(room)]);
+            }
+        }
     }
+}
+
+impl Streamed {
+    async fn write(&mut self, bytes: &[u8]) {
+        use tokio::io::AsyncWriteExt as _;
+        if !self.broken && self.file.write_all(bytes).await.is_err() {
+            self.broken = true;
+        }
+        self.total += bytes.len() as u64;
+        self.tail.extend_from_slice(bytes);
+        // Trimmed in batches, so each byte is moved a bounded number of times.
+        if self.tail.len() > 2 * OUTPUT_CAP {
+            self.tail.drain(..self.tail.len() - OUTPUT_CAP);
+        }
+    }
+
+    /// The capped text (head, omitted-bytes marker, tail, as [`cap_text`] makes it) and
+    /// the spill file, unless a write failed.
+    async fn finish(mut self, head: &[u8]) -> (String, Option<PathBuf>) {
+        use tokio::io::AsyncWriteExt as _;
+        if self.file.flush().await.is_err() {
+            self.broken = true;
+        }
+        let head = &head[..utf8_floor(head, OUTPUT_CAP / 2)];
+        let keep = OUTPUT_CAP - OUTPUT_CAP / 2;
+        let mut start = self.tail.len().saturating_sub(keep);
+        // Not inside a UTF-8 sequence.
+        while start < self.tail.len() && (self.tail[start] & 0xC0) == 0x80 {
+            start += 1;
+        }
+        let tail = &self.tail[start..];
+        let omitted = self.total - head.len() as u64 - tail.len() as u64;
+        let text = format!(
+            "{}\n… [{omitted} bytes omitted] …\n{}",
+            String::from_utf8_lossy(head),
+            String::from_utf8_lossy(tail)
+        );
+        (text, (!self.broken).then_some(self.path))
+    }
+}
+
+/// The longest prefix of `b` up to `max` bytes that does not end inside a UTF-8 sequence.
+fn utf8_floor(b: &[u8], max: usize) -> usize {
+    let mut end = max.min(b.len());
+    while end > 0 && end < b.len() && (b[end] & 0xC0) == 0x80 {
+        end -= 1;
+    }
+    end
 }
 
 /// Marks the code index stale when dropped and starts a background refresh to catch it up.
@@ -311,6 +406,9 @@ impl Tool for BashTool {
         let mut cap = Capture {
             buf: Vec::new(),
             tx: cx.output_tx(),
+            sb,
+            stream: None,
+            in_memory: false,
         };
         let deadline = Instant::now() + Duration::from_secs(timeout_s);
         let mut exit: Option<ExitStatus> = None;
@@ -332,9 +430,7 @@ impl Tool for BashTool {
                 _ = cx.cancel().cancelled(), if exit.is_none() => break Outcome::Cancelled,
                 _ = tokio::time::sleep_until(deadline), if exit.is_none() => break Outcome::TimedOut,
                 line = lines.recv(), if pipes_open => match line {
-                    Some(l) => {
-                        cap.push(l);
-                    }
+                    Some(l) => cap.push(l).await,
                     None => pipes_open = false,
                 },
                 _ = tokio::time::sleep_until(drain_until.unwrap_or(deadline)), if drain_until.is_some() => {
@@ -345,7 +441,14 @@ impl Tool for BashTool {
                 r = child.wait(), if exit.is_none() => match r {
                     Ok(status) => {
                         exit = Some(status);
-                        drain_until = Some(Instant::now() + DRAIN_GRACE);
+                        // Nothing left in the group: only what was already written is in
+                        // the pipes, so read it to the end (under load that can take longer
+                        // than DRAIN_GRACE). A background child may hold them forever.
+                        let grace = match pgid {
+                            Some(p) if !group_alive(p) => EOF_DRAIN,
+                            _ => DRAIN_GRACE,
+                        };
+                        drain_until = Some(Instant::now() + grace);
                     }
                     Err(e) => {
                         // The command started, so it may have written files.
@@ -376,7 +479,7 @@ impl Tool for BashTool {
             // Collect what was already written before the kill.
             let end = Instant::now() + TERM_GRACE;
             while let Ok(Some(l)) = tokio::time::timeout_at(end, lines.recv()).await {
-                cap.push(l);
+                cap.push(l).await;
             }
         }
 
@@ -400,21 +503,28 @@ impl Tool for BashTool {
         // release what is in flight.
         drop(readers);
         drop(lines);
-        let full = match String::from_utf8(cap.buf) {
-            Ok(s) => s,
-            Err(e) => String::from_utf8_lossy(e.as_bytes()).into_owned(),
+        let streamed = match cap.stream.take() {
+            Some(s) => Some(s.finish(&cap.buf).await),
+            None => None,
         };
-        let summary = parse_summary(&a.command, &full, exit_code);
-        let filtered = if a.raw == Some(true) {
+        // Output that streamed to a spill file is too large to summarize: head and tail.
+        let full = match (&streamed, String::from_utf8(cap.buf)) {
+            (Some(_), _) => String::new(),
+            (None, Ok(s)) => s,
+            (None, Err(e)) => String::from_utf8_lossy(e.as_bytes()).into_owned(),
+        };
+        let summary = parse_summary(&a.command, &full, exit_code).filter(|_| streamed.is_none());
+        let filtered = if a.raw == Some(true) || streamed.is_some() {
             None
         } else {
             filtered_output(summary.as_ref(), &full, exit_code, sb).await
         };
         let was_filtered = filtered.is_some();
         // A summary already names the spilled file; otherwise the cap spills when it cuts.
-        let (mut text, spilled) = match filtered {
-            Some(summary) => (summary, None),
-            None => cap_output(&full, OUTPUT_CAP, sb).await,
+        let (mut text, spilled) = match (streamed, filtered) {
+            (Some(streamed), _) => streamed,
+            (None, Some(summary)) => (summary, None),
+            (None, None) => cap_output(&full, OUTPUT_CAP, sb).await,
         };
         if !text.is_empty() && !text.ends_with('\n') {
             text.push('\n');

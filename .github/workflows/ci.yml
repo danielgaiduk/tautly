@@ -23,6 +23,28 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo clippy -p tautly --all-targets --features mock -- -D warnings
 
+  # Performance gates (spec 9.1, Task 33), release build on both OSes: cold start and idle
+  # RSS (benches/perf/startup.sh), then the in-process gates in benches/perf/ (crate
+  # tautly-perf, all `#[ignore]`, one at a time so timings and RSS are not shared). Each
+  # measurement is also written to the job summary.
+  perf:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install hyperfine
+        run: |
+          if [ "$RUNNER_OS" = macOS ]; then brew install hyperfine
+          else sudo apt-get update && sudo apt-get install -y hyperfine; fi
+      - run: cargo build --release -p tautly --features mock
+      - run: bash benches/perf/startup.sh
+      - run: cargo test --release -p tautly-perf -- --ignored --test-threads=1 --nocapture
+
   # Hooks declared in configuration (`hook.<name>.command`/`event`) arrived in git 2.54, and
   # `core.hooksPath=/dev/null` does not switch them off, so checkpoint git disables each one it
   # finds (CP5 review C1). Runner images may ship an older git, on which the regression tests

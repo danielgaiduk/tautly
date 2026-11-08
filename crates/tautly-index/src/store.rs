@@ -153,6 +153,10 @@ pub(crate) struct ParsedFile {
 
 pub(crate) struct Inner {
     conn: Mutex<Connection>,
+    /// The database file, and a read-only connection to it opened on first use (see
+    /// [`Index::top_referenced`]).
+    db: PathBuf,
+    reader: Mutex<Option<Connection>>,
     pub sb: Arc<dyn Sandbox>,
     pub fresh: Freshness,
     /// The generation the next write gets (see [`Inner::apply`]).
@@ -208,6 +212,8 @@ impl Index {
         Ok(Index {
             inner: Arc::new(Inner {
                 conn: Mutex::new(conn),
+                db: db.to_path_buf(),
+                reader: Mutex::new(None),
                 sb,
                 fresh: Freshness::default(),
                 next_generation: AtomicU32::new(1),
@@ -313,8 +319,26 @@ impl Index {
     /// definition for count: identifiers like `self` or library calls are not symbols of
     /// this repository, and method names (`new`, `len`) are shared noise. The cap is
     /// applied in SQL; a database error is returned, not folded into an empty list.
+    ///
+    /// It reads on a read-only connection of its own: on a large index the query takes a
+    /// while (150 ms on 20,000 files), and in WAL mode it then never holds up a write such
+    /// as an edit's reindex. It sees what was committed when it started.
     pub fn top_referenced(&self, limit: usize) -> Result<Vec<(String, u64)>, IndexError> {
-        let conn = self.inner.conn();
+        let mut reader = self
+            .inner
+            .reader
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if reader.is_none() {
+            let conn = Connection::open_with_flags(
+                &self.inner.db,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                    | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            )?;
+            conn.busy_timeout(BUSY_TIMEOUT)?;
+            *reader = Some(conn);
+        }
+        let conn = reader.as_ref().expect("opened above");
         let mut stmt = conn.prepare_cached(
             "SELECT r.name, COUNT(*) AS n FROM refs r \
              WHERE r.name IN (SELECT name FROM symbols WHERE kind != 'method') \

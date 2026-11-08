@@ -3392,6 +3392,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "tautly-perf"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "futures",
+ "libc",
+ "serde_json",
+ "tautly-acp",
+ "tautly-context",
+ "tautly-core",
+ "tautly-index",
+ "tautly-provider",
+ "tautly-sandbox",
+ "tautly-tools",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
 name = "tautly-provider"
 version = "0.1.0"
 dependencies = [
