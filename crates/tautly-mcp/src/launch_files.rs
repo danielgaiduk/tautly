@@ -16,6 +16,12 @@ const MAX_TOTAL: u64 = 8 * 1024 * 1024;
 const MAX_FILES: u32 = 4000;
 /// Most bytecode headers read for one key (timestamp bytecode costs only its header).
 const MAX_HEADERS: u32 = MAX_FILES;
+/// Most candidate paths looked up for one key.
+const MAX_CANDIDATES: usize = 4 * MAX_FILES as usize;
+/// Deepest `-m` module keyed by content (`a.b.c` is 3); far beyond any real package.
+const MAX_MODULE_PARTS: usize = 64;
+/// Longest `-m` module keyed by content: a longer one is no path Python can open.
+const MAX_MODULE_BYTES: usize = 4096;
 /// Directory names never walked: version control, dependencies, build output.
 const SKIPPED_DIRS: &[&str] = &[".git", "node_modules", "target", ".venv"];
 /// Python's bytecode cache directory: walked for hash-based `.pyc` files only.
@@ -80,7 +86,9 @@ const SHELL_SPLIT: &[char] = &[';', '&', '|', '(', ')', '<', '>', '\'', '"', '`'
 /// Bounds: [`MAX_FILE`] per file, [`MAX_TOTAL`], [`MAX_FILES`] entries and
 /// [`MAX_HEADERS`] bytecode headers per key. Content that cannot be hashed (over a bound,
 /// unreadable, a FIFO) gets a value no other call produces and clears `rememberable`, so
-/// the server is asked about at every start. Candidates outside the root add nothing.
+/// the server is asked about at every start. So does a command line the candidate bounds
+/// do not cover ([`MAX_CANDIDATES`], [`MAX_MODULE_PARTS`], [`MAX_MODULE_BYTES`]): its
+/// files are not all keyed. Candidates outside the root add nothing.
 pub(crate) fn files_named(
     root: &Path,
     base: &Path,
@@ -94,7 +102,9 @@ pub(crate) fn files_named(
     };
     let mut seen = std::collections::BTreeSet::new();
     let mut entries = Vec::new();
-    for (word, candidate) in candidates(words, base) {
+    let (candidates, complete) = candidates(words, base);
+    *rememberable &= complete;
+    for (word, candidate) in candidates {
         if !seen.insert(candidate.clone()) {
             continue;
         }
@@ -218,11 +228,17 @@ fn tokens(word: &str) -> Vec<&str> {
         .collect()
 }
 
-/// `(word index, candidate path)` for every candidate of `words` (see [`files_named`]).
-fn candidates(words: &[&String], base: &Path) -> Vec<(usize, String)> {
+/// `(word index, candidate path)` for every candidate of `words` (see [`files_named`]),
+/// and whether that is all of them: false when the bounds cut them short.
+fn candidates(words: &[&String], base: &Path) -> (Vec<(usize, String)>, bool) {
     let mut out = Vec::new();
     let mut runner = false;
+    let mut complete = true;
     for (i, word) in words.iter().enumerate() {
+        if out.len() > MAX_CANDIDATES {
+            complete = false;
+            break;
+        }
         let tokens = tokens(word);
         for (j, token) in tokens.iter().enumerate() {
             runner |= Path::new(token)
@@ -236,18 +252,17 @@ fn candidates(words: &[&String], base: &Path) -> Vec<(usize, String)> {
             if let Some(rest) = short_flag_value(token) {
                 out.push((i, rest.to_string()));
             }
-            match python_module_flag(token) {
-                Some(Some(module)) => module_paths(i, module, &mut out),
+            let module = match python_module_flag(token) {
+                Some(Some(module)) => Some((i, module)),
                 // The module is the next token of a split word, else the next word.
                 Some(None) => match tokens.get(j + 1) {
-                    Some(module) if j > 0 => module_paths(i, module, &mut out),
-                    _ => {
-                        if let Some(module) = words.get(i + 1) {
-                            module_paths(i + 1, module, &mut out);
-                        }
-                    }
+                    Some(module) if j > 0 => Some((i, *module)),
+                    _ => words.get(i + 1).map(|m| (i + 1, m.as_str())),
                 },
-                None => {}
+                None => None,
+            };
+            if let Some((w, module)) = module {
+                complete &= module_paths(w, module, &mut out);
             }
         }
     }
@@ -258,7 +273,11 @@ fn candidates(words: &[&String], base: &Path) -> Vec<(usize, String)> {
             }
         }
     }
-    out
+    if out.len() > MAX_CANDIDATES {
+        out.truncate(MAX_CANDIDATES);
+        complete = false;
+    }
+    (out, complete)
 }
 
 /// What follows a one-letter flag (`-r./pre.js` → `./pre.js`); none for `--long` flags
@@ -286,11 +305,17 @@ fn python_module_flag(token: &str) -> Option<Option<&str>> {
 /// `module` (`a.b`) as the directory `a/b` and the files `a/b.py` and `a/b.pyc`, with the
 /// `__init__.py` (and `.pyc`) of each parent package (`a/__init__.py`), which runs first,
 /// and the `__pycache__` next to each of those files, where Python looks for their
-/// bytecode (`a/__pycache__` for both; `__pycache__` for a top-level module).
-fn module_paths(word: usize, module: &str, out: &mut Vec<(usize, String)>) {
+/// bytecode (`a/__pycache__` for both; `__pycache__` for a top-level module). False,
+/// adding nothing, for a module over [`MAX_MODULE_PARTS`] or [`MAX_MODULE_BYTES`]: each
+/// parent package costs a candidate as long as the module, so its candidates would grow
+/// with the square of its length.
+fn module_paths(word: usize, module: &str, out: &mut Vec<(usize, String)>) -> bool {
+    if module.len() > MAX_MODULE_BYTES || module.split('.').count() > MAX_MODULE_PARTS {
+        return false;
+    }
     let path = module.replace('.', "/");
     if path.is_empty() {
-        return;
+        return true;
     }
     out.push((word, format!("{path}.py")));
     // A sourceless module: bytecode imported where no source is.
@@ -305,10 +330,11 @@ fn module_paths(word: usize, module: &str, out: &mut Vec<(usize, String)>) {
     let cache = match parts.split_last() {
         Some((_, [])) => PYCACHE.to_string(),
         Some((_, dirs)) => format!("{}/{PYCACHE}", dirs.join("/")),
-        None => return,
+        None => return true,
     };
     out.push((word, cache));
     out.push((word, path));
+    true
 }
 
 /// What is left of the per-key bounds.
