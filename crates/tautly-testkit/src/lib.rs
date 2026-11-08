@@ -251,6 +251,8 @@ pub trait Delegate: Send + Sync {
     async fn spill(&self, bytes: &[u8]) -> Result<PathBuf, SandboxError> {
         self.inner().spill(bytes).await
     }
+    // `spill_stream` and `spawn_stdio` do not forward: they copy the `Sandbox` trait
+    // defaults, as the wrappers did, and must be kept equal to them.
     async fn spill_stream(&self) -> Result<Option<(PathBuf, SpillWriter)>, SandboxError> {
         Ok(None)
     }

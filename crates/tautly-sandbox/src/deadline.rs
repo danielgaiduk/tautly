@@ -164,14 +164,27 @@ mod tests {
     /// while the second still runs.
     #[test]
     fn only_the_last_abandoned_job_clears_stuck() {
-        // Long enough that both jobs are queued before either caller gives up.
-        let w = worker(1000);
-        let (release_a, a) = blocked();
-        let (release_b, b) = blocked();
-        let first = std::thread::spawn(move || w.run(a));
-        let second = std::thread::spawn(move || w.run(b));
-        assert_eq!(first.join().unwrap(), Err(Refusal::TimedOut));
-        assert_eq!(second.join().unwrap(), Err(Refusal::TimedOut));
+        let (w, release_a, release_b) = loop {
+            let w = worker(1000);
+            let (release_a, a) = blocked();
+            let (release_b, b) = blocked();
+            let (started, running) = mpsc::channel();
+            let first = std::thread::spawn(move || {
+                w.run(move || {
+                    let _ = started.send(());
+                    a();
+                })
+            });
+            // B is queued only once A runs, so A is the first job.
+            running.recv().unwrap();
+            let second = std::thread::spawn(move || w.run(b));
+            assert_eq!(first.join().unwrap(), Err(Refusal::TimedOut));
+            match second.join().unwrap() {
+                Err(Refusal::TimedOut) => break (w, release_a, release_b),
+                // A loaded runner let A's caller give up before B was queued: again.
+                other => assert_eq!(other, Err(Refusal::Stuck)),
+            }
+        };
         drop(release_a);
         // Time for the worker to finish A; the assertion holds however long it takes.
         std::thread::sleep(Duration::from_millis(100));
