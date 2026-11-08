@@ -1,0 +1,3 @@
+cmd <<EOF <<< hi @
+x
+EOF

@@ -1,0 +1,1 @@
+diff <(ls a) <(ls b); if true; then rm x; fi; for i in 1; do echo $i; done

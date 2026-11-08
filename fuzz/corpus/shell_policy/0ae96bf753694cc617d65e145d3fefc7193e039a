@@ -1,0 +1,1 @@
+cmd >> a.log 2> err.log >&2 2>&1 &> both.log

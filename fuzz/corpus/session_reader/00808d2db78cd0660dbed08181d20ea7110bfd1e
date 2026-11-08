@@ -1,0 +1,5 @@
+{"type":"header","schema_version":1,"session_id":"s","created":{"secs_since_epoch":0,"nanos_since_epoch":0},"root":"/r","parent":null}
+{"type": "record", "offset": 0, "t": 0, "data": {"type": "edit", "data": {"path": "../etc/passwd", "pre_image": null, "post_image_blob": null, "step": 1}}}
+{"type": "record", "offset": 1, "t": 0, "data": {"type": "edit", "data": {"path": "/abs", "pre_image": null, "post_image_blob": null, "step": 1}}}
+{"type": "record", "offset": 2, "t": 0, "data": {"type": "hologram", "data": {}}}
+{"type": "record", "offset": 3, "t": 0, "data": {"type": "edit", "data": {"bogus": 1}}}

@@ -1,0 +1,4 @@
+{"type":"header","schema_version":1,"session_id":"s","created":{"secs_since_epoch":0,"nanos_since_epoch":0},"root":"/r","parent":null}
+{"type": "record", "offset": 0, "t": 0, "data": {"type": "undone", "data": {"turn": 1, "files": [{"path": "a\u0000b", "from_blob": null, "to": null}], "backup_ref": null}}}
+{"type": "record", "offset": 1, "t": 0, "data": {"type": "writes_lost", "data": {"paths": ["x/./y", "x//y"], "late": true}}}
+{"type": "record", "offset": 2, "t": 0, "data": {"type": "restore_begun", "data": {"backup_ref": null, "paths": [".."]}}}

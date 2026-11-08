@@ -1,0 +1,5 @@
+cmd <<EOF <<EOF2 @
+x
+EOF
+y
+EOF2
