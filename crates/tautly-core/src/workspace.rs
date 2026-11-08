@@ -78,6 +78,22 @@ pub(crate) struct Opened {
     _index_lock: Option<File>,
 }
 
+impl Drop for Opened {
+    /// Stopping the watcher joins its event thread, which can take seconds on a loaded
+    /// machine: off the async workers, as starting it is, or it stalls every task on the
+    /// runtime (the shutdown's bounded ledger flush among them).
+    fn drop(&mut self) {
+        let watch = self
+            ._watch
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let (Some(watch), Ok(rt)) = (watch, tokio::runtime::Handle::try_current()) {
+            rt.spawn_blocking(move || drop(watch));
+        }
+    }
+}
+
 /// One work tree's shared parts (sandbox, index, data home) for the sessions on it.
 pub struct Workspace {
     sandbox: Arc<dyn Sandbox>,
