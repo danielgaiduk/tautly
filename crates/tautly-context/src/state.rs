@@ -24,6 +24,8 @@ pub struct FileNote {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct WorkingState {
+    /// Spec 6.3 lists it in the record, but the engine does not set it yet: setting it
+    /// must reach both the live turn and every rebuild path, or their requests diverge.
     pub task: Option<String>,
     pub plan: Vec<PlanStep>,
     pub files: BTreeMap<PathBuf, FileNote>,
