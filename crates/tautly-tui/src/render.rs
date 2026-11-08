@@ -15,8 +15,8 @@ use std::time::Instant;
 
 use serde_json::Value;
 use tautly_core::{
-    DiffPreview, EffectView, ErrorKind, Event, FinishReason, MemoryChange, SaveKind, Savings,
-    TestEvidence, ToolMetaView, UsageRole, printable, printable_multiline,
+    DiffFile, DiffPreview, EffectView, ErrorKind, Event, FinishReason, MemoryChange, SaveKind,
+    Savings, TestEvidence, ToolMetaView, UsageRole, printable, printable_multiline,
 };
 
 use crate::ReplOptions;
@@ -419,25 +419,7 @@ pub fn event(e: &Event, st: &mut RenderState, opts: &ReplOptions) -> Option<Stri
             files,
             unified,
             ..
-        } => {
-            let scope = turn.map_or_else(|| "the session".to_string(), |n| format!("turn {n}"));
-            if files.is_empty() {
-                return Some(st.line(format!("no changes by Tautly's tools in {scope}")));
-            }
-            let mut out = format!("changes in {scope}:\n");
-            for f in files {
-                let _ = writeln!(
-                    out,
-                    "  {} {} +{} -{}",
-                    wire_name(&f.status),
-                    printable(&f.path),
-                    f.added,
-                    f.removed
-                );
-            }
-            out.push_str(&diff_text(unified, opts.color));
-            Some(st.line(out))
-        }
+        } => Some(st.line(session_diff(*turn, files, unified, opts.color))),
         Event::ModelChanged {
             id: _,
             model,
@@ -585,6 +567,27 @@ fn finish_notes(meta: &ToolMetaView, diff: Option<&DiffPreview>) -> Vec<String> 
         ));
     }
     notes
+}
+
+/// A `/diff` answer: the files changed in `turn` (None: the session), then the diff.
+fn session_diff(turn: Option<u32>, files: &[DiffFile], unified: &str, color: bool) -> String {
+    let scope = turn.map_or_else(|| "the session".to_string(), |n| format!("turn {n}"));
+    if files.is_empty() {
+        return format!("no changes by Tautly's tools in {scope}");
+    }
+    let mut out = format!("changes in {scope}:\n");
+    for f in files {
+        let _ = writeln!(
+            out,
+            "  {} {} +{} -{}",
+            wire_name(&f.status),
+            printable(&f.path),
+            f.added,
+            f.removed
+        );
+    }
+    out.push_str(&diff_text(unified, color));
+    out
 }
 
 /// What an undo did or would do. Paths are escaped.
