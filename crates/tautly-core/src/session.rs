@@ -10,7 +10,7 @@ use std::time::{Duration, SystemTime};
 
 use tautly_context::pinned::{self, PinSource, Pinned};
 use tautly_context::{CompactionRecord, Context, Turn, agents_md};
-use tautly_provider::{Block, CanonicalRequest, ModelId, ModelInfo, Provider, ToolSpec};
+use tautly_provider::{Block, CanonicalRequest, ModelId, ModelInfo, Provider, Reasoning, ToolSpec};
 use tautly_sandbox::{Policy, Sandbox, cleanup_spills};
 use tautly_session::{BlobRef, HeaderInit, SessionWriter};
 use tautly_tools::{ProcessGroups, ReadTracker, Tool};
@@ -28,6 +28,7 @@ use crate::mcp::{McpSession, PreExecHook};
 use crate::memory::MemoryState;
 use crate::model_switch::ModelSetup;
 use crate::protocol::{Command, ErrorKind, Event};
+use crate::reasoning::ReasoningLevel;
 use crate::receipt::ReceiptBuilder;
 use crate::record::{BlockHashes, LoggedPin, SessionRecord};
 use crate::routing::Side;
@@ -444,6 +445,8 @@ pub(crate) struct Session {
     /// Set by a switch within one provider: the next request, if refused for its
     /// reasoning, is sent again once without it.
     pub reasoning_retry: bool,
+    /// The reasoning the last main request carried (`None`: none sent yet).
+    pub sent_reasoning: Option<Option<Reasoning>>,
     /// Paths already reported as not tracked (outside the root, or not valid UTF-8).
     pub untracked_paths: HashSet<PathBuf>,
     /// User turns started in this session (1-based once the first message runs).
@@ -456,6 +459,8 @@ pub(crate) struct Session {
     pub session_id: String,
     /// Limits and spend; `SetBudget` changes the limits from the actor at any time.
     pub budgets: Arc<Mutex<Budgets>>,
+    /// The `reasoning` level; `SetReasoning` changes it from the actor at any time.
+    pub reasoning: Arc<Mutex<ReasoningLevel>>,
     /// Wall-clock limit per user message.
     pub turn_timeout: Option<Duration>,
     /// Its background writer starts at [`Session::init`].

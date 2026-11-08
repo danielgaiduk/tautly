@@ -5,11 +5,12 @@
 //! The project file is repository content, so it is untrusted: it cannot set `providers`,
 //! `telemetry`, `approve_memory`, `catalog_overrides`, `routing`, `evidence` or
 //! `checkpoints` (a repository must not turn off what lets the user undo it), and in
-//! `permissions` it can only lower the mode and add `deny` rules; `budget`, `max_turns`
-//! and `turn_timeout_s` can only go down. Of `[mcp]` it may only declare `servers`, which
-//! never merge with the user's: they are kept apart in [`Config::project_mcp_servers`] and
-//! each needs the user's approval before it starts. Dropped settings come back as
-//! [`LoadedConfig::warnings`]. Command-line flags are the user's own and override all.
+//! `permissions` it can only lower the mode and add `deny` rules; `budget`, `max_turns`,
+//! `turn_timeout_s` and `reasoning` can only go down. Of `[mcp]` it may only declare
+//! `servers`, which never merge with the user's: they are kept apart in
+//! [`Config::project_mcp_servers`] and each needs the user's approval before it starts.
+//! Dropped settings come back as [`LoadedConfig::warnings`]. Command-line flags are the
+//! user's own and override all.
 
 use std::collections::{BTreeMap, HashSet};
 use std::ffi::OsString;
@@ -27,6 +28,7 @@ use toml::{Table, Value};
 use url::Url;
 
 use crate::evidence::{EvidenceConfig, TestMatcher};
+use crate::reasoning::ReasoningLevel;
 
 /// Largest config file read; a bigger one is refused rather than parsed.
 const MAX_CONFIG_BYTES: u64 = 256 * 1024;
@@ -72,6 +74,9 @@ pub enum ConfigError {
 pub struct Config {
     #[serde(default = "default_model")]
     pub model: ModelId,
+    /// How hard the main model thinks (spec 4.7; default `auto`).
+    #[serde(default)]
+    pub reasoning: ReasoningLevel,
     #[serde(default)]
     pub providers: ProvidersConfig,
     #[serde(default = "default_permissions", deserialize_with = "permissions_de")]
@@ -221,6 +226,7 @@ impl Default for Config {
     fn default() -> Self {
         Config {
             model: default_model(),
+            reasoning: ReasoningLevel::default(),
             providers: ProvidersConfig::default(),
             permissions: default_permissions(),
             compaction_threshold: default_compaction_threshold(),
@@ -343,6 +349,8 @@ pub struct RoutingConfig {
 #[derive(Debug, Clone, Default)]
 pub struct CliOverrides {
     pub model: Option<ModelId>,
+    /// `--reasoning <level>`.
+    pub reasoning: Option<ReasoningLevel>,
     /// `--approve auto-edit|yolo`.
     pub mode: Option<Mode>,
     /// `--approve-memory`.
@@ -752,6 +760,7 @@ const USER_ONLY_KEYS: &[&str] = &[
 /// Everything else a project file may set (some of it only to tighten).
 const PROJECT_KEYS: &[&str] = &[
     "model",
+    "reasoning",
     "permissions",
     "compaction_threshold",
     "max_turns",
@@ -780,7 +789,8 @@ const MIN_PROJECT_THRESHOLD: f64 = 0.5;
 /// - `permissions.mode` may only go lower than so far, `permissions.allow` is dropped and
 ///   `permissions.deny` rules are added to the user's (`PolicyConfig` has no `ask` rules,
 ///   so deny rules are the only rule a project can add);
-/// - `max_turns`, `turn_timeout_s`, `budget.*.max_usd` / `max_tokens` may only go lower,
+/// - `max_turns`, `turn_timeout_s`, `budget.*.max_usd` / `max_tokens` and `reasoning`
+///   (towards `off`; `auto` counts as `medium`) may only go lower,
 ///   `compaction_threshold` only lower and within 0.5..1 (it can neither disable
 ///   compaction nor raise the threshold);
 /// - `model` must be a priced model of the catalog the trusted layers produce, else a
@@ -822,6 +832,25 @@ fn restrict_project_layer(
                 "model",
                 "a project config may only choose a priced model from the catalog",
             );
+        }
+    }
+
+    if let Some(wanted) = layer.get("reasoning") {
+        let level = |v: &Value| v.clone().try_into::<ReasoningLevel>().ok();
+        let current = so_far.get("reasoning").and_then(level).unwrap_or_default();
+        match level(wanted) {
+            Some(w) if w.rank() <= current.rank() => {}
+            Some(_) => {
+                layer.remove("reasoning");
+                ignore("reasoning", "a project config can only lower it");
+            }
+            None => {
+                layer.remove("reasoning");
+                ignore(
+                    "reasoning",
+                    &format!("must be one of {}", ReasoningLevel::NAMES),
+                );
+            }
         }
     }
 
@@ -1307,6 +1336,9 @@ fn cli_table(cli: &CliOverrides) -> Table {
     let mut t = Table::new();
     if let Some(model) = &cli.model {
         t.insert("model".into(), Value::String(model.as_str().to_string()));
+    }
+    if let Some(level) = cli.reasoning {
+        t.insert("reasoning".into(), Value::String(level.to_string()));
     }
     if let Some(mode) = cli.mode {
         let mut permissions = Table::new();

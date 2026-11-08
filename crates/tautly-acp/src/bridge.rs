@@ -20,7 +20,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use serde_json::{Value, json};
 use tautly_core::{
     Command, DiffPreview, EffectView, Engine, Event, FinishReason, McpState, MemoryChange,
-    SessionReader, SessionRecord, TestEvidence, printable,
+    ReasoningLevel, SessionReader, SessionRecord, TestEvidence, printable,
 };
 use tautly_rpc::jsonrpc::{
     self, Error, INVALID_PARAMS, INVALID_REQUEST, Line, MAX_LINE, METHOD_NOT_FOUND,
@@ -578,6 +578,28 @@ impl Conn {
     /// then, a `config_option_update` puts the real model back).
     async fn set_config(self: Arc<Self>, p: SetConfigParams) -> Result<Reply, Error> {
         let session = self.session(&p.session_id)?;
+        if p.config_id == "reasoning" {
+            // `SetReasoning` has no answer: applied from the next request (spec 4.7).
+            let level = p
+                .value
+                .as_str()
+                .and_then(|v| v.parse::<ReasoningLevel>().ok())
+                .ok_or_else(|| {
+                    invalid(format!(
+                        "the `reasoning` option takes one of {}",
+                        ReasoningLevel::NAMES
+                    ))
+                })?;
+            session.send(Command::SetReasoning { level }).await?;
+            let options = {
+                let mut st = lock(&session.st);
+                st.reasoning = level;
+                st.options()
+            };
+            return Ok(Box::pin(
+                async move { Ok(json!({"configOptions": options})) },
+            ));
+        }
         if p.config_id != "model" {
             return Err(invalid(format!("no config option `{}`", p.config_id)));
         }
@@ -613,12 +635,12 @@ impl Conn {
                     available: Vec::new(),
                 });
                 shown.current = model;
-                return Ok(json!({"configOptions": config_options(&shown)}));
+                return Ok(json!({"configOptions": config_options(Some(&shown), st.reasoning)}));
             }
             match rx.await {
                 Ok(Ok(())) => {
                     let st = lock(&session.st);
-                    Ok(json!({"configOptions": st.models.as_ref().map(config_options)}))
+                    Ok(json!({"configOptions": st.options()}))
                 }
                 Ok(Err(msg)) => Err(Error::new(INVALID_PARAMS, msg)),
                 Err(_) => Err(Error::new(INTERNAL_ERROR, "the session has stopped")),
@@ -705,6 +727,9 @@ struct SessionState {
     /// Approval requests the client has not answered, by request (or proposal) id.
     approvals: HashMap<String, Pending>,
     models: Option<ModelChoices>,
+    /// The `reasoning` option's value: the session's level at open, then what the client
+    /// set (spec 4.7).
+    reasoning: ReasoningLevel,
     /// The last `ContextStatus`: tokens used and the window.
     context: Option<(u32, u32)>,
     /// The session's priced spend so far.
@@ -722,20 +747,48 @@ fn chunk(text: &str) -> Value {
     json!({"sessionUpdate": "agent_message_chunk", "content": ContentBlock::text(text)})
 }
 
-fn config_options(m: &ModelChoices) -> Value {
-    let mut ids = vec![m.current.clone()];
-    ids.extend(m.available.iter().filter(|a| **a != m.current).cloned());
-    json!([{
-        "id": "model",
-        "name": "Model",
-        "category": "model",
+/// The `model` option (when the session offers a model choice), then `reasoning` with the
+/// levels the RPC `set_reasoning` takes.
+fn config_options(models: Option<&ModelChoices>, reasoning: ReasoningLevel) -> Value {
+    let mut options = Vec::new();
+    if let Some(m) = models {
+        let mut ids = vec![m.current.clone()];
+        ids.extend(m.available.iter().filter(|a| **a != m.current).cloned());
+        options.push(json!({
+            "id": "model",
+            "name": "Model",
+            "category": "model",
+            "type": "select",
+            "currentValue": m.current,
+            "options": ids.iter().map(|id| json!({"value": id, "name": id})).collect::<Vec<_>>(),
+        }));
+    }
+    let levels = [
+        ReasoningLevel::Auto,
+        ReasoningLevel::Off,
+        ReasoningLevel::Low,
+        ReasoningLevel::Medium,
+        ReasoningLevel::High,
+    ];
+    options.push(json!({
+        "id": "reasoning",
+        "name": "Reasoning",
+        "category": "thought_level",
         "type": "select",
-        "currentValue": m.current,
-        "options": ids.iter().map(|id| json!({"value": id, "name": id})).collect::<Vec<_>>(),
-    }])
+        "currentValue": reasoning.to_string(),
+        "options": levels
+            .iter()
+            .map(|l| json!({"value": l.to_string(), "name": l.to_string()}))
+            .collect::<Vec<_>>(),
+    }));
+    Value::Array(options)
 }
 
 impl SessionState {
+    fn options(&self) -> Value {
+        config_options(self.models.as_ref(), self.reasoning)
+    }
+
     fn cost_text(&self) -> String {
         let session = format!("session: ${:.4}", self.cost_usd);
         match &self.receipt {
@@ -780,12 +833,14 @@ impl SessionState {
 
 impl Session {
     fn new(engine: Engine, root: PathBuf, models: Option<ModelChoices>) -> Session {
+        let reasoning = engine.reasoning();
         Session {
             id: engine.session_id().to_string(),
             root,
             engine,
             st: Mutex::new(SessionState {
                 models,
+                reasoning,
                 ..SessionState::default()
             }),
             ids: AtomicU64::new(0),
@@ -799,11 +854,7 @@ impl Session {
 
     fn opened_result(&self) -> Value {
         let st = lock(&self.st);
-        let mut result = json!({"sessionId": self.id});
-        if let Some(m) = &st.models {
-            result["configOptions"] = config_options(m);
-        }
-        result
+        json!({"sessionId": self.id, "configOptions": st.options()})
     }
 
     async fn send(&self, cmd: Command) -> Result<(), Error> {
@@ -1136,7 +1187,10 @@ async fn on_event(conn: &Arc<Conn>, s: &Arc<Session>, ev: Event) {
                     }
                     None => {
                         // Answered at once during a turn: put the real model back.
-                        let options = lock(&s.st).models.as_ref().map(config_options);
+                        let options = {
+                            let st = lock(&s.st);
+                            st.models.is_some().then(|| st.options())
+                        };
                         if let Some(o) = options {
                             conn.update(
                                 &s.id,
@@ -1238,10 +1292,13 @@ async fn on_event(conn: &Arc<Conn>, s: &Arc<Session>, ev: Event) {
         Event::ModelChanged { model, .. } => {
             let (options, waiter) = {
                 let mut st = lock(&s.st);
-                let options = st.models.as_mut().map(|m| {
-                    m.current = model.as_str().to_string();
-                    config_options(m)
-                });
+                let options = match st.models.as_mut() {
+                    Some(m) => {
+                        m.current = model.as_str().to_string();
+                        Some(st.options())
+                    }
+                    None => None,
+                };
                 let switch = st.switch.take_if(|sw| sw.model == model.as_str());
                 (options, switch.and_then(|sw| sw.reply))
             };

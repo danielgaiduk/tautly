@@ -99,6 +99,7 @@ Naming: the package in `crates/tautly-cli` is named `tautly` (7.11.3: release ar
 | Key | Default | Layers |
 |---|---|---|
 | `providers.auto_detect` | `true` | user, CLI. Provider detection when no layer names a model (7.11.2) |
+| `reasoning` | `auto` | user, CLI (`--reasoning`). Project layer: lower only (4.7) |
 | `[mcp]` `enabled`, `timeout_s`, `startup_timeout_ms`, `max_tools`, `import_mcp_json` | `true`, 120, 5000, 50, `true` | user, CLI |
 | `[mcp.servers.<name>]` `{command, args, env, cwd}` or `{url, headers}` | none | user: trusted. Project layer: `servers` only; each such server is repository-declared and needs approval (7.11.10). A repository `.mcp.json` counts as the project layer |
 | `[evidence]` `test_commands`, `replace_defaults` | built-in list, `false` | user, CLI. A repository could otherwise label any command a passing test (7.11.7) |
@@ -136,7 +137,7 @@ Typed, serde-serializable, versioned:
 `diff` is a `DiffPreview{unified, lines, truncated}` (7.11.4). New fields are optional or defaulted, so readers built for the first list keep working (3.4).
 
 ### 3.3 Commands (client → engine)
-`SendMessage{text, id?}`, `Approve{request_id, session_rule?}`, `Deny{request_id, reason?}`, `Cancel`, `SetBudget`, `Compact{id?}`, `Uncompact`, `Pin`, `Unpin`, `ApproveMemory{proposal_id}`, `RejectMemory{proposal_id}`, `ConsolidateMemory{id?}`, `Fork{at?, label?, id?}`, `SetModel{model, id?}` (7.11.5), `Diff{turn?, id?}` (7.11.4), `Undo{turn?, dry_run, id?}` (7.11.11), `Rewind{at, label?, dry_run, overwrite, id?}`, `Switch{session_id, dry_run, overwrite, id?}`, `Label{label}`, `Replay{session_id?, speed, from_step?, id?}` (7.12), `Shutdown`. `id` is the client's correlation id (3.2). Over JSON-RPC it is a param of the command's method (`{"method": "undo", "params": {"id": "u1", …}}`); without one, the request's own JSON-RPC `id` (a string as is, a number as its decimal text) is used, so `{"id": 7, "method": "send_message", …}` ends with `turn_finished{id: "7"}`.
+`SendMessage{text, id?}`, `Approve{request_id, session_rule?}`, `Deny{request_id, reason?}`, `Cancel`, `SetBudget`, `Compact{id?}`, `Uncompact`, `Pin`, `Unpin`, `ApproveMemory{proposal_id}`, `RejectMemory{proposal_id}`, `ConsolidateMemory{id?}`, `Fork{at?, label?, id?}`, `SetModel{model, id?}` (7.11.5), `SetReasoning{level}` (4.7), `Diff{turn?, id?}` (7.11.4), `Undo{turn?, dry_run, id?}` (7.11.11), `Rewind{at, label?, dry_run, overwrite, id?}`, `Switch{session_id, dry_run, overwrite, id?}`, `Label{label}`, `Replay{session_id?, speed, from_step?, id?}` (7.12), `Shutdown`. `id` is the client's correlation id (3.2). Over JSON-RPC it is a param of the command's method (`{"method": "undo", "params": {"id": "u1", …}}`); without one, the request's own JSON-RPC `id` (a string as is, a number as its decimal text) is used, so `{"id": 7, "method": "send_message", …}` ends with `turn_finished{id: "7"}`.
 
 `Approve`/`Deny` answer both tool-call approvals and MCP server approvals; request ids are unique across both. `session_rule` (7.11.8) only applies to tool calls.
 
@@ -177,15 +178,15 @@ trait Provider: Send + Sync {
         -> BoxStream<'static, Result<ProviderEvent, ProviderError>>;
 }
 ```
-`Capabilities`: context window, max output tokens, parallel tool calls (bool), reasoning style (`none | budget | effort`), cache style (`explicit | automatic | none`), image input (bool), preferred edit format.
+`Capabilities`: context window, max output tokens, parallel tool calls (bool), reasoning style (`none | budget | effort | effort_always`; `effort_always`: effort-controlled, thinking cannot be turned off, 4.7), cache style (`explicit | automatic | none`), image input (bool), preferred edit format.
 
 ### 4.2 Adapters (v1)
 | Adapter | Wire API | Provider-specific handling |
 |---|---|---|
-| `anthropic` | Messages API | `cache_control` breakpoints on system, tools, rolling conversation prefix; extended thinking budget; fine-grained tool streaming |
+| `anthropic` | Messages API | `cache_control` breakpoints on system, tools, rolling conversation prefix; adaptive thinking with `output_config.effort` (effort-style models), or a thinking budget (budget-style models); fine-grained tool streaming |
 | `openai` | Responses API | reasoning effort; stateless requests (`store: false`) with reasoning carried across steps as encrypted reasoning items (`include: ["reasoning.encrypted_content"]`); automatic prefix caching |
 | `google` | Gemini API | thinking budget; implicit/explicit context caching |
-| `openai-compat` | Chat Completions | base URL configurable (OpenRouter, Ollama, vLLM, LM Studio, Groq, …); conservative default capabilities |
+| `openai-compat` | Chat Completions | base URL configurable (OpenRouter, Ollama, vLLM, LM Studio, Groq, …); conservative default capabilities; `reasoning_effort` only for a model whose catalog entry declares `reasoning = "effort"` |
 
 Adapters may place the volatile tail (6.1) inside the last tool result's content when the provider would otherwise treat it as a new user turn (earlier reasoning is then dropped); the last cache breakpoint stays on the block before it.
 
@@ -203,6 +204,19 @@ API keys from environment variables or the OS keychain (`keyring` crate). No sub
 - Quota: rate-limit response headers (Anthropic, OpenAI) parsed into `Usage.quota{remaining_requests, remaining_tokens, reset_at}` when present.
 - `SetBudget{scope: turn|session, max_usd?, max_tokens?}`. At 80%: warning event. At 100%: the engine finishes the in-flight tool call, then ends with `TurnFinished{reason: budget}`.
 - Telemetry: OpenTelemetry export is removed from v1 (user-approved 2026-11-03) and is post-v1. Nothing leaves the machine except provider, `web_fetch` and MCP requests. The `[telemetry]` table stays reserved (2.4).
+
+### 4.7 Reasoning
+- **Setting.** `reasoning = "auto" | "off" | "low" | "medium" | "high"`, a top-level key (`model` is a string, so it cannot be a `[model]` table), default `auto`. User and CLI layers set it (`--reasoning <level>`); a project layer may only lower it, towards `off` (`auto` counts as `medium`), else it is dropped with a `Warning` (2.2). At run time `Command::SetReasoning{level}` (REPL `/reasoning <level>`, RPC `set_reasoning {level}`) changes it from the next request on, even mid-turn. It is not replayed on resume or by `tautly fork`: the configured level applies again. The ACP bridge offers it as the `reasoning` select of `session/set_config_option` (same levels; `currentValue` starts at the session's level).
+- **Resolution** against the model's catalog reasoning style (4.1), at every main request: `off` sends nothing; `auto` means `medium`; a model with style `none` gets nothing whatever the level. Style `effort` gets `Reasoning::Effort(low|medium|high)`; style `budget` gets `Reasoning::Budget` of 4,096 / 12,288 / 32,768 tokens. Style `effort_always` (thinking cannot be turned off: every built-in Claude, gpt-5 and Gemini 3 entry; without a setting they think at the provider's default, medium for gpt-5 and dynamic for Gemini 3) resolves like `effort`, except that `off` means minimal thinking: the lowest effort, `low`.
+- **Side-model requests** (compaction summaries, episodes, memory consolidation, `web_fetch` answers; 7.5) always run at `off` for the side model's style: nothing, or `low` effort on an `effort_always` model.
+- **Cache.** When the level changes mid-session and the request's reasoning parameters change with it, a step on an `anthropic` model starts a cold epoch (`force_cold_epoch`, 7.7): Anthropic's message cache does not survive a thinking change, so pending collection, compaction, pin folds and the memory index apply then. Other providers keep the warm accounting. A resumed session's first step is always a cold epoch (its cache clock is not in the log), so a level change across a resume is counted too.
+- **Preserved thinking.** Current Claude models check that a replayed thinking block's conversation prefix (`system`, `tools`, earlier messages) is unchanged, and Tautly edits history (GC elisions, keep-tail compaction, pin and memory-index folds at a cold epoch). Every adaptive request therefore sets `thinking.block_binding: {prefix_mismatch_behavior: "drop_block"}` with `anthropic-beta: thinking-binding-controls-2026-08-01`: the API drops the invalidated blocks (and later ones, for that request) instead of answering 400.
+- **Adapters:**
+  - `anthropic`: an effort becomes `thinking: {type: "adaptive", display: "summarized", block_binding: {prefix_mismatch_behavior: "drop_block"}}` with `output_config: {effort}` and the binding beta header; current models (the built-in catalog's Claude entries are effort-style) reject `budget_tokens`. A budget becomes `thinking: {type: "enabled", budget_tokens}` capped at half of `max_tokens` (the answer keeps room), and is left out when that is under 1,024; with tools it adds `anthropic-beta: interleaved-thinking-2025-05-14` so the model thinks between tool calls. No `temperature`, `top_p`, `top_k` or forced `tool_choice` is ever sent. Thinking blocks go back with their signatures (and `redacted_thinking` verbatim) ahead of the tool calls of the same turn. With reasoning off nothing is sent, except on `effort_always` models, which get `low` effort.
+  - `openai`: `reasoning: {effort, summary: "auto"}`; a budget maps to the effort of its level (up to 4,096 low, up to 12,288 medium, else high). Encrypted reasoning items are replayed as before (4.2).
+  - `google`: `thinkingConfig: {thinkingBudget, includeThoughts: true}` with the level's budget, clamped to the catalog's `thinking_budget_max` for the model when it has one (Gemini 3 Pro 32,768, Flash 24,576: the Gemini 2.5 documented maxima, unverified for 3) and capped at half of `maxOutputTokens` (thoughts count against it); thought signatures go back on the following part. Gemini 3 prefers `thinkingLevel`; the budget is its backward-compatible form, kept until the daily-driver checklist's live check says otherwise.
+  - `openai-compat`: `reasoning_effort` for an effort; nothing for a budget (no portable field).
+- **Accounting.** Reasoning tokens are output tokens: Anthropic's and OpenAI's `output_tokens` include them, and Gemini's `thoughtsTokenCount` is added to `candidatesTokenCount`. They are priced, budgeted and shown in receipts as output.
 
 ## 5. Tools and edits
 
@@ -590,6 +604,7 @@ At each directory level where `AGENTS.md` is read (root and ancestors, 6.1), a d
   - Memory proposals and MCP server approvals use `y`/`n`.
 - **Slash commands:**
   - `/model [id]`: no id lists the current model and the models whose provider has a key.
+  - `/reasoning <level>`: `auto`, `off`, `low`, `medium` or `high` from the next request on (4.7).
   - `/cost`: turn and session receipt.
   - `/diff [N]`.
   - `/undo [N]`: shows the dry run, asks y/n, then undoes (7.11.11).

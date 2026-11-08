@@ -534,6 +534,11 @@ where
                     .await?,
                 ));
             }
+            Slash::Reasoning(level) => {
+                self.send(Command::SetReasoning { level }).await?;
+                self.print_line(&format!("reasoning: {level} from the next request"))
+                    .await?;
+            }
             Slash::Help => self.print_line(HELP).await?,
             Slash::Unknown(what) => {
                 let text = format!("unknown command: {}\n{HELP}", printable(&what));

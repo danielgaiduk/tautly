@@ -63,6 +63,9 @@ struct Entry {
     cache_ttl_s: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     tier: Option<Tier>,
+    /// The largest thinking budget the model takes (Gemini), when documented.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    thinking_budget_max: Option<u32>,
 }
 
 impl Entry {
@@ -126,9 +129,16 @@ impl Catalog {
                     price: None,
                     cache_ttl_s: None,
                     tier: None,
+                    thinking_budget_max: None,
                 }
             });
         entry.edit_format = format;
+    }
+
+    /// The largest thinking budget the model takes, when the catalog says
+    /// (`thinking_budget_max`); adapters clamp to it.
+    pub fn thinking_budget_max(&self, id: &ModelId) -> Option<u32> {
+        self.models.get(id.as_str())?.thinking_budget_max
     }
 
     pub fn contains(&self, id: &ModelId) -> bool {

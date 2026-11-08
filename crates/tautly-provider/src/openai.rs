@@ -67,8 +67,8 @@ fn effort_name(e: &Effort) -> &'static str {
 
 fn budget_effort(n: u32) -> &'static str {
     match n {
-        0..=2_048 => "low",
-        2_049..=8_192 => "medium",
+        0..=4_096 => "low",
+        4_097..=12_288 => "medium",
         _ => "high",
     }
 }

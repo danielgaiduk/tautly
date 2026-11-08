@@ -64,6 +64,7 @@ use crate::memory::{MemoryMode, MemoryState};
 use crate::model_switch::ModelSetup;
 use crate::protocol::{BudgetScope, Command, ErrorKind, Event, FinishReason};
 use crate::provider_setup::{ProviderFactory, provider_for_with, provider_label};
+use crate::reasoning::ReasoningLevel;
 use crate::record::SessionRecord;
 use crate::resume;
 use crate::routing::Side;
@@ -389,6 +390,7 @@ impl EngineBuilder {
             provider,
             setup: ModelSetup::new(config.clone(), Arc::clone(&catalog), Some(provider_factory)),
             reasoning_retry: false,
+            sent_reasoning: None,
             model: config.model.clone(),
             info,
             side,
@@ -408,6 +410,7 @@ impl EngineBuilder {
             index_error_reported: false,
             session_id: session_id.clone(),
             budgets: Arc::clone(&budgets),
+            reasoning: Arc::new(Mutex::new(config.reasoning)),
             turn_timeout: config.turn_timeout_s.map(Duration::from_secs),
             cost_ledger: Arc::clone(&cost_ledger),
             cost_ledger_reported: false,
@@ -427,6 +430,7 @@ impl EngineBuilder {
             end_recovery: None,
         };
         let current = Arc::new(Mutex::new((session_id.clone(), session_path.clone())));
+        let reasoning = Arc::clone(&session.reasoning);
         let actor = Actor {
             _live: session.workspace.enter(),
             log: session.log.clone(),
@@ -436,6 +440,7 @@ impl EngineBuilder {
             session_id: session_id.clone(),
             current: Arc::clone(&current),
             budgets,
+            reasoning: Arc::clone(&reasoning),
             groups: groups.clone(),
             cost_ledger: Arc::clone(&session.cost_ledger),
         };
@@ -463,6 +468,7 @@ impl EngineBuilder {
                 session_path,
                 current,
                 groups,
+                reasoning,
             },
             event_rx,
         ))
@@ -513,9 +519,20 @@ pub struct Engine {
     /// The session the engine is on now (a fork moves it to the branch).
     current: Arc<Mutex<(String, PathBuf)>>,
     groups: ProcessGroups,
+    /// Shared with the session (`SetReasoning`).
+    reasoning: Arc<Mutex<ReasoningLevel>>,
 }
 
 impl Engine {
+    /// The session's reasoning level now (spec 4.7): the configured one until a
+    /// `SetReasoning` is applied.
+    pub fn reasoning(&self) -> ReasoningLevel {
+        *self
+            .reasoning
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
     /// Hand a command to the session; an error only when the session has stopped.
     pub async fn send(&self, cmd: Command) -> Result<(), EngineError> {
         self.commands
@@ -626,6 +643,8 @@ struct Actor {
     /// Shared with the [`Engine`] handle.
     current: Arc<Mutex<(String, PathBuf)>>,
     budgets: Arc<Mutex<Budgets>>,
+    /// Shared with the session (`SetReasoning`).
+    reasoning: Arc<Mutex<ReasoningLevel>>,
     groups: ProcessGroups,
     /// The session's cost ledger, flushed at shutdown.
     cost_ledger: Arc<CostLedger>,
@@ -1092,7 +1111,10 @@ impl Actor {
         let queued = !lost
             && !to_inbox
             && !Self::urgent(&cmd)
-            && !matches!(cmd, Command::SetBudget { .. } | Command::Unknown)
+            && !matches!(
+                cmd,
+                Command::SetBudget { .. } | Command::SetReasoning { .. } | Command::Unknown
+            )
             && !(busy && matches!(cmd, Command::Replay { .. }));
         let full = if to_inbox {
             running.is_some_and(|r| r.inbox.capacity() == 0)
@@ -1155,6 +1177,12 @@ impl Actor {
                 max_tokens,
             } => {
                 self.set_budget(scope, max_usd, max_tokens);
+            }
+            Command::SetReasoning { level } => {
+                *self
+                    .reasoning
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner) = level;
             }
             cmd @ (Command::Pin { .. }
             | Command::Unpin { .. }

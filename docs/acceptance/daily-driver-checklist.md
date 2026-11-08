@@ -199,9 +199,30 @@ means applying the documented `volatile_tail` placement for that adapter: the wo
 goes inside the last tool result, with the last cache breakpoint on the block before it.
 Open an issue for that adapter. Do not change adapters on a single failure.
 
-These tests check the prompt cache only. **Reasoning continuity is not checked here.** The
-engine does not enable reasoning yet, and the real check comes with the
-reasoning-enablement lane.
+These tests check the prompt cache only. **Reasoning continuity is not checked here yet.**
+The engine now enables reasoning (spec 4.7, default `auto`); the live reasoning check
+comes with the live smoke suite's continuity test.
+
+**Verify Gemini 3 thinking by hand.** Tautly sends Gemini 3 a `thinkingBudget`
+(4,096 / 12,288 / 32,768 tokens for low / medium / high; "off" sends low), not a
+`thinkingLevel`. The budget is clamped to the catalog's `thinking_budget_max` (Pro
+32,768, Flash 24,576, taken from Gemini 2.5's documented ranges) and to half of the
+output limit. Google documents the budget as still accepted for backward compatibility,
+but no real call has checked it. In the section 5 Gemini session, run `/reasoning high` before the task, then
+confirm:
+- no request is rejected for its thinking settings;
+- the stream shows reasoning text;
+- the receipt's output tokens include the thoughts (they are more than the answer alone).
+
+If Gemini 3 rejects the budget, rejects the clamp value as out of range, or ignores it,
+open an issue. The fallback: in the `google` adapter, send
+`thinkingConfig: {thinkingLevel, includeThoughts: true}` instead of `thinkingBudget` for
+`gemini-3*` models (`low` for off and low, `high` for medium and high; never both fields,
+which is a 400), and drop `thinking_budget_max` from those catalog entries.
+
+| Gemini 3 thinking check | Result | Issue |
+|---|---|---|
+| `thinkingBudget` accepted, thoughts streamed and counted | | |
 
 | Test | anthropic | openai | google | ollama |
 |---|---|---|---|---|

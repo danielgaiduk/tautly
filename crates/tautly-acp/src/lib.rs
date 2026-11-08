@@ -13,7 +13,8 @@
 //!   `/pin`), streamed back as `session/update`s, and answered with the stop reason when
 //!   the turn ends. Approvals become `session/request_permission`; `allow_always` sends the
 //!   exact-target session rule. `session/cancel` cancels the turn.
-//! - `session/set_config_option {configId: "model"}` switches the model.
+//! - `session/set_config_option {configId: "model"}` switches the model; `{configId:
+//!   "reasoning"}` sets the reasoning level (spec 4.7).
 //!
 //! Nothing but protocol frames is written to the output; diagnostics go to stderr.
 
