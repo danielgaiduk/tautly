@@ -287,6 +287,7 @@ fn walk(
         // A bare assignment changes how every later command in the input runs.
         "variable_assignment" => {
             let t = text(node, src);
+            reject_lone_dollar(t)?;
             let name = t.split(['=', '[', '+']).next().unwrap_or(t);
             if is_dangerous_env(name) {
                 return Err(Unparseable(format!(
@@ -428,6 +429,7 @@ fn walk_command(
         match child.kind() {
             "command_name" => argv.push(unquote(child, src)),
             "variable_assignment" => {
+                reject_lone_dollar(text(child, src))?;
                 assignments.push(text(child, src).to_string());
                 rest.push(child);
             }
@@ -990,6 +992,30 @@ fn check_expansion(t: &str) -> Result<(), Unparseable> {
     }
     if b.get(i) == Some(&b':') && !matches!(b.get(i + 1), Some(b'-' | b'=' | b'?' | b'+')) {
         require_literal_arith(&inner[i + 1..])?;
+    }
+    Ok(())
+}
+
+/// An assignment holding an unquoted `$` before whitespace: bash ends the word there
+/// (`ex=$ rm -rf x` runs `rm`), while the grammar reads the next word into the value,
+/// hiding the command name. Fails closed on any such `$` outside quotes.
+fn reject_lone_dollar(t: &str) -> Result<(), Unparseable> {
+    let b = t.as_bytes();
+    let (mut single, mut double, mut i) = (false, false, 0);
+    while i < b.len() {
+        match b[i] {
+            b'\\' if !single => i += 1,
+            b'\'' if !double => single = !single,
+            b'"' if !single => double = !double,
+            b'$' if !single && !double && b.get(i + 1).is_some_and(u8::is_ascii_whitespace) => {
+                return Err(Unparseable(format!(
+                    "`$` before whitespace in the assignment `{}`",
+                    snippet(t)
+                )));
+            }
+            _ => {}
+        }
+        i += 1;
     }
     Ok(())
 }

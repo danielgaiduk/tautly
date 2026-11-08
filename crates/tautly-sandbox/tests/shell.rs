@@ -1299,3 +1299,19 @@ fn a_read_redirection_without_a_command_is_unparseable() {
     }
     assert!(parse_commands("c < f").is_ok());
 }
+
+/// Fuzzing (shell_policy): an assignment whose value is a lone `$` (`ex=$ cmd`) is bash's
+/// literal `$`, and `cmd` still runs with it in its environment: the command after it is
+/// in the parse, or the input is unparseable.
+#[test]
+fn a_lone_dollar_value_does_not_hide_the_command() {
+    for s in ["ex=$ rm -rf x", "a | ex=$ rm -rf x", "a=$ b=1 rm x"] {
+        if let Ok(cmds) = parse_commands(s) {
+            assert!(
+                cmds.iter()
+                    .any(|c| c.argv.first().is_some_and(|w| w == "rm")),
+                "{s:?} parsed as {cmds:?}"
+            );
+        }
+    }
+}
