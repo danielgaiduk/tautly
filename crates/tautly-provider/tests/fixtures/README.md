@@ -27,3 +27,6 @@ as emitted by Ollama and DeepSeek-style servers, `finish_reason`, a trailing `us
 `[DONE]`); `compat/ollama.sse` imitates Ollama's `/v1/chat/completions` output. None are
 recordings of real responses, and all must be replaced by real recordings (keys scrubbed)
 when API keys / a local server are available.
+
+`compat/tool_calls_no_index.sse` is likewise hand-authored: tool-call deltas without an `index`
+field, as emitted by some servers.

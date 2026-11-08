@@ -1,4 +1,15 @@
 //! Filesystem, process and network confinement for Tautly.
+//!
+//! - [`Sandbox`] is where tools touch the world: files confined to one root, processes and
+//!   HTTP. [`LocalSandbox`] is the implementation on the local machine (no OS-level
+//!   isolation: confinement is path resolution, protected paths and the policy).
+//! - [`Policy`] decides whether a tool call runs, asks or is denied, from the permission
+//!   [`Mode`] and the `tool(glob)` allow and deny rules ([`PolicyConfig`]). Shell commands
+//!   are parsed with tree-sitter-bash ([`parse_commands`]) so rules see every simple
+//!   command, its working directories and its write redirects; a command that cannot be
+//!   analyzed always asks.
+//! - [`is_protected`] names the paths that always ask (`.git/`, `.tautly/`, `.github/
+//!   workflows/`, build and shell startup files).
 
 mod deadline;
 mod effect;

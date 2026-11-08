@@ -1,4 +1,11 @@
 //! Canonical provider types, capabilities, model catalog and cost accounting.
+//!
+//! The engine builds one provider-neutral [`CanonicalRequest`] per step; an adapter
+//! ([`anthropic`], [`openai`], [`google`], [`compat`] for OpenAI-compatible endpoints)
+//! translates it and streams back [`ProviderEvent`]s. [`Retrying`] wraps an adapter with
+//! backoff on transient errors. The [`Catalog`] (`catalog/models.toml`) holds each model's
+//! [`Capabilities`] and [`Price`]; [`cost_usd`] prices usage with it. [`MockProvider`]
+//! replays scripted responses for tests.
 
 pub mod anthropic;
 /// Provider-neutral requests, messages and stream events.

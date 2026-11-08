@@ -20,7 +20,8 @@
 //! - The engine commands, by their wire names, with the command's fields as params:
 //!   `send_message`, `approve`, `deny`, `cancel`, `set_budget`, `compact`, `uncompact`,
 //!   `pin`, `unpin`, `approve_memory`, `reject_memory`, `consolidate_memory`, `fork`,
-//!   `set_model`, `diff`, `undo`, `rewind`, `switch`, `label`, `replay` ([`command_for`];
+//!   `set_model`, `set_reasoning`, `diff`, `undo`, `rewind`, `switch`, `label`, `replay`
+//!   ([`command_for`];
 //!   `switch` names the session to switch to, and `replay` the session to play back,
 //!   `target`, since `session_id` addresses the session the command is for; `replay`
 //!   answers with `replayed` events and a `replay_finished`; a value this version does

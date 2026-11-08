@@ -1,4 +1,11 @@
-//! The `Tool` trait, shared tool context, and the built-in read-side tools.
+//! The [`Tool`] trait, the per-call [`ToolCx`], and the built-in tools: `read`, `write`,
+//! `edit` (str_replace, patch or hashline, with the tolerant applier), `bash` (with output
+//! filters for common test and build tools), `grep`, `glob`, `find`, `outline`, `symbol`,
+//! `refs`, `web_fetch`, `pin`, `state`, `recall` and `remember`. [`registry`] lists them.
+//!
+//! Tools never touch the file system or network directly: everything goes through a
+//! [`tautly_sandbox::Sandbox`], and each call reports the [`AppliedEffect`]s it had so the
+//! engine can log, undo and replay it.
 
 mod bash;
 mod cap;
