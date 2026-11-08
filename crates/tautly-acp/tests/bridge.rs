@@ -782,6 +782,7 @@ async fn set_config_option_model_sends_set_model_and_returns_options() {
         .map(|o| o["value"].as_str().unwrap())
         .collect();
     assert_eq!(values, [MODEL, OTHER_MODEL]);
+    assert_eq!(opts[1]["id"], "reasoning", "{r}");
 
     let r = acp
         .call(
@@ -801,6 +802,69 @@ async fn set_config_option_model_sends_set_model_and_returns_options() {
         )
         .await;
     assert_eq!(r["error"]["code"], -32602, "{r}");
+    acp.finish().await;
+}
+
+/// Spec 4.7: a `reasoning` select (the RPC levels) beside the model, starting at the
+/// session's configured level; setting it sends `SetReasoning`.
+#[tokio::test]
+async fn set_config_option_reasoning_sends_set_reasoning() {
+    let fx = Fx::new();
+    let mock = MockProvider::new(vec![text_step("hi")]);
+    let mut cfg = config(Mode::Ask);
+    let toml = format!(
+        "[models.\"{MODEL}\"]\ncontext_window = 200000\nmax_output = 8000\n\
+         parallel_tools = true\nreasoning = \"effort\"\ncache = \"none\"\nimages = false\n\
+         edit_format = \"str_replace\"\n"
+    );
+    cfg.catalog_overrides = Some(tautly_provider::Catalog::from_toml(&toml).unwrap());
+    cfg.reasoning = tautly_core::ReasoningLevel::Low;
+    let (f, _) = factory(&fx, cfg, vec![mock.clone()]);
+    let mut acp = Acp::start(f);
+    acp.initialize(json!({})).await;
+    let r = acp
+        .call("session/new", json!({"cwd": fx.root(), "mcpServers": []}))
+        .await;
+    let id = r["result"]["sessionId"].as_str().unwrap().to_string();
+    // No model lister: the reasoning option alone.
+    let opt = &r["result"]["configOptions"][0];
+    assert_eq!(opt["id"], "reasoning", "{r}");
+    assert_eq!(opt["type"], "select");
+    assert_eq!(opt["currentValue"], "low");
+    let values: Vec<&str> = opt["options"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|o| o["value"].as_str().unwrap())
+        .collect();
+    assert_eq!(values, ["auto", "off", "low", "medium", "high"]);
+
+    let r = acp
+        .call(
+            "session/set_config_option",
+            json!({"sessionId": id, "configId": "reasoning", "value": "high"}),
+        )
+        .await;
+    assert!(r.get("error").is_none(), "{r}");
+    assert_eq!(r["result"]["configOptions"][0]["currentValue"], "high");
+    let resp = acp.prompt(&id, "hi").await;
+    assert_eq!(stop_reason(&resp), "end_turn");
+    assert_eq!(
+        mock.requests()[0].reasoning,
+        Some(tautly_provider::Reasoning::Effort(
+            tautly_provider::Effort::High
+        ))
+    );
+
+    for bad in [json!("max"), json!(3)] {
+        let r = acp
+            .call(
+                "session/set_config_option",
+                json!({"sessionId": id, "configId": "reasoning", "value": bad}),
+            )
+            .await;
+        assert_eq!(r["error"]["code"], -32602, "{r}");
+    }
     acp.finish().await;
 }
 

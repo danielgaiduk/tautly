@@ -37,7 +37,7 @@ pub struct OpenAiProvider {
 
 impl OpenAiProvider {
     pub fn new(api_key: String, base_url: Url, catalog: Arc<Catalog>) -> Self {
-        let client = reqwest::Client::builder()
+        let client = tautly_sandbox::http_client_builder()
             .connect_timeout(Duration::from_secs(15))
             .build()
             .expect("reqwest client with rustls builds");
@@ -67,8 +67,8 @@ fn effort_name(e: &Effort) -> &'static str {
 
 fn budget_effort(n: u32) -> &'static str {
     match n {
-        0..=2_048 => "low",
-        2_049..=8_192 => "medium",
+        0..=4_096 => "low",
+        4_097..=12_288 => "medium",
         _ => "high",
     }
 }

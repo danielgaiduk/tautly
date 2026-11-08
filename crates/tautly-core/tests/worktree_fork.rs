@@ -1064,3 +1064,85 @@ async fn a_default_dir_inside_the_repository_names_dir_and_tautly_home() {
         "{text}"
     );
 }
+
+// ------------------------------------------------- quality Q1: guards and cleanup
+
+#[tokio::test]
+async fn a_dot_git_symlink_refuses_the_fork() {
+    let repo = Repo::git_repo();
+    let (_, log) = two_turn_session(&repo).await;
+    // The repository moved away and `.git` became a link to it: never followed.
+    let moved = tempfile::tempdir().unwrap();
+    let real = moved.path().join("real.git");
+    std::fs::rename(repo.root().join(".git"), &real).unwrap();
+    std::os::unix::fs::symlink(&real, repo.root().join(".git")).unwrap();
+    let refused = fork(&repo, &log, 3).await;
+    match refused {
+        Err(WtError::NotGit(why)) => assert!(why.contains("is a symbolic link"), "{why}"),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(logs(&repo.home()).len(), 1, "no session was made");
+    assert!(!repo.home().join("worktrees").exists());
+}
+
+#[tokio::test]
+async fn a_fork_whose_log_cannot_be_written_leaves_no_worktree_behind() {
+    use std::os::unix::fs::PermissionsExt;
+    let repo = Repo::git_repo();
+    let (_, log) = two_turn_session(&repo).await;
+    // The worktree shares the project's session directory: make it read-only.
+    let sessions = log.parent().unwrap().to_path_buf();
+    let mode = |m: u32| std::fs::Permissions::from_mode(m);
+    std::fs::set_permissions(&sessions, mode(0o500)).unwrap();
+    let refused = fork(&repo, &log, 3).await;
+    std::fs::set_permissions(&sessions, mode(0o700)).unwrap();
+    assert!(refused.is_err(), "{refused:?}");
+    assert_eq!(logs(&repo.home()).len(), 1, "no session was made");
+    let worktrees = repo.git(&["worktree", "list", "--porcelain"]).unwrap();
+    assert_eq!(worktrees.matches("worktree ").count(), 1, "{worktrees}");
+    let leftovers: Vec<_> = std::fs::read_dir(repo.home().join("worktrees"))
+        .map(|d| {
+            d.flatten()
+                .flat_map(|p| std::fs::read_dir(p.path()).into_iter().flatten())
+                .collect()
+        })
+        .unwrap_or_default();
+    assert!(leftovers.is_empty(), "{leftovers:?}");
+}
+
+#[tokio::test]
+async fn fork_into_copies_the_records_up_to_the_cut() {
+    let repo = Repo::git_repo();
+    let (parent, log) = two_turn_session(&repo).await;
+    let r = reader(&log);
+    let id = worktree::fork_into(
+        &r,
+        1,
+        &repo.root(),
+        Some("early".into()),
+        Origin::Fork,
+        None,
+    )
+    .unwrap();
+    assert_ne!(id, parent);
+    let child = logs(&repo.home())
+        .into_iter()
+        .find(|p| p.to_string_lossy().contains(&id))
+        .expect("the fork's log");
+    let header = reader(&child).header().clone();
+    assert_eq!(header.label.as_deref(), Some("early"));
+    assert_eq!(header.parent_step, Some(1));
+    let (from, offset) = header.parent.unwrap();
+    assert_eq!(from, parent);
+    let copied = usize::try_from(offset).unwrap() + 1;
+    let ours = raw_records(&child);
+    assert_eq!(ours[..copied], raw_records(&log)[..copied]);
+    assert_eq!(ours[copied]["type"], "forked", "{:?}", ours[copied]);
+    // Nothing of the second turn came along.
+    assert!(
+        !records(&child)
+            .iter()
+            .any(|r| matches!(r, SessionRecord::TurnStart { turn: 2, .. })),
+        "{child:?}"
+    );
+}

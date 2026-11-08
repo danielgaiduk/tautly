@@ -122,7 +122,7 @@ async fn update(from: &str) -> anyhow::Result<i32> {
 
 /// The document at `url`, as JSON.
 async fn fetch(url: &str) -> anyhow::Result<Value> {
-    let client = reqwest::Client::builder()
+    let client = tautly_sandbox::http_client_builder()
         .timeout(TIMEOUT)
         .user_agent(concat!("tautly/", env!("CARGO_PKG_VERSION")))
         .build()?;

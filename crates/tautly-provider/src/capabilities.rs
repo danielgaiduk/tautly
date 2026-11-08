@@ -6,6 +6,8 @@ pub enum ReasoningStyle {
     None,
     Budget,
     Effort,
+    /// Effort-controlled, and thinking cannot be turned off: "off" sends the lowest effort.
+    EffortAlways,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

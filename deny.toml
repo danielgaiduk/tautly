@@ -1,0 +1,62 @@
+# cargo-deny configuration. Run: cargo deny check
+[graph]
+# No `targets` list: every platform is checked, so the Linux-only keyring (Secret Service)
+# tree and the Windows crates are covered when this runs on macOS too.
+all-features = true
+
+[advisories]
+version = 2
+yanked = "deny"
+unmaintained = "all"
+ignore = [
+    # keyring 3.6 -> secret-service 4 -> zbus 4.4, Linux only (linux-native-async-persistent).
+    # Upstream merged these crates into zbus 6; there is no fixed release of them.
+    # Re-check when keyring or secret-service moves to zbus 5+ and drop these entries then.
+    { id = "RUSTSEC-2026-0370", reason = "zvariant, via keyring's Secret Service backend; no fix until keyring bumps zbus" },
+    { id = "RUSTSEC-2026-0371", reason = "zbus_names, via keyring's Secret Service backend; no fix until keyring bumps zbus" },
+    { id = "RUSTSEC-2026-0372", reason = "zvariant_derive, via keyring's Secret Service backend; no fix until keyring bumps zbus" },
+]
+
+[licenses]
+version = 2
+confidence-threshold = 0.9
+# Permissive only: anything copyleft or unlicensed fails. r-efi (MIT OR Apache-2.0 OR
+# LGPL-2.1-or-later) passes through its permissive alternatives.
+allow = [
+    "MIT",
+    "MIT-0",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "CC0-1.0",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+
+[bans]
+multiple-versions = "warn"
+# Every crate but `tautly` is `publish = false`, so its versionless path deps are allowed.
+wildcards = "deny"
+allow-wildcard-paths = true
+highlight = "all"
+# Duplicates pulled in by dependencies (keyring, ring, rmcp, ulid, proptest); revisit when
+# those bump.
+skip = [
+    { name = "rand", version = "<0.9" },
+    { name = "rand_core", version = "<0.9" },
+    { name = "rand_chacha", version = "<0.9" },
+    { name = "getrandom", version = "<0.3" },
+    { name = "windows-sys", version = "<0.61" },
+    { name = "core-foundation", version = "<0.10" },
+    { name = "security-framework", version = "<3" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

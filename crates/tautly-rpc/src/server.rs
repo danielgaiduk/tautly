@@ -116,6 +116,7 @@ const COMMAND_METHODS: &[&str] = &[
     "consolidate_memory",
     "fork",
     "set_model",
+    "set_reasoning",
     "diff",
     "undo",
     "rewind",

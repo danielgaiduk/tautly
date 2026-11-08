@@ -476,6 +476,66 @@ async fn compaction_summary_requested_from_side_model_not_main() {
     ));
 }
 
+/// Spec 4.7: side-model requests run without reasoning whatever the main level is.
+#[tokio::test]
+async fn side_requests_stay_without_reasoning_when_the_main_model_reasons() {
+    use tautly_provider::{Effort, Reasoning};
+    // Side work runs "off": nothing, or the lowest effort where thinking cannot be off.
+    for (style, side_want) in [
+        ("effort", None),
+        ("effort_always", Some(Reasoning::Effort(Effort::Low))),
+    ] {
+        let fx = compaction_fx();
+        let main = MockProvider::new(compaction_script());
+        let side = MockProvider::new(vec![text_step("SUMMARY-TEXT", usage(2000, 300))]);
+        let mut cfg = config(Some(SMALL_PRICE));
+        let styled = format!("\"{style}\"\ncache");
+        let toml = format!(
+            "{}{}",
+            model_toml(MAIN, None, Some(MAIN_PRICE)).replace("\"none\"\ncache", &styled),
+            model_toml(SMALL, Some("small"), Some(SMALL_PRICE)).replace("\"none\"\ncache", &styled)
+        );
+        cfg.catalog_overrides = Some(Catalog::from_toml(&toml).unwrap());
+        cfg.reasoning = tautly_core::ReasoningLevel::High;
+        let mut run = start(fx.builder(cfg, &main, &side));
+        let events = run.turn_with(&long_prompt()).await;
+        assert_eq!(
+            finish_reason(&events),
+            FinishReason::Completed,
+            "{events:?}"
+        );
+        let high = Some(Reasoning::Effort(Effort::High));
+        assert!(
+            main.requests().iter().all(|r| r.reasoning == high),
+            "{style}"
+        );
+        let side_reqs = side.requests();
+        assert_eq!(side_reqs.len(), 1);
+        assert_eq!(side_reqs[0].reasoning, side_want, "{style}");
+    }
+}
+
+#[tokio::test]
+async fn the_runner_sends_the_lowest_effort_to_a_model_that_always_thinks() {
+    use tautly_provider::{Effort, Reasoning, ReasoningStyle};
+    let mock = MockProvider::new(vec![
+        text_step("a", usage(1, 1)),
+        text_step("b", usage(1, 1)),
+    ]);
+    let (side, _rx) = runner(&mock);
+    let side = side.with_style(ReasoningStyle::EffortAlways);
+    side.complete("S", "U", 100).await.unwrap();
+    let (plain, _rx) = runner(&mock);
+    plain
+        .with_style(ReasoningStyle::Effort)
+        .complete("S", "U", 100)
+        .await
+        .unwrap();
+    let reqs = mock.requests();
+    assert_eq!(reqs[0].reasoning, Some(Reasoning::Effort(Effort::Low)));
+    assert_eq!(reqs[1].reasoning, None);
+}
+
 /// The tokens and cost of the `Usage` events of `role`.
 fn spent(events: &[Event], role: UsageRole) -> (u64, f64) {
     events

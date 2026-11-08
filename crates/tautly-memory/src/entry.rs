@@ -79,7 +79,7 @@ impl MemoryEntry {
     }
 
     /// Parse an entry file: the YAML frontmatter [`to_markdown`](Self::to_markdown)
-    /// writes, a hand-edited one, or the first version's `key: <JSON>` lines.
+    /// writes, or a hand-edited one that is valid YAML.
     pub fn from_markdown(text: &str) -> Result<Self, String> {
         frontmatter::parse(text)
     }

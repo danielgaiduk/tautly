@@ -677,12 +677,15 @@ async fn timeout_skips_with_warning() {
     let repo = Repo::with(&[("a.txt", "a\n")]);
     let pid_file = repo.home.path().join("sleep.pid");
     let shim = repo.home.path().join("git");
-    // The configuration read goes to the real git (one that never ends is another case:
-    // `config_include_that_never_ends_turns_checkpoints_off_once`); the next call hangs.
+    // Configuration reads answer at once, "nothing set" (exit 1), without the real git:
+    // a slow real `git config` could use up the time limit before the hanging call starts
+    // (one that never ends is another case:
+    // `config_include_that_never_ends_turns_checkpoints_off_once`). The next call hangs,
+    // so the limit always runs out inside the shim, after it named its child.
     executable(
         &shim,
         &format!(
-            "#!/bin/sh\ncase \" $* \" in *\" config \"*) exec git \"$@\";; esac\n\
+            "#!/bin/sh\ncase \" $* \" in *\" config \"*) exit 1;; esac\n\
              sleep 30 &\necho $! > '{}'\nwait\n",
             pid_file.display()
         ),
@@ -2305,4 +2308,91 @@ async fn linked_worktree_still_takes_checkpoints() {
     std::fs::write(wt.join("b.txt"), "b\n").unwrap();
     cp.snapshot_now().await.unwrap();
     assert_eq!(main.refs("refs/tautly/"), ["refs/tautly/checkpoints/w/1"]);
+}
+
+/// quality Q1: a refusal names the later turns that changed the file (by commands, seen
+/// between their checkpoints), so the user knows what to undo first; a human edit is told
+/// apart.
+#[tokio::test]
+async fn undo_of_an_early_turn_names_the_later_turns_that_changed_its_files() {
+    let repo = build_repo();
+    let step = |id: &str, text: &str| {
+        tools_step(vec![bash(id, &format!("printf '{text}\\n' > tracked.txt"))])
+    };
+    let mock = MockProvider::new(vec![
+        step("b1", "one"),
+        text_step("1"),
+        step("b2", "two"),
+        text_step("2"),
+        tools_step(vec![bash("b3", "printf 'x\\n' > other.txt")]),
+        text_step("3"),
+        step("b4", "four"),
+        text_step("4"),
+    ]);
+    let mut run = start(repo.builder(config(), &mock));
+    for t in ["1", "2", "3", "4"] {
+        run.turn_with(t).await;
+    }
+    let answer = run.undo(Some(1), false).await;
+    let Event::Error { message, hint, .. } = &answer else {
+        panic!("{answer:?}")
+    };
+    assert!(message.contains("changed by later turns"), "{message}");
+    assert!(message.contains("tracked.txt"), "{message}");
+    // Turn 3 changed another file only.
+    assert_eq!(
+        hint.as_deref(),
+        Some("undo the later turns first, newest first (2, 4)")
+    );
+    assert_eq!(repo.read("tracked.txt").as_deref(), Some("four\n"));
+    // A file only a human changed after the turn: not a later turn's doing.
+    repo.write("other.txt", "human\n");
+    let answer = run.undo(Some(3), false).await;
+    run.stop().await;
+    let Event::Error { message, hint, .. } = &answer else {
+        panic!("{answer:?}")
+    };
+    assert!(message.contains("changed since the turn"), "{message}");
+    assert!(
+        hint.as_deref()
+            .unwrap_or("")
+            .contains("edited after the turn"),
+        "{hint:?}"
+    );
+    assert_eq!(repo.read("other.txt").as_deref(), Some("human\n"));
+}
+
+/// quality Q1: a session whose log another process holds (a running engine) is never
+/// deleted.
+#[tokio::test]
+async fn sessions_delete_refuses_a_session_whose_log_is_held() {
+    let repo = Repo::with(&[("a.txt", "a\n")]);
+    let mock = MockProvider::new(vec![text_step("done")]);
+    let mut run = start(repo.builder(config(), &mock));
+    run.turn_with("hi").await;
+    let (id, path) = run.engine.current_session();
+    run.stop().await;
+    let held = std::fs::File::open(&path).unwrap();
+    // SAFETY: flock on a descriptor this test owns.
+    assert_eq!(
+        unsafe { libc::flock(std::os::fd::AsRawFd::as_raw_fd(&held), libc::LOCK_EX) },
+        0
+    );
+    let sb = repo.sandbox();
+    let refused = sessions::delete(repo.home.path(), sb.as_ref(), &id).await;
+    assert!(
+        matches!(&refused, Err(sessions::DeleteError::Running(r)) if *r == id),
+        "{refused:?}"
+    );
+    assert!(path.exists());
+    assert!(
+        !repo
+            .refs(&format!("refs/tautly/checkpoints/{id}/"))
+            .is_empty()
+    );
+    drop(held);
+    sessions::delete(repo.home.path(), sb.as_ref(), &id)
+        .await
+        .unwrap();
+    assert!(!path.exists());
 }

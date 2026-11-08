@@ -787,3 +787,45 @@ fn real_git_worktrees_and_submodules_are_trusted() {
     assert_eq!(git_head(&sub).as_deref(), Some(head.as_str()));
     assert_ne!(paths::project_id(&sub), paths::project_hash(&sub));
 }
+
+/// quality Q1: a `.git` file naming a separate git directory counts only when that
+/// directory's plain `core.worktree` names this work tree back.
+#[test]
+fn a_separate_git_dir_must_name_the_work_tree_back_plainly() {
+    let t = tempfile::tempdir().unwrap();
+    let (wt, sep) = (t.path().join("wt"), t.path().join("sep"));
+    fs::create_dir_all(&wt).unwrap();
+    fs::create_dir_all(&sep).unwrap();
+    fs::write(sep.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+    fs::write(wt.join(".git"), "gitdir: ../sep\n").unwrap();
+    let dot_git = wt.join(".git");
+    let with = |value: &str| {
+        fs::write(
+            sep.join("config"),
+            format!("[core]\n\tworktree = {value}\n"),
+        )
+        .unwrap();
+        tautly_session::git_dirs_at(&dot_git)
+    };
+    for hostile in [
+        "\"../wt\"",
+        "../wt;x",
+        "../w\\t",
+        "../missing",
+        "../sep",
+        "",
+    ] {
+        assert!(with(hostile).is_none(), "{hostile:?}");
+    }
+    let dirs = with("../wt").expect("names the work tree back");
+    assert_eq!(dirs.git_dir, sep.canonicalize().unwrap());
+    assert_eq!(dirs.common_dir, dirs.git_dir);
+    // The key outside `[core]` is not git's `core.worktree`.
+    fs::write(sep.join("config"), "[other]\n\tworktree = ../wt\n").unwrap();
+    assert!(tautly_session::git_dirs_at(&dot_git).is_none());
+    // A symbolic link named `.git` never counts, even to a real git directory.
+    let linked = t.path().join("linked");
+    fs::create_dir_all(&linked).unwrap();
+    std::os::unix::fs::symlink(&sep, linked.join(".git")).unwrap();
+    assert!(tautly_session::git_dirs_at(&linked.join(".git")).is_none());
+}

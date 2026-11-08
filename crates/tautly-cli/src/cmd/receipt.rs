@@ -141,9 +141,22 @@ impl Priced {
     }
 }
 
-/// A Markdown table cell: a `|` would end it.
+/// A Markdown table cell: a `|` would end it. `\` first, so a trailing backslash cannot
+/// escape the cell's closing `|`.
 fn cell(text: &str) -> String {
-    text.replace('|', "\\|")
+    text.replace('\\', "\\\\").replace('|', "\\|")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::cell;
+
+    #[test]
+    fn cell_escapes_backslash_before_pipe() {
+        // A trailing `\` must not escape the cell's closing `|`.
+        assert_eq!(cell(r"a|b\"), r"a\|b\\");
+        assert_eq!(cell(r"x\|y"), r"x\\\|y");
+    }
 }
 
 /// The evidence of the session's last finished turn (none: it ran no tests), and how many

@@ -696,7 +696,7 @@ pub trait Tool: Send + Sync {
 
 /// The tools available for a model: the built-in ones in a fixed order, then `extra`
 /// (MCP tools). Requests list tools sorted by name, whatever this order.
-pub fn registry(_caps: &Capabilities, extra: Vec<Arc<dyn Tool>>) -> Vec<Arc<dyn Tool>> {
+pub fn registry(extra: Vec<Arc<dyn Tool>>) -> Vec<Arc<dyn Tool>> {
     let builtin: Vec<Arc<dyn Tool>> = vec![
         Arc::new(ReadTool),
         Arc::new(EditTool),

@@ -19,15 +19,17 @@ thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "fs", "io-util", "time", "sync"] }
 ignore = "0.4"
 url = "2"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+# rustls without a bundled crypto provider: `tautly_sandbox::http_client_builder` configures
+# rustls on `ring` with the webpki roots (no aws-lc, no platform verifier in use).
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }
 tempfile = "3"
 tree-sitter = "0.27"
 tree-sitter-bash = "0.25"
 globset = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-base64 = "0.22"
-toml = "0.8"
+base64 = "0.23"
+toml = "1"
 futures = "0.3"
 tokio-util = "0.7"
 rand = "0.9"
@@ -58,13 +60,11 @@ ulid = "1"
 keyring = { version = "3.6", default-features = false }
 insta = { version = "1", features = ["json"] }
 rmcp = { version = "3.8", default-features = false }
-toml_edit = "0.22"
+toml_edit = "0.25"
 http = "1"
 hyper = "1"
 hyper-util = "0.1"
 tower-service = "0.3"
-# The reqwest rmcp uses (0.13); the rest of the workspace is on 0.12.
-reqwest013 = { package = "reqwest", version = "0.13.2", default-features = false }
 rustls = { version = "0.23", default-features = false }
 webpki-roots = "1"
 # The `tautly` binary: argument parsing and errors (anyhow only in the tautly package, crates/tautly-cli).

@@ -787,7 +787,12 @@ fn rm_flags(words: &[String]) -> (BTreeSet<char>, Vec<String>, usize) {
     let mut other = Vec::new();
     let mut i = 0;
     while let Some(w) = words.get(i) {
-        if w == "--" || w == "-" || !w.starts_with('-') {
+        if w == "--" {
+            // End of options: `rm -rf -- /x` removes `/x` just as `rm -rf /x` does.
+            i += 1;
+            break;
+        }
+        if w == "-" || !w.starts_with('-') {
             break;
         }
         match rm_long(w) {

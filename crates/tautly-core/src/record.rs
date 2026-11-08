@@ -112,7 +112,6 @@ pub enum SessionRecord {
         path: RelPath,
         pre_image: Option<BlobRef>,
         post_image_blob: Option<BlobRef>,
-        #[serde(alias = "turn")]
         step: u32,
         /// Not a tool's change: a rewind's branch (outside git) asserting the content
         /// it continues from (`pre_image` and `post_image_blob` the same, spec 7.12).
@@ -223,8 +222,7 @@ pub enum SessionRecord {
         paths: Vec<RelPath>,
         /// What wrote it. One `tautly sessions restore-backup` wrote (what it replaced) is
         /// put back by a later `restore-backup` only when asked (`--include-own`, Task 49
-        /// M-R3b). Logs of the builds before this field (`restore_backup: bool`) read as
-        /// `restore_backup` or `unknown`.
+        /// M-R3b).
         #[serde(default)]
         by: RestoreBy,
     },
@@ -348,24 +346,22 @@ pub enum RestoreOutcome {
 }
 
 /// One file of a [`SessionRecord::RestoreBegun`]: its content before the restore wrote
-/// it (`from_*`) and what the restore wrote (`to*`), named as [`UndoneFile`]'s are. Logs of
-/// the builds before the rename (`blob`, `mode`, `wrote`, `wrote_mode`) still read.
+/// it (`from_*`) and what the restore wrote (`to*`), named as [`UndoneFile`]'s are.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BackupFile {
     pub path: RelPath,
     /// It existed (with `from_blob` none: it could not be kept, a link or over 64 MiB).
     pub existed: bool,
-    #[serde(alias = "blob")]
     pub from_blob: Option<BlobRef>,
-    #[serde(default, alias = "mode")]
+    #[serde(default)]
     pub from_mode: Option<u32>,
     /// What the restore wrote there (none: not known), so putting the backup back can
     /// tell a later human edit (Task 49 N10).
-    #[serde(default, alias = "wrote")]
+    #[serde(default)]
     pub to: Option<Wrote>,
     /// The permission bits the restore wrote there (none: not known), so a later
     /// mode-only change is told apart too (Task 49 M-R3c).
-    #[serde(default, alias = "wrote_mode")]
+    #[serde(default)]
     pub to_mode: Option<u32>,
 }
 
@@ -587,7 +583,7 @@ const UNIT_TYPES: &[&str] = &["pins_folded", "reasoning_stripped", "forked"];
 /// A line that is valid JSON reads as a record whatever its payload (spec 6.5.1): an unknown
 /// type reads as `Unknown`, a known one whose payload this version cannot read (a newer
 /// shape, a value it never writes) as `Unreadable` (a command's as `Command::Unknown`),
-/// never as a corrupt log. Payloads of the builds before the format freeze are upgraded first.
+/// never as a corrupt log.
 impl<'de> Deserialize<'de> for SessionRecord {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         let mut value = Value::deserialize(d)?;
@@ -614,35 +610,13 @@ impl<'de> Deserialize<'de> for SessionRecord {
     }
 }
 
-/// A payload in its in-memory form: fields written by builds before the format freeze in
-/// their frozen form, and a tool call input kept in a blob as [`BLOB_INPUT`].
+/// A payload in its in-memory form: a tool call input kept in a blob as [`BLOB_INPUT`].
 fn upgrade(ty: &str, data: &mut serde_json::Map<String, Value>) {
-    let flag = |data: &mut serde_json::Map<String, Value>, k: &str| {
-        data.remove(k).and_then(|v| v.as_bool()) == Some(true)
-    };
-    match ty {
-        // A tool call input kept in a blob: its in-memory form (`BLOB_INPUT`).
-        "provider" => {
-            if let Some(Value::Object(call)) = data.get_mut("tool_call")
-                && let Some(Value::String(blob)) = call.remove("input_blob")
-            {
-                call.insert("input_json".into(), format!("{BLOB_INPUT}{blob}").into());
-            }
-        }
-        "restore_begun" if !data.contains_key("by") => {
-            if flag(data, "restore_backup") {
-                data.insert("by".into(), "restore_backup".into());
-            }
-        }
-        "restore_ended" if !data.contains_key("outcome") && data.contains_key("applied") => {
-            let outcome = match (flag(data, "applied"), flag(data, "rolled_back")) {
-                (true, _) => "applied",
-                (false, true) => "rolled_back",
-                (false, false) => "failed",
-            };
-            data.insert("outcome".into(), outcome.into());
-        }
-        _ => {}
+    if ty == "provider"
+        && let Some(Value::Object(call)) = data.get_mut("tool_call")
+        && let Some(Value::String(blob)) = call.remove("input_blob")
+    {
+        call.insert("input_json".into(), format!("{BLOB_INPUT}{blob}").into());
     }
 }
 
@@ -831,21 +805,6 @@ mod tests {
     }
 
     #[test]
-    fn an_edit_written_with_turn_reads_as_its_step() {
-        let rec: SessionRecord = serde_json::from_str(
-            r#"{"type":"edit","data":{"path":"a.txt","pre_image":null,"post_image_blob":null,
-                "turn":4}}"#,
-        )
-        .unwrap();
-        assert!(
-            matches!(rec, SessionRecord::Edit { step: 4, .. }),
-            "{rec:?}"
-        );
-        let v = serde_json::to_value(&rec).unwrap();
-        assert_eq!(v["data"]["step"], 4);
-    }
-
-    #[test]
     fn records_round_trip_and_unknown_types_are_tolerated() {
         let recs = vec![
             SessionRecord::Command(Command::SendMessage {
@@ -994,30 +953,7 @@ mod tests {
     }
 
     #[test]
-    fn restore_records_of_the_builds_before_the_freeze_still_read() {
-        // M8: renamed fields and the bools that became enums.
-        let blob = "b".repeat(64);
-        let begun: SessionRecord = serde_json::from_str(&format!(
-            r#"{{"type":"restore_begun","data":{{"backup_ref":null,"files":[{{"path":"a",
-                "existed":true,"blob":"{blob}","mode":420,"wrote":"absent","wrote_mode":384}}],
-                "paths":["a"],"restore_backup":true}}}}"#
-        ))
-        .unwrap();
-        let SessionRecord::RestoreBegun { files, by, .. } = begun else {
-            panic!("{begun:?}")
-        };
-        assert_eq!(
-            files[0],
-            BackupFile {
-                path: rel("a"),
-                existed: true,
-                from_blob: Some(BlobRef::parse(&blob).unwrap()),
-                from_mode: Some(0o644),
-                to: Some(Wrote::Absent),
-                to_mode: Some(0o600),
-            }
-        );
-        assert_eq!(by, RestoreBy::RestoreBackup);
+    fn restore_records_without_their_enums_read_as_unknown() {
         let unmarked: SessionRecord = serde_json::from_str(
             r#"{"type":"restore_begun","data":{"backup_ref":"r","files":[],"paths":[]}}"#,
         )
@@ -1029,27 +965,14 @@ mod tests {
                 ..
             }
         ));
-        for (old, outcome) in [
-            (r#"{"applied":true}"#, RestoreOutcome::Applied),
-            (
-                r#"{"applied":true,"rolled_back":false}"#,
-                RestoreOutcome::Applied,
-            ),
-            (
-                r#"{"applied":false,"rolled_back":true}"#,
-                RestoreOutcome::RolledBack,
-            ),
-            (
-                r#"{"applied":false,"rolled_back":false}"#,
-                RestoreOutcome::Failed,
-            ),
-            (r#"{"applied":false}"#, RestoreOutcome::Failed),
-        ] {
-            let rec: SessionRecord =
-                serde_json::from_str(&format!(r#"{{"type":"restore_ended","data":{old}}}"#))
-                    .unwrap();
-            assert_eq!(rec, SessionRecord::RestoreEnded { outcome }, "{old}");
-        }
+        let ended: SessionRecord =
+            serde_json::from_str(r#"{"type":"restore_ended","data":{"applied":true}}"#).unwrap();
+        assert_eq!(
+            ended,
+            SessionRecord::RestoreEnded {
+                outcome: RestoreOutcome::Unknown
+            }
+        );
     }
 
     #[test]

@@ -14,7 +14,7 @@ use serde_json::json;
 use tautly_core::detect::{KeyVars, ModelChoice, OllamaProbe, resolve_model, setup_hint_with};
 use tautly_core::{
     Approval, AuthError, CliOverrides, Config, KEYCHAIN_SERVICE, LoadedConfig, ProviderEntry,
-    SecretStore, Workspaces, plan_servers, provider_label, session_root,
+    SecretStore, Workspaces, plan_servers, printable, provider_label, session_root,
 };
 
 use crate::local;
@@ -399,7 +399,7 @@ async fn network_check(cx: &DoctorCx<'_>, keyed: &[Keyed], active: Option<&str>)
             "no provider has a key to check",
         )];
     }
-    let client = match reqwest::Client::builder()
+    let client = match tautly_sandbox::http_client_builder()
         .timeout(NETWORK_TIMEOUT)
         .redirect(reqwest::redirect::Policy::none())
         .build()
@@ -689,18 +689,4 @@ async fn mcp_check(config: &Config, data_home: &Path, root: &Path) -> Vec<Check>
         checks.push(check("mcp", Level::Info, "no servers configured"));
     }
     checks
-}
-
-/// `text` with control characters escaped, so a repository's setting names cannot drive
-/// the terminal.
-fn printable(text: &str) -> String {
-    text.chars()
-        .map(|c| {
-            if c.is_control() {
-                c.escape_default().to_string()
-            } else {
-                c.to_string()
-            }
-        })
-        .collect()
 }

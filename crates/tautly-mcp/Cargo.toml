@@ -5,6 +5,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+publish = false
 
 [dependencies]
 tautly-tools = { path = "../tautly-tools" }
@@ -18,11 +19,8 @@ rmcp = { workspace = true, features = [
     "transport-streamable-http-client-reqwest",
     "reqwest-tls-no-provider",
 ] }
-reqwest013 = { workspace = true, features = ["rustls-no-provider"] }
-rustls = { workspace = true, features = ["ring", "std", "tls12"] }
-webpki-roots.workspace = true
+reqwest.workspace = true
 async-trait.workspace = true
-thiserror.workspace = true
 tokio = { workspace = true, features = ["net"] }
 tokio-util.workspace = true
 futures.workspace = true

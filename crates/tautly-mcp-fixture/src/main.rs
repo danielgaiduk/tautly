@@ -1,13 +1,16 @@
 //! A test MCP server for the `tautly-mcp` and `tautly-core` tests.
 //!
-//! `echo_server [stdio|http|legacy|hang] [URL_FILE]`:
+//! `echo_server [stdio|http|legacy|ask|hang|die] [URL_FILE]`:
 //! - `stdio` (default): an `rmcp` server on stdin/stdout.
 //! - `http`: an `rmcp` streamable-HTTP server on 127.0.0.1 (a free port); the endpoint URL
 //!   is written to `URL_FILE`.
 //! - `legacy`: a hand-written server that knows only the `initialize` handshake of
 //!   2025-06-18 and answers `server/discover` with "method not found", like servers built
 //!   before 2026-07-28.
+//! - `ask`: `legacy`, which also asks the client for `roots/list` and `elicitation/create`
+//!   once initialized, and appends each answer (one JSON line) to the file `ECHO_REPLIES`.
 //! - `hang`: writes the pid file, then never answers (a server stuck in its handshake).
+//! - `die`: writes the pid file, then exits (status 3) before answering `initialize`.
 //!
 //! Tools: `echo {text}`, `env` (its environment, `NAME=VALUE` per line), `slow {ms}`,
 //! `mixed` (text, image, resource link), `structured` (only `structuredContent`), `big
@@ -340,15 +343,43 @@ async fn serve_http(url_file: &str) {
 }
 
 /// A server from before `server/discover`: line-delimited JSON-RPC, `initialize` only.
-async fn serve_legacy() {
+async fn serve_legacy(ask: bool) {
     let state = State::default();
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
     let mut out = tokio::io::stdout();
+    let replies = std::env::var_os("ECHO_REPLIES");
     while let Ok(Some(line)) = lines.next_line().await {
         let Ok(msg) = serde_json::from_str::<Value>(&line) else {
             continue;
         };
+        if msg.get("method").is_none() {
+            // The client's answer to one of `ask`'s requests.
+            if let Some(path) = &replies {
+                let mut f = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path)
+                    .expect("open ECHO_REPLIES");
+                writeln!(f, "{line}").expect("write ECHO_REPLIES");
+            }
+            continue;
+        }
         let Some(id) = msg.get("id").cloned() else {
+            if ask && msg["method"] == "notifications/initialized" {
+                for (id, method) in [("r1", "roots/list"), ("r2", "elicitation/create")] {
+                    let params = if method == "roots/list" {
+                        json!({})
+                    } else {
+                        json!({"message": "your password?", "requestedSchema": {"type": "object", "properties": {}}})
+                    };
+                    let req =
+                        json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
+                    let mut bytes = serde_json::to_vec(&req).expect("json");
+                    bytes.push(b'\n');
+                    let _ = out.write_all(&bytes).await;
+                    let _ = out.flush().await;
+                }
+            }
             continue; // a notification
         };
         let method = msg["method"].as_str().unwrap_or("");
@@ -411,8 +442,10 @@ async fn main() {
     write_pids();
     match args.get(1).map(String::as_str) {
         Some("http") => serve_http(args.get(2).expect("URL_FILE")).await,
-        Some("legacy") => serve_legacy().await,
+        Some("legacy") => serve_legacy(false).await,
+        Some("ask") => serve_legacy(true).await,
         Some("hang") => std::future::pending::<()>().await,
+        Some("die") => std::process::exit(3),
         _ => serve_stdio().await,
     }
 }

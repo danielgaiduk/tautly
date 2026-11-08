@@ -128,6 +128,10 @@ impl Env {
     pub fn stop_watcher(&mut self) {
         self.watch = None;
     }
+    /// Start a new file watcher; it sees changes from now on only.
+    pub fn start_watcher(&mut self) {
+        self.watch = Some(Arc::clone(&self.index).start_watcher().unwrap());
+    }
     /// A context without the index, over the same directory.
     pub fn cx_without_index(&self) -> ToolCx {
         ToolCx::new(EditFormat::StrReplace, self.dir.path().join(".spill")).with_turn(1)

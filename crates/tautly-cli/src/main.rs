@@ -42,8 +42,8 @@ use tautly_core::detect::{
 };
 use tautly_core::{
     BudgetScope, CliOverrides, Command, Config, EditFormat, Engine, EngineBuilder, Event,
-    LoadedConfig, Mode, ModelId, Origin, ProviderSetupError, Workspaces, hold_signal_router,
-    install_signal_handlers, install_termination_handlers, provider_for_with,
+    LoadedConfig, Mode, ModelId, Origin, ProviderSetupError, ReasoningLevel, Workspaces,
+    hold_signal_router, install_signal_handlers, install_termination_handlers, provider_for_with,
 };
 use tautly_rpc::{EngineFactory, OutputFormat, Server, run_oneshot};
 use tokio::io::BufReader;
@@ -93,6 +93,11 @@ struct Cli {
     /// compat:<name>).
     #[arg(long, value_name = "ID")]
     model: Option<String>,
+
+    /// How hard the model thinks: auto (medium for models that can reason), off, low,
+    /// medium or high.
+    #[arg(long, value_name = "LEVEL", value_parser = str::parse::<ReasoningLevel>)]
+    reasoning: Option<ReasoningLevel>,
 
     /// Stop the session once it has cost this many US dollars.
     #[arg(long, value_name = "USD", value_parser = parse_usd)]
@@ -227,6 +232,7 @@ impl Cli {
     fn overrides(&self) -> CliOverrides {
         CliOverrides {
             model: self.model.as_deref().map(ModelId::from),
+            reasoning: self.reasoning,
             mode: self.approve.map(|a| match a {
                 Approve::AutoEdit => Mode::AutoEdit,
                 Approve::Yolo => Mode::Yolo,
@@ -745,8 +751,12 @@ mod tests {
             "1.5",
             "--no-checkpoints",
             "--approve-mcp",
+            "--reasoning",
+            "high",
         ]);
         let o = cli.overrides();
+        assert_eq!(o.reasoning, Some(tautly_core::ReasoningLevel::High));
+        assert!(Cli::try_parse_from(["tautly", "--reasoning", "max"]).is_err());
         assert_eq!(o.mode, Some(Mode::AutoEdit));
         assert_eq!(o.approve_memory, Some(true));
         assert_eq!(o.model, Some(ModelId::from("openai/gpt-5")));
@@ -765,6 +775,7 @@ mod tests {
         assert_eq!(plain.mode, None);
         assert_eq!(plain.approve_memory, None);
         assert_eq!(plain.checkpoints, None);
+        assert_eq!(plain.reasoning, None);
         assert!(
             Cli::parse_from(["tautly", "--rpc"])
                 .start_commands()
