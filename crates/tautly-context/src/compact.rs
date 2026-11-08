@@ -61,6 +61,11 @@ pub struct CompactionRecord {
     /// [`Context::results`]), in first-seen order. Turns an earlier compaction removed are
     /// not listed again.
     pub forgotten_paths: Vec<PathBuf>,
+    /// The removed turns' entries of [`Context::results`], taken out with them (the list
+    /// would otherwise grow for the whole session, Task 33 review I3) and put back by
+    /// [`Context::uncompact`]. Not logged: a resume rebuilds them by replaying the log.
+    #[serde(skip)]
+    pub removed_results: Vec<crate::gc::ResultMeta>,
 }
 
 /// Why [`Context::apply_compaction`] did nothing.
@@ -206,17 +211,21 @@ impl Context {
         // Largest cut up to the wanted one that is valid and whose transcript fits. The cost
         // of a turn is the sum of its chunks' estimates, which never undercounts the joined
         // text.
-        let mut cut = self.history.len().saturating_sub(keep_recent);
+        let cut = self.history.len().saturating_sub(keep_recent);
         let chunks: Vec<String> = self.history[..cut].iter().map(render_turn).collect();
         let costs: Vec<u32> = chunks.iter().map(|c| est.estimate(c)).collect();
-        let removed = loop {
-            cut = self.settle(cut);
-            let cost = costs[..cut].iter().fold(0u32, |a, c| a.saturating_add(*c));
-            if cut == 0 || cost <= budget {
-                break cut;
-            }
-            cut -= 1;
-        };
+        // The longest prefix that fits, then the largest valid cut within it: settling only
+        // moves a cut down, so it still fits. (Settling at each cut down from the wanted one
+        // was quadratic in the history; perf gate `context`.)
+        let mut total = 0u32;
+        let fits = costs
+            .iter()
+            .take_while(|c| {
+                total = total.saturating_add(**c);
+                total <= budget
+            })
+            .count();
+        let removed = self.settle(fits);
 
         let mut transcript = String::from(OPEN);
         for chunk in &chunks[..removed] {
@@ -324,6 +333,10 @@ impl Context {
             }
         }
         let removed_turns: Vec<Turn> = self.history.splice(..removed, [replacement]).collect();
+        let (removed_results, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut self.results)
+            .into_iter()
+            .partition(|r| r.turn <= last_removed_turn);
+        self.results = kept;
         // The summary stands in the slot of the last turn it replaced.
         self.first_turn = last_removed_turn;
         CompactionRecord {
@@ -332,6 +345,7 @@ impl Context {
             first_removed_turn,
             last_removed_turn,
             forgotten_paths,
+            removed_results,
         }
     }
 
@@ -361,6 +375,8 @@ impl Context {
             return Err(UncompactError::TooLarge { needed, budget });
         }
         self.history.splice(..1, rec.removed_turns.iter().cloned());
+        self.results
+            .splice(..0, rec.removed_results.iter().cloned());
         self.first_turn = rec.first_removed_turn;
         Ok(())
     }

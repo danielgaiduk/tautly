@@ -5,6 +5,9 @@ use async_trait::async_trait;
 use tokio::process::Child;
 use url::Url;
 
+/// Where [`Sandbox::spill_stream`] output goes.
+pub type SpillWriter = Box<dyn tokio::io::AsyncWrite + Send + Unpin>;
+
 /// The side-effect class of a tool invocation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Effect {
@@ -81,6 +84,13 @@ pub trait Sandbox: Send + Sync {
     /// Persist `bytes` (e.g. over-long tool output) in a sandbox-managed scratch area and
     /// return its root-relative path, so the model can `read` it later. Content-addressed.
     async fn spill(&self, bytes: &[u8]) -> Result<PathBuf, SandboxError>;
+    /// Start a spill file in the same scratch area for output too large to hold in memory:
+    /// its root-relative path and the new file, written as the output arrives (named
+    /// uniquely, not by content). `None` when this sandbox offers no such file; the caller
+    /// then keeps the output in memory and uses [`Sandbox::spill`].
+    async fn spill_stream(&self) -> Result<Option<(PathBuf, SpillWriter)>, SandboxError> {
+        Ok(None)
+    }
     async fn spawn(&self, spec: SpawnSpec) -> Result<Child, SandboxError>;
     /// Like [`Sandbox::spawn`], with the child's stdin piped as well: for a process that
     /// speaks a protocol over stdin and stdout (an MCP stdio server). A sandbox that cannot

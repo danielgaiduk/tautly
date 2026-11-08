@@ -11,37 +11,80 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --workspace
-      # The `tautly` binary end to end on a scripted provider (`--mock-script`).
-      - run: cargo test -p tautly --features mock
+      # One run, with the `tautly` binary's scripted provider (`--mock-script`) on, so its
+      # end-to-end tests run too without building the workspace a second time.
+      - run: cargo test --workspace --features tautly/mock
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo clippy -p tautly --all-targets --features mock -- -D warnings
 
-  # Performance gates (spec 9.1). The token regression gate replays the scripted starter
-  # sessions (evals/replay, mock provider, deterministic) and fails when tokens per solved
-  # task exceed evals/baseline.json by more than 10%. The benchmark kit's report generator
-  # runs on its committed fixture; live benchmark runs (benchmarks/tokens/run.sh) are manual.
+  # Performance gates (spec 9.1), release build on both OSes: cold start and idle
+  # RSS (benches/perf/startup.sh, relative to the merge-base's binary), then the in-process
+  # gates in benches/perf/ (crate tautly-perf, all `#[ignore]`, one at a time so timings and
+  # RSS are not shared). Each measurement is also written to the job summary. Then the token
+  # regression gate on the same release binary: the scripted starter sessions
+  # (evals/replay, mock provider, no scripted usage, so the engine's own request estimates
+  # count) must all pass and stay within 10% of evals/baseline.json in tokens per solved
+  # task. On Linux, the benchmark kit's report generator runs on its committed fixture and
+  # its script is syntax-checked; live benchmark runs (benchmarks/tokens/run.sh) are manual.
   perf:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo build -p tautly --features mock
-      - run: ./target/debug/tautly eval --replay evals/replay
-      - run: ./target/debug/tautly eval report benchmarks/tokens/fixtures/sample.json --markdown
-      - run: bash -n benchmarks/tokens/run.sh
+      - name: Install hyperfine
+        run: |
+          if [ "$RUNNER_OS" = macOS ]; then brew install hyperfine
+          else sudo apt-get update && sudo apt-get install -y hyperfine; fi
+      - name: Merge base
+        id: base
+        run: echo "sha=$(git merge-base HEAD origin/${{ github.base_ref || 'main' }})" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@v4
+        id: baseline
+        with:
+          path: baseline/tautly
+          key: tautly-baseline-${{ runner.os }}-${{ steps.base.outputs.sha }}
+      - name: Build the merge-base binary
+        if: steps.baseline.outputs.cache-hit != 'true'
+        run: |
+          git worktree add ../base "${{ steps.base.outputs.sha }}"
+          if (cd ../base && cargo build --release -p tautly --features mock); then
+            mkdir -p baseline && cp ../base/target/release/tautly baseline/tautly
+          else
+            echo "::warning::the merge-base binary did not build; the relative start-up gate is skipped"
+          fi
+      # One feature selection for the build and the gates, so nothing is built twice.
+      - run: cargo test --release -p tautly -p tautly-perf --features tautly/mock --no-run
+      - run: bash benches/perf/startup.sh
+        env:
+          TAUTLY_BASELINE_BIN: baseline/tautly
+      - run: cargo test --release -p tautly -p tautly-perf --features tautly/mock -- --ignored --test-threads=1 --nocapture
+      # Built by the test build above (the binary the integration tests run).
+      - run: ./target/release/tautly eval --replay evals/replay --jobs 4
+      - if: runner.os == 'Linux'
+        run: ./target/release/tautly eval report benchmarks/tokens/fixtures/sample.json --markdown
+      - if: runner.os == 'Linux'
+        run: bash -n benchmarks/tokens/run.sh
 
   # Every starter task must fail before it is solved, with all four toolchains present
   # (a missing `go` or an old Node would make a task fail for the wrong reason).
   eval-tasks:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -76,6 +119,7 @@ jobs:
   # really exercise config-based hooks somewhere.
   config-hooks:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -90,6 +134,7 @@ jobs:
   # sha256 checksums, binstall names, release.yml in sync with dist-workspace.toml.
   dist-plan:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -103,6 +148,7 @@ jobs:
   # target is first built by the release workflow.
   musl-static:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

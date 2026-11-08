@@ -137,7 +137,7 @@ impl Fx {
     pub async fn ready_workspace(&self) -> Arc<Workspace> {
         let ws = self.workspaces.get(&self.root()).unwrap();
         ws.start();
-        assert!(ws.wait_ready(WAIT).await, "index never became ready");
+        assert!(ws.wait_ready_or_failed().await, "index never became ready");
         for _ in 0..1000 {
             if ws.memory().is_some() {
                 return ws;

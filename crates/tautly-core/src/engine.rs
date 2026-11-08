@@ -82,6 +82,31 @@ const LEASE_WAIT: Duration = Duration::from_secs(30);
 /// Longest a shutdown waits for the cost ledger to write the rows queued for it.
 const LEDGER_FLUSH: Duration = Duration::from_secs(1);
 
+/// Session actors of this process that have not finished (their shutdown included).
+static SESSIONS_RUNNING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Counts one session actor in [`SESSIONS_RUNNING`] while it lives.
+struct SessionRunning;
+
+impl SessionRunning {
+    fn new() -> SessionRunning {
+        SESSIONS_RUNNING.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        SessionRunning
+    }
+}
+
+impl Drop for SessionRunning {
+    fn drop(&mut self) {
+        SESSIONS_RUNNING.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// Whether a session of this process is still running or shutting down: a client about
+/// to exit gives it a moment to finish, and otherwise need not wait for anything.
+pub fn sessions_running() -> bool {
+    SESSIONS_RUNNING.load(std::sync::atomic::Ordering::SeqCst) > 0
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum EngineError {
     #[error("the engine has stopped")]
@@ -162,6 +187,10 @@ pub struct EngineBuilder {
     /// Who started a new session (its header's `origin`); `tautly eval` runs mark theirs
     /// `eval`, with the header tag `eval`. Default `user`.
     pub origin: Origin,
+    /// How long the first request waits for the repo map and memory index, built in the
+    /// background at start, before it goes without them. Default 300 ms; tests that check
+    /// what the first request carries wait longer, so a loaded machine cannot change it.
+    pub startup_wait: Duration,
 }
 
 impl EngineBuilder {
@@ -184,6 +213,7 @@ impl EngineBuilder {
             secret_store: None,
             lease_wait: LEASE_WAIT,
             origin: Origin::User,
+            startup_wait: crate::session::STARTUP_WAIT,
         }
     }
 
@@ -367,6 +397,7 @@ impl EngineBuilder {
             max_turns: config.max_turns,
             compaction_threshold: config.compaction_threshold,
             startup: None,
+            startup_wait: self.startup_wait,
             latest_compaction: None,
             pending_memory_index: None,
             memory: MemoryState::new(MemoryMode::new(config.approve_memory, self.interactive)),
@@ -408,7 +439,8 @@ impl EngineBuilder {
             groups: groups.clone(),
             cost_ledger: Arc::clone(&session.cost_ledger),
         };
-        runtime.spawn(actor.run(
+        let running = SessionRunning::new();
+        let run = actor.run(
             session,
             command_rx,
             Start {
@@ -419,7 +451,11 @@ impl EngineBuilder {
                 lease_pending,
                 lease_wait: self.lease_wait,
             },
-        ));
+        );
+        runtime.spawn(async move {
+            let _running = running;
+            run.await
+        });
         Ok((
             Engine {
                 commands: command_tx,
@@ -1003,7 +1039,9 @@ impl Actor {
         if let Some(s) = state.as_mut() {
             s.end_episode().await;
         }
-        self.with_log(|l| l.checkpoint()).await;
+        // Closed, not just synced: the lock goes now, before the event stream ends, so a
+        // client that resumes the session as soon as it closed finds it free (review M6).
+        self.with_log(|l| l.close()).await;
         // The episode's usage included: a client that exits once the event stream closes
         // loses no row, unless the ledger is stuck. (Also after a crashed job lost the
         // session: the actor keeps the ledger's handle.)

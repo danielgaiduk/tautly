@@ -96,12 +96,22 @@ async fn oneshot_json_golden() {
     let evs = events(&out);
     assert_eq!(evs.first().unwrap()["type"], "session_changed");
     assert!(evs.iter().any(|e| e["type"] == "turn_finished"));
-    // Should the repo map not be ready for the first request (a warning says so), that
-    // is left out of the comparison.
+    // Warnings from the session's start-up tasks are left out: they run beside the turn,
+    // so whether they come (the repo map not ready for the first request, a staleness
+    // check that hit a busy index, a watcher that did not start) and where they land in
+    // the stream depend on the machine's load.
     let all = normalized(&out, &fx);
+    let startup = [
+        "repo map",
+        "memory index",
+        "memory staleness",
+        "code index",
+        "file watcher",
+        "project memory",
+    ];
     let stable: Vec<&str> = all
         .lines()
-        .filter(|l| !l.contains("repo map") && !l.contains("memory index"))
+        .filter(|l| !(l.contains(r#""type":"warning""#) && startup.iter().any(|s| l.contains(s))))
         .collect();
     insta::assert_snapshot!("oneshot_json", stable.join("\n"));
 }

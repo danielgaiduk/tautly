@@ -1,8 +1,6 @@
 //! The advisory lock on a work tree's index database (Task 31): an open workspace holds it
 //! shared, `tautly index rebuild` takes it exclusively before deleting the database.
 
-use std::time::Duration;
-
 use tautly_core::{IndexLockError, Workspaces};
 use tempfile::TempDir;
 
@@ -17,7 +15,7 @@ async fn an_open_workspace_blocks_the_exclusive_lock_until_it_is_dropped() {
     drop(ws.try_lock_index_exclusive().expect("free"));
 
     ws.start();
-    assert!(ws.wait_ready(Duration::from_secs(60)).await);
+    assert!(ws.wait_ready_or_failed().await);
     assert!(matches!(
         ws.try_lock_index_exclusive(),
         Err(IndexLockError::Busy)

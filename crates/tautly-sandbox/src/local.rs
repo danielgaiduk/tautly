@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use tokio::process::{Child, Command};
 use url::Url;
 
-use crate::effect::{FileMeta, HttpResponse, Sandbox, SandboxError, SpawnSpec};
+use crate::effect::{FileMeta, HttpResponse, Sandbox, SandboxError, SpawnSpec, SpillWriter};
 use crate::protected::{self, Resolved, is_protected};
 use crate::spill::SPILL_DIR;
 use crate::walk;
@@ -319,6 +319,35 @@ impl Sandbox for LocalSandbox {
         .await
         .map_err(|e| SandboxError::Io(std::io::Error::other(e)))??;
         Ok(rel)
+    }
+
+    async fn spill_stream(&self) -> Result<Option<(PathBuf, SpillWriter)>, SandboxError> {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let name = format!(
+            "stream-{}-{nanos}-{}.txt",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        );
+        let rel = Path::new(SPILL_DIR).join(name);
+        let path = self.resolve(&rel)?;
+        self.guard_protected_target(&rel, &path)?;
+        self.ensure_spill_ignore().await?;
+        if !self.spill_ready.load(Ordering::Acquire)
+            || !tokio::fs::try_exists(path.parent().unwrap_or(&self.root)).await?
+        {
+            self.prepare_spill_dir().await?;
+        }
+        // A new file only: never one a link or an earlier run left at that name.
+        let file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&path)
+            .await?;
+        Ok(Some((rel, Box::new(file))))
     }
 
     async fn spawn(&self, spec: SpawnSpec) -> Result<Child, SandboxError> {

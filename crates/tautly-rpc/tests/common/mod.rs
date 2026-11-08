@@ -137,7 +137,7 @@ impl Fx {
         let sb: Arc<dyn Sandbox> = Arc::new(LocalSandbox::new(self.root()).unwrap());
         let ws = Workspace::new(sb, self.home.path());
         ws.start();
-        assert!(ws.wait_ready(WAIT).await, "index never became ready");
+        assert!(ws.wait_ready_or_failed().await, "index never became ready");
         let deadline = tokio::time::Instant::now() + WAIT;
         while ws.memory().is_none() {
             assert!(

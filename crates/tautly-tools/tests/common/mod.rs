@@ -128,7 +128,6 @@ impl Env {
     pub fn stop_watcher(&mut self) {
         self.watch = None;
     }
-
     /// A context without the index, over the same directory.
     pub fn cx_without_index(&self) -> ToolCx {
         ToolCx::new(EditFormat::StrReplace, self.dir.path().join(".spill")).with_turn(1)

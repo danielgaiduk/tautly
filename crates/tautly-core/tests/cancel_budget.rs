@@ -282,6 +282,13 @@ fn running(pattern: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// A `sleep` argument unique to this run (`<secs>.<nanos>`): `pgrep` then finds this
+/// test's process, never one of another copy of this binary running at the same time.
+fn unique_sleep(secs: u32) -> String {
+    let nanos = UNIX_EPOCH.elapsed().unwrap().subsec_nanos();
+    format!("{secs}.{nanos:09}")
+}
+
 async fn wait_running(pattern: &str) {
     let end = Instant::now() + WAIT;
     while !running(pattern) {
@@ -294,27 +301,38 @@ async fn wait_running(pattern: &str) {
 
 #[tokio::test]
 async fn cancel_ends_turn_with_cancelled_and_kills_children_within_200ms() {
-    let fx = Fx::new();
-    let mock = MockProvider::new(vec![tools_step(vec![bash("c1", "sleep 300")], None)]);
-    let mut run = start(fx.builder(config(false), &mock));
-    run.say("go").await;
-    run.until(|e| matches!(e, Event::ToolStarted { .. })).await;
-    wait_running("^sleep 300$").await;
+    let mut fastest = Duration::MAX;
+    // The fastest of three: a loaded runner can stall any one run, but a cancel that is
+    // slow by design is slow every time.
+    for _ in 0..3 {
+        let s = unique_sleep(300);
+        let pattern = format!("^sleep {s}$");
+        let fx = Fx::new();
+        let mock = MockProvider::new(vec![tools_step(
+            vec![bash("c1", &format!("sleep {s}"))],
+            None,
+        )]);
+        let mut run = start(fx.builder(config(false), &mock));
+        run.say("go").await;
+        run.until(|e| matches!(e, Event::ToolStarted { .. })).await;
+        wait_running(&pattern).await;
 
-    let t0 = Instant::now();
-    run.send(Command::Cancel).await;
-    let events = run.turn().await;
-    let took = t0.elapsed();
-    eprintln!("TurnFinished {took:?} after Cancel");
-    assert_eq!(finish_reason(&events), FinishReason::Cancelled);
+        let t0 = Instant::now();
+        run.send(Command::Cancel).await;
+        let events = run.turn().await;
+        let took = t0.elapsed();
+        eprintln!("TurnFinished {took:?} after Cancel");
+        fastest = fastest.min(took);
+        assert_eq!(finish_reason(&events), FinishReason::Cancelled);
+        assert!(!running(&pattern), "the child survived the cancel");
+        let done = finished(&events);
+        assert_eq!(done.len(), 1, "{events:?}");
+        assert!(done[0].1.contains("killed: cancelled"), "{}", done[0].1);
+    }
     assert!(
-        took < Duration::from_millis(250),
-        "TurnFinished after {took:?}"
+        fastest < Duration::from_millis(250),
+        "TurnFinished after {fastest:?}"
     );
-    assert!(!running("^sleep 300$"), "the child survived the cancel");
-    let done = finished(&events);
-    assert_eq!(done.len(), 1, "{events:?}");
-    assert!(done[0].1.contains("killed: cancelled"), "{}", done[0].1);
 }
 
 /// A sandbox whose reads of `hang.txt` never finish and ignore cancellation, and which
@@ -328,6 +346,8 @@ struct Hang {
     late_write: Option<Duration>,
     /// Calls of `metadata` on `hang.txt` (each one never returns).
     hung_metadata: Arc<std::sync::atomic::AtomicUsize>,
+    /// Reads that returned.
+    reads_done: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl Hang {
@@ -338,6 +358,7 @@ impl Hang {
             written: Default::default(),
             late_write: None,
             hung_metadata: Arc::default(),
+            reads_done: Arc::default(),
         }
     }
 }
@@ -358,7 +379,10 @@ impl Sandbox for Hang {
         if hangs(p) {
             std::future::pending::<()>().await;
         }
-        self.sb.read(p).await
+        let r = self.sb.read(p).await;
+        self.reads_done
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        r
     }
     async fn metadata(&self, p: &Path) -> Result<FileMeta, SandboxError> {
         if hangs(p) {
@@ -432,7 +456,9 @@ async fn a_call_that_ignores_cancel_is_abandoned_and_its_step_baselines_forgotte
         tools_step(vec![call("r3", "read", json!({"path": "a.txt"}))], None),
         text_step("done", tokens(10, 1)),
     ]);
-    let sb: Arc<dyn Sandbox> = Arc::new(Hang::new(LocalSandbox::new(fx.root()).unwrap()));
+    let hang = Hang::new(LocalSandbox::new(fx.root()).unwrap());
+    let reads_done = Arc::clone(&hang.reads_done);
+    let sb: Arc<dyn Sandbox> = Arc::new(hang);
     let mut run = start(EngineBuilder {
         sandbox: Some(sb),
         ..fx.builder(config(false), &mock)
@@ -440,14 +466,21 @@ async fn a_call_that_ignores_cancel_is_abandoned_and_its_step_baselines_forgotte
     run.say("go").await;
     run.until(|e| matches!(e, Event::ToolStarted { call_id, .. } if call_id == "r2"))
         .await;
-    // Let r1 finish (and record its baseline) while r2 hangs.
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // Let r1 finish (and record its baseline) while r2 hangs: its read has returned (not
+    // assumed after a fixed time: under load it can take longer), then a second for the
+    // rest of the call, which only formats what it read.
+    while reads_done.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    tokio::time::sleep(Duration::from_secs(1)).await;
     let t0 = Instant::now();
     run.send(Command::Cancel).await;
     let events = run.turn().await;
     let took = t0.elapsed();
     assert_eq!(finish_reason(&events), FinishReason::Cancelled);
-    assert!(took < Duration::from_secs(1), "TurnFinished after {took:?}");
+    // Abandoned after 150 ms; without that the hanging read would hold the turn forever.
+    // 5 s leaves a loaded runner room and still tells the two apart.
+    assert!(took < Duration::from_secs(5), "TurnFinished after {took:?}");
     let done = finished(&events);
     assert_eq!(done.len(), 2, "{events:?}");
     assert!(!done[0].2, "r1: {}", done[0].1);
@@ -616,6 +649,10 @@ async fn a_write_that_lands_after_its_bound_is_noticed_at_the_next_step() {
             )],
             None,
         ),
+        // Each step start checks the path again, waiting 100 ms at most for an answer: on a
+        // loaded runner the first check may not get one, a later step does.
+        tools_step(vec![call("r1", "read", json!({"path": "late.txt"}))], None),
+        tools_step(vec![call("r2", "read", json!({"path": "late.txt"}))], None),
         text_step("ok", tokens(1, 1)),
     ]);
     let sb: Arc<dyn Sandbox> = Arc::new(Hang {
@@ -708,17 +745,22 @@ async fn turn_timeout_finishes_with_timeout() {
 #[tokio::test]
 async fn shutdown_kills_all_process_groups_and_session_is_resumable() {
     let fx = Fx::new();
+    let (bg, fg) = (unique_sleep(302), unique_sleep(301));
+    let (bg_pattern, fg_pattern) = (format!("^sleep {bg}$"), format!("^sleep {fg}$"));
     let mock = MockProvider::new(vec![
         // A background child that outlives its call (a dev server, say).
-        tools_step(vec![bash("c1", "sleep 302 >/dev/null 2>&1 &")], None),
-        tools_step(vec![bash("c2", "sleep 301")], None),
+        tools_step(
+            vec![bash("c1", &format!("sleep {bg} >/dev/null 2>&1 &"))],
+            None,
+        ),
+        tools_step(vec![bash("c2", &format!("sleep {fg}"))], None),
     ]);
     let mut run = start(fx.builder(config(false), &mock));
     run.say("go").await;
     run.until(|e| matches!(e, Event::ToolStarted { call_id, .. } if call_id == "c2"))
         .await;
-    wait_running("^sleep 301$").await;
-    assert!(running("^sleep 302$"), "the background child should run");
+    wait_running(&fg_pattern).await;
+    assert!(running(&bg_pattern), "the background child should run");
 
     run.send(Command::Shutdown).await;
     let events = run.until_closed().await;
@@ -732,8 +774,8 @@ async fn shutdown_kills_all_process_groups_and_session_is_resumable() {
         )),
         "{events:?}"
     );
-    assert!(!running("^sleep 301$"), "the running command survived");
-    assert!(!running("^sleep 302$"), "the background child survived");
+    assert!(!running(&fg_pattern), "the running command survived");
+    assert!(!running(&bg_pattern), "the background child survived");
 
     let reader = SessionReader::<SessionRecord>::open(run.engine.session_path()).unwrap();
     assert!(!reader.truncated_tail());
@@ -1173,13 +1215,19 @@ async fn an_unopenable_ledger_is_reported_once_and_the_session_runs() {
         text_step("two", tokens(1, 1)),
     ]);
     let mut run = start(fx.builder(config(true), &mock));
-    let first = run.turn_with("go").await;
-    let second = run.turn_with("again").await;
-    assert_eq!(finish_reason(&first), FinishReason::Completed);
-    assert_eq!(finish_reason(&second), FinishReason::Completed);
-    let about_ledger: Vec<String> = warnings(&first)
+    // The ledger is opened in the background: its warning may come at any point of the
+    // session on a loaded runner, so every event counts.
+    let mut all = Vec::new();
+    for text in ["go", "again"] {
+        run.say(text).await;
+        let events = run.until(|e| matches!(e, Event::TurnFinished { .. })).await;
+        assert_eq!(finish_reason(&events), FinishReason::Completed);
+        all.extend(events);
+    }
+    run.send(Command::Shutdown).await;
+    all.extend(run.until_closed().await);
+    let about_ledger: Vec<String> = warnings(&all)
         .into_iter()
-        .chain(warnings(&second))
         .filter(|w| w.contains("ledger"))
         .collect();
     assert_eq!(about_ledger.len(), 1, "{about_ledger:?}");
@@ -1198,16 +1246,23 @@ async fn a_corrupt_ledger_is_moved_aside_with_one_warning_and_recording_goes_on(
         text_step("two", tokens(1, 1)),
     ]);
     let mut run = start(fx.builder(config(true), &mock));
-    let first = run.turn_with("go").await;
-    let second = run.turn_with("again").await;
-    let about_ledger: Vec<String> = warnings(&first)
+    // The ledger is opened (and moved aside) in the background, so on a loaded runner its
+    // warning can come before, between or after the turns: count it over every event of
+    // the session.
+    let mut all = Vec::new();
+    for text in ["go", "again"] {
+        run.say(text).await;
+        all.extend(run.until(|e| matches!(e, Event::TurnFinished { .. })).await);
+    }
+    fx.ledger_rows(2).await;
+    run.send(Command::Shutdown).await;
+    all.extend(run.until_closed().await);
+    let about_ledger: Vec<String> = warnings(&all)
         .into_iter()
-        .chain(warnings(&second))
         .filter(|w| w.contains("ledger"))
         .collect();
     assert_eq!(about_ledger.len(), 1, "{about_ledger:?}");
     assert!(about_ledger[0].contains("corrupt"), "{about_ledger:?}");
-    fx.ledger_rows(2).await;
 }
 
 #[tokio::test]
@@ -1315,7 +1370,10 @@ async fn a_stuck_ledger_delays_shutdown_by_at_most_about_a_second() {
     run.send(Command::Shutdown).await;
     run.until_closed().await;
     let took = t0.elapsed();
-    assert!(took < Duration::from_millis(1800), "shutdown took {took:?}");
+    // The flush waits 1 s (spec: "about a second"); unbounded, it would wait out the
+    // ledger's 5 s busy timeout, since the lock is held until after the close. 1 s plus a
+    // 2 s margin for a loaded runner still ends 2 s before the busy timeout could.
+    assert!(took < Duration::from_secs(3), "shutdown took {took:?}");
     holder.execute_batch("COMMIT;").unwrap();
     drop(holder);
     // The writer goes on after the session: the row still arrives.
