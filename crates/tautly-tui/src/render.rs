@@ -15,8 +15,8 @@ use std::time::Instant;
 
 use serde_json::Value;
 use tautly_core::{
-    DiffPreview, EffectView, ErrorKind, Event, FinishReason, MemoryChange, SaveKind, Savings,
-    TestEvidence, UsageRole, printable, printable_multiline,
+    DiffFile, DiffPreview, EffectView, ErrorKind, Event, FinishReason, MemoryChange, SaveKind,
+    Savings, TestEvidence, ToolMetaView, UsageRole, printable, printable_multiline,
 };
 
 use crate::ReplOptions;
@@ -292,23 +292,7 @@ pub fn event(e: &Event, st: &mut RenderState, opts: &ReplOptions) -> Option<Stri
                 .filter(|e| matches!(e, EffectView::Edited { .. } | EffectView::Deleted { .. }))
                 .count();
             st.turn_edits += u32::try_from(edits).unwrap_or(u32::MAX);
-            let status = if *blocked {
-                "blocked"
-            } else if !is_error {
-                "ok"
-            } else if output.starts_with("cancelled") {
-                "cancelled"
-            } else if output.starts_with("denied") {
-                "denied"
-            } else {
-                "err"
-            };
-            let colour = match status {
-                "ok" => GREEN,
-                "err" => RED,
-                "cancelled" => DIM,
-                _ => YELLOW,
-            };
+            let (status, colour) = finish_status(output, *is_error, *blocked);
             // No start time (a replay, or a call that never started): no duration.
             let secs = pending
                 .as_ref()
@@ -323,24 +307,7 @@ pub fn event(e: &Event, st: &mut RenderState, opts: &ReplOptions) -> Option<Stri
             if let Some(secs) = secs {
                 let _ = write!(row, " {secs:.1}s");
             }
-            let mut notes = Vec::new();
-            if let Some(code) = meta.exit_code {
-                notes.push(format!("exit {code}"));
-            }
-            if let Some((added, removed)) = diff.as_ref().map(diff_stat) {
-                notes.push(format!("+{added} -{removed}"));
-            }
-            if let Some(saved) = meta.saved.filter(|s| s.bytes > 0) {
-                let what = match saved.kind {
-                    SaveKind::Filter => "filtered, ",
-                    _ => "",
-                };
-                notes.push(format!(
-                    "{what}saved ~{} tok (est.)",
-                    tokens(u64::from(saved.bytes) / 4)
-                ));
-            }
-            for n in notes {
+            for n in finish_notes(meta, diff.as_ref()) {
                 let _ = write!(row, " · {n}");
             }
             let mut out = st.line(row);
@@ -452,25 +419,7 @@ pub fn event(e: &Event, st: &mut RenderState, opts: &ReplOptions) -> Option<Stri
             files,
             unified,
             ..
-        } => {
-            let scope = turn.map_or_else(|| "the session".to_string(), |n| format!("turn {n}"));
-            if files.is_empty() {
-                return Some(st.line(format!("no changes by Tautly's tools in {scope}")));
-            }
-            let mut out = format!("changes in {scope}:\n");
-            for f in files {
-                let _ = writeln!(
-                    out,
-                    "  {} {} +{} -{}",
-                    wire_name(&f.status),
-                    printable(&f.path),
-                    f.added,
-                    f.removed
-                );
-            }
-            out.push_str(&diff_text(unified, opts.color));
-            Some(st.line(out))
-        }
+        } => Some(st.line(session_diff(*turn, files, unified, opts.color))),
         Event::ModelChanged {
             id: _,
             model,
@@ -504,38 +453,14 @@ pub fn event(e: &Event, st: &mut RenderState, opts: &ReplOptions) -> Option<Stri
             dry_run,
             backup_ref,
             note,
-        } => {
-            let list = |v: &[String]| {
-                if v.is_empty() {
-                    "nothing".to_string()
-                } else {
-                    v.iter()
-                        .map(|p| printable(p))
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                }
-            };
-            let mut out = if *dry_run {
-                format!(
-                    "undo turn {turn} would restore: {}\n  and delete: {}",
-                    list(restored),
-                    list(deleted)
-                )
-            } else {
-                format!(
-                    "undid turn {turn}: restored {}; deleted {}",
-                    list(restored),
-                    list(deleted)
-                )
-            };
-            if let Some(b) = backup_ref {
-                let _ = write!(out, "\n  snapshot before: {}", printable(b));
-            }
-            if let Some(n) = note {
-                let _ = write!(out, "\n  note: {}", printable(n));
-            }
-            Some(st.line(out))
-        }
+        } => Some(st.line(undone(
+            *turn,
+            restored,
+            deleted,
+            *dry_run,
+            backup_ref.as_deref(),
+            note.as_deref(),
+        ))),
         Event::Rewound { at, report, .. } => {
             Some(st.line(materialized(&format!("rewind to step {at}"), report)))
         }
@@ -598,6 +523,112 @@ pub fn event(e: &Event, st: &mut RenderState, opts: &ReplOptions) -> Option<Stri
         ))),
         _ => None,
     }
+}
+
+/// A finished call's status word and its colour.
+fn finish_status(output: &str, is_error: bool, blocked: bool) -> (&'static str, &'static str) {
+    let status = if blocked {
+        "blocked"
+    } else if !is_error {
+        "ok"
+    } else if output.starts_with("cancelled") {
+        "cancelled"
+    } else if output.starts_with("denied") {
+        "denied"
+    } else {
+        "err"
+    };
+    let colour = match status {
+        "ok" => GREEN,
+        "err" => RED,
+        "cancelled" => DIM,
+        _ => YELLOW,
+    };
+    (status, colour)
+}
+
+/// The notes after a finished call's row: exit code, diff size, tokens saved.
+fn finish_notes(meta: &ToolMetaView, diff: Option<&DiffPreview>) -> Vec<String> {
+    let mut notes = Vec::new();
+    if let Some(code) = meta.exit_code {
+        notes.push(format!("exit {code}"));
+    }
+    if let Some((added, removed)) = diff.map(diff_stat) {
+        notes.push(format!("+{added} -{removed}"));
+    }
+    if let Some(saved) = meta.saved.filter(|s| s.bytes > 0) {
+        let what = match saved.kind {
+            SaveKind::Filter => "filtered, ",
+            _ => "",
+        };
+        notes.push(format!(
+            "{what}saved ~{} tok (est.)",
+            tokens(u64::from(saved.bytes) / 4)
+        ));
+    }
+    notes
+}
+
+/// A `/diff` answer: the files changed in `turn` (None: the session), then the diff.
+fn session_diff(turn: Option<u32>, files: &[DiffFile], unified: &str, color: bool) -> String {
+    let scope = turn.map_or_else(|| "the session".to_string(), |n| format!("turn {n}"));
+    if files.is_empty() {
+        return format!("no changes by Tautly's tools in {scope}");
+    }
+    let mut out = format!("changes in {scope}:\n");
+    for f in files {
+        let _ = writeln!(
+            out,
+            "  {} {} +{} -{}",
+            wire_name(&f.status),
+            printable(&f.path),
+            f.added,
+            f.removed
+        );
+    }
+    out.push_str(&diff_text(unified, color));
+    out
+}
+
+/// What an undo did or would do. Paths are escaped.
+fn undone(
+    turn: u32,
+    restored: &[String],
+    deleted: &[String],
+    dry_run: bool,
+    backup_ref: Option<&str>,
+    note: Option<&str>,
+) -> String {
+    let list = |v: &[String]| {
+        if v.is_empty() {
+            "nothing".to_string()
+        } else {
+            v.iter()
+                .map(|p| printable(p))
+                .collect::<Vec<_>>()
+                .join(", ")
+        }
+    };
+    let mut out = if dry_run {
+        format!(
+            "undo turn {turn} would restore: {}\n  and delete: {}",
+            list(restored),
+            list(deleted)
+        )
+    } else {
+        format!(
+            "undid turn {turn}: restored {}; deleted {}",
+            list(restored),
+            list(deleted)
+        )
+    };
+    if let Some(b) = backup_ref {
+        let _ = write!(out, "\n  snapshot before: {}", printable(b));
+    }
+    if let Some(n) = note {
+        let _ = write!(out, "\n  note: {}", printable(n));
+    }
+    out
 }
 
 /// What a rewind or switch (`what`) did or would do: what it restores and deletes, the

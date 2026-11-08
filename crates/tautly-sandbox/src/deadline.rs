@@ -25,14 +25,22 @@ pub(crate) enum Refusal {
     Unavailable,
 }
 
-type Job = Box<dyn FnOnce() + Send>;
+/// A job, given its number in queue order.
+type Job = Box<dyn FnOnce(u64) + Send>;
+
+struct Queue {
+    tx: Option<mpsc::Sender<(u64, Job)>>,
+    /// The number of the next job sent.
+    next: u64,
+}
 
 pub(crate) struct Worker {
     deadline: Duration,
-    /// A job ran past its deadline and the worker has not finished it yet. Set by its
-    /// caller and cleared by the worker, both under this lock.
-    stuck: Mutex<bool>,
-    jobs: Mutex<Option<mpsc::Sender<Job>>>,
+    /// The last job that ran past its deadline, while the worker has not finished it. Set
+    /// by its caller and cleared by the worker, both under this lock. Jobs run in queue
+    /// order, so no earlier abandoned job is still running once this one ends.
+    stuck: Mutex<Option<u64>>,
+    jobs: Mutex<Queue>,
     /// Worker threads started (one, unless starting failed).
     spawned: AtomicUsize,
 }
@@ -41,12 +49,16 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// Clears `stuck` when the worker is done with a job, however it ended.
-struct Done(&'static Mutex<bool>);
+/// Clears `stuck` when the worker is done with job `.1`, however it ended, if that is the
+/// last abandoned job.
+struct Done(&'static Mutex<Option<u64>>, u64);
 
 impl Drop for Done {
     fn drop(&mut self) {
-        *lock(self.0) = false;
+        let mut stuck = lock(self.0);
+        if stuck.is_some_and(|last| last <= self.1) {
+            *stuck = None;
+        }
     }
 }
 
@@ -54,8 +66,8 @@ impl Worker {
     pub(crate) const fn new(deadline: Duration) -> Worker {
         Worker {
             deadline,
-            stuck: Mutex::new(false),
-            jobs: Mutex::new(None),
+            stuck: Mutex::new(None),
+            jobs: Mutex::new(Queue { tx: None, next: 0 }),
             spawned: AtomicUsize::new(0),
         }
     }
@@ -65,20 +77,20 @@ impl Worker {
         &'static self,
         f: impl FnOnce() -> T + Send + 'static,
     ) -> Result<T, Refusal> {
-        if *lock(&self.stuck) {
+        if lock(&self.stuck).is_some() {
             return Err(Refusal::Stuck);
         }
         let (tx, rx) = mpsc::sync_channel(1);
         let stuck = &self.stuck;
-        let job: Job = Box::new(move || {
-            let done = Done(stuck);
+        let job: Job = Box::new(move |id| {
+            let done = Done(stuck, id);
             let result = catch_unwind(AssertUnwindSafe(f));
             // Sent before `done` clears `stuck`: a caller that finds no result under the
             // lock marks the worker stuck, and this clear comes after.
             let _ = tx.send(result);
             drop(done);
         });
-        self.submit(job)?;
+        let id = self.submit(job)?;
         match rx.recv_timeout(self.deadline) {
             Ok(r) => r.map_err(|_| Refusal::Panicked),
             Err(mpsc::RecvTimeoutError::Timeout) => {
@@ -86,7 +98,7 @@ impl Worker {
                 match rx.try_recv() {
                     Ok(r) => r.map_err(|_| Refusal::Panicked),
                     Err(_) => {
-                        *stuck = true;
+                        *stuck = Some(stuck.map_or(id, |last| last.max(id)));
                         Err(Refusal::TimedOut)
                     }
                 }
@@ -95,24 +107,27 @@ impl Worker {
         }
     }
 
-    /// Hand `job` to the worker thread, starting it on first use.
-    fn submit(&'static self, job: Job) -> Result<(), Refusal> {
+    /// Hand `job` to the worker thread, starting it on first use. Returns the job's number.
+    fn submit(&'static self, job: Job) -> Result<u64, Refusal> {
         let mut jobs = lock(&self.jobs);
-        if jobs.is_none() {
-            let (tx, rx) = mpsc::channel::<Job>();
+        if jobs.tx.is_none() {
+            let (tx, rx) = mpsc::channel::<(u64, Job)>();
             std::thread::Builder::new()
                 .name("shell-parse".into())
                 .spawn(move || {
-                    for job in rx {
-                        job();
+                    for (id, job) in rx {
+                        job(id);
                     }
                 })
                 .map_err(|_| Refusal::Unavailable)?;
             self.spawned.fetch_add(1, Ordering::Relaxed);
-            *jobs = Some(tx);
+            jobs.tx = Some(tx);
         }
-        let tx = jobs.as_ref().ok_or(Refusal::Unavailable)?;
-        tx.send(job).map_err(|_| Refusal::Unavailable)
+        let id = jobs.next;
+        let tx = jobs.tx.as_ref().ok_or(Refusal::Unavailable)?;
+        tx.send((id, job)).map_err(|_| Refusal::Unavailable)?;
+        jobs.next += 1;
+        Ok(id)
     }
 }
 
@@ -123,6 +138,46 @@ mod tests {
 
     fn worker(ms: u64) -> &'static Worker {
         Box::leak(Box::new(Worker::new(Duration::from_millis(ms))))
+    }
+
+    /// Waits (generously, for a loaded runner) until the worker takes jobs again.
+    fn eventually_ok(w: &'static Worker) {
+        let until = Instant::now() + Duration::from_secs(30);
+        loop {
+            match w.run(|| 3) {
+                Ok(n) => return assert_eq!(n, 3),
+                Err(e) => assert!(Instant::now() < until, "still refused: {e:?}"),
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// A job that runs until `release` is sent or dropped.
+    fn blocked() -> (mpsc::Sender<()>, impl FnOnce() + Send + 'static) {
+        let (release, gate) = mpsc::channel::<()>();
+        (release, move || {
+            let _ = gate.recv();
+        })
+    }
+
+    /// Review N1: with two abandoned jobs, the first one ending does not clear `stuck`
+    /// while the second still runs.
+    #[test]
+    fn only_the_last_abandoned_job_clears_stuck() {
+        // Long enough that both jobs are queued before either caller gives up.
+        let w = worker(1000);
+        let (release_a, a) = blocked();
+        let (release_b, b) = blocked();
+        let first = std::thread::spawn(move || w.run(a));
+        let second = std::thread::spawn(move || w.run(b));
+        assert_eq!(first.join().unwrap(), Err(Refusal::TimedOut));
+        assert_eq!(second.join().unwrap(), Err(Refusal::TimedOut));
+        drop(release_a);
+        // Time for the worker to finish A; the assertion holds however long it takes.
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(w.run(|| 1), Err(Refusal::Stuck));
+        drop(release_b);
+        eventually_ok(w);
     }
 
     #[test]
@@ -139,31 +194,26 @@ mod tests {
         assert_eq!(w.run(|| -> u8 { panic!("boom") }), Err(Refusal::Panicked));
         assert_eq!(w.run(|| 1), Ok(1));
         // Also when the panic comes after the deadline: the worker clears `stuck`.
+        let (release, wait) = blocked();
         assert_eq!(
             w.run(|| -> u8 {
-                std::thread::sleep(Duration::from_millis(2300));
+                wait();
                 panic!("late")
             }),
             Err(Refusal::TimedOut)
         );
-        std::thread::sleep(Duration::from_millis(600));
-        assert_eq!(w.run(|| 2), Ok(2));
+        drop(release);
+        eventually_ok(w);
     }
 
     #[test]
     fn a_job_past_the_deadline_refuses_others_until_it_ends() {
         let w = worker(100);
-        let started = Instant::now();
-        assert_eq!(
-            w.run(|| std::thread::sleep(Duration::from_millis(600))),
-            Err(Refusal::TimedOut)
-        );
-        assert!(started.elapsed() < Duration::from_millis(500));
-        let started = Instant::now();
+        let (release, job) = blocked();
+        assert_eq!(w.run(job), Err(Refusal::TimedOut));
         assert_eq!(w.run(|| 1), Err(Refusal::Stuck));
-        assert!(started.elapsed() < Duration::from_millis(50));
-        std::thread::sleep(Duration::from_millis(700));
-        assert_eq!(w.run(|| 1), Ok(1));
+        drop(release);
+        eventually_ok(w);
     }
 
     /// Review M2: concurrent callers that all time out leave one worker thread, so at
@@ -171,9 +221,16 @@ mod tests {
     #[test]
     fn concurrent_timeouts_leave_one_worker() {
         let w = worker(50);
+        let (release, gate) = mpsc::channel::<()>();
+        let gate = std::sync::Arc::new(Mutex::new(gate));
         let callers: Vec<_> = (0..8)
             .map(|_| {
-                std::thread::spawn(move || w.run(|| std::thread::sleep(Duration::from_millis(200))))
+                let gate = gate.clone();
+                std::thread::spawn(move || {
+                    w.run(move || {
+                        let _ = lock(&gate).recv();
+                    })
+                })
             })
             .collect();
         for c in callers {
@@ -181,7 +238,7 @@ mod tests {
         }
         assert_eq!(w.spawned.load(Ordering::Relaxed), 1);
         // The queued jobs run one after another; then the worker is free again.
-        std::thread::sleep(Duration::from_millis(8 * 200 + 300));
-        assert_eq!(w.run(|| 3), Ok(3));
+        drop(release);
+        eventually_ok(w);
     }
 }

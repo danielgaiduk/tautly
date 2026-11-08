@@ -210,6 +210,19 @@ fn usd(v: Option<f64>) -> String {
     }
 }
 
+/// The cost cell: `amount`, `?` when it covers only the priced part, `(est.)` when some
+/// usage was estimated.
+fn cost_cell(amount: Option<f64>, partial: bool, estimated: bool) -> String {
+    let mut c = usd(amount);
+    if partial && amount.is_some() {
+        c.push('?');
+    }
+    if estimated {
+        c.push_str(" (est.)");
+    }
+    c
+}
+
 /// A duration in milliseconds, short: `850ms`, `4.2s`, `3m05s`, `1h02m`.
 fn duration(ms: u64) -> String {
     let secs = ms / 1000;
@@ -224,6 +237,16 @@ fn duration(ms: u64) -> String {
 /// A ratio as a whole percentage, or `-`.
 fn percent(ratio: Option<f64>) -> String {
     ratio.map_or_else(|| "-".to_string(), |r| format!("{:.0}%", r * 100.0))
+}
+
+/// A ratio as a percentage with one decimal, or `-`.
+fn pct(r: Option<f64>) -> String {
+    r.map_or_else(|| "-".to_string(), |r| format!("{:.1}%", r * 100.0))
+}
+
+/// A token count, rounded, with separators, or `-`.
+fn tokens(v: Option<f64>) -> String {
+    v.map_or_else(|| "-".to_string(), |v| thousands(v.round() as u64))
 }
 
 /// The cost ledger, if one exists (a command that only reads it never creates it).

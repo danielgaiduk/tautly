@@ -5,8 +5,10 @@
 
 use std::io::Read;
 use std::os::unix::fs::OpenOptionsExt;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+use tautly_sandbox::lexical;
 
 /// Largest file whose content a key covers.
 const MAX_FILE: u64 = 1024 * 1024;
@@ -481,21 +483,6 @@ fn hash_dir(root: &Path, dir: &Path, budget: &mut Budget) -> Option<String> {
         pending.extend(subdirs.into_iter().rev());
     }
     Some(hasher.finalize().to_hex().to_string())
-}
-
-/// `path` with `.` and `..` components resolved by name (no links followed).
-fn lexical(path: &Path) -> PathBuf {
-    let mut out = PathBuf::new();
-    for c in path.components() {
-        match c {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                out.pop();
-            }
-            other => out.push(other),
-        }
-    }
-    out
 }
 
 /// A value no other call returns: keys an approval that must never be remembered.

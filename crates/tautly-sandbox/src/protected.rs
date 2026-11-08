@@ -221,7 +221,8 @@ pub(crate) fn normalize(root: &Path, target: &str) -> Option<PathBuf> {
     Some(parts.into_iter().collect())
 }
 
-fn lexical(p: &Path) -> PathBuf {
+/// `p` with `.` and `..` components resolved by name (no links followed).
+pub fn lexical(p: &Path) -> PathBuf {
     let mut out = PathBuf::new();
     for c in p.components() {
         match c {

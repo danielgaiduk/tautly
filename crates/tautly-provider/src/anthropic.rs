@@ -13,7 +13,7 @@ use tokio_util::sync::CancellationToken;
 use url::Url;
 
 use crate::sse::try_events;
-use crate::util::{header_u64, retry_after, transient};
+use crate::util::{header_u64, http_msg, map_http_status, retry_after, transient};
 use crate::{
     Block, CachePoint, CanonicalRequest, Catalog, Content, Effort, Provider, ProviderError,
     ProviderEvent, Quota, RawUsage, Reasoning, Role, StopReason,
@@ -242,35 +242,27 @@ fn error_parts(body: &str) -> (Option<String>, String) {
 
 fn map_http_error(status: u16, retry_after: Option<Duration>, body: &str) -> ProviderError {
     let (kind, msg) = error_parts(body);
-    let msg = if msg.is_empty() {
-        format!("HTTP {status}")
-    } else {
-        msg
-    };
-    let lower = msg.to_lowercase();
-    let transient = || ProviderError::Transient {
-        status: Some(status),
-        retry_after,
-        msg: msg.clone(),
-    };
-    match status {
-        429 | 500..=504 | 529 => transient(),
-        _ if kind.as_deref() == Some("overloaded_error") => transient(),
-        401 | 403 => ProviderError::Auth(msg),
-        413 => ProviderError::ContextOverflow(msg),
-        400 if [
+    // Anthropic's own arms come ahead of the shared table.
+    if status == 529 || kind.as_deref() == Some("overloaded_error") {
+        return ProviderError::Transient {
+            status: Some(status),
+            retry_after,
+            msg: http_msg(status, msg),
+        };
+    }
+    if status == 413 {
+        return ProviderError::ContextOverflow(http_msg(status, msg));
+    }
+    map_http_status(status, retry_after, msg, |m| {
+        let lower = m.to_lowercase();
+        [
             "prompt is too long",
             "input is too long",
             "exceeds the maximum context",
         ]
         .iter()
-        .any(|p| lower.contains(p)) =>
-        {
-            ProviderError::ContextOverflow(msg)
-        }
-        400..=499 => ProviderError::InvalidRequest(msg),
-        _ => ProviderError::Other(format!("HTTP {status}: {msg}")),
-    }
+        .any(|p| lower.contains(p))
+    })
 }
 
 fn map_stream_error(v: &Value) -> ProviderError {

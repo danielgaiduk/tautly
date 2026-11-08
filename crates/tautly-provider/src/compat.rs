@@ -17,7 +17,9 @@ use tokio_util::sync::CancellationToken;
 use url::Url;
 
 use crate::sse::try_events;
-use crate::util::{merge_same_role, openai_quota_from_headers, retry_after, transient};
+use crate::util::{
+    map_http_status, merge_same_role, openai_quota_from_headers, retry_after, transient,
+};
 use crate::{
     Block, CanonicalRequest, Catalog, Content, Effort, Provider, ProviderError, ProviderEvent,
     RawUsage, Reasoning, Role, StopReason,
@@ -189,22 +191,9 @@ fn is_overflow(code: Option<&str>, msg: &str) -> bool {
 
 fn map_http_error(status: u16, retry_after: Option<Duration>, body: &str) -> ProviderError {
     let (code, msg) = error_parts(body);
-    let msg = if msg.is_empty() {
-        format!("HTTP {status}")
-    } else {
-        msg
-    };
-    match status {
-        429 | 500..=504 => ProviderError::Transient {
-            status: Some(status),
-            retry_after,
-            msg,
-        },
-        401 | 403 => ProviderError::Auth(msg),
-        400 if is_overflow(code.as_deref(), &msg) => ProviderError::ContextOverflow(msg),
-        400..=499 => ProviderError::InvalidRequest(msg),
-        _ => ProviderError::Other(format!("HTTP {status}: {msg}")),
-    }
+    map_http_status(status, retry_after, msg, |m| {
+        is_overflow(code.as_deref(), m)
+    })
 }
 
 fn map_stream_error(v: &Value) -> ProviderError {
