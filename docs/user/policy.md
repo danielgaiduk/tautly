@@ -20,9 +20,11 @@ Set it with `[permissions] mode = "..."` or for one run with `--approve auto-edi
 
 ## The order of the decision
 
-1. **Deny rules.** A matching deny rule refuses the call, in every mode.
+1. **Deny rules.** A matching deny rule refuses the call, in every mode. An `edit` or
+   `write` of a path outside the work tree (as written, or through a symlink) is refused
+   too: the sandbox never writes there, so there is nothing to approve.
 2. **Always-ask checks.** Even in `yolo`, the call asks when it:
-   - writes a protected path, or a path outside the work tree;
+   - writes a protected path, or (a shell redirect) a path outside the work tree;
    - is a command that cannot be parsed (an `xargs` command line, heredoc tricks, words
      the parser cannot place);
    - is a command whose arguments or redirects name a protected path, that sets a

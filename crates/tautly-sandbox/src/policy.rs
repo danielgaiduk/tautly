@@ -9,7 +9,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::effect::Effect;
 use crate::protected::{
-    Resolved, argv_word_reason, normalize, path_reason, rebase, redirect_reason, resolve_links,
+    Resolved, argv_word_reason, normalize, outside_reason, path_reason, rebase, redirect_reason,
+    resolve_links,
 };
 use crate::runners::{WRAPPERS, base};
 use crate::shell::{SimpleCommand, is_dangerous_env, parse_commands};
@@ -42,6 +43,12 @@ pub enum Decision {
     Deny {
         /// The deny rule that matched.
         rule: String,
+    },
+    /// Refuse it: no approval could make it work (a write tool's path outside the
+    /// workspace, which the sandbox will not write).
+    Refuse {
+        /// Why it cannot run.
+        reason: String,
     },
 }
 
@@ -400,8 +407,8 @@ impl Policy {
             .map(|_| rule)
     }
 
-    /// Order: deny rules, protected paths, unparseable commands, allow rules (configured
-    /// and session), mode default.
+    /// Order: deny rules, write-tool paths outside the workspace (refused), protected
+    /// paths, unparseable commands, allow rules (configured and session), mode default.
     ///
     /// Write paths are judged both as written and after following symlinks under
     /// the workspace root (read from disk at decision time), so a committed
@@ -417,6 +424,11 @@ impl Policy {
         let subjects = self.subjects(effect, raw_cmd);
         if let Some(d) = self.denied(tool, &subjects) {
             return d;
+        }
+        if let Subjects::Paths(ps) = &subjects
+            && let Some(reason) = ps.iter().find_map(|p| outside_reason(&self.root, &p.raw))
+        {
+            return Decision::Refuse { reason };
         }
         if let Some(reason) = self.needs_approval(&subjects) {
             return Decision::Ask { reason };

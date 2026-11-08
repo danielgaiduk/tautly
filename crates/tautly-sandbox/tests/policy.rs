@@ -29,6 +29,9 @@ fn exec(cmd: &str) -> Effect {
 fn asks(d: Decision) -> bool {
     matches!(d, Decision::Ask { .. })
 }
+fn refuses(d: Decision) -> bool {
+    matches!(d, Decision::Refuse { .. })
+}
 
 #[test]
 fn dotdot_after_a_missing_component_cannot_dodge_the_protected_list() {
@@ -190,7 +193,7 @@ fn unresolvable_targets_ask_in_yolo() {
             "{t}"
         );
     }
-    assert!(asks(p(Mode::Yolo).decide(
+    assert!(refuses(p(Mode::Yolo).decide(
         "write",
         &write("/etc/passwd"),
         None
@@ -278,7 +281,7 @@ fn path_rules_match_normalized_paths() {
         );
     }
     assert!(asks(p.decide("edit", &write("docs/../src/a.rs"), None)));
-    assert!(asks(p.decide("edit", &write("docs/../../x"), None)));
+    assert!(refuses(p.decide("edit", &write("docs/../../x"), None)));
     assert_eq!(
         p.decide("edit", &write("./docs/a.md"), None),
         Decision::Allow
@@ -689,10 +692,12 @@ mod symlinks {
                 "docs/hooks/pre-commit",
                 "x",
                 "docs/hooks/../config",
-                "out/passwd",
-                "loop1",
             ] {
                 assert!(asks(p.decide("write", &write(f), None)), "{f}");
+            }
+            // A link out of the root, or a loop: the sandbox would never write it.
+            for f in ["out/passwd", "loop1"] {
+                assert!(refuses(p.decide("write", &write(f), None)), "{f}");
             }
             let abs = root.join("NOTES.md");
             assert!(asks(p.decide("write", &write(abs.to_str().unwrap()), None)));
@@ -722,11 +727,7 @@ mod symlinks {
     fn dotdot_over_a_missing_component_still_follows_symlinks() {
         let (_t, root) = repo();
         let p = policy(&root, Mode::Yolo, &["write"], &[]);
-        for f in [
-            "missing/../docs/hooks/pre-commit",
-            "missing/../NOTES.md",
-            "missing/../out/passwd",
-        ] {
+        for f in ["missing/../docs/hooks/pre-commit", "missing/../NOTES.md"] {
             assert!(asks(p.decide("write", &write(f), None)), "{f}");
             let abs = root.join(f);
             assert!(
@@ -734,6 +735,14 @@ mod symlinks {
                 "{f}"
             );
         }
+        let f = "missing/../out/passwd";
+        assert!(refuses(p.decide("write", &write(f), None)), "{f}");
+        let abs = root.join(f);
+        assert!(refuses(p.decide(
+            "write",
+            &write(abs.to_str().unwrap()),
+            None
+        )));
         assert_eq!(
             p.decide("write", &write("missing/../src/main.rs"), None),
             Decision::Allow
@@ -1953,14 +1962,50 @@ fn dotdot_spellings_of_protected_paths_ask_with_the_normalized_name() {
         let r = reason(path);
         assert!(r.contains("protected path: .git/"), "{path}: {r}");
     }
+    // A write tool cannot write outside the root at all: refused, not asked.
     for path in [
         "./../.git/config",
         "/ws/../.git/config",
         "/elsewhere/.git/config",
     ] {
-        let r = reason(path);
-        assert!(r.contains("outside workspace"), "{path}: {r}");
+        match pol.decide("write", &write(path), None) {
+            Decision::Refuse { reason } => {
+                assert!(reason.contains("outside workspace"), "{path}: {reason}")
+            }
+            d => panic!("{path}: {d:?}"),
+        }
     }
+}
+#[test]
+fn write_tool_paths_outside_the_root_are_refused_in_every_mode_and_under_any_rule() {
+    for mode in [Mode::Ask, Mode::AutoEdit, Mode::Yolo] {
+        let pol = with_rules(mode, &["write", "edit(**)", "write(/tmp/*)"], &[]);
+        for (tool, path) in [
+            ("write", "/tmp/x"),
+            ("edit", "../x"),
+            ("write", "a/../../x"),
+        ] {
+            assert!(
+                matches!(
+                    pol.decide(tool, &write(path), None),
+                    Decision::Refuse { .. }
+                ),
+                "{mode:?} {tool} {path}"
+            );
+        }
+        // A deny rule still names itself first.
+        let d = with_rules(mode, &[], &["write"]);
+        assert!(matches!(
+            d.decide("write", &write("/tmp/x"), None),
+            Decision::Deny { .. }
+        ));
+    }
+    // A shell redirect outside the root can work once approved: it still asks.
+    assert!(asks(p(Mode::Yolo).decide(
+        "bash",
+        &exec("echo"),
+        Some("echo x > /tmp/x")
+    )));
 }
 
 /// Review C1: `[` then a newline runs the next line as a command. A deny rule on it

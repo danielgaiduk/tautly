@@ -99,6 +99,23 @@ pub(crate) fn path_reason(root: &Path, cwd: &Path, target: &str) -> Option<Strin
     }
 }
 
+/// Reason a write tool's path (taken literally) can never be written: it is outside the
+/// workspace, as written or once symlinks are followed, or a symlink loop. The sandbox
+/// refuses the same paths (`LocalSandbox::resolve` shares the walk).
+pub(crate) fn outside_reason(root: &Path, target: &str) -> Option<String> {
+    if normalize(root, target).is_none() {
+        return Some(format!("path outside workspace: {target}"));
+    }
+    match resolve_links(root, Path::new(target))? {
+        Resolved::Inside(_) => None,
+        Resolved::Outside(real) => Some(format!(
+            "path outside workspace: {} (via symlink {target})",
+            real.display()
+        )),
+        Resolved::Loop => Some(format!("too many levels of symlinks: {target}")),
+    }
+}
+
 /// Whether two root-relative paths are the same file name for name; the case of a
 /// spelling alone (`.GIT` for `.git`) is not a symlink.
 fn same_path(a: &Path, b: &Path) -> bool {
