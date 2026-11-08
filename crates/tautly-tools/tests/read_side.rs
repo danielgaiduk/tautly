@@ -591,20 +591,19 @@ async fn explicit_path_into_hidden_or_ignored_directory_matches_the_walker() {
 
 #[tokio::test]
 async fn stale_index_sends_grep_glob_and_find_to_the_walker_until_refreshed() {
-    let e = repo(common::Built::Full).await;
+    // `repo` waited for the watcher's signal: the index has converged.
+    let mut e = repo(common::Built::Full).await;
+    let made = Path::new("fresh/made.txt");
+    // Created behind the index's back: no watcher runs while it appears (a running one
+    // would index it, and its refresh, the tree having a link, would clear the mark).
+    // The new watcher sees changes from its start only.
+    e.stop_watcher();
     e.put("fresh/made.txt", b"needle from the shell\n").await;
-    // The watcher handles the new file with a refresh of its own (the tree has a link),
-    // which would clear a mark set before it finished. Wait for its signal (a cookie
-    // written after the file comes back only once the file's events are processed), then
-    // mark: with no change pending, nothing but the refresh below clears the mark.
+    e.start_watcher();
     e.index.mark_stale();
-    e.index
-        .refresh_stale_in_background()
-        .unwrap()
-        .await
-        .unwrap();
-    assert!(!e.index.is_stale());
-    e.index.mark_stale();
+    let refreshes = e.index.refresh_count();
+    assert!(e.index.is_stale());
+    assert_eq!(e.index.file_hash(made), None, "the index never saw it");
 
     e.sb.reset();
     let r = e.run(&GlobTool, json!({"pattern": "*.txt"})).await;
@@ -629,10 +628,15 @@ async fn stale_index_sends_grep_glob_and_find_to_the_walker_until_refreshed() {
         .run(&FindTool, json!({"query": "needle from", "kind": "text"}))
         .await;
     assert!(r.output.contains("fresh/made.txt:1  text"), "{}", r.output);
+    // All of that while stale and before the index saw the file: no refresh ran.
+    assert!(e.index.is_stale());
+    assert_eq!(e.index.refresh_count(), refreshes);
+    assert_eq!(e.index.file_hash(made), None);
 
     // A refresh that started after the mark makes the index trustworthy again.
     e.index.refresh().await.unwrap();
     assert!(!e.index.is_stale());
+    assert!(e.index.file_hash(made).is_some());
     e.sb.reset();
     let r = e.run(&GlobTool, json!({"pattern": "*.txt"})).await;
     assert_eq!(e.sb.walks(), 0, "fresh: glob from the tree");

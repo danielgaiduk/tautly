@@ -677,12 +677,15 @@ async fn timeout_skips_with_warning() {
     let repo = Repo::with(&[("a.txt", "a\n")]);
     let pid_file = repo.home.path().join("sleep.pid");
     let shim = repo.home.path().join("git");
-    // The configuration read goes to the real git (one that never ends is another case:
-    // `config_include_that_never_ends_turns_checkpoints_off_once`); the next call hangs.
+    // Configuration reads answer at once, "nothing set" (exit 1), without the real git:
+    // a slow real `git config` could use up the time limit before the hanging call starts
+    // (one that never ends is another case:
+    // `config_include_that_never_ends_turns_checkpoints_off_once`). The next call hangs,
+    // so the limit always runs out inside the shim, after it named its child.
     executable(
         &shim,
         &format!(
-            "#!/bin/sh\ncase \" $* \" in *\" config \"*) exec git \"$@\";; esac\n\
+            "#!/bin/sh\ncase \" $* \" in *\" config \"*) exit 1;; esac\n\
              sleep 30 &\necho $! > '{}'\nwait\n",
             pid_file.display()
         ),
