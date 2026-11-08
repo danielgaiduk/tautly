@@ -1276,7 +1276,12 @@ impl Session {
             // cp5 review C M9). The parent offset names the last record copied: with none,
             // a branch would read as one cut after record 0.
             let step = cut.context.next_turn() - 1;
-            let count = crate::timetravel::copy_count(&parent, step, &cut).ok_or_else(|| {
+            let count = match at {
+                Some(at) => crate::timetravel::copy_count(&parent, at, &cut),
+                // The tip of a session with no step yet is nothing to branch from.
+                None => cut.end_offset.map(|end| end + 1),
+            };
+            let count = count.ok_or_else(|| {
                 "there is nothing to branch from yet: the session has no records before \
                  that point"
                     .to_string()

@@ -12,6 +12,6 @@ expression: "stable.join(\"\\n\")"
 {"text":"The file says hello.","type":"text_delta"}
 {"cache_read":0,"cache_write":0,"cost_usd":null,"quota":null,"role":"main","tokens_in":100,"tokens_out":10,"type":"usage"}
 {"breakdown":"[n]","budget":"[n]","type":"context_status","used":"[n]","warnings":[]}
-{"cache_hit_ratio":0.0,"cache_read":0,"cache_write":0,"cost_usd":null,"estimated":true,"model":"mock/test","saved":{"cache_read_tokens":0,"cache_usd":null,"context_gc":0,"diff_reads":0,"filters":0,"index":0,"total_usd":null},"side_tokens":0,"steps":2,"tokens_in":"[n]","tokens_out":"[n]","tool_calls":1,"turn":1,"type":"turn_receipt","wall_ms":"[ms]"}
+{"cache_hit_ratio":0.0,"cache_read":0,"cache_write":0,"cost_partial":true,"cost_usd":null,"estimated":true,"model":"mock/test","saved":{"cache_read_tokens":0,"cache_usd":null,"context_gc":0,"diff_reads":0,"filters":0,"index":0,"total_usd":null},"side_tokens":0,"steps":2,"tokens_in":"[n]","tokens_out":"[n]","tool_calls":1,"turn":1,"type":"turn_receipt","wall_ms":"[ms]"}
 {"reason":"completed","type":"turn_finished"}
 {"message":"the session's episode was not written: provider error: mock script exhausted","type":"warning"}
