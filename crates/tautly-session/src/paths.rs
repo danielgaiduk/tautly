@@ -6,7 +6,8 @@ use std::path::{Path, PathBuf};
 use crate::error::{Error, Result};
 
 /// The Tautly data directory: `TAUTLY_HOME` used as-is, else `$XDG_DATA_HOME/tautly`,
-/// else `~/.local/share/tautly`. Empty variables are ignored.
+/// else `~/.local/share/tautly`. Empty variables are ignored. `TAUTLY_HOME` is also the
+/// config home (`tautly_core::config::config_home`): one isolated home for both.
 ///
 /// An error when the result would not be an absolute path (no `HOME`, or a relative
 /// variable): a relative directory would resolve against the working directory, which is

@@ -28,7 +28,9 @@ pub struct FileNote {
 /// The structured task state the model keeps with the `state` tool, plus files the engine tracks.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct WorkingState {
-    /// A one-line task description, when one is set.
+    /// A one-line task description, when one is set. Spec 6.3 lists it in the record,
+    /// but the engine does not set it yet: setting it must reach both the live turn and
+    /// every rebuild path, or their requests diverge.
     pub task: Option<String>,
     /// The plan.
     pub plan: Vec<PlanStep>,

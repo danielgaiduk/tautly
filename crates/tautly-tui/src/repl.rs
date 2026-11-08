@@ -473,12 +473,12 @@ where
                 self.send(Command::Unpin { text }).await?;
                 return self.quiet().await;
             }
-            Slash::Fork => {
+            Slash::Fork(label) => {
                 let id = self.next_id();
                 self.send(Command::Fork {
                     id: Some(id.clone()),
                     at: None,
-                    label: None,
+                    label,
                 })
                 .await?;
                 return Ok(exit(

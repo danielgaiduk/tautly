@@ -58,7 +58,7 @@ A rule is `tool(glob)` or a bare `tool`. A bare tool matches every call of that 
 | `edit`, `write` | each file written, root-relative (normalized, and after following links) | `edit(src/**)`, `write(docs/*.md)` |
 | `web_fetch` | the host: lowercase, no port | `web_fetch(docs.rs)` |
 | MCP tools | the tool name itself, no parentheses; may be a glob | `mcp__github__create_issue`, `mcp__github__*` |
-| read-only tools | (only bare rules; `read(src/*)` is an error) | `grep` |
+| read-only and context tools | (only bare rules; `read(src/*)` or `find(src/*)` is an error) | `grep` |
 
 Globs use the `globset` syntax: `*`, `?`, `[...]`, `{a,b}`. In rules `*` also matches
 `/`, so `edit(src/*)` covers files in subdirectories of `src/` too.

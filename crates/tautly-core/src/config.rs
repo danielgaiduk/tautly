@@ -361,8 +361,11 @@ pub struct CliOverrides {
     pub receipts_footer: Option<bool>,
 }
 
-/// Directory of the user config file: `TAUTLY_HOME` as is (tests), else
+/// Directory of the user config file: `TAUTLY_HOME` as is, else
 /// `$XDG_CONFIG_HOME/tautly`, else `~/.config/tautly`. Empty variables are ignored.
+/// `TAUTLY_HOME` is one isolated home for configuration and data alike (it is also the
+/// data home, `tautly_session::paths::data_home`): tests and clean-account checks use it,
+/// and error messages offer it to move the data home.
 /// An error when the result would not be an absolute path (no `HOME`, or a relative
 /// variable): a relative path would resolve against the working directory, which is
 /// usually the repository, and make repository content the trusted user layer.
