@@ -43,11 +43,16 @@ sandbox. A memory entry `remember` proposes is written only after you approve it
 ## Protected paths
 
 Writing any of these always asks, whatever the mode or rules (case-insensitive, at any
-depth): directories `.git/`, `.tautly/`, `.vscode/`, `.idea/`, `.github/workflows/`, and
-files `.envrc`, `.gitconfig`, `Makefile`, `GNUmakefile`, `package.json`, `Cargo.toml`,
-`build.rs`, `.bashrc`, `.zshrc`, `.profile`, `.bash_profile`, `.zprofile`, `.zshenv`,
+depth): directories `.git/`, `.tautly/`, `.vscode/`, `.idea/`, `.github/workflows/`, the
+files `config` and `config.toml` inside a `.cargo/` directory, and files `.envrc`,
+`.gitconfig`, `Makefile`, `GNUmakefile`, `package.json`, `Cargo.toml`, `build.rs`,
+`rust-toolchain`, `rust-toolchain.toml`, `.npmrc`, `.yarnrc`, `.yarnrc.yml`,
+`.pnpmfile.cjs`, `bunfig.toml`, `.bashrc`, `.zshrc`, `.profile`, `.bash_profile`, `.zprofile`, `.zshenv`,
 `.zlogin`, `.zlogout`, `.bash_login`, `.bash_logout`, `config.fish`. These are files a
-trusted tool later executes. A path is judged both as written and after following
+trusted tool later executes, or configuration that names a program it runs (a cargo
+`runner` or `rustc-wrapper`, npm's `script-shell`, yarn's `yarnPath`, bun's `preload`, a
+rustup toolchain `path`), so an allowed `cargo test` or `npm test` cannot be turned into
+something else by a file the agent wrote. A path is judged both as written and after following
 symlinks, so `NOTES.md -> .git/config` counts as `.git/config`.
 
 ## Rule syntax

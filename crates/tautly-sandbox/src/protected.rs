@@ -15,6 +15,16 @@ const PROTECTED_FILES: &[&str] = &[
     "package.json",
     "cargo.toml",
     "build.rs",
+    // Tool configuration that names a program the tool then runs or a script it loads:
+    // npm `script-shell`, yarn `yarn-path`/`yarnPath`, pnpm hooks, bun `preload`,
+    // rustup `toolchain.path`.
+    ".npmrc",
+    ".yarnrc",
+    ".yarnrc.yml",
+    ".pnpmfile.cjs",
+    "bunfig.toml",
+    "rust-toolchain",
+    "rust-toolchain.toml",
     ".bashrc",
     ".zshrc",
     ".profile",
@@ -41,10 +51,11 @@ pub fn is_protected(rel: &Path) -> bool {
     if parts.iter().any(|p| PROTECTED_DIRS.contains(&p.as_str())) {
         return true;
     }
-    if parts
-        .windows(2)
-        .any(|w| w[0] == ".github" && w[1] == "workflows")
-    {
+    // `.cargo/config[.toml]` sets `rustc-wrapper`, `runner` and `linker`.
+    if parts.windows(2).any(|w| {
+        (w[0] == ".github" && w[1] == "workflows")
+            || (w[0] == ".cargo" && (w[1] == "config" || w[1] == "config.toml"))
+    }) {
         return true;
     }
     parts

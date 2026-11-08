@@ -371,6 +371,42 @@ fn git_global_options_that_choose_config_or_binaries_ask_under_an_allow_rule() {
     }
 }
 #[test]
+fn tool_configs_that_name_programs_to_run_are_protected() {
+    let yolo = p(Mode::Yolo);
+    for f in [
+        ".cargo/config.toml",
+        ".cargo/config",
+        "sub/.cargo/config.toml",
+        ".Cargo/Config.TOML",
+        ".npmrc",
+        "web/.npmrc",
+        ".yarnrc.yml",
+        ".yarnrc",
+        ".pnpmfile.cjs",
+        "bunfig.toml",
+        "pkg/BunFig.toml",
+        "rust-toolchain.toml",
+        "rust-toolchain",
+    ] {
+        assert!(is_protected(std::path::Path::new(f)), "{f}");
+        assert!(asks(yolo.decide("write", &write(f), None)), "{f}");
+    }
+    assert!(asks(yolo.decide(
+        "bash",
+        &exec("echo"),
+        Some("echo '[target.x]' >> .cargo/config.toml")
+    )));
+    // Neighbours are not: a `config.toml` elsewhere, other files under `.cargo`.
+    for f in [
+        "config.toml",
+        "app/config",
+        ".cargo/notes.md",
+        ".npmrc.example",
+    ] {
+        assert!(!is_protected(std::path::Path::new(f)), "{f}");
+    }
+}
+#[test]
 fn mode_kebab_case_with_snake_alias() {
     let k: PolicyConfig = serde_json::from_str(r#"{"mode":"auto-edit"}"#).unwrap();
     assert_eq!(k.mode, Mode::AutoEdit);
