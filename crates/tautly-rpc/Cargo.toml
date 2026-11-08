@@ -14,6 +14,7 @@ serde_json.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+tautly-testkit = { path = "../tautly-testkit" }
 tautly-provider = { path = "../tautly-provider" }
 tautly-sandbox = { path = "../tautly-sandbox" }
 tautly-session = { path = "../tautly-session" }

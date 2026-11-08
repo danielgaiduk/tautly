@@ -8,8 +8,8 @@ use std::time::{Duration, Instant};
 
 use serde_json::json;
 use tautly_core::{
-    BudgetLimits, Command, Config, Engine, EngineBuilder, Event, FinishReason, SessionRecord,
-    UsageRole, Workspace,
+    BudgetLimits, Command, Config, EngineBuilder, Event, FinishReason, SessionRecord, UsageRole,
+    Workspace,
 };
 use tautly_memory::{MemoryDraft, MemoryKind};
 use tautly_provider::mock::{call, text_step, tools_step};
@@ -19,11 +19,8 @@ use tautly_provider::{
 };
 use tautly_sandbox::{LocalSandbox, Mode, Sandbox};
 use tautly_session::SessionReader;
-use tempfile::TempDir;
-use tokio::sync::mpsc;
+use tautly_testkit::{Fx, MODEL, Run, WAIT, start};
 
-const MODEL: &str = "mock/test";
-const WAIT: Duration = Duration::from_secs(30);
 const OVER_BUDGET: &str = "memory index over budget — run /memory consolidate";
 
 fn catalog_with(window: u32, max_output: u32, cache: &str) -> Catalog {
@@ -60,29 +57,17 @@ fn remember(id: &str, title: &str) -> ProviderEvent {
     )
 }
 
-struct Fx {
-    dir: TempDir,
-    home: TempDir,
+trait FxExt {
+    fn memory_dir(&self) -> PathBuf;
+    fn memory_files(&self) -> Vec<(String, String)>;
+    fn entry_file(&self, name: &str, id: &str, title: &str);
+    fn episode_path(&self, session_id: &str) -> PathBuf;
+    fn interactive_builder(&self, cfg: Config, mock: &MockProvider) -> EngineBuilder;
+    async fn ready_workspace(&self) -> Arc<Workspace>;
+    async fn ready(&self, cfg: Config, mock: &MockProvider) -> EngineBuilder;
 }
 
-impl Fx {
-    fn new() -> Fx {
-        Fx {
-            dir: tempfile::tempdir().unwrap(),
-            home: tempfile::tempdir().unwrap(),
-        }
-    }
-
-    fn root(&self) -> PathBuf {
-        self.dir.path().canonicalize().unwrap()
-    }
-
-    fn write(&self, rel: &str, text: &str) {
-        let p = self.dir.path().join(rel);
-        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
-        std::fs::write(p, text).unwrap();
-    }
-
+impl FxExt for Fx {
     fn memory_dir(&self) -> PathBuf {
         self.dir.path().join(".tautly/memory")
     }
@@ -124,7 +109,7 @@ impl Fx {
             .join(format!("{session_id}.md"))
     }
 
-    fn builder(&self, cfg: Config, mock: &MockProvider) -> EngineBuilder {
+    fn interactive_builder(&self, cfg: Config, mock: &MockProvider) -> EngineBuilder {
         EngineBuilder {
             provider: Some(Arc::new(mock.clone())),
             data_home: Some(self.home.path().to_path_buf()),
@@ -154,69 +139,17 @@ impl Fx {
             workspace: Some(self.ready_workspace().await),
             // The memory index in the first request, however loaded the runner.
             startup_wait: WAIT,
-            ..self.builder(cfg, mock)
+            ..self.interactive_builder(cfg, mock)
         }
     }
 }
 
-struct Run {
-    engine: Engine,
-    events: mpsc::Receiver<Event>,
+trait RunExt {
+    fn records(&self) -> Vec<SessionRecord>;
+    async fn logged(&self, pred: impl Fn(&SessionRecord) -> bool);
 }
 
-fn start(b: EngineBuilder) -> Run {
-    let (engine, events) = b.build().unwrap();
-    Run { engine, events }
-}
-
-impl Run {
-    async fn send(&self, cmd: Command) {
-        self.engine.send(cmd).await.unwrap();
-    }
-
-    async fn next(&mut self) -> Event {
-        tokio::time::timeout(WAIT, self.events.recv())
-            .await
-            .expect("timed out waiting for an event")
-            .expect("event channel closed")
-    }
-
-    async fn until(&mut self, pred: impl Fn(&Event) -> bool) -> Vec<Event> {
-        let mut out = Vec::new();
-        loop {
-            let ev = self.next().await;
-            let done = pred(&ev);
-            out.push(ev);
-            if done {
-                return out;
-            }
-        }
-    }
-
-    async fn turn_with(&mut self, text: &str) -> Vec<Event> {
-        self.send(Command::SendMessage {
-            id: None,
-            text: text.into(),
-        })
-        .await;
-        self.until(|e| matches!(e, Event::TurnFinished { .. }))
-            .await
-    }
-
-    /// Shut down; the events until the channel closes.
-    async fn stop(mut self) -> Vec<Event> {
-        self.send(Command::Shutdown).await;
-        let mut out = Vec::new();
-        let closed = tokio::time::timeout(WAIT, async {
-            while let Some(ev) = self.events.recv().await {
-                out.push(ev);
-            }
-        })
-        .await;
-        assert!(closed.is_ok(), "the engine did not stop");
-        out
-    }
-
+impl RunExt for Run {
     fn records(&self) -> Vec<SessionRecord> {
         records_at(&self.engine.current_session().1)
     }
@@ -570,7 +503,7 @@ async fn stale_flag_appears_at_next_cache_epoch() {
     let mut run = start(EngineBuilder {
         workspace: Some(ws),
         startup_wait: WAIT,
-        ..fx.builder(cfg, &mock)
+        ..fx.interactive_builder(cfg, &mock)
     });
     let events = run.turn_with("change alpha").await;
     assert_eq!(

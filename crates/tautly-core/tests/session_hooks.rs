@@ -2,37 +2,20 @@
 //! prefix inputs, richer request records, post-images, approval requests, root-relative
 //! paths, the header's config hash, and labels.
 
-use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
 
 use serde_json::json;
 use tautly_core::record::{ApprovalKind, SessionRecord, session_label};
-use tautly_core::{Command, Config, Engine, EngineBuilder, Event, FinishReason, Workspace};
+use tautly_core::{Command, Config, EngineBuilder, Event, FinishReason, Workspace};
 use tautly_provider::mock::{call, text_step, tools_step};
-use tautly_provider::{Block, CanonicalRequest, Catalog, MockProvider, ModelId};
+use tautly_provider::{Block, CanonicalRequest, MockProvider, ModelId};
 use tautly_sandbox::{LocalSandbox, Mode, Sandbox};
 use tautly_session::{BlobRef, HeaderInit, SessionReader, SessionWriter, paths};
+use tautly_testkit::{Fx, MODEL, Run, WAIT, catalog, start};
 use tautly_tools::PersistedEffect;
-use tempfile::TempDir;
-use tokio::sync::mpsc;
-
-const MODEL: &str = "mock/test";
-const WAIT: Duration = Duration::from_secs(30);
 
 fn config(mode: Mode) -> Config {
-    let catalog = Catalog::from_toml(&format!(
-        r#"[models."{MODEL}"]
-context_window = 200000
-max_output = 8000
-parallel_tools = true
-reasoning = "none"
-cache = "none"
-images = false
-edit_format = "str_replace"
-"#
-    ))
-    .unwrap();
+    let catalog = catalog(200_000, 8000, "str_replace");
     let mut c = Config {
         model: ModelId::from(MODEL),
         catalog_overrides: Some(catalog),
@@ -42,37 +25,11 @@ edit_format = "str_replace"
     c
 }
 
-struct Fx {
-    dir: TempDir,
-    home: TempDir,
+trait FxExt {
+    async fn ready_workspace(&self) -> Arc<Workspace>;
 }
 
-impl Fx {
-    fn new() -> Fx {
-        Fx {
-            dir: tempfile::tempdir().unwrap(),
-            home: tempfile::tempdir().unwrap(),
-        }
-    }
-
-    fn root(&self) -> PathBuf {
-        self.dir.path().canonicalize().unwrap()
-    }
-
-    fn write(&self, rel: &str, text: &str) {
-        let p = self.dir.path().join(rel);
-        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
-        std::fs::write(p, text).unwrap();
-    }
-
-    fn builder(&self, cfg: Config, mock: &MockProvider) -> EngineBuilder {
-        EngineBuilder {
-            provider: Some(Arc::new(mock.clone())),
-            data_home: Some(self.home.path().to_path_buf()),
-            ..EngineBuilder::new(cfg, self.dir.path())
-        }
-    }
-
+impl FxExt for Fx {
     async fn ready_workspace(&self) -> Arc<Workspace> {
         let sb: Arc<dyn Sandbox> = Arc::new(LocalSandbox::new(self.root()).unwrap());
         let ws = Workspace::new(sb, self.home.path());
@@ -82,43 +39,14 @@ impl Fx {
     }
 }
 
-struct Run {
-    engine: Engine,
-    events: mpsc::Receiver<Event>,
+trait RunExt {
+    async fn turn_reason(&mut self, text: &str) -> FinishReason;
+    fn reader(&self) -> SessionReader<SessionRecord>;
+    fn records(&self) -> Vec<SessionRecord>;
 }
 
-fn start(b: EngineBuilder) -> Run {
-    let (engine, events) = b.build().unwrap();
-    Run { engine, events }
-}
-
-impl Run {
-    async fn say(&self, text: &str) {
-        self.engine
-            .send(Command::SendMessage {
-                id: None,
-                text: text.into(),
-            })
-            .await
-            .unwrap();
-    }
-
-    async fn until(&mut self, pred: impl Fn(&Event) -> bool) -> Vec<Event> {
-        let mut out = Vec::new();
-        loop {
-            let ev = tokio::time::timeout(WAIT, self.events.recv())
-                .await
-                .expect("timed out waiting for an event")
-                .expect("event channel closed");
-            let done = pred(&ev);
-            out.push(ev);
-            if done {
-                return out;
-            }
-        }
-    }
-
-    async fn turn_with(&mut self, text: &str) -> FinishReason {
+impl RunExt for Run {
+    async fn turn_reason(&mut self, text: &str) -> FinishReason {
         self.say(text).await;
         match self
             .until(|e| matches!(e, Event::TurnFinished { .. }))
@@ -185,7 +113,7 @@ async fn prefix_applied_logged_before_first_request_with_agents_md_and_repo_map_
         startup_wait: WAIT,
         ..fx.builder(config(Mode::Ask), &mock)
     });
-    assert_eq!(run.turn_with("hi").await, FinishReason::Completed);
+    assert_eq!(run.turn_reason("hi").await, FinishReason::Completed);
 
     let recs = run.records();
     let found = prefixes(&recs);
@@ -227,8 +155,8 @@ async fn prefix_applied_relogged_only_when_inputs_change() {
         text_step("two"),
     ]);
     let mut run = start(fx.builder(config(Mode::Ask), &mock));
-    run.turn_with("first").await;
-    run.turn_with("second").await;
+    run.turn_reason("first").await;
+    run.turn_reason("second").await;
     let recs = run.records();
     assert_eq!(request_positions(&recs).len(), 3);
     // Three requests, unchanged inputs: one record. No AGENTS.md and no repo map here.
@@ -247,7 +175,7 @@ async fn prefix_applied_relogged_only_when_inputs_change() {
     fx.write("AGENTS.md", "Prefer small diffs.\n");
     let mock = MockProvider::new(vec![text_step("three")]);
     let mut other = start(fx.builder(config(Mode::Ask), &mock));
-    other.turn_with("third").await;
+    other.turn_reason("third").await;
     let recs2 = other.records();
     let found2 = prefixes(&recs2);
     assert_eq!(found2.len(), 1);
@@ -264,8 +192,8 @@ async fn request_record_has_turn_step_model_and_block_hashes() {
         text_step("two"),
     ]);
     let mut run = start(fx.builder(config(Mode::Ask), &mock));
-    run.turn_with("first").await;
-    run.turn_with("second").await;
+    run.turn_reason("first").await;
+    run.turn_reason("second").await;
     let reqs = mock.requests();
     let got: Vec<_> = run
         .records()
@@ -338,7 +266,7 @@ async fn edit_records_carry_post_image_equal_to_disk() {
         text_step("ok"),
     ]);
     let mut run = start(fx.builder(config(Mode::AutoEdit), &mock));
-    assert_eq!(run.turn_with("edit").await, FinishReason::Completed);
+    assert_eq!(run.turn_reason("edit").await, FinishReason::Completed);
     let reader = run.reader();
     let recs = run.records();
     let edits: Vec<_> = recs
@@ -447,7 +375,7 @@ async fn persisted_paths_are_root_relative() {
         text_step("ok"),
     ]);
     let mut run = start(fx.builder(config(Mode::AutoEdit), &mock));
-    assert_eq!(run.turn_with("go").await, FinishReason::Completed);
+    assert_eq!(run.turn_reason("go").await, FinishReason::Completed);
     let recs = run.records();
     let paths: Vec<String> = recs
         .iter()

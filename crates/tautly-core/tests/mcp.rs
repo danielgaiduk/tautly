@@ -10,7 +10,7 @@ use async_trait::async_trait;
 use serde_json::json;
 use tautly_core::record::ApprovalKind;
 use tautly_core::{
-    Command, Config, Engine, EngineBuilder, Event, McpState, PreExecHook, ServerSpec, SessionRecord,
+    Command, Config, EngineBuilder, Event, McpState, PreExecHook, ServerSpec, SessionRecord,
 };
 use tautly_mcp::approvals::key;
 use tautly_mcp::{APPROVALS_FILE, ApprovalStore};
@@ -20,10 +20,8 @@ use tautly_provider::{
 };
 use tautly_sandbox::Mode;
 use tautly_session::SessionReader;
-use tempfile::TempDir;
-use tokio::sync::mpsc;
+use tautly_testkit::{Fx, MODEL, Run, catalog};
 
-const MODEL: &str = "mock/test";
 const WAIT: Duration = Duration::from_secs(20);
 /// Tools the fixture offers by default.
 const ECHO_TOOL_COUNT: usize = 11;
@@ -51,25 +49,10 @@ fn fixture() -> String {
     .clone()
 }
 
-fn catalog() -> Catalog {
-    Catalog::from_toml(&format!(
-        r#"[models."{MODEL}"]
-context_window = 200000
-max_output = 8000
-parallel_tools = true
-reasoning = "none"
-cache = "none"
-images = false
-edit_format = "str_replace"
-"#
-    ))
-    .unwrap()
-}
-
 fn config(mode: Mode) -> Config {
     let mut c = Config {
         model: ModelId::from(MODEL),
-        catalog_overrides: Some(catalog()),
+        catalog_overrides: Some(catalog(200_000, 8000, "str_replace")),
         ..Config::default()
     };
     c.permissions.mode = mode;
@@ -91,31 +74,17 @@ fn stdio(env: &[(&str, &str)]) -> ServerSpec {
     }
 }
 
-struct Fx {
-    dir: TempDir,
-    home: TempDir,
+trait FxExt {
+    fn path(&self, rel: &str) -> PathBuf;
+    fn project_server(&self, name: &str, env: &[(&str, &str)]);
+    fn loaded(&self, mode: Mode) -> (Config, Vec<String>);
+    fn waiting_builder(&self, cfg: Config, mock: &MockProvider) -> EngineBuilder;
+    fn approvals(&self) -> ApprovalStore;
 }
 
-impl Fx {
-    fn new() -> Fx {
-        Fx {
-            dir: tempfile::tempdir().unwrap(),
-            home: tempfile::tempdir().unwrap(),
-        }
-    }
-
-    fn root(&self) -> PathBuf {
-        self.dir.path().canonicalize().unwrap()
-    }
-
+impl FxExt for Fx {
     fn path(&self, rel: &str) -> PathBuf {
         self.root().join(rel)
-    }
-
-    fn write(&self, rel: &str, text: &str) {
-        let p = self.dir.path().join(rel);
-        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
-        std::fs::write(p, text).unwrap();
     }
 
     /// A project config declaring `[mcp.servers.<name>]` = the fixture with `env`.
@@ -140,12 +109,12 @@ impl Fx {
             Config::load_from(None, &self.root(), tautly_core::CliOverrides::default()).unwrap();
         let mut cfg = loaded.config;
         cfg.model = ModelId::from(MODEL);
-        cfg.catalog_overrides = Some(catalog());
+        cfg.catalog_overrides = Some(catalog(200_000, 8000, "str_replace"));
         cfg.permissions.mode = mode;
         (cfg, loaded.warnings)
     }
 
-    fn builder(&self, cfg: Config, mock: &MockProvider) -> EngineBuilder {
+    fn waiting_builder(&self, cfg: Config, mock: &MockProvider) -> EngineBuilder {
         EngineBuilder {
             provider: Some(Arc::new(mock.clone())),
             data_home: Some(self.home.path().to_path_buf()),
@@ -165,50 +134,18 @@ fn toml_str(s: &str) -> String {
     serde_json::to_string(s).unwrap()
 }
 
-struct Run {
-    engine: Engine,
-    events: mpsc::Receiver<Event>,
-}
-
 fn start(b: EngineBuilder) -> Run {
-    let (engine, events) = b.build().unwrap();
-    Run { engine, events }
+    let mut run = tautly_testkit::start(b);
+    run.wait = WAIT;
+    run
 }
 
-impl Run {
-    async fn send(&self, cmd: Command) {
-        self.engine.send(cmd).await.unwrap();
-    }
+trait RunExt {
+    async fn until_state(&mut self, server: &str, state: McpState) -> Vec<Event>;
+    async fn shutdown(self) -> Vec<Event>;
+}
 
-    async fn next(&mut self) -> Event {
-        tokio::time::timeout(WAIT, self.events.recv())
-            .await
-            .expect("timed out waiting for an event")
-            .expect("event channel closed")
-    }
-
-    async fn until(&mut self, pred: impl Fn(&Event) -> bool) -> Vec<Event> {
-        let mut out = Vec::new();
-        loop {
-            let ev = self.next().await;
-            let done = pred(&ev);
-            out.push(ev);
-            if done {
-                return out;
-            }
-        }
-    }
-
-    async fn turn_with(&mut self, text: &str) -> Vec<Event> {
-        self.send(Command::SendMessage {
-            id: None,
-            text: text.into(),
-        })
-        .await;
-        self.until(|e| matches!(e, Event::TurnFinished { .. }))
-            .await
-    }
-
+impl RunExt for Run {
     /// Events until `server` reports `state`.
     async fn until_state(&mut self, server: &str, state: McpState) -> Vec<Event> {
         self.until(|e| matches!(e, Event::McpServerStatus { server: s, state: st, .. } if s == server && *st == state))
@@ -292,7 +229,7 @@ async fn repo_server_not_spawned_without_approval() {
     let mock = MockProvider::new(vec![]);
     let mut run = start(EngineBuilder {
         interactive: true,
-        ..fx.builder(cfg.clone(), &mock)
+        ..fx.waiting_builder(cfg.clone(), &mock)
     });
     let events = run
         .until(|e| matches!(e, Event::McpServerApprovalRequested { .. }))
@@ -347,7 +284,7 @@ async fn repo_server_approval_request_and_answer_are_logged() {
     let mock = MockProvider::new(vec![]);
     let mut run = start(EngineBuilder {
         interactive: true,
-        ..fx.builder(cfg, &mock)
+        ..fx.waiting_builder(cfg, &mock)
     });
     let events = run
         .until(|e| matches!(e, Event::McpServerApprovalRequested { .. }))
@@ -397,7 +334,7 @@ async fn approval_remembered_by_root_and_launch_hash() {
 
     // Headless, no flag: an approved server starts without asking.
     let mock = MockProvider::new(vec![]);
-    let mut run = start(fx.builder(cfg, &mock));
+    let mut run = start(fx.waiting_builder(cfg, &mock));
     let events = run.until_state("echo", McpState::Ready).await;
     assert!(approval_request(&events).is_none());
     run.shutdown().await;
@@ -420,7 +357,7 @@ async fn changed_command_asks_again() {
     let mock = MockProvider::new(vec![]);
     let mut run = start(EngineBuilder {
         interactive: true,
-        ..fx.builder(cfg, &mock)
+        ..fx.waiting_builder(cfg, &mock)
     });
     let events = run
         .until(|e| matches!(e, Event::McpServerApprovalRequested { .. }))
@@ -437,7 +374,7 @@ async fn headless_repo_server_skipped_without_flag_started_with_approve_mcp_and_
     let (cfg, _) = fx.loaded(Mode::Ask);
 
     let mock = MockProvider::new(vec![text_step_no_usage("one")]);
-    let mut run = start(fx.builder(cfg.clone(), &mock));
+    let mut run = start(fx.waiting_builder(cfg.clone(), &mock));
     let events = run.until_state("echo", McpState::Skipped).await;
     assert!(approval_request(&events).is_none());
     let skipped = events.iter().find_map(|e| match e {
@@ -453,7 +390,7 @@ async fn headless_repo_server_skipped_without_flag_started_with_approve_mcp_and_
     let mock = MockProvider::new(vec![text_step_no_usage("two")]);
     let mut run = start(EngineBuilder {
         approve_mcp: true,
-        ..fx.builder(cfg.clone(), &mock)
+        ..fx.waiting_builder(cfg.clone(), &mock)
     });
     run.until_state("echo", McpState::Ready).await;
     run.turn_with("hi").await;
@@ -477,7 +414,7 @@ async fn user_server_shadows_repo_server_with_warning() {
     let mock = MockProvider::new(vec![]);
     let mut run = start(EngineBuilder {
         interactive: true,
-        ..fx.builder(cfg, &mock)
+        ..fx.waiting_builder(cfg, &mock)
     });
     let events = run.until_state("echo", McpState::Ready).await;
     assert!(approval_request(&events).is_none());
@@ -559,7 +496,7 @@ async fn deny_lasts_for_the_session() {
     let mock = MockProvider::new(vec![text_step_no_usage("a"), text_step_no_usage("b")]);
     let mut run = start(EngineBuilder {
         interactive: true,
-        ..fx.builder(cfg.clone(), &mock)
+        ..fx.waiting_builder(cfg.clone(), &mock)
     });
     let events = run
         .until(|e| matches!(e, Event::McpServerApprovalRequested { .. }))
@@ -585,7 +522,7 @@ async fn deny_lasts_for_the_session() {
     let mock = MockProvider::new(vec![]);
     let mut run = start(EngineBuilder {
         interactive: true,
-        ..fx.builder(cfg, &mock)
+        ..fx.waiting_builder(cfg, &mock)
     });
     let events = run
         .until(|e| matches!(e, Event::McpServerApprovalRequested { .. }))
@@ -607,7 +544,7 @@ async fn mcp_json_ignored_when_import_mcp_json_false() {
     let mock = MockProvider::new(vec![]);
     let mut run = start(EngineBuilder {
         interactive: true,
-        ..fx.builder(cfg.clone(), &mock)
+        ..fx.waiting_builder(cfg.clone(), &mock)
     });
     let events = run.until_state("echo", McpState::Ready).await;
     assert!(approval_request(&events).is_none());
@@ -626,7 +563,7 @@ async fn mcp_json_ignored_when_import_mcp_json_false() {
     let mock = MockProvider::new(vec![]);
     let mut run = start(EngineBuilder {
         interactive: true,
-        ..fx.builder(cfg, &mock)
+        ..fx.waiting_builder(cfg, &mock)
     });
     let events = run
         .until(|e| matches!(e, Event::McpServerApprovalRequested { .. }))
@@ -649,7 +586,7 @@ fn with_user_server(mode: Mode, env: &[(&str, &str)]) -> Config {
 async fn mcp_tools_sorted_by_name_in_request() {
     let fx = Fx::new();
     let mock = MockProvider::new(vec![text_step_no_usage("done")]);
-    let mut run = start(fx.builder(with_user_server(Mode::Ask, &[]), &mock));
+    let mut run = start(fx.waiting_builder(with_user_server(Mode::Ask, &[]), &mock));
     run.turn_with("hi").await;
     let req = &mock.requests()[0];
     let names = tool_names(req);
@@ -672,7 +609,7 @@ async fn mcp_call_asks_in_ask_and_auto_edit_allowed_in_yolo() {
         ]);
         let mut run = start(EngineBuilder {
             interactive: true,
-            ..fx.builder(with_user_server(mode, &[]), &mock)
+            ..fx.waiting_builder(with_user_server(mode, &[]), &mock)
         });
         run.send(Command::SendMessage {
             id: None,
@@ -706,7 +643,7 @@ async fn mcp_call_asks_in_ask_and_auto_edit_allowed_in_yolo() {
     ]);
     let mut run = start(EngineBuilder {
         interactive: true,
-        ..fx.builder(with_user_server(Mode::Yolo, &[]), &mock)
+        ..fx.waiting_builder(with_user_server(Mode::Yolo, &[]), &mock)
     });
     let events = run.turn_with("go").await;
     assert!(
@@ -736,7 +673,7 @@ async fn mcp_rule_by_name_glob_allows() {
         text_step_no_usage("done"),
     ]);
     // Headless: anything that asked would be denied.
-    let mut run = start(fx.builder(cfg, &mock));
+    let mut run = start(fx.waiting_builder(cfg, &mock));
     let events = run.turn_with("go").await;
     let finished: Vec<(String, bool)> = events
         .iter()
@@ -762,7 +699,7 @@ async fn first_request_waits_up_to_startup_timeout() {
     let mut cfg = with_user_server(Mode::Ask, &[("ECHO_START_DELAY_MS", "700")]);
     cfg.mcp.startup_timeout_ms = 60_000;
     let mock = MockProvider::new(vec![text_step_no_usage("done")]);
-    let mut run = start(fx.builder(cfg, &mock));
+    let mut run = start(fx.waiting_builder(cfg, &mock));
     run.turn_with("hi").await;
     assert_eq!(mcp_names(&mock.requests()[0]).len(), ECHO_TOOL_COUNT);
     run.shutdown().await;
@@ -773,7 +710,7 @@ async fn first_request_waits_up_to_startup_timeout() {
     let mut cfg = with_user_server(Mode::Ask, &[("ECHO_START_DELAY_MS", "60000")]);
     cfg.mcp.startup_timeout_ms = 300;
     let mock = MockProvider::new(vec![text_step_no_usage("done")]);
-    let mut run = start(fx.builder(cfg, &mock));
+    let mut run = start(fx.waiting_builder(cfg, &mock));
     let t = Instant::now();
     run.turn_with("hi").await;
     assert!(t.elapsed() < Duration::from_secs(20), "{:?}", t.elapsed());
@@ -799,7 +736,7 @@ async fn late_server_joins_at_next_user_turn_once() {
         tools_step(vec![state("c")]),
         text_step_no_usage("turn 2"),
     ]);
-    let mut run = start(fx.builder(cfg, &mock));
+    let mut run = start(fx.waiting_builder(cfg, &mock));
     run.turn_with("one").await;
     let reqs = mock.requests();
     assert!(mcp_names(&reqs[0]).is_empty() && mcp_names(&reqs[1]).is_empty());
@@ -830,7 +767,7 @@ async fn list_changed_applies_at_next_user_turn() {
         text_step_no_usage("turn 1"),
         text_step_no_usage("turn 2"),
     ]);
-    let mut run = start(fx.builder(with_user_server(Mode::Yolo, &[]), &mock));
+    let mut run = start(fx.waiting_builder(with_user_server(Mode::Yolo, &[]), &mock));
     run.turn_with("one").await;
     // Give the notification time to arrive and the list to be fetched again.
     tokio::time::sleep(Duration::from_millis(800)).await;
@@ -890,7 +827,7 @@ async fn checkpoint_taken_before_stdio_mcp_call() {
     ]);
     let mut run = start(EngineBuilder {
         pre_exec: Some(hook.clone()),
-        ..fx.builder(
+        ..fx.waiting_builder(
             with_user_server(Mode::Yolo, &[("ECHO_CALLS", &calls.to_string_lossy())]),
             &mock,
         )
@@ -911,7 +848,7 @@ async fn identical_failed_mcp_call_blocked() {
         tools_step(vec![call("c2", "mcp__echo__fail", json!({"why": 1}))]),
         text_step_no_usage("done"),
     ]);
-    let mut run = start(fx.builder(with_user_server(Mode::Yolo, &[]), &mock));
+    let mut run = start(fx.waiting_builder(with_user_server(Mode::Yolo, &[]), &mock));
     let events = run.turn_with("go").await;
     let blocked: Vec<bool> = events
         .iter()
@@ -931,7 +868,7 @@ async fn client_servers_are_trusted() {
     let mut run = start(EngineBuilder {
         interactive: true,
         client_mcp: vec![("editor".into(), stdio(&[]))],
-        ..fx.builder(config(Mode::Ask), &mock)
+        ..fx.waiting_builder(config(Mode::Ask), &mock)
     });
     let events = run.until_state("editor", McpState::Ready).await;
     assert!(approval_request(&events).is_none());
@@ -1036,7 +973,7 @@ async fn changed_env_value_asks_again() {
     let mock = MockProvider::new(vec![]);
     let mut run = start(EngineBuilder {
         interactive: true,
-        ..fx.builder(cfg, &mock)
+        ..fx.waiting_builder(cfg, &mock)
     });
     let events = run
         .until(|e| matches!(e, Event::McpServerApprovalRequested { .. }))
@@ -1084,7 +1021,7 @@ async fn stdio_servers_get_a_private_pycache_prefix() {
     let k = key(&fx.root(), "echo", &cfg.project_mcp_servers["echo"]);
     fx.approvals().approve(&k, &fx.root(), "echo").unwrap();
     let mock = MockProvider::new(vec![]);
-    let mut run = start(fx.builder(cfg, &mock));
+    let mut run = start(fx.waiting_builder(cfg, &mock));
     let events = run.until_state("echo", McpState::Ready).await;
     run.shutdown().await;
     let warned: Vec<&String> = events
@@ -1130,7 +1067,7 @@ async fn a_bad_private_pycache_dir_is_replaced_for_the_run() {
     let k = key(&fx.root(), "echo", &cfg.project_mcp_servers["echo"]);
     fx.approvals().approve(&k, &fx.root(), "echo").unwrap();
     let mock = MockProvider::new(vec![]);
-    let mut run = start(fx.builder(cfg, &mock));
+    let mut run = start(fx.waiting_builder(cfg, &mock));
     let events = run.until_state("echo", McpState::Ready).await;
     let got = PathBuf::from(pycache_prefix_seen(&seen));
     let warned: Vec<&String> = events
@@ -1175,7 +1112,7 @@ async fn unhashable_server_is_approved_for_this_run_only() {
     let mock = MockProvider::new(vec![]);
     let mut run = start(EngineBuilder {
         interactive: true,
-        ..fx.builder(cfg, &mock)
+        ..fx.waiting_builder(cfg, &mock)
     });
     let events = run
         .until(|e| matches!(e, Event::McpServerApprovalRequested { .. }))
@@ -1211,7 +1148,7 @@ async fn rewritten_server_script_asks_again() {
 
     // Unchanged: remembered, started without asking.
     let mock = MockProvider::new(vec![]);
-    let mut run = start(fx.builder(cfg.clone(), &mock));
+    let mut run = start(fx.waiting_builder(cfg.clone(), &mock));
     let events = run.until_state("echo", McpState::Ready).await;
     assert!(approval_request(&events).is_none());
     run.shutdown().await;
@@ -1225,7 +1162,7 @@ async fn rewritten_server_script_asks_again() {
     let mock = MockProvider::new(vec![]);
     let mut run = start(EngineBuilder {
         interactive: true,
-        ..fx.builder(cfg, &mock)
+        ..fx.waiting_builder(cfg, &mock)
     });
     let events = run
         .until(|e| matches!(e, Event::McpServerApprovalRequested { .. }))
@@ -1259,7 +1196,7 @@ async fn repository_server_names_cannot_borrow_user_rules() {
     let mock = MockProvider::new(vec![text_step_no_usage("done")]);
     let mut run = start(EngineBuilder {
         approve_mcp: true,
-        ..fx.builder(cfg, &mock)
+        ..fx.waiting_builder(cfg, &mock)
     });
     let ready = |events: &[Event], name: &str| {
         events.iter().any(|e| matches!(e, Event::McpServerStatus { server, state: McpState::Ready, .. } if server == name))
@@ -1323,7 +1260,7 @@ async fn approval_prompt_escapes_control_characters() {
     let mock = MockProvider::new(vec![]);
     let mut run = start(EngineBuilder {
         interactive: true,
-        ..fx.builder(cfg, &mock)
+        ..fx.waiting_builder(cfg, &mock)
     });
     let events = run
         .until(|e| matches!(e, Event::McpServerApprovalRequested { .. }))
@@ -1346,7 +1283,7 @@ async fn pending_approval_is_announced_again_each_turn() {
     let mock = MockProvider::new(vec![text_step_no_usage("a"), text_step_no_usage("b")]);
     let mut run = start(EngineBuilder {
         interactive: true,
-        ..fx.builder(cfg, &mock)
+        ..fx.waiting_builder(cfg, &mock)
     });
     let events = run
         .until(|e| matches!(e, Event::McpServerApprovalRequested { .. }))
@@ -1374,7 +1311,7 @@ async fn dead_server_tools_removed_at_next_user_turn() {
         text_step_no_usage("turn 1"),
         text_step_no_usage("turn 2"),
     ]);
-    let mut run = start(fx.builder(with_user_server(Mode::Yolo, &[]), &mock));
+    let mut run = start(fx.waiting_builder(with_user_server(Mode::Yolo, &[]), &mock));
     let first = run.turn_with("one").await;
     // The server may be reported dead during turn one already.
     let failed = |e: &Event| matches!(e, Event::McpServerStatus { server, state: McpState::Failed, .. } if server == "echo");
@@ -1421,7 +1358,7 @@ edit_format = "str_replace"
         text_step_no_usage("turn 1"),
         text_step_no_usage("turn 2"),
     ]);
-    let mut run = start(fx.builder(cfg, &mock));
+    let mut run = start(fx.waiting_builder(cfg, &mock));
     let events = run.turn_with("one").await;
     let failed = |e: &Event| matches!(e, Event::McpServerStatus { server, state: McpState::Failed, .. } if server == "echo");
     if !events.iter().any(failed) {
@@ -1462,7 +1399,7 @@ async fn mcp_json_fifo_does_not_block_startup() {
     // SAFETY: a valid NUL-terminated path.
     assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o644) }, 0);
     let mock = MockProvider::new(vec![text_step_no_usage("done")]);
-    let mut run = start(fx.builder(with_user_server(Mode::Ask, &[]), &mock));
+    let mut run = start(fx.waiting_builder(with_user_server(Mode::Ask, &[]), &mock));
     let events = run.until_state("echo", McpState::Ready).await;
     assert!(
         events
@@ -1493,7 +1430,7 @@ async fn cancel_during_the_mcp_startup_wait_ends_the_turn_within_200ms() {
         },
     );
     let mock = MockProvider::new(vec![text_step_no_usage("never sent")]);
-    let mut run = start(fx.builder(cfg, &mock));
+    let mut run = start(fx.waiting_builder(cfg, &mock));
     run.send(Command::SendMessage {
         id: None,
         text: "go".into(),
@@ -1566,21 +1503,21 @@ async fn a_resumed_mcp_session_estimates_as_the_live_one_and_does_not_warn_of_ne
         text_with_usage("one", 6000),
         text_with_usage("two", 6000),
     ]);
-    let mut run = start(fx.builder(cfg.clone(), &live));
+    let mut run = start(fx.waiting_builder(cfg.clone(), &live));
     run.turn_with("first").await;
     let live_two = run.turn_with("second").await;
     run.shutdown().await;
 
     // The same first turn in another session, then resumed for the second.
     let first = MockProvider::new(vec![text_with_usage("one", 6000)]);
-    let mut run = start(fx.builder(cfg.clone(), &first));
+    let mut run = start(fx.waiting_builder(cfg.clone(), &first));
     let id = run.engine.session_id().to_string();
     run.turn_with("first").await;
     run.shutdown().await;
     let resumed = MockProvider::new(vec![text_with_usage("two", 6000)]);
     let mut run = start(EngineBuilder {
         resume: Some(id),
-        ..fx.builder(cfg, &resumed)
+        ..fx.waiting_builder(cfg, &resumed)
     });
     let resumed_two = run.turn_with("second").await;
     run.shutdown().await;
@@ -1602,7 +1539,7 @@ async fn a_resumed_mcp_session_estimates_as_the_live_one_and_does_not_warn_of_ne
 async fn a_resumed_session_whose_mcp_tools_are_gone_warns_once_at_its_first_request() {
     let fx = Fx::new();
     let first = MockProvider::new(vec![text_with_usage("one", 6000)]);
-    let mut run = start(fx.builder(with_user_server(Mode::Ask, &[]), &first));
+    let mut run = start(fx.waiting_builder(with_user_server(Mode::Ask, &[]), &first));
     let id = run.engine.session_id().to_string();
     run.turn_with("first").await;
     run.shutdown().await;
@@ -1613,7 +1550,7 @@ async fn a_resumed_session_whose_mcp_tools_are_gone_warns_once_at_its_first_requ
     ]);
     let mut run = start(EngineBuilder {
         resume: Some(id),
-        ..fx.builder(config(Mode::Ask), &resumed)
+        ..fx.waiting_builder(config(Mode::Ask), &resumed)
     });
     let two = run.turn_with("second").await;
     let three = run.turn_with("third").await;
@@ -1657,7 +1594,7 @@ async fn unreadable_approvals_fail_closed_and_unsaved_ones_last_one_session() {
     let mock = MockProvider::new(vec![]);
     let mut run = start(EngineBuilder {
         interactive: true,
-        ..fx.builder(cfg, &mock)
+        ..fx.waiting_builder(cfg, &mock)
     });
     let events = run
         .until(|e| matches!(e, Event::McpServerApprovalRequested { .. }))

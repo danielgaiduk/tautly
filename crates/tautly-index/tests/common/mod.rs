@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 
 use tautly_index::Index;
 use tautly_sandbox::{FileMeta, LocalSandbox, Sandbox, SandboxError};
+use tautly_testkit::{Delegate, Delegating};
 
 pub fn write_all(root: &Path, files: &[(&str, &str)]) {
     for (rel, content) in files {
@@ -75,49 +76,14 @@ pub struct BlockingSandbox {
 }
 
 #[async_trait::async_trait]
-impl Sandbox for BlockingSandbox {
-    fn root(&self) -> &Path {
-        self.inner.root()
-    }
-    fn resolve(&self, p: &Path) -> Result<PathBuf, SandboxError> {
-        self.inner.resolve(p)
-    }
-    async fn read(&self, p: &Path) -> Result<Vec<u8>, SandboxError> {
-        self.inner.read(p).await
-    }
-    async fn metadata(&self, p: &Path) -> Result<FileMeta, SandboxError> {
-        self.inner.metadata(p).await
-    }
-    async fn write_atomic(
-        &self,
-        p: &Path,
-        bytes: &[u8],
-        mode: Option<u32>,
-    ) -> Result<(), SandboxError> {
-        self.inner.write_atomic(p, bytes, mode).await
-    }
-    async fn remove_file(&self, p: &Path) -> Result<(), SandboxError> {
-        self.inner.remove_file(p).await
-    }
-    async fn spill(&self, bytes: &[u8]) -> Result<PathBuf, SandboxError> {
-        self.inner.spill(bytes).await
-    }
-    async fn spawn(
-        &self,
-        spec: tautly_sandbox::SpawnSpec,
-    ) -> Result<tautly_sandbox::Child, SandboxError> {
-        self.inner.spawn(spec).await
+impl Delegate for BlockingSandbox {
+    fn inner(&self) -> &LocalSandbox {
+        &self.inner
     }
     fn walker(&self, base: &Path) -> Result<ignore::WalkBuilder, SandboxError> {
         let mut b = self.inner.walker(base)?;
         b.filter_entry(|e| e.file_name() != "blocked");
         Ok(b)
-    }
-    async fn http_get(
-        &self,
-        url: &tautly_sandbox::Url,
-    ) -> Result<tautly_sandbox::HttpResponse, SandboxError> {
-        self.inner.http_get(url).await
     }
 }
 
@@ -163,15 +129,15 @@ pub struct ProbeSandbox {
 }
 
 impl ProbeSandbox {
-    pub fn new(root: &Path) -> Arc<ProbeSandbox> {
-        Arc::new(ProbeSandbox {
+    pub fn new(root: &Path) -> Arc<Delegating<ProbeSandbox>> {
+        Arc::new(Delegating(ProbeSandbox {
             inner: LocalSandbox::new(root.to_path_buf()).unwrap(),
             metadata_calls: std::sync::atomic::AtomicUsize::new(0),
             walker_calls: std::sync::atomic::AtomicUsize::new(0),
             fail_read: Default::default(),
             fail_metadata: Default::default(),
             fail_walk: std::sync::atomic::AtomicBool::new(false),
-        })
+        }))
     }
 
     pub fn calls(&self) -> usize {
@@ -203,12 +169,9 @@ impl ProbeSandbox {
 }
 
 #[async_trait::async_trait]
-impl Sandbox for ProbeSandbox {
-    fn root(&self) -> &Path {
-        self.inner.root()
-    }
-    fn resolve(&self, p: &Path) -> Result<PathBuf, SandboxError> {
-        self.inner.resolve(p)
+impl Delegate for ProbeSandbox {
+    fn inner(&self) -> &LocalSandbox {
+        &self.inner
     }
     async fn read(&self, p: &Path) -> Result<Vec<u8>, SandboxError> {
         let rel = p.strip_prefix(self.inner.root()).unwrap_or(p);
@@ -232,26 +195,6 @@ impl Sandbox for ProbeSandbox {
         }
         self.inner.metadata(p).await
     }
-    async fn write_atomic(
-        &self,
-        p: &Path,
-        bytes: &[u8],
-        mode: Option<u32>,
-    ) -> Result<(), SandboxError> {
-        self.inner.write_atomic(p, bytes, mode).await
-    }
-    async fn remove_file(&self, p: &Path) -> Result<(), SandboxError> {
-        self.inner.remove_file(p).await
-    }
-    async fn spill(&self, bytes: &[u8]) -> Result<PathBuf, SandboxError> {
-        self.inner.spill(bytes).await
-    }
-    async fn spawn(
-        &self,
-        spec: tautly_sandbox::SpawnSpec,
-    ) -> Result<tautly_sandbox::Child, SandboxError> {
-        self.inner.spawn(spec).await
-    }
     fn walker(&self, base: &Path) -> Result<ignore::WalkBuilder, SandboxError> {
         self.walker_calls
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -259,12 +202,6 @@ impl Sandbox for ProbeSandbox {
             return Err(SandboxError::Denied("injected walk failure".into()));
         }
         self.inner.walker(base)
-    }
-    async fn http_get(
-        &self,
-        url: &tautly_sandbox::Url,
-    ) -> Result<tautly_sandbox::HttpResponse, SandboxError> {
-        self.inner.http_get(url).await
     }
 }
 
@@ -276,49 +213,14 @@ pub struct HookSandbox {
 }
 
 #[async_trait::async_trait]
-impl Sandbox for HookSandbox {
-    fn root(&self) -> &Path {
-        self.inner.root()
-    }
-    fn resolve(&self, p: &Path) -> Result<PathBuf, SandboxError> {
-        self.inner.resolve(p)
-    }
-    async fn read(&self, p: &Path) -> Result<Vec<u8>, SandboxError> {
-        self.inner.read(p).await
-    }
-    async fn metadata(&self, p: &Path) -> Result<FileMeta, SandboxError> {
-        self.inner.metadata(p).await
-    }
-    async fn write_atomic(
-        &self,
-        p: &Path,
-        bytes: &[u8],
-        mode: Option<u32>,
-    ) -> Result<(), SandboxError> {
-        self.inner.write_atomic(p, bytes, mode).await
-    }
-    async fn remove_file(&self, p: &Path) -> Result<(), SandboxError> {
-        self.inner.remove_file(p).await
-    }
-    async fn spill(&self, bytes: &[u8]) -> Result<PathBuf, SandboxError> {
-        self.inner.spill(bytes).await
-    }
-    async fn spawn(
-        &self,
-        spec: tautly_sandbox::SpawnSpec,
-    ) -> Result<tautly_sandbox::Child, SandboxError> {
-        self.inner.spawn(spec).await
+impl Delegate for HookSandbox {
+    fn inner(&self) -> &LocalSandbox {
+        &self.inner
     }
     fn walker(&self, base: &Path) -> Result<ignore::WalkBuilder, SandboxError> {
         if let Some(hook) = self.on_walk.lock().unwrap().take() {
             hook();
         }
         self.inner.walker(base)
-    }
-    async fn http_get(
-        &self,
-        url: &tautly_sandbox::Url,
-    ) -> Result<tautly_sandbox::HttpResponse, SandboxError> {
-        self.inner.http_get(url).await
     }
 }

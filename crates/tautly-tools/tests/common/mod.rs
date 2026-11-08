@@ -11,9 +11,8 @@ use serde_json::Value;
 use std::sync::Arc;
 use tautly_index::{Index, WatchHandle};
 use tautly_provider::EditFormat;
-use tautly_sandbox::{
-    Child, FileMeta, HttpResponse, LocalSandbox, Sandbox, SandboxError, SpawnSpec, Url,
-};
+use tautly_sandbox::{LocalSandbox, Sandbox, SandboxError};
+use tautly_testkit::{Delegate, Delegating};
 use tautly_tools::{Tool, ToolCx, ToolResult};
 use tempfile::TempDir;
 
@@ -25,12 +24,12 @@ pub struct Counting {
 }
 
 impl Counting {
-    pub fn new(root: &Path) -> Self {
-        Self {
+    pub fn new(root: &Path) -> Delegating<Self> {
+        Delegating(Self {
             inner: LocalSandbox::new(root.to_path_buf()).unwrap(),
             reads: Mutex::new(Vec::new()),
             walks: AtomicUsize::new(0),
-        }
+        })
     }
 
     /// Root-relative paths read since the last reset, sorted.
@@ -62,43 +61,17 @@ impl Counting {
 }
 
 #[async_trait]
-impl Sandbox for Counting {
-    fn root(&self) -> &Path {
-        self.inner.root()
-    }
-    fn resolve(&self, p: &Path) -> Result<PathBuf, SandboxError> {
-        self.inner.resolve(p)
+impl Delegate for Counting {
+    fn inner(&self) -> &LocalSandbox {
+        &self.inner
     }
     async fn read(&self, p: &Path) -> Result<Vec<u8>, SandboxError> {
         self.reads.lock().unwrap().push(p.to_path_buf());
         self.inner.read(p).await
     }
-    async fn metadata(&self, p: &Path) -> Result<FileMeta, SandboxError> {
-        self.inner.metadata(p).await
-    }
-    async fn write_atomic(
-        &self,
-        p: &Path,
-        bytes: &[u8],
-        mode: Option<u32>,
-    ) -> Result<(), SandboxError> {
-        self.inner.write_atomic(p, bytes, mode).await
-    }
-    async fn remove_file(&self, p: &Path) -> Result<(), SandboxError> {
-        self.inner.remove_file(p).await
-    }
-    async fn spill(&self, bytes: &[u8]) -> Result<PathBuf, SandboxError> {
-        self.inner.spill(bytes).await
-    }
-    async fn spawn(&self, spec: SpawnSpec) -> Result<Child, SandboxError> {
-        self.inner.spawn(spec).await
-    }
     fn walker(&self, base: &Path) -> Result<ignore::WalkBuilder, SandboxError> {
         self.walks.fetch_add(1, Ordering::SeqCst);
         self.inner.walker(base)
-    }
-    async fn http_get(&self, url: &Url) -> Result<HttpResponse, SandboxError> {
-        self.inner.http_get(url).await
     }
 }
 
@@ -116,7 +89,7 @@ pub enum Built {
 pub struct Env {
     pub dir: TempDir,
     _db: TempDir,
-    pub sb: Counting,
+    pub sb: Delegating<Counting>,
     pub index: Arc<Index>,
     pub cx: ToolCx,
     /// The index's file watcher; the tools trust the index only while it runs.

@@ -4,9 +4,8 @@ use std::path::{Path, PathBuf};
 use async_trait::async_trait;
 use serde_json::{Value, json};
 use tautly_provider::{Capabilities, EditFormat};
-use tautly_sandbox::{
-    Child, Effect, FileMeta, HttpResponse, LocalSandbox, Sandbox, SandboxError, SpawnSpec, Url,
-};
+use tautly_sandbox::{Effect, LocalSandbox, Sandbox, SandboxError};
+use tautly_testkit::{Delegate, Delegating};
 use tautly_tools::edit::hashline::{self, Anchor, HashlineError, HashlineOp};
 use tautly_tools::edit::patch::{self, PatchError, PatchOp};
 use tautly_tools::{AppliedEffect, EditTool, ReadTool, Tool, ToolCx, ToolResult};
@@ -647,18 +646,9 @@ struct FailingSandbox {
 }
 
 #[async_trait]
-impl Sandbox for FailingSandbox {
-    fn root(&self) -> &Path {
-        self.inner.root()
-    }
-    fn resolve(&self, p: &Path) -> Result<PathBuf, SandboxError> {
-        self.inner.resolve(p)
-    }
-    async fn read(&self, p: &Path) -> Result<Vec<u8>, SandboxError> {
-        self.inner.read(p).await
-    }
-    async fn metadata(&self, p: &Path) -> Result<FileMeta, SandboxError> {
-        self.inner.metadata(p).await
+impl Delegate for FailingSandbox {
+    fn inner(&self) -> &LocalSandbox {
+        &self.inner
     }
     async fn write_atomic(
         &self,
@@ -671,21 +661,6 @@ impl Sandbox for FailingSandbox {
         }
         self.inner.write_atomic(p, bytes, mode).await
     }
-    async fn remove_file(&self, p: &Path) -> Result<(), SandboxError> {
-        self.inner.remove_file(p).await
-    }
-    async fn spill(&self, bytes: &[u8]) -> Result<PathBuf, SandboxError> {
-        self.inner.spill(bytes).await
-    }
-    async fn spawn(&self, spec: SpawnSpec) -> Result<Child, SandboxError> {
-        self.inner.spawn(spec).await
-    }
-    fn walker(&self, base: &Path) -> Result<ignore::WalkBuilder, SandboxError> {
-        self.inner.walker(base)
-    }
-    async fn http_get(&self, url: &Url) -> Result<HttpResponse, SandboxError> {
-        self.inner.http_get(url).await
-    }
 }
 
 #[tokio::test]
@@ -694,10 +669,10 @@ async fn patch_write_failure_rolls_back_earlier_files() {
     let local = LocalSandbox::new(dir.path().to_path_buf()).unwrap();
     let e = Env {
         cx: ToolCx::new(EditFormat::Patch, dir.path().join(".spill")).with_turn(1),
-        sb: FailingSandbox {
+        sb: Delegating(FailingSandbox {
             inner: local,
             fail_suffix: "boom.txt",
-        },
+        }),
         dir,
     };
     put(&e, "a.txt", b"one\ntwo\n").await;

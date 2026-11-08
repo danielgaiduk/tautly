@@ -4,7 +4,6 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::process::Command as Process;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -20,57 +19,28 @@ use tautly_provider::mock::{call, text_step_no_usage, tools_step};
 use tautly_provider::{CanonicalRequest, Catalog, MockProvider, MockTurn, ModelId, ProviderEvent};
 use tautly_sandbox::{LocalSandbox, Mode, Sandbox};
 use tautly_session::{Origin, SessionReader};
-use tempfile::TempDir;
-use tokio::sync::mpsc;
-
-const MODEL: &str = "mock/test";
-const WAIT: Duration = Duration::from_secs(30);
+use tautly_testkit::Repo;
+use tautly_testkit::{Delegate, Delegating, catalog};
+use tautly_testkit::{MODEL, Run, WAIT, start};
 
 // ------------------------------------------------------------------------ fixtures
 
-struct Repo {
-    dir: TempDir,
-    home: TempDir,
+/// `a.txt`, the file of a plain work tree.
+const A: &[(&str, &str)] = &[("a.txt", "zero\n")];
+/// `a.txt` and `b.txt`, committed in a repository.
+const AB: &[(&str, &str)] = &[("a.txt", "zero\n"), ("b.txt", "bee\n")];
+
+trait RepoExt {
+    fn home(&self) -> &Path;
+    fn files(&self) -> BTreeMap<String, String>;
+    fn config() -> Config;
+    fn builder(&self, mock: &MockProvider) -> EngineBuilder;
+    fn project(&self) -> String;
 }
 
-impl Repo {
-    /// A git repository with `a.txt` and `b.txt` committed.
-    fn git_repo() -> Repo {
-        let repo = Repo::plain();
-        repo.git(&["init", "-q", "-b", "main"]);
-        repo.write("a.txt", "zero\n");
-        repo.write("b.txt", "bee\n");
-        repo.git(&["add", "-A"]);
-        repo.git(&["commit", "-q", "-m", "init"]);
-        repo
-    }
-
-    /// A directory that is not a git work tree, with `a.txt`.
-    fn plain() -> Repo {
-        let repo = Repo {
-            dir: tempfile::tempdir().unwrap(),
-            home: tempfile::tempdir().unwrap(),
-        };
-        repo.write("a.txt", "zero\n");
-        repo
-    }
-
-    fn root(&self) -> PathBuf {
-        self.dir.path().canonicalize().unwrap()
-    }
-
+impl RepoExt for Repo {
     fn home(&self) -> &Path {
         self.home.path()
-    }
-
-    fn write(&self, rel: &str, text: &str) {
-        let p = self.root().join(rel);
-        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
-        std::fs::write(p, text).unwrap();
-    }
-
-    fn read(&self, rel: &str) -> Option<String> {
-        std::fs::read_to_string(self.root().join(rel)).ok()
     }
 
     /// Every file of the work tree (outside `.git` and `.tautly`) and its content.
@@ -94,33 +64,8 @@ impl Repo {
         out
     }
 
-    fn git(&self, args: &[&str]) -> Option<String> {
-        let out = Process::new("git")
-            .current_dir(self.root())
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .args(["-c", "user.name=T", "-c", "user.email=t@example.com"])
-            .args(args)
-            .output()
-            .unwrap();
-        out.status
-            .success()
-            .then(|| String::from_utf8(out.stdout).unwrap())
-    }
-
     fn config() -> Config {
-        let catalog = Catalog::from_toml(&format!(
-            r#"[models."{MODEL}"]
-context_window = 200000
-max_output = 8000
-parallel_tools = true
-reasoning = "none"
-cache = "none"
-images = false
-edit_format = "str_replace"
-"#
-        ))
-        .unwrap();
+        let catalog = catalog(200_000, 8000, "str_replace");
         let mut cfg = Config {
             model: ModelId::from(MODEL),
             catalog_overrides: Some(catalog),
@@ -154,49 +99,14 @@ fn bash(id: &str, command: &str) -> ProviderEvent {
     call(id, "bash", json!({ "command": command }))
 }
 
-struct Run {
-    engine: tautly_core::Engine,
-    events: mpsc::Receiver<Event>,
+trait RunExt {
+    async fn answer(&mut self, cmd: Command) -> Answer;
+    async fn rewind(&mut self, at: u32, dry_run: bool, overwrite: &[&str]) -> Answer;
+    async fn switch(&mut self, id: &str, overwrite: &[&str]) -> Answer;
+    fn current(&self) -> (String, PathBuf);
 }
 
-impl Run {
-    fn start(b: EngineBuilder) -> Run {
-        let (engine, events) = b.build().unwrap();
-        Run { engine, events }
-    }
-
-    async fn next(&mut self) -> Event {
-        tokio::time::timeout(WAIT, self.events.recv())
-            .await
-            .expect("timed out waiting for an event")
-            .expect("event channel closed")
-    }
-
-    /// Events until one `until` accepts (included).
-    async fn until(&mut self, until: impl Fn(&Event) -> bool) -> Vec<Event> {
-        let mut seen = Vec::new();
-        loop {
-            let ev = self.next().await;
-            let done = until(&ev);
-            seen.push(ev);
-            if done {
-                return seen;
-            }
-        }
-    }
-
-    async fn turn_with(&mut self, text: &str) {
-        self.engine
-            .send(Command::SendMessage {
-                id: None,
-                text: text.into(),
-            })
-            .await
-            .unwrap();
-        self.until(|e| matches!(e, Event::TurnFinished { .. }))
-            .await;
-    }
-
+impl RunExt for Run {
     /// Send `cmd` and wait for its answer: `Rewound`/`Switched` (then the
     /// `SessionChanged` that follows an applied one), or an `Error`.
     async fn answer(&mut self, cmd: Command) -> Answer {
@@ -259,15 +169,6 @@ impl Run {
 
     fn current(&self) -> (String, PathBuf) {
         self.engine.current_session()
-    }
-
-    async fn stop(mut self) {
-        self.engine.send(Command::Shutdown).await.unwrap();
-        while tokio::time::timeout(WAIT, self.events.recv())
-            .await
-            .expect("the engine did not stop")
-            .is_some()
-        {}
     }
 }
 
@@ -338,7 +239,7 @@ fn two_turns() -> MockProvider {
 }
 
 async fn run_two_turns(repo: &Repo, mock: &MockProvider) -> Run {
-    let mut run = Run::start(repo.builder(mock));
+    let mut run = start(repo.builder(mock));
     run.turn_with("one").await;
     run.turn_with("two").await;
     run
@@ -349,7 +250,7 @@ async fn run_two_turns(repo: &Repo, mock: &MockProvider) -> Run {
 #[tokio::test]
 async fn state_at_uses_earliest_checkpoint_after_and_reverts_tool_edits() {
     // Steps: 1 user, 2 write a=one, 3 write a=two then bash c=x, 4 text.
-    let repo = Repo::git_repo();
+    let repo = Repo::git_repo(AB);
     let mock = MockProvider::new(vec![
         tools_step(vec![write("w1", "a.txt", "one\n")]),
         tools_step(vec![
@@ -358,7 +259,7 @@ async fn state_at_uses_earliest_checkpoint_after_and_reverts_tool_edits() {
         ]),
         text_step_no_usage("done"),
     ]);
-    let mut run = Run::start(repo.builder(&mock));
+    let mut run = start(repo.builder(&mock));
     run.turn_with("go").await;
     let log = run.current().1;
     run.stop().await;
@@ -436,7 +337,7 @@ fn without_points(log: &Path, point: Option<&str>) -> PathBuf {
 async fn state_at_with_skipped_checkpoint_is_partial() {
     // A cancelled turn logs `CheckpointSkipped{cancelled}` at its end: the next turn's
     // checkpoint (which has whatever changed meanwhile) is only partial for step 2.
-    let repo = Repo::git_repo();
+    let repo = Repo::git_repo(AB);
     let mock = MockProvider::new(vec![
         tools_step(vec![bash("b1", "sleep 30")]),
         tools_step(vec![bash("b2", "true")]),
@@ -447,7 +348,7 @@ async fn state_at_with_skipped_checkpoint_is_partial() {
         b.config.checkpoints.timeout_ms = 120_000;
         b
     };
-    let mut run = Run::start(patient(repo.builder(&mock)));
+    let mut run = start(patient(repo.builder(&mock)));
     run.engine
         .send(Command::SendMessage {
             id: None,
@@ -473,7 +374,7 @@ async fn state_at_with_skipped_checkpoint_is_partial() {
         tools_step(vec![write("w1", "a.txt", "one\n")]),
         text_step_no_usage("first"),
     ]);
-    let mut run = Run::start(patient(repo.builder(&mock)));
+    let mut run = start(patient(repo.builder(&mock)));
     run.turn_with("one").await;
     let log = run.current().1;
     run.stop().await;
@@ -491,7 +392,7 @@ async fn state_at_with_skipped_checkpoint_is_partial() {
 
 #[tokio::test]
 async fn rewind_creates_branch_and_leaves_old_log_unmodified_except_tip_checkpoint() {
-    let repo = Repo::git_repo();
+    let repo = Repo::git_repo(AB);
     let mock = two_turns();
     let mut run = run_two_turns(&repo, &mock).await;
     let (old_id, old_log) = run.current();
@@ -566,7 +467,7 @@ async fn rewind_creates_branch_and_leaves_old_log_unmodified_except_tip_checkpoi
 
 #[tokio::test]
 async fn rewind_restores_tool_and_bash_changes() {
-    let repo = Repo::git_repo();
+    let repo = Repo::git_repo(AB);
     let mock = two_turns();
     let mut run = run_two_turns(&repo, &mock).await;
     assert_eq!(repo.read("c.txt").as_deref(), Some("x\n"));
@@ -586,7 +487,7 @@ async fn rewind_restores_tool_and_bash_changes() {
 
 #[tokio::test]
 async fn rewind_conflict_on_human_edit_writes_nothing_and_creates_no_branch() {
-    let repo = Repo::git_repo();
+    let repo = Repo::git_repo(AB);
     let mock = two_turns();
     let mut run = run_two_turns(&repo, &mock).await;
     let (id, _) = run.current();
@@ -612,7 +513,7 @@ async fn rewind_conflict_on_human_edit_writes_nothing_and_creates_no_branch() {
 
 #[tokio::test]
 async fn rewind_overwrite_list_applies_with_backup_ref() {
-    let repo = Repo::git_repo();
+    let repo = Repo::git_repo(AB);
     let mock = two_turns();
     let mut run = run_two_turns(&repo, &mock).await;
     repo.write("a.txt", "human\n");
@@ -633,7 +534,7 @@ async fn rewind_overwrite_list_applies_with_backup_ref() {
 
 #[tokio::test]
 async fn human_edit_outside_changed_paths_left_alone() {
-    let repo = Repo::git_repo();
+    let repo = Repo::git_repo(AB);
     repo.write("z.txt", "zed\n");
     repo.git(&["add", "-A"]);
     repo.git(&["commit", "-q", "-m", "z"]);
@@ -654,7 +555,7 @@ async fn human_edit_outside_changed_paths_left_alone() {
 async fn human_added_file_not_deleted_without_overwrite() {
     // Turn 2's command created c.txt; a human replaced it. The rewind would delete it: a
     // conflict. A file only a human added is no change at all.
-    let repo = Repo::git_repo();
+    let repo = Repo::git_repo(AB);
     let mock = two_turns();
     let mut run = run_two_turns(&repo, &mock).await;
     repo.write("c.txt", "human\n");
@@ -690,7 +591,7 @@ fn assemble(rebuilt: &tautly_core::resume::Rebuilt) -> CanonicalRequest {
 
 #[tokio::test]
 async fn context_after_rewind_equals_rebuild_until() {
-    let repo = Repo::git_repo();
+    let repo = Repo::git_repo(AB);
     let mut script = vec![
         tools_step(vec![write("w1", "a.txt", "one\n")]),
         text_step_no_usage("first"),
@@ -716,7 +617,7 @@ async fn context_after_rewind_equals_rebuild_until() {
 
 #[tokio::test]
 async fn non_git_rewind_restores_tool_edits_and_notes_commands() {
-    let repo = Repo::plain();
+    let repo = Repo::plain(A);
     let mock = MockProvider::new(vec![
         tools_step(vec![write("w1", "a.txt", "one\n")]),
         text_step_no_usage("first"),
@@ -756,7 +657,7 @@ async fn non_git_rewind_restores_tool_edits_and_notes_commands() {
 
 #[tokio::test]
 async fn switch_back_and_forth_restores_each_tip_exactly() {
-    let repo = Repo::git_repo();
+    let repo = Repo::git_repo(AB);
     let mut script = two_turns_script();
     script.extend([
         tools_step(vec![
@@ -808,12 +709,12 @@ fn two_turns_script() -> Vec<MockTurn> {
 
 #[tokio::test]
 async fn rewind_and_switch_refused_while_lease_shared_elsewhere() {
-    let repo = Repo::git_repo();
+    let repo = Repo::git_repo(AB);
     let mock = two_turns();
     let mut run = run_two_turns(&repo, &mock).await;
     let (a, _) = run.current();
     // A second engine on the same work tree.
-    let other = Run::start(repo.builder(&MockProvider::new(vec![])));
+    let other = start(repo.builder(&MockProvider::new(vec![])));
     let other_id = other.engine.session_id().to_string();
     let why = run.rewind(3, false, &[]).await.error();
     assert!(why.contains("another live session"), "{why}");
@@ -827,13 +728,13 @@ async fn rewind_and_switch_refused_while_lease_shared_elsewhere() {
     let sb: Arc<dyn Sandbox> = Arc::new(LocalSandbox::new(repo.root()).unwrap());
     let ws = tautly_core::Workspace::new(sb, repo.home());
     let mock = two_turns();
-    let mut shared = Run::start(EngineBuilder {
+    let mut shared = start(EngineBuilder {
         workspace: Some(Arc::clone(&ws)),
         ..repo.builder(&mock)
     });
     shared.turn_with("one").await;
     run.stop().await;
-    let second = Run::start(EngineBuilder {
+    let second = start(EngineBuilder {
         workspace: Some(Arc::clone(&ws)),
         ..repo.builder(&MockProvider::new(vec![]))
     });
@@ -848,7 +749,7 @@ async fn rewind_and_switch_refused_while_lease_shared_elsewhere() {
 
 #[tokio::test]
 async fn fork_children_own_checkpoint_refs() {
-    let repo = Repo::git_repo();
+    let repo = Repo::git_repo(AB);
     let mock = two_turns();
     let mut run = run_two_turns(&repo, &mock).await;
     let (a, _) = run.current();
@@ -881,7 +782,7 @@ async fn fork_children_own_checkpoint_refs() {
     repo.git(&["reflog", "expire", "--expire=now", "--all"]);
     repo.git(&["gc", "-q", "--prune=now"]).unwrap();
     assert_eq!(repo.read("c.txt").as_deref(), Some("x\n"));
-    let mut run = Run::start(repo.builder(&MockProvider::new(vec![])));
+    let mut run = start(repo.builder(&MockProvider::new(vec![])));
     let (_, report) = run.switch(&b, &[]).await.done();
     assert!(report.applied, "{report:?}");
     assert!(report.conflicts.is_empty(), "{report:?}");
@@ -896,13 +797,13 @@ async fn fork_children_own_checkpoint_refs() {
 /// after its header's parent offset.
 #[tokio::test]
 async fn a_fork_childs_ledger_rows_hold_only_its_post_fork_requests() {
-    let repo = Repo::git_repo();
+    let repo = Repo::git_repo(AB);
     let mock = MockProvider::new(vec![
         text_step_no_usage("one"),
         text_step_no_usage("two"),
         text_step_no_usage("three"),
     ]);
-    let mut run = Run::start(repo.builder(&mock));
+    let mut run = start(repo.builder(&mock));
     run.turn_with("first").await;
     let (parent, _) = run.current();
     run.engine
@@ -940,9 +841,9 @@ async fn a_fork_childs_ledger_rows_hold_only_its_post_fork_requests() {
 
 #[tokio::test]
 async fn label_command_renames_branch() {
-    let repo = Repo::git_repo();
+    let repo = Repo::git_repo(AB);
     let mock = MockProvider::new(vec![text_step_no_usage("hi")]);
-    let mut run = Run::start(repo.builder(&mock));
+    let mut run = start(repo.builder(&mock));
     run.turn_with("hello").await;
     run.engine
         .send(Command::Label {
@@ -964,7 +865,7 @@ async fn label_command_renames_branch() {
 
 #[tokio::test]
 async fn tree_lists_parent_step_label_origin_live_current() {
-    let repo = Repo::git_repo();
+    let repo = Repo::git_repo(AB);
     let mock = two_turns();
     let mut run = run_two_turns(&repo, &mock).await;
     let (a, _) = run.current();
@@ -1011,7 +912,7 @@ async fn tree_lists_parent_step_label_origin_live_current() {
     let nodes = tree::build(repo.home(), &repo.project(), None).unwrap();
     assert!(nodes.iter().all(|n| !n.live && !n.current), "{nodes:?}");
     // So resuming it at once finds it free, not "already open for writing".
-    let again = Run::start(EngineBuilder {
+    let again = start(EngineBuilder {
         resume: Some(b.clone()),
         ..repo.builder(&MockProvider::new(vec![]))
     });
@@ -1028,13 +929,13 @@ fn wire(report: &MaterializeReport, field: &str) -> Value {
 #[tokio::test]
 async fn offline_human_edit_absorbed_by_resume_is_a_conflict() {
     // I2: the resume's start checkpoint holds the edit; it is still the human's.
-    let repo = Repo::git_repo();
+    let repo = Repo::git_repo(AB);
     let mock = two_turns();
     let run = run_two_turns(&repo, &mock).await;
     let id = run.current().0;
     run.stop().await;
     repo.write("a.txt", "offline\n");
-    let mut run = Run::start(EngineBuilder {
+    let mut run = start(EngineBuilder {
         resume: Some(id),
         ..repo.builder(&MockProvider::new(vec![]))
     });
@@ -1054,7 +955,7 @@ async fn offline_human_edit_absorbed_by_resume_is_a_conflict() {
 #[tokio::test]
 async fn human_edit_between_turns_is_a_conflict() {
     // I3: the next turn's first checkpoint holds the edits; they are still the human's.
-    let repo = Repo::git_repo();
+    let repo = Repo::git_repo(AB);
     let mock = MockProvider::new(vec![
         tools_step(vec![write("w1", "a.txt", "one\n")]),
         text_step_no_usage("first"),
@@ -1064,7 +965,7 @@ async fn human_edit_between_turns_is_a_conflict() {
         ]),
         text_step_no_usage("second"),
     ]);
-    let mut run = Run::start(repo.builder(&mock));
+    let mut run = start(repo.builder(&mock));
     run.turn_with("one").await;
     repo.write("b.txt", "mine\n");
     repo.write("mine.txt", "new\n");
@@ -1091,7 +992,11 @@ async fn human_edit_between_turns_is_a_conflict() {
 async fn a_symlinked_parent_is_blocked_and_never_written_through() {
     // I1, from git (the checkpoint) and outside git (a pre-image).
     for git in [true, false] {
-        let repo = if git { Repo::git_repo() } else { Repo::plain() };
+        let repo = if git {
+            Repo::git_repo(AB)
+        } else {
+            Repo::plain(A)
+        };
         let mock = MockProvider::new(vec![
             tools_step(vec![write("w1", "sub/y.txt", "one\n")]),
             text_step_no_usage("first"),
@@ -1124,7 +1029,7 @@ async fn a_symlinked_parent_is_blocked_and_never_written_through() {
 #[tokio::test]
 async fn a_tool_edit_of_an_ignored_file_is_reverted() {
     // M4: no checkpoint holds `gen.log`; its pre-image (none) is what it goes back to.
-    let repo = Repo::git_repo();
+    let repo = Repo::git_repo(AB);
     repo.write(".gitignore", "*.log\n");
     repo.git(&["add", "-A"]);
     repo.git(&["commit", "-q", "-m", "ignore"]);
@@ -1147,7 +1052,7 @@ async fn a_tool_edit_of_an_ignored_file_is_reverted() {
 #[tokio::test]
 async fn a_mode_change_is_a_conflict() {
     use std::os::unix::fs::PermissionsExt;
-    let repo = Repo::git_repo();
+    let repo = Repo::git_repo(AB);
     let mock = two_turns();
     let mut run = run_two_turns(&repo, &mock).await;
     let a = repo.root().join("a.txt");
@@ -1162,7 +1067,7 @@ async fn a_mode_change_is_a_conflict() {
 #[tokio::test]
 async fn rewind_to_step_zero_branches_before_the_first_step() {
     // I6.
-    let repo = Repo::git_repo();
+    let repo = Repo::git_repo(AB);
     let mock = two_turns();
     let mut run = run_two_turns(&repo, &mock).await;
     // From a branch too (its copy holds nothing kept before step 1, review probe p9).
@@ -1185,7 +1090,7 @@ async fn rewind_to_step_zero_branches_before_the_first_step() {
 #[tokio::test]
 async fn a_large_human_file_is_a_conflict_and_backed_up_in_git() {
     // Over the 64 MiB read limit: compared by its streaming hash, kept whole by the backup.
-    let repo = Repo::git_repo();
+    let repo = Repo::git_repo(AB);
     let mock = two_turns();
     let mut run = run_two_turns(&repo, &mock).await;
     let size = 65 * 1024 * 1024 + 7;
@@ -1214,7 +1119,7 @@ fn read_only(dir: &Path, mode: u32) {
 async fn a_failed_write_puts_the_files_back_and_names_the_backup() {
     // I4: c.txt is deleted first; then d/a.txt cannot be written (its directory is
     // read-only). The deletion is undone and the error says so, with the snapshot.
-    let repo = Repo::git_repo();
+    let repo = Repo::git_repo(AB);
     let mock = MockProvider::new(vec![
         tools_step(vec![write("w1", "d/a.txt", "one\n")]),
         text_step_no_usage("first"),
@@ -1239,7 +1144,7 @@ async fn a_failed_write_puts_the_files_back_and_names_the_backup() {
 #[tokio::test]
 async fn a_failed_branch_puts_the_files_back() {
     // I4: the branch's log cannot be created (its directory is read-only).
-    let repo = Repo::git_repo();
+    let repo = Repo::git_repo(AB);
     let mock = two_turns();
     let mut run = run_two_turns(&repo, &mock).await;
     let (id, log) = run.current();
@@ -1261,7 +1166,7 @@ async fn a_failed_branch_puts_the_files_back() {
 #[tokio::test]
 async fn outside_git_an_overwrite_keeps_the_content_in_the_session_log() {
     // I5: no snapshot; the bytes go to the blob store, in a `RestoreBegun` record.
-    let repo = Repo::plain();
+    let repo = Repo::plain(A);
     let mock = MockProvider::new(vec![
         tools_step(vec![write("w1", "a.txt", "one\n")]),
         text_step_no_usage("first"),
@@ -1305,7 +1210,7 @@ async fn outside_git_an_overwrite_keeps_the_content_in_the_session_log() {
 #[tokio::test]
 async fn an_unknown_step_changes_nothing() {
     // M6: refused before the tip checkpoint is taken.
-    let repo = Repo::git_repo();
+    let repo = Repo::git_repo(AB);
     let mock = two_turns();
     let mut run = run_two_turns(&repo, &mock).await;
     let log = run.current().1;
@@ -1323,9 +1228,9 @@ async fn an_unknown_step_changes_nothing() {
 #[tokio::test]
 async fn a_restore_cut_off_is_warned_about_at_resume() {
     // M7: a `RestoreBegun` with no `RestoreEnded` (a crash mid-restore).
-    let repo = Repo::git_repo();
+    let repo = Repo::git_repo(AB);
     let mock = MockProvider::new(vec![text_step_no_usage("hi")]);
-    let mut run = Run::start(repo.builder(&mock));
+    let mut run = start(repo.builder(&mock));
     run.turn_with("hello").await;
     let (id, log) = run.current();
     run.stop().await;
@@ -1337,7 +1242,7 @@ async fn a_restore_cut_off_is_warned_about_at_resume() {
     let mut text = std::fs::read_to_string(&log).unwrap();
     text.push_str(&format!("{line}\n"));
     std::fs::write(&log, text).unwrap();
-    let mut run = Run::start(EngineBuilder {
+    let mut run = start(EngineBuilder {
         resume: Some(id),
         ..repo.builder(&MockProvider::new(vec![]))
     });
@@ -1366,13 +1271,13 @@ async fn a_restore_cut_off_is_warned_about_at_resume() {
 async fn human_edit_after_a_cancelled_command_turn_is_a_conflict() {
     // N1 (review probe p13b): turn 1's command is cancelled; its end checkpoint is taken
     // after it, so the human's edit between turns falls in a command-free pair.
-    let repo = Repo::git_repo();
+    let repo = Repo::git_repo(AB);
     let mock = MockProvider::new(vec![
         tools_step(vec![bash("b1", "sleep 30")]),
         tools_step(vec![write("w1", "a.txt", "two\n")]),
         text_step_no_usage("second"),
     ]);
-    let mut run = Run::start(repo.builder(&mock));
+    let mut run = start(repo.builder(&mock));
     run.engine
         .send(Command::SendMessage {
             id: None,
@@ -1407,7 +1312,7 @@ async fn an_offline_edit_after_a_crash_in_a_command_turn_is_a_conflict() {
     // own file (a spurious conflict, which fails safe). The snapshots get a generous time
     // limit: one skipped under load leaves the offline edit out of the tip (Task 49
     // M-R3a), which is safe but not what this checks.
-    let repo = Repo::git_repo();
+    let repo = Repo::git_repo(AB);
     let patient = |mut b: EngineBuilder| {
         b.config.checkpoints.timeout_ms = 120_000;
         b
@@ -1416,7 +1321,7 @@ async fn an_offline_edit_after_a_crash_in_a_command_turn_is_a_conflict() {
         tools_step(vec![bash("b1", "printf 'cmd\\n' > c.txt")]),
         text_step_no_usage("done"),
     ]);
-    let mut run = Run::start(patient(repo.builder(&mock)));
+    let mut run = start(patient(repo.builder(&mock)));
     let id = run.engine.session_id().to_string();
     run.turn_with("go").await;
     let log = run.current().1;
@@ -1430,7 +1335,7 @@ async fn an_offline_edit_after_a_crash_in_a_command_turn_is_a_conflict() {
     let kept: Vec<&str> = text.lines().take(cut + 2).collect();
     std::fs::write(&log, kept.join("\n") + "\n").unwrap();
     repo.write("b.txt", "offline\n");
-    let mut run = Run::start(EngineBuilder {
+    let mut run = start(EngineBuilder {
         resume: Some(id),
         ..patient(repo.builder(&MockProvider::new(vec![])))
     });
@@ -1445,9 +1350,9 @@ async fn an_offline_edit_after_a_crash_in_a_command_turn_is_a_conflict() {
 #[tokio::test]
 async fn an_offline_edit_after_cancel_then_quit_is_a_conflict() {
     // N1 round 3 (review probe p28): cancel, quit at once, edit offline, resume, rewind.
-    let repo = Repo::git_repo();
+    let repo = Repo::git_repo(AB);
     let mock = MockProvider::new(vec![tools_step(vec![bash("b1", "sleep 30")])]);
-    let mut run = Run::start(repo.builder(&mock));
+    let mut run = start(repo.builder(&mock));
     let id = run.engine.session_id().to_string();
     run.engine
         .send(Command::SendMessage {
@@ -1461,7 +1366,7 @@ async fn an_offline_edit_after_cancel_then_quit_is_a_conflict() {
     run.until(|e| matches!(e, Event::TurnFinished { .. })).await;
     run.stop().await;
     repo.write("b.txt", "offline\n");
-    let mut run = Run::start(EngineBuilder {
+    let mut run = start(EngineBuilder {
         resume: Some(id),
         ..repo.builder(&MockProvider::new(vec![]))
     });
@@ -1473,7 +1378,7 @@ async fn an_offline_edit_after_cancel_then_quit_is_a_conflict() {
 }
 
 fn ignoring_logs() -> Repo {
-    let repo = Repo::git_repo();
+    let repo = Repo::git_repo(AB);
     repo.write(".gitignore", "*.log\n");
     repo.git(&["add", "-A"]);
     repo.git(&["commit", "-q", "-m", "ignore"]);
@@ -1559,7 +1464,7 @@ async fn a_switch_restores_an_ignored_file_the_target_wrote() {
 async fn a_switch_to_a_locked_session_logs_nothing() {
     // N7: the target's lock is checked before the tip checkpoint is taken.
     use std::os::fd::AsRawFd;
-    let repo = Repo::git_repo();
+    let repo = Repo::git_repo(AB);
     let mock = two_turns();
     let mut run = run_two_turns(&repo, &mock).await;
     let (a, _) = run.current();
@@ -1589,7 +1494,7 @@ async fn a_switch_to_a_locked_session_logs_nothing() {
 #[tokio::test]
 async fn a_switch_records_the_restore_in_both_sessions() {
     // N8: the session switched to is the one usually resumed.
-    let repo = Repo::git_repo();
+    let repo = Repo::git_repo(AB);
     let mock = two_turns();
     let mut run = run_two_turns(&repo, &mock).await;
     let (a, a_log) = run.current();
@@ -1609,11 +1514,11 @@ async fn a_switch_records_the_restore_in_both_sessions() {
 #[tokio::test]
 async fn an_engine_never_runs_without_the_lease() {
     // N3 (review probe p15): another engine's rewind holds it exclusively too long.
-    let repo = Repo::git_repo();
+    let repo = Repo::git_repo(AB);
     let lease = tautly_core::Lease::shared(repo.home(), &repo.root()).unwrap();
     let held = lease.try_exclusive().unwrap();
     let mock = MockProvider::new(vec![text_step_no_usage("never")]);
-    let mut run = Run::start(EngineBuilder {
+    let mut run = start(EngineBuilder {
         lease_wait: Duration::from_millis(300),
         ..repo.builder(&mock)
     });
@@ -1667,7 +1572,7 @@ async fn an_engine_never_runs_without_the_lease() {
     run.stop().await;
 
     // A lock file that cannot be opened fails the build.
-    let repo = Repo::git_repo();
+    let repo = Repo::git_repo(AB);
     std::fs::write(repo.home().join("locks"), "not a directory").unwrap();
     let built = repo.builder(&MockProvider::new(vec![])).build();
     let err = built.err().expect("built without a lease");
@@ -1718,7 +1623,7 @@ fn own_opts(force: bool, overwrite: &[&str]) -> tautly_core::sessions::RestoreBa
 
 /// Outside git: two turns writing a.txt, a human edit, a rewind that overwrites it.
 async fn overwritten_outside_git() -> (Repo, String) {
-    let repo = Repo::plain();
+    let repo = Repo::plain(A);
     let mock = MockProvider::new(vec![
         tools_step(vec![write("w1", "a.txt", "one\n")]),
         text_step_no_usage("first"),
@@ -1822,7 +1727,7 @@ async fn restore_backup_counts_a_mode_change_of_a_file_the_restore_created() {
     // Task 50 M6: outside git, a rewind recreates n.txt a human removed; the human then
     // makes it executable. Putting the backup back (removing it) would lose that.
     use std::os::unix::fs::PermissionsExt;
-    let repo = Repo::plain();
+    let repo = Repo::plain(A);
     let mock = MockProvider::new(vec![
         tools_step(vec![write("w1", "n.txt", "one\n")]),
         text_step_no_usage("first"),
@@ -1879,7 +1784,7 @@ async fn restore_backup_never_overwrites_a_later_human_edit() {
 #[tokio::test]
 async fn restore_backup_never_removes_a_file_a_human_changed() {
     // N10 (review probe p27b): a switch recreated n.txt; a human then edited it.
-    let repo = Repo::plain();
+    let repo = Repo::plain(A);
     let mock = MockProvider::new(vec![
         tools_step(vec![write("w1", "a.txt", "one\n")]),
         text_step_no_usage("first"),
@@ -1905,10 +1810,10 @@ async fn restore_backup_never_removes_a_file_a_human_changed() {
 #[tokio::test]
 async fn shutdown_during_the_lease_wait_returns_at_once() {
     // N12: the wait is polled in short slices and stops on Shutdown.
-    let repo = Repo::git_repo();
+    let repo = Repo::git_repo(AB);
     let lease = tautly_core::Lease::shared(repo.home(), &repo.root()).unwrap();
     let held = lease.try_exclusive().unwrap();
-    let run = Run::start(EngineBuilder {
+    let run = start(EngineBuilder {
         lease_wait: Duration::from_secs(30),
         ..repo.builder(&MockProvider::new(vec![]))
     });
@@ -1943,7 +1848,7 @@ async fn unanswered(repo: &Repo, how: NoResponse) -> Run {
         second,
         text_step_no_usage("third"),
     ]);
-    let mut run = Run::start(repo.builder(&mock));
+    let mut run = start(repo.builder(&mock));
     let id = run.engine.session_id().to_string();
     run.turn_with("one").await;
     let log = run.current().1;
@@ -1972,7 +1877,7 @@ async fn unanswered(repo: &Repo, how: NoResponse) -> Run {
         .rposition(|l| l.contains(r#""type":"request""#))
         .unwrap();
     std::fs::write(&log, lines[..=request].join("\n") + "\n").unwrap();
-    Run::start(EngineBuilder {
+    start(EngineBuilder {
         resume: Some(id),
         ..repo.builder(&MockProvider::new(vec![text_step_no_usage("third")]))
     })
@@ -2016,7 +1921,7 @@ fn user_texts(rebuilt: &tautly_core::resume::Rebuilt) -> Vec<String> {
 #[tokio::test]
 async fn a_request_with_no_response_shares_its_number_with_the_next_step() {
     for how in [NoResponse::Cancel, NoResponse::Error, NoResponse::Crash] {
-        let repo = Repo::git_repo();
+        let repo = Repo::git_repo(AB);
         let mut run = unanswered(&repo, how).await;
         let (id, log) = run.current();
         // The tip every surface shows is the one rewind and fork cut at.
@@ -2062,7 +1967,7 @@ async fn a_request_with_no_response_shares_its_number_with_the_next_step() {
 async fn a_request_with_no_response_mid_log_keeps_every_boundary_in_step() {
     // Turn two's request is cancelled; turn three is answered. Every boundary rebuilds and
     // restores at the step the counters agree on.
-    let repo = Repo::git_repo();
+    let repo = Repo::git_repo(AB);
     let mut run = unanswered(&repo, NoResponse::Cancel).await;
     run.turn_with("three").await;
     let log = run.current().1;
@@ -2096,12 +2001,12 @@ async fn a_request_with_no_response_mid_log_keeps_every_boundary_in_step() {
 
 #[tokio::test]
 async fn a_log_holding_a_null_replay_speed_resumes_forks_rewinds_and_compares() {
-    let repo = Repo::git_repo();
+    let repo = Repo::git_repo(AB);
     let mock = MockProvider::new(vec![
         tools_step(vec![write("w1", "a.txt", "one\n")]),
         text_step_no_usage("first"),
     ]);
-    let mut run = Run::start(repo.builder(&mock));
+    let mut run = start(repo.builder(&mock));
     let id = run.engine.session_id().to_string();
     run.turn_with("one").await;
     let log = run.current().1;
@@ -2115,7 +2020,7 @@ async fn a_log_holding_a_null_replay_speed_resumes_forks_rewinds_and_compares() 
     text.push_str(&format!("{line}\n"));
     std::fs::write(&log, text).unwrap();
 
-    let mut run = Run::start(EngineBuilder {
+    let mut run = start(EngineBuilder {
         resume: Some(id),
         ..repo.builder(&MockProvider::new(vec![
             tools_step(vec![write("w2", "a.txt", "two\n")]),
@@ -2158,7 +2063,7 @@ fn typed_lines(path: &Path) -> Vec<(String, u64, Value)> {
 
 #[tokio::test]
 async fn synthetic_turn_ends_are_marked_and_stamped_at_the_last_record() {
-    let repo = Repo::git_repo();
+    let repo = Repo::git_repo(AB);
     let mut run = unanswered(&repo, NoResponse::Crash).await;
     let log = run.current().1;
     // Answered once the resume (which closes the crashed turn) is done.
@@ -2197,7 +2102,7 @@ async fn synthetic_turn_ends_are_marked_and_stamped_at_the_last_record() {
 
 #[tokio::test]
 async fn fork_at_zero_accepts_what_rewind_zero_accepts_and_headers_name_the_step() {
-    let repo = Repo::git_repo();
+    let repo = Repo::git_repo(AB);
     let mock = two_turns();
     let mut run = run_two_turns(&repo, &mock).await;
     run.rewind(4, false, &[]).await.done();
@@ -2244,7 +2149,7 @@ async fn fork_at_zero_accepts_what_rewind_zero_accepts_and_headers_name_the_step
 
 #[tokio::test]
 async fn a_large_tool_input_is_one_blob_both_records_name_and_every_reader_resolves() {
-    let repo = Repo::git_repo();
+    let repo = Repo::git_repo(AB);
     let big = "x".repeat(10_000) + "\n";
     let small = "small\n";
     let mock = MockProvider::new(vec![
@@ -2254,7 +2159,7 @@ async fn a_large_tool_input_is_one_blob_both_records_name_and_every_reader_resol
         ]),
         text_step_no_usage("done"),
     ]);
-    let mut run = Run::start(repo.builder(&mock));
+    let mut run = start(repo.builder(&mock));
     run.turn_with("write").await;
     let log = run.current().1;
     let lines = typed_lines(&log);
@@ -2351,13 +2256,13 @@ fn with_unreadable_checkpoint(log: &Path, which: &str) -> PathBuf {
 async fn a_record_this_version_cannot_read_makes_the_states_across_it_partial() {
     // Steps: 1 user, 2 write a=one, 3 a command that creates c.txt (after its before_exec
     // checkpoint), 4 text.
-    let repo = Repo::git_repo();
+    let repo = Repo::git_repo(AB);
     let mock = MockProvider::new(vec![
         tools_step(vec![write("w1", "a.txt", "one\n")]),
         tools_step(vec![bash("b1", "printf 'x\\n' > c.txt")]),
         text_step_no_usage("done"),
     ]);
-    let mut run = Run::start(repo.builder(&mock));
+    let mut run = start(repo.builder(&mock));
     run.turn_with("go").await;
     let log = run.current().1;
     run.stop().await;
@@ -2398,9 +2303,9 @@ async fn a_record_this_version_cannot_read_makes_the_states_across_it_partial() 
 async fn a_switch_closes_the_targets_cut_turn_before_it_writes_there() {
     // cp5 FMT re-review N3: the synthetic end is stamped at the target's last record and
     // precedes the switch's own records, so compare's wall time leaves the downtime out.
-    let repo = Repo::git_repo();
+    let repo = Repo::git_repo(AB);
     let lived = Instant::now();
-    let mut run = Run::start(repo.builder(&MockProvider::new(vec![text_step_no_usage("one")])));
+    let mut run = start(repo.builder(&MockProvider::new(vec![text_step_no_usage("one")])));
     let target = run.engine.session_id().to_string();
     run.turn_with("one").await;
     let log = run.current().1;
@@ -2416,7 +2321,7 @@ async fn a_switch_closes_the_targets_cut_turn_before_it_writes_there() {
     std::fs::write(&log, text).unwrap();
     let start_t = line["t"].as_u64().unwrap();
 
-    let mut run = Run::start(repo.builder(&MockProvider::new(vec![text_step_no_usage("other")])));
+    let mut run = start(repo.builder(&MockProvider::new(vec![text_step_no_usage("other")])));
     run.turn_with("elsewhere").await;
     // Time no session of the target ran.
     tokio::time::sleep(Duration::from_millis(1500)).await;
@@ -2452,21 +2357,9 @@ struct FailC {
 }
 
 #[async_trait::async_trait]
-impl Sandbox for FailC {
-    fn root(&self) -> &Path {
-        self.sb.root()
-    }
-    fn resolve(&self, p: &Path) -> Result<PathBuf, tautly_sandbox::SandboxError> {
-        self.sb.resolve(p)
-    }
-    async fn read(&self, p: &Path) -> Result<Vec<u8>, tautly_sandbox::SandboxError> {
-        self.sb.read(p).await
-    }
-    async fn metadata(
-        &self,
-        p: &Path,
-    ) -> Result<tautly_sandbox::FileMeta, tautly_sandbox::SandboxError> {
-        self.sb.metadata(p).await
+impl Delegate for FailC {
+    fn inner(&self) -> &LocalSandbox {
+        &self.sb
     }
     async fn write_atomic(
         &self,
@@ -2481,31 +2374,10 @@ impl Sandbox for FailC {
         }
         self.sb.write_atomic(p, bytes, mode).await
     }
-    async fn remove_file(&self, p: &Path) -> Result<(), tautly_sandbox::SandboxError> {
-        self.sb.remove_file(p).await
-    }
-    async fn spill(&self, bytes: &[u8]) -> Result<PathBuf, tautly_sandbox::SandboxError> {
-        self.sb.spill(bytes).await
-    }
     async fn spill_stream(
         &self,
     ) -> Result<Option<(PathBuf, tautly_sandbox::SpillWriter)>, tautly_sandbox::SandboxError> {
         self.sb.spill_stream().await
-    }
-    async fn spawn(
-        &self,
-        spec: tautly_sandbox::SpawnSpec,
-    ) -> Result<tautly_sandbox::Child, tautly_sandbox::SandboxError> {
-        self.sb.spawn(spec).await
-    }
-    fn walker(&self, base: &Path) -> Result<ignore::WalkBuilder, tautly_sandbox::SandboxError> {
-        self.sb.walker(base)
-    }
-    async fn http_get(
-        &self,
-        url: &tautly_sandbox::Url,
-    ) -> Result<tautly_sandbox::HttpResponse, tautly_sandbox::SandboxError> {
-        self.sb.http_get(url).await
     }
 }
 
@@ -2533,7 +2405,7 @@ fn restore_outcomes(log: &Path) -> Vec<tautly_core::record::RestoreOutcome> {
 #[tokio::test]
 async fn a_restore_that_fails_midway_puts_back_what_it_can_and_logs_how_it_ended() {
     use tautly_core::record::RestoreOutcome;
-    let repo = Repo::plain();
+    let repo = Repo::plain(A);
     let mock = MockProvider::new(vec![
         tools_step(vec![
             write("w1", "a.txt", "one\n"),
@@ -2549,11 +2421,11 @@ async fn a_restore_that_fails_midway_puts_back_what_it_can_and_logs_how_it_ended
         text_step_no_usage("second"),
     ]);
     let armed = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let sb: Arc<dyn Sandbox> = Arc::new(FailC {
+    let sb: Arc<dyn Sandbox> = Arc::new(Delegating(FailC {
         sb: LocalSandbox::new(repo.root()).unwrap(),
         armed: Arc::clone(&armed),
-    });
-    let mut run = Run::start(EngineBuilder {
+    }));
+    let mut run = start(EngineBuilder {
         sandbox: Some(sb),
         ..repo.builder(&mock)
     });
@@ -2602,7 +2474,7 @@ async fn a_restore_that_fails_midway_puts_back_what_it_can_and_logs_how_it_ended
 
 #[tokio::test]
 async fn a_restore_never_writes_through_a_link_or_over_a_directory() {
-    let repo = Repo::plain();
+    let repo = Repo::plain(A);
     let outside = tempfile::tempdir().unwrap();
     std::fs::write(outside.path().join("x.txt"), "outside\n").unwrap();
     let mock = MockProvider::new(vec![
@@ -2650,7 +2522,7 @@ async fn a_restore_never_writes_through_a_link_or_over_a_directory() {
 
 #[test]
 fn a_tool_edit_whose_result_was_not_captured_is_named_in_the_tip() {
-    let repo = Repo::plain();
+    let repo = Repo::plain(A);
     let mut w = tautly_session::SessionWriter::<SessionRecord>::create_in(
         repo.home(),
         &repo.root(),

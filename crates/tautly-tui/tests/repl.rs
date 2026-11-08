@@ -20,14 +20,13 @@ use tautly_provider::{
     Catalog, MockProvider, MockTurn, ModelId, ProviderEvent, RawUsage, StopReason,
 };
 use tautly_sandbox::{LocalSandbox, Mode, Sandbox};
+use tautly_testkit::{Fx, MODEL};
 use tautly_tui::approve::exact_rule;
 use tautly_tui::render::{self, RenderState};
 use tautly_tui::{EngineFactory, Line, ReplOptions, ScriptedSource, run_repl};
-use tempfile::TempDir;
 use tokio::io::AsyncWrite;
 use tokio::sync::mpsc;
 
-const MODEL: &str = "mock/test";
 const WAIT: Duration = Duration::from_secs(60);
 
 // ---------------------------------------------------------------------------------------
@@ -102,23 +101,11 @@ fn text(s: &str) -> Line {
     Line::Text(s.into())
 }
 
-struct Fx {
-    dir: TempDir,
-    home: TempDir,
+trait FxExt {
+    fn opts(&self) -> ReplOptions;
 }
 
-impl Fx {
-    fn new() -> Fx {
-        Fx {
-            dir: tempfile::tempdir().unwrap(),
-            home: tempfile::tempdir().unwrap(),
-        }
-    }
-
-    fn root(&self) -> PathBuf {
-        self.dir.path().canonicalize().unwrap()
-    }
-
+impl FxExt for Fx {
     fn opts(&self) -> ReplOptions {
         ReplOptions {
             color: false,

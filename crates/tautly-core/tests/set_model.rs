@@ -18,10 +18,7 @@ use tautly_provider::{
 };
 use tautly_sandbox::Mode;
 use tautly_session::SessionReader;
-use tempfile::TempDir;
-use tokio::sync::mpsc;
-
-const WAIT: Duration = Duration::from_secs(30);
+use tautly_testkit::{Fx, Run, WAIT, start};
 
 /// A catalog entry: explicit prompt cache, `price_input` USD per million input tokens
 /// (`None`: unpriced).
@@ -130,26 +127,14 @@ fn factory(mock: &MockProvider) -> ProviderFactory {
     Arc::new(move |_: &ModelId| Ok(Arc::new(mock.clone()) as Arc<dyn Provider>))
 }
 
-struct Fx {
-    dir: TempDir,
-    home: TempDir,
+trait FxExt {
+    fn switching_builder(&self, cfg: Config, mock: &MockProvider) -> EngineBuilder;
 }
 
-impl Fx {
-    fn new() -> Fx {
-        Fx {
-            dir: tempfile::tempdir().unwrap(),
-            home: tempfile::tempdir().unwrap(),
-        }
-    }
-
-    fn write(&self, rel: &str, text: &str) {
-        std::fs::write(self.dir.path().join(rel), text).unwrap();
-    }
-
+impl FxExt for Fx {
     /// The mock serves the main model, the side model and every switch, so no test looks
     /// up a key (the OS keychain can stall a lookup).
-    fn builder(&self, cfg: Config, mock: &MockProvider) -> EngineBuilder {
+    fn switching_builder(&self, cfg: Config, mock: &MockProvider) -> EngineBuilder {
         EngineBuilder {
             provider: Some(Arc::new(mock.clone())),
             side_provider: Some(Arc::new(mock.clone())),
@@ -160,48 +145,13 @@ impl Fx {
     }
 }
 
-struct Run {
-    engine: Engine,
-    events: mpsc::Receiver<Event>,
+trait RunExt {
+    async fn turn(&mut self) -> Vec<Event>;
+    async fn turn_from_start(&mut self, text: &str) -> Vec<Event>;
+    async fn set_model(&mut self, model: &str) -> Vec<Event>;
 }
 
-fn start(b: EngineBuilder) -> Run {
-    let (engine, events) = b.build().unwrap();
-    Run { engine, events }
-}
-
-impl Run {
-    async fn send(&self, cmd: Command) {
-        self.engine.send(cmd).await.unwrap();
-    }
-
-    async fn say(&self, text: &str) {
-        self.send(Command::SendMessage {
-            id: None,
-            text: text.into(),
-        })
-        .await;
-    }
-
-    async fn next(&mut self) -> Event {
-        tokio::time::timeout(WAIT, self.events.recv())
-            .await
-            .expect("timed out waiting for an event")
-            .expect("event channel closed")
-    }
-
-    async fn until(&mut self, pred: impl Fn(&Event) -> bool) -> Vec<Event> {
-        let mut out = Vec::new();
-        loop {
-            let ev = self.next().await;
-            let done = pred(&ev);
-            out.push(ev);
-            if done {
-                return out;
-            }
-        }
-    }
-
+impl RunExt for Run {
     /// Events through `TurnFinished`, from `TurnStarted`.
     async fn turn(&mut self) -> Vec<Event> {
         let all = self
@@ -214,7 +164,7 @@ impl Run {
         all[from..].to_vec()
     }
 
-    async fn turn_with(&mut self, text: &str) -> Vec<Event> {
+    async fn turn_from_start(&mut self, text: &str) -> Vec<Event> {
         self.say(text).await;
         self.turn().await
     }
@@ -305,7 +255,7 @@ fn signed_thought(text: &str, sig: &str, answer: &str) -> MockTurn {
 async fn set_model_idle_applies_immediately_and_emits_model_changed() {
     let fx = Fx::new();
     let mock = MockProvider::new(vec![reply("one")]);
-    let mut run = start(fx.builder(config("anthropic/a1"), &mock));
+    let mut run = start(fx.switching_builder(config("anthropic/a1"), &mock));
 
     let answer = run.set_model("openai/o1").await;
     assert_eq!(
@@ -318,7 +268,7 @@ async fn set_model_idle_applies_immediately_and_emits_model_changed() {
         "{answer:?}"
     );
     // Applied before any message: the first request already goes to the new model.
-    let events = run.turn_with("hi").await;
+    let events = run.turn_from_start("hi").await;
     assert_eq!(finish_reason(&events), FinishReason::Completed);
     assert_eq!(mock.requests()[0].model, m("openai/o1"));
 
@@ -352,7 +302,7 @@ async fn set_model_during_turn_applies_at_next_user_turn() {
     ]);
     let mut run = start(EngineBuilder {
         interactive: true,
-        ..fx.builder(config("anthropic/a1"), &mock)
+        ..fx.switching_builder(config("anthropic/a1"), &mock)
     });
     run.say("write it").await;
     let events = run
@@ -383,7 +333,7 @@ async fn set_model_during_turn_applies_at_next_user_turn() {
         after.last(),
         Some(Event::ModelChanged { model, .. }) if *model == m("openai/o1")
     ));
-    let events = run.turn_with("again").await;
+    let events = run.turn_from_start("again").await;
     assert_eq!(finish_reason(&events), FinishReason::Completed);
     let models: Vec<ModelId> = mock.requests().iter().map(|r| r.model.clone()).collect();
     assert_eq!(
@@ -411,7 +361,7 @@ async fn unknown_model_or_missing_key_errors_and_keeps_model() {
     });
     let mut run = start(EngineBuilder {
         provider_factory: Some(keyless),
-        ..fx.builder(config("anthropic/a1"), &mock)
+        ..fx.switching_builder(config("anthropic/a1"), &mock)
     });
 
     for (model, hint_has) in [
@@ -434,7 +384,7 @@ async fn unknown_model_or_missing_key_errors_and_keeps_model() {
             other => panic!("{model}: {other:?}"),
         }
     }
-    let events = run.turn_with("hi").await;
+    let events = run.turn_from_start("hi").await;
     assert_eq!(finish_reason(&events), FinishReason::Completed);
     assert_eq!(mock.requests()[0].model, m("anthropic/a1"));
     assert!(
@@ -453,10 +403,10 @@ async fn edit_format_follows_new_model_unless_configured() {
         catalog_overrides: None,
         ..config("anthropic/claude-sonnet-5-5")
     };
-    let mut run = start(fx.builder(cfg, &mock));
-    run.turn_with("hi").await;
+    let mut run = start(fx.switching_builder(cfg, &mock));
+    run.turn_from_start("hi").await;
     run.set_model("openai/gpt-5").await;
-    run.turn_with("again").await;
+    run.turn_from_start("again").await;
     let reqs = mock.requests();
     assert_eq!(
         edit_required(&reqs[0]),
@@ -482,9 +432,9 @@ async fn edit_format_follows_new_model_unless_configured() {
         catalog_overrides: Some(Catalog::from_toml(&override_toml).unwrap()),
         ..config("anthropic/claude-sonnet-5-5")
     };
-    let mut run = start(fx.builder(cfg, &mock));
+    let mut run = start(fx.switching_builder(cfg, &mock));
     run.set_model("openai/gpt-5").await;
-    run.turn_with("hi").await;
+    run.turn_from_start("hi").await;
     assert_eq!(
         edit_required(&mock.requests()[0]),
         json!(["path", "old_text", "new_text"])
@@ -495,9 +445,9 @@ async fn edit_format_follows_new_model_unless_configured() {
 /// message (about 24k tokens) puts a 32k window over its 80% threshold.
 async fn fill_for_compaction(run: &mut Run) {
     let big = format!("BIG-MARKER {}", "lorem ipsum dolor sit amet ".repeat(3555));
-    run.turn_with(&big).await;
-    run.turn_with("two").await;
-    run.turn_with("three").await;
+    run.turn_from_start(&big).await;
+    run.turn_from_start("two").await;
+    run.turn_from_start("three").await;
 }
 
 #[tokio::test]
@@ -524,10 +474,10 @@ async fn side_model_recomputed_unless_routing_set() {
             },
             ..config("anthropic/a1")
         };
-        let mut run = start(fx.builder(cfg, &mock));
+        let mut run = start(fx.switching_builder(cfg, &mock));
         fill_for_compaction(&mut run).await;
         run.set_model(to).await;
-        let events = run.turn_with("four").await;
+        let events = run.turn_from_start("four").await;
         assert_eq!(
             finish_reason(&events),
             FinishReason::Completed,
@@ -554,12 +504,12 @@ async fn after_a_switch_the_summary_goes_to_the_recomputed_side_model_under_its_
         reply("done"),
     ]);
     // No routing: a1's side model is `anthropic/a0-side` until the switch.
-    let mut run = start(fx.builder(config("anthropic/a1"), &mock));
+    let mut run = start(fx.switching_builder(config("anthropic/a1"), &mock));
     fill_for_compaction(&mut run).await;
     // openai/mini has a 32k window (the next step compacts) and is not small, so the
     // recomputed side model is OpenAI's small `openai/a-side`.
     run.set_model("openai/mini").await;
-    let events = run.turn_with("four").await;
+    let events = run.turn_from_start("four").await;
     assert_eq!(
         finish_reason(&events),
         FinishReason::Completed,
@@ -643,11 +593,11 @@ async fn a_side_model_summary_is_sized_priced_and_recorded_as_the_side_model() {
         },
         ..config("anthropic/a1")
     };
-    let mut run = start(fx.builder(cfg, &mock));
+    let mut run = start(fx.switching_builder(cfg, &mock));
     fill_for_compaction(&mut run).await;
     // anthropic/a2 has a 32k window: the next step compacts.
     run.set_model("anthropic/a2").await;
-    let events = run.turn_with("four").await;
+    let events = run.turn_from_start("four").await;
     assert_eq!(
         finish_reason(&events),
         FinishReason::Completed,
@@ -701,11 +651,11 @@ async fn a_reasoning_change_on_anthropic_starts_a_cold_epoch() {
             reply("read twice"),
             reply("after"),
         ]);
-        let mut run = start(fx.builder(config(model), &mock));
-        let t1 = run.turn_with("read it twice").await;
+        let mut run = start(fx.switching_builder(config(model), &mock));
+        let t1 = run.turn_from_start("read it twice").await;
         assert_eq!(finish_reason(&t1), FinishReason::Completed, "{t1:?}");
         run.send(Command::SetReasoning { level }).await;
-        let t2 = run.turn_with("after the change").await;
+        let t2 = run.turn_from_start("after the change").await;
         let cold = t2.iter().any(|e| {
             matches!(
                 e,
@@ -732,8 +682,8 @@ async fn first_request_after_switch_is_cold_epoch() {
         reply("warm"),
         reply("cold"),
     ]);
-    let mut run = start(fx.builder(config("anthropic/a1"), &mock));
-    let t1 = run.turn_with("read it twice").await;
+    let mut run = start(fx.switching_builder(config("anthropic/a1"), &mock));
+    let t1 = run.turn_from_start("read it twice").await;
     assert_eq!(finish_reason(&t1), FinishReason::Completed, "{t1:?}");
     run.send(Command::Pin {
         text: "PIN-MARKER".into(),
@@ -741,7 +691,7 @@ async fn first_request_after_switch_is_cold_epoch() {
     .await;
 
     // Warm cache, same model: the superseded read stays and the pin waits in the tail.
-    let t2 = run.turn_with("anything").await;
+    let t2 = run.turn_from_start("anything").await;
     assert!(
         !t2.iter()
             .any(|e| matches!(e, Event::ContextCollected { .. })),
@@ -751,7 +701,7 @@ async fn first_request_after_switch_is_cold_epoch() {
     assert!(tail_text(&warm).contains("PIN-MARKER"));
 
     run.set_model("anthropic/a2").await;
-    let t3 = run.turn_with("after the switch").await;
+    let t3 = run.turn_from_start("after the switch").await;
     assert!(
         t3.iter().any(|e| matches!(
             e,
@@ -779,18 +729,18 @@ async fn smaller_window_forces_compaction_at_next_step() {
     script.push(reply("SUMMARY-TEXT"));
     script.push(reply("done"));
     let mock = MockProvider::new(script);
-    let mut run = start(fx.builder(config("anthropic/a1"), &mock));
+    let mut run = start(fx.switching_builder(config("anthropic/a1"), &mock));
     // About 150k tokens: 5 messages of 120 KB (4 bytes a token).
     let filler = "lorem ipsum dolor sit amet ".repeat(120_000 / 27);
     for i in 0..5 {
-        let events = run.turn_with(&format!("M{i} {filler}")).await;
+        let events = run.turn_from_start(&format!("M{i} {filler}")).await;
         assert!(
             !events.iter().any(|e| matches!(e, Event::Compacted { .. })),
             "compacted before the switch: {events:?}"
         );
     }
     run.set_model("openai/small").await;
-    let events = run.turn_with("go on").await;
+    let events = run.turn_from_start("go on").await;
     assert_eq!(
         finish_reason(&events),
         FinishReason::Completed,
@@ -839,17 +789,17 @@ async fn foreign_reasoning_stripped_same_provider_kept() {
         ]),
         reply("four"),
     ]);
-    let mut run = start(fx.builder(config("anthropic/a1"), &mock));
-    run.turn_with("one").await;
+    let mut run = start(fx.switching_builder(config("anthropic/a1"), &mock));
+    run.turn_from_start("one").await;
     // Same provider: the signed thinking travels on.
     run.set_model("anthropic/a2").await;
-    run.turn_with("two").await;
+    run.turn_from_start("two").await;
     // Another provider: Anthropic's thinking is stripped.
     run.set_model("openai/o1").await;
-    run.turn_with("three").await;
+    run.turn_from_start("three").await;
     // And back: OpenAI's reasoning item is stripped.
     run.set_model("anthropic/a1").await;
-    run.turn_with("four").await;
+    run.turn_from_start("four").await;
 
     let reqs = mock.requests();
     assert_eq!(
@@ -879,10 +829,10 @@ async fn reasoning_rejection_strips_and_retries_once() {
         rejected(),
         rejected(),
     ]);
-    let mut run = start(fx.builder(config("anthropic/a1"), &mock));
-    run.turn_with("one").await;
+    let mut run = start(fx.switching_builder(config("anthropic/a1"), &mock));
+    run.turn_from_start("one").await;
     run.set_model("anthropic/a2").await;
-    let events = run.turn_with("two").await;
+    let events = run.turn_from_start("two").await;
 
     assert_eq!(finish_reason(&events), FinishReason::Error, "{events:?}");
     let reqs = mock.requests();
@@ -939,16 +889,16 @@ async fn reasoning_rejection_retry_that_succeeds_completes_without_reasoning() {
         reply("two"),
         reply("three"),
     ]);
-    let mut run = start(fx.builder(config("anthropic/a1"), &mock));
-    run.turn_with("one").await;
+    let mut run = start(fx.switching_builder(config("anthropic/a1"), &mock));
+    run.turn_from_start("one").await;
     run.set_model("anthropic/a2").await;
-    let t2 = run.turn_with("two").await;
+    let t2 = run.turn_from_start("two").await;
     assert_eq!(finish_reason(&t2), FinishReason::Completed, "{t2:?}");
     assert!(
         !t2.iter().any(|e| matches!(e, Event::Error { .. })),
         "{t2:?}"
     );
-    let t3 = run.turn_with("three").await;
+    let t3 = run.turn_from_start("three").await;
     assert_eq!(finish_reason(&t3), FinishReason::Completed, "{t3:?}");
 
     let reqs = mock.requests();
@@ -977,12 +927,12 @@ async fn a_cross_provider_switch_does_not_arm_the_reasoning_retry() {
         rejected_reasoning(),
         reply("never sent"),
     ]);
-    let mut run = start(fx.builder(config("anthropic/a1"), &mock));
-    run.turn_with("one").await;
+    let mut run = start(fx.switching_builder(config("anthropic/a1"), &mock));
+    run.turn_from_start("one").await;
     // Another provider: the reasoning is stripped before the request, so a refusal that
     // names it is not about carried-over reasoning and is not retried.
     run.set_model("openai/o1").await;
-    let events = run.turn_with("two").await;
+    let events = run.turn_from_start("two").await;
     assert_eq!(finish_reason(&events), FinishReason::Error, "{events:?}");
     assert_eq!(mock.requests().len(), 2, "no retry");
     assert!(
@@ -1000,7 +950,7 @@ async fn a_cross_provider_switch_does_not_arm_the_reasoning_retry() {
 async fn model_set_survives_resume() {
     let fx = Fx::new();
     let mock = MockProvider::new(vec![]);
-    let mut run = start(fx.builder(config("anthropic/a1"), &mock));
+    let mut run = start(fx.switching_builder(config("anthropic/a1"), &mock));
     run.set_model("openai/o1").await;
     run.set_model("acme/nope").await;
     run.set_model("openai/small").await;
@@ -1038,8 +988,8 @@ async fn budget_carries_over_and_unpriced_model_warns() {
     ]);
     let mut cfg = config("anthropic/pricey");
     cfg.budget.session.max_usd = Some(0.10);
-    let mut run = start(fx.builder(cfg, &mock));
-    let t1 = run.turn_with("one").await;
+    let mut run = start(fx.switching_builder(cfg, &mock));
+    let t1 = run.turn_from_start("one").await;
     assert!(warnings(&t1).is_empty(), "{t1:?}");
 
     let answer = run.set_model("openai/free").await;
@@ -1051,7 +1001,7 @@ async fn budget_carries_over_and_unpriced_model_warns() {
             .any(|w| w.contains("openai/free") && w.contains("no known price")),
         "{answer:?} {more:?}"
     );
-    let t2 = run.turn_with("two").await;
+    let t2 = run.turn_from_start("two").await;
     assert!(t2.iter().any(|e| matches!(
         e,
         Event::Usage {
@@ -1063,7 +1013,7 @@ async fn budget_carries_over_and_unpriced_model_warns() {
     assert!(warnings(&t2).is_empty(), "{t2:?}");
 
     run.set_model("anthropic/pricey").await;
-    let t3 = run.turn_with("three").await;
+    let t3 = run.turn_from_start("three").await;
     // 0.03 before the switch plus 0.06 now: the spend carried over.
     assert!(
         warnings(&t3)
@@ -1084,26 +1034,26 @@ async fn switch_to_unpriced_model_rewarns_and_back_restores_usd_budget() {
     ]);
     let mut cfg = config("anthropic/pricey");
     cfg.budget.session.max_usd = Some(0.05);
-    let mut run = start(fx.builder(cfg, &mock));
-    run.turn_with("one").await;
+    let mut run = start(fx.switching_builder(cfg, &mock));
+    run.turn_from_start("one").await;
 
     run.set_model("openai/free").await;
     let first = run.until(|e| matches!(e, Event::Warning { .. })).await;
     assert!(warnings(&first)[0].contains("no known price"));
     // Unpriced: only tokens count, so 5000 tokens are no USD spend.
-    let t2 = run.turn_with("two").await;
+    let t2 = run.turn_from_start("two").await;
     assert_eq!(finish_reason(&t2), FinishReason::Completed);
 
     // Back to the priced model: USD is enforced again, the spend so far unchanged.
     run.set_model("anthropic/pricey").await;
-    let t3 = run.turn_with("three").await;
+    let t3 = run.turn_from_start("three").await;
     assert!(
         warnings(&t3)
             .iter()
             .any(|w| w.contains("session budget exhausted") && w.contains("$0.0600 of $0.0500")),
         "{t3:?}"
     );
-    let t4 = run.turn_with("four").await;
+    let t4 = run.turn_from_start("four").await;
     assert_eq!(finish_reason(&t4), FinishReason::Budget);
     assert_eq!(mock.requests().len(), 3);
 
@@ -1122,7 +1072,7 @@ async fn switch_to_unpriced_model_rewarns_and_back_restores_usd_budget() {
 async fn an_uncatalogued_model_switches_with_conservative_defaults_and_a_warning() {
     let fx = Fx::new();
     let mock = MockProvider::new(vec![reply("one")]);
-    let mut run = start(fx.builder(config("anthropic/a1"), &mock));
+    let mut run = start(fx.switching_builder(config("anthropic/a1"), &mock));
     let answer = run.set_model("anthropic/not-in-the-catalog").await;
     assert!(
         matches!(
@@ -1139,7 +1089,7 @@ async fn an_uncatalogued_model_switches_with_conservative_defaults_and_a_warning
                 && w.contains("catalog_overrides")),
         "{answer:?}"
     );
-    let events = run.turn_with("hi").await;
+    let events = run.turn_from_start("hi").await;
     assert_eq!(finish_reason(&events), FinishReason::Completed);
     let req = &mock.requests()[0];
     assert_eq!(req.model, m("anthropic/not-in-the-catalog"));
@@ -1172,15 +1122,15 @@ async fn the_estimator_calibration_resets_when_the_provider_changes() {
     let fx = Fx::new();
     // A billed count far above the estimate drives the learned ratio to its 2.0 limit.
     let mock = MockProvider::new(vec![billed("one", 1_000_000), reply("two"), reply("three")]);
-    let mut run = start(fx.builder(config("anthropic/a1"), &mock));
-    run.turn_with("one").await;
+    let mut run = start(fx.switching_builder(config("anthropic/a1"), &mock));
+    run.turn_from_start("one").await;
     // Same provider: the ratio carries on.
     run.set_model("anthropic/a2").await;
-    let kept = used(&run.turn_with("two").await);
+    let kept = used(&run.turn_from_start("two").await);
     // Another provider (another tokenizer): it starts again at 1.0, about half the
     // estimate of the same context.
     run.set_model("openai/o1").await;
-    let reset = used(&run.turn_with("three").await);
+    let reset = used(&run.turn_from_start("three").await);
     assert!(reset * 3 < kept * 2, "kept {kept}, reset {reset}");
 }
 
@@ -1201,7 +1151,7 @@ async fn shutdown_does_not_wait_for_a_slow_provider_build() {
     });
     let mut run = start(EngineBuilder {
         provider_factory: Some(slow),
-        ..fx.builder(config("anthropic/a1"), &mock)
+        ..fx.switching_builder(config("anthropic/a1"), &mock)
     });
     run.send(Command::SetModel {
         id: None,
@@ -1262,7 +1212,7 @@ async fn a_replay_during_a_provider_build_is_refused_and_answers_echo_ids() {
     });
     let mut run = start(EngineBuilder {
         provider_factory: Some(slow),
-        ..fx.builder(config("anthropic/a1"), &mock)
+        ..fx.switching_builder(config("anthropic/a1"), &mock)
     });
     run.send(Command::SetModel {
         id: Some("sm-1".into()),
@@ -1308,22 +1258,16 @@ async fn a_replay_during_a_provider_build_is_refused_and_answers_echo_ids() {
 
 // ----------------------------------------------------------- resume and fork after a switch
 
-impl Fx {
+trait FxExt2 {
+    fn resumed(&self, cfg: Config, mock: &MockProvider, id: &str) -> EngineBuilder;
+}
+
+impl FxExt2 for Fx {
     fn resumed(&self, cfg: Config, mock: &MockProvider, id: &str) -> EngineBuilder {
         EngineBuilder {
             resume: Some(id.to_string()),
-            ..self.builder(cfg, mock)
+            ..self.switching_builder(cfg, mock)
         }
-    }
-}
-
-impl Run {
-    /// Shut down and wait until the engine has stopped (its log is closed).
-    async fn stop(mut self) {
-        self.send(Command::Shutdown).await;
-        let closed =
-            tokio::time::timeout(WAIT, async { while self.events.recv().await.is_some() {} }).await;
-        assert!(closed.is_ok(), "the engine did not stop");
     }
 }
 
@@ -1344,8 +1288,8 @@ async fn a_shutdown_while_a_resumed_session_sets_up_its_model_starts_nothing() {
         .unwrap();
     assert!(git.success());
     let mock = MockProvider::new(vec![reply("one")]);
-    let mut run = start(fx.builder(config("anthropic/a1"), &mock));
-    run.turn_with("one").await;
+    let mut run = start(fx.switching_builder(config("anthropic/a1"), &mock));
+    run.turn_from_start("one").await;
     run.set_model("openai/o1").await;
     let id = run.engine.session_id().to_string();
     let path = run.engine.session_path().to_path_buf();
@@ -1441,27 +1385,27 @@ async fn a_resumed_session_continues_on_the_model_it_switched_to() {
     };
     let live_fx = Fx::new();
     let live_mock = MockProvider::new(script());
-    let mut live = start(live_fx.builder(config("anthropic/a1"), &live_mock));
-    live.turn_with("one").await;
+    let mut live = start(live_fx.switching_builder(config("anthropic/a1"), &live_mock));
+    live.turn_from_start("one").await;
     live.set_model("openai/o1").await;
-    live.turn_with("two").await;
-    live.turn_with("three").await;
+    live.turn_from_start("two").await;
+    live.turn_from_start("three").await;
     live.stop().await;
     let expected = live_mock.requests()[2].clone();
     assert_eq!(expected.model, m("openai/o1"));
 
     let fx = Fx::new();
     let mock = MockProvider::new(script());
-    let mut run = start(fx.builder(config("anthropic/a1"), &mock));
-    run.turn_with("one").await;
+    let mut run = start(fx.switching_builder(config("anthropic/a1"), &mock));
+    run.turn_from_start("one").await;
     run.set_model("openai/o1").await;
-    run.turn_with("two").await;
+    run.turn_from_start("two").await;
     let id = run.engine.session_id().to_string();
     run.stop().await;
 
     let mock = MockProvider::new(vec![reply("three")]);
     let mut run = start(fx.resumed(config("anthropic/a1"), &mock, &id));
-    let events = run.turn_with("three").await;
+    let events = run.turn_from_start("three").await;
     assert_eq!(
         finish_reason(&events),
         FinishReason::Completed,
@@ -1486,17 +1430,17 @@ async fn a_resumed_session_does_not_resend_the_reasoning_a_model_refused() {
         rejected_reasoning(),
         reply("two"),
     ]);
-    let mut run = start(fx.builder(config("anthropic/a1"), &mock));
-    run.turn_with("one").await;
+    let mut run = start(fx.switching_builder(config("anthropic/a1"), &mock));
+    run.turn_from_start("one").await;
     run.set_model("anthropic/a2").await;
-    let t2 = run.turn_with("two").await;
+    let t2 = run.turn_from_start("two").await;
     assert_eq!(finish_reason(&t2), FinishReason::Completed, "{t2:?}");
     let id = run.engine.session_id().to_string();
     run.stop().await;
 
     let mock = MockProvider::new(vec![reply("three")]);
     let mut run = start(fx.resumed(config("anthropic/a1"), &mock, &id));
-    run.turn_with("three").await;
+    run.turn_from_start("three").await;
     let got = &mock.requests()[0];
     assert_eq!(got.model, m("anthropic/a2"));
     assert_eq!(reasoning_items(got), []);
@@ -1514,15 +1458,15 @@ async fn a_resumed_session_does_not_resend_the_reasoning_a_model_refused() {
 async fn a_session_resumed_right_after_a_switch_still_retries_without_reasoning() {
     let fx = Fx::new();
     let mock = MockProvider::new(vec![signed_thought("THINK-1", "SIG-1", "answer one")]);
-    let mut run = start(fx.builder(config("anthropic/a1"), &mock));
-    run.turn_with("one").await;
+    let mut run = start(fx.switching_builder(config("anthropic/a1"), &mock));
+    run.turn_from_start("one").await;
     run.set_model("anthropic/a2").await;
     let id = run.engine.session_id().to_string();
     run.stop().await;
 
     let mock = MockProvider::new(vec![rejected_reasoning(), reply("two")]);
     let mut run = start(fx.resumed(config("anthropic/a1"), &mock, &id));
-    let events = run.turn_with("two").await;
+    let events = run.turn_from_start("two").await;
     assert_eq!(
         finish_reason(&events),
         FinishReason::Completed,
@@ -1543,10 +1487,10 @@ async fn a_session_resumed_right_after_a_switch_still_retries_without_reasoning(
 async fn a_fork_before_a_later_switch_is_on_the_model_of_its_cut() {
     let fx = Fx::new();
     let mock = MockProvider::new(vec![reply("one"), reply("two"), reply("three")]);
-    let mut run = start(fx.builder(config("anthropic/a1"), &mock));
-    run.turn_with("one").await;
+    let mut run = start(fx.switching_builder(config("anthropic/a1"), &mock));
+    run.turn_from_start("one").await;
     run.set_model("openai/o1").await;
-    run.turn_with("two").await;
+    run.turn_from_start("two").await;
     run.set_model("anthropic/a2").await;
     // Steps: 1 "one", 2 its answer, (switch to o1), 3 "two", 4 its answer, (switch to a2).
     run.send(Command::Fork {
@@ -1569,7 +1513,7 @@ async fn a_fork_before_a_later_switch_is_on_the_model_of_its_cut() {
         )),
         "{events:?}"
     );
-    run.turn_with("three").await;
+    run.turn_from_start("three").await;
     let got = mock.requests().last().unwrap().clone();
     assert_eq!(got.model, m("openai/o1"));
     assert_eq!(edit_required(&got), json!(["patch"]));
@@ -1682,8 +1626,8 @@ async fn history_edits_leave_a_valid_adaptive_request() {
     script.push(reply("SUMMARY"));
     script.push(signed_thought("t", "s9", "after compaction"));
     let mock = MockProvider::new(script);
-    let mut run = start(fx.builder(adaptive_config(), &mock));
-    let t1 = run.turn_with("read it twice").await;
+    let mut run = start(fx.switching_builder(adaptive_config(), &mock));
+    let t1 = run.turn_from_start("read it twice").await;
     assert_eq!(finish_reason(&t1), FinishReason::Completed, "{t1:?}");
     run.send(Command::Pin {
         text: "PIN-MARKER".into(),
@@ -1693,7 +1637,7 @@ async fn history_edits_leave_a_valid_adaptive_request() {
         level: tautly_core::ReasoningLevel::High,
     })
     .await;
-    let t2 = run.turn_with("after the change").await;
+    let t2 = run.turn_from_start("after the change").await;
     assert!(
         t2.iter().any(|e| matches!(
             e,
@@ -1705,7 +1649,7 @@ async fn history_edits_leave_a_valid_adaptive_request() {
         "{t2:?}"
     );
     for _ in 0..4 {
-        let t = run.turn_with("more").await;
+        let t = run.turn_from_start("more").await;
         assert_eq!(finish_reason(&t), FinishReason::Completed, "{t:?}");
     }
     run.send(Command::Compact { id: None }).await;
@@ -1716,7 +1660,7 @@ async fn history_edits_leave_a_valid_adaptive_request() {
         c.iter().any(|e| matches!(e, Event::Compacted { .. })),
         "{c:?}"
     );
-    let t = run.turn_with("after compaction").await;
+    let t = run.turn_from_start("after compaction").await;
     assert_eq!(finish_reason(&t), FinishReason::Completed, "{t:?}");
     assert!(
         records(&run.engine)
@@ -1756,16 +1700,16 @@ async fn a_resume_starts_a_cold_epoch_at_any_reasoning_level() {
         ]);
         let mut high = config("anthropic/a1");
         high.reasoning = ReasoningLevel::High;
-        let mut run = start(fx.builder(high, &mock));
+        let mut run = start(fx.switching_builder(high, &mock));
         let id = run.engine.session_id().to_string();
-        let t1 = run.turn_with("read it twice").await;
+        let t1 = run.turn_from_start("read it twice").await;
         assert_eq!(finish_reason(&t1), FinishReason::Completed, "{t1:?}");
         run.stop().await;
 
         let mut cfg = config("anthropic/a1");
         cfg.reasoning = level;
         let mut run = start(fx.resumed(cfg, &mock, &id));
-        let t2 = run.turn_with("after resume").await;
+        let t2 = run.turn_from_start("after resume").await;
         let cold = t2.iter().any(|e| {
             matches!(
                 e,

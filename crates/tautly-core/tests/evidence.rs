@@ -12,10 +12,9 @@ use tautly_core::{
     EvidenceConfig, EvidenceTracker, FinishReason, TestEvidence, TestMatcher,
 };
 use tautly_provider::mock::{call, tools_step};
-use tautly_provider::{
-    Catalog, MockProvider, MockTurn, ModelId, ProviderEvent, RawUsage, StopReason,
-};
+use tautly_provider::{MockProvider, MockTurn, ModelId, ProviderEvent, RawUsage, StopReason};
 use tautly_sandbox::Mode;
+use tautly_testkit::catalog;
 use tautly_tools::{AppliedEffect, TestCounts, ToolMeta, ToolResult};
 use tempfile::TempDir;
 
@@ -431,18 +430,7 @@ const MODEL: &str = "mock/test";
 const WAIT: Duration = Duration::from_secs(30);
 
 fn config(patterns: &[&str]) -> Config {
-    let catalog = Catalog::from_toml(&format!(
-        r#"[models."{MODEL}"]
-context_window = 200000
-max_output = 8000
-parallel_tools = true
-reasoning = "none"
-cache = "none"
-images = false
-edit_format = "str_replace"
-"#
-    ))
-    .unwrap();
+    let catalog = catalog(200_000, 8000, "str_replace");
     let mut c = Config {
         model: ModelId::from(MODEL),
         catalog_overrides: Some(catalog),

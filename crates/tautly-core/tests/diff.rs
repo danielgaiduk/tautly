@@ -6,30 +6,15 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 use tautly_core::{
-    Command, Config, DiffFile, DiffPreview, DiffStatus, Engine, EngineBuilder, Event, FinishReason,
+    Command, Config, DiffFile, DiffPreview, DiffStatus, EngineBuilder, Event, FinishReason,
 };
 use tautly_provider::mock::{call, text_step_no_usage, tools_step};
-use tautly_provider::{Catalog, MockProvider, ModelId, ProviderEvent};
+use tautly_provider::{MockProvider, ModelId, ProviderEvent};
 use tautly_sandbox::Mode;
-use tempfile::TempDir;
-use tokio::sync::mpsc;
-
-const MODEL: &str = "mock/test";
-const WAIT: Duration = Duration::from_secs(30);
+use tautly_testkit::{Fx, MODEL, Run, catalog, start};
 
 fn config(mode: Mode, edit_format: &str) -> Config {
-    let catalog = Catalog::from_toml(&format!(
-        r#"[models."{MODEL}"]
-context_window = 200000
-max_output = 8000
-parallel_tools = true
-reasoning = "none"
-cache = "none"
-images = false
-edit_format = "{edit_format}"
-"#
-    ))
-    .unwrap();
+    let catalog = catalog(200_000, 8000, edit_format);
     let mut c = Config {
         model: ModelId::from(MODEL),
         catalog_overrides: Some(catalog),
@@ -63,79 +48,33 @@ fn patch(id: &str, body: &str) -> ProviderEvent {
     )
 }
 
-struct Fx {
-    dir: TempDir,
-    home: TempDir,
+trait FxExt {
+    fn slurp(&self, rel: &str) -> String;
+    fn start(&self, cfg: Config, mock: &MockProvider, interactive: bool) -> Run;
 }
 
-impl Fx {
-    fn new() -> Fx {
-        Fx {
-            dir: tempfile::tempdir().unwrap(),
-            home: tempfile::tempdir().unwrap(),
-        }
-    }
-
-    fn write(&self, rel: &str, text: &str) {
-        let p = self.dir.path().join(rel);
-        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
-        std::fs::write(p, text).unwrap();
-    }
-
+impl FxExt for Fx {
     fn slurp(&self, rel: &str) -> String {
         std::fs::read_to_string(self.dir.path().join(rel)).unwrap()
     }
 
     fn start(&self, cfg: Config, mock: &MockProvider, interactive: bool) -> Run {
-        let (engine, events) = EngineBuilder {
+        start(EngineBuilder {
             provider: Some(Arc::new(mock.clone())),
             data_home: Some(self.home.path().to_path_buf()),
             interactive,
             ..EngineBuilder::new(cfg, self.dir.path())
-        }
-        .build()
-        .unwrap();
-        Run { engine, events }
-    }
-}
-
-struct Run {
-    engine: Engine,
-    events: mpsc::Receiver<Event>,
-}
-
-impl Run {
-    async fn send(&self, cmd: Command) {
-        self.engine.send(cmd).await.unwrap();
-    }
-
-    async fn say(&self, text: &str) {
-        self.send(Command::SendMessage {
-            id: None,
-            text: text.into(),
         })
-        .await;
     }
+}
 
-    async fn next(&mut self) -> Event {
-        tokio::time::timeout(WAIT, self.events.recv())
-            .await
-            .expect("timed out waiting for an event")
-            .expect("event channel closed")
-    }
+trait RunExt {
+    async fn turn(&mut self) -> Vec<Event>;
+    async fn approve_next(&mut self) -> (Vec<Event>, String, Option<DiffPreview>);
+    async fn diff(&mut self, turn: Option<u32>) -> Event;
+}
 
-    async fn until(&mut self, pred: impl Fn(&Event) -> bool) -> Vec<Event> {
-        let mut out = Vec::new();
-        loop {
-            let ev = self.next().await;
-            let done = pred(&ev);
-            out.push(ev);
-            if done {
-                return out;
-            }
-        }
-    }
-
+impl RunExt for Run {
     async fn turn(&mut self) -> Vec<Event> {
         self.until(|e| matches!(e, Event::TurnFinished { .. }))
             .await
@@ -522,15 +461,12 @@ async fn session_diff_counts_started_turns_not_messages() {
     line["data"] = json!({"type": "command", "data": {"type": "send_message", "text": "lost"}});
     std::fs::write(&log, format!("{text}{line}\n")).unwrap();
 
-    let (engine, events) = EngineBuilder {
+    let mut run = start(EngineBuilder {
         provider: Some(Arc::new(MockProvider::new(vec![]))),
         data_home: Some(fx.home.path().to_path_buf()),
         resume: Some(id),
         ..EngineBuilder::new(config(Mode::Yolo, "str_replace"), fx.dir.path())
-    }
-    .build()
-    .unwrap();
-    let mut run = Run { engine, events };
+    });
     match run.diff(Some(2)).await {
         Event::Error { message, hint, .. } => {
             assert!(message.contains("no turn 2"), "{message}");

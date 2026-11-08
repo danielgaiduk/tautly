@@ -31,6 +31,7 @@ tree-sitter-toml-ng.workspace = true
 tree-sitter-yaml.workspace = true
 
 [dev-dependencies]
+tautly-testkit = { path = "../tautly-testkit" }
 async-trait.workspace = true
 tempfile.workspace = true
 tokio.workspace = true

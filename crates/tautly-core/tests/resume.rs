@@ -10,8 +10,8 @@ use serde_json::{Value, json};
 use tautly_core::record::UndoneFile;
 use tautly_core::resume::{self, Rebuilt, UndoError};
 use tautly_core::{
-    BudgetScope, Command, Config, Engine, EngineBuilder, Event, FinishReason, Ledger,
-    SessionRecord, Workspace,
+    BudgetScope, Command, Config, EngineBuilder, Event, FinishReason, Ledger, SessionRecord,
+    Workspace,
 };
 use tautly_provider::mock::{call, text_step, tools_step};
 use tautly_provider::{
@@ -20,26 +20,7 @@ use tautly_provider::{
 };
 use tautly_sandbox::{LocalSandbox, Mode, Sandbox};
 use tautly_session::{Origin, SessionReader};
-use tempfile::TempDir;
-use tokio::sync::mpsc;
-
-const MODEL: &str = "mock/test";
-const WAIT: Duration = Duration::from_secs(30);
-
-fn catalog(window: u32, max_output: u32, edit_format: &str) -> Catalog {
-    Catalog::from_toml(&format!(
-        r#"[models."{MODEL}"]
-context_window = {window}
-max_output = {max_output}
-parallel_tools = true
-reasoning = "none"
-cache = "none"
-images = false
-edit_format = "{edit_format}"
-"#
-    ))
-    .unwrap()
-}
+use tautly_testkit::{Fx, MODEL, Run, WAIT, catalog, start};
 
 fn config(mode: Mode) -> Config {
     let mut c = Config {
@@ -51,39 +32,18 @@ fn config(mode: Mode) -> Config {
     c
 }
 
-struct Fx {
-    dir: TempDir,
-    home: TempDir,
+trait FxExt {
+    fn read(&self, rel: &str) -> Option<String>;
+    fn resume(&self, cfg: Config, mock: &MockProvider, id: &str) -> EngineBuilder;
+    fn sandbox(&self) -> LocalSandbox;
+    async fn ready_workspace(&self) -> Arc<Workspace>;
+    fn ledger(&self) -> Ledger;
+    async fn ledger_rows(&self, n: u64);
 }
 
-impl Fx {
-    fn new() -> Fx {
-        Fx {
-            dir: tempfile::tempdir().unwrap(),
-            home: tempfile::tempdir().unwrap(),
-        }
-    }
-
-    fn root(&self) -> PathBuf {
-        self.dir.path().canonicalize().unwrap()
-    }
-
-    fn write(&self, rel: &str, text: &str) {
-        let p = self.dir.path().join(rel);
-        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
-        std::fs::write(p, text).unwrap();
-    }
-
+impl FxExt for Fx {
     fn read(&self, rel: &str) -> Option<String> {
         std::fs::read_to_string(self.dir.path().join(rel)).ok()
-    }
-
-    fn builder(&self, cfg: Config, mock: &MockProvider) -> EngineBuilder {
-        EngineBuilder {
-            provider: Some(Arc::new(mock.clone())),
-            data_home: Some(self.home.path().to_path_buf()),
-            ..EngineBuilder::new(cfg, self.dir.path())
-        }
     }
 
     fn resume(&self, cfg: Config, mock: &MockProvider, id: &str) -> EngineBuilder {
@@ -139,55 +99,11 @@ fn break_ledger(fx: &Fx) {
     std::fs::create_dir(&ledger).unwrap();
 }
 
-struct Run {
-    engine: Engine,
-    events: mpsc::Receiver<Event>,
+trait RunExt {
+    async fn fork(&mut self, at: Option<u32>, label: &str) -> String;
 }
 
-fn start(b: EngineBuilder) -> Run {
-    let (engine, events) = b.build().unwrap();
-    Run { engine, events }
-}
-
-impl Run {
-    async fn send(&self, cmd: Command) {
-        self.engine.send(cmd).await.unwrap();
-    }
-
-    async fn say(&self, text: &str) {
-        self.send(Command::SendMessage {
-            id: None,
-            text: text.into(),
-        })
-        .await;
-    }
-
-    async fn next(&mut self) -> Event {
-        tokio::time::timeout(WAIT, self.events.recv())
-            .await
-            .expect("timed out waiting for an event")
-            .expect("event channel closed")
-    }
-
-    /// Events up to and including the first that matches `pred`.
-    async fn until(&mut self, pred: impl Fn(&Event) -> bool) -> Vec<Event> {
-        let mut out = Vec::new();
-        loop {
-            let ev = self.next().await;
-            let done = pred(&ev);
-            out.push(ev);
-            if done {
-                return out;
-            }
-        }
-    }
-
-    async fn turn_with(&mut self, text: &str) -> Vec<Event> {
-        self.say(text).await;
-        self.until(|e| matches!(e, Event::TurnFinished { .. }))
-            .await
-    }
-
+impl RunExt for Run {
     /// The `SessionChanged` of a fork.
     async fn fork(&mut self, at: Option<u32>, label: &str) -> String {
         self.send(Command::Fork {
@@ -203,25 +119,6 @@ impl Run {
             Some(Event::SessionChanged { id: _, session_id }) => session_id.clone(),
             other => panic!("the fork failed: {other:?}"),
         }
-    }
-
-    /// Shut down and wait until the engine has stopped (its log is closed).
-    async fn stop(self) {
-        self.stop_events().await;
-    }
-
-    /// Shut down; the events until the stream closed.
-    async fn stop_events(mut self) -> Vec<Event> {
-        self.send(Command::Shutdown).await;
-        let mut out = Vec::new();
-        let closed = tokio::time::timeout(WAIT, async {
-            while let Some(ev) = self.events.recv().await {
-                out.push(ev);
-            }
-        })
-        .await;
-        assert!(closed.is_ok(), "the engine did not stop");
-        out
     }
 }
 
@@ -1881,7 +1778,7 @@ async fn a_panic_in_a_compaction_job_logs_no_turn_end() {
         "{events:?}"
     );
     let path = run.engine.session_path().to_path_buf();
-    let rest = run.stop_events().await;
+    let rest = run.stop().await;
     assert!(
         !rest.iter().any(|e| matches!(e, Event::TurnFinished { .. })),
         "{rest:?}"

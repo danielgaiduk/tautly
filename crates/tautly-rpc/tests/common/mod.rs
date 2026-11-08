@@ -16,25 +16,12 @@ pub use tautly_provider::mock::{call, text_step, tools_step};
 use tautly_provider::{Catalog, MockProvider};
 use tautly_rpc::{EngineFactory, SessionSpec};
 use tautly_sandbox::{LocalSandbox, Sandbox};
-use tempfile::TempDir;
 use tokio::sync::mpsc;
 
-pub const MODEL: &str = "mock/test";
-pub const WAIT: Duration = Duration::from_secs(30);
+pub use tautly_testkit::{Fx, MODEL, WAIT};
 
 pub fn catalog() -> Catalog {
-    Catalog::from_toml(&format!(
-        r#"[models."{MODEL}"]
-context_window = 200000
-max_output = 8000
-parallel_tools = true
-reasoning = "none"
-cache = "none"
-images = false
-edit_format = "str_replace"
-"#
-    ))
-    .unwrap()
+    tautly_testkit::catalog(200_000, 8000, "str_replace")
 }
 
 /// The configuration `tautly` loads for these CLI flags (no user or project file), on the
@@ -59,51 +46,30 @@ pub fn config(mode: Mode) -> Config {
     c
 }
 
-pub struct Fx {
-    pub dir: TempDir,
-    pub home: TempDir,
+/// What the tests ask of [`Fx`] beyond the shared fixture.
+#[allow(async_fn_in_trait)]
+pub trait FxExt {
+    fn exists(&self, rel: &str) -> bool;
+    fn build(&self, b: EngineBuilder) -> (Engine, mpsc::Receiver<Event>);
+    fn workspaces(&self) -> Workspaces;
+    async fn ready_workspace(&self) -> Arc<Workspace>;
 }
 
-impl Fx {
-    pub fn new() -> Fx {
-        Fx {
-            dir: tempfile::tempdir().unwrap(),
-            home: tempfile::tempdir().unwrap(),
-        }
-    }
-
-    pub fn root(&self) -> PathBuf {
-        self.dir.path().canonicalize().unwrap()
-    }
-
-    pub fn write(&self, rel: &str, text: &str) {
-        let p = self.dir.path().join(rel);
-        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
-        std::fs::write(p, text).unwrap();
-    }
-
-    pub fn exists(&self, rel: &str) -> bool {
+impl FxExt for Fx {
+    fn exists(&self, rel: &str) -> bool {
         self.dir.path().join(rel).exists()
     }
 
-    pub fn builder(&self, cfg: Config, mock: &MockProvider) -> EngineBuilder {
-        EngineBuilder {
-            provider: Some(Arc::new(mock.clone())),
-            data_home: Some(self.home.path().to_path_buf()),
-            ..EngineBuilder::new(cfg, self.dir.path())
-        }
-    }
-
-    pub fn build(&self, b: EngineBuilder) -> (Engine, mpsc::Receiver<Event>) {
+    fn build(&self, b: EngineBuilder) -> (Engine, mpsc::Receiver<Event>) {
         b.build().unwrap()
     }
 
-    pub fn workspaces(&self) -> Workspaces {
+    fn workspaces(&self) -> Workspaces {
         Workspaces::new(self.home.path())
     }
 
     /// A workspace over this root whose index and memory store are open.
-    pub async fn ready_workspace(&self) -> Arc<Workspace> {
+    async fn ready_workspace(&self) -> Arc<Workspace> {
         let sb: Arc<dyn Sandbox> = Arc::new(LocalSandbox::new(self.root()).unwrap());
         let ws = Workspace::new(sb, self.home.path());
         ws.start();

@@ -2,15 +2,14 @@
 //! changes nothing; after it, the write is reported in full and the slow bookkeeping
 //! (read baseline, re-index) is skipped.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde_json::json;
 use tautly_provider::EditFormat;
-use tautly_sandbox::{
-    Child, FileMeta, HttpResponse, LocalSandbox, Sandbox, SandboxError, SpawnSpec, Url,
-};
+use tautly_sandbox::{LocalSandbox, Sandbox, SandboxError};
+use tautly_testkit::{Delegate, Delegating};
 use tautly_tools::{
     AppliedEffect, EditTool, LineRange, ReadTool, ReadTracker, Tool, ToolCx, WriteTool,
 };
@@ -83,18 +82,9 @@ struct CancelOnWrite {
 }
 
 #[async_trait]
-impl Sandbox for CancelOnWrite {
-    fn root(&self) -> &Path {
-        self.sb.root()
-    }
-    fn resolve(&self, p: &Path) -> Result<PathBuf, SandboxError> {
-        self.sb.resolve(p)
-    }
-    async fn read(&self, p: &Path) -> Result<Vec<u8>, SandboxError> {
-        self.sb.read(p).await
-    }
-    async fn metadata(&self, p: &Path) -> Result<FileMeta, SandboxError> {
-        self.sb.metadata(p).await
+impl Delegate for CancelOnWrite {
+    fn inner(&self) -> &LocalSandbox {
+        &self.sb
     }
     async fn write_atomic(
         &self,
@@ -106,31 +96,16 @@ impl Sandbox for CancelOnWrite {
         self.cancel.cancel();
         r
     }
-    async fn remove_file(&self, p: &Path) -> Result<(), SandboxError> {
-        self.sb.remove_file(p).await
-    }
-    async fn spill(&self, bytes: &[u8]) -> Result<PathBuf, SandboxError> {
-        self.sb.spill(bytes).await
-    }
-    async fn spawn(&self, spec: SpawnSpec) -> Result<Child, SandboxError> {
-        self.sb.spawn(spec).await
-    }
-    fn walker(&self, base: &Path) -> Result<ignore::WalkBuilder, SandboxError> {
-        self.sb.walker(base)
-    }
-    async fn http_get(&self, url: &Url) -> Result<HttpResponse, SandboxError> {
-        self.sb.http_get(url).await
-    }
 }
 
 #[tokio::test]
 async fn a_write_cancelled_after_its_commit_reports_the_change_and_skips_the_baseline() {
     let (dir, sb) = setup();
     let cancel = CancellationToken::new();
-    let sb = CancelOnWrite {
+    let sb = Delegating(CancelOnWrite {
         sb,
         cancel: cancel.clone(),
-    };
+    });
     sb.sb
         .write_atomic(Path::new("a.txt"), b"alpha\n", None)
         .await

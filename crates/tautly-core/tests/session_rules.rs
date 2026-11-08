@@ -2,18 +2,13 @@
 //! through the engine with a scripted provider and a real sandbox on a temporary directory.
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use serde_json::json;
-use tautly_core::{Command, Config, Engine, EngineBuilder, Event, FinishReason};
+use tautly_core::{Command, Config, EngineBuilder, Event, FinishReason};
 use tautly_provider::mock::{call, text_step_no_usage};
 use tautly_provider::{Catalog, MockProvider, MockTurn, ModelId, ProviderEvent, StopReason};
 use tautly_sandbox::Mode;
-use tempfile::TempDir;
-use tokio::sync::mpsc;
-
-const MODEL: &str = "mock/test";
-const WAIT: Duration = Duration::from_secs(30);
+use tautly_testkit::{Fx, MODEL, Run, WAIT, start};
 
 fn config(deny: &[&str]) -> Config {
     let catalog = Catalog::from_toml(&format!(
@@ -52,50 +47,29 @@ fn step(c: ProviderEvent) -> MockTurn {
     ])
 }
 
-struct Fx {
-    dir: TempDir,
-    home: TempDir,
+trait FxExt {
+    fn start(&self, cfg: Config, mock: &MockProvider, resume: Option<String>) -> Run;
 }
 
-impl Fx {
-    fn new() -> Fx {
-        Fx {
-            dir: tempfile::tempdir().unwrap(),
-            home: tempfile::tempdir().unwrap(),
-        }
-    }
-
+impl FxExt for Fx {
     fn start(&self, cfg: Config, mock: &MockProvider, resume: Option<String>) -> Run {
-        let (engine, events) = EngineBuilder {
+        start(EngineBuilder {
             provider: Some(Arc::new(mock.clone())),
             data_home: Some(self.home.path().to_path_buf()),
             interactive: true,
             resume,
             ..EngineBuilder::new(cfg, self.dir.path())
-        }
-        .build()
-        .unwrap();
-        Run { engine, events }
+        })
     }
 }
 
-struct Run {
-    engine: Engine,
-    events: mpsc::Receiver<Event>,
+trait RunExt {
+    async fn until_ask_or_end(&mut self, seen: &mut Vec<Event>) -> Option<String>;
+    async fn approve(&self, request_id: String, rule: Option<&str>);
+    async fn shutdown(self);
 }
 
-impl Run {
-    async fn send(&self, cmd: Command) {
-        self.engine.send(cmd).await.unwrap();
-    }
-
-    async fn next(&mut self) -> Event {
-        tokio::time::timeout(WAIT, self.events.recv())
-            .await
-            .expect("timed out waiting for an event")
-            .expect("event channel closed")
-    }
-
+impl RunExt for Run {
     /// Events up to the next approval request (its id) or the end of the turn (None).
     async fn until_ask_or_end(&mut self, seen: &mut Vec<Event>) -> Option<String> {
         loop {
