@@ -1265,38 +1265,23 @@ async fn rows_queued_at_shutdown_are_written_before_the_event_stream_closes() {
 
 #[tokio::test]
 async fn a_stuck_ledger_delays_shutdown_by_at_most_about_a_second() {
-    // The rest of a shutdown (turn-end checkpoint, process groups, the log) takes what it
-    // takes on a loaded runner: timed on the same session shape without the lock, it is
-    // the baseline the stuck ledger is measured against.
-    let shutdown = |locked: bool| async move {
-        let fx = Fx::new();
-        let mock = MockProvider::new(vec![
-            text_step("one", tokens(10, 2)),
-            text_step("two", tokens(20, 3)),
-        ]);
-        let mut run = start(fx.builder(config(true), &mock));
-        let holder = if locked {
-            Some(second_row_queued_behind_a_lock(&fx, &mut run).await)
-        } else {
-            run.turn_with("first").await;
-            run.turn_with("second").await;
-            None
-        };
-        let t0 = Instant::now();
-        run.send(Command::Shutdown).await;
-        run.until_closed().await;
-        (t0.elapsed(), fx, holder)
-    };
-    let (baseline, _, _) = shutdown(false).await;
-    let (took, fx, holder) = shutdown(true).await;
-    let holder = holder.unwrap();
+    let fx = Fx::new();
+    let mock = MockProvider::new(vec![
+        text_step("one", tokens(10, 2)),
+        text_step("two", tokens(20, 3)),
+    ]);
+    let mut run = start(fx.builder(config(true), &mock));
+    let holder = second_row_queued_behind_a_lock(&fx, &mut run).await;
+    let t0 = Instant::now();
+    run.send(Command::Shutdown).await;
+    run.until_closed().await;
+    let took = t0.elapsed();
     // The flush waits 1 s (spec: "about a second"); unbounded, it would wait out the
     // ledger's 5 s busy timeout, since the lock is held until after the close. 1 s plus a
-    // 3 s margin over the baseline still ends 1 s before the busy timeout could.
-    assert!(
-        took < baseline + Duration::from_secs(4),
-        "shutdown took {took:?} (baseline {baseline:?})"
-    );
+    // 3 s margin for a loaded runner still ends 1 s before the busy timeout could. (The
+    // shutdown's other work is milliseconds; a file watcher stopped on the runtime thread
+    // once stalled it for seconds, see `Held` in workspace.rs.)
+    assert!(took < Duration::from_secs(4), "shutdown took {took:?}");
     holder.execute_batch("COMMIT;").unwrap();
     drop(holder);
     // The writer goes on after the session: the row still arrives.
