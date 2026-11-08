@@ -23,6 +23,24 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo clippy -p tautly --all-targets --features mock -- -D warnings
 
+  # Hooks declared in configuration (`hook.<name>.command`/`event`) arrived in git 2.54, and
+  # `core.hooksPath=/dev/null` does not switch them off, so checkpoint git disables each one it
+  # finds (CP5 review C1). Runner images may ship an older git, on which the regression tests
+  # skip themselves. This job installs a current git from the git-core PPA and sets
+  # TAUTLY_REQUIRE_CONFIG_HOOKS, which turns that skip into a failure, so the hardening tests
+  # really exercise config-based hooks somewhere.
+  config-hooks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo add-apt-repository -y ppa:git-core/ppa && sudo apt-get update && sudo apt-get install -y git
+      - run: git --version
+      - run: cargo test -p tautly-core --test checkpoint --test worktree_fork --test bisect
+        env:
+          TAUTLY_REQUIRE_CONFIG_HOOKS: "1"
+
   # The release plan (cargo-dist) matches spec 7.11.3: four targets, shell + Homebrew installers,
   # sha256 checksums, binstall names, release.yml in sync with dist-workspace.toml.
   dist-plan:

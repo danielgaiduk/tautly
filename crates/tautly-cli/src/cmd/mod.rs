@@ -149,12 +149,9 @@ impl Env {
     }
 }
 
-/// `path` relative to `root`, when it is inside.
+/// `path` relative to `root`, when it is inside, escaped for the terminal.
 fn rel(root: &Path, path: &Path) -> String {
-    path.strip_prefix(root)
-        .unwrap_or(path)
-        .to_string_lossy()
-        .into_owned()
+    tautly_core::printable(&path.strip_prefix(root).unwrap_or(path).to_string_lossy())
 }
 
 /// `t` as `YYYY-MM-DD HH:MM` in UTC.

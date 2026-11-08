@@ -82,11 +82,11 @@ fn input_redirects_heredocs_herestrings_are_not_writes() {
 
 #[test]
 fn wrappers_are_not_unwrapped() {
-    let c = parse_commands("sudo env FOO=1 time nohup xargs rm").unwrap();
+    let c = parse_commands("sudo env FOO=1 time nohup nice rm").unwrap();
     assert_eq!(c.len(), 1);
     assert_eq!(
         c[0].argv,
-        ["sudo", "env", "FOO=1", "time", "nohup", "xargs", "rm"]
+        ["sudo", "env", "FOO=1", "time", "nohup", "nice", "rm"]
     );
 }
 
@@ -601,16 +601,13 @@ fn more_wrappers_and_xargs_into_runners_are_unparseable() {
         "echo x | xargs -n1 bash",
         "echo x | xargs python3",
         "echo x | xargs nice",
-    ] {
-        assert!(parse_commands(s).is_err(), "{s}");
-    }
-    for s in [
-        "arch -arm64 cargo build",
+        // Any `xargs`: its command line is completed from stdin (CP5 review M2).
         "echo a | xargs rm",
         "find src -name '*.o' | xargs rm -f",
     ] {
-        assert!(parse_commands(s).is_ok(), "{s}");
+        assert!(parse_commands(s).is_err(), "{s}");
     }
+    assert!(parse_commands("arch -arm64 cargo build").is_ok());
 }
 
 #[test]

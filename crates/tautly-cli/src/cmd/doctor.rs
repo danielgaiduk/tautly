@@ -6,7 +6,6 @@
 //! tokens, and follows no redirect.
 
 use std::ffi::OsString;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -155,7 +154,7 @@ pub fn run(cx: &DoctorCx) -> Vec<Check> {
     }
     let data_home = data_home_check(cx, &mut checks);
     let root = sandbox_check(cx, &mut checks);
-    checks.push(git_check(cx));
+    checks.push(git_check(cx, root.as_deref().unwrap_or(cx.root)));
     if let (Some(home), Some(root)) = (&data_home, &root) {
         checks.push(index_check(home, root));
         match &runtime {
@@ -557,22 +556,25 @@ fn sandbox_check(cx: &DoctorCx, checks: &mut Vec<Check>) -> Option<PathBuf> {
     root
 }
 
-/// `git`: the binary and its version; missing is a warn (checkpoints are off).
-fn git_check(cx: &DoctorCx) -> Check {
-    let git = (cx.env)("PATH").and_then(|path| {
-        std::env::split_paths(&path)
-            .map(|dir| dir.join("git"))
-            .find(|p| {
-                std::fs::metadata(p)
-                    .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-            })
-    });
-    let Some(git) = git else {
-        return check(
-            "git",
-            Level::Warn,
-            "git not found on PATH: checkpoints are off",
-        );
+/// `git`: the binary and its version; missing is a warn (checkpoints are off). Found as
+/// checkpoints find it: on `PATH` outside the work tree at `root` (CP5 review I1).
+fn git_check(cx: &DoctorCx, root: &Path) -> Check {
+    let found = match (cx.env)("PATH") {
+        Some(path) => tautly_sandbox::which_outside_or_skipped("git", &path, root),
+        None => Err(None),
+    };
+    let git = match found {
+        Ok(git) => git,
+        Err(skipped) => {
+            let why = skipped.map_or(String::new(), |p| {
+                format!(" (skipped {} inside the work tree)", p.display())
+            });
+            return check(
+                "git",
+                Level::Warn,
+                format!("git not found on PATH{why}: checkpoints are off"),
+            );
+        }
     };
     match std::process::Command::new(&git).arg("--version").output() {
         Ok(out) if out.status.success() => check(

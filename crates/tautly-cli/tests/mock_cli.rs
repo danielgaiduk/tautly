@@ -563,6 +563,95 @@ fn undo_restores_file() {
     assert!(shown.contains("undone"), "{shown}");
 }
 
+/// CP5 review M1: repository text reaches the terminal escaped on every channel: a
+/// project config key (dropped with a warning) on `-p`, `mcp list` and `models list`, a
+/// TOML error's quoted line, a first prompt in `sessions list`, a file name `undo` names.
+#[test]
+fn repository_text_never_reaches_the_terminal_raw() {
+    let s = Scratch::new();
+    let esc = '\u{1b}';
+    let config = s.work.path().join(".tautly/config.toml");
+    std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+    std::fs::write(&config, "\"\\u001b]0;owned\\u0007\\u001b[2Jfake\" = 1\n").unwrap();
+    let script = s.script("s.json", json!([text("hi")]));
+    for args in [
+        &["-p", "hi", "--mock-script", script.as_str()][..],
+        &["mcp", "list"],
+        &["models", "list"],
+    ] {
+        let err = stderr(&s.run(args));
+        assert!(err.contains("fake"), "{args:?}: no warning: {err}");
+        assert!(!err.contains(esc), "{args:?}: {err:?}");
+    }
+    std::fs::write(&config, "model = \"x\u{1b}]0;owned\u{7}\u{1b}[2J\n").unwrap();
+    let out = s.run(&["-p", "hi", "--mock-script", &script]);
+    assert_ne!(out.status.code(), Some(0));
+    assert!(!stderr(&out).contains(esc), "{:?}", stderr(&out));
+    std::fs::remove_file(&config).unwrap();
+
+    let name = "a\u{1b}[2J.txt";
+    s.prompt(
+        "\u{1b}]0;owned\u{7}edit",
+        json!([write_content(name, "new\n"), text("ok")]),
+        &[],
+    );
+    let list = s.run(&["sessions", "list"]);
+    assert!(out_text(&list).contains("edit"), "{}", out_text(&list));
+    assert!(!out_text(&list).contains(esc), "{:?}", out_text(&list));
+    let undo = s.run(&["undo"]);
+    assert_eq!(undo.status.code(), Some(0), "{}", stderr(&undo));
+    assert!(out_text(&undo).contains("deleted a"), "{}", out_text(&undo));
+    assert!(!out_text(&undo).contains(esc), "{:?}", out_text(&undo));
+
+    // The note naming a kept ignored file (CP5 re-review N1), in a git work tree.
+    let g = Scratch::new();
+    g.write(".gitignore", "*.log\n");
+    g.write("a.txt", "a\n");
+    git(&g, &["init", "-q"]);
+    git(&g, &["add", "-A"]);
+    git(&g, &["commit", "-q", "-m", "i"]);
+    let command = "touch 'x\u{1b}]0;owned\u{7}\u{1b}[2Jy.log' && : > .gitignore";
+    let script = g.script(
+        "n.json",
+        json!([[
+            {"tool_call": {"id": "b1", "name": "bash",
+                           "input_json": json!({"command": command}).to_string()}},
+            {"done": {"stop": "tool_use"}}
+        ], text("ok")]),
+    );
+    let out = g.run(&["-p", "go", "--approve", "yolo", "--mock-script", &script]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let undo = g.run(&["undo"]);
+    assert_eq!(undo.status.code(), Some(0), "{}", stderr(&undo));
+    assert!(out_text(&undo).contains("note:"), "{}", out_text(&undo));
+    assert!(!out_text(&undo).contains(esc), "{:?}", out_text(&undo));
+}
+
+/// CP5 review M3: `tautly undo` takes the working-tree lease exclusively, so it refuses
+/// (writing nothing) while a live session uses the work tree.
+#[test]
+fn undo_refuses_while_a_live_session_uses_the_work_tree() {
+    let s = Scratch::new();
+    s.write("a.txt", "old\n");
+    s.prompt(
+        "edit",
+        json!([write_content("a.txt", "new\n"), text("ok")]),
+        &[],
+    );
+    let root = s.work.path().canonicalize().unwrap();
+    let live = tautly_core::Lease::shared(s.home.path(), &root).unwrap();
+    let out = s.run(&["undo"]);
+    assert_ne!(out.status.code(), Some(0), "{}", out_text(&out));
+    assert!(stderr(&out).contains("running tautly"), "{}", stderr(&out));
+    assert_eq!(s.read("a.txt"), "new\n");
+    let dry = s.run(&["undo", "--dry-run"]);
+    assert_eq!(dry.status.code(), Some(0), "{}", stderr(&dry));
+    drop(live);
+    let out = s.run(&["undo"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert_eq!(s.read("a.txt"), "old\n");
+}
+
 #[test]
 fn undo_deletes_a_file_the_turn_created_and_takes_a_turn_number() {
     let s = Scratch::new();

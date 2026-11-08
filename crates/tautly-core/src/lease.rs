@@ -1,7 +1,7 @@
 //! The working-tree lease (spec 7.12.1): every engine holds a shared `flock` on
-//! `<data home>/locks/<root hash>.lock` for as long as it runs; a rewind or a branch switch
-//! needs it exclusive, so it is refused while another live session, in this process or
-//! another, uses the same working tree.
+//! `<data home>/locks/<root hash>.lock` for as long as it runs; an undo, a rewind or a
+//! branch switch needs it exclusive, so it is refused while another live session, in this
+//! process or another, uses the same working tree.
 //!
 //! `flock` locks belong to an open file: each engine opens the lock file itself, so two
 //! engines of one process exclude each other like two processes do. Converting the shared
@@ -25,8 +25,8 @@ use crate::workspace::Workspace;
 #[derive(Debug, thiserror::Error)]
 pub enum LeaseError {
     #[error(
-        "another live session uses this working tree; close it first (rewind and switch \
-         change files under it)"
+        "another live session uses this working tree; close it first (undo, rewind and \
+         switch change files under it)"
     )]
     Busy,
     #[error("cannot lock the working tree: {0}")]

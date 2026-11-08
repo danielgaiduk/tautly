@@ -55,7 +55,7 @@ pub async fn run(cmd: Cmd, env: &Env) -> anyhow::Result<i32> {
     println!("symbols: {}", stats.symbols);
     println!("references: {}", stats.refs);
     if let Some(e) = index.last_error() {
-        println!("last error: {e}");
+        println!("last error: {}", tautly_core::printable(&e.to_string()));
     }
     if !ready {
         println!(
