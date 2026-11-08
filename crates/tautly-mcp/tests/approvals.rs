@@ -765,7 +765,10 @@ fn a_huge_module_or_command_line_is_bounded_and_never_remembered() {
     let repo = dir.path().canonicalize().unwrap();
     let deep = format!("{}a", "a.".repeat(20_000));
     let many = "x ".repeat(60_000);
+    // Review I1: `/` instead of `.`, 60 times in one 246 KB shell word.
+    let slashes = format!("python3 -m {}a > ", "a/".repeat(2047)).repeat(60);
     let specs = [
+        stdio("sh", &["-c", &slashes], &[]),
         stdio("python3", &["-m", &deep], &[]),
         stdio("python3", &[&format!("-m{deep}")], &[]),
         stdio("sh", &["-c", &format!("python3 -m {deep}")], &[]),

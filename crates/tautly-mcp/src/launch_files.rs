@@ -241,6 +241,11 @@ fn candidates(words: &[&String], base: &Path) -> (Vec<(usize, String)>, bool) {
         }
         let tokens = tokens(word);
         for (j, token) in tokens.iter().enumerate() {
+            // Checked per token too: one `sh -c` word can hold any number of them.
+            if out.len() > MAX_CANDIDATES {
+                complete = false;
+                break;
+            }
             runner |= Path::new(token)
                 .file_name()
                 .and_then(|n| n.to_str())
@@ -310,10 +315,14 @@ fn python_module_flag(token: &str) -> Option<Option<&str>> {
 /// parent package costs a candidate as long as the module, so its candidates would grow
 /// with the square of its length.
 fn module_paths(word: usize, module: &str, out: &mut Vec<(usize, String)>) -> bool {
-    if module.len() > MAX_MODULE_BYTES || module.split('.').count() > MAX_MODULE_PARTS {
+    if module.len() > MAX_MODULE_BYTES {
         return false;
     }
     let path = module.replace('.', "/");
+    // Counted as path parts: `a/b` is as deep as `a.b`.
+    if path.split('/').count() > MAX_MODULE_PARTS {
+        return false;
+    }
     if path.is_empty() {
         return true;
     }
@@ -499,4 +508,33 @@ pub(crate) fn nonce() -> String {
         .map_or(0, |d| d.as_nanos());
     let seed = format!("{}:{t}:{n}", std::process::id());
     blake3::hash(seed.as_bytes()).to_hex().to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Review I1: a `-m` module written with `/` (`a/a/a…`, one dot-part) still has a
+    /// path part per `/`, and one `sh -c` word can hold many of them: the parts are
+    /// counted after the `.`-to-`/` change and the candidate cap holds inside a word, so
+    /// a 246 KB command line yields a bounded candidate list (count and bytes), and is
+    /// not complete (never remembered).
+    #[test]
+    fn slash_modules_and_one_long_word_are_bounded() {
+        let module = format!("{}a", "a/".repeat(2047));
+        let word = format!("python3 -m {module} > ").repeat(60);
+        let short = format!("python3 -m {module}");
+        let base = Path::new("/nonexistent-tautly-test-root");
+        for w in [word, short] {
+            let words = [&w];
+            let (out, complete) = candidates(&words, base);
+            assert!(!complete);
+            assert!(out.len() <= MAX_CANDIDATES, "{} candidates", out.len());
+            let bytes: usize = out.iter().map(|(_, c)| c.len()).sum();
+            assert!(bytes < 16 * 1024 * 1024, "{bytes} bytes of candidates");
+        }
+        // A real package written with `/` still counts as complete.
+        let ok = "python3 -m a/b/c".to_string();
+        assert!(candidates(&[&ok], base).1);
+    }
 }
