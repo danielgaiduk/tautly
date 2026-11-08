@@ -42,7 +42,7 @@ use tautly_tools::preview::{FileChange, diff_files};
 use crate::checkpoint::check_session;
 use crate::evidence::TestEvidence;
 use crate::ledger::Ledger;
-use crate::record::SessionRecord;
+use crate::record::{RecordLog, SessionRecord};
 use crate::timetravel::{StepCounter, Writes, befores, ran_command, step_at_offset};
 
 /// The most sessions one comparison takes.
@@ -221,7 +221,7 @@ pub fn fork_point(a: &Header, b: &Header, data_home: &Path) -> Option<(String, u
 /// The step in force at record `offset` of the log at `log` (as [`step_at_offset`]
 /// counts it); none when the log cannot be read as far as that record.
 fn step_through(log: &Path, offset: u64) -> Option<u32> {
-    let reader = SessionReader::<SessionRecord>::open(log).ok()?;
+    let reader = RecordLog::open(log).ok()?;
     let mut steps = StepCounter::default();
     for rec in reader.records() {
         let (at, rec) = rec.ok()?;
@@ -243,7 +243,7 @@ fn step_through(log: &Path, offset: u64) -> Option<u32> {
 /// before the first step past it (as a rewind to that step cuts). Comparisons should cut
 /// at [`ForkPoint::offset`] instead, which names the same record in every log.
 pub fn summarize(
-    reader: &SessionReader<SessionRecord>,
+    reader: &RecordLog,
     ledger: Option<&Ledger>,
     catalog: &Catalog,
     from_step: Option<u32>,
@@ -259,7 +259,7 @@ pub fn summarize(
 
 /// The offset of the last record before the first one of a step past `n` (none: that is
 /// the first record, so every record counts; the last record when no step is past `n`).
-fn step_cut(reader: &SessionReader<SessionRecord>, n: u32) -> Result<Option<u64>, CompareError> {
+fn step_cut(reader: &RecordLog, n: u32) -> Result<Option<u64>, CompareError> {
     let mut steps = StepCounter::default();
     let mut last = None;
     for rec in reader.records() {
@@ -284,7 +284,7 @@ fn step_cut(reader: &SessionReader<SessionRecord>, n: u32) -> Result<Option<u64>
 /// `cut` is none). A turn open at the cut counts its wall time from the first record after
 /// it. Blocking I/O (the log, its blobs, the ledger).
 pub fn summarize_at(
-    reader: &SessionReader<SessionRecord>,
+    reader: &RecordLog,
     ledger: Option<&Ledger>,
     catalog: &Catalog,
     cut: Option<u64>,
@@ -534,7 +534,7 @@ impl Tally {
 
     fn finish(
         mut self,
-        reader: &SessionReader<SessionRecord>,
+        reader: &RecordLog,
         ledger: Option<&Ledger>,
         catalog: &Catalog,
         own_range: bool,
@@ -636,11 +636,7 @@ impl Tally {
 
     /// Lines added and removed: each path's earliest content after the cut against the
     /// last one a tool left there.
-    fn diff_stat(
-        &self,
-        reader: &SessionReader<SessionRecord>,
-        notes: &mut Vec<String>,
-    ) -> (u32, u32) {
+    fn diff_stat(&self, reader: &RecordLog, notes: &mut Vec<String>) -> (u32, u32) {
         let read = |b: &Option<BlobRef>| -> Result<Option<Vec<u8>>, ()> {
             b.as_ref()
                 .map(|b| reader.read_blob(b))

@@ -6,11 +6,11 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use tautly_sandbox::Sandbox;
-use tautly_session::{BlobRef, RelPath, SessionReader};
+use tautly_session::{BlobRef, RelPath};
 
 use super::{FileState, TtError};
 use crate::checkpoint::{self, Checkpointer};
-use crate::record::{BackupFile, RestoreBy, RestoreOutcome, SessionRecord, Wrote};
+use crate::record::{BackupFile, RecordLog, RestoreBy, RestoreOutcome, SessionRecord, Wrote};
 use crate::undo::{Disk, MAX_DISK_READ, UndoLog, read_disk};
 
 /// Why a path is blocked (never written).
@@ -134,14 +134,14 @@ pub(crate) struct Applied {
 /// Blob contents and ids, read from the states' logs once each.
 struct Blobs<'a> {
     cp: Option<&'a Checkpointer>,
-    readers: HashMap<PathBuf, SessionReader<SessionRecord>>,
+    readers: HashMap<PathBuf, RecordLog>,
     ids: HashMap<BlobRef, String>,
 }
 
 impl Blobs<'_> {
     fn bytes(&mut self, log: &Path, b: &BlobRef) -> Result<Vec<u8>, TtError> {
         if !self.readers.contains_key(log) {
-            let reader = SessionReader::<SessionRecord>::open(log)?;
+            let reader = RecordLog::open(log)?;
             self.readers.insert(log.to_path_buf(), reader);
         }
         Ok(self.readers[log].read_blob(b)?)
@@ -774,7 +774,7 @@ async fn write(
         };
         let full = confined(sb, &root, &p.rel)?;
         if reader.is_none() {
-            reader = Some(SessionReader::<SessionRecord>::open(&target.log)?);
+            reader = Some(RecordLog::open(&target.log)?);
         }
         let bytes = reader.as_ref().expect("opened").read_blob(b)?;
         // Over a file with its mode, a new one with the default mode (`new_file_mode`).

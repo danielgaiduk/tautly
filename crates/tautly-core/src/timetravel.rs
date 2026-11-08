@@ -53,9 +53,7 @@ use std::sync::Arc;
 
 use tautly_provider::ProviderEvent;
 use tautly_sandbox::SandboxError;
-use tautly_session::{
-    BlobRef, ConfineError, HeaderInit, Origin, RelPath, SessionReader, SessionWriter,
-};
+use tautly_session::{BlobRef, ConfineError, HeaderInit, Origin, RelPath, SessionWriter};
 use tautly_tools::PersistedEffect;
 
 pub(crate) use self::materialize::confined;
@@ -64,7 +62,7 @@ use self::materialize::{fail, materialize_inner};
 use crate::checkpoint::{CheckpointError, Checkpointer, Point, Skip};
 use crate::lease::{ExclusiveGuard, LeaseError};
 use crate::protocol::{Command, ErrorKind, Event, FinishReason};
-use crate::record::{CheckpointPoint, RestoreBy, RestoreOutcome, SessionRecord};
+use crate::record::{CheckpointPoint, RecordLog, RestoreBy, RestoreOutcome, SessionRecord};
 use crate::resume::{Continue, Rebuilt, ResumeError, branch, discard, rebuild, rebuild_with};
 use crate::session::Session;
 use crate::turn::{Response, TurnControl};
@@ -375,7 +373,7 @@ struct Walked {
     last_step: u32,
 }
 
-fn walk(reader: &SessionReader<SessionRecord>) -> Result<Walked, TtError> {
+fn walk(reader: &RecordLog) -> Result<Walked, TtError> {
     let mut steps = StepCounter::default();
     let mut recs = Vec::new();
     let mut owner = Vec::new();
@@ -399,7 +397,7 @@ fn walk(reader: &SessionReader<SessionRecord>) -> Result<Walked, TtError> {
 /// 7.12.3 words it as "the step whose last record is at `offset − 1`", counting the
 /// offset past the copy; the header stores the last record's own offset.) 0 before the
 /// first step. A record that cannot be read ends the count there.
-pub fn step_at_offset(reader: &SessionReader<SessionRecord>, offset: u64) -> u32 {
+pub fn step_at_offset(reader: &RecordLog, offset: u64) -> u32 {
     let mut steps = StepCounter::default();
     for rec in reader.records() {
         let Ok((at, rec)) = rec else {
@@ -440,7 +438,7 @@ pub(crate) fn befores(rec: &SessionRecord) -> Vec<(RelPath, Option<BlobRef>)> {
 /// first `Checkpoint` after the step's last record, with the `Edit`s and `Undone`s between
 /// reverted; see the module docs for when it is partial. A step past the log's last is
 /// [`TtError::NoSuchStep`]. Blocking I/O (the log).
-pub fn state_at(reader: &SessionReader<SessionRecord>, at: u32) -> Result<FileState, TtError> {
+pub fn state_at(reader: &RecordLog, at: u32) -> Result<FileState, TtError> {
     Boundaries::new(reader)?.state(at, true)
 }
 
@@ -457,7 +455,7 @@ pub(crate) struct Boundaries {
 
 impl Boundaries {
     /// Read the log once. Blocking I/O.
-    pub(crate) fn new(reader: &SessionReader<SessionRecord>) -> Result<Boundaries, TtError> {
+    pub(crate) fn new(reader: &RecordLog) -> Result<Boundaries, TtError> {
         let w = walk(reader)?;
         let mut last_of = std::collections::HashMap::new();
         let mut first_turn_end = std::collections::HashMap::new();
@@ -665,7 +663,7 @@ pub(crate) fn ran_command(rec: &SessionRecord) -> bool {
 /// undos applied. A tool edit whose result was not captured leaves its path out (it is then
 /// compared with the checkpoint's) and makes the state partial. Also gathers what
 /// [`materialize`] needs to tell human changes apart. Blocking I/O (the log).
-pub fn expected_tip(reader: &SessionReader<SessionRecord>) -> Result<FileState, TtError> {
+pub fn expected_tip(reader: &RecordLog) -> Result<FileState, TtError> {
     let mut state = FileState::new(reader.path());
     // Two passes over the log rather than holding it (cp5 review C M7): the base first.
     let mut base: Option<(u64, String)> = None;
@@ -804,11 +802,7 @@ async fn blocking<T: Send + 'static>(
 /// How many records a rewind to step `at` copies: through the cut's last record, or for
 /// `at = 0` with nothing kept before the first step, the records before that step's first
 /// one (commands and set-up, which change nothing). None: nothing to copy.
-pub(crate) fn copy_count(
-    reader: &SessionReader<SessionRecord>,
-    at: u32,
-    cut: &Rebuilt,
-) -> Option<u64> {
+pub(crate) fn copy_count(reader: &RecordLog, at: u32, cut: &Rebuilt) -> Option<u64> {
     if let Some(end) = cut.end_offset {
         return Some(end + 1);
     }
@@ -833,7 +827,7 @@ pub(crate) fn copy_count(
 /// number `n`, of user turn `turn` and step `step`. None without a base.
 async fn restored_checkpoint(
     cp: &Checkpointer,
-    reader: &SessionReader<SessionRecord>,
+    reader: &RecordLog,
     base: Option<&str>,
     overlay: &[(RelPath, Option<BlobRef>)],
     (n, turn, step): (u32, u32, u32),
@@ -869,7 +863,7 @@ async fn restored_checkpoint(
 /// an asserted `Edit` per overlay file (pre- and post-image the same).
 async fn branch_tip(
     cp: Option<&Checkpointer>,
-    reader: &SessionReader<SessionRecord>,
+    reader: &RecordLog,
     target: &FileState,
     expected: &FileState,
     at: u32,
@@ -903,7 +897,7 @@ async fn branch_tip(
 }
 
 /// The log ends after a `TurnStart` with no `TurnEnd` (a crash mid-turn).
-fn ends_inside_a_turn(reader: &SessionReader<SessionRecord>) -> Result<bool, TtError> {
+fn ends_inside_a_turn(reader: &RecordLog) -> Result<bool, TtError> {
     let mut open = false;
     for rec in reader.records() {
         match rec?.1 {
@@ -916,7 +910,7 @@ fn ends_inside_a_turn(reader: &SessionReader<SessionRecord>) -> Result<bool, TtE
 }
 
 /// The highest checkpoint number, the user turn and the step a log ends on.
-fn log_tip(reader: &SessionReader<SessionRecord>) -> Result<(u32, u32, u32), TtError> {
+fn log_tip(reader: &RecordLog) -> Result<(u32, u32, u32), TtError> {
     let (mut n, mut turn) = (0, 0);
     let mut steps = StepCounter::default();
     for rec in reader.records() {
@@ -1070,7 +1064,7 @@ impl Session {
         self.checkpoint().await;
         let checked = path.clone();
         blocking(move |_| {
-            let reader = SessionReader::<SessionRecord>::open(&checked)?;
+            let reader = RecordLog::open(&checked)?;
             let last = step_at_offset(&reader, u64::MAX);
             if at > last {
                 return Err(TtError::NoSuchStep { at, last });
@@ -1099,7 +1093,7 @@ impl Session {
             rt.block_on(async move {
                 let mut guard = guard;
                 let mut cp = guard.as_deref_mut().map(|g| &mut g.cp);
-                let reader = SessionReader::<SessionRecord>::open(&path)?;
+                let reader = RecordLog::open(&path)?;
                 let cut = rebuild(&reader, Some(at))?;
                 // Checked before any write.
                 let count = copy_count(&reader, at, &cut).ok_or_else(|| {
@@ -1147,7 +1141,7 @@ impl Session {
                         tip,
                     )
                     .map_err(TtError::Other)?;
-                    let rebuilt = SessionReader::<SessionRecord>::open(child.path())
+                    let rebuilt = RecordLog::open(child.path())
                         .map_err(ResumeError::from)
                         .and_then(|r| rebuild_with(&r, None, Some(&calibration)));
                     match rebuilt {
@@ -1246,7 +1240,7 @@ impl Session {
                 let mut guard = guard;
                 let mut cp = guard.as_deref_mut().map(|g| &mut g.cp);
                 let mut writer = opened;
-                let there = SessionReader::<SessionRecord>::open(&found)?;
+                let there = RecordLog::open(&found)?;
                 // A session that stopped mid-turn gets its missing `TurnEnd`, as on resume,
                 // before the switch writes anything there: stamped at its last record, so
                 // the time no session ran is not the turn's (cp5 FMT re-review N3).
@@ -1260,7 +1254,7 @@ impl Session {
                     })?;
                     w.checkpoint()?;
                 }
-                let here = SessionReader::<SessionRecord>::open(&current)?;
+                let here = RecordLog::open(&current)?;
                 let target = expected_tip(&there)?;
                 let expected = expected_tip(&here)?;
                 // Both sessions record the restore, so a cut-off one is warned about
@@ -1304,7 +1298,7 @@ impl Session {
                             writer.checkpoint()?;
                         }
                     }
-                    let there = SessionReader::<SessionRecord>::open(&found)?;
+                    let there = RecordLog::open(&found)?;
                     let r = rebuild_with(&there, None, Some(&calibration))?;
                     Ok::<_, TtError>(r)
                 }

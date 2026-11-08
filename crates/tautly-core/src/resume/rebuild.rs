@@ -13,11 +13,12 @@ use super::*;
 use crate::dispatch::signature;
 use crate::protocol::Command;
 use crate::provider_setup::provider_label;
+use crate::record::RecordLog;
 use crate::turn::Response;
 
 /// [`rebuild`], calibrating the token estimator when `calibration` is given.
 pub(crate) fn rebuild_with(
-    reader: &SessionReader<SessionRecord>,
+    reader: &RecordLog,
     until: Option<u32>,
     calibration: Option<&Calibration>,
 ) -> Result<Rebuilt, ResumeError> {
@@ -153,7 +154,7 @@ struct OpenStep {
 }
 
 struct Replay<'a> {
-    reader: &'a SessionReader<SessionRecord>,
+    reader: &'a RecordLog,
     until: Option<u32>,
     calibration: Option<&'a Calibration>,
     /// What requests were assembled with, per model (with a calibration).
@@ -781,7 +782,7 @@ pub(super) fn originals(
     path: &std::path::Path,
     ids: &[String],
 ) -> Result<Vec<GcElision>, ResumeError> {
-    let reader = SessionReader::<SessionRecord>::open(path)?;
+    let reader = RecordLog::open(path)?;
     let wanted: HashSet<&str> = ids.iter().map(String::as_str).collect();
     let mut blobs: HashMap<String, BlobRef> = HashMap::new();
     for rec in reader.records() {

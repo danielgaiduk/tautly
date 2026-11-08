@@ -30,12 +30,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use tautly_sandbox::{Sandbox, SandboxError};
-use tautly_session::{BlobRef, ConfineError, RelPath, SessionReader, SessionWriter};
+use tautly_session::{BlobRef, ConfineError, RelPath, SessionWriter};
 use tautly_tools::{AppliedEffect, PersistedEffect};
 
 use crate::checkpoint::{self, Change, CheckpointError, Checkpointer, Skip};
 use crate::protocol::{ErrorKind, Event};
-use crate::record::{CheckpointPoint, SessionRecord, UndoneFile};
+use crate::record::{CheckpointPoint, RecordLog, SessionRecord, UndoneFile};
 use crate::session::{Log, Session};
 use crate::turn::TurnControl;
 
@@ -179,7 +179,7 @@ impl UndoLog for LiveLog {
 /// writing (not for a dry run), so the session must not be running in an engine
 /// ([`tautly_session::Error::AlreadyOpen`]). Blocking file I/O on the log.
 pub async fn undo(
-    reader: &SessionReader<SessionRecord>,
+    reader: &RecordLog,
     sandbox: &dyn Sandbox,
     cp: Option<&mut Checkpointer>,
     turn: Option<u32>,
@@ -203,7 +203,7 @@ pub async fn undo(
 
 /// [`undo`] logging to `log` (none: a dry run).
 pub(crate) async fn undo_with(
-    reader: &SessionReader<SessionRecord>,
+    reader: &RecordLog,
     sandbox: &dyn Sandbox,
     cp: Option<&mut Checkpointer>,
     turn: Option<u32>,
@@ -308,7 +308,7 @@ struct Scan {
 }
 
 impl Scan {
-    fn read(reader: &SessionReader<SessionRecord>) -> Result<Scan, UndoError> {
+    fn read(reader: &RecordLog) -> Result<Scan, UndoError> {
         let mut scan = Scan {
             turns: 0,
             per_turn: HashMap::new(),
@@ -539,7 +539,7 @@ struct Planned {
 }
 
 struct GitUndo<'a> {
-    reader: &'a SessionReader<SessionRecord>,
+    reader: &'a RecordLog,
     sandbox: &'a dyn Sandbox,
     cp: &'a mut Checkpointer,
     scan: &'a Scan,
@@ -1050,7 +1050,7 @@ struct Target {
 /// not what the log says the session left it at. With `cp`, a backup snapshot is taken
 /// before the first write.
 async fn preimage_undo(
-    reader: &SessionReader<SessionRecord>,
+    reader: &RecordLog,
     sandbox: &dyn Sandbox,
     cp: Option<&mut Checkpointer>,
     turn: Option<u32>,
@@ -1194,10 +1194,7 @@ struct UndoPlan {
 }
 
 /// The user turn to undo, its files and what the log says of them since.
-fn undo_plan(
-    reader: &SessionReader<SessionRecord>,
-    turn: Option<u32>,
-) -> Result<UndoPlan, UndoError> {
+fn undo_plan(reader: &RecordLog, turn: Option<u32>) -> Result<UndoPlan, UndoError> {
     let mut current = 0u32;
     let mut turns = 0u32;
     // Per user turn: each path's earliest pre-image, in order of its latest change.
@@ -1354,7 +1351,7 @@ impl Session {
         // and writes files: all blocking I/O, so it runs off the async workers, on a
         // runtime of its own for its git steps.
         let result = tokio::task::spawn_blocking(move || {
-            let reader = SessionReader::<SessionRecord>::open(&path)?;
+            let reader = RecordLog::open(&path)?;
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()

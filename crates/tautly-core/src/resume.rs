@@ -58,7 +58,7 @@ use std::sync::Arc;
 use tautly_context::{CompactionRecord, Context, MutationReason};
 use tautly_memory::MemoryChange;
 use tautly_provider::{Capabilities, Catalog, ModelId, RawUsage, ToolSpec, cost_usd};
-use tautly_session::{HeaderInit, Origin, SessionReader, SessionWriter};
+use tautly_session::{HeaderInit, Origin, SessionWriter};
 use tautly_tools::{ReadTracker, Tool, registry};
 
 use crate::attempts::AttemptLedger;
@@ -67,7 +67,7 @@ use crate::ledger::{LEDGER_FILE, Ledger};
 use crate::mcp::MCP_TOOL_PREFIX;
 use crate::model_switch::Stopped;
 use crate::protocol::{BudgetScope, ErrorKind, Event, FinishReason};
-use crate::record::SessionRecord;
+use crate::record::{RecordLog, SessionRecord};
 use crate::session::{PrefixLog, Session};
 use crate::turn::TurnControl;
 
@@ -170,10 +170,7 @@ impl Calibration {
 /// The context as it stood at the end of step `until` (None: the end of the log). An
 /// `until` past the last step is [`ResumeError::NoSuchStep`]. Blocking I/O (the log and
 /// its blobs).
-pub fn rebuild(
-    reader: &SessionReader<SessionRecord>,
-    until: Option<u32>,
-) -> Result<Rebuilt, ResumeError> {
+pub fn rebuild(reader: &RecordLog, until: Option<u32>) -> Result<Rebuilt, ResumeError> {
     rebuild_with(reader, until, None)
 }
 
@@ -228,7 +225,7 @@ impl Session {
         let log = self.log.clone();
         let calibration = self.calibration();
         let (rebuilt, closed) = tokio::task::spawn_blocking(move || -> Result<_, String> {
-            let reader = SessionReader::<SessionRecord>::open(&path).map_err(err)?;
+            let reader = RecordLog::open(&path).map_err(err)?;
             let rebuilt = rebuild_with(&reader, None, Some(&calibration)).map_err(err)?;
             let closed = if rebuilt.incomplete_turn {
                 log.append_at_last(&SessionRecord::TurnEnd {
@@ -478,7 +475,7 @@ impl Session {
         };
         let calibration = self.calibration();
         let made = tokio::task::spawn_blocking(move || -> Result<_, String> {
-            let parent = SessionReader::<SessionRecord>::open(&parent_path).map_err(err)?;
+            let parent = RecordLog::open(&parent_path).map_err(err)?;
             let cut = rebuild(&parent, at).map_err(err)?;
             // As a rewind counts it (`at = 0` copies the set-up before the first step,
             // cp5 review C M9). The parent offset names the last record copied: with none,
@@ -510,7 +507,7 @@ impl Session {
                 cut.incomplete_turn,
                 Vec::new(),
             )?;
-            let rebuilt = SessionReader::<SessionRecord>::open(child.path())
+            let rebuilt = RecordLog::open(child.path())
                 .map_err(ResumeError::from)
                 .and_then(|reader| rebuild_with(&reader, None, Some(&calibration)));
             match rebuilt {
@@ -822,7 +819,7 @@ mod tests {
             w.append(r).unwrap();
         }
         w.checkpoint().unwrap();
-        let reader = SessionReader::<SessionRecord>::open(w.path()).unwrap();
+        let reader = RecordLog::open(w.path()).unwrap();
         rebuild(&reader, until).unwrap().attempts.generation()
     }
 
@@ -1010,7 +1007,7 @@ mod tests {
             w.append(r).unwrap();
         }
         w.checkpoint().unwrap();
-        let reader = SessionReader::<SessionRecord>::open(w.path()).unwrap();
+        let reader = RecordLog::open(w.path()).unwrap();
         let last = crate::timetravel::step_at_offset(&reader, u64::MAX);
         match rebuild(&reader, Some(last + 1)) {
             Err(ResumeError::NoSuchStep { last: rebuilt, .. }) => {

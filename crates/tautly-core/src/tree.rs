@@ -13,10 +13,10 @@ use std::path::Path;
 use std::time::UNIX_EPOCH;
 
 use serde::{Deserialize, Serialize};
-use tautly_session::{Origin, SessionReader};
+use tautly_session::Origin;
 
 use crate::ledger::{LEDGER_FILE, Ledger};
-use crate::record::SessionRecord;
+use crate::record::{RecordLog, SessionRecord};
 use crate::timetravel::TtError;
 
 /// Longest [`TreeNode::last_prompt`] kept, in characters.
@@ -131,7 +131,7 @@ fn cached_node(path: &Path) -> Option<TreeNode> {
 /// One log's node (cost, `live` and `current` filled in by the caller); none when it
 /// cannot be read.
 fn node(path: &Path) -> Option<TreeNode> {
-    let reader = SessionReader::<SessionRecord>::open(path).ok()?;
+    let reader = RecordLog::open(path).ok()?;
     let header = reader.header().clone();
     let mut label = header.label.clone();
     let mut last_prompt = String::new();

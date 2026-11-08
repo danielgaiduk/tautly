@@ -39,14 +39,12 @@ use std::sync::Arc;
 
 use tautly_provider::ModelId;
 use tautly_sandbox::Sandbox;
-use tautly_session::{
-    ConfineError, HeaderInit, Origin, RelPath, SessionReader, SessionWriter, new_session_id,
-};
+use tautly_session::{ConfineError, HeaderInit, Origin, RelPath, SessionWriter, new_session_id};
 use tautly_tools::PersistedEffect;
 
 use crate::checkpoint::{self, CheckpointError, CheckpointRef, Checkpointer};
 use crate::config::CheckpointConfig;
-use crate::record::{CheckpointPoint, SessionRecord};
+use crate::record::{CheckpointPoint, RecordLog, SessionRecord};
 use crate::resume::{Rebuilt, discard, rebuild};
 use crate::timetravel::{FileState, TtError, copy_count, state_at, step_at_offset};
 
@@ -255,7 +253,7 @@ async fn overlay_entries(
         dir.to_path_buf(),
     );
     blocking(move || {
-        let reader = SessionReader::<SessionRecord>::open(&log)?;
+        let reader = RecordLog::open(&log)?;
         let mut entries = Vec::with_capacity(overlay.len());
         for (path, blob) in &overlay {
             path.resolve(&dir)?;
@@ -413,7 +411,7 @@ async fn blocking<T: Send + 'static>(
 /// `model` (applied before the first message); returns its id. See the module docs.
 /// Blocking I/O.
 pub fn fork_into(
-    reader: &SessionReader<SessionRecord>,
+    reader: &RecordLog,
     at: u32,
     new_root: &Path,
     label: Option<String>,
@@ -452,7 +450,7 @@ struct Fork {
 
 /// Check that step `at` exists and can be branched from, and that every path the records
 /// to copy name resolves under a root (Review Focus 14).
-fn plan(reader: &SessionReader<SessionRecord>, at: u32) -> Result<Plan, WtError> {
+fn plan(reader: &RecordLog, at: u32) -> Result<Plan, WtError> {
     let cut = rebuild(reader, Some(at)).map_err(TtError::from)?;
     let count = copy_count(reader, at, &cut).ok_or_else(|| {
         WtError::Other(
@@ -504,7 +502,7 @@ fn record_paths(rec: &SessionRecord) -> Vec<RelPath> {
 /// Write the fork's log next to the parent's (see the module docs). On a failure the
 /// half-written log is removed.
 fn fork_log(
-    reader: &SessionReader<SessionRecord>,
+    reader: &RecordLog,
     plan: &Plan,
     new_root: &Path,
     fork: Fork,
@@ -604,7 +602,7 @@ pub async fn fork_to_worktree(
     let log = parent_log.to_path_buf();
     let wanted = req.at;
     let (plan, state, project) = blocking(move || {
-        let reader = SessionReader::<SessionRecord>::open(&log)?;
+        let reader = RecordLog::open(&log)?;
         let at = wanted.unwrap_or_else(|| step_at_offset(&reader, u64::MAX));
         let plan = plan(&reader, at)?;
         let state = state_at(&reader, at)?;
@@ -638,7 +636,7 @@ pub async fn fork_to_worktree(
     let written = {
         let (log, worktree, id) = (parent_log.to_path_buf(), worktree.clone(), id.clone());
         blocking(move || {
-            let reader = SessionReader::<SessionRecord>::open(&log)?;
+            let reader = RecordLog::open(&log)?;
             let fork = Fork {
                 label: req.label,
                 origin: Origin::WhatIf,
@@ -685,7 +683,7 @@ async fn adopt(
 ) -> Result<(), WtError> {
     let log = log.to_path_buf();
     let all = blocking(move || {
-        let reader = SessionReader::<SessionRecord>::open(&log)?;
+        let reader = RecordLog::open(&log)?;
         let mut all = Vec::new();
         for rec in reader.records() {
             if let SessionRecord::Checkpoint { n, commit, .. } = rec?.1 {

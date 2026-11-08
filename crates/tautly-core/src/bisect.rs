@@ -57,13 +57,13 @@ use serde_json::{Value, json};
 use tautly_provider::{EditFormat, ProviderEvent};
 pub use tautly_sandbox::Decision;
 use tautly_sandbox::{LocalSandbox, Policy, PolicyConfig, SPILL_DIR, Sandbox};
-use tautly_session::{SessionReader, new_session_id};
+use tautly_session::new_session_id;
 use tautly_tools::{BashTool, PersistedEffect, ProcessGroups, Tool, ToolCx};
 pub use tokio_util::sync::CancellationToken;
 
 use crate::checkpoint::{self, CheckpointError};
 use crate::lease;
-use crate::record::SessionRecord;
+use crate::record::{RecordLog, SessionRecord};
 use crate::timetravel::{Boundaries, FileState, StepCounter, TtError};
 use crate::worktree::{self, WtError};
 
@@ -313,7 +313,7 @@ pub fn normalize(cmd: &str) -> String {
 /// the pre-pass's) and `bad` (default the last step, or the pre-pass's). Reads the log
 /// once. Blocking I/O.
 pub fn plan(
-    reader: &SessionReader<SessionRecord>,
+    reader: &RecordLog,
     test: &str,
     good: Option<u32>,
     bad: Option<u32>,
@@ -415,7 +415,7 @@ struct StepRuns {
 /// write generation did not move between them (see the module docs); a boundary with runs
 /// that disagree counts for neither. Blocking I/O; a record that cannot be read ends the
 /// log there.
-pub fn prepass(reader: &SessionReader<SessionRecord>, test: &str) -> Option<(u32, u32)> {
+pub fn prepass(reader: &RecordLog, test: &str) -> Option<(u32, u32)> {
     let mut recs = Vec::new();
     for rec in reader.records() {
         let Ok(rec) = rec else {
@@ -426,11 +426,7 @@ pub fn prepass(reader: &SessionReader<SessionRecord>, test: &str) -> Option<(u32
     prepass_in(reader, &recs, test)
 }
 
-fn prepass_in(
-    reader: &SessionReader<SessionRecord>,
-    recs: &[(u64, SessionRecord)],
-    test: &str,
-) -> Option<(u32, u32)> {
+fn prepass_in(reader: &RecordLog, recs: &[(u64, SessionRecord)], test: &str) -> Option<(u32, u32)> {
     let test = normalize(test);
     let mut steps = StepCounter::default();
     let mut by_step: BTreeMap<u32, StepRuns> = BTreeMap::new();
@@ -783,7 +779,7 @@ async fn bisect_in(
 /// Step `step` of the log at `log`: its user turn, its calls (`tool: target`) and its
 /// assistant text.
 fn step_info(log: &Path, step: u32) -> Result<(Option<u32>, Vec<String>, String), BisectError> {
-    let reader = SessionReader::<SessionRecord>::open(log)?;
+    let reader = RecordLog::open(log)?;
     let mut steps = StepCounter::default();
     let (mut turn, mut calls, mut text) = (None, Vec::new(), String::new());
     for rec in reader.records() {

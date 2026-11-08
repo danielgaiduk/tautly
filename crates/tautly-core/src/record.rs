@@ -20,6 +20,9 @@ use tautly_tools::{PersistedEffect, ToolMeta};
 use crate::evidence::TestEvidence;
 use crate::protocol::{Command, FinishReason, UsageRole};
 
+/// A session log read as this crate's records.
+pub(crate) type RecordLog = SessionReader<SessionRecord>;
+
 /// One line of a session log, in the order things happened.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(
@@ -532,7 +535,7 @@ impl Serialize for SessionRecord {
 /// [`BLOB_INPUT`]); every other event as it is. A blob that cannot be read leaves the input
 /// empty (an empty object in the history), with the error.
 pub(crate) fn resolved_event(
-    reader: &SessionReader<SessionRecord>,
+    reader: &RecordLog,
     ev: ProviderEvent,
 ) -> (ProviderEvent, Option<tautly_session::Error>) {
     match ev {
@@ -560,11 +563,7 @@ pub(crate) fn resolved_event(
 
 /// A `ToolCall` record's input: `args`, or read from `args_blob` as the history holds it
 /// (an empty object when it is not a JSON object, or cannot be read).
-pub fn tool_args(
-    reader: &SessionReader<SessionRecord>,
-    args: &Value,
-    args_blob: Option<&BlobRef>,
-) -> Value {
+pub fn tool_args(reader: &RecordLog, args: &Value, args_blob: Option<&BlobRef>) -> Value {
     match args_blob {
         None => args.clone(),
         Some(b) => reader
@@ -621,9 +620,7 @@ fn upgrade(ty: &str, data: &mut serde_json::Map<String, Value>) {
 }
 
 /// The session's name: the last `Labeled` record's, else the header's label.
-pub fn session_label(
-    reader: &SessionReader<SessionRecord>,
-) -> tautly_session::Result<Option<String>> {
+pub fn session_label(reader: &RecordLog) -> tautly_session::Result<Option<String>> {
     let mut label = reader.header().label.clone();
     for rec in reader.records() {
         if let (_, SessionRecord::Labeled { label: l }) = rec? {
@@ -638,9 +635,7 @@ pub fn session_label(
 /// a `ModelSet` to another provider strips the reasoning before it
 /// (`Context::strip_reasoning(Some(provider))`), and a `ReasoningStripped` strips all of it
 /// (`Context::strip_reasoning(None)`), each at its position, as the live session did.
-pub fn session_model(
-    reader: &SessionReader<SessionRecord>,
-) -> tautly_session::Result<Option<ModelId>> {
+pub fn session_model(reader: &RecordLog) -> tautly_session::Result<Option<ModelId>> {
     let mut model = reader.header().model.clone().map(ModelId::from);
     for rec in reader.records() {
         if let (_, SessionRecord::ModelSet { model: m }) = rec? {

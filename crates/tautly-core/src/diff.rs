@@ -6,11 +6,11 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 
 use tautly_sandbox::{Sandbox, SandboxError};
-use tautly_session::{BlobRef, SessionReader};
+use tautly_session::BlobRef;
 use tautly_tools::preview::diff_owned;
 
 use crate::protocol::{DiffFile, DiffStatus, ErrorKind, Event};
-use crate::record::SessionRecord;
+use crate::record::{RecordLog, SessionRecord};
 use crate::session::Session;
 
 /// Most lines of a session diff.
@@ -40,10 +40,7 @@ pub type PreImage = (PathBuf, Option<Vec<u8>>);
 /// the blob store), in log order.
 ///
 /// Blocking I/O (the log and the blob store): call it off the async workers.
-pub fn pre_images(
-    reader: &SessionReader<SessionRecord>,
-    turn: Option<u32>,
-) -> Result<Vec<PreImage>, DiffError> {
+pub fn pre_images(reader: &RecordLog, turn: Option<u32>) -> Result<Vec<PreImage>, DiffError> {
     let (first, turns) = earliest_pre_images(reader, turn)?;
     if let Some(t) = turn
         && (t == 0 || t > turns)
@@ -128,7 +125,7 @@ type PreImageRef = (PathBuf, Option<BlobRef>);
 /// `SendMessage` is logged on arrival and may never start a turn); a record belongs to the
 /// turn of the last `TurnStart` before it.
 fn earliest_pre_images(
-    reader: &SessionReader<SessionRecord>,
+    reader: &RecordLog,
     turn: Option<u32>,
 ) -> Result<(Vec<PreImageRef>, u32), DiffError> {
     let (mut turns, mut current) = (0u32, 0u32);
@@ -186,7 +183,7 @@ impl Session {
         self.checkpoint().await;
         let path = self.log.path();
         let scope = tokio::task::spawn_blocking(move || {
-            let reader = SessionReader::<SessionRecord>::open(&path)?;
+            let reader = RecordLog::open(&path)?;
             pre_images(&reader, turn)
         })
         .await
