@@ -63,3 +63,52 @@ async fn empty_data_blocks_are_not_dispatched() {
     let got = parse(&[": only a comment\n\n\n\ndata: x\n\n"]).await;
     assert_eq!(got, vec![ev(None, "x")]);
 }
+
+/// Review M5: a line that never ends (or one event's data growing without a blank line)
+/// is cut off at 16 MiB as a transient error instead of growing without limit.
+#[tokio::test]
+async fn an_endless_line_is_a_transient_error_at_the_cap() {
+    use tautly_provider::ProviderError;
+    let mib = Bytes::from(vec![b'a'; 1 << 20]);
+    let body = futures::stream::iter(std::iter::repeat_n(mib, 20));
+    let out: Vec<_> = events(body).collect().await;
+    assert_eq!(out.len(), 1, "{:?}", out.len());
+    assert!(
+        matches!(&out[0], Err(ProviderError::Transient { msg, .. }) if msg.contains("16 MiB")),
+        "{:?}",
+        out[0].as_ref().err()
+    );
+    // Data lines of one event count too.
+    let line = Bytes::from(format!("data: {}\n", "b".repeat(1 << 20)));
+    let body = futures::stream::iter(std::iter::repeat_n(line, 20));
+    let out: Vec<_> = events(body).collect().await;
+    assert!(matches!(
+        out.last(),
+        Some(Err(ProviderError::Transient { .. }))
+    ));
+}
+
+#[tokio::test]
+async fn many_events_past_the_cap_in_total_are_fine() {
+    let ev = Bytes::from(format!("data: {}\n\n", "c".repeat(1 << 20)));
+    let body = futures::stream::iter(std::iter::repeat_n(ev, 20));
+    let out: Vec<_> = events(body).collect().await;
+    assert_eq!(out.len(), 20);
+    assert!(
+        out.iter()
+            .all(|e| e.as_ref().is_ok_and(|e| e.data.len() == 1 << 20))
+    );
+}
+
+#[tokio::test]
+async fn a_long_line_in_small_chunks_parses_once() {
+    let line = format!("data: {}\n\n", "d".repeat(300_000));
+    let chunks: Vec<&str> = line
+        .as_bytes()
+        .chunks(1000)
+        .map(|c| std::str::from_utf8(c).unwrap())
+        .collect();
+    let out = parse(&chunks).await;
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0].data.len(), 300_000);
+}

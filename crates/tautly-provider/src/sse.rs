@@ -36,6 +36,14 @@ pub fn try_events<E: std::fmt::Display>(
                     while let Some(ev) = parser.next_event(false) {
                         yield Ok(ev);
                     }
+                    if parser.pending() > MAX_PENDING {
+                        yield Err(ProviderError::Transient {
+                            status: None,
+                            retry_after: None,
+                            msg: "stream error: an event grew past 16 MiB without ending".into(),
+                        });
+                        return;
+                    }
                 }
                 Err(e) => {
                     yield Err(ProviderError::Transient { status: None, retry_after: None, msg: format!("stream error: {e}") });
@@ -49,38 +57,68 @@ pub fn try_events<E: std::fmt::Display>(
     }
 }
 
+/// Most bytes an unfinished event (its partial line plus its data so far) may hold.
+const MAX_PENDING: usize = 16 << 20;
+
 #[derive(Default)]
 struct Parser {
     buf: Vec<u8>,
+    /// Bytes of `buf` already consumed as lines (dropped when more input is needed).
+    start: usize,
+    /// Bytes of `buf` already searched for a line end, so a long line is scanned once.
+    scanned: usize,
     event: Option<String>,
     data: Vec<String>,
+    data_len: usize,
 }
 
 impl Parser {
+    /// Bytes held for the event not yet dispatched.
+    fn pending(&self) -> usize {
+        self.buf.len() - self.start + self.data_len
+    }
+
+    /// Drop the consumed lines before waiting for more input.
+    fn need_more(&mut self) -> Option<SseEvent> {
+        self.buf.drain(..self.start);
+        self.scanned -= self.start;
+        self.start = 0;
+        None
+    }
+
     /// Consume complete lines until an event is dispatched. With `eof`, a trailing partial line
     /// and any pending event are flushed.
     fn next_event(&mut self, eof: bool) -> Option<SseEvent> {
         loop {
-            let Some(pos) = self.buf.iter().position(|&b| b == b'\n' || b == b'\r') else {
+            let found = self.buf[self.scanned..]
+                .iter()
+                .position(|&b| b == b'\n' || b == b'\r');
+            let Some(pos) = found.map(|off| self.scanned + off) else {
+                self.scanned = self.buf.len();
                 if !eof {
-                    return None;
+                    return self.need_more();
                 }
-                if !self.buf.is_empty() {
-                    let line = std::mem::take(&mut self.buf);
+                if self.start < self.buf.len() {
+                    let line = self.buf.split_off(self.start);
                     self.field(&line);
                 }
+                self.buf.clear();
+                (self.start, self.scanned) = (0, 0);
                 return self.dispatch();
             };
             // A trailing CR may be the first half of CRLF; wait for the next chunk.
             if self.buf[pos] == b'\r' && pos + 1 == self.buf.len() && !eof {
-                return None;
+                self.scanned = pos;
+                return self.need_more();
             }
             let skip = if self.buf[pos] == b'\r' && self.buf.get(pos + 1) == Some(&b'\n') {
                 2
             } else {
                 1
             };
-            let line: Vec<u8> = self.buf.drain(..pos + skip).take(pos).collect();
+            let line = self.buf[self.start..pos].to_vec();
+            self.start = pos + skip;
+            self.scanned = self.start;
             if line.is_empty() {
                 if let Some(ev) = self.dispatch() {
                     return Some(ev);
@@ -100,13 +138,17 @@ impl Parser {
         let value = value.strip_prefix(' ').unwrap_or(value);
         match name {
             "event" => self.event = Some(value.to_string()),
-            "data" => self.data.push(value.to_string()),
+            "data" => {
+                self.data_len += value.len();
+                self.data.push(value.to_string());
+            }
             _ => {}
         }
     }
 
     fn dispatch(&mut self) -> Option<SseEvent> {
         let event = self.event.take();
+        self.data_len = 0;
         if self.data.is_empty() {
             return None;
         }
