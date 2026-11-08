@@ -34,19 +34,30 @@ const RESET: &str = "\x1b[0m";
 /// One turn's receipt, as the footer and `/cost` show it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Receipt {
+    /// The user turn's number.
     pub turn: u32,
+    /// Provider requests the turn made.
     pub steps: u32,
+    /// Tool calls it ran.
     pub tool_calls: u32,
+    /// Wall-clock time, in milliseconds.
     pub wall_ms: u64,
+    /// Input tokens.
     pub tokens_in: u64,
+    /// Output tokens.
     pub tokens_out: u64,
+    /// Share of input tokens read from the provider's cache.
     pub cache_hit_ratio: Option<f64>,
+    /// The priced cost in US dollars (None: nothing was priced).
     pub cost_usd: Option<f64>,
+    /// Tokens the token-saving features kept out of requests (an estimate).
     pub saved_tokens: u64,
+    /// Some of the usage is the engine's estimate.
     pub estimated: bool,
 }
 
 impl Receipt {
+    /// The receipt an `Event::TurnReceipt` carries; None for any other event.
     pub fn from_event(e: &Event) -> Option<Receipt> {
         let Event::TurnReceipt {
             turn,

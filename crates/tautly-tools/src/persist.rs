@@ -131,17 +131,27 @@ impl<'de> Deserialize<'de> for ToolMeta {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum PersistedEffect {
+    /// See [`AppliedEffect::Read`].
     Read {
+        /// The file, relative to the session root.
         path: RelPath,
+        /// The lines requested.
         range: LineRange,
+        /// Hash of the whole file.
         #[serde(with = "hash_hex")]
         file_hash: blake3::Hash,
+        /// How the target was shown.
         shown: Shown,
     },
+    /// See [`AppliedEffect::Edited`].
     Edited {
+        /// The file, relative to the session root.
         path: RelPath,
+        /// Blob hash of the content before the write (None: the write created it).
         pre_image_blob: Option<String>,
+        /// The permission bits before the write.
         pre_mode: Option<u32>,
+        /// Hash of the content written.
         #[serde(with = "hash_hex")]
         post_hash: blake3::Hash,
         /// The content written (hash `post_hash`), so an undone or rewound state can be
@@ -151,12 +161,18 @@ pub enum PersistedEffect {
         #[serde(default)]
         post_image_blob: Option<BlobRef>,
     },
+    /// See [`AppliedEffect::Deleted`].
     Deleted {
+        /// The file, relative to the session root.
         path: RelPath,
+        /// Blob hash of the content before deletion.
         pre_image_blob: String,
+        /// The permission bits before deletion.
         pre_mode: u32,
     },
+    /// See [`AppliedEffect::Exec`].
     Exec {
+        /// The command may have changed files.
         may_write: bool,
     },
     /// An effect type this version does not know (read back from a newer log; never

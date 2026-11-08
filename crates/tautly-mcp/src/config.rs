@@ -31,6 +31,7 @@ pub const PROVIDER_KEY_VARS: &[&str] = &[
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct McpConfig {
+    /// Start MCP servers at all (default true).
     pub enabled: bool,
     /// Per tool call.
     pub timeout_s: u64,
@@ -40,6 +41,7 @@ pub struct McpConfig {
     pub max_tools: usize,
     /// Read the repository root's `.mcp.json` (its servers need approval).
     pub import_mcp_json: bool,
+    /// `[mcp.servers.<name>]`: the servers, by name.
     pub servers: BTreeMap<String, ServerSpec>,
 }
 
@@ -61,14 +63,18 @@ impl Default for McpConfig {
 pub enum ServerSpec {
     /// A child process speaking MCP over its stdin and stdout.
     Stdio {
+        /// The program to run.
         command: String,
+        /// Its arguments.
         args: Vec<String>,
+        /// Variables added to its environment.
         env: BTreeMap<String, String>,
         /// Relative to the workspace root; default the root.
         cwd: Option<PathBuf>,
     },
     /// Streamable HTTP.
     Http {
+        /// The server's endpoint (http or https).
         url: Url,
         /// Values may use `${VAR}` in the user's configuration (expanded at start).
         headers: BTreeMap<String, String>,
@@ -90,6 +96,7 @@ pub enum ServerSource {
 }
 
 impl ServerSource {
+    /// The name used in listings and events (`user`, `project`, `mcp_json`, `client`).
     pub fn as_str(self) -> &'static str {
         match self {
             ServerSource::User => "user",

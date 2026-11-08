@@ -32,6 +32,7 @@ const MAX_SKIPS_LISTED: usize = 50;
 /// A recall adds at most this many entries linked from its hits.
 const MAX_LINKED_HITS: usize = 5;
 
+/// Project memory: the entries of one project, searchable, with episodes.
 pub struct MemoryStore {
     pub(crate) index: Arc<Index>,
     /// `<project>/.tautly/memory`.
@@ -222,6 +223,7 @@ impl MemoryStore {
         Ok(store)
     }
 
+    /// Every entry, loaded.
     pub fn entries(&self) -> &[MemoryEntry] {
         &self.entries
     }
@@ -495,7 +497,7 @@ impl MemoryStore {
     /// Write the change to disk and update the in-memory entries. The upserted file is
     /// written first, so a failure there changes nothing; a failed delete is reported after
     /// the others were tried. The upserted body's links to known entries are written by
-    /// file name (see [`obsidian_links`](Self::obsidian_links)).
+    /// file name (see `obsidian_links`).
     pub fn apply(&mut self, c: &MemoryChange) -> Result<(), MemoryError> {
         verify_dirs(&self.dir_chain)?;
         if let Some(e) = &c.upsert {
@@ -597,7 +599,7 @@ impl MemoryStore {
     }
 
     /// BM25 (k1 = 1.2, b = 0.75) over project entries and episodes: the best `k` that match,
-    /// then the entries their bodies `[[link]]` to (one hop, at most [`MAX_LINKED_HITS`]),
+    /// then the entries their bodies `[[link]]` to (one hop, at most `MAX_LINKED_HITS`),
     /// with texts cut so that titles and texts together fit `cap_tokens`.
     pub fn search(
         &self,

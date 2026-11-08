@@ -12,6 +12,7 @@ use crate::preview::{
 use crate::spec::{parse_args, tool_spec};
 use crate::{AppliedEffect, Tool, ToolCx, ToolError, ToolResult};
 
+/// `write`: creates or overwrites a whole file.
 pub struct WriteTool;
 
 #[derive(Deserialize)]

@@ -13,9 +13,13 @@ pub enum Slash {
     Undo(Option<u32>),
     /// `/resume [n|id]`: list the work tree's last sessions, or resume one.
     Resume(Option<String>),
+    /// `/compact`: compact the conversation now.
     Compact,
+    /// `/pin <text>`: keep `text` in the context.
     Pin(String),
+    /// `/unpin <text>`: remove that pin.
     Unpin(String),
+    /// `/fork`: branch the conversation into a new session.
     Fork,
     /// `/rewind N`: show the dry run, ask, then rewind files and conversation to step N
     /// as a new branch.
@@ -30,7 +34,9 @@ pub enum Slash {
     Replay(Option<String>),
     /// `/reasoning <level>`: how hard the model thinks from the next request on.
     Reasoning(tautly_core::ReasoningLevel),
+    /// `/memory consolidate`: propose merging and pruning project memory.
     MemoryConsolidate,
+    /// `/help`: list the commands.
     Help,
     /// Anything else (or a known command with arguments it does not take): the help is
     /// printed.

@@ -56,6 +56,7 @@ pub use write::WriteTool;
 /// Invalid tool arguments.
 #[derive(Debug, thiserror::Error)]
 pub enum ToolError {
+    /// The arguments do not fit the tool's schema (the reason).
     #[error("invalid arguments: {0}")]
     BadArgs(String),
 }
@@ -68,31 +69,45 @@ pub enum AppliedEffect {
     /// One read target: `range` as requested (a symbol target: the symbol's lines),
     /// `file_hash` of the whole file, and how it was shown.
     Read {
+        /// The file.
         path: PathBuf,
+        /// The lines requested.
         range: LineRange,
+        /// Hash of the whole file.
         #[serde(with = "persist::hash_hex")]
         file_hash: blake3::Hash,
+        /// How the target was shown.
         shown: Shown,
     },
     /// A file was written. `pre_image`/`pre_mode` (permission bits) describe it before the
     /// write; both are None when the write created it.
     Edited {
+        /// The file.
         path: PathBuf,
+        /// The content before the write.
         #[serde(with = "persist::b64_opt")]
         pre_image: Option<Vec<u8>>,
+        /// The permission bits before the write.
         pre_mode: Option<u32>,
+        /// Hash of the content written.
         #[serde(with = "persist::hash_hex")]
         post_hash: blake3::Hash,
     },
     /// A file was deleted; `pre_mode` holds its permission bits.
     Deleted {
+        /// The file.
         path: PathBuf,
+        /// The content before deletion.
         #[serde(with = "persist::b64")]
         pre_image: Vec<u8>,
+        /// The permission bits before deletion.
         pre_mode: u32,
     },
     /// A command ran that may have changed any file.
-    Exec { may_write: bool },
+    Exec {
+        /// Whether it may have written files (always true for `bash`).
+        may_write: bool,
+    },
 }
 
 /// How a read target was shown, which tells the engine what the output depends on.
@@ -104,10 +119,16 @@ pub enum Shown {
     /// Cut short (the 2,000-line window or the output cap); no baseline was kept.
     Partial,
     /// `unchanged since turn N`: only meaningful while the turn-`since` output is in context.
-    Unchanged { since: u32 },
+    Unchanged {
+        /// The turn whose output it refers to.
+        since: u32,
+    },
     /// A diff against the turn-`since` output, which must stay in context; this output is
     /// also the new baseline.
-    Diff { since: u32 },
+    Diff {
+        /// The turn whose output it refers to.
+        since: u32,
+    },
     /// A kind this version does not know (read back from a newer log): treated as an
     /// output that covers nothing and keeps no baseline.
     #[serde(other)]
@@ -159,7 +180,9 @@ pub enum SaveKind {
 /// `ToolResult`, the error type of many helpers, small).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Saved {
+    /// The mechanism credited.
     pub kind: SaveKind,
+    /// Bytes saved.
     pub bytes: u32,
 }
 
@@ -179,15 +202,22 @@ impl Saved {
 /// test binary or a collection error counts as a failure).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TestCounts {
+    /// Tests that passed.
     pub passed: u32,
+    /// Tests that failed or errored.
     pub failed: u32,
 }
 
+/// What a tool call returns: the output the model sees, and facts for the engine.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolResult {
+    /// The text the model sees.
     pub output: String,
+    /// Whether the call failed.
     pub is_error: bool,
+    /// The side effects the call applied.
     pub effects: Vec<AppliedEffect>,
+    /// Structured facts about the result.
     pub meta: ToolMeta,
     /// The diff a successful `edit` or `write` applied (spec 7.11.4).
     /// Boxed to keep `ToolResult` small (it is the error type of many helpers).
@@ -195,6 +225,7 @@ pub struct ToolResult {
 }
 
 impl ToolResult {
+    /// A successful result with `output`.
     pub fn ok(output: impl Into<String>) -> Self {
         Self {
             output: output.into(),
@@ -205,6 +236,7 @@ impl ToolResult {
         }
     }
 
+    /// A failed result with `output`.
     pub fn error(output: impl Into<String>) -> Self {
         Self {
             is_error: true,
@@ -224,7 +256,9 @@ impl ToolResult {
 /// Two reads are "the same read" when their ranges are equal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct LineRange {
+    /// The first line (None: line 1).
     pub start: Option<usize>,
+    /// The last line (None: the end of the file).
     pub end: Option<usize>,
 }
 
@@ -253,8 +287,11 @@ pub struct PrevRead {
     pub format: EditFormat,
     /// Hash of the range's content, which decides whether a re-read is unchanged.
     pub content_hash: blake3::Hash,
+    /// The turn it was shown in.
     pub turn: u32,
+    /// The file's mtime at that time.
     pub mtime: SystemTime,
+    /// The spill file holding the content shown.
     pub content_path: PathBuf,
 }
 
@@ -367,6 +404,7 @@ impl ReadTracker {
         seen.insert(path.to_path_buf(), (meta.mtime, hash));
     }
 
+    /// The mtime and hash last recorded for `path` (the stale-read guard's view).
     pub fn last(&self, path: &Path) -> Option<(SystemTime, blake3::Hash)> {
         let seen = self.seen.lock().unwrap_or_else(|e| e.into_inner());
         seen.get(path).copied()
@@ -532,6 +570,7 @@ impl std::fmt::Debug for ToolCx {
 }
 
 impl ToolCx {
+    /// A context with the given edit format and spill directory, and nothing else set.
     pub fn new(edit_format: EditFormat, spill_dir: PathBuf) -> Self {
         Self {
             edit_format,
@@ -550,16 +589,19 @@ impl ToolCx {
         }
     }
 
+    /// The session's read tracker (shared across calls).
     pub fn with_reads(mut self, reads: Arc<ReadTracker>) -> Self {
         self.reads = reads;
         self
     }
 
+    /// The token that cancels this call.
     pub fn with_cancel(mut self, cancel: CancellationToken) -> Self {
         self.cancel = cancel;
         self
     }
 
+    /// Where `bash` streams its output as it runs.
     pub fn with_output_tx(mut self, tx: mpsc::Sender<String>) -> Self {
         self.output_tx = Some(tx);
         self
@@ -618,38 +660,47 @@ impl ToolCx {
         self
     }
 
+    /// The session's edit format.
     pub fn edit_format(&self) -> EditFormat {
         self.edit_format
     }
 
+    /// The session's read tracker.
     pub fn reads(&self) -> &Arc<ReadTracker> {
         &self.reads
     }
 
+    /// Where long outputs are saved (sandbox-relative).
     pub fn spill_dir(&self) -> &Path {
         &self.spill_dir
     }
 
+    /// The token that cancels this call.
     pub fn cancel(&self) -> &CancellationToken {
         &self.cancel
     }
 
+    /// Where `bash` streams its output, if anywhere.
     pub fn output_tx(&self) -> Option<&mpsc::Sender<String>> {
         self.output_tx.as_ref()
     }
 
+    /// The code index, if any.
     pub fn index(&self) -> Option<&Arc<Index>> {
         self.index.as_ref()
     }
 
+    /// The project memory, if any.
     pub fn memory(&self) -> Option<&Arc<RwLock<MemoryStore>>> {
         self.memory.as_ref()
     }
 
+    /// The 1-based turn this call belongs to.
     pub fn turn(&self) -> u32 {
         self.turn
     }
 
+    /// The session's process groups.
     pub fn process_groups(&self) -> &ProcessGroups {
         &self.groups
     }
@@ -659,23 +710,28 @@ impl ToolCx {
         &self.env_remove
     }
 
+    /// See [`with_approved_bases`](Self::with_approved_bases).
     pub fn approved_bases(&self) -> Option<&[(PathBuf, Option<blake3::Hash>)]> {
         self.approved_bases.as_deref()
     }
 
+    /// Whether [`Tool::preview`] computes the diff.
     pub fn preview_diff(&self) -> bool {
         self.preview_diff
     }
 
+    /// The side model, if any.
     pub fn side(&self) -> Option<&Arc<dyn SideModel>> {
         self.side.as_ref()
     }
 }
 
+/// A tool the model can call.
 #[async_trait]
 pub trait Tool: Send + Sync {
     /// Built-in tools have fixed names; MCP tools (`mcp__<server>__<tool>`) do not.
     fn name(&self) -> &str;
+    /// The tool's name, description and argument schema, for the provider's `caps`.
     fn spec(&self, caps: &Capabilities) -> ToolSpec;
     /// The side-effect class of this call, used for permission checks before `run`.
     fn effect(&self, args: &Value) -> Result<Effect, ToolError>;

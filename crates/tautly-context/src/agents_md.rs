@@ -12,8 +12,11 @@ use crate::pinned::{self, PinSource, Pinned};
 /// `Constraints` sections, and warnings for the session's `ContextStatus`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AgentsMd {
+    /// The instruction text, outermost directory first; None when there is none.
     pub text: Option<String>,
+    /// The items of its `Rules` / `Constraints` sections.
     pub pins: Vec<Pinned>,
+    /// Problems found (a file too large, too many pins, ...).
     pub warnings: Vec<String>,
     /// The files whose text is in `text`, outermost first (the order of the text), each
     /// with the instruction file that directory level contributed.
@@ -24,7 +27,9 @@ pub struct AgentsMd {
 /// `CLAUDE.md` (spec 7.11.6).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InstructionFile {
+    /// `AGENTS.md`.
     AgentsMd,
+    /// `CLAUDE.md`, read where a directory has no `AGENTS.md`.
     ClaudeMd,
 }
 

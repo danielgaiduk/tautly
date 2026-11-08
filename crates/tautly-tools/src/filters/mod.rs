@@ -35,20 +35,26 @@ pub const MAX_DETAIL_LINES: usize = 20;
 pub enum FilterKind {
     /// `cargo test|build|check|clippy`.
     Cargo,
+    /// `pytest`.
     Pytest,
     /// `jest` and `vitest`.
     Jest,
+    /// `go test`.
     GoTest,
+    /// `tsc`.
     Tsc,
+    /// `eslint`.
     Eslint,
 }
 
 /// One failure or diagnostic.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Item {
+    /// The test or diagnostic's name.
     pub name: String,
     /// `file:line[:col]` when the tool reports one.
     pub location: Option<String>,
+    /// The one-line message.
     pub message: String,
     /// Further lines (at most [`MAX_DETAIL_LINES`] when produced by a parser).
     pub detail: Vec<String>,
@@ -84,9 +90,13 @@ pub struct Summary {
     pub tool: &'static str,
     /// `None` when the tool does not report passes (builds, linters).
     pub passed: Option<u32>,
+    /// Tests failed.
     pub failed: u32,
+    /// Errors (build errors, crashed tests).
     pub errors: u32,
+    /// Warnings.
     pub warnings: u32,
+    /// The failures and diagnostics, in output order.
     pub items: Vec<Item>,
 }
 

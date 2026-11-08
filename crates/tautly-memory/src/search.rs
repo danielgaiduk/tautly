@@ -14,14 +14,20 @@ pub enum HitSource {
     Episode(String),
 }
 
+/// One recall result.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Hit {
+    /// Where it came from.
     pub source: HitSource,
     /// The entry's kind; None for an episode.
     pub kind: Option<crate::MemoryKind>,
+    /// The entry's title, or the episode's.
     pub title: String,
+    /// The text shown.
     pub text: String,
+    /// An anchor's code changed since it was written.
     pub stale: bool,
+    /// Relevance; higher is better.
     pub score: f32,
     /// The project entry whose `[[link]]` brought this one in (one hop); None for a match.
     pub linked_from: Option<String>,

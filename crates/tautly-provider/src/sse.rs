@@ -5,9 +5,12 @@ use futures::{Stream, StreamExt};
 
 use crate::ProviderError;
 
+/// One server-sent event.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SseEvent {
+    /// The `event:` field, if any.
     pub event: Option<String>,
+    /// The `data:` lines, joined with newlines.
     pub data: String,
 }
 

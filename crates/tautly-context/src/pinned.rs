@@ -6,11 +6,16 @@ pub use tautly_tools::MAX_PIN_BYTES;
 /// They are uncached on every request until folded, so their number is bounded.
 pub const MAX_SESSION_PINS: usize = 20;
 
+/// Who pinned an item.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PinSource {
+    /// The user (`/pin`).
     User,
+    /// The configuration's `pins`.
     Config,
+    /// The model (the `pin` tool).
     Model,
+    /// A `Constraints` / `Rules` section of an `AGENTS.md`.
     AgentsMd,
     /// A `Constraints` / `Rules` section of a `CLAUDE.md` used in place of `AGENTS.md`
     /// (spec 7.11.6); as authoritative as an AGENTS.md pin.
@@ -30,13 +35,17 @@ impl PinSource {
     }
 }
 
+/// A constraint or fact that every request carries, never summarized.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Pinned {
+    /// The text.
     pub text: String,
+    /// Who pinned it.
     pub source: PinSource,
 }
 
 impl Pinned {
+    /// A pin of `text` from `source`.
     pub fn new(text: impl Into<String>, source: PinSource) -> Self {
         Self {
             text: text.into(),
@@ -48,19 +57,28 @@ impl Pinned {
 /// Why [`Context::pin`](crate::Context::pin) refused a pin.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum PinError {
+    /// The text is empty or only whitespace.
     #[error("a pin must not be empty")]
     Empty,
     /// Over [`MAX_PIN_BYTES`] (trimmed). Refused rather than cut: a constraint cut short
     /// can mean something else.
     #[error("the pin is {bytes} bytes; a pin holds at most {max} bytes")]
-    TooLong { bytes: usize, max: usize },
+    TooLong {
+        /// The pin's length, trimmed.
+        bytes: usize,
+        /// The limit.
+        max: usize,
+    },
     /// [`MAX_SESSION_PINS`] pins were added this session; more are refused until the
     /// engine folds them into `<pinned>` at the next cache epoch.
     #[error(
         "{max} pins were added this session already; no more until they move into <pinned> \
          at the next context reorganization"
     )]
-    TooMany { max: usize },
+    TooMany {
+        /// The limit.
+        max: usize,
+    },
 }
 
 /// Add a pin unless an identical text is already pinned.

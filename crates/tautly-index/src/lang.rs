@@ -4,16 +4,26 @@ use std::path::Path;
 
 use tree_sitter::Language;
 
+/// A language the index can parse.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Lang {
+    /// `.rs`
     Rust,
+    /// `.ts`
     TypeScript,
+    /// `.tsx`
     Tsx,
+    /// `.js`
     JavaScript,
+    /// `.py`
     Python,
+    /// `.go`
     Go,
+    /// `.json` (syntax check only)
     Json,
+    /// `.toml` (syntax check only)
     Toml,
+    /// `.yaml`, `.yml` (syntax check only)
     Yaml,
 }
 
@@ -59,6 +69,7 @@ impl Lang {
         })
     }
 
+    /// The tree-sitter grammar for this language.
     pub fn grammar(self) -> Language {
         match self {
             Lang::Rust => tree_sitter_rust::LANGUAGE.into(),

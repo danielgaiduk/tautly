@@ -72,10 +72,15 @@ const WATCH_EVERY: Duration = Duration::from_millis(200);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum McpState {
+    /// Being started or initialized.
     Starting,
+    /// Connected; its tools are offered.
     Ready,
+    /// Could not start, or exited or disconnected.
     Failed,
+    /// Not started: a repository server that was not approved, or was denied.
     Skipped,
+    /// A repository server waiting for the user's approval.
     AwaitingApproval,
     /// A state this version does not know.
     #[serde(other)]
@@ -85,11 +90,15 @@ pub enum McpState {
 /// One server as [`McpHub::status`] reports it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServerStatus {
+    /// The server's configured name.
     pub name: String,
+    /// Where it was declared.
     pub source: ServerSource,
+    /// Where it is now.
     pub state: McpState,
     /// Tools offered (after the per-server cap and skipped schemas).
     pub tools: u32,
+    /// Why it failed or was skipped, if so.
     pub message: Option<String>,
 }
 
@@ -1004,7 +1013,7 @@ impl McpHub {
     }
 
     /// Warnings since the last call (skipped tools, capped tool lists), each distinct one
-    /// once, at most [`MAX_HUB_WARNINGS`] in the hub's life.
+    /// once, at most `MAX_HUB_WARNINGS` in the hub's life.
     pub fn take_warnings(&self) -> Vec<String> {
         std::mem::take(&mut lock(&self.inner.state).warnings)
     }

@@ -32,20 +32,25 @@ pub use tokens::TokenEstimator;
 /// Everything the engine assembles into a request.
 #[derive(Debug, Clone)]
 pub struct Context {
+    /// Pinned items, rendered in the cached prefix.
     pub pinned: Vec<Pinned>,
+    /// The structured working state, rendered after the history.
     pub state: WorkingState,
+    /// The conversation, one entry per user turn.
     pub history: Vec<Turn>,
     /// Absolute session turn number of `history[0]`; turns are 1-based like the read
     /// tracker's (`ToolCx::with_turn`), so a fresh session has 1. Compaction keeps
     /// `history[i]` at turn `first_turn + i`, see [`CompactionRecord`] and
     /// [`Context::next_turn`].
     pub first_turn: u32,
+    /// The instruction files' text (see [`agents_md::load`]).
     pub agents_md: Option<String>,
     /// Set by the engine from the memory store; rendered in the stable prefix after AGENTS.md.
     pub memory_index: Option<String>,
     /// Generated once at session start ([`Context::init_repo_map`]) and never rebuilt, so
     /// the cached prefix stays byte-stable; rendered after the memory index.
     pub repo_map: Option<String>,
+    /// Estimates tokens, calibrated against provider usage.
     pub tokens: TokenEstimator,
     /// Project root; file paths in the working state are displayed relative to it.
     pub root: Option<PathBuf>,

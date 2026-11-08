@@ -9,7 +9,7 @@
 //! Text in these requests is the model's or the repository's. It is escaped before it
 //! goes out (spec 3.4): single-line fields (titles, names, rules) with every control and
 //! invisible character as a visible escape, multi-line text (commands, launch lines,
-//! memory bodies) escaped and fenced, with long blank runs marked ([`map::approval_text`]),
+//! memory bodies) escaped and fenced, with long blank runs marked (`map::approval_text`),
 //! so a client that renders markdown shows it whole and literally.
 
 use serde_json::{Value, json};
@@ -21,16 +21,21 @@ use crate::schema::{
     ToolCallUpdate, ToolKind,
 };
 
+/// Option id of "allow once".
 pub const ALLOW_ONCE: &str = "allow_once";
+/// Option id of "allow for this session".
 pub const ALLOW_ALWAYS: &str = "allow_always";
+/// Option id of "reject".
 pub const REJECT_ONCE: &str = "reject_once";
 
 /// How the user answered.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Answer {
+    /// Approve this one call.
     Once,
     /// Approve, and allow what this rule matches for the rest of the session.
     Always(String),
+    /// Refuse this call.
     Reject,
 }
 

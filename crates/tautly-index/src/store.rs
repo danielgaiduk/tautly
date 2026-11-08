@@ -39,16 +39,23 @@ const BULK_CACHE_KIB: i64 = 64 * 1024;
 /// The page cache while the tree is loaded at open, in KiB.
 const LOAD_CACHE_KIB: i64 = 128;
 
+/// What kind of definition a symbol is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SymbolKind {
+    /// A free function.
     Function,
+    /// A function inside a type or impl block.
     Method,
+    /// A struct, enum, class, interface, trait or type alias.
     Type,
+    /// A constant or static.
     Constant,
+    /// A module or namespace.
     Module,
 }
 
 impl SymbolKind {
+    /// The name stored in the database and shown to the model.
     pub fn as_str(self) -> &'static str {
         match self {
             SymbolKind::Function => "function",
@@ -70,56 +77,90 @@ impl SymbolKind {
     }
 }
 
+/// One definition in the index.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SymbolRow {
+    /// Root-relative path of the file.
     pub path: PathBuf,
+    /// The symbol's name.
     pub name: String,
+    /// What kind of definition it is.
     pub kind: SymbolKind,
+    /// The enclosing type, for a method.
     pub parent: Option<String>,
+    /// First line, 1-based.
     pub start_line: u32,
+    /// Last line, 1-based.
     pub end_line: u32,
+    /// The declaration line(s), shortened.
     pub signature: String,
+    /// blake3 hex of the definition's text.
     pub hash: String,
 }
 
+/// One reference to a symbol.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RefRow {
+    /// Root-relative path of the file.
     pub path: PathBuf,
+    /// The line, 1-based.
     pub line: u32,
     /// The trimmed source line, at most 200 characters.
     pub context: String,
 }
 
+/// What a refresh did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RefreshStats {
+    /// Files parsed again.
     pub parsed: u32,
+    /// Files dropped from the index.
     pub removed: u32,
+    /// Files left as they were.
     pub unchanged: u32,
 }
 
+/// The size of the index.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IndexStats {
+    /// Files indexed.
     pub files: u64,
+    /// Definitions.
     pub symbols: u64,
+    /// References.
     pub refs: u64,
 }
 
+/// Errors from the code index.
 #[derive(Debug, thiserror::Error)]
 pub enum IndexError {
+    /// The SQLite database failed.
     #[error("database error: {0}")]
     Db(#[from] rusqlite::Error),
+    /// A file could not be read.
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+    /// The sandbox refused or failed a read.
     #[error("sandbox error: {0}")]
     Sandbox(#[from] tautly_sandbox::SandboxError),
+    /// The database was written by a newer version.
     #[error("index database has schema version {found}, this build understands {SCHEMA_VERSION}")]
-    SchemaTooNew { found: i64 },
+    SchemaTooNew {
+        /// The database's schema version.
+        found: i64,
+    },
+    /// The database is too old to migrate (delete it to rebuild).
     #[error(
         "index database has schema version {found}, older than the oldest migratable version ({OLDEST_MIGRATABLE}); delete it to rebuild"
     )]
-    SchemaTooOld { found: i64 },
+    SchemaTooOld {
+        /// The database's schema version.
+        found: i64,
+    },
+    /// The file watcher failed.
     #[error("file watcher error: {0}")]
     Watch(#[from] notify::Error),
+    /// A background task panicked or was cancelled.
     #[error("background task failed: {0}")]
     Task(String),
 }
@@ -445,6 +486,7 @@ impl Index {
             .flatten()
     }
 
+    /// How many files, definitions and references the index holds.
     pub fn stats(&self) -> IndexStats {
         let conn = self.inner.conn();
         let count = |table: &str| -> u64 {

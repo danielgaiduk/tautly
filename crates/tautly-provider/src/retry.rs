@@ -15,6 +15,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{CanonicalRequest, Provider, ProviderError, ProviderEvent, RawUsage};
 
+/// A provider that retries transient errors with exponential backoff and jitter.
 pub struct Retrying<P> {
     inner: P,
     max_attempts: u32,
@@ -22,9 +23,11 @@ pub struct Retrying<P> {
 }
 
 impl<P> Retrying<P> {
+    /// Retry up to 5 attempts, starting at 500 ms.
     pub fn new(inner: P) -> Self {
         Self::with_policy(inner, 5, Duration::from_millis(500))
     }
+    /// Retry up to `max_attempts` attempts, the delay starting at `base`.
     pub fn with_policy(inner: P, max_attempts: u32, base: Duration) -> Self {
         Self {
             inner,

@@ -65,6 +65,7 @@ pub struct ModelChoices {
 /// What ends a bridge with an error.
 #[derive(Debug, thiserror::Error)]
 pub enum AcpError {
+    /// Reading the client's input failed.
     #[error("cannot read the client's input: {0}")]
     Input(std::io::Error),
 }

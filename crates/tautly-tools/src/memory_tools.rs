@@ -27,7 +27,9 @@ const HIT_MARKER: &str = "memory hit";
 
 const PROPOSED: &str = "proposed; awaiting user approval";
 
+/// `recall`: searches project memory.
 pub struct RecallTool;
+/// `remember`: proposes a memory entry (written only once the user approves).
 pub struct RememberTool;
 
 #[derive(Deserialize)]

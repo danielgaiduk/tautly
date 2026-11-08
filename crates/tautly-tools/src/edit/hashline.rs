@@ -6,7 +6,9 @@ const HASH_LEN: usize = 4;
 /// A line reference: 1-based line number plus the first 4 hex of the blake3 of its text.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Anchor {
+    /// The 1-based line number.
     pub line: usize,
+    /// The first 4 hex digits of the line's blake3 hash, lowercase.
     pub hash: String,
 }
 
@@ -28,35 +30,70 @@ impl Anchor {
     }
 }
 
+/// One `hashline` operation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HashlineOp {
+    /// Replace lines `start..=end` with `lines`.
     Replace {
+        /// The first line replaced.
         start: Anchor,
+        /// The last line replaced.
         end: Anchor,
+        /// The new lines.
         lines: Vec<String>,
     },
+    /// Insert `lines` after line `at`.
     InsertAfter {
+        /// The line to insert after.
         at: Anchor,
+        /// The new lines.
         lines: Vec<String>,
     },
+    /// Delete lines `start..=end`.
     Delete {
+        /// The first line deleted.
         start: Anchor,
+        /// The last line deleted.
         end: Anchor,
     },
 }
 
+/// Why a `hashline` edit could not be applied.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum HashlineError {
+    /// An anchor that is not `<line>:<4-hex hash>`.
     #[error("invalid anchor `{0}`; expected `<line>:<4-hex hash>` as printed by `read`")]
     BadAnchor(String),
+    /// The line's text no longer has the anchor's hash.
     #[error("line {line} changed since it was read (anchor hash mismatch)")]
-    Stale { line: usize },
+    Stale {
+        /// The anchor's line.
+        line: usize,
+    },
+    /// The line is past the end of the file.
     #[error("line {line} is past the end of the file ({total} lines)")]
-    OutOfRange { line: usize, total: usize },
+    OutOfRange {
+        /// The anchor's line.
+        line: usize,
+        /// Lines in the file.
+        total: usize,
+    },
+    /// A range whose start is after its end.
     #[error("range start line {start} is after end line {end}")]
-    BadRange { start: usize, end: usize },
+    BadRange {
+        /// The range's first line.
+        start: usize,
+        /// The range's last line.
+        end: usize,
+    },
+    /// Two operations touch the same lines.
     #[error("operations at lines {a} and {b} overlap")]
-    Overlap { a: usize, b: usize },
+    Overlap {
+        /// A line of the first operation.
+        a: usize,
+        /// A line of the second operation.
+        b: usize,
+    },
 }
 
 /// The hash `read` prints for a line.

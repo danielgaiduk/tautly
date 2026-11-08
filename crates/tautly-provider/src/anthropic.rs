@@ -21,6 +21,7 @@ use crate::{
 
 const API_VERSION: &str = "2023-06-01";
 
+/// The Anthropic Messages API adapter.
 #[derive(Clone)]
 pub struct AnthropicProvider {
     client: reqwest::Client,
@@ -30,6 +31,7 @@ pub struct AnthropicProvider {
 }
 
 impl AnthropicProvider {
+    /// An adapter sending requests to `base_url` with `api_key`, sized by `catalog`.
     pub fn new(api_key: String, base_url: Url, catalog: Arc<Catalog>) -> Self {
         let client = tautly_sandbox::http_client_builder()
             .connect_timeout(Duration::from_secs(15))

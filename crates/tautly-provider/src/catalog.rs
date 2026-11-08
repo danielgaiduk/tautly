@@ -16,9 +16,13 @@ pub const DEFAULT_CACHE_TTL_S: u32 = 300;
 /// USD per million tokens.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Price {
+    /// Input tokens not read from the cache.
     pub input: f64,
+    /// Output tokens.
     pub output: f64,
+    /// Input tokens read from the cache.
     pub cache_read: f64,
+    /// Input tokens written to the cache.
     pub cache_write: f64,
 }
 
@@ -27,15 +31,19 @@ pub struct Price {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Tier {
+    /// A small, cheap model.
     Small,
     /// Only `Small` has a meaning today (side routing looks for it); `Large` marks a model
     /// as not small, for the catalog's vocabulary.
     Large,
 }
 
+/// What the catalog knows about one model.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ModelInfo {
+    /// Its capabilities.
     pub caps: Capabilities,
+    /// Its price; None when unknown (then USD budgets cannot be enforced).
     pub price: Option<Price>,
     /// How long the provider keeps a prompt-cache entry alive after a request, in seconds;
     /// `None` when the model has no prompt cache.
@@ -44,6 +52,7 @@ pub struct ModelInfo {
     pub tier: Option<Tier>,
 }
 
+/// A catalog TOML document that does not parse.
 #[derive(Debug, thiserror::Error)]
 #[error("invalid model catalog: {0}")]
 pub struct CatalogError(#[from] toml::de::Error);
@@ -90,6 +99,7 @@ impl Entry {
     }
 }
 
+/// The model catalog: capabilities and prices by model id (`catalog/models.toml`).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Catalog {
     models: BTreeMap<String, Entry>,
@@ -101,6 +111,7 @@ impl Catalog {
         Catalog::from_toml(BUILTIN).expect("built-in models.toml is valid")
     }
 
+    /// Parse a catalog from TOML (`[models."provider/model"]` tables).
     pub fn from_toml(s: &str) -> Result<Catalog, CatalogError> {
         Ok(toml::from_str(s)?)
     }
@@ -141,6 +152,7 @@ impl Catalog {
         self.models.get(id.as_str())?.thinking_budget_max
     }
 
+    /// Whether the catalog has an entry for `id`.
     pub fn contains(&self, id: &ModelId) -> bool {
         self.models.contains_key(id.as_str())
     }

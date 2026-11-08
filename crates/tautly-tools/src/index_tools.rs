@@ -73,8 +73,11 @@ async fn parse_outline(path: &str, sb: &dyn Sandbox) -> Result<Vec<SymbolRow>, S
     Ok(tautly_index::extract(lang, text).symbols)
 }
 
+/// `outline`: a file's symbols from the code index.
 pub struct OutlineTool;
+/// `symbol`: where a symbol is defined, from the code index.
 pub struct SymbolTool;
+/// `refs`: where a symbol is referenced, from the code index.
 pub struct RefsTool;
 
 #[derive(Deserialize)]
