@@ -118,7 +118,7 @@ directory (its git top level). History is kept in `<data home>/repl_history`.
 | `/model [id]` | switch model; without an id, list the current one and those with a key |
 | `/reasoning <level>` | `auto`, `off`, `low`, `medium` or `high`, from the next request on |
 | `/cost` | the last turn's and the session's receipt |
-| `/diff [N]` | what the session (or user turn N) changed |
+| `/diff [N]` | what the session's file tools (or those of user turn N) changed; changes made by commands, like a `Cargo.lock` from `cargo test`, show only in `/undo`'s preview |
 | `/undo [N]` | undo the last turn (or turn N), after showing what it would do |
 | `/resume [n\|id]` | list this work tree's last sessions, or resume one |
 | `/compact` | compact the conversation now |
