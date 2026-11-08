@@ -476,6 +476,37 @@ async fn compaction_summary_requested_from_side_model_not_main() {
     ));
 }
 
+/// Spec 4.7: side-model requests run without reasoning whatever the main level is.
+#[tokio::test]
+async fn side_requests_stay_without_reasoning_when_the_main_model_reasons() {
+    let fx = compaction_fx();
+    let main = MockProvider::new(compaction_script());
+    let side = MockProvider::new(vec![text_step("SUMMARY-TEXT", usage(2000, 300))]);
+    let mut cfg = config(Some(SMALL_PRICE));
+    let toml = format!(
+        "{}{}",
+        model_toml(MAIN, None, Some(MAIN_PRICE)).replace("\"none\"\ncache", "\"effort\"\ncache"),
+        model_toml(SMALL, Some("small"), Some(SMALL_PRICE))
+            .replace("\"none\"\ncache", "\"effort\"\ncache")
+    );
+    cfg.catalog_overrides = Some(Catalog::from_toml(&toml).unwrap());
+    cfg.reasoning = tautly_core::ReasoningLevel::High;
+    let mut run = start(fx.builder(cfg, &main, &side));
+    let events = run.turn_with(&long_prompt()).await;
+    assert_eq!(
+        finish_reason(&events),
+        FinishReason::Completed,
+        "{events:?}"
+    );
+    let high = Some(tautly_provider::Reasoning::Effort(
+        tautly_provider::Effort::High,
+    ));
+    assert!(main.requests().iter().all(|r| r.reasoning == high));
+    let side_reqs = side.requests();
+    assert_eq!(side_reqs.len(), 1);
+    assert_eq!(side_reqs[0].reasoning, None);
+}
+
 /// The tokens and cost of the `Usage` events of `role`.
 fn spent(events: &[Event], role: UsageRole) -> (u64, f64) {
     events

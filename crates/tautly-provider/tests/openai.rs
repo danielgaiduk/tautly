@@ -111,10 +111,10 @@ fn reasoning_effort_maps() {
 fn reasoning_budget_maps_to_effort_buckets() {
     for (budget, want) in [
         (1, "low"),
-        (2_048, "low"),
-        (2_049, "medium"),
-        (8_192, "medium"),
-        (8_193, "high"),
+        (4_096, "low"),
+        (4_097, "medium"),
+        (12_288, "medium"),
+        (12_289, "high"),
     ] {
         let w = to_wire(&req_reasoning(Reasoning::Budget(budget)));
         assert_eq!(w["reasoning"]["effort"], want, "budget {budget}");

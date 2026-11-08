@@ -24,6 +24,7 @@ mod memory;
 mod model_switch;
 pub mod protocol;
 mod provider_setup;
+pub mod reasoning;
 pub mod receipt;
 pub mod record;
 pub mod replay;
@@ -63,6 +64,7 @@ pub use protocol::{
 pub use provider_setup::{
     ProviderFactory, ProviderSetupError, known_provider, provider_for_with, provider_label,
 };
+pub use reasoning::ReasoningLevel;
 pub use receipt::{ReceiptBuilder, Savings};
 pub use record::SessionRecord;
 pub use signals::{

@@ -28,6 +28,7 @@ use crate::mcp::{McpSession, PreExecHook};
 use crate::memory::MemoryState;
 use crate::model_switch::ModelSetup;
 use crate::protocol::{Command, ErrorKind, Event};
+use crate::reasoning::ReasoningLevel;
 use crate::receipt::ReceiptBuilder;
 use crate::record::{BlockHashes, LoggedPin, SessionRecord};
 use crate::routing::Side;
@@ -456,6 +457,8 @@ pub(crate) struct Session {
     pub session_id: String,
     /// Limits and spend; `SetBudget` changes the limits from the actor at any time.
     pub budgets: Arc<Mutex<Budgets>>,
+    /// The `reasoning` level; `SetReasoning` changes it from the actor at any time.
+    pub reasoning: Arc<Mutex<ReasoningLevel>>,
     /// Wall-clock limit per user message.
     pub turn_timeout: Option<Duration>,
     /// Its background writer starts at [`Session::init`].

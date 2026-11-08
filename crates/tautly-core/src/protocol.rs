@@ -32,6 +32,7 @@ use tautly_provider::{ModelId, Quota};
 use tautly_tools::{AppliedEffect, DiffPreview, LineRange, Saved, Shown, ToolMeta};
 
 use crate::evidence::TestEvidence;
+use crate::reasoning::ReasoningLevel;
 use crate::receipt::Savings;
 pub use crate::timetravel::MaterializeReport;
 
@@ -645,6 +646,12 @@ pub enum Command {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         id: Option<String>,
         model: ModelId,
+    },
+    /// How hard the main model thinks from its next request on (spec 4.7), even
+    /// mid-turn; side-model requests stay without reasoning. No answer. Not replayed on
+    /// resume, where the configured level applies again.
+    SetReasoning {
+        level: ReasoningLevel,
     },
     /// Revert the file changes of user turn `turn` (1-based; default: the last), its
     /// commands' too where git checkpoints were taken (spec 7.11.11). Waits for a running

@@ -147,8 +147,9 @@ fn wire_basics_and_message_mapping() {
     assert_eq!(w["stream"], true);
     assert_eq!(w["stream_options"], json!({"include_usage": true}));
     assert_eq!(w["max_tokens"], 8_000);
-    // No portable reasoning field exists.
-    assert!(w.get("reasoning").is_none() && w.get("reasoning_effort").is_none());
+    // An effort goes out as `reasoning_effort` (tests/reasoning.rs has the levels).
+    assert!(w.get("reasoning").is_none());
+    assert_eq!(w["reasoning_effort"], "high");
     assert_eq!(
         w["tools"][0],
         json!({"type":"function","function":{"name":"read_file","description":"read a file","parameters":{"type":"object","properties":{"path":{"type":"string"}}}}})

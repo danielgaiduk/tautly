@@ -84,6 +84,10 @@ expression: every_command()
     "model": "openai/gpt-5"
   },
   {
+    "type": "set_reasoning",
+    "level": "high"
+  },
+  {
     "type": "undo",
     "turn": null,
     "dry_run": false

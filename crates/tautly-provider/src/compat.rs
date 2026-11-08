@@ -1,7 +1,9 @@
 //! OpenAI-compatible Chat Completions adapter (Ollama, vLLM, LM Studio, ...).
 //!
-//! No reasoning parameter is sent because there is no portable field for it; servers that
-//! stream reasoning text (`reasoning_content` or `reasoning`) still have it surfaced.
+//! A reasoning effort goes out as `reasoning_effort` (the engine asks for one only when the
+//! model's catalog entry declares `reasoning = "effort"`); there is no portable budget
+//! field, so a budget sends nothing. Servers that stream reasoning text
+//! (`reasoning_content` or `reasoning`) have it surfaced either way.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -17,8 +19,8 @@ use url::Url;
 use crate::sse::try_events;
 use crate::util::{merge_same_role, openai_quota_from_headers, retry_after, transient};
 use crate::{
-    Block, CanonicalRequest, Catalog, Content, Provider, ProviderError, ProviderEvent, RawUsage,
-    Role, StopReason,
+    Block, CanonicalRequest, Catalog, Content, Effort, Provider, ProviderError, ProviderEvent,
+    RawUsage, Reasoning, Role, StopReason,
 };
 
 #[derive(Clone)]
@@ -151,6 +153,14 @@ pub fn to_wire(req: &CanonicalRequest) -> Value {
             .iter()
             .map(|t| json!({"type": "function", "function": {"name": t.name, "description": t.description, "parameters": t.schema}}))
             .collect();
+    }
+    if let Some(Reasoning::Effort(e)) = &req.reasoning {
+        body["reasoning_effort"] = match e {
+            Effort::Low => "low",
+            Effort::Medium => "medium",
+            Effort::High => "high",
+        }
+        .into();
     }
     body
 }

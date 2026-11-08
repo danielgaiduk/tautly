@@ -110,9 +110,9 @@ fn thinking_budget_maps() {
         true
     );
     for (e, n) in [
-        (Effort::Low, 1_024),
-        (Effort::Medium, 8_192),
-        (Effort::High, 24_576),
+        (Effort::Low, 4_096),
+        (Effort::Medium, 7_999), // 12_288, capped below maxOutputTokens 8_000
+        (Effort::High, 7_999),
     ] {
         let w = to_wire(&req_reasoning(Reasoning::Effort(e)));
         assert_eq!(w["generationConfig"]["thinkingConfig"]["thinkingBudget"], n);

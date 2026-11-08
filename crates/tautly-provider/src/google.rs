@@ -19,8 +19,8 @@ use url::Url;
 use crate::sse::try_events;
 use crate::util::{merge_same_role, retry_after, transient};
 use crate::{
-    Block, CanonicalRequest, Catalog, Content, Effort, Provider, ProviderError, ProviderEvent,
-    RawUsage, Reasoning, Role, StopReason,
+    Block, CanonicalRequest, Catalog, Content, Provider, ProviderError, ProviderEvent, RawUsage,
+    Reasoning, Role, StopReason,
 };
 
 #[derive(Clone)]
@@ -50,14 +50,6 @@ impl GoogleProvider {
             "{}/v1beta/models/{model}:streamGenerateContent?alt=sse",
             self.base_url.as_str().trim_end_matches('/')
         )
-    }
-}
-
-fn effort_budget(e: &Effort) -> u32 {
-    match e {
-        Effort::Low => 1_024,
-        Effort::Medium => 8_192,
-        Effort::High => 24_576,
     }
 }
 
@@ -173,10 +165,11 @@ pub fn to_wire(req: &CanonicalRequest) -> Value {
     let mut generation = json!({"maxOutputTokens": req.max_output});
     let budget = match &req.reasoning {
         Some(Reasoning::Budget(n)) => Some(*n),
-        Some(Reasoning::Effort(e)) => Some(effort_budget(e)),
+        Some(Reasoning::Effort(e)) => Some(e.budget_tokens()),
         None => None,
     };
-    if let Some(n) = budget {
+    // Thoughts count against maxOutputTokens: keep room for the answer.
+    if let Some(n) = budget.map(|n| n.min(req.max_output.saturating_sub(1))) {
         generation["thinkingConfig"] = json!({"thinkingBudget": n, "includeThoughts": true});
     }
 

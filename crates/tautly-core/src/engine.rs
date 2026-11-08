@@ -64,6 +64,7 @@ use crate::memory::{MemoryMode, MemoryState};
 use crate::model_switch::ModelSetup;
 use crate::protocol::{BudgetScope, Command, ErrorKind, Event, FinishReason};
 use crate::provider_setup::{ProviderFactory, provider_for_with, provider_label};
+use crate::reasoning::ReasoningLevel;
 use crate::record::SessionRecord;
 use crate::resume;
 use crate::routing::Side;
@@ -399,6 +400,7 @@ impl EngineBuilder {
             index_error_reported: false,
             session_id: session_id.clone(),
             budgets: Arc::clone(&budgets),
+            reasoning: Arc::new(Mutex::new(config.reasoning)),
             turn_timeout: config.turn_timeout_s.map(Duration::from_secs),
             cost_ledger: Arc::clone(&cost_ledger),
             cost_ledger_reported: false,
@@ -427,6 +429,7 @@ impl EngineBuilder {
             session_id: session_id.clone(),
             current: Arc::clone(&current),
             budgets,
+            reasoning: Arc::clone(&session.reasoning),
             groups: groups.clone(),
             cost_ledger: Arc::clone(&session.cost_ledger),
         };
@@ -617,6 +620,8 @@ struct Actor {
     /// Shared with the [`Engine`] handle.
     current: Arc<Mutex<(String, PathBuf)>>,
     budgets: Arc<Mutex<Budgets>>,
+    /// Shared with the session (`SetReasoning`).
+    reasoning: Arc<Mutex<ReasoningLevel>>,
     groups: ProcessGroups,
     /// The session's cost ledger, flushed at shutdown.
     cost_ledger: Arc<CostLedger>,
@@ -1083,7 +1088,10 @@ impl Actor {
         let queued = !lost
             && !to_inbox
             && !Self::urgent(&cmd)
-            && !matches!(cmd, Command::SetBudget { .. } | Command::Unknown)
+            && !matches!(
+                cmd,
+                Command::SetBudget { .. } | Command::SetReasoning { .. } | Command::Unknown
+            )
             && !(busy && matches!(cmd, Command::Replay { .. }));
         let full = if to_inbox {
             running.is_some_and(|r| r.inbox.capacity() == 0)
@@ -1146,6 +1154,12 @@ impl Actor {
                 max_tokens,
             } => {
                 self.set_budget(scope, max_usd, max_tokens);
+            }
+            Command::SetReasoning { level } => {
+                *self
+                    .reasoning
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner) = level;
             }
             cmd @ (Command::Pin { .. }
             | Command::Unpin { .. }

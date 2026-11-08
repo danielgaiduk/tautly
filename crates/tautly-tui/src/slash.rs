@@ -28,6 +28,8 @@ pub enum Slash {
     Label(String),
     /// `/replay [id]`: play this session (or session id) back from its log.
     Replay(Option<String>),
+    /// `/reasoning <level>`: how hard the model thinks from the next request on.
+    Reasoning(tautly_core::ReasoningLevel),
     MemoryConsolidate,
     Help,
     /// Anything else (or a known command with arguments it does not take): the help is
@@ -39,6 +41,7 @@ pub enum Slash {
 pub const HELP: &str = "\
 commands:
   /model [id]          switch model; without an id, list the current one and those with a key
+  /reasoning <level>   how hard the model thinks: auto, off, low, medium or high
   /cost                the last turn's and the session's receipt
   /diff [N]            what the session (or user turn N) changed
   /undo [N]            undo the last turn (or turn N), after showing what it would do
@@ -86,6 +89,7 @@ pub fn parse(line: &str) -> Option<Slash> {
         ("switch", Some(a)) => Slash::Switch(a),
         ("label", Some(a)) => Slash::Label(a),
         ("replay", a) => Slash::Replay(a),
+        ("reasoning", Some(a)) => a.parse().map_or_else(|_| unknown(), Slash::Reasoning),
         ("memory", Some(a)) if a == "consolidate" => Slash::MemoryConsolidate,
         ("help", None) => Slash::Help,
         _ => unknown(),
@@ -116,6 +120,14 @@ mod tests {
         assert_eq!(parse("/label main"), Some(Slash::Label("main".into())));
         assert_eq!(parse("/replay"), Some(Slash::Replay(None)));
         assert_eq!(
+            parse("/reasoning high"),
+            Some(Slash::Reasoning(tautly_core::ReasoningLevel::High))
+        );
+        assert_eq!(
+            parse("/reasoning off"),
+            Some(Slash::Reasoning(tautly_core::ReasoningLevel::Off))
+        );
+        assert_eq!(
             parse("/replay 01J"),
             Some(Slash::Replay(Some("01J".into())))
         );
@@ -130,6 +142,8 @@ mod tests {
             "/pin",
             "/memory",
             "/cost now",
+            "/reasoning",
+            "/reasoning max",
             "/nope",
         ] {
             assert_eq!(parse(bad), Some(Slash::Unknown(bad.into())), "{bad}");

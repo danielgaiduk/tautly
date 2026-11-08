@@ -73,6 +73,18 @@ pub enum Effort {
     High,
 }
 
+impl Effort {
+    /// The thinking-token budget this level means for budget-style models (spec 4.7):
+    /// 4k, 12k, 32k. Adapters cap it below the request's output limit.
+    pub fn budget_tokens(self) -> u32 {
+        match self {
+            Effort::Low => 4_096,
+            Effort::Medium => 12_288,
+            Effort::High => 32_768,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Reasoning {

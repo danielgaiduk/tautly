@@ -5,8 +5,8 @@ use serde_json::json;
 use tautly_context::{Breakdown, ContextStatus, MutationReason};
 use tautly_core::{
     BudgetScope, Command, DiffFile, DiffPreview, DiffStatus, EffectView, ErrorKind, Event,
-    FinishReason, MaterializeReport, McpState, MemAnchor, MemoryChange, PROTOCOL_VERSION, Savings,
-    ToolMetaView, UsageRole,
+    FinishReason, MaterializeReport, McpState, MemAnchor, MemoryChange, PROTOCOL_VERSION,
+    ReasoningLevel, Savings, ToolMetaView, UsageRole,
 };
 use tautly_memory::{MemoryEntry, MemoryKind};
 use tautly_provider::{ModelId, Quota};
@@ -403,6 +403,9 @@ fn every_command() -> Vec<Command> {
             id: None,
             model: ModelId::from("openai/gpt-5"),
         },
+        Command::SetReasoning {
+            level: ReasoningLevel::High,
+        },
         Command::Undo {
             id: None,
             turn: None,
@@ -472,6 +475,7 @@ fn every_command() -> Vec<Command> {
             | Command::Fork { .. }
             | Command::Diff { .. }
             | Command::SetModel { .. }
+            | Command::SetReasoning { .. }
             | Command::Undo { .. }
             | Command::Rewind { .. }
             | Command::Switch { .. }

@@ -61,11 +61,11 @@ fn mark_last(blocks: &mut [Value]) {
     }
 }
 
-fn effort_budget(e: &Effort) -> u32 {
+fn effort_name(e: &Effort) -> &'static str {
     match e {
-        Effort::Low => 1_024,
-        Effort::Medium => 4_096,
-        Effort::High => 16_000,
+        Effort::Low => "low",
+        Effort::Medium => "medium",
+        Effort::High => "high",
     }
 }
 
@@ -158,16 +158,19 @@ pub fn to_wire(req: &CanonicalRequest) -> Value {
     if !tools.is_empty() {
         body["tools"] = tools.into();
     }
+    // No `temperature` or forced `tool_choice` is ever sent: both conflict with thinking.
     match &req.reasoning {
+        // Older models: a fixed budget, below max_tokens and at least 1024.
         Some(Reasoning::Budget(n)) => {
-            body["thinking"] = json!({"type": "enabled", "budget_tokens": n})
-        }
-        Some(Reasoning::Effort(e)) => {
-            // The budget must stay below max_tokens and be at least 1024.
-            let budget = effort_budget(e).min(req.max_output.saturating_sub(1));
+            let budget = (*n).min(req.max_output.saturating_sub(1));
             if budget >= 1_024 {
                 body["thinking"] = json!({"type": "enabled", "budget_tokens": budget});
             }
+        }
+        // Current models reject `budget_tokens`: adaptive thinking, depth set by effort.
+        Some(Reasoning::Effort(e)) => {
+            body["thinking"] = json!({"type": "adaptive", "display": "summarized"});
+            body["output_config"] = json!({"effort": effort_name(e)});
         }
         None => {}
     }

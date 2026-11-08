@@ -623,9 +623,14 @@ impl Session {
     }
 
     pub(crate) fn assemble(&self) -> (CanonicalRequest, ContextStatus) {
-        let (req, mut status) = self
-            .context
-            .assemble(&self.info.caps, &self.specs, &self.model);
+        let (mut req, mut status) =
+            self.context
+                .assemble(&self.info.caps, &self.specs, &self.model);
+        req.reasoning = self
+            .reasoning
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .resolve(self.info.caps.reasoning);
         if self.memory.live && self.memory.over_budget {
             status.warnings.push(OVER_BUDGET_WARNING.to_string());
         }
