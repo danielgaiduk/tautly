@@ -316,6 +316,13 @@ impl Log {
         Self::fail(&mut g, r)
     }
 
+    /// [`append`](Self::append) stamped with the last record's time (a synthetic turn end).
+    pub fn append_at_last(&self, rec: &SessionRecord) -> Result<(), LogFailure> {
+        let mut g = self.lock();
+        let r = g.writer.append_at_last(rec).map(drop);
+        Self::fail(&mut g, r)
+    }
+
     pub fn blob(&self, bytes: &[u8]) -> Result<BlobRef, LogFailure> {
         let mut g = self.lock();
         let r = g.writer.blob(bytes);

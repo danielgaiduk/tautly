@@ -1315,6 +1315,7 @@ impl Actor {
             recs.push(SessionRecord::TurnEnd {
                 reason: FinishReason::Error,
                 evidence: None,
+                synthetic: false,
             });
         }
         self.with_log(move |l| {

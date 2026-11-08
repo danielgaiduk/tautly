@@ -36,8 +36,8 @@ pub struct TreeNode {
     pub origin: Origin,
     /// When it started, in Unix seconds.
     pub created: u64,
-    /// Its last step.
-    pub steps: u32,
+    /// Its last step's number (spec 7.12.1; not a count of provider steps).
+    pub last_step: u32,
     /// The first line of its last user message (at most 200 characters; empty: none).
     pub last_prompt: String,
     /// What it spent, from the cost ledger (none: no priced request).
@@ -74,7 +74,8 @@ pub fn build(
         if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
             continue;
         }
-        if let Some(mut node) = node(&path) {
+        if let Some(mut node) = cached_node(&path) {
+            node.live = held(&path);
             node.current = current == Some(node.session_id.as_str());
             node.cost_usd = ledger
                 .as_ref()
@@ -102,16 +103,49 @@ pub fn for_root(
     )
 }
 
-/// One log's node (cost and `current` filled in by the caller); none when it cannot be
-/// read.
+/// Nodes already read, by log, with the length and modification time they were read at:
+/// a log that has not changed is not read again (cp5 review C M7).
+/// shortcut: in-process only (the REPL and RPC server repeat `/tree`; a one-shot
+/// `tautly sessions tree` reads every log), upgrade to a file under the data home if that
+/// becomes slow.
+static NODES: std::sync::Mutex<Option<NodeCache>> = std::sync::Mutex::new(None);
+
+/// Each log's node, with the log's length and modification time when it was read.
+type NodeCache = HashMap<std::path::PathBuf, (u64, std::time::SystemTime, TreeNode)>;
+
+/// [`node`], from [`NODES`] when the log is unchanged.
+fn cached_node(path: &Path) -> Option<TreeNode> {
+    let meta = std::fs::metadata(path).ok()?;
+    let key = (meta.len(), meta.modified().ok()?);
+    let mut cache = NODES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let cache = cache.get_or_insert_with(HashMap::new);
+    if let Some((len, mtime, node)) = cache.get(path)
+        && (*len, *mtime) == key
+    {
+        return Some(node.clone());
+    }
+    let node = node(path)?;
+    cache.insert(path.to_path_buf(), (key.0, key.1, node.clone()));
+    Some(node)
+}
+
+/// One log's node (cost, `live` and `current` filled in by the caller); none when it
+/// cannot be read.
 fn node(path: &Path) -> Option<TreeNode> {
     let reader = SessionReader::<SessionRecord>::open(path).ok()?;
     let header = reader.header().clone();
     let mut label = header.label.clone();
     let mut last_prompt = String::new();
-    // One pass: the steps, the step at the parent offset, the label and the last prompt.
+    // One pass: the steps, the step at the parent offset (when the header does not name
+    // it), the label and the last prompt.
     let mut steps = crate::timetravel::StepCounter::default();
-    let fork_at = header.parent.as_ref().map(|(_, offset)| *offset);
+    let fork_at = header
+        .parent
+        .as_ref()
+        .filter(|_| header.parent_step.is_none())
+        .map(|(_, offset)| *offset);
     let mut parent_step = 0;
     for rec in reader.records() {
         let Ok((at, rec)) = rec else {
@@ -119,7 +153,7 @@ fn node(path: &Path) -> Option<TreeNode> {
         };
         steps.see(&rec);
         if fork_at.is_some_and(|o| at <= o) {
-            parent_step = steps.last;
+            parent_step = steps.last();
         }
         match rec {
             SessionRecord::Labeled { label: l } => label = Some(l),
@@ -130,8 +164,10 @@ fn node(path: &Path) -> Option<TreeNode> {
             _ => {}
         }
     }
-    let steps = steps.last;
-    let parent = header.parent.map(|(id, _)| (id, parent_step));
+    let last_step = steps.last();
+    let parent = header
+        .parent
+        .map(|(id, _)| (id, header.parent_step.unwrap_or(parent_step)));
     Some(TreeNode {
         session_id: header.session_id,
         parent,
@@ -141,10 +177,10 @@ fn node(path: &Path) -> Option<TreeNode> {
             .created
             .duration_since(UNIX_EPOCH)
             .map_or(0, |d| d.as_secs()),
-        steps,
+        last_step,
         last_prompt,
         cost_usd: None,
-        live: held(path),
+        live: false,
         current: false,
     })
 }
@@ -219,7 +255,7 @@ pub fn lines(nodes: &[TreeNode]) -> Vec<String> {
             "{}{} {name}  step {} · {origin} · {cost} · {}",
             "  ".repeat(d),
             if n.current { '*' } else { ' ' },
-            n.steps,
+            n.last_step,
             crate::printable(&prompt)
         ));
     }
@@ -237,7 +273,7 @@ mod tests {
             label: None,
             origin: Origin::User,
             created,
-            steps: 1,
+            last_step: 1,
             last_prompt: String::new(),
             cost_usd: None,
             live: false,

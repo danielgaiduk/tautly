@@ -524,6 +524,48 @@ async fn session_diff_turn_scope_uses_user_turns() {
     }
 }
 
+#[tokio::test]
+async fn session_diff_counts_started_turns_not_messages() {
+    // cp5 review C M4: a message logged on arrival whose turn never started (the engine
+    // stopped first) is not a user turn, for diff as for undo, receipts and rebuild.
+    let fx = Fx::new();
+    let mock = MockProvider::new(vec![
+        tools_step(vec![write("w1", "x.txt", "x\n")]),
+        text_step("done"),
+    ]);
+    let mut run = fx.start(config(Mode::Yolo, "str_replace"), &mock, false);
+    let id = run.engine.session_id().to_string();
+    let log = run.engine.session_path().to_path_buf();
+    run.say("first").await;
+    run.turn().await;
+    run.send(Command::Shutdown).await;
+    while run.events.recv().await.is_some() {}
+    let text = std::fs::read_to_string(&log).unwrap();
+    let mut line: Value = serde_json::from_str(text.lines().last().unwrap()).unwrap();
+    line["offset"] = json!(line["offset"].as_u64().unwrap() + 1);
+    line["data"] = json!({"type": "command", "data": {"type": "send_message", "text": "lost"}});
+    std::fs::write(&log, format!("{text}{line}\n")).unwrap();
+
+    let (engine, events) = EngineBuilder {
+        provider: Some(Arc::new(MockProvider::new(vec![]))),
+        data_home: Some(fx.home.path().to_path_buf()),
+        resume: Some(id),
+        ..EngineBuilder::new(config(Mode::Yolo, "str_replace"), fx.dir.path())
+    }
+    .build()
+    .unwrap();
+    let mut run = Run { engine, events };
+    match run.diff(Some(2)).await {
+        Event::Error { message, hint, .. } => {
+            assert!(message.contains("no turn 2"), "{message}");
+            assert_eq!(hint.as_deref(), Some("this session has 1 user turn"));
+        }
+        other => panic!("{other:?}"),
+    }
+    let (_, files, _, _) = session_diff(run.diff(Some(1)).await);
+    assert_eq!(files, vec![file("x.txt", DiffStatus::Added, 1, 0)]);
+}
+
 /// The answer to `Diff` waits for room in a full event channel instead of being dropped.
 #[tokio::test]
 async fn session_diff_reply_waits_for_a_full_event_channel() {

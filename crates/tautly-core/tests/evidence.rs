@@ -624,7 +624,8 @@ async fn turn_end_record_carries_the_evidence() {
         old,
         SessionRecord::TurnEnd {
             reason: FinishReason::Completed,
-            evidence: None
+            evidence: None,
+            synthetic: false,
         }
     );
     // And a turn without evidence writes the old shape.

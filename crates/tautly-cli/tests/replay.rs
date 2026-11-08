@@ -71,6 +71,7 @@ impl Scratch {
                 id: "b1".into(),
                 name: "bash".into(),
                 args: json!({"command": "echo hi"}),
+                args_blob: None,
             },
             SessionRecord::ToolResult {
                 id: "b1".into(),
@@ -84,6 +85,7 @@ impl Scratch {
             SessionRecord::TurnEnd {
                 reason: FinishReason::Completed,
                 evidence: None,
+                synthetic: false,
             },
         ] {
             w.append(&r).unwrap();

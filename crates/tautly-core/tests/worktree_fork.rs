@@ -350,6 +350,12 @@ async fn fork_session_has_parent_origin_what_if_and_records_up_to_n() {
     let (from, offset) = header.parent.clone().unwrap();
     assert_eq!(from, parent);
     assert_eq!(step_at_offset(&reader(&log), offset), 3);
+    // cp5 review C M7, M9: the step it branched at, and the parent's hash and tags.
+    assert_eq!(header.parent_step, Some(3));
+    let parent_header = reader(&log).header().clone();
+    assert!(parent_header.config_hash.is_some());
+    assert_eq!(header.config_hash, parent_header.config_hash);
+    assert_eq!(header.tags, parent_header.tags);
     // The records up to the step's last one, verbatim; then the fork's own.
     let copied = usize::try_from(offset).unwrap() + 1;
     let ours = raw_records(&made.log);

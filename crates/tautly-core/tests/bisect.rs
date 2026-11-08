@@ -1047,3 +1047,22 @@ async fn a_checkpoint_without_a_known_point_is_partial() {
         );
     }
 }
+
+#[tokio::test]
+async fn prepass_reads_a_command_kept_in_a_blob() {
+    // cp5 FMT re-review N4: a command over 4 KiB is logged as a blob.
+    let repo = Repo::new();
+    let long = format!("./check.sh # {}", "x".repeat(5000));
+    let log = repo
+        .session(vec![
+            tools_step(vec![bash("b1", &long)]),
+            tools_step(vec![write("w1", "a.txt", "bad\n")]),
+            tools_step(vec![bash("b2", &long)]),
+            text_step("done"),
+        ])
+        .await;
+    let text = std::fs::read_to_string(&log).unwrap();
+    assert!(text.contains("\"args_blob\""), "the command is in a blob");
+    // Passes before step 2 (boundary 1), fails before step 4 (boundary 3).
+    assert_eq!(bisect::prepass(&reader(&log), &long), Some((1, 3)));
+}

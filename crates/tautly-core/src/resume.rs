@@ -366,6 +366,14 @@ impl Replay<'_> {
     fn apply(&mut self, rec: SessionRecord) -> Flow {
         match rec {
             SessionRecord::Provider(ev) => {
+                // A tool call's input kept in a blob is read back.
+                let (ev, unread) = crate::record::resolved_event(self.reader, ev);
+                if let Some(e) = unread {
+                    self.warn(format!(
+                        "a tool call's input could not be read back ({e}); it is rebuilt as \
+                         an empty object"
+                    ));
+                }
                 if let Some(step) = &mut self.step {
                     step.resp.push(ev);
                     step.responded = true;
@@ -514,10 +522,13 @@ impl Replay<'_> {
                 backup_ref,
                 files,
                 paths,
-                restore_backup,
-            } => self.restoring = Some((backup_ref, paths, !files.is_empty(), restore_backup)),
+                by,
+            } => {
+                let own = by == crate::record::RestoreBy::RestoreBackup;
+                self.restoring = Some((backup_ref, paths, !files.is_empty(), own))
+            }
             SessionRecord::RestoreEnded { .. } => self.restoring = None,
-            SessionRecord::Unknown => self.unknown += 1,
+            SessionRecord::Unknown | SessionRecord::Unreadable => self.unknown += 1,
         }
         Flow::Go
     }
@@ -1017,9 +1028,10 @@ impl Session {
             let reader = SessionReader::<SessionRecord>::open(&path).map_err(err)?;
             let rebuilt = rebuild_with(&reader, None, Some(&calibration)).map_err(err)?;
             let closed = if rebuilt.incomplete_turn {
-                log.append(&SessionRecord::TurnEnd {
+                log.append_at_last(&SessionRecord::TurnEnd {
                     reason: FinishReason::Error,
                     evidence: None,
+                    synthetic: true,
                 })
                 .and_then(|()| log.checkpoint())
                 .err()
@@ -1132,9 +1144,9 @@ impl Session {
         self.restore_guard(resumed.seen).await;
     }
 
-    /// Count what the session spent before against its budgets: the cost ledger's rows of
-    /// this session (discarded attempts included), else the usage in the log, each priced
-    /// by the model it was spent on.
+    /// Count what the session spent before against its budgets: each figure the larger of
+    /// the cost ledger's rows of this session (discarded attempts included) and the usage
+    /// in the log, each priced by the model it was spent on.
     async fn restore_spend(&mut self, logged: Vec<(ModelId, RawUsage)>) {
         let path = self.data_home.join(LEDGER_FILE);
         let id = self.session_id.clone();
@@ -1142,16 +1154,27 @@ impl Session {
             Ledger::open(&path).and_then(|l| l.session_totals(&id))
         })
         .await;
-        let (usage, usd) = match totals {
-            Ok(Ok(t)) if t.requests > 0 || logged.is_empty() => (
-                RawUsage {
-                    input: t.input,
-                    output: t.output,
-                    cache_read: t.cache_read,
-                    cache_write: t.cache_write,
-                },
-                t.usd,
-            ),
+        let mut usage = RawUsage::default();
+        let mut usd = 0.0;
+        for (model, u) in &logged {
+            usage.input += u.input;
+            usage.output += u.output;
+            usage.cache_read += u.cache_read;
+            usage.cache_write += u.cache_write;
+            let price = self.setup.catalog.get(model).price;
+            usd += cost_usd(u, price.as_ref()).unwrap_or(0.0);
+        }
+        // Both are lower bounds: ledger rows are queued and may be lost at a crash (or
+        // with a ledger moved aside), and the log holds no discarded attempts of a
+        // response that broke off. Each figure is the larger (cp5 review C M3).
+        match totals {
+            Ok(Ok(t)) if t.requests > 0 || logged.is_empty() => {
+                usage.input = usage.input.max(t.input);
+                usage.output = usage.output.max(t.output);
+                usage.cache_read = usage.cache_read.max(t.cache_read);
+                usage.cache_write = usage.cache_write.max(t.cache_write);
+                usd = usd.max(t.usd);
+            }
             other => {
                 let why = match other {
                     Ok(Err(e)) => e.to_string(),
@@ -1163,19 +1186,8 @@ impl Session {
                      rebuilt from the session log"
                 ))
                 .await;
-                let mut sum = RawUsage::default();
-                let mut usd = 0.0;
-                for (model, u) in &logged {
-                    sum.input += u.input;
-                    sum.output += u.output;
-                    sum.cache_read += u.cache_read;
-                    sum.cache_write += u.cache_write;
-                    let price = self.setup.catalog.get(model).price;
-                    usd += cost_usd(u, price.as_ref()).unwrap_or(0.0);
-                }
-                (sum, usd)
             }
-        };
+        }
         let mut b = self.budgets.lock().unwrap_or_else(PoisonError::into_inner);
         b.spend(&usage, Some(usd));
         b.start_turn();
@@ -1265,16 +1277,24 @@ impl Session {
         let made = tokio::task::spawn_blocking(move || -> Result<_, String> {
             let parent = SessionReader::<SessionRecord>::open(&parent_path).map_err(err)?;
             let cut = rebuild(&parent, at).map_err(err)?;
-            // The parent offset names the last record copied: with none, a branch would
-            // read as one cut after record 0.
-            let end = cut.end_offset.ok_or_else(|| {
+            // As a rewind counts it (`at = 0` copies the set-up before the first step,
+            // cp5 review C M9). The parent offset names the last record copied: with none,
+            // a branch would read as one cut after record 0.
+            let step = cut.context.next_turn() - 1;
+            let count = match at {
+                Some(at) => crate::timetravel::copy_count(&parent, at, &cut),
+                // The tip of a session with no step yet is nothing to branch from.
+                None => cut.end_offset.map(|end| end + 1),
+            };
+            let count = count.ok_or_else(|| {
                 "there is nothing to branch from yet: the session has no records before \
                  that point"
                     .to_string()
             })?;
             // The branch's records start from the parent's first model.
             let init = HeaderInit {
-                parent: Some((parent_id, end)),
+                parent: Some((parent_id, count - 1)),
+                parent_step: Some(step),
                 model: parent.header().model.clone(),
                 ..init
             };
@@ -1283,7 +1303,7 @@ impl Session {
                 &root,
                 init,
                 &parent_path,
-                end + 1,
+                count,
                 cut.incomplete_turn,
                 Vec::new(),
             )?;
@@ -1527,11 +1547,13 @@ pub(crate) fn branch(
         SessionWriter::<SessionRecord>::create_in(data_home, root, init).map_err(err)?;
     let written = (|| {
         child.copy_from(parent, count)?;
-        child.append(&SessionRecord::Forked)?;
+        // Both are written for the copy, at its last record's time.
+        child.append_at_last(&SessionRecord::Forked)?;
         if close_turn {
-            child.append(&SessionRecord::TurnEnd {
+            child.append_at_last(&SessionRecord::TurnEnd {
                 reason: FinishReason::Cancelled,
                 evidence: None,
+                synthetic: true,
             })?;
         }
         for rec in &tail {
@@ -1608,6 +1630,7 @@ mod tests {
             all.push(SessionRecord::TurnEnd {
                 reason: FinishReason::Cancelled,
                 evidence: None,
+                synthetic: false,
             });
             all
         };
@@ -1665,6 +1688,7 @@ mod tests {
             all.push(SessionRecord::TurnEnd {
                 reason: FinishReason::Completed,
                 evidence: None,
+                synthetic: false,
             });
             all
         };

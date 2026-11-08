@@ -72,6 +72,12 @@ pub struct BranchSummary {
     pub cost_estimated: bool,
     /// Some usage was on a model without a known price: `cost_usd` covers the rest.
     pub cost_partial: bool,
+    /// What the cost ledger recorded for the counted range, at the prices of when it was
+    /// spent (discarded attempts included): only when that range is exactly the session's
+    /// own records, and some of it was priced. Every other figure is from the log, priced
+    /// at the current catalog; this is shown as its own, labelled line (cp5 review C M11).
+    #[serde(default)]
+    pub ledger_usd: Option<f64>,
     /// `Σ(TurnEnd.t − TurnStart.t)`.
     pub wall_ms: u64,
     /// Tool calls that ran.
@@ -227,7 +233,7 @@ fn step_through(log: &Path, offset: u64) -> Option<u32> {
         }
         steps.see(&rec);
         if at == offset {
-            return Some(steps.last);
+            return Some(steps.last());
         }
     }
     None
@@ -261,12 +267,12 @@ fn step_cut(reader: &SessionReader<SessionRecord>, n: u32) -> Result<Option<u64>
     let mut last = None;
     for rec in reader.records() {
         let (at, rec) = rec?;
-        steps.see(&rec);
+        let owner = steps.see(&rec);
         let starts = matches!(
             rec,
             SessionRecord::TurnStart { .. } | SessionRecord::Request { .. }
         );
-        if starts && steps.last > n {
+        if starts && owner.is_some_and(|(s, _)| s > n) {
             return Ok(at.checked_sub(1));
         }
         last = Some(at);
@@ -274,12 +280,12 @@ fn step_cut(reader: &SessionReader<SessionRecord>, n: u32) -> Result<Option<u64>
     Ok(last)
 }
 
-/// The figures of `reader`'s session after record `cut` (none: the whole session), with
-/// cost from `ledger` when it covers exactly that range (the session's own records: `cut`
-/// is its header's parent offset, or it has no parent and `cut` is none), else from the
-/// logged usage priced with `catalog` (`Config::effective_catalog`). A turn open at the
-/// cut counts its wall time from the first record after it. Blocking I/O (the log, its
-/// blobs, the ledger).
+/// The figures of `reader`'s session after record `cut` (none: the whole session), the
+/// cost from the logged usage priced with `catalog` (`Config::effective_catalog`), and the
+/// ledger's historical figure beside it when the ledger covers exactly that range (the
+/// session's own records: `cut` is its header's parent offset, or it has no parent and
+/// `cut` is none). A turn open at the cut counts its wall time from the first record after
+/// it. Blocking I/O (the log, its blobs, the ledger).
 pub fn summarize_at(
     reader: &SessionReader<SessionRecord>,
     ledger: Option<&Ledger>,
@@ -332,6 +338,8 @@ struct Tally {
     user_turns: u32,
     steps: BTreeSet<u32>,
     turn_start: Option<u64>,
+    /// The time of the last record counted, a synthetic turn end's excepted.
+    last_t: u64,
     wall_ms: u64,
     /// The open step's model and its response's latest (cumulative) usage.
     model: Option<ModelId>,
@@ -367,6 +375,7 @@ impl Tally {
             user_turns: 0,
             steps: BTreeSet::new(),
             turn_start: None,
+            last_t: 0,
             wall_ms: 0,
             model: None,
             response: None,
@@ -414,16 +423,31 @@ impl Tally {
     }
 
     fn see(&mut self, t_ms: u64, rec: &SessionRecord, wrote: Vec<WriteValue>) {
+        if !matches!(
+            rec,
+            SessionRecord::TurnEnd {
+                synthetic: true,
+                ..
+            }
+        ) {
+            self.last_t = self.last_t.max(t_ms);
+        }
         match rec {
             SessionRecord::TurnStart { .. } => {
                 self.close_response();
                 self.user_turns += 1;
                 self.turn_start = Some(t_ms);
             }
-            SessionRecord::TurnEnd { evidence, .. } => {
+            SessionRecord::TurnEnd {
+                evidence,
+                synthetic,
+                ..
+            } => {
                 self.close_response();
+                // A turn closed afterwards (a crash, a cut) ran until its last record.
+                let end = if *synthetic { self.last_t } else { t_ms };
                 if let Some(start) = self.turn_start.take() {
-                    self.wall_ms = self.wall_ms.saturating_add(t_ms.saturating_sub(start));
+                    self.wall_ms = self.wall_ms.saturating_add(end.saturating_sub(start));
                 }
                 if let Some(e) = evidence {
                     self.evidence = Some(e.clone());
@@ -505,7 +529,7 @@ impl Tally {
                     }
                 }
             }
-            SessionRecord::Unknown => self.unknown += 1,
+            SessionRecord::Unknown | SessionRecord::Unreadable => self.unknown += 1,
             rec @ SessionRecord::WritesLost { .. } if ran_command(rec) => self.commands += 1,
             _ => {}
         }
@@ -555,23 +579,12 @@ impl Tally {
             e.edits_since = e.edits_since.saturating_add(self.edits_after_test);
             e.execs_since = e.execs_since.saturating_add(self.execs_after_test);
         }
-        let mut cost = self.logged_cost(catalog);
+        let cost = self.logged_cost(catalog);
+        let mut ledger_usd = None;
         if own_range && let Some(l) = ledger {
             match l.session_totals(&self.session_id) {
-                Ok(t) if t.requests > 0 => {
-                    cost = Cost {
-                        tokens_in: t.input,
-                        tokens_out: t.output,
-                        cache_read: t.cache_read,
-                        usd: (t.requests > t.unpriced).then_some(t.usd),
-                        estimated: t.estimated > 0,
-                        partial: t.unpriced > 0,
-                    }
-                }
-                Ok(_) => {}
-                Err(e) => notes.push(format!(
-                    "the cost ledger could not be read ({e}); the cost is from the session log"
-                )),
+                Ok(t) => ledger_usd = (t.requests > t.unpriced).then_some(t.usd),
+                Err(e) => notes.push(format!("the cost ledger could not be read ({e})")),
             }
         }
         BranchSummary {
@@ -586,6 +599,7 @@ impl Tally {
             cost_usd: cost.usd,
             cost_estimated: cost.estimated,
             cost_partial: cost.partial,
+            ledger_usd,
             wall_ms: self.wall_ms,
             tool_calls: self.tool_calls,
             blocked: self.blocked,

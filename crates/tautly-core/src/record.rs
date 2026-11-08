@@ -77,11 +77,16 @@ pub enum SessionRecord {
         estimated: bool,
     },
     /// A tool call of the response before it. `args` is the input as it stands in the
-    /// history: an empty object when the model's JSON did not parse.
+    /// history: an empty object when the model's JSON did not parse. An input over
+    /// [`INLINE_INPUT_MAX`] bytes is in the blob `args_blob` instead (`args` null): the
+    /// exact text the provider sent, the same blob its `Provider` event names, so the log
+    /// and every branch copy hold it once (cp5 review C M6). Read it with [`tool_args`].
     ToolCall {
         id: String,
         name: String,
         args: Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        args_blob: Option<BlobRef>,
     },
     /// The result returned to the model for call `id` (after the engine's own changes,
     /// e.g. a refused pin), with what the call did to files. Effects on paths that cannot
@@ -216,18 +221,17 @@ pub enum SessionRecord {
         /// Every path it is about to write (the snapshot holds the rest of the tree too).
         #[serde(default)]
         paths: Vec<RelPath>,
-        /// Written by `tautly sessions restore-backup` itself (what it replaced), not by a
-        /// rewind or switch: a later `restore-backup` puts it back only when asked
-        /// (`--include-own`, Task 49 M-R3b).
-        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-        restore_backup: bool,
-    },
-    /// The end of the restore a `RestoreBegun` started: whether the files are now the
-    /// target's (`applied`), else whether they were put back (`rolled_back`).
-    RestoreEnded {
-        applied: bool,
+        /// What wrote it. One `tautly sessions restore-backup` wrote (what it replaced) is
+        /// put back by a later `restore-backup` only when asked (`--include-own`, Task 49
+        /// M-R3b). Logs of the builds before this field (`restore_backup: bool`) read as
+        /// `restore_backup` or `unknown`.
         #[serde(default)]
-        rolled_back: bool,
+        by: RestoreBy,
+    },
+    /// The end of the restore a `RestoreBegun` started.
+    RestoreEnded {
+        #[serde(default)]
+        outcome: RestoreOutcome,
     },
     /// The session switched to `model` (`Command::SetModel`, spec 7.11.5); requests from
     /// here on go to it. The last one wins over the header's model.
@@ -256,10 +260,20 @@ pub enum SessionRecord {
         /// so a receipt on a resumed session can show it.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         evidence: Option<TestEvidence>,
+        /// Not the turn's own end: written for it afterwards, by a resume after a crash
+        /// (`error`) or a branch whose copy ends inside the turn (`cancelled`), stamped with
+        /// the time of the log's last record. Wall times leave it out.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        synthetic: bool,
     },
     /// A record type this version does not know (read only; never written).
     #[serde(skip)]
     Unknown,
+    /// A record of a type this version knows whose payload it cannot read: a newer shape
+    /// (read only; never written). It may have changed files, so every time-travel state
+    /// across it is partial (cp5 FMT re-review N1).
+    #[serde(skip)]
+    Unreadable,
 }
 
 /// blake3 hex of each part of a request (H6): `stable` the system blocks and tools,
@@ -303,34 +317,84 @@ pub enum CheckpointPoint {
     Unknown,
 }
 
+/// What a [`SessionRecord::RestoreBegun`] was written by.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RestoreBy {
+    Rewind,
+    Switch,
+    /// `tautly sessions restore-backup`.
+    RestoreBackup,
+    /// Not known: written before the field (a rewind or a switch), or by a newer version.
+    #[default]
+    #[serde(other)]
+    Unknown,
+}
+
+/// How a restore ended ([`SessionRecord::RestoreEnded`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RestoreOutcome {
+    /// The files are now the target's.
+    Applied,
+    /// It failed, and the files written were put back.
+    RolledBack,
+    /// It failed, and the files written were not (all) put back.
+    Failed,
+    /// An outcome this version does not know (read only).
+    #[default]
+    #[serde(other)]
+    Unknown,
+}
+
 /// One file of a [`SessionRecord::RestoreBegun`]: its content before the restore wrote
-/// it.
+/// it (`from_*`) and what the restore wrote (`to*`), named as [`UndoneFile`]'s are. Logs of
+/// the builds before the rename (`blob`, `mode`, `wrote`, `wrote_mode`) still read.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BackupFile {
     pub path: RelPath,
-    /// It existed (with `blob` none: it could not be kept, a link or over 64 MiB).
+    /// It existed (with `from_blob` none: it could not be kept, a link or over 64 MiB).
     pub existed: bool,
-    pub blob: Option<BlobRef>,
-    #[serde(default)]
-    pub mode: Option<u32>,
+    #[serde(alias = "blob")]
+    pub from_blob: Option<BlobRef>,
+    #[serde(default, alias = "mode")]
+    pub from_mode: Option<u32>,
     /// What the restore wrote there (none: not known), so putting the backup back can
     /// tell a later human edit (Task 49 N10).
-    #[serde(default)]
-    pub wrote: Option<Wrote>,
+    #[serde(default, alias = "wrote")]
+    pub to: Option<Wrote>,
     /// The permission bits the restore wrote there (none: not known), so a later
     /// mode-only change is told apart too (Task 49 M-R3c).
-    #[serde(default)]
-    pub wrote_mode: Option<u32>,
+    #[serde(default, alias = "wrote_mode")]
+    pub to_mode: Option<u32>,
 }
 
 /// What a restore wrote at a path.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Wrote {
     /// This content.
     Blob(BlobRef),
     /// It deleted the file.
     Absent,
+    /// A form this version does not know (read only): treated as not known.
+    Unknown,
+}
+
+impl<'de> Deserialize<'de> for Wrote {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "snake_case")]
+        enum Known {
+            Blob(BlobRef),
+            Absent,
+        }
+        Ok(match serde_json::from_value(Value::deserialize(d)?) {
+            Ok(Known::Blob(b)) => Wrote::Blob(b),
+            Ok(Known::Absent) => Wrote::Absent,
+            Err(_) => Wrote::Unknown,
+        })
+    }
 }
 
 /// One file of an [`SessionRecord::Undone`].
@@ -442,23 +506,143 @@ const KNOWN_TYPES: &[&str] = &[
     "turn_end",
 ];
 
+/// Tool inputs longer than this many bytes are logged as a blob (cp5 review C M6).
+pub const INLINE_INPUT_MAX: usize = 4096;
+
+/// In memory, a `Provider` tool call event whose input is in a blob holds this prefix and
+/// the blob's hash as its `input_json`; the log line holds `input_json: ""` and
+/// `input_blob: <hash>`. No JSON text starts with a NUL. Read it with [`resolved_event`].
+pub(crate) const BLOB_INPUT: &str = "\u{0}blob:";
+
 impl Serialize for SessionRecord {
     fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        if let SessionRecord::Provider(ProviderEvent::ToolCall {
+            id,
+            name,
+            input_json,
+        }) = self
+            && let Some(blob) = input_json.strip_prefix(BLOB_INPUT)
+        {
+            let data = serde_json::json!({"tool_call": {
+                "id": id, "name": name, "input_json": "", "input_blob": blob,
+            }});
+            return serde_json::json!({"type": "provider", "data": data}).serialize(s);
+        }
         SessionRecord::serialize(self, s)
     }
 }
 
+/// `ev` with a tool call's input read back from its blob (the blob form of
+/// [`BLOB_INPUT`]); every other event as it is. A blob that cannot be read leaves the input
+/// empty (an empty object in the history), with the error.
+pub(crate) fn resolved_event(
+    reader: &SessionReader<SessionRecord>,
+    ev: ProviderEvent,
+) -> (ProviderEvent, Option<tautly_session::Error>) {
+    match ev {
+        ProviderEvent::ToolCall {
+            id,
+            name,
+            input_json,
+        } if input_json.starts_with(BLOB_INPUT) => {
+            let read =
+                BlobRef::parse(&input_json[BLOB_INPUT.len()..]).and_then(|b| reader.read_blob(&b));
+            let (input_json, error) = match read {
+                Ok(bytes) => (String::from_utf8_lossy(&bytes).into_owned(), None),
+                Err(e) => (String::new(), Some(e)),
+            };
+            let ev = ProviderEvent::ToolCall {
+                id,
+                name,
+                input_json,
+            };
+            (ev, error)
+        }
+        ev => (ev, None),
+    }
+}
+
+/// A `ToolCall` record's input: `args`, or read from `args_blob` as the history holds it
+/// (an empty object when it is not a JSON object, or cannot be read).
+pub fn tool_args(
+    reader: &SessionReader<SessionRecord>,
+    args: &Value,
+    args_blob: Option<&BlobRef>,
+) -> Value {
+    match args_blob {
+        None => args.clone(),
+        Some(b) => reader
+            .read_blob(b)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+            .filter(Value::is_object)
+            .unwrap_or_else(|| Value::Object(Default::default())),
+    }
+}
+
+/// The record types written without a payload: a newer version may give them one, which
+/// this version ignores (spec 6.5: unit records may gain fields).
+const UNIT_TYPES: &[&str] = &["pins_folded", "reasoning_stripped", "forked"];
+
+/// A line that is valid JSON reads as a record whatever its payload (spec 6.5.1): an unknown
+/// type reads as `Unknown`, a known one whose payload this version cannot read (a newer
+/// shape, a value it never writes) as `Unreadable` (a command's as `Command::Unknown`),
+/// never as a corrupt log. Payloads of the builds before the format freeze are upgraded first.
 impl<'de> Deserialize<'de> for SessionRecord {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        let value = Value::deserialize(d)?;
-        let known = value
+        let mut value = Value::deserialize(d)?;
+        let Some(ty) = value
             .get("type")
             .and_then(Value::as_str)
-            .is_some_and(|t| KNOWN_TYPES.contains(&t));
-        if !known {
+            .filter(|t| KNOWN_TYPES.contains(t))
+            .map(str::to_string)
+        else {
             return Ok(SessionRecord::Unknown);
+        };
+        if let Some(obj) = value.as_object_mut() {
+            if UNIT_TYPES.contains(&ty.as_str()) {
+                obj.remove("data");
+            } else if let Some(Value::Object(data)) = obj.get_mut("data") {
+                upgrade(&ty, data);
+            }
         }
-        SessionRecord::deserialize(value).map_err(serde::de::Error::custom)
+        Ok(match SessionRecord::deserialize(value) {
+            Ok(rec) => rec,
+            Err(_) if ty == "command" => SessionRecord::Command(Command::Unknown),
+            Err(_) => SessionRecord::Unreadable,
+        })
+    }
+}
+
+/// A payload in its in-memory form: fields written by builds before the format freeze in
+/// their frozen form, and a tool call input kept in a blob as [`BLOB_INPUT`].
+fn upgrade(ty: &str, data: &mut serde_json::Map<String, Value>) {
+    let flag = |data: &mut serde_json::Map<String, Value>, k: &str| {
+        data.remove(k).and_then(|v| v.as_bool()) == Some(true)
+    };
+    match ty {
+        // A tool call input kept in a blob: its in-memory form (`BLOB_INPUT`).
+        "provider" => {
+            if let Some(Value::Object(call)) = data.get_mut("tool_call")
+                && let Some(Value::String(blob)) = call.remove("input_blob")
+            {
+                call.insert("input_json".into(), format!("{BLOB_INPUT}{blob}").into());
+            }
+        }
+        "restore_begun" if !data.contains_key("by") => {
+            if flag(data, "restore_backup") {
+                data.insert("by".into(), "restore_backup".into());
+            }
+        }
+        "restore_ended" if !data.contains_key("outcome") && data.contains_key("applied") => {
+            let outcome = match (flag(data, "applied"), flag(data, "rolled_back")) {
+                (true, _) => "applied",
+                (false, true) => "rolled_back",
+                (false, false) => "failed",
+            };
+            data.insert("outcome".into(), outcome.into());
+        }
+        _ => {}
     }
 }
 
@@ -679,6 +863,7 @@ mod tests {
             SessionRecord::TurnEnd {
                 reason: FinishReason::Completed,
                 evidence: None,
+                synthetic: false,
             },
         ];
         for r in recs {
@@ -688,8 +873,13 @@ mod tests {
         let future: SessionRecord =
             serde_json::from_str(r#"{"type":"from_the_future","data":{"x":1}}"#).unwrap();
         assert_eq!(future, SessionRecord::Unknown);
-        // A known type with a bad payload is still an error.
-        assert!(serde_json::from_str::<SessionRecord>(r#"{"type":"request","data":7}"#).is_err());
+        // A known type with a payload this version cannot read is not a corrupt log.
+        assert_eq!(
+            serde_json::from_str::<SessionRecord>(r#"{"type":"request","data":7}"#).unwrap(),
+            SessionRecord::Unreadable
+        );
+        // A line that is not JSON is.
+        assert!(serde_json::from_str::<SessionRecord>(r#"{"type":"request","#).is_err());
     }
 
     #[test]
@@ -718,6 +908,148 @@ mod tests {
             checkpoint,
             SessionRecord::Checkpoint { point: None, .. }
         ));
+    }
+
+    #[test]
+    fn unit_records_and_nested_enums_accept_a_newer_versions_fields() {
+        // cp5 review C I3: unit records may gain fields; `Wrote` may gain variants.
+        let read = |line: &str| -> SessionRecord {
+            serde_json::from_str(line).unwrap_or_else(|e| panic!("{line}: {e}"))
+        };
+        assert_eq!(
+            read(r#"{"type":"forked","data":{"at":3}}"#),
+            SessionRecord::Forked
+        );
+        assert_eq!(
+            read(r#"{"type":"forked","data":{}}"#),
+            SessionRecord::Forked
+        );
+        assert_eq!(
+            read(r#"{"type":"pins_folded","data":{"n":1}}"#),
+            SessionRecord::PinsFolded
+        );
+        assert_eq!(
+            read(r#"{"type":"reasoning_stripped","data":{"why":"x"}}"#),
+            SessionRecord::ReasoningStripped
+        );
+        let begun = read(
+            r#"{"type":"restore_begun","data":{"backup_ref":null,"files":[{"path":"a",
+                "existed":true,"from_blob":null,"to":{"link":"b"},"later":1}],"paths":[],
+                "by":"teleport","extra":true}}"#,
+        );
+        let SessionRecord::RestoreBegun { files, by, .. } = begun else {
+            panic!("{begun:?}")
+        };
+        assert_eq!(files[0].to, Some(Wrote::Unknown));
+        assert_eq!(by, RestoreBy::Unknown);
+        assert_eq!(
+            read(r#"{"type":"restore_ended","data":{"outcome":"half","why":"x"}}"#),
+            SessionRecord::RestoreEnded {
+                outcome: RestoreOutcome::Unknown
+            }
+        );
+        assert_eq!(
+            read(r#"{"type":"command","data":{"type":"cancel","reason":"x"}}"#),
+            SessionRecord::Command(Command::Cancel)
+        );
+    }
+
+    #[test]
+    fn a_tool_call_input_in_a_blob_round_trips_through_its_log_form() {
+        let blob = "c".repeat(64);
+        let rec = SessionRecord::Provider(ProviderEvent::ToolCall {
+            id: "w1".into(),
+            name: "write".into(),
+            input_json: format!("{BLOB_INPUT}{blob}"),
+        });
+        let v = serde_json::to_value(&rec).unwrap();
+        assert_eq!(v["data"]["tool_call"]["input_json"], "");
+        assert_eq!(v["data"]["tool_call"]["input_blob"], blob.as_str());
+        assert_eq!(serde_json::from_value::<SessionRecord>(v).unwrap(), rec);
+        // An inline input is written as before.
+        let inline = SessionRecord::Provider(ProviderEvent::ToolCall {
+            id: "w2".into(),
+            name: "write".into(),
+            input_json: "{}".into(),
+        });
+        let v = serde_json::to_value(&inline).unwrap();
+        assert!(v["data"]["tool_call"].get("input_blob").is_none());
+        assert_eq!(serde_json::from_value::<SessionRecord>(v).unwrap(), inline);
+    }
+
+    #[test]
+    fn a_payload_this_version_cannot_read_is_unknown_not_corrupt() {
+        // cp5 review C I2: a non-finite speed was logged as `null`.
+        let read = |line: &str| -> SessionRecord {
+            serde_json::from_str(line).unwrap_or_else(|e| panic!("{line}: {e}"))
+        };
+        assert_eq!(
+            read(r#"{"type":"command","data":{"type":"replay","session_id":null,"speed":null}}"#),
+            SessionRecord::Command(Command::Unknown)
+        );
+        assert_eq!(
+            read(r#"{"type":"turn_start","data":{"turn":"one"}}"#),
+            SessionRecord::Unreadable
+        );
+    }
+
+    #[test]
+    fn restore_records_of_the_builds_before_the_freeze_still_read() {
+        // M8: renamed fields and the bools that became enums.
+        let blob = "b".repeat(64);
+        let begun: SessionRecord = serde_json::from_str(&format!(
+            r#"{{"type":"restore_begun","data":{{"backup_ref":null,"files":[{{"path":"a",
+                "existed":true,"blob":"{blob}","mode":420,"wrote":"absent","wrote_mode":384}}],
+                "paths":["a"],"restore_backup":true}}}}"#
+        ))
+        .unwrap();
+        let SessionRecord::RestoreBegun { files, by, .. } = begun else {
+            panic!("{begun:?}")
+        };
+        assert_eq!(
+            files[0],
+            BackupFile {
+                path: rel("a"),
+                existed: true,
+                from_blob: Some(BlobRef::parse(&blob).unwrap()),
+                from_mode: Some(0o644),
+                to: Some(Wrote::Absent),
+                to_mode: Some(0o600),
+            }
+        );
+        assert_eq!(by, RestoreBy::RestoreBackup);
+        let unmarked: SessionRecord = serde_json::from_str(
+            r#"{"type":"restore_begun","data":{"backup_ref":"r","files":[],"paths":[]}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            unmarked,
+            SessionRecord::RestoreBegun {
+                by: RestoreBy::Unknown,
+                ..
+            }
+        ));
+        for (old, outcome) in [
+            (r#"{"applied":true}"#, RestoreOutcome::Applied),
+            (
+                r#"{"applied":true,"rolled_back":false}"#,
+                RestoreOutcome::Applied,
+            ),
+            (
+                r#"{"applied":false,"rolled_back":true}"#,
+                RestoreOutcome::RolledBack,
+            ),
+            (
+                r#"{"applied":false,"rolled_back":false}"#,
+                RestoreOutcome::Failed,
+            ),
+            (r#"{"applied":false}"#, RestoreOutcome::Failed),
+        ] {
+            let rec: SessionRecord =
+                serde_json::from_str(&format!(r#"{{"type":"restore_ended","data":{old}}}"#))
+                    .unwrap();
+            assert_eq!(rec, SessionRecord::RestoreEnded { outcome }, "{old}");
+        }
     }
 
     #[test]
@@ -755,6 +1087,7 @@ mod tests {
                 id: String::new(),
                 name: String::new(),
                 args: Value::Null,
+                args_blob: None,
             },
             SessionRecord::ToolResult {
                 id: String::new(),
@@ -849,16 +1182,15 @@ mod tests {
                 files: vec![BackupFile {
                     path: rel("a"),
                     existed: true,
-                    blob: Some(BlobRef::parse(&"b".repeat(64)).unwrap()),
-                    mode: Some(0o644),
-                    wrote: Some(Wrote::Absent),
-                    wrote_mode: Some(0o600),
+                    from_blob: Some(BlobRef::parse(&"b".repeat(64)).unwrap()),
+                    from_mode: Some(0o644),
+                    to: Some(Wrote::Absent),
+                    to_mode: Some(0o600),
                 }],
-                restore_backup: true,
+                by: RestoreBy::RestoreBackup,
             },
             SessionRecord::RestoreEnded {
-                applied: false,
-                rolled_back: true,
+                outcome: RestoreOutcome::RolledBack,
             },
             SessionRecord::WritesLost {
                 paths: vec![rel("a.txt")],
@@ -879,6 +1211,7 @@ mod tests {
             SessionRecord::TurnEnd {
                 reason: FinishReason::Error,
                 evidence: None,
+                synthetic: false,
             },
         ];
         assert_eq!(all.len(), KNOWN_TYPES.len());

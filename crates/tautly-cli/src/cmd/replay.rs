@@ -42,8 +42,11 @@ pub struct Args {
 
 fn parse_speed(s: &str) -> Result<f32, String> {
     match s.parse::<f32>() {
-        Ok(v) if v.is_finite() && v >= 0.0 => Ok(v),
-        _ => Err(format!("`{s}` is not a speed (a number of at least 0)")),
+        Ok(v) if replay::speed_ok(v) => Ok(v),
+        _ => Err(format!(
+            "`{s}` is not a speed (a number from 0 to {})",
+            replay::MAX_SPEED
+        )),
     }
 }
 

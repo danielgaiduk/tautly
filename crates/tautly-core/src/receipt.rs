@@ -66,8 +66,11 @@ pub struct ReceiptBuilder {
     main_cache_read: u64,
     main_cache_write: u64,
     side_tokens: u64,
-    /// `None` once an unpriced entry was charged.
-    cost_usd: Option<f64>,
+    /// The priced entries' cost.
+    cost_usd: f64,
+    /// Entries charged with a known price, and without one.
+    priced: u32,
+    unpriced: u32,
     estimated: bool,
     steps: u32,
     /// The step of the last request: a step sent again (after an overflow) counts once.
@@ -94,7 +97,9 @@ impl ReceiptBuilder {
             main_cache_read: 0,
             main_cache_write: 0,
             side_tokens: 0,
-            cost_usd: Some(0.0),
+            cost_usd: 0.0,
+            priced: 0,
+            unpriced: 0,
             estimated: false,
             steps: 0,
             last_step: None,
@@ -125,7 +130,13 @@ impl ReceiptBuilder {
             }
             UsageRole::Unknown => {}
         }
-        self.cost_usd = self.cost_usd.zip(cost).map(|(a, b)| a + b);
+        match cost {
+            Some(c) => {
+                self.cost_usd += c;
+                self.priced += 1;
+            }
+            None => self.unpriced += 1,
+        }
     }
 
     /// Some of the charged usage is the engine's estimate.
@@ -185,7 +196,9 @@ impl ReceiptBuilder {
             cache_read: self.cache_read,
             cache_write: self.cache_write,
             side_tokens: self.side_tokens,
-            cost_usd: self.cost_usd,
+            // The priced part, with the rest marked (cp5 review C M1), as compare does.
+            cost_usd: (self.priced > 0 || self.unpriced == 0).then_some(self.cost_usd),
+            cost_partial: self.unpriced > 0,
             wall_ms: u64::try_from(now.saturating_duration_since(self.started).as_millis())
                 .unwrap_or(u64::MAX),
             cache_hit_ratio: (seen > 0).then(|| self.cache_read as f64 / seen as f64),

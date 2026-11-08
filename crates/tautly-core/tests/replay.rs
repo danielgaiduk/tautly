@@ -536,6 +536,7 @@ fn paced_log(fx: &Fx) -> String {
             SessionRecord::TurnEnd {
                 reason: tautly_core::FinishReason::Completed,
                 evidence: None,
+                synthetic: false,
             },
         ),
     ];
@@ -615,6 +616,7 @@ async fn speed_zero_is_instant() {
             SessionRecord::TurnEnd {
                 reason: tautly_core::FinishReason::Completed,
                 evidence: None,
+                synthetic: false,
             },
         ),
     ];
@@ -649,6 +651,7 @@ fn two_turns(fx: &Fx) -> (String, PathBuf) {
     let end = || SessionRecord::TurnEnd {
         reason: tautly_core::FinishReason::Completed,
         evidence: None,
+        synthetic: false,
     };
     let recs = vec![
         (
@@ -825,6 +828,7 @@ async fn replayed_request_ids_not_answerable() {
             id: "w1".into(),
             name: "write".into(),
             args: json!({"path": "a.txt", "content": "pwned\n"}),
+            args_blob: None,
         },
         SessionRecord::ApprovalRequested {
             request_id: "approval-1".into(),

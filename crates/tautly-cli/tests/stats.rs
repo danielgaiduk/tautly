@@ -90,6 +90,7 @@ impl Scratch {
         w.append(&SessionRecord::TurnEnd {
             reason: tautly_core::FinishReason::Completed,
             evidence,
+            synthetic: false,
         })
         .unwrap();
         w.checkpoint().unwrap();
@@ -128,6 +129,7 @@ fn receipt(
         cache_write: 40,
         side_tokens: 100,
         cost_usd: cost,
+        cost_partial: false,
         wall_ms,
         cache_hit_ratio: None,
         steps: 3,
@@ -498,4 +500,53 @@ fn receipt_cost_shows_the_priced_sum_when_a_turn_is_unpriced() {
         .unwrap_or_else(|| panic!("{out}"));
     assert!(cost.contains("$0.0150?"), "{out}");
     assert!(out.contains("?:"), "a legend for `?`: {out}");
+}
+
+#[test]
+fn receipt_counts_spend_outside_turns_and_turns_without_a_receipt() {
+    // cp5 review C M1: a side request between turns, and a turn that crashed (no
+    // receipt), are spend the ledger's rows and the log hold; `tautly receipt` agrees
+    // with tree and stats.
+    let s = Scratch::new();
+    let root = s.root();
+    let project = tautly_session::paths::project_id(&root);
+    let mut w =
+        SessionWriter::<SessionRecord>::create_in(s.home.path(), &root, HeaderInit::default())
+            .unwrap();
+    for (turn, text) in [(1, "one"), (2, "two")] {
+        w.append(&SessionRecord::TurnStart {
+            turn,
+            text: text.into(),
+        })
+        .unwrap();
+    }
+    w.checkpoint().unwrap();
+    let id = w.session_id().to_string();
+    drop(w);
+    let l = s.ledger();
+    // Turn 1's receipt and row, a compaction summary between turns, turn 2's row.
+    l.record_receipt(
+        &id,
+        &project,
+        &root,
+        &receipt(1, "m/a", 1000, 100, Some(0.01), 1, [0; 4], false),
+    )
+    .unwrap();
+    for (m, usd) in [("m/a", 0.01), ("m/small", 0.004), ("m/a", 0.02)] {
+        l.record(&id, &ModelId::from(m), &usage(1000, 100, 0), Some(usd))
+            .unwrap();
+    }
+    let out = s.ok(&["receipt"]);
+    let line = |name: &str| {
+        out.lines()
+            .find(|l| l.starts_with(name))
+            .unwrap_or_else(|| panic!("no {name} line in {out}"))
+            .to_string()
+    };
+    assert!(line("cost").contains("$0.0340"), "{out}");
+    assert!(line("outside turns").contains("$0.0240"), "{out}");
+    assert!(line("tokens").contains("in 3,000"), "{out}");
+    assert_eq!(turns(&out), 2, "{out}");
+    let tree_cost = l.session_totals(&id).unwrap().usd;
+    assert!((tree_cost - 0.034).abs() < 1e-9);
 }

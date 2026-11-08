@@ -1,7 +1,8 @@
 //! `tautly compare <a> <b> [<c>…] [--json]` (spec 7.12.6): two to five sessions of this
 //! project side by side, from their logs (and the cost ledger) alone; no model or tool
-//! runs. When the sessions share a fork point the figures count from it, otherwise they
-//! cover whole sessions.
+//! runs. When the sessions share a fork point the figures count from it, otherwise each
+//! covers its own records (a branch's from its fork record). Every cost is the logged
+//! usage at the current catalog; the ledger's figure (own records only) is its own line.
 //!
 //! The text form prints one column per session (its label, or the shortest prefix of its
 //! id that tells the sessions apart): models, user turns and steps, tokens, cost, wall
@@ -79,11 +80,16 @@ pub fn run(args: Args, env: &Env) -> anyhow::Result<i32> {
         }
     };
     let fork = common_fork_point(&readers, env);
-    let cut = fork.as_ref().map(|f| f.offset);
     let summaries = readers
         .iter()
         .zip(&found)
         .map(|(r, s)| {
+            // With no shared fork point, each session's own records: a branch's copied
+            // prefix is its parent's work (cp5 review C I4).
+            let cut = match &fork {
+                Some(f) => Some(f.offset),
+                None => r.header().parent.as_ref().map(|(_, offset)| *offset),
+            };
             summarize_at(r, ledger.as_ref(), &catalog, cut)
                 .with_context(|| format!("session {}", printable(&s.id)))
         })
@@ -187,6 +193,7 @@ fn text(
         ("tokens out", row(&|s| thousands(s.tokens_out))),
         ("cache read", row(&|s| thousands(s.cache_read))),
         ("cost", row(&cost)),
+        ("ledger cost", row(&|s| usd(s.ledger_usd))),
         ("wall time", row(&|s| duration(s.wall_ms))),
         ("tool calls", row(&|s| s.tool_calls.to_string())),
         ("blocked", row(&|s| s.blocked.to_string())),
@@ -233,10 +240,17 @@ fn text(
             printable(&f.session_id),
             f.step
         )),
-        None => out.push_str("no common fork point: the figures cover whole sessions\n"),
+        None => out.push_str(
+            "no common fork point: the figures cover each session's own records (a branch's \
+             from its fork)\n",
+        ),
     }
     out.push_str(
         "files and diff count tool edits only; changes made by commands are not in the logs\n",
+    );
+    out.push_str(
+        "cost prices the logged usage at the current catalog; ledger cost is what the cost \
+         ledger recorded, at the prices of the time (own records only)\n",
     );
     if summaries.iter().any(|s| s.cost_estimated) {
         out.push_str("(est.): some usage is the engine's estimate\n");

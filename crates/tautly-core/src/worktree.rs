@@ -517,11 +517,14 @@ fn fork_log(
     let header = reader.header();
     let init = HeaderInit {
         parent: Some((header.session_id.clone(), plan.count - 1)),
+        parent_step: Some(plan.at),
         label: fork.label,
         origin: fork.origin,
         // The copied records start from the parent's first model.
         model: header.model.clone(),
-        ..HeaderInit::default()
+        // The parent's, as a fork or rewind inherits them (cp5 review C M9).
+        config_hash: header.config_hash.clone(),
+        tags: header.tags.clone(),
     };
     let mut child = SessionWriter::<SessionRecord>::create_beside(
         reader.path(),
@@ -533,11 +536,13 @@ fn fork_log(
     let model = fork.model.filter(|m| plan.cut.model.as_ref() != Some(m));
     let written = (|| {
         child.copy_from(reader.path(), plan.count)?;
-        child.append(&SessionRecord::Forked)?;
+        // Both are written for the copy, at its last record's time.
+        child.append_at_last(&SessionRecord::Forked)?;
         if plan.cut.incomplete_turn {
-            child.append(&SessionRecord::TurnEnd {
+            child.append_at_last(&SessionRecord::TurnEnd {
                 reason: crate::FinishReason::Cancelled,
                 evidence: None,
+                synthetic: true,
             })?;
         }
         for rec in &fork.tail {

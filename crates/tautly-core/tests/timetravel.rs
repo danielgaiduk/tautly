@@ -465,7 +465,12 @@ async fn state_at_with_skipped_checkpoint_is_partial() {
         tools_step(vec![bash("b2", "true")]),
         text_step("done"),
     ]);
-    let mut run = Run::start(repo.builder(&mock));
+    // A generous checkpoint time limit: one skipped under load is another partial case.
+    let patient = |mut b: EngineBuilder| {
+        b.config.checkpoints.timeout_ms = 120_000;
+        b
+    };
+    let mut run = Run::start(patient(repo.builder(&mock)));
     run.engine
         .send(Command::SendMessage {
             id: None,
@@ -491,7 +496,7 @@ async fn state_at_with_skipped_checkpoint_is_partial() {
         tools_step(vec![write("w1", "a.txt", "one\n")]),
         text_step("first"),
     ]);
-    let mut run = Run::start(repo.builder(&mock));
+    let mut run = Run::start(patient(repo.builder(&mock)));
     run.turn_with("one").await;
     let log = run.current().1;
     run.stop().await;
@@ -554,7 +559,8 @@ async fn rewind_creates_branch_and_leaves_old_log_unmodified_except_tip_checkpoi
         added[2]["data"]["backup_ref"].as_str(),
         report.backup_ref.as_deref()
     );
-    assert_eq!(added[3]["data"]["applied"], true);
+    assert_eq!(added[2]["data"]["by"], "rewind");
+    assert_eq!(added[3]["data"]["outcome"], "applied");
 
     // The branch: origin rewind, parent (old session, offset of step 3's end).
     let branch_log = run.current().1;
@@ -997,14 +1003,14 @@ async fn tree_lists_parent_step_label_origin_live_current() {
     assert_eq!(nodes[0].session_id, a);
     assert_eq!(nodes[0].parent, None);
     assert_eq!(nodes[0].origin, Origin::User);
-    assert_eq!(nodes[0].steps, 6);
+    assert_eq!(nodes[0].last_step, 6);
     assert_eq!(nodes[0].last_prompt, "two");
     assert!(!nodes[0].live && !nodes[0].current);
     assert_eq!(nodes[1].session_id, b);
     assert_eq!(nodes[1].parent, Some((a.clone(), 3)));
     assert_eq!(nodes[1].label.as_deref(), Some("try-b"));
     assert_eq!(nodes[1].origin, Origin::Rewind);
-    assert_eq!(nodes[1].steps, 3);
+    assert_eq!(nodes[1].last_step, 3);
     assert_eq!(nodes[1].last_prompt, "one");
     assert!(nodes[1].live && nodes[1].current);
 
@@ -1260,7 +1266,7 @@ async fn a_failed_branch_puts_the_files_back() {
     // The old log says how it ended.
     let last: Value = serde_json::from_str(raw_lines(&log).last().unwrap()).unwrap();
     assert_eq!(last["data"]["type"], "restore_ended", "{last}");
-    assert_eq!(last["data"]["data"]["rolled_back"], true);
+    assert_eq!(last["data"]["data"]["outcome"], "rolled_back");
     run.stop().await;
 }
 
@@ -1289,7 +1295,7 @@ async fn outside_git_an_overwrite_keeps_the_content_in_the_session_log() {
         .expect("a RestoreBegun record");
     let file = &begun["data"]["data"]["files"][0];
     assert_eq!(file["path"], "a.txt");
-    let blob = tautly_session::BlobRef::parse(file["blob"].as_str().unwrap()).unwrap();
+    let blob = tautly_session::BlobRef::parse(file["from_blob"].as_str().unwrap()).unwrap();
     assert_eq!(reader(&log).read_blob(&blob).unwrap(), b"human\n");
     // The branch's assertion records are marked as such (M5).
     let branch_log = run.current().1;
@@ -1517,7 +1523,7 @@ async fn an_ignored_file_is_kept_in_the_log_before_a_git_overwrite() {
         .unwrap();
     let file = &begun["data"]["data"]["files"][0];
     assert_eq!(file["path"], "gen.log", "{begun}");
-    let blob = tautly_session::BlobRef::parse(file["blob"].as_str().unwrap()).unwrap();
+    let blob = tautly_session::BlobRef::parse(file["from_blob"].as_str().unwrap()).unwrap();
     assert_eq!(reader(&log).read_blob(&blob).unwrap(), b"the human's\n");
     assert_eq!(begun["data"]["data"]["paths"], json!(["gen.log"]));
     run.stop().await;
@@ -1923,4 +1929,519 @@ async fn shutdown_during_the_lease_wait_returns_at_once() {
     run.stop().await;
     assert!(t0.elapsed() < Duration::from_secs(3), "{:?}", t0.elapsed());
     drop(held);
+}
+
+// ------------------------------------------- cp5 review C I1: one step numbering
+
+#[derive(Debug, Clone, Copy)]
+enum NoResponse {
+    Cancel,
+    Error,
+    Crash,
+}
+
+/// Turn one is answered (step 1 its message, 2 its text); turn two's request (logged as
+/// step 4) gets no response, `how`. The run continues on that session; its next answer is
+/// `third`.
+async fn unanswered(repo: &Repo, how: NoResponse) -> Run {
+    let second = match how {
+        NoResponse::Error => MockTurn::Error(tautly_provider::ProviderError::InvalidRequest(
+            "refused".into(),
+        )),
+        NoResponse::Cancel | NoResponse::Crash => MockTurn::Stall,
+    };
+    let mock = MockProvider::new(vec![text_step("first"), second, text_step("third")]);
+    let mut run = Run::start(repo.builder(&mock));
+    let id = run.engine.session_id().to_string();
+    run.turn_with("one").await;
+    let log = run.current().1;
+    run.engine
+        .send(Command::SendMessage {
+            id: None,
+            text: "two".into(),
+        })
+        .await
+        .unwrap();
+    if !matches!(how, NoResponse::Error) {
+        // The request stalls once sent.
+        run.until(|e| matches!(e, Event::TurnStarted)).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        run.engine.send(Command::Cancel).await.unwrap();
+    }
+    run.until(|e| matches!(e, Event::TurnFinished { .. })).await;
+    if !matches!(how, NoResponse::Crash) {
+        return run;
+    }
+    // A crash: the log ends on the request.
+    run.stop().await;
+    let lines = raw_lines(&log);
+    let request = lines
+        .iter()
+        .rposition(|l| l.contains(r#""type":"request""#))
+        .unwrap();
+    std::fs::write(&log, lines[..=request].join("\n") + "\n").unwrap();
+    Run::start(EngineBuilder {
+        resume: Some(id),
+        ..repo.builder(&MockProvider::new(vec![text_step("third")]))
+    })
+}
+
+/// Fork the current session at `at`: the branch's id, or the error.
+async fn fork_at(run: &mut Run, at: u32) -> Result<String, String> {
+    run.engine
+        .send(Command::Fork {
+            id: None,
+            at: Some(at),
+            label: None,
+        })
+        .await
+        .unwrap();
+    let seen = run
+        .until(|e| matches!(e, Event::SessionChanged { .. } | Event::Error { .. }))
+        .await;
+    match seen.last().unwrap() {
+        Event::SessionChanged { session_id, .. } => Ok(session_id.clone()),
+        Event::Error { message, .. } => Err(message.clone()),
+        _ => unreachable!(),
+    }
+}
+
+fn user_texts(rebuilt: &tautly_core::resume::Rebuilt) -> Vec<String> {
+    rebuilt
+        .context
+        .history
+        .iter()
+        .flat_map(|t| &t.messages)
+        .filter(|m| m.role == tautly_provider::Role::User)
+        .flat_map(|m| &m.content)
+        .filter_map(|c| match c {
+            tautly_provider::Content::Text(t) => Some(t.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn a_request_with_no_response_shares_its_number_with_the_next_step() {
+    for how in [NoResponse::Cancel, NoResponse::Error, NoResponse::Crash] {
+        let repo = Repo::git_repo();
+        let mut run = unanswered(&repo, how).await;
+        let (id, log) = run.current();
+        // The tip every surface shows is the one rewind and fork cut at.
+        let tip = step_at_offset(&reader(&log), u64::MAX);
+        assert_eq!(tip, 3, "{how:?}");
+        let rebuilt = rebuild(&reader(&log), Some(tip)).unwrap();
+        assert_eq!(user_texts(&rebuilt), ["one", "two"], "{how:?}");
+        assert!(rebuild(&reader(&log), Some(tip + 1)).is_err(), "{how:?}");
+        let nodes = tree::build(repo.home(), &repo.project(), None).unwrap();
+        let node = nodes.iter().find(|n| n.session_id == id).unwrap();
+        assert_eq!(node.last_step, tip, "{how:?}");
+        assert!(state_at(&reader(&log), tip).is_ok(), "{how:?}");
+
+        // The shown tip rewinds and forks.
+        let (branch, _) = run.rewind(tip, false, &[]).await.done();
+        assert!(!branch.is_empty(), "{how:?}");
+        let b = reader(&run.current().1);
+        let (_, offset) = b.header().parent.clone().unwrap();
+        assert_eq!(step_at_offset(&b, offset), tip, "{how:?}");
+        let forked = fork_at(&mut run, tip).await;
+        assert!(forked.is_ok(), "{how:?}: {forked:?}");
+
+        // The next message is step 4 on both numberings.
+        run.turn_with("three").await;
+        let log = run.current().1;
+        let r = reader(&log);
+        assert_eq!(step_at_offset(&r, u64::MAX), 5, "{how:?}");
+        assert_eq!(
+            user_texts(&rebuild(&r, Some(4)).unwrap()),
+            ["one", "two", "three"],
+            "{how:?}"
+        );
+        assert_eq!(
+            user_texts(&rebuild(&r, Some(3)).unwrap()),
+            ["one", "two"],
+            "{how:?}"
+        );
+        run.stop().await;
+    }
+}
+
+#[tokio::test]
+async fn a_request_with_no_response_mid_log_keeps_every_boundary_in_step() {
+    // Turn two's request is cancelled; turn three is answered. Every boundary rebuilds and
+    // restores at the step the counters agree on.
+    let repo = Repo::git_repo();
+    let mut run = unanswered(&repo, NoResponse::Cancel).await;
+    run.turn_with("three").await;
+    let log = run.current().1;
+    run.stop().await;
+    let r = reader(&log);
+    let mut at_start = BTreeMap::new();
+    for rec in r.records() {
+        let (at, rec) = rec.unwrap();
+        if let SessionRecord::TurnStart { text, .. } = rec {
+            at_start.insert(text, step_at_offset(&r, at));
+        }
+    }
+    assert_eq!(at_start["two"], 3);
+    assert_eq!(at_start["three"], 4);
+    assert_eq!(step_at_offset(&r, u64::MAX), 5);
+    for at in 0..=5 {
+        let s = state_at(&r, at);
+        assert!(s.is_ok(), "state_at({at}): {s:?}");
+        let texts = user_texts(&rebuild(&r, Some(at)).unwrap());
+        let expected: &[&str] = match at {
+            0 => &[],
+            1 | 2 => &["one"],
+            3 => &["one", "two"],
+            _ => &["one", "two", "three"],
+        };
+        assert_eq!(texts, expected, "rebuild({at})");
+    }
+}
+
+// ------------------------------------------- cp5 review C I2: unreadable payloads
+
+#[tokio::test]
+async fn a_log_holding_a_null_replay_speed_resumes_forks_rewinds_and_compares() {
+    let repo = Repo::git_repo();
+    let mock = MockProvider::new(vec![
+        tools_step(vec![write("w1", "a.txt", "one\n")]),
+        text_step("first"),
+    ]);
+    let mut run = Run::start(repo.builder(&mock));
+    let id = run.engine.session_id().to_string();
+    run.turn_with("one").await;
+    let log = run.current().1;
+    run.stop().await;
+    // What a build before the freeze logged for `replay {speed: 1e39}`.
+    let mut line: Value = serde_json::from_str(raw_lines(&log).last().unwrap()).unwrap();
+    line["data"] = json!({"type": "command", "data": {"type": "replay", "session_id": null,
+        "speed": null, "from_step": null}});
+    line["offset"] = json!(line["offset"].as_u64().unwrap() + 1);
+    let mut text = std::fs::read_to_string(&log).unwrap();
+    text.push_str(&format!("{line}\n"));
+    std::fs::write(&log, text).unwrap();
+
+    let mut run = Run::start(EngineBuilder {
+        resume: Some(id),
+        ..repo.builder(&MockProvider::new(vec![
+            tools_step(vec![write("w2", "a.txt", "two\n")]),
+            text_step("second"),
+        ]))
+    });
+    run.engine
+        .send(Command::SendMessage {
+            id: None,
+            text: "two".into(),
+        })
+        .await
+        .unwrap();
+    let evs = run.until(|e| matches!(e, Event::TurnFinished { .. })).await;
+    assert_eq!(repo.read("a.txt").as_deref(), Some("two\n"), "{evs:#?}");
+    let (_, report) = run.rewind(3, false, &[]).await.done();
+    assert!(report.applied, "{report:?}");
+    assert_eq!(repo.read("a.txt").as_deref(), Some("one\n"));
+    let forked = fork_at(&mut run, 2).await;
+    assert!(forked.is_ok(), "{forked:?}");
+    run.stop().await;
+    let s =
+        tautly_core::compare::summarize_at(&reader(&log), None, &Catalog::default(), None).unwrap();
+    assert_eq!(s.user_turns, 2);
+}
+
+// ------------------------------------------- cp5 review C M2: synthetic turn ends
+
+/// Each record line's `(type, t, data)`.
+fn typed_lines(path: &Path) -> Vec<(String, u64, Value)> {
+    raw_lines(path)[1..]
+        .iter()
+        .map(|l| {
+            let v: Value = serde_json::from_str(l).unwrap();
+            let ty = v["data"]["type"].as_str().unwrap().to_string();
+            (ty, v["t"].as_u64().unwrap(), v["data"]["data"].clone())
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn synthetic_turn_ends_are_marked_and_stamped_at_the_last_record() {
+    let repo = Repo::git_repo();
+    let mut run = unanswered(&repo, NoResponse::Crash).await;
+    let log = run.current().1;
+    // Answered once the resume (which closes the crashed turn) is done.
+    run.rewind(3, true, &[]).await.done();
+    let lines = typed_lines(&log);
+    let end = lines
+        .iter()
+        .position(|(ty, _, d)| ty == "turn_end" && d["synthetic"] == true)
+        .expect("the crashed turn's end");
+    assert_eq!(lines[end].2["reason"], "error");
+    assert_eq!(lines[end].0, "turn_end");
+    assert_eq!(lines[end - 1].0, "request", "{lines:?}");
+    assert_eq!(lines[end].1, lines[end - 1].1, "stamped at the last record");
+    // Real turn ends are not marked.
+    assert!(
+        lines[..end]
+            .iter()
+            .any(|(ty, _, d)| ty == "turn_end" && d.get("synthetic").is_none())
+    );
+
+    // A branch cut inside a turn: `Forked` and the closing end, at the copy's last time.
+    run.rewind(3, false, &[]).await.done();
+    let branch = typed_lines(&run.current().1);
+    let forked = branch.iter().position(|(ty, _, _)| ty == "forked").unwrap();
+    let (ty, t, d) = &branch[forked + 1];
+    assert_eq!(
+        (ty.as_str(), &d["reason"], &d["synthetic"]),
+        ("turn_end", &json!("cancelled"), &json!(true))
+    );
+    assert_eq!(*t, branch[forked - 1].1);
+    assert_eq!(branch[forked].1, branch[forked - 1].1);
+    run.stop().await;
+}
+
+// ------------------------------------- cp5 review C M7, M9: branch edges and headers
+
+#[tokio::test]
+async fn fork_at_zero_accepts_what_rewind_zero_accepts_and_headers_name_the_step() {
+    let repo = Repo::git_repo();
+    let mock = two_turns();
+    let mut run = run_two_turns(&repo, &mock).await;
+    run.rewind(4, false, &[]).await.done();
+    let b = reader(&run.current().1);
+    assert_eq!(b.header().parent_step, Some(4));
+    // From that branch, whose copy holds nothing kept before step 1 (review probe p9).
+    let forked = fork_at(&mut run, 0).await;
+    assert!(forked.is_ok(), "{forked:?}");
+    let f = reader(&run.current().1);
+    let (_, offset) = f.header().parent.clone().unwrap();
+    assert_eq!(f.header().parent_step, Some(0));
+    assert_eq!(step_at_offset(&f, offset), 0);
+    // A fork at the tip names it.
+    run.turn_with("again").await;
+    run.engine
+        .send(Command::Fork {
+            id: None,
+            at: None,
+            label: None,
+        })
+        .await
+        .unwrap();
+    run.until(|e| matches!(e, Event::SessionChanged { .. }))
+        .await;
+    let tip = reader(&run.current().1);
+    let (parent, offset) = tip.header().parent.clone().unwrap();
+    let parent_log = logs(repo.home())
+        .into_iter()
+        .find(|p| reader(p).header().session_id == parent)
+        .unwrap();
+    let parent_tip = step_at_offset(&reader(&parent_log), u64::MAX);
+    assert_eq!(tip.header().parent_step, Some(parent_tip));
+    assert_eq!(step_at_offset(&tip, offset), parent_tip);
+    let nodes = tree::build(repo.home(), &repo.project(), None).unwrap();
+    let node = nodes
+        .iter()
+        .find(|n| n.session_id == tip.header().session_id)
+        .unwrap();
+    assert_eq!(node.parent, Some((parent, parent_tip)));
+    run.stop().await;
+}
+
+// ------------------------------------------------ cp5 review C M6: large tool inputs
+
+#[tokio::test]
+async fn a_large_tool_input_is_one_blob_both_records_name_and_every_reader_resolves() {
+    let repo = Repo::git_repo();
+    let big = "x".repeat(10_000) + "\n";
+    let small = "small\n";
+    let mock = MockProvider::new(vec![
+        tools_step(vec![
+            write("w1", "big.txt", &big),
+            write("w2", "s.txt", small),
+        ]),
+        text_step("done"),
+    ]);
+    let mut run = Run::start(repo.builder(&mock));
+    run.turn_with("write").await;
+    let log = run.current().1;
+    let lines = typed_lines(&log);
+    let event = lines
+        .iter()
+        .find(|(ty, _, d)| ty == "provider" && d["tool_call"]["id"] == "w1")
+        .map(|(_, _, d)| d["tool_call"].clone())
+        .unwrap();
+    let call = lines
+        .iter()
+        .find(|(ty, _, d)| ty == "tool_call" && d["id"] == "w1")
+        .map(|(_, _, d)| d.clone())
+        .unwrap();
+    // One blob: the exact input text, named by both.
+    let blob = event["input_blob"]
+        .as_str()
+        .expect("the event names a blob");
+    assert_eq!(event["input_json"], "");
+    assert_eq!(call["args_blob"], blob);
+    assert_eq!(call["args"], Value::Null);
+    let r = reader(&log);
+    let bytes = r
+        .read_blob(&tautly_session::BlobRef::parse(blob).unwrap())
+        .unwrap();
+    let input = serde_json::to_string(&json!({ "path": "big.txt", "content": big })).unwrap();
+    assert_eq!(bytes, input.as_bytes());
+    // A small input stays inline.
+    let small_event = lines
+        .iter()
+        .find(|(ty, _, d)| ty == "provider" && d["tool_call"]["id"] == "w2")
+        .map(|(_, _, d)| d["tool_call"].clone())
+        .unwrap();
+    assert!(small_event.get("input_blob").is_none());
+    assert!(
+        small_event["input_json"]
+            .as_str()
+            .unwrap()
+            .contains("s.txt")
+    );
+
+    // Rebuild resolves it: the history holds the call's input.
+    let rebuilt = rebuild(&r, None).unwrap();
+    let used = rebuilt
+        .context
+        .history
+        .iter()
+        .flat_map(|t| &t.messages)
+        .flat_map(|m| &m.content)
+        .find_map(|c| match c {
+            tautly_provider::Content::ToolUse { id, input, .. } if id == "w1" => {
+                Some(input.clone())
+            }
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(used["content"], big);
+    // Replay resolves it.
+    let proposed = tautly_core::replay::events(&r, None)
+        .find_map(|(_, _, ev)| match ev {
+            Event::ToolCallProposed { call_id, args, .. } if call_id == "w1" => Some(args),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(proposed["content"], big);
+    // A branch shares the blob rather than copying the input.
+    run.rewind(3, false, &[]).await.done();
+    let branch = std::fs::read_to_string(run.current().1).unwrap();
+    assert!(!branch.contains(&big[..5000]));
+    assert!(branch.contains(blob));
+    run.stop().await;
+}
+
+// ------------------------------------------- cp5 FMT re-review N1: unreadable records
+
+/// `log` with the checkpoint whose `point` is `which` given a newer `point` shape this
+/// version cannot read; the rewritten log's path.
+fn with_unreadable_checkpoint(log: &Path, which: &str) -> PathBuf {
+    let text = std::fs::read_to_string(log).unwrap();
+    let mut lines = text.lines();
+    let mut out = vec![lines.next().unwrap().to_string()];
+    for l in lines {
+        let mut v: Value = serde_json::from_str(l).unwrap();
+        if v["data"]["type"] == "checkpoint" && v["data"]["data"]["point"] == which {
+            v["data"]["data"]["point"] = json!({ "from_the_future": which });
+        }
+        out.push(v.to_string());
+    }
+    let rewritten = log.with_extension(format!("{which}-unreadable.jsonl"));
+    std::fs::write(&rewritten, out.join("\n") + "\n").unwrap();
+    rewritten
+}
+
+#[tokio::test]
+async fn a_record_this_version_cannot_read_makes_the_states_across_it_partial() {
+    // Steps: 1 user, 2 write a=one, 3 a command that creates c.txt (after its before_exec
+    // checkpoint), 4 text.
+    let repo = Repo::git_repo();
+    let mock = MockProvider::new(vec![
+        tools_step(vec![write("w1", "a.txt", "one\n")]),
+        tools_step(vec![bash("b1", "printf 'x\\n' > c.txt")]),
+        text_step("done"),
+    ]);
+    let mut run = Run::start(repo.builder(&mock));
+    run.turn_with("go").await;
+    let log = run.current().1;
+    run.stop().await;
+    let exact = state_at(&reader(&log), 2).unwrap();
+    assert_eq!(exact.partial, None, "{exact:?}");
+
+    // The reviewer's probe: the before_exec checkpoint reads as Unreadable; the next
+    // checkpoint (after the command) must not be taken as exact for step 2.
+    let probe = with_unreadable_checkpoint(&log, "before_exec");
+    let r = reader(&probe);
+    assert!(
+        records(&probe)
+            .iter()
+            .any(|rec| matches!(rec, SessionRecord::Unreadable))
+    );
+    let s = state_at(&r, 2).unwrap();
+    assert_ne!(s.base, exact.base);
+    assert!(
+        s.partial
+            .as_deref()
+            .is_some_and(|p| p.contains("newer version")),
+        "{s:?}"
+    );
+
+    // After the expected tip's base: the tip is partial too.
+    let probe = with_unreadable_checkpoint(&log, "turn_end");
+    let tip = expected_tip(&reader(&probe)).unwrap();
+    assert!(
+        tip.partial
+            .as_deref()
+            .is_some_and(|p| p.contains("newer version")),
+        "{tip:?}"
+    );
+    assert!(expected_tip(&reader(&log)).unwrap().partial.is_none());
+}
+
+#[tokio::test]
+async fn a_switch_closes_the_targets_cut_turn_before_it_writes_there() {
+    // cp5 FMT re-review N3: the synthetic end is stamped at the target's last record and
+    // precedes the switch's own records, so compare's wall time leaves the downtime out.
+    let repo = Repo::git_repo();
+    let mut run = Run::start(repo.builder(&MockProvider::new(vec![text_step("one")])));
+    let target = run.engine.session_id().to_string();
+    run.turn_with("one").await;
+    let log = run.current().1;
+    run.stop().await;
+    // A crash inside the next turn: the log ends on its `TurnStart`.
+    let mut line: Value = serde_json::from_str(raw_lines(&log).last().unwrap()).unwrap();
+    line["offset"] = json!(line["offset"].as_u64().unwrap() + 1);
+    line["data"] = json!({"type": "turn_start", "data": {"turn": 2, "text": "two"}});
+    let mut text = std::fs::read_to_string(&log).unwrap();
+    text.push_str(&format!("{line}\n"));
+    std::fs::write(&log, text).unwrap();
+    let start_t = line["t"].as_u64().unwrap();
+
+    let mut run = Run::start(repo.builder(&MockProvider::new(vec![text_step("other")])));
+    run.turn_with("elsewhere").await;
+    // Time no session of the target ran.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    run.switch(&target, &[]).await.done();
+    run.stop().await;
+    let lines = typed_lines(&log);
+    let started = lines
+        .iter()
+        .rposition(|(ty, _, d)| ty == "turn_start" && d["turn"] == 2)
+        .unwrap();
+    let (ty, t, d) = &lines[started + 1];
+    assert_eq!(ty, "turn_end", "{lines:?}");
+    assert_eq!(d["synthetic"], true);
+    assert_eq!(*t, start_t);
+    let synthetic = lines
+        .iter()
+        .filter(|(ty, _, d)| ty == "turn_end" && d["synthetic"] == true)
+        .count();
+    assert_eq!(synthetic, 1);
+    let s =
+        tautly_core::compare::summarize_at(&reader(&log), None, &Catalog::default(), None).unwrap();
+    assert!(s.wall_ms < 1500, "{}", s.wall_ms);
 }

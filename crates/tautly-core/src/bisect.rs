@@ -359,7 +359,7 @@ pub fn plan(
     };
     let (mut lo, mut hi) = (lo0, hi0);
     let (mut good_from, mut bad_from) = (given(good), given(bad));
-    if let Some((g, b)) = prepass_in(walked.records(), test) {
+    if let Some((g, b)) = prepass_in(reader, walked.records(), test) {
         if good.is_none() && g > lo && g < hi && exact.contains_key(&g) {
             lo = g;
             good_from = Endpoint::Logged;
@@ -423,17 +423,21 @@ pub fn prepass(reader: &SessionReader<SessionRecord>, test: &str) -> Option<(u32
         };
         recs.push(rec);
     }
-    prepass_in(&recs, test)
+    prepass_in(reader, &recs, test)
 }
 
-fn prepass_in(recs: &[(u64, SessionRecord)], test: &str) -> Option<(u32, u32)> {
+fn prepass_in(
+    reader: &SessionReader<SessionRecord>,
+    recs: &[(u64, SessionRecord)],
+    test: &str,
+) -> Option<(u32, u32)> {
     let test = normalize(test);
     let mut steps = StepCounter::default();
     let mut by_step: BTreeMap<u32, StepRuns> = BTreeMap::new();
     // Each call's step, and whether it is a run of the command.
     let mut calls: HashMap<&str, (u32, bool)> = HashMap::new();
     for (_, rec) in recs {
-        let before = steps.last;
+        let before = steps.last();
         let owner = steps.see(rec);
         match rec {
             SessionRecord::Request { step, .. } => {
@@ -442,8 +446,15 @@ fn prepass_in(recs: &[(u64, SessionRecord)], test: &str) -> Option<(u32, u32)> {
                     ..StepRuns::default()
                 });
             }
-            SessionRecord::ToolCall { id, name, args } => {
+            SessionRecord::ToolCall {
+                id,
+                name,
+                args,
+                args_blob,
+            } => {
                 if let Some((s, _)) = owner {
+                    // A command over 4 KiB is in a blob (cp5 FMT re-review N4).
+                    let args = crate::record::tool_args(reader, args, args_blob.as_ref());
                     let matches = name == "bash"
                         && args
                             .get("command")
@@ -479,7 +490,7 @@ fn prepass_in(recs: &[(u64, SessionRecord)], test: &str) -> Option<(u32, u32)> {
                 }
             }
             SessionRecord::WritesLost { .. } => {
-                if let Some(runs) = by_step.get_mut(&steps.last) {
+                if let Some(runs) = by_step.get_mut(&steps.last()) {
                     runs.wrote = true;
                 }
             }
@@ -785,7 +796,13 @@ fn step_info(log: &Path, step: u32) -> Result<(Option<u32>, Vec<String>, String)
         }
         turn = Some(t);
         match rec {
-            SessionRecord::ToolCall { name, args, .. } => {
+            SessionRecord::ToolCall {
+                name,
+                args,
+                args_blob,
+                ..
+            } => {
+                let args = crate::record::tool_args(&reader, &args, args_blob.as_ref());
                 calls.push(format!("{name}: {}", target(&name, &args)));
             }
             SessionRecord::Provider(ProviderEvent::TextDelta(t)) => text.push_str(&t),

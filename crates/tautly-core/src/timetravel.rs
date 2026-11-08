@@ -51,6 +51,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use tautly_provider::ProviderEvent;
 use tautly_sandbox::SandboxError;
 use tautly_session::{
     BlobRef, ConfineError, HeaderInit, Origin, RelPath, SessionReader, SessionWriter,
@@ -63,16 +64,20 @@ use self::materialize::{fail, materialize_inner};
 use crate::checkpoint::{CheckpointError, Checkpointer, Point, Skip};
 use crate::lease::{ExclusiveGuard, LeaseError};
 use crate::protocol::{ErrorKind, Event, FinishReason};
-use crate::record::{CheckpointPoint, SessionRecord};
+use crate::record::{CheckpointPoint, RestoreBy, RestoreOutcome, SessionRecord};
 use crate::resume::{Continue, Rebuilt, ResumeError, branch, discard, rebuild, rebuild_with};
 use crate::session::Session;
-use crate::turn::TurnControl;
+use crate::turn::{Response, TurnControl};
 use crate::undo::{LiveLog, UndoError, UndoLog};
 
 /// The note of a state with no checkpoint after its boundary.
 const NOTE_NO_CHECKPOINT: &str = "only tool edits are restored; command effects are not \
      (no checkpoint follows that step: outside git, checkpoints off, or the session stopped \
      mid-turn)";
+
+/// The note of a state across a record this version cannot read (cp5 FMT re-review N1).
+const NOTE_UNREADABLE: &str = "a record written by a newer version of tautly, which this one \
+     cannot read, lies between; it may have changed files";
 
 /// The files of a session at some point: the tree of checkpoint commit `base` with
 /// `overlay` applied (each path's content as a blob of the log's store; none: absent).
@@ -212,11 +217,20 @@ impl From<Skip> for TtError {
 /// Steps as the context turn counter numbers them (spec 7.12.1): a user message is the
 /// step after the last one, a provider step is its `Request`'s. A step's records are its
 /// `Request`, `Provider`, `ToolCall`, `ToolResult` and `Edit` records, and a user
-/// message's `TurnStart`.
+/// message's `TurnStart`. A request uses up its number only once its response puts
+/// something into the history ([`Response::answered`], the rule rebuild and the live loop
+/// follow): one with no response (cancelled, failed, cut off by a crash) shares its number
+/// with the step after it. The one numbering of tree, `state_at`, `step_at_offset`,
+/// replay, compare, bisect, rewind and fork.
 #[derive(Default)]
 pub(crate) struct StepCounter {
-    pub last: u32,
+    /// The last step that used up its number.
+    done: u32,
     open: Option<(u32, u32)>,
+    /// The open step's response so far.
+    resp: Response,
+    /// The open step logged a `ToolCall`.
+    called: bool,
 }
 
 impl StepCounter {
@@ -224,26 +238,114 @@ impl StepCounter {
     pub fn see(&mut self, rec: &SessionRecord) -> Option<(u32, u32)> {
         match rec {
             SessionRecord::TurnStart { turn, .. } => {
-                self.last = self.last.saturating_add(1);
-                self.open = None;
-                Some((self.last, *turn))
+                self.close();
+                self.done = self.done.saturating_add(1);
+                Some((self.done, *turn))
             }
             SessionRecord::Request { step, turn, .. } => {
-                self.last = *step;
+                self.close();
                 self.open = Some((*step, *turn));
                 self.open
             }
             SessionRecord::TurnEnd { .. } => {
-                self.open = None;
+                self.close();
                 None
             }
-            SessionRecord::Provider(_)
-            | SessionRecord::ToolCall { .. }
-            | SessionRecord::ToolResult { .. }
-            | SessionRecord::Edit { .. } => self.open,
+            SessionRecord::Provider(ev) => {
+                if self.open.is_some()
+                    && let Some(ev) = slim_event(ev)
+                {
+                    self.resp.push(ev);
+                }
+                self.open
+            }
+            // Logged only for a response whose calls entered the history.
+            SessionRecord::ToolCall { .. } => {
+                self.called |= self.open.is_some();
+                self.open
+            }
+            SessionRecord::ToolResult { .. } | SessionRecord::Edit { .. } => self.open,
             _ => None,
         }
     }
+
+    /// The last step so far: the open one once its response is answered.
+    pub fn last(&self) -> u32 {
+        match self.open {
+            Some((step, _)) if self.called || self.resp.answered() => step,
+            _ => self.done,
+        }
+    }
+
+    fn close(&mut self) {
+        self.done = self.last();
+        self.open = None;
+        self.called = false;
+        self.resp = Response::default();
+    }
+}
+
+/// `ev` as far as step numbering needs it: content events emptied (their kind and count
+/// decide whether a response is answered), `Done` kept (a cut-off reasoning item is
+/// dropped), usage and the rest left out.
+fn slim_event(ev: &ProviderEvent) -> Option<ProviderEvent> {
+    Some(match ev {
+        ProviderEvent::TextDelta(_) => ProviderEvent::TextDelta(String::new()),
+        ProviderEvent::ReasoningDelta(_) => ProviderEvent::ReasoningDelta(String::new()),
+        ProviderEvent::ReasoningSignature(_) => ProviderEvent::ReasoningSignature(String::new()),
+        ProviderEvent::RedactedReasoning(_) => ProviderEvent::RedactedReasoning(String::new()),
+        ProviderEvent::ToolCall { id, name, .. } => ProviderEvent::ToolCall {
+            id: id.clone(),
+            name: name.clone(),
+            input_json: String::new(),
+        },
+        ProviderEvent::Done { stop } => ProviderEvent::Done { stop: stop.clone() },
+        _ => return None,
+    })
+}
+
+/// A record as [`Boundaries`] keeps it: what `state_at` and the bisect pre-pass read, with
+/// the bulk (provider text, other tools' arguments, prompts) left out, so a walk does not
+/// hold the log (cp5 review C M7). None: not needed.
+fn slim(rec: SessionRecord) -> Option<SessionRecord> {
+    Some(match rec {
+        // Every one is kept: a step's last record decides its boundary.
+        SessionRecord::Provider(ev) => {
+            SessionRecord::Provider(slim_event(&ev).unwrap_or(ProviderEvent::Unknown))
+        }
+        SessionRecord::ToolCall {
+            id,
+            name,
+            args,
+            args_blob,
+        } => {
+            let (args, args_blob) = match name.as_str() {
+                "bash" => (args, args_blob),
+                _ => (serde_json::Value::Null, None),
+            };
+            SessionRecord::ToolCall {
+                id,
+                name,
+                args,
+                args_blob,
+            }
+        }
+        SessionRecord::TurnStart { turn, .. } => SessionRecord::TurnStart {
+            turn,
+            text: String::new(),
+        },
+        rec @ (SessionRecord::Request { .. }
+        | SessionRecord::ToolResult { .. }
+        | SessionRecord::Edit { .. }
+        | SessionRecord::Undone { .. }
+        | SessionRecord::WritesLost { .. }
+        | SessionRecord::TurnEnd { .. }
+        | SessionRecord::Checkpoint { .. }
+        | SessionRecord::CheckpointSkipped { .. }
+        // It may have changed files: the states across it are partial.
+        | SessionRecord::Unreadable) => rec,
+        _ => return None,
+    })
 }
 
 /// A log's records with their offsets and the step each belongs to.
@@ -259,13 +361,16 @@ fn walk(reader: &SessionReader<SessionRecord>) -> Result<Walked, TtError> {
     let mut owner = Vec::new();
     for rec in reader.records() {
         let (at, rec) = rec?;
-        owner.push(steps.see(&rec));
-        recs.push((at, rec));
+        let o = steps.see(&rec);
+        if let Some(rec) = slim(rec) {
+            owner.push(o);
+            recs.push((at, rec));
+        }
     }
     Ok(Walked {
         recs,
         owner,
-        last_step: steps.last,
+        last_step: steps.last(),
     })
 }
 
@@ -285,7 +390,7 @@ pub fn step_at_offset(reader: &SessionReader<SessionRecord>, offset: u64) -> u32
         }
         steps.see(&rec);
     }
-    steps.last
+    steps.last()
 }
 
 /// Values in log order, each path's earliest kept.
@@ -394,12 +499,13 @@ fn state_in(b: &Boundaries, at: u32, later: bool) -> Result<FileState, TtError> 
     };
     let turn_end_seen = turn.is_some_and(|t| b.first_turn_end.get(&t).is_some_and(|&i| i < start));
     let mut reverts = Vec::new();
-    let (mut skipped, mut lost) = (false, false);
+    let (mut skipped, mut lost, mut unreadable) = (false, false, false);
     let mut chosen = None;
     for (i, (_, rec)) in w.recs.iter().enumerate().skip(start) {
         match rec {
             SessionRecord::CheckpointSkipped { .. } => skipped = true,
             SessionRecord::WritesLost { .. } => lost = true,
+            SessionRecord::Unreadable => unreadable = true,
             SessionRecord::Checkpoint { .. } => {
                 chosen = Some(i);
                 break;
@@ -409,7 +515,12 @@ fn state_in(b: &Boundaries, at: u32, later: bool) -> Result<FileState, TtError> 
     }
     state.overlay = earliest(reverts);
     let Some(i) = chosen else {
-        state.partial = Some(NOTE_NO_CHECKPOINT.to_string());
+        let mut note = NOTE_NO_CHECKPOINT.to_string();
+        if unreadable {
+            note.push_str("; ");
+            note.push_str(NOTE_UNREADABLE);
+        }
+        state.partial = Some(note);
         return Ok(state);
     };
     let SessionRecord::Checkpoint { commit, point, .. } = &w.recs[i].1 else {
@@ -426,6 +537,9 @@ fn state_in(b: &Boundaries, at: u32, later: bool) -> Result<FileState, TtError> 
         notes.push(format!(
             "writes of unknown outcome happened after step {at}"
         ));
+    }
+    if unreadable {
+        notes.push(NOTE_UNREADABLE.to_string());
     }
     match point {
         Some(CheckpointPoint::ResumeStart | CheckpointPoint::BeforeRestore) => {
@@ -532,14 +646,21 @@ pub(crate) fn ran_command(rec: &SessionRecord) -> bool {
 /// compared with the checkpoint's) and makes the state partial. Also gathers what
 /// [`materialize`] needs to tell human changes apart. Blocking I/O (the log).
 pub fn expected_tip(reader: &SessionReader<SessionRecord>) -> Result<FileState, TtError> {
-    let recs: Vec<(u64, SessionRecord)> = reader.records().collect::<Result<_, _>>()?;
     let mut state = FileState::new(reader.path());
-    let base_at = recs.iter().rposition(|(_, r)| {
-        matches!(r, SessionRecord::Checkpoint { point, .. }
-            if *point != Some(CheckpointPoint::BeforeRestore))
-    });
+    // Two passes over the log rather than holding it (cp5 review C M7): the base first.
+    let mut base: Option<(u64, String)> = None;
+    for rec in reader.records() {
+        if let (offset, SessionRecord::Checkpoint { commit, point, .. }) = rec?
+            && point != Some(CheckpointPoint::BeforeRestore)
+        {
+            base = Some((offset, commit));
+        }
+    }
+    let base_at = base.as_ref().map(|(offset, _)| *offset);
     let mut overlay: BTreeMap<RelPath, Option<BlobRef>> = BTreeMap::new();
     let mut unknown = std::collections::BTreeSet::new();
+    // A record this version cannot read follows the base (N1).
+    let mut unreadable = false;
     let mut written: BTreeMap<RelPath, Option<BlobRef>> = BTreeMap::new();
     let mut writes = Writes::default();
     // The pairs: the last checkpoint, what was written since, whether a command ran.
@@ -551,7 +672,9 @@ pub fn expected_tip(reader: &SessionReader<SessionRecord>) -> Result<FileState, 
     // pair counts whatever commands ran in it (Task 49 N1).
     let mut cut = false;
     let mut end_checkpointed = false;
-    for (i, (offset, rec)) in recs.iter().enumerate() {
+    for rec in reader.records() {
+        let (offset, rec) = rec?;
+        let (offset, rec) = (&offset, &rec);
         match rec {
             SessionRecord::Checkpoint {
                 point: Some(CheckpointPoint::TurnEnd),
@@ -587,6 +710,8 @@ pub fn expected_tip(reader: &SessionReader<SessionRecord>) -> Result<FileState, 
             cut = false;
             continue;
         }
+        unreadable |=
+            matches!(rec, SessionRecord::Unreadable) && base_at.is_none_or(|b| *offset > b);
         command |= ran_command(rec);
         for (path, value) in writes.see(rec) {
             between.insert(path.clone(), value.clone());
@@ -598,7 +723,7 @@ pub fn expected_tip(reader: &SessionReader<SessionRecord>) -> Result<FileState, 
                     written.remove(&path);
                 }
             }
-            if base_at.is_none_or(|b| i > b) {
+            if base_at.is_none_or(|b| *offset > b) {
                 match value {
                     Some(v) => {
                         overlay.insert(path.clone(), v);
@@ -612,19 +737,21 @@ pub fn expected_tip(reader: &SessionReader<SessionRecord>) -> Result<FileState, 
             }
         }
     }
-    state.base = base_at.map(|i| match &recs[i].1 {
-        SessionRecord::Checkpoint { commit, .. } => commit.clone(),
-        _ => unreachable!("found as a checkpoint"),
-    });
+    state.base = base.map(|(_, commit)| commit);
     state.overlay = overlay.into_iter().collect();
     state.written = written.into_iter().collect();
-    state.partial = (!unknown.is_empty()).then(|| {
+    let mut notes = Vec::new();
+    if !unknown.is_empty() {
         let names: Vec<&str> = unknown.iter().map(RelPath::as_str).collect();
-        format!(
+        notes.push(format!(
             "the content a tool left in {} was not captured",
             names.join(", ")
-        )
-    });
+        ));
+    }
+    if unreadable {
+        notes.push(NOTE_UNREADABLE.to_string());
+    }
+    state.partial = (!notes.is_empty()).then(|| notes.join("; "));
     Ok(state)
 }
 
@@ -755,6 +882,19 @@ async fn branch_tip(
     Ok(made.into_iter().collect())
 }
 
+/// The log ends after a `TurnStart` with no `TurnEnd` (a crash mid-turn).
+fn ends_inside_a_turn(reader: &SessionReader<SessionRecord>) -> Result<bool, TtError> {
+    let mut open = false;
+    for rec in reader.records() {
+        match rec?.1 {
+            SessionRecord::TurnStart { .. } => open = true,
+            SessionRecord::TurnEnd { .. } => open = false,
+            _ => {}
+        }
+    }
+    Ok(open)
+}
+
 /// The highest checkpoint number, the user turn and the step a log ends on.
 fn log_tip(reader: &SessionReader<SessionRecord>) -> Result<(u32, u32, u32), TtError> {
     let (mut n, mut turn) = (0, 0);
@@ -768,7 +908,7 @@ fn log_tip(reader: &SessionReader<SessionRecord>) -> Result<(u32, u32, u32), TtE
         }
         steps.see(&rec);
     }
-    Ok((n, turn, steps.last))
+    Ok((n, turn, steps.last()))
 }
 
 /// What a rewind or switch made: the report, and when applied the log the session
@@ -958,7 +1098,7 @@ impl Session {
                     &expected,
                     &overwrite,
                     dry_run,
-                    Some(&mut live as &mut dyn UndoLog),
+                    Some((&mut live as &mut dyn UndoLog, RestoreBy::Rewind)),
                 )
                 .await?;
                 let materialize::Applied {
@@ -973,6 +1113,7 @@ impl Session {
                         branch_tip(cp.as_deref(), &reader, &target, &expected, at, &cut).await?;
                     let init = HeaderInit {
                         parent: Some((parent_id, count - 1)),
+                        parent_step: Some(at),
                         model: reader.header().model.clone(),
                         ..init
                     };
@@ -1086,6 +1227,19 @@ impl Session {
                 let mut cp = guard.as_deref_mut().map(|g| &mut g.cp);
                 let mut writer = opened;
                 let there = SessionReader::<SessionRecord>::open(&found)?;
+                // A session that stopped mid-turn gets its missing `TurnEnd`, as on resume,
+                // before the switch writes anything there: stamped at its last record, so
+                // the time no session ran is not the turn's (cp5 FMT re-review N3).
+                if let Some(w) = writer.as_mut()
+                    && ends_inside_a_turn(&there)?
+                {
+                    w.append_at_last(&SessionRecord::TurnEnd {
+                        reason: FinishReason::Error,
+                        evidence: None,
+                        synthetic: true,
+                    })?;
+                    w.checkpoint()?;
+                }
                 let here = SessionReader::<SessionRecord>::open(&current)?;
                 let target = expected_tip(&there)?;
                 let expected = expected_tip(&here)?;
@@ -1102,7 +1256,7 @@ impl Session {
                     &expected,
                     &overwrite,
                     dry_run,
-                    Some(&mut both as &mut dyn UndoLog),
+                    Some((&mut both as &mut dyn UndoLog, RestoreBy::Switch)),
                 )
                 .await?;
                 let materialize::Applied {
@@ -1132,15 +1286,6 @@ impl Session {
                     }
                     let there = SessionReader::<SessionRecord>::open(&found)?;
                     let r = rebuild_with(&there, None, Some(&calibration))?;
-                    // A session that stopped mid-turn gets its missing `TurnEnd`, as on
-                    // resume.
-                    if r.incomplete_turn {
-                        writer.append(&SessionRecord::TurnEnd {
-                            reason: FinishReason::Error,
-                            evidence: None,
-                        })?;
-                        writer.checkpoint()?;
-                    }
                     Ok::<_, TtError>(r)
                 }
                 .await;
@@ -1213,8 +1358,7 @@ fn ended(live: &mut dyn UndoLog, report: &mut MaterializeReport) {
         return;
     }
     let rec = SessionRecord::RestoreEnded {
-        applied: true,
-        rolled_back: false,
+        outcome: RestoreOutcome::Applied,
     };
     if live.record(&rec).is_err() {
         let note = "the session log could not record the restore's end";

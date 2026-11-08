@@ -1079,7 +1079,7 @@ proptest! { #[test] fn apply_then_inverse_restores(text in "[a-z\\n]{1,200}", ..
 
 ### Task 33: Performance gates in CI
 
-**Checkpoint 4 amendment (binding):** C-M5. A `ToolCall` record whose `args` JSON is over 4 KiB stores the arguments as a blob reference (`args_blob`, additive with `#[serde(default)]`; `args` is then `null`), so an edit-heavy session no longer logs every large argument twice. Readers take the arguments from the blob. The `SendMessage`/`TurnStart.text` duplication is accepted. Add a gate: a scripted session with ten 200 KB `write` calls has a log under 1.3× the sum of its post-image blobs plus 64 KiB.
+**Checkpoint 4 amendment (binding), replaced at checkpoint 5:** C-M5 is done. The checkpoint 5 format lane (cp5 review C M6) logs a tool input over 4 KiB (`INLINE_INPUT_MAX`) once, as a blob of the exact text the provider sent: the `Provider` tool call event holds `input_json: ""` and `input_blob`, and the `ToolCall` record `args: null` and `args_blob`, both naming that blob, so the log and every branch copy share it. Readers resolve either form (`record::resolved_event`, `record::tool_args`). The `SendMessage`/`TurnStart.text` duplication is accepted. Task 33 only adds the size gate: a scripted session with ten 200 KB `write` calls has its `.jsonl` plus the blobs it added, minus the post-images, under 1.3× the sum of its post-image blobs plus 64 KiB.
 
 **Checkpoint 2 amendments (binding):** Add an RSS gate for a 100k-file tree (index open + tree) and a gate that a no-op post-bash freshness check with a live watcher is cookie-based (< 50 ms), not a full refresh.
 

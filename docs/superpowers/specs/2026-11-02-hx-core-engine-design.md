@@ -306,7 +306,7 @@ Structured record: task, plan steps with status, files read/edited with content 
 - **Time-travel hooks** (user-approved 2026-11-03, schema 1, before release). Each one captures data that can never be recovered later:
   - **H1, timestamp:** every record line carries `"t": <unix ms>` in its envelope.
   - **H2, root-relative paths:** paths in records are relative to the header's `root`. On read they are re-confined under the current root: absolute paths, `..` and NUL are refused. Events keep showing paths as before.
-  - **H3, header fields:** `project`, `label?`, `origin` (`user | fork | rewind | what_if | eval | import`), `git?: {head?, dirty?}`, `tautly_version`, `model?`, `config_hash?` (blake3 of the effective config), `tags`.
+  - **H3, header fields:** `project`, `label?`, `origin` (`user | fork | rewind | what_if | eval | import`), `git?: {head?, dirty?}`, `tautly_version`, `model?`, `config_hash?` (blake3 of what the user and project configuration files set, 6.5.1), `parent_step?` (a fork's step), `tags`.
     - `git.head` is read from the `.git` files without spawning git, so start-up stays fast. `dirty` is unknown in the header.
     - The session-start `Checkpoint` record (7.11.11) carries the authoritative head, dirty state and tree.
     - A later `Labeled{label}` record renames the session (the last one wins).
@@ -325,6 +325,73 @@ Structured record: task, plan steps with status, files read/edited with content 
   - **H10, project id:** sessions and blobs are keyed by `<project-id>` (above). The header's `root` names the worktree.
   - **Checkpoint record:** `Checkpoint{n, commit, tree, head?, dirty, turn, step, point?}`, plus `CheckpointSkipped{reason, turn, step, point?}`. The single checkpoint mechanism is the git one of 7.11.11.
     - `point` (additive, CP4 fix wave; none in older logs) says where it was taken: `session_start`, `resume_start`, `before_exec` (before a command of step `step`, so inside that step), `turn_end` (the turn's last step is `step`) or `before_restore` (before a rewind or switch writes, Task 49); a value a reader does not know reads as `unknown`. The step field alone cannot place a checkpoint at a step boundary (7.12.1).
+
+#### 6.5.1 Format freeze v1 (checkpoint 5, 2026-11-08)
+The session log format is frozen for v1 as listed here. After v1 every change is additive; a reader of v1 must read every later log without calling it corrupt. Rules (cp5 review C I2, I3):
+- **Lines.** The first line is `{"type":"header", …Header}`. Every other line is `{"type":"record","offset":N,"t":<unix ms>,"data":<record>}`, with `offset` 0, 1, 2, … and `t` non-decreasing. A line of another `type` is skipped. A torn final line is skipped (and cut at reopen); any other line that is not JSON is corruption. A reader stops at the log's length when it opened it (`SessionReader::follow` reads on).
+- **Records** are adjacently tagged: `{"type":"<record type>","data":<payload>}`. A type this version does not know reads as `Unknown` and is counted in one "written by a newer version" warning. A known type whose payload this version cannot read (a newer shape, a value it never writes, such as a non-finite float written as `null`) reads as `Unreadable`, and a `command` as `Command::Unknown`. A log is never corrupt because of a payload.
+- **A record this version cannot read makes every time-travel state across it partial** (cp5 FMT re-review N1). An `Unreadable` record may have changed files (a newer `edit`, `undone`, `checkpoint` or `writes_lost` shape), so `state_at(N)` is partial when one lies between step N's last record and the chosen checkpoint, and `expected_tip` is partial when one follows its base. Bisect skips such boundaries; rewind and switch report the note. A record of a type this version does not know at all (`Unknown`) is counted in the warning only.
+- **Unit records may gain fields.** `pins_folded`, `reasoning_stripped` and `forked` are written without `data`; a `data` member is ignored.
+- **Nested enums carry a catch-all** (`unknown`, `#[serde(other)]` or a lenient reader): `Command`, `ProviderEvent`, `StopReason`, `FinishReason`, `UsageRole`, `CheckpointPoint`, `ApprovalKind`, `PinOrigin`, `MutationReason`, `BudgetScope`, `PersistedEffect`, `Shown`, `SaveKind`, `MemoryKind`, `Origin`, `Wrote`, `RestoreBy`, `RestoreOutcome`.
+- **Fields are additive.** A field added later is `#[serde(default)]`; `false` and `None` are not written (`skip_serializing_if`). No record-reachable type denies unknown fields.
+- **Renames.** The names below are final. Records written by the builds before the freeze still read: `edit.turn` reads as `step`; `BackupFile{blob, mode, wrote, wrote_mode}` as `{from_blob, from_mode, to, to_mode}`; `restore_begun.restore_backup: true` as `by: restore_backup` (absent or false: `unknown`); `restore_ended{applied, rolled_back}` as `outcome` (`applied`; else `rolled_back`; else `failed`).
+- **Step numbers** (7.12.1) are the context turn counter's: a user message is the step after the last one; a provider step is its `Request.step`, and uses up its number only when its response put something into the history. Every surface (tree, `state_at`, `step_at_offset`, replay, compare, bisect, rebuild, rewind, fork) counts with this one rule (`StepCounter`, `Response::answered`).
+
+Header (`tautly-session` `Header`):
+
+| Field | Meaning | Stability |
+|---|---|---|
+| `schema_version` | 1 | A reader refuses a larger one |
+| `session_id` | ULID | Frozen |
+| `created` | `SystemTime` (`secs_since_epoch`, `nanos_since_epoch`) | Frozen |
+| `root` | Canonical work tree root; record paths are relative to it | Frozen |
+| `parent` | `[session_id, offset]`: the parent and the offset of the last record the branch copied (inclusive) | Frozen; a JSON array, so it never grows (see `parent_step`) |
+| `project` | blake3 project id (6.5) | Default `""` |
+| `label?` | The name; a later `labeled` record wins | Default none |
+| `origin` | `user \| fork \| rewind \| what_if \| eval \| import \| unknown` | Catch-all |
+| `git?` | `{head?, dirty?}` read from the git files | Default none |
+| `tautly_version` | The writing build | Default `""` |
+| `model?` | The model the session started on | Default none |
+| `config_hash?` | blake3 hex of what the user and project configuration files (and the command line's overrides) set, merged, as canonical JSON (keys sorted). The running version's built-in values and catalog and the models file (`tautly models update`) are not part of it, so an upgrade or a catalog update leaves it alone (cp5 review C M10). Fork, rewind and worktree forks carry the parent's | Default none |
+| `tags` | Free-form | Default empty |
+| `parent_step?` | A fork's step `at` (cp5 review C M7) | Additive; none in older logs and for a root session: read the step from the copy (`step_at_offset`) |
+
+Records (the payload of `data`):
+
+| Type | Fields | Stability notes |
+|---|---|---|
+| `command` | A `Command`, internally tagged (`{"type":"send_message",…}`), as received (`Approve.session_rule` never logged) | Unknown or unreadable: `Command::Unknown`. Replayed by rebuild: `set_budget`, `pin`, `unpin` only. Replay `speed` is refused unless finite in 0..=1000 (RPC -32602, engine `Error`, CLI) |
+| `prefix_applied` | `agents_md?`, `repo_map?` (blobs), `system_prompt_hash`, `tools_hash`, `tools?` (blob) | `tools` additive |
+| `request` | `hash` (blob ref of the request's blake3; not stored), `turn`, `step`, `model`, `blocks{stable, pinned, history, tail}` | Frozen |
+| `provider` | A `ProviderEvent`: `text_delta`, `reasoning_delta`, `reasoning_signature`, `redacted_reasoning`, `tool_call{id, name, input_json, input_blob?}`, `usage` and `discarded_usage` (a `RawUsage{input, output, cache_read, cache_write}`, cumulative within a response: the last one counts), `quota{remaining_requests?, remaining_tokens?, reset_at?}`, `done{stop}` (`StopReason`, catch-all) | Catch-all. A tool input over 4 KiB is `input_json: ""` with `input_blob` (the exact text; cp5 review C M6) |
+| `charged` | `role` (`main \| side \| unknown`), `model`, `usage` (`RawUsage`), `estimated` | Frozen. Removing a `RawUsage` field would break it |
+| `tool_call` | `id`, `name`, `args` (the input as the history holds it), `args_blob?` | `args_blob` names the same blob as its `provider` event when the input is over 4 KiB (`args` is then `null`); read with `record::tool_args` |
+| `tool_result` | `id`, `result_blob`, `is_error`, `effects` (`PersistedEffect`s), `meta` (`exit_code?`, `error_kind?` (an unknown kind reads as `unknown`), `counts?{passed, failed}`, `saved?{kind, bytes}`), `ran`, `blocked` | `ran`, `blocked`, `counts`, `saved` additive; unknown effects and kinds read as `unknown` |
+| `edit` | `path`, `pre_image?`, `post_image_blob?`, `step` (alias `turn`), `asserted` | `asserted` additive, written only when true |
+| `writes_lost` | `paths`, `late` | `late` additive |
+| `undone` | `turn`, `files[{path, from_blob?, from_mode?, to?, to_mode?}]`, `backup_ref?` | Frozen |
+| `uncompacted` | `compaction`, `restored` (call ids) | Frozen |
+| `compaction` | `removed` (blobs of context turns), `summary` | Frozen |
+| `gc_applied` | `elided[[call_id, turn]]`, `reason`, `tokens_freed`, `forgotten_paths` | `reason` catch-all |
+| `memory_index_applied` | `text` | Frozen |
+| `memory_proposal` | `id`, `change{upsert?, delete}` | Kinds catch-all |
+| `memory_decision` | `id`, `approved` | Frozen |
+| `pins_folded` | — | Unit: may gain fields |
+| `start_pins` | `pins[{text, source}]` | `source` catch-all |
+| `approval_requested` | `request_id`, `kind` (`tool \| mcp_server \| memory \| unknown`), `call_id?`, `reason` | Frozen |
+| `checkpoint` | `n`, `commit`, `tree`, `head?`, `dirty`, `turn`, `step`, `point?` (`session_start \| resume_start \| before_exec \| turn_end \| before_restore \| turn_start \| restored \| unknown`) | `point` additive, catch-all; none or unknown reads as partial (7.12.1) |
+| `checkpoint_skipped` | `reason`, `turn`, `step`, `point?` | As `checkpoint` |
+| `labeled` | `label` | Frozen |
+| `restore_begun` | `backup_ref?`, `files[BackupFile{path, existed, from_blob?, from_mode?, to?: Wrote, to_mode?}]`, `paths`, `by` (`rewind \| switch \| restore_backup \| unknown`) | Renamed at the freeze (aliases above). `Wrote` is `{"blob": <ref>}`, `"absent"`, or a form a newer version wrote, read as not known |
+| `restore_ended` | `outcome` (`applied \| rolled_back \| failed \| unknown`) | Replaces the two bools (aliases above) |
+| `model_set` | `model` | Frozen |
+| `reasoning_stripped` | — | Unit: may gain fields |
+| `engine_error` | `message` | Frozen |
+| `turn_start` | `turn`, `text` | Frozen |
+| `forked` | — | Unit: may gain fields. A branch writes it after its copy, stamped with the copy's last `t` |
+| `turn_end` | `reason` (`FinishReason`, catch-all), `evidence?` (`TestEvidence{command, exit_code?, passed?, failed?, step, write_gen, stale, edits_since, execs_since}`: removing one of its fields would break), `synthetic` | `synthetic` additive (cp5 review C M2): written by a resume after a crash (`error`) or a branch whose copy ends inside a turn (`cancelled`), stamped with the log's last `t`, left out of wall time |
+
+Cost ledger (SQLite, `PRAGMA user_version` 4): table `usage` (one row per charge) and table `receipts` (one row per turn receipt: … `cost_usd` the priced part, `cost_partial` some usage was unpriced, `estimated`). A schema-4 file an earlier build made gets `cost_partial` when opened. A newer schema is refused. Receipts show the priced part and mark the rest; `tautly receipt` takes tokens and cost from the session's `usage` rows (as `/tree` and `tautly stats` do) and shows what no receipt holds (side requests between turns, turns that did not finish) as "outside turns" (cp5 review C M1).
 
 ## 7. Token efficiency and memory
 
@@ -667,7 +734,7 @@ At each directory level where `AGENTS.md` is read (root and ancestors, 6.1), a d
 Every operation here creates a new branch or a new view. None truncates a log, and none overwrites a file the user changed without explicit consent. Rationale: the 2026-11-03 research notes. Untrustworthy file rewind is the most-voiced complaint about other tools, and forks elsewhere share one mutable working tree.
 
 #### 7.12.1 Step addresses and file states
-- **Step addresses.** Steps are numbered by the single context turn counter (7.2), 1-based. User messages are context turns too, so provider steps are not consecutive (e.g. 2, 3, 5); every tool, record and CLI uses this one numbering. "At step N" means steps 1..N are kept and the next step is N+1. `at = 0` means before the first step. CLIs and the REPL show step numbers next to user turns (`tautly sessions show`, `/tree`).
+- **Step addresses.** Steps are numbered by the single context turn counter (7.2), 1-based. User messages are context turns too, so provider steps are not consecutive (e.g. 2, 3, 5); every tool, record and CLI uses this one numbering. A provider request uses up its number only when its response put something into the history: a request that got no response (cancelled while streaming, a provider error, a crash) shares its number with the step after it (cp5 review C I1). "At step N" means steps 1..N are kept and the next step is N+1. `at = 0` means before the first step. CLIs and the REPL show step numbers next to user turns (`tautly sessions show`, `/tree`).
 - **`state_at(session, N)`, the files at a step boundary.** The rule goes by log offset, never by the `step` field: a `BeforeExec` checkpoint carries the step it sits inside (taken before that step's command ran), while a `TurnEnd` or start checkpoint carries the step it follows, so neither `step >= N` nor `step > N` picks the right one.
   1. Find the last record of step N: the last of its `Request`, `Provider`, `ToolCall`, `ToolResult` and `Edit` records (a checkpoint is never a step's last record; for a user message's step, its `TurnStart`; for N = 0, the log's start).
   2. Take the first `Checkpoint` record after it.
@@ -702,7 +769,7 @@ Every operation here creates a new branch or a new view. None truncates a log, a
 #### 7.12.2 Rewind as fork
 - `Command::Rewind{at, label?, dry_run, overwrite}` (REPL `/rewind <step>`):
   1. Take a checkpoint of the current tree and append it to the current session, so its tip stays restorable.
-  2. Create a branch: a new session with `origin: rewind`, `parent: (current, offset of step at)`, the records up to that step copied verbatim, and child checkpoint refs.
+  2. Create a branch: a new session with `origin: rewind`, `parent: (current, offset of the last record copied)`, `parent_step: at`, the records up to that step copied verbatim, and child checkpoint refs.
   3. Materialize `state_at(at)` in place.
   4. Continue on the branch (`SessionChanged`). The old branch's log gets only the `Rewind` command, that tip checkpoint, and the restore's `RestoreBegun` and `RestoreEnded`; nothing in it is changed.
 - **Materializing** changes only the paths where the target state differs from `expected_tip`.
@@ -712,13 +779,13 @@ Every operation here creates a new branch or a new view. None truncates a log, a
   - Before any write, a backup snapshot is taken (`undo-<n>` ref, 7.11.11). A path the snapshot's tree does not hold (an ignored file, for example) has its bytes kept in the session log, in the `RestoreBegun` record, and a rollback restores it from there. If its bytes cannot be kept (over 64 MiB, or a link), the path is blocked. `RestoreBegun` names every path the restore writes. A switch records `RestoreBegun` and `RestoreEnded` in both sessions. The resume warning lists those paths, suggests `git diff <ref> -- <paths>` and restoring only those paths, and points at `tautly sessions restore-backup <session>` for log-kept bytes.
   - `restore-backup` never destroys a human edit:
     - After the restore finished (`RestoreEnded`), it is refused unless `--force`.
-    - Each kept file records what the restore wrote (`wrote`). A path whose disk content differs from that is a conflict, left alone unless `--overwrite <path>`.
+    - Each kept file records what the restore wrote (`to`, with `to_mode`). A path whose disk content differs from that is a conflict, left alone unless `--overwrite <path>`.
     - Before it writes, it keeps what it replaces as a `RestoreBegun` of its own, and ends with `RestoreEnded`.
     - Its writes pass the same symlinked-parent and resolve checks.
     - The CLI shows what it would do first. It asks y/N on a terminal; otherwise it needs `--yes`.
   - A blocked path's note says why it is blocked: a link or file above it, a directory in the way, or content that can be neither held nor kept. Outside git, or with checkpoints off, the engine instead keeps each overwritten file's bytes in the session's blob store, in a `RestoreBegun{backup_ref?, files}` record. When a file cannot be kept (a link, or a file over 64 MiB), the report's `backup` is none and the REPL does not promise a backup.
   - A path below a symbolic link or a file, or one where a directory is in the way, is **blocked**: it is never written, whatever `overwrite` lists, and nothing is written while any blocked path is left. Each write first checks that the path resolves to itself.
-  - The current log records the command, the tip checkpoint, then `RestoreBegun` (before the first write) and `RestoreEnded{applied, rolled_back}`. A resume warns about a `RestoreBegun` with no end, naming the backup. A failure after files were written puts them back and says whether that worked, and which snapshot holds the files from before.
+  - The current log records the command, the tip checkpoint, then `RestoreBegun` (before the first write) and `RestoreEnded{outcome}` (`applied`, `rolled_back` or `failed`). A resume warns about a `RestoreBegun` with no end, naming the backup. A failure after files were written puts them back and says whether that worked, and which snapshot holds the files from before.
   - A step that does not exist is refused before anything is logged. `at = 0` copies the records before the first step; the parent offset is the last of them.
   - The branch ends with a `restored` checkpoint of exactly the materialized files. Outside git, it ends instead with an `Edit{asserted: true}` per overlay file, which turn diffs and undo ignore. A switch appends a `restored` checkpoint to the session it switches to.
 - **The answer is `Rewound{at, branch, report}`**, where `report` is `{restored, deleted, conflicts, blocked, dry_run, applied, backup?, backup_ref?, note?}`. `blocked` lists paths that can never be written (something is in the way). `backup` is `git` or `log`, or none when nothing would be kept. The REPL first sends a dry run and shows what would be restored, deleted and in conflict. It asks y/n, and on conflicts asks separately before sending `overwrite` with the paths.
@@ -727,13 +794,13 @@ Every operation here creates a new branch or a new view. None truncates a log, a
 
 #### 7.12.3 Session tree and switching
 - **Branches are first-class.** Each session's header gives its parent `(session, record offset)` (the offset of the last record the branch copied; the step is the one in force at that record, `step_at_offset`), `label` and `origin`. `Fork{at?, label?}` (REPL `/fork [label]`) creates a conversation-only branch at step `at` (default: the tip) without touching files. `Label{label}` (`/label <name>`) renames the current branch.
-- **`session/tree {root}`** (RPC), `tautly sessions tree` and `/tree` list the project's sessions (H10) as a tree. Each node is `{session_id, parent?, label?, origin, created, steps, last_prompt, cost_usd?, live, current}`. The REPL prints one indented line per branch: `* <label or id8>  step N · <origin> · $cost · <last prompt, 40 chars>`, with `*` marking the current branch.
+- **`session/tree {root}`** (RPC), `tautly sessions tree` and `/tree` list the project's sessions (H10) as a tree. Each node is `{session_id, parent?, label?, origin, created, last_step, last_prompt, cost_usd?, live, current}`. The REPL prints one indented line per branch: `* <label or id8>  step N · <origin> · $cost · <last prompt, 40 chars>`, with `*` marking the current branch.
 - **`Command::Switch{session_id, dry_run, overwrite}`** (`/switch <label|id|n>`) materializes the target branch's tip (`expected_tip(target)`) in place, with the same conflict rules and backup as rewind. It then continues that session (`Switched{branch, report}`, `SessionChanged`). Switching back and forth restores each tip exactly.
 
 #### 7.12.4 Fork at a step into an isolated worktree
 - **Command:** `tautly fork <session> --at N [--model M] [--prompt TEXT] [--label L] [--dir PATH] [--approve auto-edit|yolo] [--budget-usd N] [--output json|text]`.
 - **Worktree:** it creates `git worktree add --detach <dir> <commit>`, where `<commit>` is `state_at(N)`'s checkpoint with the tool-edit reverts applied, composed as a commit of its own (Task 50), so the worktree starts clean at exactly that state. Git runs with hooks disabled (file hooks and hooks declared in configuration), through the checkpoints' hardened git, found on `PATH` against the main work tree. `<dir>` defaults to `<data home>/worktrees/<project-id>/<session-id>`. A state with no checkpoint to start from is refused with its note.
-- **Session:** a new session (`origin: what_if`, parent `(session, step N)`, `root` = the worktree) holding the records up to step N. Root-relative paths make them valid there. It shares blobs with its parent (H10). `--model` applies `SetModel` before the first message.
+- **Session:** a new session (`origin: what_if`, parent `(session, offset of the last record copied)` and `parent_step: N`, `root` = the worktree) holding the records up to step N. Root-relative paths make them valid there. It shares blobs with its parent (H10). `--model` applies `SetModel` before the first message.
 - **Running:**
   - Without `--prompt` it prints the worktree path, the session id and the resume command.
   - With `--prompt` it runs one-shot in the worktree under the headless rules (3.4).
@@ -753,7 +820,7 @@ Every operation here creates a new branch or a new view. None truncates a log, a
   | `ToolCall` | `ToolCallProposed` |
   | `ApprovalRequested` (a tool's) | `ToolApprovalRequested` (no `diff`; id prefixed `replayed:`) |
   | `ToolResult` | `ToolFinished` (output from its blob, no `diff`) |
-  | provider usage | `Usage` (the response's last, after its discarded attempts; priced by its step's `Request.model`) |
+  | provider usage | `Usage` (the response's last, after its discarded attempts; priced by its step's `Request.model` at the current catalog) |
   | `Charged` | `Usage` (priced by its own `model`; `estimated` kept) |
   | `Compaction` | `Compacted` |
   | `GcApplied` | `ContextCollected` |
@@ -765,19 +832,19 @@ Every operation here creates a new branch or a new view. None truncates a log, a
 - **Read-only:** no provider request, no tool execution, no file access beyond the log and its blobs. It works without an API key. Replayed approval request ids cannot be answered. `Cancel` stops a replay.
 
 #### 7.12.6 Compare
-- `tautly compare <a> <b> [<c>…] [--json]` takes 2–5 sessions. When the sessions share a fork point, figures count from it; otherwise they cover whole sessions. Compare reads only the logs, their blobs and the cost ledger: no provider, tool or disk access.
+- `tautly compare <a> <b> [<c>…] [--json]` takes 2–5 sessions. When the sessions share a fork point, figures count from it; otherwise each session counts its own records: a branch from its header's parent offset (its copied prefix is its parent's work, as resume, tree, stats and receipts count it), a root session whole (cp5 review C I4). Compare reads only the logs, their blobs and the cost ledger: no provider, tool or disk access.
 - **Fork point (Task 52 fix round 1).**
   - Each session's parent chain is walked through its headers' `parent` (the parent and the offset of the last record copied). Copies keep their source's offsets, so what a session holds of an ancestor ends at the smallest offset along its chain: a rewind into a copied prefix copies less than its parent did.
   - Two sessions meet at the nearest session both chains hold, at the earlier of the two offsets. That offset names the same record in every log that holds it. Its step is read from the ancestor's log, or from a branch's copy when the ancestor's log is gone or unreadable.
-  - With 3–5 sessions, the first session's fork point with each other one is taken. All of these lie on the first session's chain, so the earliest is common to all. When any pair has no fork point, whole sessions are compared.
+  - With 3–5 sessions, the first session's fork point with each other one is taken. All of these lie on the first session's chain, so the earliest is common to all. When any pair has no fork point, each session counts its own records.
   - Every session is cut at that record. A turn open at the cut counts its wall time from the first record after it.
 - **One column per session:**
   - label (a label two sessions share is followed by an id prefix);
   - models used;
   - user turns, and steps (distinct `Request.step` values: a retry repeats its step);
   - tokens (input, output, cache read) and cost.
-    - The cost comes from the ledger by session, which includes discarded attempts. It is used only when the counted range is exactly the session's own records: the cut is its header's parent offset, or it has no parent and the whole session is compared.
-    - Otherwise, or with no ledger rows, the logged usage is used: each complete response's last usage and its discarded attempts at its step's model, plus every `Charged` record (side-model and estimated usage), each priced by its own model in the effective catalog.
+    - Every column's tokens and cost come from one source, the logged usage priced at the current catalog (cp5 review C M11): each complete response's last usage and its discarded attempts at its step's model, plus every `Charged` record (side-model and estimated usage), each priced by its own model in the effective catalog.
+    - The ledger's figure for the session (at the prices of when it was spent, discarded attempts included) is shown as its own, labelled line (`ledger cost`, JSON `ledger_usd`), only when the counted range is exactly the session's own records: the cut is its header's parent offset, or it has no parent and the whole session is compared.
     - Estimates and unpriced models are marked;
   - wall time: the sum of `TurnEnd.t − TurnStart.t` (a `SendMessage` is logged on arrival and may overlap a running turn, C-M7);
   - tool calls, blocked calls and edit failures (failed `edit` and `write` calls);

@@ -13,7 +13,8 @@ use crate::{Error, Result};
 
 /// Reads one session log.
 ///
-/// A final line that lacks its trailing newline or is not structurally valid
+/// Records stop at the log's length when it was opened, unless the reader
+/// [`follow`](Self::follow)s. A final line that lacks its trailing newline or is not structurally valid
 /// (not a JSON object of a known shape) is the remnant of a crash mid-write: it is skipped and reported by
 /// [`truncated_tail`](Self::truncated_tail). A malformed line anywhere else is
 /// corruption, as is any line whose payload does not deserialize as `R`; both
@@ -25,6 +26,10 @@ pub struct SessionReader<R: DeserializeOwned> {
     body_start: u64,
     /// Byte offset of the truncated final line, if there is one.
     tail_start: Option<u64>,
+    /// Where the records stop: the log's length at `open` (its truncated tail's start), so
+    /// a line a live writer is appending is not read as corruption (cp5 review C M5). None:
+    /// [`follow`](Self::follow).
+    end: Option<u64>,
     blobs: BlobStore,
     _record: PhantomData<fn() -> R>,
 }
@@ -54,13 +59,16 @@ impl<R: DeserializeOwned> SessionReader<R> {
             });
         }
         let body_start = first.len() as u64;
-        let tail_start = find_truncated_tail(file.into_inner(), body_start)?;
+        let file = file.into_inner();
+        let len = file.metadata()?.len();
+        let tail_start = find_truncated_tail(file, body_start)?;
         let project_dir = path.parent().unwrap_or(Path::new("."));
         Ok(Self {
             path: path.to_path_buf(),
             header,
             body_start,
             tail_start,
+            end: Some(tail_start.unwrap_or(len)),
             blobs: BlobStore::new(project_dir),
             _record: PhantomData,
         })
@@ -73,6 +81,13 @@ impl<R: DeserializeOwned> SessionReader<R> {
     /// The log file.
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Read what is appended after `open` too (the records stop at the length seen at
+    /// `open` otherwise).
+    pub fn follow(mut self) -> Self {
+        self.end = None;
+        self
     }
 
     /// Whether the log ended in a partial line that was skipped.
@@ -97,6 +112,7 @@ impl<R: DeserializeOwned> SessionReader<R> {
             input: Some(Input::Pending(self.body_start)),
             pos: self.body_start,
             tail_start: self.tail_start,
+            end: self.end,
             line: 1,
             next_offset: 0,
             _record: PhantomData,
@@ -165,6 +181,7 @@ struct Records<R> {
     input: Option<Input>,
     pos: u64,
     tail_start: Option<u64>,
+    end: Option<u64>,
     /// 1-based number of the last line read (header = 1).
     line: u64,
     next_offset: u64,
@@ -187,7 +204,7 @@ impl<R: DeserializeOwned> Iterator for Records<R> {
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
-            if self.tail_start == Some(self.pos) {
+            if self.tail_start == Some(self.pos) || self.end.is_some_and(|e| self.pos >= e) {
                 self.input = None;
             }
             let input = self.input.take()?;

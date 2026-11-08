@@ -946,7 +946,7 @@ mod tests {
             label: label.map(str::to_string),
             origin: tautly_core::Origin::User,
             created: 0,
-            steps: 0,
+            last_step: 0,
             last_prompt: String::new(),
             cost_usd: None,
             live: false,

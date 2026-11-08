@@ -171,6 +171,7 @@ fn every_event() -> Vec<Event> {
             cache_write: 200,
             side_tokens: 150,
             cost_usd: Some(0.0125),
+            cost_partial: false,
             wall_ms: 4200,
             cache_hit_ratio: Some(0.8),
             steps: 2,

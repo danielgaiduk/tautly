@@ -295,7 +295,13 @@ fn markdown(reader: &SessionReader<SessionRecord>) -> anyhow::Result<String> {
                 let _ = write!(md, "\n## Turn {turn}\n\n**You:** {}\n", text.trim());
             }
             SessionRecord::Provider(tautly_core::ProviderEvent::TextDelta(t)) => said.push_str(&t),
-            SessionRecord::ToolCall { name, args, .. } => {
+            SessionRecord::ToolCall {
+                name,
+                args,
+                args_blob,
+                ..
+            } => {
+                let args = tautly_core::record::tool_args(reader, &args, args_blob.as_ref());
                 flush(&mut md, &mut said);
                 let _ = write!(
                     md,

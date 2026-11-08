@@ -469,6 +469,15 @@ fn methods_map_to_commands() {
     );
     assert!(command_for("set_budget", &json!({"scope": "session", "max_usd": 1})).is_ok());
     assert_eq!(code("approve", json!({"request_id": 5})), INVALID_PARAMS);
+    // cp5 review C I2: 1e39 reads as an infinite f32, which a log would hold as `null`.
+    for speed in [json!(1e39), json!(-1), json!(1001)] {
+        assert_eq!(
+            code("replay", json!({"speed": speed})),
+            INVALID_PARAMS,
+            "{speed}"
+        );
+    }
+    assert!(command_for("replay", &json!({"speed": 1000})).is_ok());
 }
 
 #[tokio::test]

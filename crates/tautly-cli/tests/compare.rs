@@ -132,11 +132,12 @@ impl Log {
             SessionRecord::TurnEnd {
                 reason: FinishReason::Completed,
                 evidence,
+                synthetic: false,
             },
         )
     }
 
-    /// A request of `step` on `model` and its response's usage.
+    /// A request of `step` on `model` and its response (text, then its usage).
     fn step(&mut self, t: u64, turn: u32, step: u32, model: &str, input: u64, output: u64) {
         let hash = self.blob(format!("request {step}").as_bytes());
         self.at(
@@ -153,6 +154,10 @@ impl Log {
                     tail: "t".into(),
                 },
             },
+        );
+        self.at(
+            t + 5,
+            SessionRecord::Provider(ProviderEvent::TextDelta("ok".into())),
         );
         self.at(
             t + 10,
@@ -173,6 +178,7 @@ impl Log {
                 id: id.into(),
                 name: name.into(),
                 args: json!({}),
+                args_blob: None,
             },
         );
         let blob = self.blob(b"result");
@@ -364,30 +370,50 @@ fn json_shape() {
 }
 
 #[test]
-fn unrelated_sessions_are_compared_whole() {
+fn unrelated_sessions_count_their_own_records() {
+    // cp5 review C I4: with no shared fork point a branch counts from its own fork record,
+    // as resume, tree, stats and receipts do; a root session counts whole.
     let s = Scratch::new();
     let one = tree(&s);
     let two = tree(&s);
-    let out = s.ok(&["compare", &one.a.id, &two.b.id, "--json"]);
+    let out = s.ok(&["compare", &one.a.id, &two.b.id, &two.parent.id, "--json"]);
     let v: Value = serde_json::from_str(&out).unwrap();
     assert_eq!(v["fork_point"], Value::Null);
-    // Whole sessions: the copied parent turn counts too.
-    assert_eq!(v["sessions"][0]["user_turns"], 2);
+    let a = &v["sessions"][0];
+    assert_eq!((&a["user_turns"], &a["steps"]), (&json!(1), &json!(1)));
+    assert_eq!(
+        (&a["tokens_in"], &a["tokens_out"]),
+        (&json!(2_000), &json!(200))
+    );
+    assert_eq!(a["files"], json!(["a.txt", "both.txt"]));
+    assert_eq!(v["sessions"][1]["user_turns"], 2);
+    assert_eq!(v["sessions"][2]["user_turns"], 1);
+    assert_eq!(v["sessions"][2]["tokens_in"], 1_000);
     let text = s.ok(&["compare", &one.a.id, &two.b.id]);
     assert!(text.contains("no common fork point"), "{text}");
 }
 
 #[test]
-fn a_malformed_line_names_the_session() {
+fn a_payload_this_version_cannot_read_is_noted_not_fatal() {
+    // cp5 review C I2: a well-formed line whose payload is no record this version reads
+    // is skipped with a note, never a corrupt log.
     let s = Scratch::new();
     let t = tree(&s);
-    // Break b's first record (not its last line, which would read as a cut-off tail): a
-    // well-formed line whose payload is no record.
     let text = std::fs::read_to_string(&t.b.path).unwrap();
     let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
-    lines[1] = json!({"type": "record", "offset": 0, "t": 1,
-        "data": {"type": "turn_start", "data": {"turn": "bad"}}})
-    .to_string();
+    // A record of b's own (after the fork point), not its last line (a cut-off tail).
+    let i = lines.len() - 2;
+    let mut line: Value = serde_json::from_str(&lines[i]).unwrap();
+    line["data"] = json!({"type": "turn_start", "data": {"turn": "bad"}});
+    lines[i] = line.to_string();
+    std::fs::write(&t.b.path, lines.join("\n") + "\n").unwrap();
+    let out = s.ok(&["compare", &t.a.id, &t.b.id]);
+    assert!(
+        out.contains("1 record written by a newer version was skipped"),
+        "{out}"
+    );
+    // A line that is not JSON still names the session.
+    lines[1] = "{not json".into();
     std::fs::write(&t.b.path, lines.join("\n") + "\n").unwrap();
     let out = s.run(&["compare", &t.a.id, &t.b.id]);
     assert_eq!(out.status.code(), Some(1), "{out:?}");

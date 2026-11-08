@@ -83,8 +83,12 @@ pub fn run(args: Args, env: &Env) -> anyhow::Result<i32> {
             }
         }
     };
-    let evidence = last_evidence(&session)?;
-    let summary = Summary::of(&receipts);
+    let (evidence, user_turns) = last_evidence(&session)?;
+    let mut summary = Summary::of(&receipts);
+    summary.turns = summary.turns.max(user_turns);
+    if let Some(l) = &ledger {
+        summary.whole_session(l.session_totals(&session.id)?);
+    }
     let rows = rows(&summary, evidence.as_ref());
     let unpriced = summary.cost_usd.partial || summary.total_usd.partial;
     if args.markdown {
@@ -142,17 +146,20 @@ fn cell(text: &str) -> String {
     text.replace('|', "\\|")
 }
 
-/// The evidence of the session's last finished turn (none: it ran no tests).
-fn last_evidence(session: &LogSummary) -> anyhow::Result<Option<TestEvidence>> {
+/// The evidence of the session's last finished turn (none: it ran no tests), and how many
+/// user turns started (a turn that did not finish has no receipt).
+fn last_evidence(session: &LogSummary) -> anyhow::Result<(Option<TestEvidence>, usize)> {
     let reader = SessionReader::<SessionRecord>::open(&session.path)
         .with_context(|| format!("cannot read session {}", session.id))?;
-    let mut last = None;
+    let (mut last, mut turns) = (None, 0);
     for rec in reader.records() {
-        if let (_, SessionRecord::TurnEnd { evidence, .. }) = rec? {
-            last = evidence;
+        match rec?.1 {
+            SessionRecord::TurnEnd { evidence, .. } => last = evidence,
+            SessionRecord::TurnStart { .. } => turns += 1,
+            _ => {}
         }
     }
-    Ok(last)
+    Ok((last, turns))
 }
 
 /// The session's receipts summed.
@@ -168,6 +175,8 @@ struct Summary {
     cache_write: u64,
     side_tokens: u64,
     cost_usd: Priced,
+    /// Spend no receipt holds (side requests between turns, turns that did not finish).
+    outside: Option<f64>,
     estimated: bool,
     index: u64,
     diff_reads: u64,
@@ -191,6 +200,7 @@ impl Summary {
             s.cache_write += r.cache_write;
             s.side_tokens += r.side_tokens;
             s.cost_usd.add(r.cost_usd);
+            s.cost_usd.partial |= r.cost_partial;
             s.estimated |= r.estimated;
             s.index += r.saved.index;
             s.diff_reads += r.saved.diff_reads;
@@ -203,13 +213,36 @@ impl Summary {
     }
 }
 
+impl Summary {
+    /// Tokens and cost from the ledger's rows of the session, as `/tree` and `tautly stats`
+    /// count them: they hold what no receipt does (side requests between turns, a turn
+    /// that did not finish), which is shown apart (cp5 review C M1). Kept as summed from
+    /// the receipts when the ledger has no rows of the session.
+    fn whole_session(&mut self, t: tautly_core::Totals) {
+        if t.requests == 0 {
+            return;
+        }
+        let receipts = self.cost_usd.sum.unwrap_or(0.0);
+        self.tokens_in = t.input;
+        self.tokens_out = t.output;
+        self.cache_read = t.cache_read;
+        self.cache_write = t.cache_write;
+        self.cost_usd = Priced {
+            sum: (t.requests > t.unpriced).then_some(t.usd),
+            partial: t.unpriced > 0,
+        };
+        self.estimated |= t.estimated > 0;
+        self.outside = Some(t.usd - receipts).filter(|d| d.abs() >= 0.000_05);
+    }
+}
+
 /// The receipt's `(label, value)` lines.
 fn rows(s: &Summary, evidence: Option<&TestEvidence>) -> Vec<(&'static str, String)> {
     let est = if s.estimated { " (est.)" } else { "" };
     let seen = s.tokens_in + s.cache_read;
     let models: Vec<String> = s.models.iter().map(|m| printable(m)).collect();
     let saved = s.index + s.diff_reads + s.context_gc + s.filters;
-    vec![
+    let mut rows = vec![
         ("Model", models.join(", ")),
         ("Turns", s.turns.to_string()),
         ("Tool calls", thousands(s.tool_calls)),
@@ -250,7 +283,24 @@ fn rows(s: &Summary, evidence: Option<&TestEvidence>) -> Vec<(&'static str, Stri
             ),
         ),
         ("Last test", last_test(evidence)),
-    ]
+    ];
+    if let Some(outside) = s.outside {
+        let at = rows
+            .iter()
+            .position(|(l, _)| *l == "Cost")
+            .map_or(rows.len(), |i| i + 1);
+        rows.insert(
+            at,
+            (
+                "Outside turns",
+                format!(
+                    "{} (side requests between turns, turns that did not finish)",
+                    usd(Some(outside))
+                ),
+            ),
+        );
+    }
+    rows
 }
 
 /// The last turn's test evidence, without its command (which may name paths).

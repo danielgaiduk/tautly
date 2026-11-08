@@ -9,7 +9,7 @@ use tautly_sandbox::{Sandbox, SandboxError};
 use tautly_session::{BlobRef, SessionReader};
 use tautly_tools::preview::diff_owned;
 
-use crate::protocol::{Command, DiffFile, DiffStatus, ErrorKind, Event};
+use crate::protocol::{DiffFile, DiffStatus, ErrorKind, Event};
 use crate::record::SessionRecord;
 use crate::session::Session;
 
@@ -124,26 +124,27 @@ type PreImageRef = (PathBuf, Option<BlobRef>);
 
 /// The first `Edit` record per path in scope, in log order, and the number of user turns.
 ///
-/// A `SendMessage` is logged when it arrives, which may be while the turn before it still
-/// runs; turns run one at a time in that order, so a record belongs to the turn after the
-/// last `TurnEnd` before it.
+/// Turns are numbered by `TurnStart.turn`, as undo, receipts and rebuild number them (a
+/// `SendMessage` is logged on arrival and may never start a turn); a record belongs to the
+/// turn of the last `TurnStart` before it.
 fn earliest_pre_images(
     reader: &SessionReader<SessionRecord>,
     turn: Option<u32>,
 ) -> Result<(Vec<PreImageRef>, u32), DiffError> {
-    let mut messages = 0u32;
-    let mut ended = 0u32;
+    let (mut turns, mut current) = (0u32, 0u32);
     let mut edits: Vec<PreImageRef> = Vec::new();
     for rec in reader.records() {
         match rec?.1 {
-            SessionRecord::Command(Command::SendMessage { .. }) => messages += 1,
-            SessionRecord::TurnEnd { .. } => ended += 1,
+            SessionRecord::TurnStart { turn, .. } => {
+                current = turn;
+                turns = turns.max(turn);
+            }
             SessionRecord::Edit {
                 path,
                 pre_image,
                 asserted: false,
                 ..
-            } if turn.is_none_or(|t| t == ended + 1) => {
+            } if turn.is_none_or(|t| t == current) => {
                 edits.push((PathBuf::from(path.as_str()), pre_image))
             }
             _ => {}
@@ -151,7 +152,7 @@ fn earliest_pre_images(
     }
     let mut seen = HashSet::new();
     edits.retain(|(path, _)| seen.insert(path.clone()));
-    Ok((edits, messages))
+    Ok((edits, turns))
 }
 
 impl Session {

@@ -111,7 +111,12 @@ impl Log {
         )
     }
 
+    /// A response of text and its usage (an answered step).
     fn usage(&mut self, t: u64, input: u64, output: u64) -> u64 {
+        self.at(
+            t,
+            SessionRecord::Provider(ProviderEvent::TextDelta("ok".into())),
+        );
         self.at(
             t,
             SessionRecord::Provider(ProviderEvent::Usage(usage(input, output))),
@@ -134,6 +139,7 @@ impl Log {
             SessionRecord::TurnEnd {
                 reason: FinishReason::Completed,
                 evidence,
+                synthetic: false,
             },
         )
     }
@@ -146,6 +152,7 @@ impl Log {
                 id: id.into(),
                 name: name.into(),
                 args: json!({}),
+                args_blob: None,
             },
         );
         let result_blob = self.blob(b"result");
@@ -527,7 +534,7 @@ fn evidence_is_the_last_test_run_and_goes_stale_after_later_edits() {
 }
 
 #[test]
-fn cost_from_ledger_includes_discarded_attempts_else_logged_usage() {
+fn cost_is_the_logged_usage_and_the_ledger_its_own_figure() {
     let h = Home::new();
     let mut s = h.log(HeaderInit::default());
     s.turn(1_000, 1, "go");
@@ -567,8 +574,10 @@ fn cost_from_ledger_includes_discarded_attempts_else_logged_usage() {
     let ledger = Ledger::open(&h.data().join("ledger.sqlite")).unwrap();
     let empty = summarize(&reader, Some(&ledger), &catalog(), None).unwrap();
     assert_eq!(empty.cost_usd, logged.cost_usd);
+    assert_eq!(empty.ledger_usd, None);
 
-    // The ledger, discarded attempts included.
+    // The ledger (its historical prices, discarded attempts included) is its own figure;
+    // every column's cost stays the logged usage at the current catalog (M11).
     ledger
         .record(&s.id, &ModelId::from("m/a"), &usage(1_000, 100), Some(0.05))
         .unwrap();
@@ -579,13 +588,9 @@ fn cost_from_ledger_includes_discarded_attempts_else_logged_usage() {
         .record_estimated(&s.id, &ModelId::from("m/small"), &usage(200, 20), None)
         .unwrap();
     let led = summarize(&reader, Some(&ledger), &catalog(), None).unwrap();
-    assert!((led.cost_usd.unwrap() - 0.06).abs() < 1e-12, "{led:?}");
-    assert_eq!((led.tokens_in, led.tokens_out), (2_100, 120));
-    assert!(led.cost_estimated);
-    assert!(
-        led.cost_partial,
-        "an unpriced row leaves the amount partial"
-    );
+    assert!((led.ledger_usd.unwrap() - 0.06).abs() < 1e-12, "{led:?}");
+    assert_eq!(led.cost_usd, logged.cost_usd);
+    assert_eq!((led.tokens_in, led.tokens_out), (1_700, 120));
 
     // A model the catalog has no price for: the priced part, marked partial.
     let mut u = h.log(HeaderInit::default());
@@ -600,6 +605,28 @@ fn cost_from_ledger_includes_discarded_attempts_else_logged_usage() {
 }
 
 #[test]
+fn a_synthetic_turn_end_adds_no_wall_time() {
+    // cp5 review C M2: a crashed turn closed at resume ran until its last record.
+    let h = Home::new();
+    let mut s = h.log(HeaderInit::default());
+    s.turn(1_000, 1, "go");
+    s.request(1_100, 1, 2, "m/a");
+    s.usage(1_250, 10, 1);
+    s.at(
+        90_000,
+        SessionRecord::TurnEnd {
+            reason: FinishReason::Error,
+            evidence: None,
+            synthetic: true,
+        },
+    );
+    s.turn(100_000, 2, "again");
+    s.end(100_500, None);
+    let s = s.done();
+    assert_eq!(sum(&s.reader(), None).wall_ms, 250 + 500);
+}
+
+#[test]
 fn ledger_is_not_used_for_a_range_that_is_not_the_sessions_own() {
     let h = Home::new();
     let (p, _) = parent(&h);
@@ -609,9 +636,10 @@ fn ledger_is_not_used_for_a_range_that_is_not_the_sessions_own() {
         .unwrap();
     let reader = p.reader();
     let whole = summarize(&reader, Some(&ledger), &catalog(), None).unwrap();
-    assert_eq!(whole.cost_usd, Some(9.0));
+    assert_eq!(whole.ledger_usd, Some(9.0));
     // From step 2 on the parent spent nothing; its ledger rows are all before.
     let after = summarize(&reader, Some(&ledger), &catalog(), Some(2)).unwrap();
+    assert_eq!(after.ledger_usd, None);
     assert_eq!(after.cost_usd, Some(0.0));
 }
 
@@ -754,6 +782,7 @@ fn a_mid_turn_fork_counts_the_rest_of_the_parents_turn() {
         SessionRecord::TurnEnd {
             reason: FinishReason::Cancelled,
             evidence: None,
+            synthetic: false,
         },
     );
     e.turn(30_000, 2, "again");
@@ -799,13 +828,12 @@ fn a_branchs_ledger_rows_count_from_its_own_fork_and_the_parents_do_not() {
     let cut = fork_cut(p.reader().header(), b.reader().header(), h.data()).unwrap();
     assert_eq!(cut.offset, last);
     let sb = summarize_at(&b.reader(), Some(&ledger), &catalog(), Some(cut.offset)).unwrap();
-    assert_eq!(sb.cost_usd, Some(0.07));
+    assert_eq!(sb.ledger_usd, Some(0.07));
+    // Both columns priced alike: the logged usage at the current catalog (M11).
+    assert!((sb.cost_usd.unwrap() - 12.0 / 1e6).abs() < 1e-12, "{sb:?}");
     let sp = summarize_at(&p.reader(), Some(&ledger), &catalog(), Some(cut.offset)).unwrap();
-    assert_eq!(
-        sp.cost_usd,
-        Some(0.0),
-        "the parent's rows are before the cut"
-    );
+    assert_eq!(sp.ledger_usd, None, "the parent's rows are before the cut");
+    assert_eq!(sp.cost_usd, Some(0.0));
 }
 
 #[test]
