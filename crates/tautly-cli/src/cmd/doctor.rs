@@ -399,7 +399,7 @@ async fn network_check(cx: &DoctorCx<'_>, keyed: &[Keyed], active: Option<&str>)
             "no provider has a key to check",
         )];
     }
-    let client = match reqwest::Client::builder()
+    let client = match tautly_sandbox::http_client_builder()
         .timeout(NETWORK_TIMEOUT)
         .redirect(reqwest::redirect::Policy::none())
         .build()

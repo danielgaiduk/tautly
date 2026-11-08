@@ -5,8 +5,11 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+publish = false
 
 [dependencies]
+# `http_client_builder`: one TLS setup for every HTTP client.
+tautly-sandbox = { path = "../tautly-sandbox" }
 thiserror.workspace = true
 async-trait.workspace = true
 serde.workspace = true
@@ -22,7 +25,6 @@ bytes.workspace = true
 humantime.workspace = true
 reqwest = { workspace = true, features = ["stream"] }
 url.workspace = true
-blake3.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
