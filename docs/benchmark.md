@@ -1,8 +1,14 @@
 # Benchmarks
 
-Tautly is measured in three ways. CI runs only the deterministic replay gate, plus
-`shellcheck` and a doctest on the Terminal-Bench kit (the `benchmark-kit` job). Everything
-that calls a real model is run by hand, or by the nightly workflow with repository secrets.
+Tautly is measured in three ways. CI makes no model calls. It runs:
+
+- the `perf` job: the deterministic replay gate, `tautly eval report` on
+  `benchmarks/tokens/fixtures/sample.json`, and `bash -n benchmarks/tokens/run.sh`;
+- the `eval-tasks` job: every starter task must fail before it is solved;
+- the `benchmark-kit` job: `shellcheck` and a doctest on the Terminal-Bench kit.
+
+Everything that calls a real model is run by hand, or by the nightly workflow with
+repository secrets.
 
 | What | Measures | Real calls | Where |
 |---|---|---|---|
@@ -35,9 +41,9 @@ that calls a real model is run by hand, or by the nightly workflow with reposito
 ### `tautly eval`
 
 ```sh
-# Deterministic replay gate, no network (what CI runs):
+# Deterministic replay gate, no network (CI's perf job runs the release build):
 cargo build -p tautly --features mock
-target/debug/tautly eval --replay evals/replay
+target/debug/tautly eval --replay evals/replay --jobs 4
 # After an intended change in token use, rewrite the baseline:
 target/debug/tautly eval --replay evals/replay --update-baseline
 
