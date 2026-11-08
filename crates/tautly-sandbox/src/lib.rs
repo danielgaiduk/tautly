@@ -16,7 +16,7 @@ pub use effect::{Effect, FileMeta, HttpResponse, Sandbox, SandboxError, SpawnSpe
 pub use local::LocalSandbox;
 pub use path_search::{which_outside, which_outside_or_skipped};
 pub use policy::{Decision, Mode, Policy, PolicyConfig, PolicyError};
-pub use protected::is_protected;
+pub use protected::{is_protected, lexical};
 pub use shell::{Redirect, SimpleCommand, Unparseable, parse_commands};
 pub use spill::{SPILL_DIR, SpillCleanup, cleanup_spills};
 pub use tokio::process::Child;
