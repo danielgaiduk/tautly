@@ -80,9 +80,11 @@ fn anthropic_effort_uses_adaptive_thinking_and_output_effort() {
             64_000,
             Some(Reasoning::Effort(e)),
         ));
+        // Drop thinking blocks a history edit invalidated instead of failing (C1).
         assert_eq!(
             w["thinking"],
-            json!({"type": "adaptive", "display": "summarized"})
+            json!({"type": "adaptive", "display": "summarized",
+                   "block_binding": {"prefix_mismatch_behavior": "drop_block"}})
         );
         assert_eq!(w["output_config"], json!({"effort": name}));
     }
@@ -92,8 +94,9 @@ fn anthropic_effort_uses_adaptive_thinking_and_output_effort() {
 }
 
 #[test]
-fn anthropic_budget_is_capped_below_max_tokens() {
+fn anthropic_budget_is_capped_at_half_the_output_limit() {
     for (e, _, n) in LEVELS {
+        let n = n.min(32_000);
         let w = anthropic::to_wire(&req(
             "anthropic/claude-haiku-4-5",
             64_000,
@@ -105,18 +108,20 @@ fn anthropic_budget_is_capped_below_max_tokens() {
         );
         assert!(w.get("output_config").is_none());
     }
-    // 32k with a 16k output limit: just below the limit.
+    // 32k with a 16k output limit: half of it, so the answer keeps room.
     let w = anthropic::to_wire(&req(
         "anthropic/claude-haiku-4-5",
         16_000,
         Some(Reasoning::Budget(32_768)),
     ));
-    assert_eq!(w["thinking"]["budget_tokens"], 15_999);
+    assert_eq!(w["thinking"]["budget_tokens"], 8_000);
     assert_eq!(w["max_tokens"], 16_000);
+    // Budget thinking runs no history check: no block_binding.
+    assert!(w["thinking"].get("block_binding").is_none());
     // Below the API's 1024 minimum once capped: no thinking at all.
     let w = anthropic::to_wire(&req(
         "anthropic/claude-haiku-4-5",
-        1_024,
+        2_000,
         Some(Reasoning::Budget(4_096)),
     ));
     assert!(w.get("thinking").is_none());
@@ -152,6 +157,73 @@ fn anthropic_thinking_and_signature_round_trip_with_tools() {
     );
     assert_eq!(w["messages"][2]["content"][0]["type"], "tool_result");
     assert_eq!(w["messages"][2]["content"][0]["tool_use_id"], "call_1");
+}
+
+#[test]
+fn anthropic_beta_headers_follow_the_thinking_mode() {
+    const BINDING: &str = "thinking-binding-controls-2026-08-01";
+    const INTERLEAVED: &str = "interleaved-thinking-2025-05-14";
+    // Adaptive thinking: the binding controls that make `block_binding` valid.
+    let adaptive = req(
+        "anthropic/claude-opus-5-5",
+        64_000,
+        Some(Reasoning::Effort(Effort::Low)),
+    );
+    assert_eq!(anthropic::beta_headers(&adaptive), [BINDING]);
+    // Budget thinking with tools: interleaved thinking between tool calls (M5).
+    let budget = req(
+        "anthropic/claude-haiku-4-5",
+        64_000,
+        Some(Reasoning::Budget(4_096)),
+    );
+    assert_eq!(anthropic::beta_headers(&budget), [INTERLEAVED]);
+    let mut no_tools = budget.clone();
+    no_tools.tools.clear();
+    assert!(anthropic::beta_headers(&no_tools).is_empty());
+    // A budget capped away (no thinking sent) needs no header either.
+    let mut tiny = budget.clone();
+    tiny.max_output = 1_500;
+    assert!(anthropic::beta_headers(&tiny).is_empty());
+    assert!(anthropic::beta_headers(&req("anthropic/claude-opus-5-5", 64_000, None)).is_empty());
+}
+
+#[tokio::test]
+async fn anthropic_adaptive_request_carries_the_binding_beta_header_and_field() {
+    use futures::StreamExt;
+    use std::sync::Arc;
+    use tokio_util::sync::CancellationToken;
+    use wiremock::matchers::{body_partial_json, header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .and(header(
+            "anthropic-beta",
+            "thinking-binding-controls-2026-08-01",
+        ))
+        .and(body_partial_json(json!({"thinking": {"type": "adaptive",
+            "block_binding": {"prefix_mismatch_behavior": "drop_block"}}})))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(""),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let p = anthropic::AnthropicProvider::new(
+        "k".into(),
+        server.uri().parse().unwrap(),
+        Arc::new(Catalog::builtin()),
+    );
+    let r = req(
+        "anthropic/claude-opus-5-5",
+        64_000,
+        Some(Reasoning::Effort(Effort::High)),
+    );
+    let _: Vec<_> = p.stream(r, CancellationToken::new()).collect().await;
+    server.verify().await;
 }
 
 // ---- openai -------------------------------------------------------------------------
@@ -201,7 +273,7 @@ fn google_budget_levels_are_capped_below_max_output() {
     for (e, _, n) in LEVELS {
         for r in [Reasoning::Budget(n), Reasoning::Effort(e)] {
             let w = google::to_wire(&req("google/gemini-3-pro", 64_000, Some(r)));
-            assert_eq!(thinking_budget(&w), Some(u64::from(n)));
+            assert_eq!(thinking_budget(&w), Some(u64::from(n.min(32_000))));
             assert_eq!(
                 w["generationConfig"]["thinkingConfig"]["includeThoughts"],
                 true
@@ -213,7 +285,7 @@ fn google_budget_levels_are_capped_below_max_output() {
         8_000,
         Some(Reasoning::Budget(32_768)),
     ));
-    assert_eq!(thinking_budget(&w), Some(7_999));
+    assert_eq!(thinking_budget(&w), Some(4_000));
     let w = google::to_wire(&req("google/gemini-3-pro", 64_000, None));
     assert!(w["generationConfig"].get("thinkingConfig").is_none());
 }
@@ -234,6 +306,47 @@ fn google_thought_signature_round_trips_with_tools() {
         w["contents"][2]["parts"][0]["functionResponse"]["name"],
         "read_file"
     );
+}
+
+#[tokio::test]
+async fn google_clamps_the_budget_to_the_models_documented_range() {
+    use futures::StreamExt;
+    use std::sync::Arc;
+    use tokio_util::sync::CancellationToken;
+    use wiremock::matchers::{body_partial_json, method};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let catalog = Catalog::builtin();
+    assert_eq!(
+        catalog.thinking_budget_max(&"google/gemini-3-flash".into()),
+        Some(24_576)
+    );
+    for (model, want) in [
+        ("google/gemini-3-flash", 24_576),
+        ("google/gemini-3-pro", 32_000),
+    ] {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(
+                json!({"generationConfig": {"thinkingConfig": {"thinkingBudget": want}}}),
+            ))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(""),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let p = google::GoogleProvider::new(
+            "k".into(),
+            server.uri().parse().unwrap(),
+            Arc::new(Catalog::builtin()),
+        );
+        let r = req(model, 64_000, Some(Reasoning::Effort(Effort::High)));
+        let _: Vec<_> = p.stream(r, CancellationToken::new()).collect().await;
+        server.verify().await;
+    }
 }
 
 // ---- compat -------------------------------------------------------------------------

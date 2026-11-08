@@ -168,8 +168,8 @@ pub fn to_wire(req: &CanonicalRequest) -> Value {
         Some(Reasoning::Effort(e)) => Some(e.budget_tokens()),
         None => None,
     };
-    // Thoughts count against maxOutputTokens: keep room for the answer.
-    if let Some(n) = budget.map(|n| n.min(req.max_output.saturating_sub(1))) {
+    // Thoughts count against maxOutputTokens: keep half of it for the answer.
+    if let Some(n) = budget.map(|n| n.min(req.max_output / 2)) {
         generation["thinkingConfig"] = json!({"thinkingBudget": n, "includeThoughts": true});
     }
 
@@ -357,6 +357,16 @@ impl Provider for GoogleProvider {
             req.max_output = req
                 .max_output
                 .min(self.catalog.get(&req.model).caps.max_output);
+        }
+        // Keep the budget within the model's documented range, where the catalog knows it.
+        if let Some(max) = self.catalog.thinking_budget_max(&req.model) {
+            req.reasoning = req.reasoning.map(|r| {
+                let n = match r {
+                    Reasoning::Budget(n) => n,
+                    Reasoning::Effort(e) => e.budget_tokens(),
+                };
+                Reasoning::Budget(n.min(max))
+            });
         }
         if req.system.iter().any(|b| matches!(b, Block::Image { .. })) {
             return Box::pin(futures::stream::once(async {

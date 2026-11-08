@@ -1,69 +1,74 @@
 # Built-in model catalog. Prices are USD per million tokens.
 # NOTE: windows and prices below are best-effort estimates and MUST be verified
-# against the providers' pricing pages before release.
+# against the providers' pricing pages before release. Anthropic entries: per the
+# Claude API reference (2026-10); cache_write is the 5-minute TTL rate (1.25x input).
+# Haiku 5.5 prices are its prompt <= 100K tokens card ($0.50 / $2.50 above).
+# `reasoning = "effort_always"`: thinking cannot be turned off, so "off" sends the
+# lowest effort. `thinking_budget_max` (Gemini): the largest thinking budget sent;
+# Gemini 3's ranges are unverified (the 2.5 Pro / Flash documented maxima).
 
 [models."anthropic/claude-sonnet-5-5"]
-context_window = 200000
-max_output = 64000
+context_window = 1000000
+max_output = 128000
 parallel_tools = true
 reasoning = "effort_always"
 cache = "explicit"
 images = true
 edit_format = "str_replace"
 [models."anthropic/claude-sonnet-5-5".price]
-input = 3.0
-output = 15.0
-cache_read = 0.3
-cache_write = 3.75
+input = 2.0
+output = 10.0
+cache_read = 0.2
+cache_write = 2.5
 
 [models."anthropic/claude-opus-5-5"]
-context_window = 200000
-max_output = 64000
+context_window = 1000000
+max_output = 128000
 parallel_tools = true
 reasoning = "effort_always"
 cache = "explicit"
 images = true
 edit_format = "str_replace"
 [models."anthropic/claude-opus-5-5".price]
-input = 5.0
-output = 25.0
-cache_read = 0.5
-cache_write = 6.25
+input = 4.0
+output = 20.0
+cache_read = 0.2
+cache_write = 5.0
 
 [models."anthropic/claude-haiku-5-5"]
 tier = "small"
-context_window = 200000
-max_output = 64000
+context_window = 1000000
+max_output = 128000
 parallel_tools = true
 reasoning = "effort_always"
 cache = "explicit"
 images = true
 edit_format = "str_replace"
 [models."anthropic/claude-haiku-5-5".price]
-input = 1.0
-output = 5.0
-cache_read = 0.1
-cache_write = 1.25
+input = 0.1
+output = 0.5
+cache_read = 0.01
+cache_write = 0.125
 
 [models."anthropic/claude-fable-5-1"]
-context_window = 200000
-max_output = 64000
+context_window = 1000000
+max_output = 128000
 parallel_tools = true
 reasoning = "effort_always"
 cache = "explicit"
 images = true
 edit_format = "str_replace"
 [models."anthropic/claude-fable-5-1".price]
-input = 15.0
-output = 75.0
-cache_read = 1.5
-cache_write = 18.75
+input = 10.0
+output = 50.0
+cache_read = 0.25
+cache_write = 12.5
 
 [models."openai/gpt-5"]
 context_window = 400000
 max_output = 128000
 parallel_tools = true
-reasoning = "effort"
+reasoning = "effort_always"
 cache = "automatic"
 images = true
 edit_format = "patch"
@@ -78,7 +83,7 @@ tier = "small"
 context_window = 400000
 max_output = 128000
 parallel_tools = true
-reasoning = "effort"
+reasoning = "effort_always"
 cache = "automatic"
 images = true
 edit_format = "patch"
@@ -92,7 +97,8 @@ cache_write = 0.0
 context_window = 1000000
 max_output = 64000
 parallel_tools = true
-reasoning = "budget"
+reasoning = "effort_always"
+thinking_budget_max = 32768
 cache = "automatic"
 images = true
 edit_format = "str_replace"
@@ -107,7 +113,8 @@ tier = "small"
 context_window = 1000000
 max_output = 64000
 parallel_tools = true
-reasoning = "budget"
+reasoning = "effort_always"
+thinking_budget_max = 24576
 cache = "automatic"
 images = true
 edit_format = "str_replace"

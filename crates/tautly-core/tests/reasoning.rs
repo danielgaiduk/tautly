@@ -80,6 +80,12 @@ fn the_built_in_catalog_marks_current_anthropic_models_as_always_thinking_effort
         "anthropic/claude-opus-5-5",
         "anthropic/claude-haiku-5-5",
         "anthropic/claude-fable-5-1",
+        // No reasoning off switch either: gpt-5 runs at medium and Gemini 3 thinks
+        // dynamically without one (review I1).
+        "openai/gpt-5",
+        "openai/gpt-5-mini",
+        "google/gemini-3-pro",
+        "google/gemini-3-flash",
     ] {
         let caps = catalog.get(&ModelId::from(id)).caps;
         assert_eq!(caps.reasoning, ReasoningStyle::EffortAlways, "{id}");

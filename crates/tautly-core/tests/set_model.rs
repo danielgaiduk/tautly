@@ -1593,3 +1593,206 @@ async fn a_fork_before_a_later_switch_is_on_the_model_of_its_cut() {
     assert!(text.contains("one") && !text.contains("two"), "{text}");
     run.stop().await;
 }
+
+// ------------------------------------------------------- reasoning: history edits, resume
+
+/// One Anthropic model whose thinking cannot be turned off (adaptive thinking).
+fn adaptive_config() -> Config {
+    let toml = entry("anthropic/a1", 200_000, "str_replace", Some(3.0))
+        .replace("reasoning = \"budget\"", "reasoning = \"effort_always\"");
+    let mut c = config("anthropic/a1");
+    c.catalog_overrides = Some(Catalog::from_toml(&toml).unwrap());
+    c
+}
+
+fn thought_then_call(sig: &str, call: ProviderEvent) -> MockTurn {
+    MockTurn::Events(vec![
+        ProviderEvent::ReasoningDelta("thinking".into()),
+        ProviderEvent::ReasoningSignature(sig.into()),
+        call,
+        ProviderEvent::Done {
+            stop: StopReason::ToolUse,
+        },
+    ])
+}
+
+/// The request as the Anthropic adapter sends it is one the API takes after history
+/// edits: `drop_block` binding with its beta header, signed thinking blocks first in
+/// their turn, and every `tool_use` answered in the next user turn. Consecutive messages
+/// of one role are one turn (the API combines them; the working state follows the tool
+/// results as its own user message).
+fn assert_valid_anthropic_request(req: &CanonicalRequest) {
+    use tautly_provider::anthropic;
+    let w = anthropic::to_wire(req);
+    assert_eq!(
+        w["thinking"]["block_binding"],
+        json!({"prefix_mismatch_behavior": "drop_block"})
+    );
+    assert!(anthropic::beta_headers(req).contains(&"thinking-binding-controls-2026-08-01"));
+    let msgs = w["messages"].as_array().unwrap();
+    assert_eq!(msgs[0]["role"], "user");
+    let mut turns: Vec<(Value, Vec<Value>)> = Vec::new();
+    for m in msgs {
+        let blocks = m["content"].as_array().unwrap();
+        assert!(!blocks.is_empty(), "empty message: {w}");
+        match turns.last_mut() {
+            Some((role, all)) if *role == m["role"] => all.extend(blocks.iter().cloned()),
+            _ => turns.push((m["role"].clone(), blocks.clone())),
+        }
+    }
+    let mut open: Vec<String> = Vec::new();
+    for (role, blocks) in &turns {
+        let is_thinking =
+            |b: &Value| matches!(b["type"].as_str(), Some("thinking" | "redacted_thinking"));
+        let ids = |kind: &str, key: &str| -> Vec<String> {
+            blocks
+                .iter()
+                .filter(|b| b["type"] == kind)
+                .map(|b| b[key].as_str().unwrap().to_string())
+                .collect()
+        };
+        if *role == "assistant" {
+            let lead = blocks.iter().take_while(|b| is_thinking(b)).count();
+            assert!(
+                !blocks[lead..].iter().any(is_thinking),
+                "thinking after content: {w}"
+            );
+            for b in &blocks[..lead] {
+                if b["type"] == "thinking" {
+                    assert!(
+                        b["signature"].as_str().is_some_and(|s| !s.is_empty()),
+                        "{w}"
+                    );
+                }
+            }
+            open = ids("tool_use", "id");
+        } else {
+            assert_eq!(
+                ids("tool_result", "tool_use_id"),
+                open,
+                "unanswered tool_use: {w}"
+            );
+            open.clear();
+        }
+    }
+}
+
+/// Review C1: a GC of a superseded read, a pin fold (both at the cold epoch a reasoning
+/// change starts) and a keep-tail compaction edit the history the thinking blocks were
+/// bound to; every request after them still has a valid shape, with `drop_block`.
+#[tokio::test]
+async fn history_edits_leave_a_valid_adaptive_request() {
+    let fx = Fx::new();
+    let small: String = (0..20).map(|i| format!("line {i}\n")).collect();
+    fx.write("small.txt", &small);
+    let read = |id: &str| call(id, "read", json!({"path": "small.txt", "full": true}));
+    let mut script = vec![
+        thought_then_call("s1", read("r1")),
+        thought_then_call("s2", read("r2")),
+        signed_thought("t", "s3", "read twice"),
+        signed_thought("t", "s4", "after the change"),
+    ];
+    for i in 5..=8 {
+        script.push(signed_thought("t", &format!("s{i}"), "more"));
+    }
+    script.push(reply("SUMMARY"));
+    script.push(signed_thought("t", "s9", "after compaction"));
+    let mock = MockProvider::new(script);
+    let mut run = start(fx.builder(adaptive_config(), &mock));
+    let t1 = run.turn_with("read it twice").await;
+    assert_eq!(finish_reason(&t1), FinishReason::Completed, "{t1:?}");
+    run.send(Command::Pin {
+        text: "PIN-MARKER".into(),
+    })
+    .await;
+    run.send(Command::SetReasoning {
+        level: tautly_core::ReasoningLevel::High,
+    })
+    .await;
+    let t2 = run.turn_with("after the change").await;
+    assert!(
+        t2.iter().any(|e| matches!(
+            e,
+            Event::ContextCollected {
+                reason: MutationReason::ColdCache,
+                ..
+            }
+        )),
+        "{t2:?}"
+    );
+    for _ in 0..4 {
+        let t = run.turn_with("more").await;
+        assert_eq!(finish_reason(&t), FinishReason::Completed, "{t:?}");
+    }
+    run.send(Command::Compact { id: None }).await;
+    let c = run
+        .until(|e| matches!(e, Event::CompactFinished { .. }))
+        .await;
+    assert!(
+        c.iter().any(|e| matches!(e, Event::Compacted { .. })),
+        "{c:?}"
+    );
+    let t = run.turn_with("after compaction").await;
+    assert_eq!(finish_reason(&t), FinishReason::Completed, "{t:?}");
+    assert!(
+        records(&run.engine)
+            .iter()
+            .any(|r| matches!(r, SessionRecord::PinsFolded))
+    );
+
+    let reqs = mock.requests();
+    assert_eq!(reqs.len(), 10);
+    let main: Vec<_> = reqs.iter().filter(|r| !r.tools.is_empty()).collect();
+    assert_eq!(main.len(), 9);
+    for r in main {
+        assert_valid_anthropic_request(r);
+    }
+    // The last request still replays the kept turns' thinking.
+    let last = tautly_provider::anthropic::to_wire(reqs.last().unwrap());
+    assert!(last.to_string().contains("\"signature\":\"s8\""), "{last}");
+}
+
+/// Review M3: a resume at another reasoning level than the last request's is counted as
+/// a cold cache. A resumed session has no cache clock (the last request's instant is not
+/// in the log), so its first step is always a cold epoch, at any level.
+#[tokio::test]
+async fn a_resume_starts_a_cold_epoch_at_any_reasoning_level() {
+    use tautly_core::ReasoningLevel;
+    for level in [ReasoningLevel::Auto, ReasoningLevel::High] {
+        let fx = Fx::new();
+        let small: String = (0..20).map(|i| format!("line {i}\n")).collect();
+        fx.write("small.txt", &small);
+        let read = || call("r", "read", json!({"path": "small.txt", "full": true}));
+        let mock = MockProvider::new(vec![
+            tools_step(vec![read()]),
+            tools_step(vec![read()]),
+            reply("read twice"),
+            reply("resumed"),
+            reply("spare"),
+        ]);
+        let mut high = config("anthropic/a1");
+        high.reasoning = ReasoningLevel::High;
+        let mut run = start(fx.builder(high, &mock));
+        let id = run.engine.session_id().to_string();
+        let t1 = run.turn_with("read it twice").await;
+        assert_eq!(finish_reason(&t1), FinishReason::Completed, "{t1:?}");
+        run.stop().await;
+
+        let mut cfg = config("anthropic/a1");
+        cfg.reasoning = level;
+        let mut run = start(fx.resumed(cfg, &mock, &id));
+        let t2 = run.turn_with("after resume").await;
+        let cold = t2.iter().any(|e| {
+            matches!(
+                e,
+                Event::ContextCollected {
+                    reason: MutationReason::ColdCache,
+                    ..
+                }
+            )
+        });
+        assert!(cold, "{level}: {t2:?}");
+        assert_eq!(finish_reason(&t2), FinishReason::Completed, "{t2:?}");
+        run.stop().await;
+    }
+}

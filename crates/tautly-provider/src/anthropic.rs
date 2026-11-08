@@ -97,6 +97,31 @@ fn content_to_wire(c: &Content) -> Option<Value> {
     })
 }
 
+/// Lets adaptive requests set `thinking.block_binding` (preserved thinking).
+const BINDING_BETA: &str = "thinking-binding-controls-2026-08-01";
+/// Thinking between tool calls for budget-style (older) models.
+const INTERLEAVED_BETA: &str = "interleaved-thinking-2025-05-14";
+
+/// A budget below `max_tokens` with room for the answer (half of it), or none when that
+/// is under the API's 1024 minimum.
+fn thinking_budget(n: u32, max_output: u32) -> Option<u32> {
+    Some(n.min(max_output / 2)).filter(|b| *b >= 1_024)
+}
+
+/// The `anthropic-beta` values a request needs: the binding controls with adaptive
+/// thinking (its `block_binding`), interleaved thinking with a budget and tools.
+pub fn beta_headers(req: &CanonicalRequest) -> Vec<&'static str> {
+    match &req.reasoning {
+        Some(Reasoning::Effort(_)) => vec![BINDING_BETA],
+        Some(Reasoning::Budget(n))
+            if !req.tools.is_empty() && thinking_budget(*n, req.max_output).is_some() =>
+        {
+            vec![INTERLEAVED_BETA]
+        }
+        _ => Vec::new(),
+    }
+}
+
 /// Build the Messages API request body.
 pub fn to_wire(req: &CanonicalRequest) -> Value {
     let mut system: Vec<Value> = req
@@ -160,16 +185,21 @@ pub fn to_wire(req: &CanonicalRequest) -> Value {
     }
     // No `temperature` or forced `tool_choice` is ever sent: both conflict with thinking.
     match &req.reasoning {
-        // Older models: a fixed budget, below max_tokens and at least 1024.
+        // Older models: a fixed budget (no history check runs, so no block_binding).
         Some(Reasoning::Budget(n)) => {
-            let budget = (*n).min(req.max_output.saturating_sub(1));
-            if budget >= 1_024 {
+            if let Some(budget) = thinking_budget(*n, req.max_output) {
                 body["thinking"] = json!({"type": "enabled", "budget_tokens": budget});
             }
         }
         // Current models reject `budget_tokens`: adaptive thinking, depth set by effort.
+        // A thinking block an earlier history edit (GC, compaction, a pin fold)
+        // invalidated is dropped by the API instead of failing the request.
         Some(Reasoning::Effort(e)) => {
-            body["thinking"] = json!({"type": "adaptive", "display": "summarized"});
+            body["thinking"] = json!({
+                "type": "adaptive",
+                "display": "summarized",
+                "block_binding": {"prefix_mismatch_behavior": "drop_block"},
+            });
             body["output_config"] = json!({"effort": effort_name(e)});
         }
         None => {}
@@ -413,13 +443,17 @@ impl Provider for AnthropicProvider {
                 ))
             }));
         }
-        let builder = self
+        let mut builder = self
             .client
             .post(self.endpoint())
             .header("x-api-key", &self.api_key)
             .header("anthropic-version", API_VERSION)
-            .header("content-type", "application/json")
-            .body(to_wire(&req).to_string());
+            .header("content-type", "application/json");
+        let betas = beta_headers(&req);
+        if !betas.is_empty() {
+            builder = builder.header("anthropic-beta", betas.join(","));
+        }
+        let builder = builder.body(to_wire(&req).to_string());
 
         Box::pin(async_stream::stream! {
             let sent = tokio::select! {
