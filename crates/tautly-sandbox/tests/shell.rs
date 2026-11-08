@@ -1258,3 +1258,44 @@ fn leading_descriptor_of_a_redirect_is_not_an_argv_word() {
     assert_eq!(parse_commands("cmd 0 <&3").unwrap()[0].argv, ["cmd", "0"]);
     assert_eq!(parse_commands("cmd 0").unwrap()[0].argv, ["cmd", "0"]);
 }
+
+// ---- Fuzzing (shell_policy): a prefix word with no command after it ----
+
+/// `command`, `builtin` and `time` (with or without their options) and no command after
+/// them run nothing: the parse keeps the words as written and never indexes past them.
+#[test]
+fn a_bare_prefix_word_parses() {
+    for s in [
+        "time",
+        "command",
+        "builtin",
+        "command -p",
+        "time -p",
+        "A=1; time",
+        "x | command --",
+    ] {
+        let cmds = parse_commands(s).unwrap_or_else(|e| panic!("{s:?}: {e}"));
+        assert!(!cmds.last().unwrap().argv.is_empty(), "{s:?}");
+    }
+}
+
+/// Fuzzing (shell_policy): a redirection with no command still opens its target (`< f`
+/// reads it, and bash connects for `< /dev/tcp/host/port`), so like a write it fails
+/// closed rather than vanish from the parse.
+#[test]
+fn a_read_redirection_without_a_command_is_unparseable() {
+    for s in [
+        "< f",
+        " < f \nc",
+        "c; < /dev/tcp/example.com/80",
+        "{ c; } && < f",
+        "2< f",
+    ] {
+        assert!(
+            parse_commands(s).is_err(),
+            "{s:?} parsed as {:?}",
+            parse_commands(s)
+        );
+    }
+    assert!(parse_commands("c < f").is_ok());
+}

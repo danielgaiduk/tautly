@@ -446,7 +446,8 @@ fn walk_command(
         }
     }
     if argv.is_empty() {
-        if redirects.iter().any(|r| r.write) {
+        // Even a read opens its target (`< /dev/tcp/host/port` connects).
+        if !redirects.is_empty() {
             return Err(Unparseable("redirection without a command".into()));
         }
     } else {
@@ -581,7 +582,7 @@ fn walk_redirected(
         reject_fed_modules(&out[start..])?;
     }
     if out.len() == start {
-        if redirects.iter().any(|r| r.write) {
+        if !redirects.is_empty() {
             return Err(Unparseable("redirection without a command".into()));
         }
     } else {
@@ -997,7 +998,11 @@ fn check_expansion(t: &str) -> Result<(), Unparseable> {
 /// dynamic or code-bearing name hides commands. Also `let`, integer/nameref
 /// declarations and `mapfile -C` callbacks.
 fn reject_dynamic_names(argv: &[String]) -> Result<(), Unparseable> {
-    let cmd = base(&argv[0]);
+    // Empty behind a bare prefix (`command`, `time -p`): nothing runs.
+    let Some(first) = argv.first() else {
+        return Ok(());
+    };
+    let cmd = base(first);
     let args = &argv[1..];
     let names: Vec<&str> = match cmd {
         "let" => return Err(hidden("`let` arithmetic")),
@@ -1067,7 +1072,10 @@ fn reject_dangerous_name(name: &str) -> Result<(), Unparseable> {
 fn reject_dynamic_numbers(argv: &[String]) -> Result<(), Unparseable> {
     const ARITH_TESTS: &[&str] = &["-eq", "-ne", "-lt", "-le", "-gt", "-ge"];
     let dynamic = |w: &String| w.contains(['$', '`']);
-    let cmd = base(&argv[0]);
+    let Some(first) = argv.first() else {
+        return Ok(());
+    };
+    let cmd = base(first);
     let args = &argv[1..];
     let bad = match cmd {
         "test" | "[" => {
