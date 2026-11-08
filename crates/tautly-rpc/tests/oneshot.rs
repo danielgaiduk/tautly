@@ -174,6 +174,30 @@ async fn oneshot_split(
     )
 }
 
+/// A diagnostic after text that ends mid-line ends that line first (on a terminal stdout
+/// and stderr share the screen), and stdout still holds one paragraph break, not two.
+#[tokio::test]
+async fn oneshot_text_ends_the_line_before_a_diagnostic() {
+    let fx = Fx::new();
+    let mock = MockProvider::new(vec![
+        tools_step(vec![
+            tautly_provider::ProviderEvent::TextDelta("Writing it.".into()),
+            call("w1", "write", json!({"path": "out.txt", "content": "x"})),
+        ]),
+        text_step("Denied."),
+    ]);
+    let (code, out, err) = oneshot_split(
+        &fx,
+        fx.builder(config(Mode::Ask), &mock),
+        "write",
+        OutputFormat::Text,
+    )
+    .await;
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(out, "Writing it.\n\nDenied.\n", "{err}");
+    assert!(err.contains("write denied"), "{err}");
+}
+
 #[tokio::test]
 async fn oneshot_text_reports_headless_refusals_on_stderr() {
     let script = || {

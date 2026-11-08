@@ -137,6 +137,11 @@ pub struct ReedlineSource {
     editor: Option<Reedline>,
     answers: Option<Reedline>,
     color: bool,
+    /// The editor has read a line: a later error is a real one, not a terminal it cannot drive.
+    worked: bool,
+    /// Plain line input: the terminal could not drive the editor (it never answered the
+    /// cursor-position query, as some embedded terminals do).
+    plain: bool,
 }
 
 impl ReedlineSource {
@@ -157,10 +162,15 @@ impl ReedlineSource {
             editor: Some(main),
             answers: Some(answers),
             color,
+            worked: false,
+            plain: false,
         })
     }
 
     async fn read_with(&mut self, answer: bool, prompt: &str) -> Result<Line, ReplError> {
+        if self.plain {
+            return plain_line(prompt).await;
+        }
         let slot = if answer {
             &mut self.answers
         } else {
@@ -169,6 +179,7 @@ impl ReedlineSource {
         let mut editor = slot
             .take()
             .ok_or_else(|| std::io::Error::other("the line editor was lost"))?;
+        let raw = prompt.to_string();
         let prompt = PlainPrompt {
             text: prompt.to_string(),
             color: self.color,
@@ -180,13 +191,58 @@ impl ReedlineSource {
         .await
         .map_err(|e| std::io::Error::other(e.to_string()))?;
         *slot = Some(editor);
-        Ok(match signal? {
+        let signal = match signal {
+            Ok(s) => s,
+            Err(e) if !self.worked => {
+                self.plain = true;
+                eprintln!(
+                    "tautly: this terminal cannot run the line editor ({e}); using plain line \
+                     input (no history recall or multi-line editing)"
+                );
+                return plain_line(&raw).await;
+            }
+            Err(e) => return Err(e.into()),
+        };
+        self.worked = true;
+        Ok(match signal {
             Signal::Success(text) => Line::Text(text),
             Signal::CtrlC => Line::CtrlC,
             Signal::CtrlD => Line::CtrlD,
             _ => Line::Text(String::new()),
         })
     }
+}
+
+/// One line from stdin after printing `prompt`, on the blocking pool.
+async fn plain_line(prompt: &str) -> Result<Line, ReplError> {
+    let prompt = prompt.to_string();
+    let line = tokio::task::spawn_blocking(move || {
+        read_plain(
+            &mut std::io::stdin().lock(),
+            &mut std::io::stdout(),
+            &prompt,
+        )
+    })
+    .await
+    .map_err(|e| std::io::Error::other(e.to_string()))??;
+    Ok(line)
+}
+
+/// `prompt` to `out`, then one line of `input` without its line end; Ctrl+D at its end.
+fn read_plain(
+    input: &mut impl std::io::BufRead,
+    out: &mut impl std::io::Write,
+    prompt: &str,
+) -> std::io::Result<Line> {
+    out.write_all(prompt.as_bytes())?;
+    out.flush()?;
+    let mut text = String::new();
+    if input.read_line(&mut text)? == 0 {
+        return Ok(Line::CtrlD);
+    }
+    let end = text.trim_end_matches(['\n', '\r']).len();
+    text.truncate(end);
+    Ok(Line::Text(text))
 }
 
 fn editor() -> Reedline {
@@ -319,6 +375,25 @@ fn unescape(line: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn plain_input_reads_lines_then_ctrl_d() {
+        let mut input = std::io::Cursor::new(b"hello\r\n/help\n".to_vec());
+        let mut out = Vec::new();
+        let read = |i: &mut std::io::Cursor<Vec<u8>>, o: &mut Vec<u8>| {
+            super::read_plain(i, o, "> ").unwrap()
+        };
+        assert_eq!(
+            read(&mut input, &mut out),
+            super::Line::Text("hello".into())
+        );
+        assert_eq!(
+            read(&mut input, &mut out),
+            super::Line::Text("/help".into())
+        );
+        assert_eq!(read(&mut input, &mut out), super::Line::CtrlD);
+        assert_eq!(out, b"> > > ");
+    }
+
     use super::*;
 
     #[test]

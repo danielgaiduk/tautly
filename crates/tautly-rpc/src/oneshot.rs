@@ -150,6 +150,11 @@ impl<W: AsyncWrite + Unpin, E: AsyncWrite + Unpin> Printer<W, E> {
                         self.step_break = true;
                     }
                     if let Some(line) = diagnostic(ev) {
+                        // On a terminal stdout and stderr share lines: end the text's line.
+                        if self.last_text.is_some_and(|c| c != '\n') {
+                            self.write(b"\n").await;
+                            self.last_text = Some('\n');
+                        }
                         // Messages may quote repository text (CP5 review M1).
                         let line = format!("tautly: {}\n", tautly_core::printable_multiline(&line));
                         // Diagnostics are best effort: a closed stderr changes nothing.
