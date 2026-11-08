@@ -173,6 +173,8 @@ async fn four_hour_session_keeps_rss_flat() {
     let (mut compactions, mut tool_errors) = (0, 0);
     let mut samples: Vec<(usize, u64)> = Vec::new();
     let mut heap: Vec<(f64, f64)> = Vec::new();
+    // Linux only: which kind of resident memory grows (at 10 min and at the end).
+    let mut splits: Vec<String> = Vec::new();
     for turn in 1..=TURNS {
         engine
             .send(Command::SendMessage {
@@ -190,6 +192,9 @@ async fn four_hour_session_keeps_rss_flat() {
             }
         }
         if turn % TURNS_PER_10_MIN == 0 {
+            if samples.is_empty() || turn == TURNS {
+                splits.push(rss_split());
+            }
             samples.push((turn / TURNS_PER_10_MIN * 10, rss()));
             heap.push((
                 (turn / TURNS_PER_10_MIN * 10) as f64,
@@ -223,6 +228,9 @@ async fn four_hour_session_keeps_rss_flat() {
         / late.iter().map(|p| (p.0 - mx).powi(2)).sum::<f64>();
     let heap_base = heap[0].1.max(1.0);
     let growth = slope * 240.0 / heap_base;
+    if splits.iter().any(|s| !s.is_empty()) {
+        report(&format!("soak: RSS split {}", splits.join(" -> ")));
+    }
     report(&format!(
         "soak: {TURNS} turns (4 h simulated), {compactions} compactions, {tool_errors} tool errors; \
          RSS MB {}; worst deviation from the 10-minute mark {:.1}%; live heap {:.2} -> {:.2} MB, \
@@ -248,4 +256,19 @@ async fn four_hour_session_keeps_rss_flat() {
         worst <= 0.10,
         "RSS left ±10% of the 10-minute mark: {readings:?}"
     );
+}
+
+/// `RssAnon`, `RssFile` and `RssShmem` of this process (Linux), else empty.
+fn rss_split() -> String {
+    let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+    status
+        .lines()
+        .filter(|l| {
+            ["RssAnon:", "RssFile:", "RssShmem:"]
+                .iter()
+                .any(|k| l.starts_with(k))
+        })
+        .map(|l| l.split_whitespace().take(2).collect::<Vec<_>>().join(" "))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
