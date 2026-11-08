@@ -14,7 +14,7 @@
 //! switch is a fresh start, and a side model that still fails falls back again, with its
 //! one warning.
 
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -215,8 +215,7 @@ impl SideModel for SideRunner {
                 Err(e) => {
                     meter.settle(false);
                     if model_failed(&e) {
-                        *self.failure.lock().unwrap_or_else(PoisonError::into_inner) =
-                            Some(e.to_string());
+                        *crate::lock(&self.failure) = Some(e.to_string());
                     }
                     return Err(e);
                 }
@@ -262,10 +261,7 @@ impl Side {
 
     /// Why a tool's side request failed for good ([`model_failed`]), once.
     pub fn take_failure(&self) -> Option<String> {
-        self.failure
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .take()
+        crate::lock(&self.failure).take()
     }
 
     /// The side route of a session whose main provider is `main` (already wrapped in

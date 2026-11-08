@@ -5,7 +5,7 @@
 
 use std::time::{Duration, Instant};
 
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex};
 
 use futures::{Stream, StreamExt};
 use tautly_tools::ProcessGroups;
@@ -153,7 +153,7 @@ impl SignalRouter {
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, RouterState> {
-        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+        crate::lock(&self.state)
     }
 }
 
@@ -222,7 +222,7 @@ fn install_into(
     listen: impl FnOnce(&Arc<SignalRouter>) -> std::io::Result<JoinHandle<()>>,
     register: impl FnOnce(&SignalRouter),
 ) -> std::io::Result<()> {
-    let mut installed = slot.lock().unwrap_or_else(PoisonError::into_inner);
+    let mut installed = crate::lock(slot);
     let router = match installed.take() {
         Some((router, listener)) if !listener.is_finished() => {
             *installed = Some((Arc::clone(&router), listener));

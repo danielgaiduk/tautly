@@ -53,7 +53,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::{Arc, PoisonError};
+use std::sync::Arc;
 
 use tautly_context::TokenEstimator;
 
@@ -1104,7 +1104,7 @@ impl Session {
         self.reads = Arc::new(ReadTracker::default());
         self.evidence = self.evidence.fresh();
         {
-            let mut b = self.budgets.lock().unwrap_or_else(PoisonError::into_inner);
+            let mut b = crate::lock(&self.budgets);
             for (scope, limit) in &r.budgets {
                 b.set(*scope, *limit);
             }
@@ -1188,7 +1188,7 @@ impl Session {
                 .await;
             }
         }
-        let mut b = self.budgets.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut b = crate::lock(&self.budgets);
         b.spend(&usage, Some(usd));
         b.start_turn();
     }
@@ -1346,12 +1346,8 @@ impl Session {
         self.session_id = id.clone();
         self.adopt_checkpoints(&id, &rebuilt.checkpoints).await;
         self.last_request_path = crate::engine::last_request_path(&path);
-        let fresh = self
-            .budgets
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .without_spend();
-        *self.budgets.lock().unwrap_or_else(PoisonError::into_inner) = fresh;
+        let fresh = crate::lock(&self.budgets).without_spend();
+        *crate::lock(&self.budgets) = fresh;
         let mut resumed = self.adopt(rebuilt);
         for w in std::mem::take(&mut resumed.warnings) {
             self.warn(format!("{what}: {w}")).await;

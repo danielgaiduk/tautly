@@ -37,7 +37,7 @@
 
 use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tautly_context::Context;
@@ -527,10 +527,7 @@ impl Engine {
     /// The session's reasoning level now (spec 4.7): the configured one until a
     /// `SetReasoning` is applied.
     pub fn reasoning(&self) -> ReasoningLevel {
-        *self
-            .reasoning
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
+        *crate::lock(&self.reasoning)
     }
 
     /// Hand a command to the session; an error only when the session has stopped.
@@ -550,10 +547,7 @@ impl Engine {
     /// The id and log of the session the engine is on now: after a `Fork`, the branch
     /// (also announced by `SessionChanged`).
     pub fn current_session(&self) -> (String, PathBuf) {
-        self.current
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone()
+        crate::lock(&self.current).clone()
     }
 
     /// The command channel, held weakly (the signal listener).
@@ -1179,10 +1173,7 @@ impl Actor {
                 self.set_budget(scope, max_usd, max_tokens);
             }
             Command::SetReasoning { level } => {
-                *self
-                    .reasoning
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner) = level;
+                *crate::lock(&self.reasoning) = level;
             }
             cmd @ (Command::Pin { .. }
             | Command::Unpin { .. }
@@ -1224,16 +1215,13 @@ impl Actor {
             });
             return;
         }
-        self.budgets
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .set(
-                scope,
-                Budget {
-                    max_usd,
-                    max_tokens,
-                },
-            );
+        crate::lock(&self.budgets).set(
+            scope,
+            Budget {
+                max_usd,
+                max_tokens,
+            },
+        );
     }
 
     /// Run `f` on the log off the async workers; a first failure is shown.
@@ -1262,8 +1250,7 @@ impl Actor {
         );
         let current = Arc::clone(&self.current);
         let moved = move |id: &str, path: &Path| {
-            *current.lock().unwrap_or_else(PoisonError::into_inner) =
-                (id.to_string(), path.to_path_buf());
+            *crate::lock(&current) = (id.to_string(), path.to_path_buf());
         };
         let handle = tokio::spawn(async move {
             // The job's answer echoes the command's correlation id (`EventSink::tagged`).

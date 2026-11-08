@@ -165,11 +165,6 @@ fn describe(change: &MemoryChange) -> String {
     parts.join(" and ")
 }
 
-/// About four bytes per token: the rule `remember` checked the draft with.
-fn est(s: &str) -> u32 {
-    s.len().div_ceil(4) as u32
-}
-
 /// Whether `effects` may have changed code a memory anchor points at.
 fn touches_code(effects: &[AppliedEffect]) -> bool {
     effects.iter().any(|e| {
@@ -275,7 +270,7 @@ impl Session {
         };
         let checked = tokio::task::spawn_blocking(move || {
             let store = store.read().unwrap_or_else(PoisonError::into_inner);
-            store.draft_to_change(draft, &est)
+            store.draft_to_change(draft, &tautly_memory::approx_tokens)
         })
         .await;
         match checked {

@@ -56,7 +56,7 @@ pub fn build(
     project: &str,
     current: Option<&str>,
 ) -> Result<Vec<TreeNode>, TtError> {
-    let dir = data_home.join("sessions").join(project);
+    let dir = tautly_session::paths::sessions_dir(data_home, project);
     let entries = match std::fs::read_dir(&dir) {
         Ok(e) => e,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -116,9 +116,7 @@ type NodeCache = HashMap<std::path::PathBuf, (u64, std::time::SystemTime, TreeNo
 fn cached_node(path: &Path) -> Option<TreeNode> {
     let meta = std::fs::metadata(path).ok()?;
     let key = (meta.len(), meta.modified().ok()?);
-    let mut cache = NODES
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut cache = crate::lock(&NODES);
     let cache = cache.get_or_insert_with(HashMap::new);
     if let Some((len, mtime, node)) = cache.get(path)
         && (*len, *mtime) == key

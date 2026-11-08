@@ -20,7 +20,6 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::PoisonError;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
@@ -325,10 +324,7 @@ impl Session {
         self.emit(Event::TurnStarted).await;
         // The tool set changes only here, so the turn's requests share one prefix.
         self.refresh_mcp_tools(&ctl.cancel).await;
-        self.budgets
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .start_turn();
+        crate::lock(&self.budgets).start_turn();
         self.context.history.push(Turn {
             messages: vec![Message {
                 role: Role::User,
@@ -627,11 +623,7 @@ impl Session {
         let (mut req, mut status) =
             self.context
                 .assemble(&self.info.caps, &self.specs, &self.model);
-        req.reasoning = self
-            .reasoning
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .resolve(self.info.caps.reasoning);
+        req.reasoning = crate::lock(&self.reasoning).resolve(self.info.caps.reasoning);
         if self.memory.live && self.memory.over_budget {
             status.warnings.push(OVER_BUDGET_WARNING.to_string());
         }
@@ -1097,7 +1089,7 @@ impl Session {
         })
         .await;
         {
-            let mut budgets = self.budgets.lock().unwrap_or_else(PoisonError::into_inner);
+            let mut budgets = crate::lock(&self.budgets);
             budgets.spend(&u, cost);
             if cost.is_none() {
                 budgets.note_unpriced(model.as_str());
@@ -1109,7 +1101,7 @@ impl Session {
     /// Show what the budgets have to say, and which one (if any) is used up.
     pub(crate) async fn budget_exhausted(&self) -> Option<BudgetScope> {
         let (news, exceeded) = {
-            let mut b = self.budgets.lock().unwrap_or_else(PoisonError::into_inner);
+            let mut b = crate::lock(&self.budgets);
             (b.news(), b.exceeded())
         };
         for w in news {

@@ -17,9 +17,10 @@
 //! later, or a changed tool list, joins at the next one, with a warning that the cached
 //! prefix breaks once (that step's epoch is then forced cold).
 
+use crate::lock;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -661,10 +662,6 @@ impl McpSession {
     pub async fn shutdown(&self) {
         self.hub.shutdown().await;
     }
-}
-
-fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 fn status_event(server: &str, state: McpState, tools: u32, message: Option<&str>) -> Event {

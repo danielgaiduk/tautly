@@ -118,10 +118,7 @@ struct Link {
 /// `<data_home>/sessions/<project>/<id>.jsonl`, when both are plain ids.
 fn log_path(data_home: &Path, project: &str, id: &str) -> Option<PathBuf> {
     (check_session(project).is_ok() && check_session(id).is_ok()).then(|| {
-        data_home
-            .join("sessions")
-            .join(project)
-            .join(format!("{id}.jsonl"))
+        tautly_session::paths::sessions_dir(data_home, project).join(format!("{id}.jsonl"))
     })
 }
 

@@ -26,7 +26,7 @@
 //! epoch; logs `ModelSet` and emits `ModelChanged`.
 
 use std::future::Future;
-use std::sync::{Arc, PoisonError};
+use std::sync::Arc;
 
 use tautly_context::TokenEstimator;
 use tautly_provider::{Catalog, ModelId, Provider, ProviderError, Retrying};
@@ -217,10 +217,7 @@ impl Session {
             .collect();
         self.tools = registry(mcp);
         self.specs = self.tools.iter().map(|t| t.spec(&info.caps)).collect();
-        self.budgets
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .set_model(info.price.is_some(), model.as_str());
+        crate::lock(&self.budgets).set_model(info.price.is_some(), model.as_str());
         self.info = info;
         self.model = model.clone();
         self.setup.config.model = model.clone();

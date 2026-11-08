@@ -15,7 +15,7 @@ use std::fs::{File, OpenOptions};
 use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, PoisonError, RwLock, Weak};
+use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::Duration;
 
 use tautly_index::{Index, WatchHandle};
@@ -329,7 +329,7 @@ impl Workspaces {
     /// `LocalSandbox` (nothing is opened until a session starts it).
     pub fn get(&self, start: &Path) -> Result<Arc<Workspace>, EngineError> {
         let root = session_root(start)?;
-        let mut open = self.open.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut open = crate::lock(&self.open);
         open.retain(|_, ws| ws.strong_count() > 0);
         if let Some(ws) = open.get(&root).and_then(Weak::upgrade) {
             return Ok(ws);

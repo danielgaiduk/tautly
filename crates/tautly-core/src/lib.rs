@@ -94,3 +94,8 @@ pub use tautly_session::{
     Error as LogError, Origin, SessionReader, SessionSummary as LogSummary,
     list_here_in as list_logs_here, list_in as list_logs,
 };
+
+/// A mutex's guard even when a panicking holder poisoned it: the data is still usable.
+pub(crate) fn lock<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}

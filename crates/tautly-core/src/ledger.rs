@@ -1,8 +1,9 @@
 //! The cost ledger (spec 4.6): one SQLite row per provider response, across sessions and
 //! processes, at `<data home>/ledger.sqlite`.
 
+use crate::lock;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, params};
@@ -574,7 +575,7 @@ impl Ledger {
     }
 
     fn conn(&self) -> std::sync::MutexGuard<'_, Connection> {
-        self.conn.lock().unwrap_or_else(PoisonError::into_inner)
+        crate::lock(&self.conn)
     }
 }
 
@@ -690,10 +691,6 @@ impl Drop for CostLedger {
     fn drop(&mut self) {
         lock(&self.sink).take();
     }
-}
-
-fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 impl CostLedger {
