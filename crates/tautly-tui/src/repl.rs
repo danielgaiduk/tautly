@@ -32,6 +32,8 @@ const DOUBLE_INTERRUPT: Duration = tautly_core::signals::DOUBLE_INTERRUPT;
 const QUIET: Duration = Duration::from_millis(200);
 /// Sessions `/resume` lists.
 const RESUME_LIST: usize = 10;
+/// After an exit by Ctrl+C, how long the REPL waits for the session to finish.
+const FORCED_CLOSE: Duration = Duration::from_secs(3);
 
 /// Run the REPL until Ctrl+D (or a second Ctrl+C within 2 s of one that cancelled), then
 /// shut the session down and wait for its last event. `signals` yields one item per
@@ -62,6 +64,7 @@ pub async fn run_repl(
         last_interrupt: None,
         answered: HashSet::new(),
         listing: Vec::new(),
+        ids: 0,
     };
     // A session resumed at start (`--continue`) counts its earlier turns in the total.
     let first = repl.engine.session_id().to_string();
@@ -110,6 +113,8 @@ struct Repl<I, W, S> {
     answered: HashSet<String>,
     /// The session ids `/resume` listed last, newest first.
     listing: Vec<String>,
+    /// The last correlation id given to a command (`repl-<n>`).
+    ids: u64,
 }
 
 impl<I, W, S> Repl<I, W, S>
@@ -131,7 +136,10 @@ where
             self.st.typed();
             let text = match line {
                 Line::CtrlD => return Ok(()),
-                Line::CtrlC if self.recently_interrupted() => return Ok(()),
+                Line::CtrlC if self.recently_interrupted() => {
+                    self.last_interrupt = Some(Instant::now());
+                    return Ok(());
+                }
                 Line::CtrlC => continue,
                 Line::Text(t) => t,
             };
@@ -142,10 +150,17 @@ where
             let exit = match slash::parse(&text) {
                 Some(cmd) => self.slash(cmd).await?,
                 None => {
-                    self.send(Command::SendMessage { text }).await?;
+                    let id = self.next_id();
+                    self.send(Command::SendMessage {
+                        id: Some(id.clone()),
+                        text,
+                    })
+                    .await?;
                     matches!(
-                        self.pump(|e| matches!(e, Event::TurnFinished { .. }))
-                            .await?,
+                        self.pump(|e| {
+                            matches!(e, Event::TurnFinished { .. }) && e.answers(Some(&id))
+                        })
+                        .await?,
                         Pumped::Exit
                     )
                 }
@@ -156,15 +171,39 @@ where
         }
     }
 
-    /// Shut the session down and print its last events.
+    /// Shut the session down and print its last events. After an exit by Ctrl+C the wait
+    /// is bounded ([`FORCED_CLOSE`]); a Ctrl+C meanwhile stops waiting at once (spec 8:
+    /// "second Ctrl-C exits"). The session's process groups die with the engine.
     async fn close(&mut self) -> Result<(), ReplError> {
+        let forced = self.recently_interrupted();
         let _ = self.engine.send(Command::Shutdown).await;
-        while let Some(ev) = self.events.recv().await {
+        if forced {
+            let text = self.dim("finishing the session (Ctrl+C to stop now)…");
+            self.print_line(&text).await?;
+        }
+        // A SIGINT from before the shutdown is the one that exited.
+        while let Some(Some(())) = self.signals.next().now_or_never() {}
+        let deadline = tokio::time::Instant::now() + FORCED_CLOSE;
+        loop {
+            let ev = tokio::select! {
+                biased;
+                Some(()) = self.signals.next() => return Ok(()),
+                () = tokio::time::sleep_until(deadline), if forced => return Ok(()),
+                ev = self.events.recv() => ev,
+            };
+            let Some(ev) = ev else {
+                return Ok(());
+            };
             if let Some(text) = render::event(&ev, &mut self.st, &self.opts) {
                 self.write(&text).await?;
             }
         }
-        Ok(())
+    }
+
+    /// A fresh correlation id for a command whose answer the REPL waits for.
+    fn next_id(&mut self) -> String {
+        self.ids += 1;
+        format!("repl-{}", self.ids)
     }
 
     async fn send(&mut self, cmd: Command) -> Result<(), ReplError> {
@@ -240,6 +279,8 @@ where
     /// A Ctrl+C while something runs: cancel it, or exit when one came within 2 s.
     async fn interrupt(&mut self) -> Result<bool, ReplError> {
         if self.recently_interrupted() {
+            // The exit's own Ctrl+C: the close that follows is bounded.
+            self.last_interrupt = Some(Instant::now());
             return Ok(true);
         }
         self.last_interrupt = Some(Instant::now());
@@ -373,13 +414,18 @@ where
         match cmd {
             Slash::Model(None) => self.list_models().await?,
             Slash::Model(Some(m)) => {
+                let id = self.next_id();
                 self.send(Command::SetModel {
+                    id: Some(id.clone()),
                     model: ModelId::from(m.as_str()),
                 })
                 .await?;
                 return Ok(exit(
-                    self.pump(|e| matches!(e, Event::ModelChanged { .. } | Event::Error { .. }))
-                        .await?,
+                    self.pump(|e| {
+                        matches!(e, Event::ModelChanged { .. } | Event::Error { .. })
+                            && e.answers(Some(&id))
+                    })
+                    .await?,
                 ));
             }
             Slash::Cost => {
@@ -387,22 +433,36 @@ where
                 self.print_line(&text).await?;
             }
             Slash::Diff(turn) => {
-                self.send(Command::Diff { turn }).await?;
+                let id = self.next_id();
+                self.send(Command::Diff {
+                    id: Some(id.clone()),
+                    turn,
+                })
+                .await?;
                 return Ok(exit(
-                    self.pump(|e| matches!(e, Event::SessionDiff { .. } | Event::Error { .. }))
-                        .await?,
+                    self.pump(|e| {
+                        matches!(e, Event::SessionDiff { .. } | Event::Error { .. })
+                            && e.answers(Some(&id))
+                    })
+                    .await?,
                 ));
             }
             Slash::Undo(turn) => return self.undo(turn).await,
             Slash::Resume(None) => self.list_sessions().await?,
             Slash::Resume(Some(which)) => return self.resume(&which).await,
             Slash::Compact => {
-                self.send(Command::Compact).await?;
+                let id = self.next_id();
+                self.send(Command::Compact {
+                    id: Some(id.clone()),
+                })
+                .await?;
                 // Ends with `CompactFinished`, after the summary (or the warning or error
                 // saying why nothing was compacted).
                 return Ok(exit(
-                    self.pump(|e| matches!(e, Event::CompactFinished { .. }))
-                        .await?,
+                    self.pump(|e| {
+                        matches!(e, Event::CompactFinished { .. }) && e.answers(Some(&id))
+                    })
+                    .await?,
                 ));
             }
             Slash::Pin(text) => {
@@ -414,14 +474,19 @@ where
                 return self.quiet().await;
             }
             Slash::Fork => {
+                let id = self.next_id();
                 self.send(Command::Fork {
+                    id: Some(id.clone()),
                     at: None,
                     label: None,
                 })
                 .await?;
                 return Ok(exit(
-                    self.pump(|e| matches!(e, Event::SessionChanged { .. } | Event::Error { .. }))
-                        .await?,
+                    self.pump(|e| {
+                        matches!(e, Event::SessionChanged { .. } | Event::Error { .. })
+                            && e.answers(Some(&id))
+                    })
+                    .await?,
                 ));
             }
             Slash::Rewind(at) => return self.rewind(at).await,
@@ -432,7 +497,9 @@ where
                 return self.quiet().await;
             }
             Slash::Replay(session_id) => {
+                let id = self.next_id();
                 self.send(Command::Replay {
+                    id: Some(id.clone()),
                     session_id,
                     speed: 1.0,
                     from_step: None,
@@ -442,24 +509,27 @@ where
                 // `ReplayFinished` (after its `Error`, when it cannot start), except one
                 // refused because something runs.
                 return Ok(exit(
-                    self.pump(|e| match e {
-                        Event::ReplayFinished { .. } => true,
-                        Event::Error { message, .. } => message == REPLAY_BUSY,
-                        _ => false,
+                    self.pump(|e| {
+                        e.answers(Some(&id))
+                            && match e {
+                                Event::ReplayFinished { .. } => true,
+                                Event::Error { message, .. } => message == REPLAY_BUSY,
+                                _ => false,
+                            }
                     })
                     .await?,
                 ));
             }
             Slash::MemoryConsolidate => {
-                self.send(Command::ConsolidateMemory).await?;
+                let id = self.next_id();
+                self.send(Command::ConsolidateMemory {
+                    id: Some(id.clone()),
+                })
+                .await?;
+                // Each proposal is asked on the way (`handle`); the end comes last.
                 return Ok(exit(
                     self.pump(|e| {
-                        matches!(
-                            e,
-                            Event::MemoryProposed { .. }
-                                | Event::Warning { .. }
-                                | Event::Error { .. }
-                        )
+                        matches!(e, Event::ConsolidateFinished { .. }) && e.answers(Some(&id))
                     })
                     .await?,
                 ));
@@ -475,8 +545,12 @@ where
 
     /// `/undo [N]`: the dry run, then (on `y`) the undo.
     async fn undo(&mut self, turn: Option<u32>) -> Result<bool, ReplError> {
-        let answered = |e: &Event| matches!(e, Event::Undone { .. } | Event::Error { .. });
+        let id = self.next_id();
+        let answered = |e: &Event| {
+            matches!(e, Event::Undone { .. } | Event::Error { .. }) && e.answers(Some(&id))
+        };
         self.send(Command::Undo {
+            id: Some(id.clone()),
             turn,
             dry_run: true,
         })
@@ -492,18 +566,29 @@ where
         if exit || !yes {
             return Ok(exit);
         }
+        // The dry run's turn: the undo applies to what was shown.
+        let shown_turn = match *shown {
+            Event::Undone { turn, .. } => Some(turn),
+            _ => turn,
+        };
+        let id = self.next_id();
         self.send(Command::Undo {
-            turn,
+            id: Some(id.clone()),
+            turn: shown_turn,
             dry_run: false,
         })
         .await?;
-        Ok(matches!(self.pump(answered).await?, Pumped::Exit))
+        let done = |e: &Event| {
+            matches!(e, Event::Undone { .. } | Event::Error { .. }) && e.answers(Some(&id))
+        };
+        Ok(matches!(self.pump(done).await?, Pumped::Exit))
     }
 
     /// `/rewind N`: the dry run, then (on `y`) the rewind; with conflicts, a second
     /// question before they are overwritten.
     async fn rewind(&mut self, at: u32) -> Result<bool, ReplError> {
-        let rewind = |dry_run, overwrite| Command::Rewind {
+        let rewind = |id, dry_run, overwrite| Command::Rewind {
+            id: Some(id),
             at,
             label: None,
             dry_run,
@@ -523,14 +608,15 @@ where
             self.print_line(&text).await?;
             return Ok(false);
         };
-        let (id, name) = (
+        let (branch, name) = (
             node.session_id.clone(),
             node.label
                 .clone()
                 .unwrap_or_else(|| node.session_id.chars().take(8).collect()),
         );
-        let switch = |dry_run, overwrite| Command::Switch {
-            session_id: id.clone(),
+        let switch = |reply, dry_run, overwrite| Command::Switch {
+            id: Some(reply),
+            session_id: branch.clone(),
             dry_run,
             overwrite,
         };
@@ -538,21 +624,24 @@ where
         self.materialize(switch, &prompt).await
     }
 
-    /// A rewind or switch: `cmd(dry_run, overwrite)`'s dry run, the question `prompt`, on
-    /// conflicts whether to overwrite them (a backup is kept), then the command itself.
+    /// A rewind or switch: `cmd(id, dry_run, overwrite)`'s dry run, the question `prompt`,
+    /// on conflicts whether to overwrite them (a backup is kept), then the command itself.
     async fn materialize(
         &mut self,
-        cmd: impl Fn(bool, Vec<String>) -> Command,
+        cmd: impl Fn(String, bool, Vec<String>) -> Command,
         prompt: &str,
     ) -> Result<bool, ReplError> {
-        let answered = |e: &Event| {
-            matches!(
-                e,
-                Event::Rewound { .. } | Event::Switched { .. } | Event::Error { .. }
-            )
-        };
-        self.send(cmd(true, Vec::new())).await?;
-        let shown = match self.pump(answered).await? {
+        fn answered(id: &str) -> impl Fn(&Event) -> bool + '_ {
+            move |e| {
+                matches!(
+                    e,
+                    Event::Rewound { .. } | Event::Switched { .. } | Event::Error { .. }
+                ) && e.answers(Some(id))
+            }
+        }
+        let id = self.next_id();
+        self.send(cmd(id.clone(), true, Vec::new())).await?;
+        let shown = match self.pump(answered(&id)).await? {
             Pumped::Exit => return Ok(true),
             Pumped::Done(ev) => ev,
         };
@@ -583,8 +672,9 @@ where
                 return Ok(exit);
             }
         }
-        self.send(cmd(false, report.conflicts)).await?;
-        let done = match self.pump(answered).await? {
+        let id = self.next_id();
+        self.send(cmd(id.clone(), false, report.conflicts)).await?;
+        let done = match self.pump(answered(&id)).await? {
             Pumped::Exit => return Ok(true),
             Pumped::Done(ev) => ev,
         };
@@ -593,7 +683,10 @@ where
             Event::Rewound { report, .. } | Event::Switched { report, .. } if report.applied
         );
         if applied {
-            let moved = |e: &Event| matches!(e, Event::SessionChanged { .. } | Event::Error { .. });
+            let moved = |e: &Event| {
+                matches!(e, Event::SessionChanged { .. } | Event::Error { .. })
+                    && e.answers(Some(&id))
+            };
             return Ok(matches!(self.pump(moved).await?, Pumped::Exit));
         }
         Ok(false)

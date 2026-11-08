@@ -119,6 +119,7 @@ impl Session {
     pub async fn set_model(&mut self, model: ModelId, stop: impl Future<Output = ()>) {
         if model == self.model {
             self.emit(Event::ModelChanged {
+                id: None,
                 provider: provider_label(&model),
                 model,
             })
@@ -134,6 +135,7 @@ impl Session {
             Some(Ok(b)) => b,
             None => {
                 self.emit(Event::Error {
+                    id: None,
                     kind: ErrorKind::ProviderFatal,
                     message: format!("cannot switch to {model}: the session is shutting down"),
                     retryable: false,
@@ -144,6 +146,7 @@ impl Session {
             }
             Some(Err(e)) => {
                 self.emit(Event::Error {
+                    id: None,
                     kind: ErrorKind::ProviderFatal,
                     message: format!("cannot switch to {model}: {e}"),
                     retryable: false,
@@ -181,6 +184,7 @@ impl Session {
         .await;
         self.checkpoint().await;
         self.emit(Event::ModelChanged {
+            id: None,
             model,
             provider: label,
         })
@@ -257,6 +261,7 @@ impl Session {
             Ok((provider, side, side_note)) => {
                 self.install_model(&model, provider, side, side_note).await;
                 self.emit(Event::ModelChanged {
+                    id: None,
                     provider: provider_label(&model),
                     model,
                 })

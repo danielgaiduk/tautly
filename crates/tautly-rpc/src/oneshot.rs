@@ -68,7 +68,10 @@ pub async fn run_oneshot_to(
     };
     let mut code = None;
     if engine
-        .send(Command::SendMessage { text: prompt })
+        .send(Command::SendMessage {
+            id: None,
+            text: prompt,
+        })
         .await
         .is_ok()
     {
@@ -135,7 +138,8 @@ impl<W: AsyncWrite + Unpin, E: AsyncWrite + Unpin> Printer<W, E> {
                 }
                 ev => {
                     if let Some(line) = diagnostic(ev) {
-                        let line = format!("tautly: {line}\n");
+                        // Messages may quote repository text (CP5 review M1).
+                        let line = format!("tautly: {}\n", tautly_core::printable_multiline(&line));
                         // Diagnostics are best effort: a closed stderr changes nothing.
                         let _ = self.err.write_all(line.as_bytes()).await;
                         let _ = self.err.flush().await;

@@ -128,7 +128,10 @@ fn start(b: EngineBuilder) -> Run {
 impl Run {
     async fn say(&self, text: &str) {
         self.engine
-            .send(Command::SendMessage { text: text.into() })
+            .send(Command::SendMessage {
+                id: None,
+                text: text.into(),
+            })
             .await
             .unwrap();
     }

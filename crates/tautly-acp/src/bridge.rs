@@ -19,8 +19,8 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use serde_json::{Value, json};
 use tautly_core::{
-    Command, DiffPreview, EffectView, Engine, ErrorKind, Event, FinishReason, McpState,
-    MemoryChange, ProviderEvent, SessionReader, SessionRecord, TestEvidence, printable,
+    Command, DiffPreview, EffectView, Engine, Event, FinishReason, McpState, MemoryChange,
+    SessionReader, SessionRecord, TestEvidence, printable,
 };
 use tautly_rpc::jsonrpc::{
     self, Error, INVALID_PARAMS, INVALID_REQUEST, Line, MAX_LINE, METHOD_NOT_FOUND,
@@ -47,6 +47,8 @@ const INTERNAL_ERROR: i64 = -32603;
 const NOT_FOUND: i64 = -32002;
 /// Lines waiting for the output before producers wait.
 const OUTPUT_CAPACITY: usize = 1024;
+/// Updates of a loaded session read ahead of the client.
+const REPLAY_BOUND: usize = 64;
 
 /// An ACP agent serving sessions from a factory.
 pub struct Bridge {
@@ -441,16 +443,20 @@ impl Conn {
             let log = session.engine.session_path().to_path_buf();
             let root = session.root.clone();
             let (home, id) = (self.data_home.clone(), session.id.clone());
-            let (updates, spent) = tokio::task::spawn_blocking(move || {
-                (
-                    replay(&log, &root),
-                    home.and_then(|h| ledger_spend(&h, &id)),
-                )
-            })
-            .await
-            .unwrap_or_default();
+            let spent =
+                tokio::task::spawn_blocking(move || home.and_then(|h| ledger_spend(&h, &id)))
+                    .await
+                    .ok()
+                    .flatten();
             lock(&session.st).cost_usd = spent.unwrap_or(0.0);
-            for u in updates {
+            // Streamed through a bounded channel: memory stays bounded however large the
+            // history, and the first update goes out before the rest is read.
+            let (tx, mut rx) = mpsc::channel(REPLAY_BOUND);
+            tokio::task::spawn_blocking(move || {
+                // A dropped receiver (the connection went away) stops the reader.
+                replay(&log, &root, &mut |u| tx.blocking_send(u).is_ok());
+            });
+            while let Some(u) = rx.recv().await {
                 self.update(&session.id, u).await;
             }
         }
@@ -487,15 +493,36 @@ impl Conn {
         let done = |stop: StopReason| -> Reply {
             Box::pin(async move { Ok(json!({"stopReason": stop})) })
         };
+        // A command's answer is matched by its correlation id: a late answer to an
+        // earlier (cancelled) prompt never answers this one.
+        let cmd_id = session.next_id();
         let (until, command) = match map::slash(&text) {
-            None => (Until::Turn, Command::SendMessage { text }),
-            Some(Slash::Compact) => (Until::Compact, Command::Compact),
-            Some(Slash::Diff(turn)) => (Until::Diff, Command::Diff { turn }),
+            None => (
+                Until::Turn,
+                Command::SendMessage {
+                    id: Some(cmd_id.clone()),
+                    text,
+                },
+            ),
+            Some(Slash::Compact) => (
+                Until::Compact,
+                Command::Compact {
+                    id: Some(cmd_id.clone()),
+                },
+            ),
+            Some(Slash::Diff(turn)) => (
+                Until::Diff,
+                Command::Diff {
+                    id: Some(cmd_id.clone()),
+                    turn,
+                },
+            ),
             // A dry run first: the editor is asked before anything is undone (spec
             // 7.11.8's `/undo`).
             Some(Slash::Undo(turn)) => (
                 Until::UndoPreview,
                 Command::Undo {
+                    id: Some(cmd_id.clone()),
                     turn,
                     dry_run: true,
                 },
@@ -526,6 +553,7 @@ impl Conn {
             }
             st.waiter = Some(Waiter {
                 until,
+                cmd_id: command.id().map(str::to_string),
                 cancelled: false,
                 reply: tx,
             });
@@ -560,17 +588,20 @@ impl Conn {
             return Err(invalid("this session offers no model choice"));
         }
         let (tx, rx) = oneshot::channel();
+        let id = session.next_id();
         let busy = {
             let mut st = lock(&session.st);
             let busy = st.waiter.is_some();
             st.switch = Some(ModelSwitch {
                 model: model.clone(),
+                id: id.clone(),
                 reply: (!busy).then_some(tx),
             });
             busy
         };
         session
             .send(Command::SetModel {
+                id: Some(id),
                 model: model.as_str().into(),
             })
             .await?;
@@ -635,11 +666,15 @@ enum Until {
 /// was sent during a turn and answered at once).
 struct ModelSwitch {
     model: String,
+    /// The `SetModel`'s correlation id: its refusal echoes it.
+    id: String,
     reply: Option<oneshot::Sender<Result<(), String>>>,
 }
 
 struct Waiter {
     until: Until,
+    /// The correlation id of the command whose answer this waits for.
+    cmd_id: Option<String>,
     /// `session/cancel` came: the prompt answers `cancelled` whatever the turn says.
     cancelled: bool,
     reply: oneshot::Sender<Result<StopReason, Error>>,
@@ -659,6 +694,8 @@ struct Session {
     root: PathBuf,
     engine: Engine,
     st: Mutex<SessionState>,
+    /// The last correlation id given to a command (`acp-<n>`).
+    ids: AtomicU64,
 }
 
 #[derive(Default)]
@@ -676,6 +713,9 @@ struct SessionState {
     receipt: Option<Event>,
     /// The last error of the running turn.
     last_error: Option<String>,
+    /// Finished-edit updates being built off the forwarder (they may read the log); the
+    /// turn's end waits for them, so they come before the prompt's answer.
+    building: Vec<JoinHandle<()>>,
 }
 
 fn chunk(text: &str) -> Value {
@@ -716,9 +756,13 @@ impl SessionState {
         }
     }
 
-    fn take_waiter(&mut self, until: Until) -> Option<Waiter> {
+    /// The waiter for `until`, when `ev` answers it: the event echoes its command's
+    /// correlation id (a waiter without one takes any).
+    fn take_waiter(&mut self, until: Until, ev: Option<&str>) -> Option<Waiter> {
         match &self.waiter {
-            Some(w) if w.until == until => self.waiter.take(),
+            Some(w) if w.until == until && (w.cmd_id.is_none() || w.cmd_id.as_deref() == ev) => {
+                self.waiter.take()
+            }
             _ => None,
         }
     }
@@ -744,7 +788,13 @@ impl Session {
                 models,
                 ..SessionState::default()
             }),
+            ids: AtomicU64::new(0),
         }
+    }
+
+    /// A fresh correlation id for a command whose answer the bridge waits for.
+    fn next_id(&self) -> String {
+        format!("acp-{}", self.ids.fetch_add(1, Ordering::Relaxed) + 1)
     }
 
     fn opened_result(&self) -> Value {
@@ -933,21 +983,34 @@ async fn on_event(conn: &Arc<Conn>, s: &Arc<Session>, ev: Event) {
             let edited = effects
                 .iter()
                 .any(|e| matches!(e, EffectView::Edited { .. } | EffectView::Deleted { .. }));
-            if edited && !is_error {
-                content.extend(finished_diffs(s, &call_id, &effects, diff).await);
-            }
             let status = if is_error || blocked {
                 ToolCallStatus::Failed
             } else {
                 ToolCallStatus::Completed
             };
-            let u = ToolCallUpdate {
-                tool_call_id: call_id,
-                status: Some(status),
-                content: Some(content),
-                ..ToolCallUpdate::default()
+            let (conn2, s2) = (Arc::clone(conn), Arc::clone(s));
+            let send = async move {
+                if edited && !is_error {
+                    content.extend(finished_diffs(&s2, &call_id, &effects, diff).await);
+                }
+                let u = ToolCallUpdate {
+                    tool_call_id: call_id,
+                    status: Some(status),
+                    content: Some(content),
+                    ..ToolCallUpdate::default()
+                };
+                conn2.update(&s2.id, tool_update(u)).await;
             };
-            conn.update(&s.id, tool_update(u)).await;
+            if edited && !is_error {
+                // Its diff may need a log read: built off the forwarder, so the turn's
+                // events keep flowing (this call's last update, so its order holds).
+                let done = tokio::spawn(send);
+                let mut st = lock(&s.st);
+                st.building.retain(|h| !h.is_finished());
+                st.building.push(done);
+            } else {
+                send.await;
+            }
         }
         Event::Usage { cost_usd, .. } => {
             let update = {
@@ -978,10 +1041,11 @@ async fn on_event(conn: &Arc<Conn>, s: &Arc<Session>, ev: Event) {
             }
         }
         Event::CompactFinished {
+            id,
             applied,
             tokens_freed,
         } => {
-            let waiter = lock(&s.st).take_waiter(Until::Compact);
+            let waiter = lock(&s.st).take_waiter(Until::Compact, id.as_deref());
             if let Some(w) = waiter {
                 if applied {
                     let text = format!("context compacted: {tokens_freed} tokens freed");
@@ -1046,21 +1110,20 @@ async fn on_event(conn: &Arc<Conn>, s: &Arc<Session>, ev: Event) {
         ev @ Event::TurnReceipt { .. } => {
             lock(&s.st).receipt = Some(ev);
         }
-        Event::TurnFinished { reason, evidence } => turn_finished(conn, s, reason, evidence).await,
+        Event::TurnFinished {
+            id,
+            reason,
+            evidence,
+        } => turn_finished(conn, s, id, reason, evidence).await,
         Event::Error {
-            kind,
-            message,
-            hint,
-            ..
+            id, message, hint, ..
         } => {
             // A failed model switch is the switch's answer, never the turn's or a
-            // command's: its message names the model (`cannot switch to <model>: ...`).
+            // command's: it echoes the `SetModel`'s correlation id.
             let switch = {
                 let mut st = lock(&s.st);
-                st.switch.take_if(|sw| {
-                    kind == ErrorKind::ProviderFatal
-                        && message.starts_with(&format!("cannot switch to {}:", sw.model))
-                })
+                st.switch
+                    .take_if(|sw| id.as_deref() == Some(sw.id.as_str()))
             };
             let text = match hint {
                 Some(h) => format!("{message}\nhint: {h}"),
@@ -1089,8 +1152,11 @@ async fn on_event(conn: &Arc<Conn>, s: &Arc<Session>, ev: Event) {
             let (command, compacting) = {
                 let mut st = lock(&s.st);
                 st.last_error = Some(text.clone());
-                let command = st.waiter.take_if(|w| {
-                    matches!(w.until, Until::Diff | Until::UndoPreview | Until::Undone)
+                // A `/diff` or undo error echoes its command's id.
+                let command = st.waiter.take_if(|w| match w.until {
+                    Until::Diff => w.cmd_id == id,
+                    Until::UndoPreview | Until::Undone => w.cmd_id == id,
+                    _ => false,
                 });
                 (
                     command,
@@ -1109,8 +1175,10 @@ async fn on_event(conn: &Arc<Conn>, s: &Arc<Session>, ev: Event) {
                 tell(conn, s, "error", &text, None, false).await;
             }
         }
-        Event::SessionDiff { files, unified, .. } => {
-            let waiter = lock(&s.st).take_waiter(Until::Diff);
+        Event::SessionDiff {
+            id, files, unified, ..
+        } => {
+            let waiter = lock(&s.st).take_waiter(Until::Diff, id.as_deref());
             if let Some(w) = waiter {
                 let text = if files.is_empty() {
                     "no changes by Tautly's tools in this scope".to_string()
@@ -1122,6 +1190,7 @@ async fn on_event(conn: &Arc<Conn>, s: &Arc<Session>, ev: Event) {
             }
         }
         Event::Undone {
+            id,
             turn,
             restored,
             deleted,
@@ -1135,7 +1204,7 @@ async fn on_event(conn: &Arc<Conn>, s: &Arc<Session>, ev: Event) {
                 let asking = {
                     let mut st = lock(&s.st);
                     match &mut st.waiter {
-                        Some(w) if w.until == Until::UndoPreview && !nothing => {
+                        Some(w) if w.until == Until::UndoPreview && w.cmd_id == id && !nothing => {
                             w.until = Until::UndoAsk;
                             true
                         }
@@ -1147,7 +1216,7 @@ async fn on_event(conn: &Arc<Conn>, s: &Arc<Session>, ev: Event) {
                     tokio::spawn(async move { ask_undo(&conn, &s, turn, list).await });
                     return;
                 }
-                let waiter = lock(&s.st).take_waiter(Until::UndoPreview);
+                let waiter = lock(&s.st).take_waiter(Until::UndoPreview, id.as_deref());
                 if let Some(w) = waiter {
                     let text = format!("nothing to undo in turn {turn}{list}");
                     conn.update(&s.id, chunk(&text)).await;
@@ -1155,7 +1224,7 @@ async fn on_event(conn: &Arc<Conn>, s: &Arc<Session>, ev: Event) {
                 }
                 return;
             }
-            let waiter = lock(&s.st).take_waiter(Until::Undone);
+            let waiter = lock(&s.st).take_waiter(Until::Undone, id.as_deref());
             if let Some(w) = waiter {
                 let text = format!(
                     "undid turn {turn}: {} restored, {} deleted{list}",
@@ -1187,6 +1256,11 @@ async fn on_event(conn: &Arc<Conn>, s: &Arc<Session>, ev: Event) {
                 let _ = w.send(Ok(()));
             }
         }
+        // The engine no longer waits for it (a cancelled or stopped turn, a shutdown): an
+        // answer the editor still gives is not sent.
+        Event::ApprovalWithdrawn { request_id } => {
+            lock(&s.st).approvals.remove(&request_id);
+        }
         Event::Warning { message } => {
             // During `/compact`, the user asked: shown in the answer (which still ends
             // with `CompactFinished`).
@@ -1209,13 +1283,19 @@ fn tool_update(u: ToolCallUpdate) -> Value {
 async fn turn_finished(
     conn: &Conn,
     s: &Session,
+    id: Option<String>,
     reason: FinishReason,
     evidence: Option<TestEvidence>,
 ) {
+    // The turn's finished-edit updates go out before its end.
+    let building = std::mem::take(&mut lock(&s.st).building);
+    for b in building {
+        let _ = b.await;
+    }
     let (waiter, receipt, error) = {
         let mut st = lock(&s.st);
         (
-            st.take_waiter(Until::Turn),
+            st.take_waiter(Until::Turn, id.as_deref()),
             st.receipt.clone(),
             st.last_error.take(),
         )
@@ -1459,85 +1539,85 @@ fn call_edits(path: &Path, id: &str) -> Option<Vec<FileChange>> {
 }
 
 /// The updates that replay a resumed session (spec 7.11.9): its user messages, the
-/// agent's messages and its tool calls in their final state. Blocking file I/O.
-fn replay(log: &Path, root: &Path) -> Vec<Value> {
+/// agent's messages and its tool calls in their final state, from core's playback mapping
+/// ([`tautly_core::replay::events`]) with each finished edit's diff from the `Edit` records
+/// behind its result (a rewind's asserted contents left out, as in turn diffs). `out`
+/// returning false (nobody reads any more) stops it. Blocking file I/O.
+fn replay(log: &Path, root: &Path, out: &mut dyn FnMut(Value) -> bool) {
     let Ok(reader) = SessionReader::<SessionRecord>::open(log) else {
-        return Vec::new();
+        return;
     };
-    let mut out = Vec::new();
-    let mut calls: HashMap<String, (String, Value)> = HashMap::new();
-    // A finished call waits for the `Edit` records behind its result.
-    let mut open: Option<(ToolCall, Vec<ToolCallContent>)> = None;
-    let flush = |open: &mut Option<(ToolCall, Vec<ToolCallContent>)>, out: &mut Vec<Value>| {
-        if let Some((mut call, diffs)) = open.take() {
-            call.content.extend(diffs);
-            let mut v = serde_json::to_value(call).unwrap_or_default();
-            v["sessionUpdate"] = json!("tool_call");
-            out.push(v);
-        }
-    };
+    // Each call's `Edit` records (blob references only), read ahead of the events.
+    let mut edits: HashMap<String, Vec<SessionRecord>> = HashMap::new();
+    let mut after: Option<String> = None;
     for rec in reader.records() {
         let Ok((_, rec)) = rec else {
             break;
         };
-        if let SessionRecord::Edit {
-            path,
-            pre_image,
-            post_image_blob,
-            ..
-        } = &rec
-            && let Some((_, diffs)) = &mut open
-        {
-            let text = |b: &Option<_>| match b {
-                Some(b) => reader
-                    .read_blob(b)
-                    .ok()
-                    .and_then(|v| String::from_utf8(v).ok())
-                    .map(Some),
-                None => Some(None),
-            };
-            if let (Some(old), Some(new)) = (text(pre_image), text(post_image_blob))
-                && let Some(d) = map::diff_content(
-                    &map::absolute(root, path.as_str()),
-                    old.as_deref(),
-                    new.as_deref().unwrap_or(""),
-                )
-            {
-                diffs.push(d);
-            }
-            continue;
-        }
-        flush(&mut open, &mut out);
         match rec {
-            SessionRecord::TurnStart { text, .. } => out.push(json!({
+            SessionRecord::ToolResult { id, .. } => after = Some(id),
+            rec @ SessionRecord::Edit {
+                asserted: false, ..
+            } => {
+                if let Some(id) = &after {
+                    edits.entry(id.clone()).or_default().push(rec);
+                }
+            }
+            _ => after = None,
+        }
+    }
+    let text = |b: &Option<_>| match b {
+        Some(b) => reader
+            .read_blob(b)
+            .ok()
+            .and_then(|v| String::from_utf8(v).ok())
+            .map(Some),
+        None => Some(None),
+    };
+    let mut calls: HashMap<String, (String, Value)> = HashMap::new();
+    for (_, _, ev) in tautly_core::replay::events(&reader, None) {
+        let update = match ev {
+            Event::UserMessage { text } => json!({
                 "sessionUpdate": "user_message_chunk",
                 "content": ContentBlock::text(text),
-            })),
-            SessionRecord::Provider(ProviderEvent::TextDelta(text)) => out.push(chunk(&text)),
-            SessionRecord::ToolCall {
-                id,
-                name,
+            }),
+            Event::TextDelta { text } => chunk(&text),
+            Event::ToolCallProposed {
+                call_id,
+                tool,
                 args,
-                args_blob,
             } => {
-                let args = tautly_core::record::tool_args(&reader, &args, args_blob.as_ref());
-                calls.insert(id, (name, args));
+                calls.insert(call_id, (tool, args));
+                continue;
             }
-            SessionRecord::ToolResult {
-                id,
-                result_blob,
+            Event::ToolFinished {
+                call_id,
+                output,
                 is_error,
                 blocked,
                 ..
             } => {
-                let (tool, args) = calls.remove(&id).unwrap_or_default();
-                let output = reader
-                    .read_blob(&result_blob)
-                    .ok()
-                    .map(|b| String::from_utf8_lossy(&b).into_owned())
-                    .unwrap_or_default();
+                let (tool, args) = calls.remove(&call_id).unwrap_or_default();
+                let mut content = vec![map::output_content(&output)];
+                for rec in edits.remove(&call_id).unwrap_or_default() {
+                    if let SessionRecord::Edit {
+                        path,
+                        pre_image,
+                        post_image_blob,
+                        ..
+                    } = &rec
+                        && let (Some(old), Some(new)) = (text(pre_image), text(post_image_blob))
+                        && let Some(d) = map::diff_content(
+                            &map::absolute(root, path.as_str()),
+                            old.as_deref(),
+                            new.as_deref().unwrap_or(""),
+                        )
+                    {
+                        content.push(d);
+                    }
+                }
                 let call = ToolCall {
-                    tool_call_id: id,
+                    tool_call_id: call_id,
                     title: map::tool_title(&tool, &args),
                     kind: map::tool_kind(&tool),
                     status: if is_error || blocked {
@@ -1545,17 +1625,20 @@ fn replay(log: &Path, root: &Path) -> Vec<Value> {
                     } else {
                         ToolCallStatus::Completed
                     },
-                    content: vec![map::output_content(&output)],
+                    content,
                     locations: map::locations(root, &args),
                     raw_input: Some(args),
                 };
-                open = Some((call, Vec::new()));
+                let mut v = serde_json::to_value(call).unwrap_or_default();
+                v["sessionUpdate"] = json!("tool_call");
+                v
             }
-            _ => {}
+            _ => continue,
+        };
+        if !out(update) {
+            return;
         }
     }
-    flush(&mut open, &mut out);
-    out
 }
 
 /// What session `id` has cost so far, from the cost ledger under `data_home` (None: no
@@ -1607,11 +1690,13 @@ async fn ask_undo(conn: &Conn, s: &Session, turn: u32, list: String) {
     });
     let result = conn.ask("session/request_permission", params).await;
     let approved = permission::answer(result.as_ref(), None) == Answer::Once;
+    let id = s.next_id();
     let waiter = {
         let mut st = lock(&s.st);
         match st.waiter.take_if(|w| w.until == Until::UndoAsk) {
             Some(mut w) if approved => {
                 w.until = Until::Undone;
+                w.cmd_id = Some(id.clone());
                 st.waiter = Some(w);
                 None
             }
@@ -1625,11 +1710,12 @@ async fn ask_undo(conn: &Conn, s: &Session, turn: u32, list: String) {
         }
         None if approved && s.waiting_for(Until::Undone) => {
             let undo = Command::Undo {
+                id: Some(id.clone()),
                 turn: Some(turn),
                 dry_run: false,
             };
             if s.send(undo).await.is_err()
-                && let Some(w) = lock(&s.st).take_waiter(Until::Undone)
+                && let Some(w) = lock(&s.st).take_waiter(Until::Undone, Some(&id))
             {
                 let _ = w
                     .reply

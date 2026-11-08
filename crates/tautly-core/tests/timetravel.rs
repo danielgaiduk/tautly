@@ -13,7 +13,8 @@ use tautly_core::record::{CheckpointPoint, session_label};
 use tautly_core::resume::rebuild;
 use tautly_core::timetravel::{expected_tip, state_at, step_at_offset};
 use tautly_core::{
-    Command, Config, EngineBuilder, Event, MaterializeReport, SessionRecord, TtError, tree,
+    Command, Config, EngineBuilder, Event, FinishReason, MaterializeReport, SessionRecord, TtError,
+    tree,
 };
 use tautly_provider::{
     CanonicalRequest, Catalog, MockProvider, MockTurn, ModelId, ProviderEvent, StopReason,
@@ -209,7 +210,10 @@ impl Run {
 
     async fn turn_with(&mut self, text: &str) {
         self.engine
-            .send(Command::SendMessage { text: text.into() })
+            .send(Command::SendMessage {
+                id: None,
+                text: text.into(),
+            })
             .await
             .unwrap();
         self.until(|e| matches!(e, Event::TurnFinished { .. }))
@@ -229,12 +233,21 @@ impl Run {
             })
             .await;
         match seen.last().unwrap().clone() {
-            Event::Rewound { branch, report, .. } | Event::Switched { branch, report } => {
+            Event::Rewound { branch, report, .. }
+            | Event::Switched {
+                id: _,
+                branch,
+                report,
+            } => {
                 if report.applied {
                     let changed = self
                         .until(|e| matches!(e, Event::SessionChanged { .. }))
                         .await;
-                    let Some(Event::SessionChanged { session_id }) = changed.last() else {
+                    let Some(Event::SessionChanged {
+                        id: None,
+                        session_id,
+                    }) = changed.last()
+                    else {
                         unreachable!()
                     };
                     assert_eq!(*session_id, branch);
@@ -248,6 +261,7 @@ impl Run {
 
     async fn rewind(&mut self, at: u32, dry_run: bool, overwrite: &[&str]) -> Answer {
         self.answer(Command::Rewind {
+            id: None,
             at,
             label: None,
             dry_run,
@@ -258,6 +272,7 @@ impl Run {
 
     async fn switch(&mut self, id: &str, overwrite: &[&str]) -> Answer {
         self.answer(Command::Switch {
+            id: None,
             session_id: id.into(),
             dry_run: false,
             overwrite: overwrite.iter().map(|s| s.to_string()).collect(),
@@ -457,7 +472,10 @@ async fn state_at_with_skipped_checkpoint_is_partial() {
     };
     let mut run = Run::start(patient(repo.builder(&mock)));
     run.engine
-        .send(Command::SendMessage { text: "one".into() })
+        .send(Command::SendMessage {
+            id: None,
+            text: "one".into(),
+        })
         .await
         .unwrap();
     run.until(|e| matches!(e, Event::ToolStarted { .. })).await;
@@ -908,6 +926,7 @@ async fn a_fork_childs_ledger_rows_hold_only_its_post_fork_requests() {
     let (parent, _) = run.current();
     run.engine
         .send(Command::Fork {
+            id: None,
             at: None,
             label: Some("b".into()),
         })
@@ -970,6 +989,7 @@ async fn tree_lists_parent_step_label_origin_live_current() {
     let (a, _) = run.current();
     let answer = run
         .answer(Command::Rewind {
+            id: None,
             at: 3,
             label: Some("try-b".into()),
             dry_run: false,
@@ -1366,7 +1386,10 @@ async fn human_edit_after_a_cancelled_command_turn_is_a_conflict() {
     ]);
     let mut run = Run::start(repo.builder(&mock));
     run.engine
-        .send(Command::SendMessage { text: "one".into() })
+        .send(Command::SendMessage {
+            id: None,
+            text: "one".into(),
+        })
         .await
         .unwrap();
     run.until(|e| matches!(e, Event::ToolStarted { .. })).await;
@@ -1439,7 +1462,10 @@ async fn an_offline_edit_after_cancel_then_quit_is_a_conflict() {
     let mut run = Run::start(repo.builder(&mock));
     let id = run.engine.session_id().to_string();
     run.engine
-        .send(Command::SendMessage { text: "one".into() })
+        .send(Command::SendMessage {
+            id: None,
+            text: "one".into(),
+        })
         .await
         .unwrap();
     run.until(|e| matches!(e, Event::ToolStarted { .. })).await;
@@ -1609,12 +1635,43 @@ async fn an_engine_never_runs_without_the_lease() {
     };
     assert!(message.contains("cannot start the session"), "{message}");
     run.engine
-        .send(Command::SendMessage { text: "hi".into() })
+        .send(Command::SendMessage {
+            id: None,
+            text: "hi".into(),
+        })
         .await
         .unwrap();
     let seen = run.until(|e| matches!(e, Event::Error { .. })).await;
     assert!(
         matches!(seen.last(), Some(Event::Error { message, .. }) if message.contains("takes no more commands")),
+        "{seen:?}"
+    );
+    // Review CP5-A I1: the message's turn still ends, and a replay still finishes.
+    let seen = run.until(|e| matches!(e, Event::TurnFinished { .. })).await;
+    assert!(
+        matches!(
+            seen.last(),
+            Some(Event::TurnFinished {
+                reason: FinishReason::Error,
+                ..
+            })
+        ),
+        "{seen:?}"
+    );
+    run.engine
+        .send(Command::Replay {
+            id: None,
+            session_id: None,
+            speed: 0.0,
+            from_step: None,
+        })
+        .await
+        .unwrap();
+    let seen = run
+        .until(|e| matches!(e, Event::ReplayFinished { .. }))
+        .await;
+    assert!(
+        matches!(seen.last(), Some(Event::ReplayFinished { events: 0, .. })),
         "{seen:?}"
     );
     assert!(mock.requests().is_empty());
@@ -1899,7 +1956,10 @@ async fn unanswered(repo: &Repo, how: NoResponse) -> Run {
     run.turn_with("one").await;
     let log = run.current().1;
     run.engine
-        .send(Command::SendMessage { text: "two".into() })
+        .send(Command::SendMessage {
+            id: None,
+            text: "two".into(),
+        })
         .await
         .unwrap();
     if !matches!(how, NoResponse::Error) {
@@ -1930,6 +1990,7 @@ async fn unanswered(repo: &Repo, how: NoResponse) -> Run {
 async fn fork_at(run: &mut Run, at: u32) -> Result<String, String> {
     run.engine
         .send(Command::Fork {
+            id: None,
             at: Some(at),
             label: None,
         })
@@ -1939,7 +2000,7 @@ async fn fork_at(run: &mut Run, at: u32) -> Result<String, String> {
         .until(|e| matches!(e, Event::SessionChanged { .. } | Event::Error { .. }))
         .await;
     match seen.last().unwrap() {
-        Event::SessionChanged { session_id } => Ok(session_id.clone()),
+        Event::SessionChanged { session_id, .. } => Ok(session_id.clone()),
         Event::Error { message, .. } => Err(message.clone()),
         _ => unreachable!(),
     }
@@ -2070,7 +2131,10 @@ async fn a_log_holding_a_null_replay_speed_resumes_forks_rewinds_and_compares() 
         ]))
     });
     run.engine
-        .send(Command::SendMessage { text: "two".into() })
+        .send(Command::SendMessage {
+            id: None,
+            text: "two".into(),
+        })
         .await
         .unwrap();
     let evs = run.until(|e| matches!(e, Event::TurnFinished { .. })).await;
@@ -2158,6 +2222,7 @@ async fn fork_at_zero_accepts_what_rewind_zero_accepts_and_headers_name_the_step
     run.turn_with("again").await;
     run.engine
         .send(Command::Fork {
+            id: None,
             at: None,
             label: None,
         })

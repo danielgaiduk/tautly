@@ -242,6 +242,7 @@ impl Events<'_> {
             SessionRecord::ModelSet { model } => {
                 self.model = Some(model.clone());
                 vec![Event::ModelChanged {
+                    id: None,
                     provider: provider_label(&model),
                     model,
                 }]
@@ -346,7 +347,11 @@ impl Events<'_> {
             SessionRecord::TurnEnd {
                 reason, evidence, ..
             } => {
-                vec![Event::TurnFinished { reason, evidence }]
+                vec![Event::TurnFinished {
+                    id: None,
+                    reason,
+                    evidence,
+                }]
             }
             SessionRecord::Unknown | SessionRecord::Unreadable => {
                 self.unknown += 1;
@@ -524,6 +529,7 @@ impl Session {
             .clone()
             .unwrap_or_else(|| self.session_id.clone());
         let finish = |session_id: String, events: u32, cancelled: bool| Event::ReplayFinished {
+            id: None,
             session_id,
             events,
             cancelled,
@@ -535,7 +541,11 @@ impl Session {
             .await;
             return sink.emit_last(finish(shown, 0, false)).await;
         }
-        // What this session logged so far is on disk before it is read.
+        // What this session logged so far, background checkpoints included, is on disk
+        // before it is read.
+        if !self.settle_start_checkpoint_or(&ctl.cancel).await {
+            return sink.emit_last(finish(shown, 0, true)).await;
+        }
         self.checkpoint().await;
         let current = (self.session_id.clone(), self.log.path());
         let (home, root) = (self.data_home.clone(), self.root().to_path_buf());
@@ -616,6 +626,7 @@ impl Session {
 
 fn replay_error(message: &str) -> Event {
     Event::Error {
+        id: None,
         kind: ErrorKind::Internal,
         message: message.to_string(),
         retryable: false,

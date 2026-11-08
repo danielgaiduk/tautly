@@ -236,14 +236,23 @@ impl Run {
     }
 
     async fn turn_with(&mut self, text: &str) -> Vec<Event> {
-        self.send(Command::SendMessage { text: text.into() }).await;
+        self.send(Command::SendMessage {
+            id: None,
+            text: text.into(),
+        })
+        .await;
         self.until(|e| matches!(e, Event::TurnFinished { .. }))
             .await
     }
 
     /// Send `Undo` and wait for its answer (`Undone`, or the `Error`).
     async fn undo(&mut self, turn: Option<u32>, dry_run: bool) -> Event {
-        self.send(Command::Undo { turn, dry_run }).await;
+        self.send(Command::Undo {
+            id: None,
+            turn,
+            dry_run,
+        })
+        .await;
         let evs = self
             .until(|e| matches!(e, Event::Undone { .. } | Event::Error { .. }))
             .await;
@@ -256,6 +265,7 @@ impl Run {
 
     async fn fork_at(&mut self, at: Option<u32>) -> String {
         self.send(Command::Fork {
+            id: None,
             at,
             label: Some("branch".into()),
         })
@@ -265,7 +275,7 @@ impl Run {
             .await;
         assert!(warnings(&evs).is_empty(), "{evs:?}");
         match evs.last() {
-            Some(Event::SessionChanged { session_id }) => session_id.clone(),
+            Some(Event::SessionChanged { id: _, session_id }) => session_id.clone(),
             other => panic!("the fork failed: {other:?}"),
         }
     }
@@ -482,6 +492,117 @@ async fn hooks_filters_and_fsmonitor_never_run() {
     std::fs::remove_file(&marker).unwrap();
     repo.git_ok(&["add", "a.txt"]);
     assert!(marker.exists(), "the filters were not set up to run");
+}
+
+/// Whether this git runs hooks declared in configuration (`hook.<name>.*`, git 2.54 and
+/// later). When it does not, the caller is skipped with a note, unless
+/// `TAUTLY_REQUIRE_CONFIG_HOOKS` is set (the CI job that installs a newer git).
+fn config_hooks_supported() -> bool {
+    let out = Process::new("git").arg("version").output().unwrap();
+    let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let v: Vec<u32> = text
+        .trim_start_matches("git version ")
+        .split(['.', ' '])
+        .take(2)
+        .filter_map(|p| p.parse().ok())
+        .collect();
+    let ok = v.len() == 2 && (v[0], v[1]) >= (2, 54);
+    if !ok {
+        assert!(
+            std::env::var_os("TAUTLY_REQUIRE_CONFIG_HOOKS").is_none(),
+            "{text} predates config-based hooks"
+        );
+        eprintln!("note: skipped, {text} predates config-based hooks (git 2.54)");
+    }
+    ok
+}
+
+/// CP5 review C1: hooks declared in configuration (git 2.54 and later), which
+/// `core.hooksPath` does not switch off, never run either: neither ones in the
+/// repository's configuration nor ones in a work-tree file it includes
+/// (`include.path = ../.gitconfig`), on snapshots, undo or session deletion.
+#[tokio::test]
+async fn config_declared_hooks_never_run() {
+    if !config_hooks_supported() {
+        return;
+    }
+    let repo = Repo::with(&[("a.txt", "a\n")]);
+    let marker = |name: &str| repo.home.path().join(name);
+    let events = [
+        "reference-transaction",
+        "post-index-change",
+        "post-checkout",
+    ];
+    let touch = format!("touch '{}'", marker("x").display());
+    repo.git(&["config", "hook.x.command", &touch]);
+    for e in events {
+        repo.git(&["config", "--add", "hook.x.event", e]);
+    }
+    repo.git(&["config", "include.path", "../.gitconfig"]);
+    let mut included = format!(
+        "[hook \"y\"]\n\tcommand = touch '{}'\n",
+        marker("y").display()
+    );
+    for e in events {
+        included += &format!("\tevent = {e}\n");
+    }
+    repo.write(".gitconfig", &included);
+
+    let mut cp = repo.checkpointer(CheckpointConfig::default());
+    cp.snapshot(0, true).await.unwrap();
+    let mock = MockProvider::new(vec![
+        tools_step(vec![write("w1", "a.txt", "b\n")]),
+        text_step("done"),
+    ]);
+    let mut run = start(repo.builder(config(), &mock));
+    run.turn_with("go").await;
+    let answer = run.undo(None, false).await;
+    let session = run.engine.current_session().0;
+    run.stop().await;
+    assert!(matches!(answer, Event::Undone { .. }), "{answer:?}");
+    assert_eq!(repo.read("a.txt").as_deref(), Some("a\n"));
+    checkpoint::delete_session_refs(&*repo.sandbox(), &repo.root(), &session, None)
+        .await
+        .unwrap();
+    for name in ["x", "y"] {
+        assert!(!marker(name).exists(), "hook {name} ran");
+    }
+
+    // Control: git itself runs both.
+    repo.git_ok(&["update-ref", "refs/heads/control", "HEAD"]);
+    for name in ["x", "y"] {
+        assert!(marker(name).exists(), "hook {name} was not set up to run");
+    }
+}
+
+/// CP5 review M3: `/undo` takes the working-tree lease exclusively around its check and
+/// write, so it refuses (writing nothing) while another live session uses the work tree.
+#[tokio::test]
+async fn undo_refuses_while_another_session_uses_the_work_tree() {
+    let repo = Repo::with(&[("a.txt", "a\n")]);
+    let mock = MockProvider::new(vec![
+        tools_step(vec![write("w1", "a.txt", "b\n")]),
+        text_step("done"),
+    ]);
+    let mut run = start(repo.builder(config(), &mock));
+    run.turn_with("go").await;
+    let other = tautly_core::Lease::shared(repo.home.path(), &repo.root()).unwrap();
+    let answer = run.undo(None, false).await;
+    match &answer {
+        Event::Error { message, .. } => {
+            assert!(message.contains("another live session"), "{message}")
+        }
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+    assert_eq!(repo.read("a.txt").as_deref(), Some("b\n"));
+    // A dry run writes nothing, so it still answers.
+    let dry = run.undo(None, true).await;
+    assert!(matches!(dry, Event::Undone { .. }), "{dry:?}");
+    drop(other);
+    let answer = run.undo(None, false).await;
+    run.stop().await;
+    assert!(matches!(answer, Event::Undone { .. }), "{answer:?}");
+    assert_eq!(repo.read("a.txt").as_deref(), Some("a\n"));
 }
 
 #[tokio::test]
@@ -781,6 +902,7 @@ async fn non_git_dir_has_no_checkpointer_and_undo_notes_it() {
     run.turn_with("go").await;
     match run.undo(None, false).await {
         Event::Undone {
+            id: _,
             turn,
             restored,
             deleted,
@@ -836,6 +958,7 @@ async fn undo_reverts_bash_side_effects() {
     let (_, path) = run.engine.current_session();
     run.stop().await;
     let Event::Undone {
+        id: None,
         turn,
         restored,
         deleted,
@@ -1628,7 +1751,11 @@ async fn undo_uses_the_excludes_of_the_turns_start() {
         text_step("done"),
     ]);
     let mut run = start(repo.builder(config(), &mock));
-    run.send(Command::SendMessage { text: "go".into() }).await;
+    run.send(Command::SendMessage {
+        id: None,
+        text: "go".into(),
+    })
+    .await;
     let began = Instant::now();
     while !repo.path("ready").exists() {
         assert!(began.elapsed() < WAIT, "the command did not start");

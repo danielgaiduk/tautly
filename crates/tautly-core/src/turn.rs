@@ -56,7 +56,7 @@ const MAX_REISSUES: u32 = 4;
 pub(crate) struct TurnControl {
     pub cancel: CancellationToken,
     /// `Pin`/`Unpin` sent while the turn runs, applied at the next step start.
-    pub inbox: mpsc::UnboundedReceiver<Command>,
+    pub inbox: mpsc::Receiver<Command>,
     pub approvals: Approvals,
 }
 
@@ -274,6 +274,7 @@ fn error_event(e: &ProviderError) -> Event {
         ProviderError::Other(_) => (ErrorKind::ProviderFatal, None),
     };
     Event::Error {
+        id: None,
         kind,
         message: e.to_string(),
         retryable: e.is_transient(),
@@ -371,7 +372,12 @@ impl Session {
             self.recover_turn_end();
         }
         self.emit_receipt().await;
-        self.emit(Event::TurnFinished { reason, evidence }).await;
+        self.emit(Event::TurnFinished {
+            id: None,
+            reason,
+            evidence,
+        })
+        .await;
     }
 
     /// The running turn's receipt, priced at the main model's price: queued for the cost

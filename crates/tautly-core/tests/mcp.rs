@@ -218,7 +218,11 @@ impl Run {
     }
 
     async fn turn_with(&mut self, text: &str) -> Vec<Event> {
-        self.send(Command::SendMessage { text: text.into() }).await;
+        self.send(Command::SendMessage {
+            id: None,
+            text: text.into(),
+        })
+        .await;
         self.until(|e| matches!(e, Event::TurnFinished { .. }))
             .await
     }
@@ -688,7 +692,11 @@ async fn mcp_call_asks_in_ask_and_auto_edit_allowed_in_yolo() {
             interactive: true,
             ..fx.builder(with_user_server(mode, &[]), &mock)
         });
-        run.send(Command::SendMessage { text: "go".into() }).await;
+        run.send(Command::SendMessage {
+            id: None,
+            text: "go".into(),
+        })
+        .await;
         let events = run
             .until(|e| matches!(e, Event::ToolApprovalRequested { .. }))
             .await;
@@ -1507,7 +1515,11 @@ async fn cancel_during_the_mcp_startup_wait_ends_the_turn_within_200ms() {
     );
     let mock = MockProvider::new(vec![text_step("never sent")]);
     let mut run = start(fx.builder(cfg, &mock));
-    run.send(Command::SendMessage { text: "go".into() }).await;
+    run.send(Command::SendMessage {
+        id: None,
+        text: "go".into(),
+    })
+    .await;
     run.until(|e| matches!(e, Event::TurnStarted)).await;
     tokio::time::sleep(Duration::from_millis(20)).await;
     let t0 = Instant::now();

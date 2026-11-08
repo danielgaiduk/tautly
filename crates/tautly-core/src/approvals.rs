@@ -125,14 +125,18 @@ impl Approvals {
         self.lock().remove(id);
     }
 
-    /// Deny every pending request.
-    pub fn deny_all(&self, reason: &str) {
+    /// Deny every pending request; their ids.
+    pub fn deny_all(&self, reason: &str) -> Vec<String> {
         let pending: Vec<_> = self.lock().drain().collect();
-        for (_, (_, tx)) in pending {
-            let _ = tx.send(Verdict::Denied {
-                reason: Some(reason.to_string()),
-            });
-        }
+        pending
+            .into_iter()
+            .map(|(id, (_, tx))| {
+                let _ = tx.send(Verdict::Denied {
+                    reason: Some(reason.to_string()),
+                });
+                id
+            })
+            .collect()
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Pending> {

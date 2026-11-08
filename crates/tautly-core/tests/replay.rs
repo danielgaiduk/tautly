@@ -220,13 +220,18 @@ impl Run {
 
     /// Wait until the session has started (a command answered between turns).
     async fn settle(&mut self) {
-        self.send(Command::Diff { turn: None }).await;
+        self.send(Command::Diff {
+            id: None,
+            turn: None,
+        })
+        .await;
         self.until(|e| matches!(e, Event::SessionDiff { .. })).await;
     }
 
     /// Replay `session` and collect everything up to its `ReplayFinished` (included).
     async fn replay(&mut self, session: &str, speed: f32, from_step: Option<u32>) -> Vec<Event> {
         self.send(Command::Replay {
+            id: None,
             session_id: Some(session.into()),
             speed,
             from_step,
@@ -317,6 +322,7 @@ async fn golden_session(fx: &Fx) -> (String, Vec<Event>) {
     let mock = golden_script();
     let mut run = Run::start(fx.builder(&mock, Mode::Ask, true));
     run.send(Command::SendMessage {
+        id: None,
         text: "do it".into(),
     })
     .await;
@@ -555,6 +561,7 @@ async fn replay_paces_by_timestamps_scaled_and_capped_at_2s() {
     run.settle().await;
     tokio::time::pause();
     run.send(Command::Replay {
+        id: None,
         session_id: Some(id),
         speed: 2.0,
         from_step: None,
@@ -696,6 +703,7 @@ async fn from_step_skips_earlier_steps() {
                 text: "second".into()
             },
             Event::TurnFinished {
+                id: None,
                 reason: tautly_core::FinishReason::Completed,
                 evidence: None
             },
@@ -737,6 +745,7 @@ async fn cancel_stops_with_finished_cancelled() {
     let mut run = Run::start(fx.builder(&MockProvider::new(vec![]), Mode::Yolo, false));
     run.settle().await;
     run.send(Command::Replay {
+        id: None,
         session_id: Some(id.clone()),
         speed: 1.0,
         from_step: None,
@@ -754,6 +763,7 @@ async fn cancel_stops_with_finished_cancelled() {
         begin.elapsed()
     );
     let Some(Event::ReplayFinished {
+        id: None,
         session_id,
         events,
         cancelled,
@@ -775,9 +785,14 @@ async fn replay_during_turn_errors() {
     let (id, _) = two_turns(&fx);
     let mock = MockProvider::new(vec![MockTurn::Stall]);
     let mut run = Run::start(fx.builder(&mock, Mode::Yolo, false));
-    run.send(Command::SendMessage { text: "hi".into() }).await;
+    run.send(Command::SendMessage {
+        id: None,
+        text: "hi".into(),
+    })
+    .await;
     run.until(|e| matches!(e, Event::TurnStarted)).await;
     run.send(Command::Replay {
+        id: None,
         session_id: Some(id),
         speed: 0.0,
         from_step: None,
@@ -1067,6 +1082,7 @@ async fn replay_streams_with_bounded_memory() {
     let mut run = Run::start(fx.builder(&MockProvider::new(vec![]), Mode::Yolo, false));
     run.settle().await;
     run.send(Command::Replay {
+        id: None,
         session_id: Some(id),
         speed: 0.0,
         from_step: None,
@@ -1157,6 +1173,7 @@ fn compaction_collection_memory_and_model_rows_are_mapped() {
                 replaces: vec![],
             },
             Event::ModelChanged {
+                id: None,
                 model: ModelId::from("openai/gpt-5"),
                 provider: "openai".into(),
             },
@@ -1207,6 +1224,7 @@ async fn shutdown_during_a_replay_finishes_it_cancelled() {
     let mut run = Run::start(fx.builder(&MockProvider::new(vec![]), Mode::Yolo, false));
     run.settle().await;
     run.send(Command::Replay {
+        id: None,
         session_id: Some(id),
         speed: 1.0,
         from_step: None,
@@ -1270,11 +1288,13 @@ async fn replay_during_a_fork_is_refused_not_held() {
     run.settle().await;
     // Sent back to back: the replay arrives while the fork runs.
     run.send(Command::Fork {
+        id: None,
         at: None,
         label: None,
     })
     .await;
     run.send(Command::Replay {
+        id: None,
         session_id: Some(id),
         speed: 0.0,
         from_step: None,

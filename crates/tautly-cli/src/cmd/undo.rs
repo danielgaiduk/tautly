@@ -35,9 +35,23 @@ pub async fn run(args: Args, env: &Env) -> anyhow::Result<i32> {
     // are still taken does not matter to reading old ones.
     let config = Config::load(env.root(), CliOverrides::default())?;
     for warning in &config.warnings {
-        eprintln!("tautly: {warning}");
+        eprintln!("tautly: {}", tautly_core::printable_multiline(warning));
     }
     let mut checkpoints = checkpointer(env, &session, config.config.checkpoints);
+    // The working-tree lease, exclusive across the check and the write: no live session's
+    // tool may write in between (CP5 review M3). A dry run writes nothing.
+    let busy =
+        || anyhow!("a running tautly uses this work tree; use /undo there, or stop it first");
+    let lease = match args.dry_run {
+        true => None,
+        false => {
+            Some(tautly_core::Lease::try_shared(&env.data_home, env.root())?.ok_or_else(busy)?)
+        }
+    };
+    let _alone = match lease.as_ref().map(tautly_core::Lease::try_exclusive) {
+        Some(Err(tautly_core::LeaseError::Busy)) => return Err(busy()),
+        other => other.transpose()?,
+    };
     let done = tautly_core::undo::undo(
         &reader,
         env.workspace.sandbox().as_ref(),
@@ -131,7 +145,8 @@ fn print_report(report: &UndoReport, session: &LogSummary, root: &Path) {
         );
     }
     if let Some(note) = &report.note {
-        println!("note: {note}");
+        // It names files, which the repository chose (CP5 re-review N1).
+        println!("note: {}", tautly_core::printable_multiline(note));
     }
     if report.dry_run {
         println!("nothing was changed");

@@ -111,12 +111,24 @@ fn cli_replay_without_api_key() {
     let s = Scratch::new();
     let id = s.session();
 
-    // JSON: the inner events, one per line, as logged.
+    // JSON: the RPC stream's shape (CP5-A M8): each event wrapped as `replayed` (with its
+    // offset and time), then `replay_finished`.
     let json_out = ok(&s.run(&["replay", &id, "--speed", "0", "--output", "json"]));
-    let events: Vec<Value> = json_out
+    let mut lines: Vec<Value> = json_out
         .lines()
         .map(|l| serde_json::from_str(l).unwrap())
         .collect();
+    let end = lines.pop().unwrap();
+    assert_eq!(end["type"], "replay_finished", "{json_out}");
+    assert_eq!(end["session_id"], id.as_str());
+    assert_eq!(end["events"], 6);
+    assert_eq!(end["cancelled"], false);
+    assert!(
+        lines
+            .iter()
+            .all(|l| l["type"] == "replayed" && l["offset"].is_u64() && l["t_ms"].is_u64())
+    );
+    let events: Vec<Value> = lines.iter().map(|l| l["event"].clone()).collect();
     let types: Vec<&str> = events.iter().map(|e| e["type"].as_str().unwrap()).collect();
     assert_eq!(
         types,

@@ -74,6 +74,11 @@ pub(crate) struct EventSink {
     overflowing: Arc<AtomicBool>,
     /// The turn's [`FINISH_GRACE`] deadline, set by the first of its last events.
     finish_by: Arc<Mutex<Option<tokio::time::Instant>>>,
+    /// The correlation id of the command this sink answers, set on its answer events.
+    reply_to: Option<String>,
+    /// An `Error` is that command's answer (an undo, fork, rewind, switch, model switch or
+    /// diff), so it echoes the id too; otherwise only the end event does.
+    tag_errors: bool,
 }
 
 impl EventSink {
@@ -85,7 +90,38 @@ impl EventSink {
             dropped: Arc::default(),
             overflowing: Arc::default(),
             finish_by: Arc::default(),
+            reply_to: None,
+            tag_errors: false,
         }
+    }
+
+    /// This sink, answering `cmd`: its answer events echo the command's correlation id,
+    /// and so do its `Error`s when an `Error` is the command's answer
+    /// ([`Command::error_answers`]).
+    pub fn tagged(&self, cmd: &Command) -> Self {
+        EventSink {
+            reply_to: cmd.id().map(str::to_string),
+            tag_errors: cmd.error_answers(),
+            ..self.clone()
+        }
+    }
+
+    /// This sink, echoing no correlation id: for incidental events (a log-write failure)
+    /// that answer no command.
+    pub fn untagged(&self) -> Self {
+        EventSink {
+            reply_to: None,
+            ..self.clone()
+        }
+    }
+
+    fn stamp(&self, mut ev: Event) -> Event {
+        if let Some(id) = &self.reply_to
+            && (self.tag_errors || !matches!(ev, Event::Error { .. }))
+        {
+            ev.set_reply_id(id);
+        }
+        ev
     }
 
     /// This sink, giving up on a full channel once `cancel` fires.
@@ -111,6 +147,7 @@ impl EventSink {
     }
 
     pub async fn emit(&self, ev: Event) {
+        let ev = self.stamp(ev);
         let Some(cancel) = &self.cancel else {
             if self.replying && !self.overflowing.load(Ordering::Relaxed) {
                 self.announce_dropped();
@@ -187,12 +224,13 @@ impl EventSink {
             finish_by: Arc::default(),
             ..self.clone()
         }
-        .finish(ev)
+        .finish(self.stamp(ev))
         .await;
     }
 
     /// Send within [`SEND_GRACE`], else drop and count.
     pub async fn send_or_drop(&self, ev: Event) {
+        let ev = self.stamp(ev);
         if let Err(mpsc::error::SendTimeoutError::Timeout(_)) =
             self.tx.send_timeout(ev, SEND_GRACE).await
         {
@@ -202,6 +240,7 @@ impl EventSink {
 
     /// Send now if there is room, else drop and count. Never waits.
     pub fn try_emit(&self, ev: Event) {
+        let ev = self.stamp(ev);
         self.announce_dropped();
         if let Err(mpsc::error::TrySendError::Full(_)) = self.tx.try_send(ev) {
             self.dropped.fetch_add(1, Ordering::Relaxed);
@@ -211,6 +250,7 @@ impl EventSink {
     /// Send now if there is room; false when it was not sent (not counted as dropped: the
     /// caller sends it again later). Never waits.
     pub fn try_send(&self, ev: Event) -> bool {
+        let ev = self.stamp(ev);
         self.announce_dropped();
         self.tx.try_send(ev).is_ok()
     }
@@ -324,6 +364,7 @@ impl LogFailure {
     /// The error event to show, the first time the log fails.
     pub fn event(self) -> Option<Event> {
         self.0.map(|why| Event::Error {
+            id: None,
             kind: ErrorKind::Internal,
             message: format!(
                 "the session log could not be written ({why}); this session is no longer saved"
@@ -457,9 +498,10 @@ impl Session {
         self.events.warn(message).await;
     }
 
+    /// A log-write failure: incidental, so it echoes no command's id.
     pub async fn report(&self, failure: LogFailure) {
         if let Some(ev) = failure.event() {
-            self.emit(ev).await;
+            self.events.untagged().emit(ev).await;
         }
     }
 
@@ -930,6 +972,48 @@ fn write_private(path: &Path, bytes: &[u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn error() -> Event {
+        Event::Error {
+            id: None,
+            kind: ErrorKind::Internal,
+            message: "x".into(),
+            retryable: false,
+            hint: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn only_a_commands_answer_echoes_its_id() {
+        // Re-review CP5-ENG N3/N5.
+        let (tx, mut rx) = mpsc::channel(16);
+        let sink = EventSink::new(tx);
+        let turn = sink.tagged(&Command::SendMessage {
+            id: Some("t1".into()),
+            text: "hi".into(),
+        });
+        turn.try_emit(error());
+        turn.try_emit(Event::TurnFinished {
+            id: None,
+            reason: crate::protocol::FinishReason::Completed,
+            evidence: None,
+        });
+        let undo = sink.tagged(&Command::Undo {
+            id: Some("u1".into()),
+            turn: None,
+            dry_run: true,
+        });
+        undo.try_emit(error());
+        undo.untagged().try_emit(error());
+        let ids: Vec<Option<String>> = (0..4)
+            .map(|_| rx.try_recv().unwrap().reply_id().map(str::to_string))
+            .collect();
+        assert_eq!(
+            ids,
+            [None, Some("t1".into()), Some("u1".into()), None],
+            "an incidental error carries no id"
+        );
+    }
 
     fn request(system: &str, tool: &str) -> CanonicalRequest {
         CanonicalRequest {

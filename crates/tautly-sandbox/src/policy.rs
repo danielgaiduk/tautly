@@ -1,6 +1,7 @@
 //! Permission policy: decides whether a tool call runs, needs approval, or is denied.
 
 use std::borrow::Cow;
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use globset::{Glob, GlobMatcher};
@@ -69,6 +70,8 @@ struct Rule {
     /// A command rule whose pattern names a write redirect (holds ` > `): the pattern
     /// split at its first ` > `, matched structurally ([`Redirected`]).
     redirect: Option<Redirected>,
+    /// A command rule `rm <flags> …`: also matched by flag set (deny rules only).
+    rm: Option<RmFlags>,
 }
 
 /// The two halves of a rule pattern that names a write redirect (`cargo test > *`): the
@@ -173,9 +176,11 @@ impl Rule {
                 tool_glob,
                 glob: None,
                 redirect: None,
+                rm: None,
             });
         }
         let mut redirect = None;
+        let mut rm = None;
         let (tool, glob) = match text.find(['(', ')']) {
             None => (text, None),
             Some(i) if text.as_bytes()[i] == b'(' => {
@@ -199,6 +204,8 @@ impl Rule {
                             .map(glob)
                             .collect::<Result<_, _>>()?,
                     });
+                } else {
+                    rm = RmFlags::parse(inner);
                 }
                 (&text[..i], Some(m.compile_matcher()))
             }
@@ -222,6 +229,7 @@ impl Rule {
             tool_glob: None,
             glob,
             redirect,
+            rm,
         })
     }
 
@@ -468,13 +476,17 @@ impl Policy {
     /// -> .env`). Any other rule matches the bare command or argv only, never a file name a
     /// redirect writes to.
     fn deny_hits(&self, r: &Rule, tool: &str, c: &SimpleCommand) -> bool {
-        let forms: Vec<String> = deny_argvs(&c.argv)
-            .into_iter()
+        let argvs = deny_argvs(&c.argv);
+        let forms: Vec<String> = argvs
+            .iter()
             .flat_map(|a| [a.join(" "), quoted_words(a)])
             .chain(std::iter::once(command_line(c)))
             .collect();
         let Some(red) = &r.redirect else {
-            return forms.iter().any(|f| r.matches_str(tool, f));
+            let by_flags =
+                r.rm.as_ref()
+                    .is_some_and(|rm| argvs.iter().any(|a| a[0] == "rm" && rm.matches(a)));
+            return by_flags || forms.iter().any(|f| r.matches_str(tool, f));
         };
         if !forms.iter().any(|f| red.command.is_match(f)) {
             return false;
@@ -717,18 +729,172 @@ fn quoted_words(argv: &[String]) -> String {
 /// and `time` prefixes removed ([`unwrap_prefixes`]); and, when the command starts with a
 /// wrapper that runs the rest of its argv (`sudo`, `env`, `nohup`, `nice`, `timeout`, …),
 /// every suffix starting at a non-option word, so `deny bash(git push*)` refuses
-/// `timeout 5 git push` and `env FOO=1 git push`. Deliberately broad (a deny rule may
-/// refuse an odd command, never miss a wrapped one); allow rules never use these forms.
-fn deny_argvs(argv: &[String]) -> Vec<&[String]> {
-    let mut out = vec![argv, unwrap_prefixes(argv)];
+/// `timeout 5 git push` and `env FOO=1 git push`. Each of those is also tried with
+/// `argv[0]` reduced to its basename (`/usr/bin/git push`), then for `git` without its
+/// global options (`git -C . --no-pager push`; CP5 review M2). An `rm` rule also matches
+/// by flag set ([`RmFlags`]). Deliberately broad (a deny rule may refuse an odd command, never miss a
+/// wrapped one); allow rules never use these forms.
+fn deny_argvs(argv: &[String]) -> Vec<Vec<String>> {
+    let mut written = vec![argv, unwrap_prefixes(argv)];
     if argv.first().is_some_and(|w| WRAPPERS.contains(&base(w))) {
-        out.extend(
+        written.extend(
             (1..argv.len())
                 .filter(|&i| !argv[i].starts_with('-'))
                 .map(|i| &argv[i..]),
         );
     }
+    let mut out = Vec::new();
+    for a in written.into_iter().filter(|a| !a.is_empty()) {
+        out.push(a.to_vec());
+        let mut short = a.to_vec();
+        short[0] = base(&a[0]).to_string();
+        if short[0] == "git" {
+            out.push(without_git_options(&short));
+        }
+        out.push(short);
+    }
     out
+}
+
+/// `git <args>` without the global options before its subcommand (`-C <dir>`, `-c k=v`,
+/// `--git-dir[=]…`, `--no-pager`, …): any leading option word, and the value of those that
+/// take one as the next word.
+fn without_git_options(argv: &[String]) -> Vec<String> {
+    const VALUED: &[&str] = &[
+        "-C",
+        "-c",
+        "--git-dir",
+        "--work-tree",
+        "--namespace",
+        "--config-env",
+        "--super-prefix",
+        "--exec-path",
+    ];
+    let mut i = 1;
+    while let Some(w) = argv.get(i).filter(|w| w.starts_with('-')) {
+        i += if VALUED.contains(&w.as_str()) { 2 } else { 1 };
+    }
+    let mut out = vec![argv[0].clone()];
+    out.extend(argv.iter().skip(i).cloned());
+    out
+}
+
+/// `rm`'s leading option words (`words` follow the program) as one set of flags: short
+/// clusters in any order and grouping, and the long forms of `-r`, `-f`, `-d` and `-v`.
+/// Returns the flags, the other long options, and how many words they took.
+fn rm_flags(words: &[String]) -> (BTreeSet<char>, Vec<String>, usize) {
+    let mut flags = BTreeSet::new();
+    let mut other = Vec::new();
+    let mut i = 0;
+    while let Some(w) = words.get(i) {
+        if w == "--" || w == "-" || !w.starts_with('-') {
+            break;
+        }
+        match rm_long(w) {
+            Some(c) => {
+                flags.insert(c);
+            }
+            None if w.starts_with("--") => other.push(w.clone()),
+            None => flags.extend(w[1..].chars()),
+        }
+        i += 1;
+    }
+    (flags, other, i)
+}
+
+/// The short flag an `rm` long option stands for.
+fn rm_long(w: &str) -> Option<char> {
+    match w {
+        "--recursive" => Some('r'),
+        "--force" => Some('f'),
+        "--dir" => Some('d'),
+        "--verbose" => Some('v'),
+        _ => None,
+    }
+}
+
+/// A deny rule `rm <flags> <rest>` matched by flag set, not spelling (CP5 review M2,
+/// re-review N2): `bash(rm -rf*)` refuses any `rm` whose flags include `r` and `f`,
+/// however many and in whatever order or grouping (`rm -vdRrf`, `rm -r -f`,
+/// `rm --force --recursive`). A flag word without a glued `*` names exactly those flags
+/// (`bash(rm -rf /)` refuses `rm -fr /`, not `rm -rfv /`). `<rest>` matches the words
+/// after the flags, other long options first.
+#[derive(Debug)]
+struct RmFlags {
+    flags: BTreeSet<char>,
+    /// The last flag word ended in `*`: more flags (and anything after) may follow.
+    superset: bool,
+    rest: GlobMatcher,
+}
+
+impl RmFlags {
+    /// For a pattern of plain flag words after `rm`; none otherwise (a pattern such as
+    /// `rm -*r*` stays a glob only).
+    fn parse(pattern: &str) -> Option<RmFlags> {
+        let words: Vec<&str> = pattern.split(' ').collect();
+        if words.first() != Some(&"rm") {
+            return None;
+        }
+        let mut flags = BTreeSet::new();
+        let (mut superset, mut i) = (false, 1);
+        while let Some(w) = words.get(i) {
+            let (w, star) = w.strip_suffix('*').map_or((*w, false), |w| (w, true));
+            let short = w.len() > 1
+                && w.starts_with('-')
+                && !w.starts_with("--")
+                && w[1..].chars().all(|c| c.is_ascii_alphabetic());
+            match rm_long(w) {
+                Some(c) => {
+                    flags.insert(c);
+                }
+                None if short => flags.extend(w[1..].chars()),
+                None => break,
+            }
+            i += 1;
+            if star {
+                superset = true;
+                break;
+            }
+        }
+        if flags.is_empty() {
+            return None;
+        }
+        let rest = words[i..].join(" ");
+        let rest = match (superset, rest.is_empty()) {
+            (true, true) => "*".to_string(),
+            (true, false) => format!("* {rest}"),
+            (false, _) => rest,
+        };
+        let rest = Glob::new(&rest).ok()?.compile_matcher();
+        Some(RmFlags {
+            flags,
+            superset,
+            rest,
+        })
+    }
+
+    /// Whether `argv` (an `rm` command, the program by its basename) is refused.
+    fn matches(&self, argv: &[String]) -> bool {
+        let (flags, other, n) = rm_flags(&argv[1..]);
+        let has = if self.superset {
+            flags.is_superset(&self.flags)
+        } else {
+            flags == self.flags
+        };
+        let rest: Vec<String> = other
+            .into_iter()
+            .chain(argv[1 + n..].iter().cloned())
+            .collect();
+        let (plain, quoted) = (rest.join(" "), quoted_words(&rest));
+        has && [
+            plain.clone(),
+            format!(" {plain}"),
+            quoted.clone(),
+            format!(" {quoted}"),
+        ]
+        .iter()
+        .any(|s| self.rest.is_match(s))
+    }
 }
 
 /// `w` as a shell word: as it is, or in single quotes (a `'` written `'\''`) when it is

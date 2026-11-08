@@ -385,7 +385,11 @@ impl Run {
     }
 
     async fn turn_with(&mut self, text: &str) -> Vec<Event> {
-        self.send(Command::SendMessage { text: text.into() }).await;
+        self.send(Command::SendMessage {
+            id: None,
+            text: text.into(),
+        })
+        .await;
         self.until(|e| matches!(e, Event::TurnFinished { .. }))
             .await
     }
@@ -445,7 +449,11 @@ async fn receipt_precedes_turn_finished_for_every_reason() {
     let fx = Fx::new();
     let mock = MockProvider::new(vec![MockTurn::Stall]);
     let mut run = fx.start(config(100), &mock);
-    run.send(Command::SendMessage { text: "go".into() }).await;
+    run.send(Command::SendMessage {
+        id: None,
+        text: "go".into(),
+    })
+    .await;
     run.until(|e| matches!(e, Event::TurnStarted)).await;
     tokio::time::sleep(Duration::from_millis(200)).await;
     run.send(Command::Cancel).await;

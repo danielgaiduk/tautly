@@ -112,7 +112,7 @@ fn list(env: &Env) -> anyhow::Result<i32> {
             "{:<26}  {:<16}  {cost:>8}  {}",
             s.id,
             utc(s.started),
-            s.first_prompt
+            tautly_core::printable(&s.first_prompt)
         );
     }
     Ok(0)
@@ -206,7 +206,7 @@ fn show(env: &Env, id: &str) -> anyhow::Result<i32> {
         println!("model    {model}");
     }
     if let Some(label) = &session.label {
-        println!("label    {label}");
+        println!("label    {}", tautly_core::printable(label));
     }
     if let Some((parent, offset)) = &header.parent {
         println!("branch   of {parent}, from record {offset}");
@@ -250,7 +250,7 @@ fn show(env: &Env, id: &str) -> anyhow::Result<i32> {
         println!(
             "  {}  {steps}  {}  {}",
             t.n,
-            cut(prompt, 60),
+            cut(&tautly_core::printable(prompt), 60),
             notes.join(", ")
         );
     }

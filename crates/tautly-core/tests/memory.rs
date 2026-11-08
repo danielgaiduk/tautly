@@ -226,7 +226,11 @@ impl Run {
     }
 
     async fn turn_with(&mut self, text: &str) -> Vec<Event> {
-        self.send(Command::SendMessage { text: text.into() }).await;
+        self.send(Command::SendMessage {
+            id: None,
+            text: text.into(),
+        })
+        .await;
         self.until(|e| matches!(e, Event::TurnFinished { .. }))
             .await
     }
@@ -603,6 +607,7 @@ async fn stale_flag_appears_at_next_cache_epoch() {
     assert_eq!(
         events.last(),
         Some(&Event::TurnFinished {
+            id: None,
             reason: FinishReason::Completed,
             evidence: None
         })
@@ -688,6 +693,7 @@ async fn episode_written_after_compaction() {
     assert_eq!(
         events.last(),
         Some(&Event::TurnFinished {
+            id: None,
             reason: FinishReason::Completed,
             evidence: None
         }),
@@ -758,6 +764,55 @@ async fn over_budget_index_adds_warning() {
     );
 }
 
+/// `ConsolidateFinished` for one proposed deletion, in a session with `approve_memory` set
+/// as given and `interactive` as given.
+async fn consolidate_counts(approve_memory: bool, interactive: bool) -> Event {
+    let fx = Fx::new();
+    fx.entry_file("c", "c", "Old note");
+    let reply = json!([{"delete": "c"}]);
+    let mock = MockProvider::new(vec![text_step(&reply.to_string())]);
+    let mut cfg = config(Mode::Ask);
+    cfg.approve_memory = approve_memory;
+    let mut run = start(EngineBuilder {
+        interactive,
+        ..fx.ready(cfg, &mock).await
+    });
+    run.send(Command::ConsolidateMemory { id: None }).await;
+    let end = run
+        .until(|e| matches!(e, Event::ConsolidateFinished { .. }))
+        .await;
+    end.last().cloned().unwrap()
+}
+
+#[tokio::test]
+async fn consolidate_counts_what_was_saved_and_what_was_not() {
+    // Review CP5-ENG concern 3: the counts come from each proposal's outcome.
+    let headless = consolidate_counts(false, false).await;
+    assert!(
+        matches!(
+            headless,
+            Event::ConsolidateFinished {
+                applied: 0,
+                failed: 1,
+                ..
+            }
+        ),
+        "{headless:?}"
+    );
+    let auto = consolidate_counts(true, false).await;
+    assert!(
+        matches!(
+            auto,
+            Event::ConsolidateFinished {
+                applied: 1,
+                failed: 0,
+                ..
+            }
+        ),
+        "{auto:?}"
+    );
+}
+
 #[tokio::test]
 async fn consolidate_emits_proposals_and_applies_only_approved() {
     let fx = Fx::new();
@@ -771,7 +826,10 @@ async fn consolidate_emits_proposals_and_applies_only_approved() {
     ]);
     let mock = MockProvider::new(vec![text_step(&reply.to_string())]);
     let mut run = start(fx.ready(config(Mode::Ask), &mock).await);
-    run.send(Command::ConsolidateMemory).await;
+    run.send(Command::ConsolidateMemory {
+        id: Some("m-1".into()),
+    })
+    .await;
     let mut events = run
         .until(|e| matches!(e, Event::MemoryProposed { .. }))
         .await;
@@ -781,6 +839,17 @@ async fn consolidate_emits_proposals_and_applies_only_approved() {
     );
     let props = proposals(&events);
     assert_eq!(props.len(), 2);
+    // Review CP5-A M5: the end, after every proposal, with the command's id.
+    let end = run
+        .until(|e| matches!(e, Event::ConsolidateFinished { .. }))
+        .await;
+    assert!(
+        matches!(
+            end.last(),
+            Some(Event::ConsolidateFinished { id: Some(id), applied: 0, failed: 0 }) if id == "m-1"
+        ),
+        "{end:?}"
+    );
     // Each shows the entries it replaces, so a client can show a diff.
     let mut shown: Vec<Vec<String>> = replaced(&events).into_iter().map(|(_, r)| r).collect();
     shown.sort();
@@ -909,7 +978,7 @@ async fn exhausted_budget_sends_no_episode_or_consolidation_request() {
     let mut run = start(fx.ready(cfg, &mock).await);
     run.turn_with("work").await;
     assert_eq!(mock.requests().len(), 1);
-    run.send(Command::ConsolidateMemory).await;
+    run.send(Command::ConsolidateMemory { id: None }).await;
     let ev = run
         .until(|e| matches!(e, Event::Warning { message } if message.contains("consolidation")))
         .await;
@@ -954,7 +1023,7 @@ async fn an_explicit_consolidation_is_held_back_only_by_the_session_budget() {
     ]);
     let mut run = start(fx.ready(cfg, &mock).await);
     run.turn_with("work").await;
-    run.send(Command::ConsolidateMemory).await;
+    run.send(Command::ConsolidateMemory { id: None }).await;
     let ev = run
         .until(|e| matches!(e, Event::Warning { message } if message.contains("consolidation")))
         .await;
@@ -993,7 +1062,7 @@ async fn consolidation_prompt_fits_the_side_model_window() {
     cfg.catalog_overrides = Some(catalog_with(6_000, 1_000, "none"));
     let mock = MockProvider::new(vec![text_step("[]")]);
     let mut run = start(fx.ready(cfg, &mock).await);
-    run.send(Command::ConsolidateMemory).await;
+    run.send(Command::ConsolidateMemory { id: None }).await;
     run.until(|e| matches!(e, Event::Warning { message } if message.contains("no changes")))
         .await;
     let text = request_text(&mock.requests()[0]);

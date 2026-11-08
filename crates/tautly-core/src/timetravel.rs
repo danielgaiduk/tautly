@@ -943,10 +943,20 @@ impl Session {
         match done {
             Ok((report, moved)) => {
                 let branch = moved.as_ref().map(|(id, _)| id.clone()).unwrap_or_default();
-                self.emit(Event::Rewound { at, branch, report }).await;
+                self.emit(Event::Rewound {
+                    id: None,
+                    at,
+                    branch,
+                    report,
+                })
+                .await;
                 if let Some((id, path)) = moved {
                     on_branch(&id, &path);
-                    self.emit(Event::SessionChanged { session_id: id }).await;
+                    self.emit(Event::SessionChanged {
+                        id: None,
+                        session_id: id,
+                    })
+                    .await;
                 }
             }
             Err(e) => self.time_travel_failed("rewind", e).await,
@@ -975,13 +985,18 @@ impl Session {
         match done {
             Ok((report, moved)) => {
                 self.emit(Event::Switched {
+                    id: None,
                     branch: session_id,
                     report,
                 })
                 .await;
                 if let Some((id, path)) = moved {
                     on_switch(&id, &path);
-                    self.emit(Event::SessionChanged { session_id: id }).await;
+                    self.emit(Event::SessionChanged {
+                        id: None,
+                        session_id: id,
+                    })
+                    .await;
                 }
             }
             Err(e) => self.time_travel_failed("switch", e).await,
@@ -989,11 +1004,12 @@ impl Session {
         self.events = unbound;
     }
 
-    async fn time_travel_failed(&self, what: &str, e: TtError) {
+    pub(crate) async fn time_travel_failed(&self, what: &str, e: TtError) {
         let hint = matches!(e, TtError::Failed { .. }).then(|| {
             "check the files named; `git status` and the snapshot ref show what changed".into()
         });
         self.emit(Event::Error {
+            id: None,
             kind: ErrorKind::Tool,
             message: crate::printable(&format!("{what}: {e}")),
             retryable: false,
@@ -1003,7 +1019,7 @@ impl Session {
     }
 
     /// The working-tree lease, exclusively.
-    fn exclusive(&self) -> Result<ExclusiveGuard, TtError> {
+    pub(crate) fn exclusive(&self) -> Result<ExclusiveGuard, TtError> {
         match &self.lease {
             Some(lease) => Ok(lease.try_exclusive()?),
             None => Err(TtError::NoLease),
