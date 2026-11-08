@@ -70,26 +70,35 @@ pub(crate) struct Opened {
     pub index: Option<Arc<Index>>,
     pub memory: Option<Arc<RwLock<MemoryStore>>>,
     pub warnings: Vec<String>,
-    /// Keeps the file watcher running for as long as the workspace lives.
-    _watch: Mutex<Option<WatchHandle>>,
-    /// The shared lock on the index database's lock file, held for the workspace's life:
-    /// `tautly index rebuild` takes it exclusively, so it cannot delete the database under
-    /// a running session.
-    _index_lock: Option<File>,
+    /// The file watcher and the index lock, held for the workspace's life.
+    _held: Mutex<Held>,
 }
 
-impl Drop for Opened {
-    /// Stopping the watcher joins its event thread, which can take seconds on a loaded
-    /// machine: off the async workers, as starting it is, or it stalls every task on the
-    /// runtime (the shutdown's bounded ledger flush among them).
+/// The file watcher (kept running) and the shared lock on the index database's lock file:
+/// `tautly index rebuild` takes it exclusively, so it cannot delete the database under a
+/// running session. On drop the watcher is told to stop before the lock goes (as when the
+/// fields dropped in order), and the lock goes at once; closing the OS watch, which joins
+/// its event thread and can take seconds on a loaded machine, happens on a thread of its
+/// own. On an async worker it would stall every task on the runtime (the shutdown's
+/// bounded ledger flush among them); a plain thread also covers a drop while the runtime
+/// shuts down (an open cancelled mid-way).
+struct Held {
+    watch: Option<WatchHandle>,
+    index_lock: Option<File>,
+}
+
+impl Drop for Held {
     fn drop(&mut self) {
-        let watch = self
-            ._watch
-            .get_mut()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take();
-        if let (Some(watch), Ok(rt)) = (watch, tokio::runtime::Handle::try_current()) {
-            rt.spawn_blocking(move || drop(watch));
+        let watch = self.watch.take();
+        if let Some(watch) = &watch {
+            watch.signal_stop();
+        }
+        drop(self.index_lock.take());
+        if let Some(watch) = watch {
+            // If no thread can be started, the watcher is dropped here.
+            let _ = std::thread::Builder::new()
+                .name("tautly-watch-stop".into())
+                .spawn(move || drop(watch));
         }
     }
 }
@@ -157,7 +166,11 @@ impl Workspace {
         let db = self.index_db();
         let lock_file = index_lock_path(&db);
         let locked = tokio::task::spawn_blocking(move || lock_index_shared(&lock_file)).await;
-        let index_lock = match locked {
+        let mut held = Held {
+            watch: None,
+            index_lock: None,
+        };
+        held.index_lock = match locked {
             Ok(Ok(f)) => Some(f),
             Ok(Err(e)) => {
                 warnings.push(format!(
@@ -180,13 +193,12 @@ impl Workspace {
                 None
             }
         };
-        let mut handle = None;
         if let Some(index) = &index {
             Arc::clone(index).spawn_background_refresh();
             // A recursive watch can walk the whole tree (inotify): off the async workers.
             let watched = Arc::clone(index);
             match tokio::task::spawn_blocking(move || watched.start_watcher()).await {
-                Ok(Ok(h)) => handle = Some(h),
+                Ok(Ok(h)) => held.watch = Some(h),
                 Ok(Err(e)) => warnings.push(format!(
                     "file watcher not running ({e}); the code index is treated as stale"
                 )),
@@ -235,8 +247,7 @@ impl Workspace {
             index,
             memory,
             warnings,
-            _watch: Mutex::new(handle),
-            _index_lock: index_lock,
+            _held: Mutex::new(held),
         }
     }
 
@@ -358,5 +369,35 @@ impl Workspaces {
         let ws = Workspace::new(sandbox, &self.data_home);
         open.insert(root, Arc::downgrade(&ws));
         Ok(ws)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The OS watch closes on a thread of its own; the index lock goes with the workspace,
+    /// so a rebuild can take it.
+    #[tokio::test]
+    async fn a_dropped_workspace_stops_its_watcher_and_lets_go_of_the_index_lock() {
+        let root = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let sandbox: Arc<dyn Sandbox> =
+            Arc::new(LocalSandbox::new(root.path().to_path_buf()).unwrap());
+        let ws = Workspace::new(sandbox, home.path());
+        ws.start();
+        assert!(ws.wait_ready(Duration::from_secs(30)).await);
+        assert!(ws.opened().await._held.lock().unwrap().watch.is_some());
+        let lock = index_lock_path(&ws.index_db());
+        drop(ws);
+        let file = open_index_lock(&lock).unwrap();
+        let until = std::time::Instant::now() + Duration::from_secs(30);
+        while file.try_lock().is_err() {
+            assert!(
+                std::time::Instant::now() < until,
+                "the index lock was never released"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
 }

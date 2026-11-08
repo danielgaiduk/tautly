@@ -164,6 +164,7 @@ mod tests {
     /// while the second still runs.
     #[test]
     fn only_the_last_abandoned_job_clears_stuck() {
+        let until = Instant::now() + Duration::from_secs(30);
         let (w, release_a, release_b) = loop {
             let w = worker(1000);
             let (release_a, a) = blocked();
@@ -181,8 +182,15 @@ mod tests {
             assert_eq!(first.join().unwrap(), Err(Refusal::TimedOut));
             match second.join().unwrap() {
                 Err(Refusal::TimedOut) => break (w, release_a, release_b),
-                // A loaded runner let A's caller give up before B was queued: again.
-                other => assert_eq!(other, Err(Refusal::Stuck)),
+                // A loaded runner let A's caller give up before B was queued: again,
+                // for up to 30 s.
+                other => {
+                    assert_eq!(other, Err(Refusal::Stuck));
+                    assert!(
+                        Instant::now() < until,
+                        "B was never queued before A's caller gave up (30 s of retries)"
+                    );
+                }
             }
         };
         drop(release_a);
