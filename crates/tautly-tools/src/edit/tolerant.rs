@@ -43,7 +43,36 @@ pub enum RepairStage {
     Structural,
 }
 
+/// As its [`name`](RepairStage::name).
+impl serde::Serialize for RepairStage {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(self.name())
+    }
+}
+
 impl RepairStage {
+    /// Every stage, in the order they are tried.
+    pub const ALL: [RepairStage; 6] = [
+        RepairStage::Exact,
+        RepairStage::Normalized,
+        RepairStage::Whitespace,
+        RepairStage::Indentation,
+        RepairStage::Anchor,
+        RepairStage::Structural,
+    ];
+
+    /// A stable name, as `ToolMeta::repair` is persisted and sent.
+    pub fn name(self) -> &'static str {
+        match self {
+            RepairStage::Exact => "exact",
+            RepairStage::Normalized => "normalized",
+            RepairStage::Whitespace => "whitespace",
+            RepairStage::Indentation => "indentation",
+            RepairStage::Anchor => "anchor",
+            RepairStage::Structural => "structural",
+        }
+    }
+
     /// Human-readable name, as in `applied via indentation-relative match`.
     pub fn describe(self) -> &'static str {
         match self {

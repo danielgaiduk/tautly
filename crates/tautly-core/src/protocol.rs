@@ -154,6 +154,10 @@ pub struct ToolMetaView {
     /// output filter's summary, a re-read diff, an index answer. Sent only when set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub saved: Option<Saved>,
+    /// The stage that located a repaired edit (`normalized`, `whitespace`, `indentation`,
+    /// `anchor`, `structural`). Sent only when set; absent in older event streams.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repair: Option<String>,
 }
 
 impl From<&ToolMeta> for ToolMetaView {
@@ -162,6 +166,7 @@ impl From<&ToolMeta> for ToolMetaView {
             exit_code: meta.exit_code,
             error_kind: meta.error_kind.map(str::to_string),
             saved: meta.saved,
+            repair: meta.repair.map(|s| s.name().to_string()),
         }
     }
 }

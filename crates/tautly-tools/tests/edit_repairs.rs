@@ -399,3 +399,52 @@ async fn a_patch_hunk_repair_over_unseen_changes_is_stale() {
     assert!(r.output.contains("lines 40-42"), "{}", r.output);
     assert_eq!(e.slurp("a.rs").await, reformatted());
 }
+
+/// C-M8: the result's meta names the stage that located a repaired edit, so evals can
+/// count repairs by stage from the event stream; an exact edit names none.
+#[tokio::test]
+async fn meta_names_the_repair_stage() {
+    let e = env();
+    e.put(
+        "a.py",
+        "def f():\n    if x:\n        a()\n        b()\n    return 1\n",
+    )
+    .await;
+    e.read(1, json!({"path": "a.py"})).await;
+    let r = e
+        .edit(
+            1,
+            "a.py",
+            "if x:\n    a()\n    b()",
+            "if x:\n    a()\n    c()\n    b()",
+        )
+        .await;
+    assert!(!r.is_error, "{}", r.output);
+    assert_eq!(r.meta.repair, Some(RepairStage::Indentation));
+
+    let exact = e.edit(1, "a.py", "return 1", "return 2").await;
+    assert!(!exact.is_error, "{}", exact.output);
+    assert_eq!(exact.meta.repair, None);
+
+    e.put("a.rs", "impl X {\n    fn f() {\n        old();\n    }\n}\n")
+        .await;
+    e.read_as(1, EditFormat::Patch, json!({"path": "a.rs"}))
+        .await;
+    let p = "*** Begin Patch\n*** Update File: a.rs\n@@\n fn f() {\n-    old();\n+    new();\n }\n*** End Patch";
+    let patched = e.patch(1, p).await;
+    assert!(!patched.is_error, "{}", patched.output);
+    assert!(patched.meta.repair.is_some(), "{:?}", patched.meta);
+
+    // Persisted and read back; absent in older logs; a newer stage name reads as none.
+    let v = serde_json::to_value(&r.meta).unwrap();
+    assert_eq!(v["repair"], "indentation");
+    let back: tautly_tools::ToolMeta = serde_json::from_value(v).unwrap();
+    assert_eq!(back.repair, Some(RepairStage::Indentation));
+    let old: tautly_tools::ToolMeta =
+        serde_json::from_value(json!({"exit_code": null, "error_kind": null})).unwrap();
+    assert_eq!(old.repair, None);
+    assert!(serde_json::to_value(&old).unwrap().get("repair").is_none());
+    let newer: tautly_tools::ToolMeta =
+        serde_json::from_value(json!({"exit_code": null, "repair": "telepathic"})).unwrap();
+    assert_eq!(newer.repair, None);
+}
