@@ -5,9 +5,10 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
+use tautly_provider::mock::{call, text_step_no_usage, tools_step};
 
 use async_trait::async_trait;
-use serde_json::{Value, json};
+use serde_json::json;
 use tautly_core::record::ApprovalKind;
 use tautly_core::{
     Command, Config, Engine, EngineBuilder, Event, McpState, PreExecHook, ServerSpec, SessionRecord,
@@ -88,31 +89,6 @@ fn stdio(env: &[(&str, &str)]) -> ServerSpec {
             .collect(),
         cwd: None,
     }
-}
-
-fn call(id: &str, name: &str, args: Value) -> ProviderEvent {
-    ProviderEvent::ToolCall {
-        id: id.into(),
-        name: name.into(),
-        input_json: args.to_string(),
-    }
-}
-
-fn tools_step(calls: Vec<ProviderEvent>) -> MockTurn {
-    let mut evs = calls;
-    evs.push(ProviderEvent::Done {
-        stop: StopReason::ToolUse,
-    });
-    MockTurn::Events(evs)
-}
-
-fn text_step(text: &str) -> MockTurn {
-    MockTurn::Events(vec![
-        ProviderEvent::TextDelta(text.into()),
-        ProviderEvent::Done {
-            stop: StopReason::EndTurn,
-        },
-    ])
 }
 
 struct Fx {
@@ -460,7 +436,7 @@ async fn headless_repo_server_skipped_without_flag_started_with_approve_mcp_and_
     fx.project_server("echo", &[("ECHO_PID_FILE", &pid_file.to_string_lossy())]);
     let (cfg, _) = fx.loaded(Mode::Ask);
 
-    let mock = MockProvider::new(vec![text_step("one")]);
+    let mock = MockProvider::new(vec![text_step_no_usage("one")]);
     let mut run = start(fx.builder(cfg.clone(), &mock));
     let events = run.until_state("echo", McpState::Skipped).await;
     assert!(approval_request(&events).is_none());
@@ -474,7 +450,7 @@ async fn headless_repo_server_skipped_without_flag_started_with_approve_mcp_and_
     assert!(!pid_file.exists());
     run.shutdown().await;
 
-    let mock = MockProvider::new(vec![text_step("two")]);
+    let mock = MockProvider::new(vec![text_step_no_usage("two")]);
     let mut run = start(EngineBuilder {
         approve_mcp: true,
         ..fx.builder(cfg.clone(), &mock)
@@ -580,7 +556,7 @@ async fn deny_lasts_for_the_session() {
     let pid_file = fx.path("pids");
     fx.project_server("echo", &[("ECHO_PID_FILE", &pid_file.to_string_lossy())]);
     let (cfg, _) = fx.loaded(Mode::Ask);
-    let mock = MockProvider::new(vec![text_step("a"), text_step("b")]);
+    let mock = MockProvider::new(vec![text_step_no_usage("a"), text_step_no_usage("b")]);
     let mut run = start(EngineBuilder {
         interactive: true,
         ..fx.builder(cfg.clone(), &mock)
@@ -672,7 +648,7 @@ fn with_user_server(mode: Mode, env: &[(&str, &str)]) -> Config {
 #[tokio::test]
 async fn mcp_tools_sorted_by_name_in_request() {
     let fx = Fx::new();
-    let mock = MockProvider::new(vec![text_step("done")]);
+    let mock = MockProvider::new(vec![text_step_no_usage("done")]);
     let mut run = start(fx.builder(with_user_server(Mode::Ask, &[]), &mock));
     run.turn_with("hi").await;
     let req = &mock.requests()[0];
@@ -692,7 +668,7 @@ async fn mcp_call_asks_in_ask_and_auto_edit_allowed_in_yolo() {
         let fx = Fx::new();
         let mock = MockProvider::new(vec![
             tools_step(vec![call("c1", "mcp__echo__echo", json!({"text": "hi"}))]),
-            text_step("done"),
+            text_step_no_usage("done"),
         ]);
         let mut run = start(EngineBuilder {
             interactive: true,
@@ -726,7 +702,7 @@ async fn mcp_call_asks_in_ask_and_auto_edit_allowed_in_yolo() {
     let fx = Fx::new();
     let mock = MockProvider::new(vec![
         tools_step(vec![call("c1", "mcp__echo__echo", json!({"text": "yolo"}))]),
-        text_step("done"),
+        text_step_no_usage("done"),
     ]);
     let mut run = start(EngineBuilder {
         interactive: true,
@@ -757,7 +733,7 @@ async fn mcp_rule_by_name_glob_allows() {
             call("c1", "mcp__echo__echo", json!({"text": "allowed"})),
             call("c2", "mcp__echo__fail", json!({})),
         ]),
-        text_step("done"),
+        text_step_no_usage("done"),
     ]);
     // Headless: anything that asked would be denied.
     let mut run = start(fx.builder(cfg, &mock));
@@ -785,7 +761,7 @@ async fn first_request_waits_up_to_startup_timeout() {
     let fx = Fx::new();
     let mut cfg = with_user_server(Mode::Ask, &[("ECHO_START_DELAY_MS", "700")]);
     cfg.mcp.startup_timeout_ms = 60_000;
-    let mock = MockProvider::new(vec![text_step("done")]);
+    let mock = MockProvider::new(vec![text_step_no_usage("done")]);
     let mut run = start(fx.builder(cfg, &mock));
     run.turn_with("hi").await;
     assert_eq!(mcp_names(&mock.requests()[0]).len(), ECHO_TOOL_COUNT);
@@ -796,7 +772,7 @@ async fn first_request_waits_up_to_startup_timeout() {
     let fx = Fx::new();
     let mut cfg = with_user_server(Mode::Ask, &[("ECHO_START_DELAY_MS", "60000")]);
     cfg.mcp.startup_timeout_ms = 300;
-    let mock = MockProvider::new(vec![text_step("done")]);
+    let mock = MockProvider::new(vec![text_step_no_usage("done")]);
     let mut run = start(fx.builder(cfg, &mock));
     let t = Instant::now();
     run.turn_with("hi").await;
@@ -818,10 +794,10 @@ async fn late_server_joins_at_next_user_turn_once() {
     let state = |n: &str| call(n, "state", json!({"decisions_add": [n]}));
     let mock = MockProvider::new(vec![
         tools_step(vec![state("a")]),
-        text_step("turn 1"),
+        text_step_no_usage("turn 1"),
         tools_step(vec![state("b")]),
         tools_step(vec![state("c")]),
-        text_step("turn 2"),
+        text_step_no_usage("turn 2"),
     ]);
     let mut run = start(fx.builder(cfg, &mock));
     run.turn_with("one").await;
@@ -851,8 +827,8 @@ async fn list_changed_applies_at_next_user_turn() {
     let mock = MockProvider::new(vec![
         tools_step(vec![call("c1", "mcp__echo__change_tools", json!({}))]),
         tools_step(vec![call("c2", "state", json!({"decisions_add": ["x"]}))]),
-        text_step("turn 1"),
-        text_step("turn 2"),
+        text_step_no_usage("turn 1"),
+        text_step_no_usage("turn 2"),
     ]);
     let mut run = start(fx.builder(with_user_server(Mode::Yolo, &[]), &mock));
     run.turn_with("one").await;
@@ -910,7 +886,7 @@ async fn checkpoint_taken_before_stdio_mcp_call() {
             call("c1", "read", json!({"path": "a.txt"})),
             call("c2", "mcp__echo__echo", json!({"text": "x"})),
         ]),
-        text_step("done"),
+        text_step_no_usage("done"),
     ]);
     let mut run = start(EngineBuilder {
         pre_exec: Some(hook.clone()),
@@ -933,7 +909,7 @@ async fn identical_failed_mcp_call_blocked() {
     let mock = MockProvider::new(vec![
         tools_step(vec![call("c1", "mcp__echo__fail", json!({"why": 1}))]),
         tools_step(vec![call("c2", "mcp__echo__fail", json!({"why": 1}))]),
-        text_step("done"),
+        text_step_no_usage("done"),
     ]);
     let mut run = start(fx.builder(with_user_server(Mode::Yolo, &[]), &mock));
     let events = run.turn_with("go").await;
@@ -951,7 +927,7 @@ async fn identical_failed_mcp_call_blocked() {
 #[tokio::test]
 async fn client_servers_are_trusted() {
     let fx = Fx::new();
-    let mock = MockProvider::new(vec![text_step("done")]);
+    let mock = MockProvider::new(vec![text_step_no_usage("done")]);
     let mut run = start(EngineBuilder {
         interactive: true,
         client_mcp: vec![("editor".into(), stdio(&[]))],
@@ -1280,7 +1256,7 @@ async fn repository_server_names_cannot_borrow_user_rules() {
     // The user's `my.srv` has the tool prefix `mcp__my_srv__` too.
     cfg.mcp.servers.insert("my.srv".into(), stdio(&[]));
     cfg.permissions.allow = vec!["mcp__gh__*".into(), "mcp__my_srv__*".into()];
-    let mock = MockProvider::new(vec![text_step("done")]);
+    let mock = MockProvider::new(vec![text_step_no_usage("done")]);
     let mut run = start(EngineBuilder {
         approve_mcp: true,
         ..fx.builder(cfg, &mock)
@@ -1367,7 +1343,7 @@ async fn pending_approval_is_announced_again_each_turn() {
     let fx = Fx::new();
     fx.project_server("echo", &[]);
     let (cfg, _) = fx.loaded(Mode::Ask);
-    let mock = MockProvider::new(vec![text_step("a"), text_step("b")]);
+    let mock = MockProvider::new(vec![text_step_no_usage("a"), text_step_no_usage("b")]);
     let mut run = start(EngineBuilder {
         interactive: true,
         ..fx.builder(cfg, &mock)
@@ -1395,8 +1371,8 @@ async fn dead_server_tools_removed_at_next_user_turn() {
     let fx = Fx::new();
     let mock = MockProvider::new(vec![
         tools_step(vec![call("c1", "mcp__echo__exit", json!({}))]),
-        text_step("turn 1"),
-        text_step("turn 2"),
+        text_step_no_usage("turn 1"),
+        text_step_no_usage("turn 2"),
     ]);
     let mut run = start(fx.builder(with_user_server(Mode::Yolo, &[]), &mock));
     let first = run.turn_with("one").await;
@@ -1442,8 +1418,8 @@ edit_format = "str_replace"
     );
     let mock = MockProvider::new(vec![
         tools_step(vec![call("c1", "mcp__echo__exit", json!({}))]),
-        text_step("turn 1"),
-        text_step("turn 2"),
+        text_step_no_usage("turn 1"),
+        text_step_no_usage("turn 2"),
     ]);
     let mut run = start(fx.builder(cfg, &mock));
     let events = run.turn_with("one").await;
@@ -1485,7 +1461,7 @@ async fn mcp_json_fifo_does_not_block_startup() {
     let fifo = std::ffi::CString::new(fx.path(".mcp.json").to_string_lossy().as_bytes()).unwrap();
     // SAFETY: a valid NUL-terminated path.
     assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o644) }, 0);
-    let mock = MockProvider::new(vec![text_step("done")]);
+    let mock = MockProvider::new(vec![text_step_no_usage("done")]);
     let mut run = start(fx.builder(with_user_server(Mode::Ask, &[]), &mock));
     let events = run.until_state("echo", McpState::Ready).await;
     assert!(
@@ -1516,7 +1492,7 @@ async fn cancel_during_the_mcp_startup_wait_ends_the_turn_within_200ms() {
             cwd: None,
         },
     );
-    let mock = MockProvider::new(vec![text_step("never sent")]);
+    let mock = MockProvider::new(vec![text_step_no_usage("never sent")]);
     let mut run = start(fx.builder(cfg, &mock));
     run.send(Command::SendMessage {
         id: None,

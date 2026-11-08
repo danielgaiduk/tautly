@@ -8,14 +8,13 @@ use std::path::{Path, PathBuf};
 use std::process::Command as Process;
 use std::sync::Arc;
 use std::time::Duration;
+use tautly_provider::mock::{call, text_step_no_usage, tools_step};
 
 use serde_json::{Value, json};
 use tautly_core::timetravel::step_at_offset;
 use tautly_core::worktree::{self, ForkRequest, WtError};
 use tautly_core::{Command, Config, EngineBuilder, Event, ProviderFactory, SessionRecord};
-use tautly_provider::{
-    Catalog, MockProvider, MockTurn, ModelId, Provider, ProviderEvent, StopReason,
-};
+use tautly_provider::{Catalog, MockProvider, ModelId, Provider, ProviderEvent};
 use tautly_sandbox::{LocalSandbox, Mode, Sandbox};
 use tautly_session::{Origin, SessionReader};
 use tempfile::TempDir;
@@ -153,14 +152,6 @@ fn files(root: &Path) -> BTreeMap<String, String> {
     out
 }
 
-fn call(id: &str, name: &str, args: Value) -> ProviderEvent {
-    ProviderEvent::ToolCall {
-        id: id.into(),
-        name: name.into(),
-        input_json: args.to_string(),
-    }
-}
-
 fn write(id: &str, path: &str, content: &str) -> ProviderEvent {
     call(id, "write", json!({ "path": path, "content": content }))
 }
@@ -169,34 +160,17 @@ fn bash(id: &str, command: &str) -> ProviderEvent {
     call(id, "bash", json!({ "command": command }))
 }
 
-fn tools_step(calls: Vec<ProviderEvent>) -> MockTurn {
-    let mut evs = calls;
-    evs.push(ProviderEvent::Done {
-        stop: StopReason::ToolUse,
-    });
-    MockTurn::Events(evs)
-}
-
-fn text_step(text: &str) -> MockTurn {
-    MockTurn::Events(vec![
-        ProviderEvent::TextDelta(text.into()),
-        ProviderEvent::Done {
-            stop: StopReason::EndTurn,
-        },
-    ])
-}
-
 /// Two turns: (1 user, 2 write a=one, 3 text) and (4 user, 5 write a=two and run a
 /// command that changes b.txt and creates c.txt, 6 text).
 fn two_turns() -> MockProvider {
     MockProvider::new(vec![
         tools_step(vec![write("w1", "a.txt", "one\n")]),
-        text_step("first"),
+        text_step_no_usage("first"),
         tools_step(vec![
             write("w2", "a.txt", "two\n"),
             bash("b1", "printf 'changed\\n' > b.txt && printf 'x\\n' > c.txt"),
         ]),
-        text_step("second"),
+        text_step_no_usage("second"),
     ])
 }
 
@@ -378,7 +352,7 @@ async fn fork_session_has_parent_origin_what_if_and_records_up_to_n() {
         resume: Some(made.session_id.clone()),
         ..EngineBuilder {
             root: made.worktree.clone(),
-            ..repo.builder(&MockProvider::new(vec![text_step("again")]))
+            ..repo.builder(&MockProvider::new(vec![text_step_no_usage("again")]))
         }
     });
     run.turn_with("three").await;
@@ -431,7 +405,7 @@ async fn model_override_applied_before_first_message() {
     )
     .await
     .unwrap();
-    let mock = MockProvider::new(vec![text_step("from the other")]);
+    let mock = MockProvider::new(vec![text_step_no_usage("from the other")]);
     let mut run = Run::start(EngineBuilder {
         resume: Some(made.session_id.clone()),
         root: made.worktree.clone(),
@@ -575,7 +549,7 @@ async fn partial_state_refused_with_note() {
     let repo = Repo::git_repo();
     let mock = MockProvider::new(vec![
         tools_step(vec![bash("b1", "printf 'cmd\\n' > c.txt")]),
-        text_step("done"),
+        text_step_no_usage("done"),
     ]);
     let mut run = Run::start(repo.builder(&mock));
     run.turn_with("go").await;

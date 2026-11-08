@@ -3,12 +3,13 @@
 
 use std::sync::Arc;
 use std::time::Duration;
+use tautly_provider::mock::{call, text_step_no_usage, tools_step};
 
 use serde_json::{Value, json};
 use tautly_core::{
     Command, Config, DiffFile, DiffPreview, DiffStatus, Engine, EngineBuilder, Event, FinishReason,
 };
-use tautly_provider::{Catalog, MockProvider, MockTurn, ModelId, ProviderEvent, StopReason};
+use tautly_provider::{Catalog, MockProvider, ModelId, ProviderEvent};
 use tautly_sandbox::Mode;
 use tempfile::TempDir;
 use tokio::sync::mpsc;
@@ -36,31 +37,6 @@ edit_format = "{edit_format}"
     };
     c.permissions.mode = mode;
     c
-}
-
-fn call(id: &str, name: &str, args: Value) -> ProviderEvent {
-    ProviderEvent::ToolCall {
-        id: id.into(),
-        name: name.into(),
-        input_json: args.to_string(),
-    }
-}
-
-fn tools_step(calls: Vec<ProviderEvent>) -> MockTurn {
-    let mut evs = calls;
-    evs.push(ProviderEvent::Done {
-        stop: StopReason::ToolUse,
-    });
-    MockTurn::Events(evs)
-}
-
-fn text_step(text: &str) -> MockTurn {
-    MockTurn::Events(vec![
-        ProviderEvent::TextDelta(text.into()),
-        ProviderEvent::Done {
-            stop: StopReason::EndTurn,
-        },
-    ])
 }
 
 fn read(id: &str, path: &str) -> ProviderEvent {
@@ -259,7 +235,7 @@ async fn approval_carries_diff_preview() {
             "fn old() {}",
             "fn new() {}",
         )]),
-        text_step("done"),
+        text_step_no_usage("done"),
     ]);
     let mut run = fx.start(config(Mode::Ask, "str_replace"), &mock, true);
     run.say("rename it").await;
@@ -303,7 +279,7 @@ async fn failing_preview_answers_without_asking() {
     let mock = MockProvider::new(vec![
         tools_step(vec![read("r1", "a.txt")]),
         tools_step(vec![replace("e1", "a.txt", "no such text", "x")]),
-        text_step("done"),
+        text_step_no_usage("done"),
     ]);
     let mut run = fx.start(config(Mode::Ask, "str_replace"), &mock, true);
     run.say("edit").await;
@@ -325,7 +301,7 @@ async fn file_changed_after_approval_fails_stale() {
     let mock = MockProvider::new(vec![
         tools_step(vec![read("r1", "a.txt")]),
         tools_step(vec![replace("e1", "a.txt", "beta", "BETA")]),
-        text_step("done"),
+        text_step_no_usage("done"),
     ]);
     let mut run = fx.start(config(Mode::Ask, "str_replace"), &mock, true);
     run.say("edit").await;
@@ -368,7 +344,7 @@ async fn tool_finished_carries_applied_diff_in_every_mode() {
             tools_step(vec![read("r1", "a.txt")]),
             tools_step(vec![replace("e1", "a.txt", "one", "ONE")]),
             tools_step(vec![write("w1", "new.txt", "fresh\n")]),
-            text_step("done"),
+            text_step_no_usage("done"),
         ]);
         let mut run = fx.start(config(mode, "str_replace"), &mock, true);
         run.say("go").await;
@@ -415,14 +391,14 @@ async fn session_diff_net_change_per_file() {
             "*** Update File: b.txt\n@@\n one\n-two\n+TWO\n*** Add File: c.txt\n+temp\n\
              *** Update File: same.txt\n@@\n-x\n+y\n",
         )]),
-        text_step("turn 1 done"),
+        text_step_no_usage("turn 1 done"),
         // Turn 2: edit b.txt again, delete c.txt, revert same.txt, create d.txt.
         tools_step(vec![patch(
             "p2",
             "*** Update File: b.txt\n@@\n-one\n+ONE\n TWO\n*** Delete File: c.txt\n\
              *** Update File: same.txt\n@@\n-y\n+x\n*** Add File: d.txt\n+new\n",
         )]),
-        text_step("turn 2 done"),
+        text_step_no_usage("turn 2 done"),
     ]);
     let mut run = fx.start(config(Mode::Yolo, "patch"), &mock, false);
     run.say("one").await;
@@ -455,7 +431,7 @@ async fn session_diff_net_change_per_file() {
     let mock = MockProvider::new(vec![
         tools_step(vec![read("r1", "old.txt")]),
         tools_step(vec![patch("p1", "*** Delete File: old.txt\n")]),
-        text_step("done"),
+        text_step_no_usage("done"),
     ]);
     let mut run = fx.start(config(Mode::Yolo, "patch"), &mock, false);
     run.say("delete").await;
@@ -477,13 +453,13 @@ async fn session_diff_turn_scope_uses_user_turns() {
         tools_step(vec![read("r1", "a.txt")]),
         tools_step(vec![replace("e1", "a.txt", "a", "A")]),
         tools_step(vec![write("w1", "x.txt", "x\n")]),
-        text_step("turn 1 done"),
+        text_step_no_usage("turn 1 done"),
         // User turn 2: one more step.
         tools_step(vec![
             write("w2", "y.txt", "y\n"),
             replace("e2", "a.txt", "A", "AA"),
         ]),
-        text_step("turn 2 done"),
+        text_step_no_usage("turn 2 done"),
     ]);
     let mut run = fx.start(config(Mode::Yolo, "str_replace"), &mock, false);
     // The second message arrives (and is logged) while the first turn is still running.
@@ -531,7 +507,7 @@ async fn session_diff_counts_started_turns_not_messages() {
     let fx = Fx::new();
     let mock = MockProvider::new(vec![
         tools_step(vec![write("w1", "x.txt", "x\n")]),
-        text_step("done"),
+        text_step_no_usage("done"),
     ]);
     let mut run = fx.start(config(Mode::Yolo, "str_replace"), &mock, false);
     let id = run.engine.session_id().to_string();
@@ -572,7 +548,7 @@ async fn session_diff_reply_waits_for_a_full_event_channel() {
     let fx = Fx::new();
     let mock = MockProvider::new(vec![
         tools_step(vec![write("w1", "a.txt", "a\n")]),
-        text_step("done"),
+        text_step_no_usage("done"),
     ]);
     let mut run = fx.start(config(Mode::Yolo, "str_replace"), &mock, false);
     run.say("write").await;
@@ -611,7 +587,7 @@ async fn headless_ask_answers_failing_previews_and_denies_the_rest() {
         tools_step(vec![read("r1", "a.txt")]),
         tools_step(vec![replace("e1", "a.txt", "no such text", "x")]),
         tools_step(vec![replace("e2", "a.txt", "alpha", "beta")]),
-        text_step("done"),
+        text_step_no_usage("done"),
     ]);
     let mut run = fx.start(config(Mode::Ask, "str_replace"), &mock, false);
     run.say("edit").await;
@@ -648,7 +624,7 @@ async fn session_diff_capped_at_2000_lines() {
     let big: String = (1..=3000).map(|i| format!("line {i}\n")).collect();
     let mock = MockProvider::new(vec![
         tools_step(vec![write("w1", "big.txt", &big)]),
-        text_step("done"),
+        text_step_no_usage("done"),
     ]);
     let mut run = fx.start(config(Mode::Yolo, "str_replace"), &mock, false);
     run.say("write").await;

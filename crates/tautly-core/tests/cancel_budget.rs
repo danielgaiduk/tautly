@@ -4,9 +4,10 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, UNIX_EPOCH};
+use tautly_provider::mock::call;
 
 use async_trait::async_trait;
-use serde_json::{Value, json};
+use serde_json::json;
 use tautly_core::{
     BudgetLimits, BudgetScope, Command, Config, Engine, EngineBuilder, Event, FinishReason, Ledger,
     SessionRecord, Signal, SignalRouter, UsageRole, handle_signals, install_signal_handlers,
@@ -54,14 +55,6 @@ fn config(priced: bool) -> Config {
     };
     c.permissions.mode = Mode::Yolo;
     c
-}
-
-fn call(id: &str, name: &str, args: Value) -> ProviderEvent {
-    ProviderEvent::ToolCall {
-        id: id.into(),
-        name: name.into(),
-        input_json: args.to_string(),
-    }
 }
 
 fn bash(id: &str, cmd: &str) -> ProviderEvent {

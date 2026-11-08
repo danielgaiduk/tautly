@@ -4,6 +4,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
+use tautly_provider::mock::{call, tools_step};
 
 use serde_json::{Value, json};
 use tautly_core::record::session_model;
@@ -95,23 +96,6 @@ fn config(model: &str) -> Config {
 
 fn m(id: &str) -> ModelId {
     ModelId::from(id)
-}
-
-fn call(id: &str, name: &str, args: Value) -> ProviderEvent {
-    ProviderEvent::ToolCall {
-        id: id.into(),
-        name: name.into(),
-        input_json: args.to_string(),
-    }
-}
-
-/// A response with tool calls, without usage (mock numbers would skew the estimator).
-fn tools_step(calls: Vec<ProviderEvent>) -> MockTurn {
-    let mut evs = calls;
-    evs.push(ProviderEvent::Done {
-        stop: StopReason::ToolUse,
-    });
-    MockTurn::Events(evs)
 }
 
 /// A text answer without usage.

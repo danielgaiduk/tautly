@@ -7,17 +7,16 @@ use std::path::{Path, PathBuf};
 use std::process::Command as Process;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tautly_provider::mock::{call, text_step, tools_step};
 
-use serde_json::{Value, json};
+use serde_json::json;
 use tautly_core::checkpoint::{self, skip_warning};
 use tautly_core::undo::{UndoError, undo};
 use tautly_core::{
     CheckpointConfig, Checkpointer, CliOverrides, Command, Config, Engine, EngineBuilder, Event,
     SessionRecord, Skip, sessions,
 };
-use tautly_provider::{
-    Catalog, MockProvider, MockTurn, ModelId, ProviderEvent, RawUsage, StopReason,
-};
+use tautly_provider::{Catalog, MockProvider, ModelId, ProviderEvent};
 use tautly_sandbox::{LocalSandbox, Mode, Sandbox};
 use tautly_session::SessionReader;
 use tempfile::TempDir;
@@ -165,43 +164,12 @@ fn config() -> Config {
     c
 }
 
-fn call(id: &str, name: &str, args: Value) -> ProviderEvent {
-    ProviderEvent::ToolCall {
-        id: id.into(),
-        name: name.into(),
-        input_json: args.to_string(),
-    }
-}
-
 fn bash(id: &str, command: &str) -> ProviderEvent {
     call(id, "bash", json!({ "command": command }))
 }
 
 fn write(id: &str, path: &str, content: &str) -> ProviderEvent {
     call(id, "write", json!({ "path": path, "content": content }))
-}
-
-fn tools_step(calls: Vec<ProviderEvent>) -> MockTurn {
-    let mut evs = calls;
-    evs.push(ProviderEvent::Done {
-        stop: StopReason::ToolUse,
-    });
-    MockTurn::Events(evs)
-}
-
-fn text_step(text: &str) -> MockTurn {
-    MockTurn::Events(vec![
-        ProviderEvent::TextDelta(text.into()),
-        ProviderEvent::Usage(RawUsage {
-            input: 100,
-            output: 10,
-            cache_read: 0,
-            cache_write: 0,
-        }),
-        ProviderEvent::Done {
-            stop: StopReason::EndTurn,
-        },
-    ])
 }
 
 struct Run {

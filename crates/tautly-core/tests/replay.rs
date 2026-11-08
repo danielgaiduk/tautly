@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
+use tautly_provider::mock::call;
 
 use async_trait::async_trait;
 use serde_json::{Value, json};
@@ -267,14 +268,6 @@ fn finished(seen: &[Event]) -> (u32, bool) {
             events, cancelled, ..
         }) => (*events, *cancelled),
         other => panic!("no ReplayFinished at the end: {other:?}"),
-    }
-}
-
-fn call(id: &str, name: &str, args: Value) -> ProviderEvent {
-    ProviderEvent::ToolCall {
-        id: id.into(),
-        name: name.into(),
-        input_json: args.to_string(),
     }
 }
 

@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command as Process;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tautly_provider::mock::{call, text_step_no_usage, tools_step};
 
 use serde_json::{Value, json};
 use tautly_core::record::{CheckpointPoint, session_label};
@@ -16,9 +17,7 @@ use tautly_core::{
     Command, Config, EngineBuilder, Event, FinishReason, MaterializeReport, SessionRecord, TtError,
     tree,
 };
-use tautly_provider::{
-    CanonicalRequest, Catalog, MockProvider, MockTurn, ModelId, ProviderEvent, StopReason,
-};
+use tautly_provider::{CanonicalRequest, Catalog, MockProvider, MockTurn, ModelId, ProviderEvent};
 use tautly_sandbox::{LocalSandbox, Mode, Sandbox};
 use tautly_session::{Origin, SessionReader};
 use tempfile::TempDir;
@@ -147,37 +146,12 @@ edit_format = "str_replace"
     }
 }
 
-fn call(id: &str, name: &str, args: Value) -> ProviderEvent {
-    ProviderEvent::ToolCall {
-        id: id.into(),
-        name: name.into(),
-        input_json: args.to_string(),
-    }
-}
-
 fn write(id: &str, path: &str, content: &str) -> ProviderEvent {
     call(id, "write", json!({ "path": path, "content": content }))
 }
 
 fn bash(id: &str, command: &str) -> ProviderEvent {
     call(id, "bash", json!({ "command": command }))
-}
-
-fn tools_step(calls: Vec<ProviderEvent>) -> MockTurn {
-    let mut evs = calls;
-    evs.push(ProviderEvent::Done {
-        stop: StopReason::ToolUse,
-    });
-    MockTurn::Events(evs)
-}
-
-fn text_step(text: &str) -> MockTurn {
-    MockTurn::Events(vec![
-        ProviderEvent::TextDelta(text.into()),
-        ProviderEvent::Done {
-            stop: StopReason::EndTurn,
-        },
-    ])
 }
 
 struct Run {
@@ -354,12 +328,12 @@ fn logs(home: &Path) -> Vec<PathBuf> {
 fn two_turns() -> MockProvider {
     MockProvider::new(vec![
         tools_step(vec![write("w1", "a.txt", "one\n")]),
-        text_step("first"),
+        text_step_no_usage("first"),
         tools_step(vec![
             write("w2", "a.txt", "two\n"),
             bash("b1", "printf 'changed\\n' > b.txt && printf 'x\\n' > c.txt"),
         ]),
-        text_step("second"),
+        text_step_no_usage("second"),
     ])
 }
 
@@ -382,7 +356,7 @@ async fn state_at_uses_earliest_checkpoint_after_and_reverts_tool_edits() {
             write("w2", "a.txt", "two\n"),
             bash("b1", "printf 'x\\n' > c.txt"),
         ]),
-        text_step("done"),
+        text_step_no_usage("done"),
     ]);
     let mut run = Run::start(repo.builder(&mock));
     run.turn_with("go").await;
@@ -466,7 +440,7 @@ async fn state_at_with_skipped_checkpoint_is_partial() {
     let mock = MockProvider::new(vec![
         tools_step(vec![bash("b1", "sleep 30")]),
         tools_step(vec![bash("b2", "true")]),
-        text_step("done"),
+        text_step_no_usage("done"),
     ]);
     // A generous checkpoint time limit: one skipped under load is another partial case.
     let patient = |mut b: EngineBuilder| {
@@ -497,7 +471,7 @@ async fn state_at_with_skipped_checkpoint_is_partial() {
     // step's turn before it. With its point known, the same boundary is exact.
     let mock = MockProvider::new(vec![
         tools_step(vec![write("w1", "a.txt", "one\n")]),
-        text_step("first"),
+        text_step_no_usage("first"),
     ]);
     let mut run = Run::start(patient(repo.builder(&mock)));
     run.turn_with("one").await;
@@ -719,11 +693,11 @@ async fn context_after_rewind_equals_rebuild_until() {
     let repo = Repo::git_repo();
     let mut script = vec![
         tools_step(vec![write("w1", "a.txt", "one\n")]),
-        text_step("first"),
+        text_step_no_usage("first"),
         tools_step(vec![write("w2", "a.txt", "two\n")]),
-        text_step("second"),
+        text_step_no_usage("second"),
     ];
-    script.push(text_step("on the branch"));
+    script.push(text_step_no_usage("on the branch"));
     let mock = MockProvider::new(script);
     let mut run = run_two_turns(&repo, &mock).await;
     let old_log = run.current().1;
@@ -745,12 +719,12 @@ async fn non_git_rewind_restores_tool_edits_and_notes_commands() {
     let repo = Repo::plain();
     let mock = MockProvider::new(vec![
         tools_step(vec![write("w1", "a.txt", "one\n")]),
-        text_step("first"),
+        text_step_no_usage("first"),
         tools_step(vec![
             write("w2", "a.txt", "two\n"),
             bash("b1", "printf 'x\\n' > c.txt"),
         ]),
-        text_step("second"),
+        text_step_no_usage("second"),
     ]);
     let mut run = run_two_turns(&repo, &mock).await;
     let (branch, report) = run.rewind(3, false, &[]).await.done();
@@ -789,7 +763,7 @@ async fn switch_back_and_forth_restores_each_tip_exactly() {
             write("w3", "d.txt", "dee\n"),
             bash("b2", "printf 'branch\\n' > b.txt"),
         ]),
-        text_step("on the branch"),
+        text_step_no_usage("on the branch"),
     ]);
     let mock = MockProvider::new(script);
     let mut run = run_two_turns(&repo, &mock).await;
@@ -823,12 +797,12 @@ async fn switch_back_and_forth_restores_each_tip_exactly() {
 fn two_turns_script() -> Vec<MockTurn> {
     vec![
         tools_step(vec![write("w1", "a.txt", "one\n")]),
-        text_step("first"),
+        text_step_no_usage("first"),
         tools_step(vec![
             write("w2", "a.txt", "two\n"),
             bash("b1", "printf 'changed\\n' > b.txt && printf 'x\\n' > c.txt"),
         ]),
-        text_step("second"),
+        text_step_no_usage("second"),
     ]
 }
 
@@ -923,7 +897,11 @@ async fn fork_children_own_checkpoint_refs() {
 #[tokio::test]
 async fn a_fork_childs_ledger_rows_hold_only_its_post_fork_requests() {
     let repo = Repo::git_repo();
-    let mock = MockProvider::new(vec![text_step("one"), text_step("two"), text_step("three")]);
+    let mock = MockProvider::new(vec![
+        text_step_no_usage("one"),
+        text_step_no_usage("two"),
+        text_step_no_usage("three"),
+    ]);
     let mut run = Run::start(repo.builder(&mock));
     run.turn_with("first").await;
     let (parent, _) = run.current();
@@ -963,7 +941,7 @@ async fn a_fork_childs_ledger_rows_hold_only_its_post_fork_requests() {
 #[tokio::test]
 async fn label_command_renames_branch() {
     let repo = Repo::git_repo();
-    let mock = MockProvider::new(vec![text_step("hi")]);
+    let mock = MockProvider::new(vec![text_step_no_usage("hi")]);
     let mut run = Run::start(repo.builder(&mock));
     run.turn_with("hello").await;
     run.engine
@@ -1079,12 +1057,12 @@ async fn human_edit_between_turns_is_a_conflict() {
     let repo = Repo::git_repo();
     let mock = MockProvider::new(vec![
         tools_step(vec![write("w1", "a.txt", "one\n")]),
-        text_step("first"),
+        text_step_no_usage("first"),
         tools_step(vec![
             write("w2", "a.txt", "two\n"),
             bash("b1", "printf 'x\\n' > c.txt"),
         ]),
-        text_step("second"),
+        text_step_no_usage("second"),
     ]);
     let mut run = Run::start(repo.builder(&mock));
     run.turn_with("one").await;
@@ -1116,9 +1094,9 @@ async fn a_symlinked_parent_is_blocked_and_never_written_through() {
         let repo = if git { Repo::git_repo() } else { Repo::plain() };
         let mock = MockProvider::new(vec![
             tools_step(vec![write("w1", "sub/y.txt", "one\n")]),
-            text_step("first"),
+            text_step_no_usage("first"),
             tools_step(vec![write("w2", "sub/y.txt", "two\n")]),
-            text_step("second"),
+            text_step_no_usage("second"),
         ]);
         let mut run = run_two_turns(&repo, &mock).await;
         std::fs::remove_dir_all(repo.root().join("sub")).unwrap();
@@ -1152,9 +1130,9 @@ async fn a_tool_edit_of_an_ignored_file_is_reverted() {
     repo.git(&["commit", "-q", "-m", "ignore"]);
     let mock = MockProvider::new(vec![
         tools_step(vec![write("w1", "a.txt", "one\n")]),
-        text_step("first"),
+        text_step_no_usage("first"),
         tools_step(vec![write("w2", "gen.log", "generated\n")]),
-        text_step("second"),
+        text_step_no_usage("second"),
     ]);
     let mut run = run_two_turns(&repo, &mock).await;
     repo.write("h.log", "the human's\n");
@@ -1239,12 +1217,12 @@ async fn a_failed_write_puts_the_files_back_and_names_the_backup() {
     let repo = Repo::git_repo();
     let mock = MockProvider::new(vec![
         tools_step(vec![write("w1", "d/a.txt", "one\n")]),
-        text_step("first"),
+        text_step_no_usage("first"),
         tools_step(vec![
             write("w2", "d/a.txt", "two\n"),
             bash("b1", "printf 'x\\n' > c.txt"),
         ]),
-        text_step("second"),
+        text_step_no_usage("second"),
     ]);
     let mut run = run_two_turns(&repo, &mock).await;
     let d = repo.root().join("d");
@@ -1286,9 +1264,9 @@ async fn outside_git_an_overwrite_keeps_the_content_in_the_session_log() {
     let repo = Repo::plain();
     let mock = MockProvider::new(vec![
         tools_step(vec![write("w1", "a.txt", "one\n")]),
-        text_step("first"),
+        text_step_no_usage("first"),
         tools_step(vec![write("w2", "a.txt", "two\n")]),
-        text_step("second"),
+        text_step_no_usage("second"),
     ]);
     let mut run = run_two_turns(&repo, &mock).await;
     let log = run.current().1;
@@ -1346,7 +1324,7 @@ async fn an_unknown_step_changes_nothing() {
 async fn a_restore_cut_off_is_warned_about_at_resume() {
     // M7: a `RestoreBegun` with no `RestoreEnded` (a crash mid-restore).
     let repo = Repo::git_repo();
-    let mock = MockProvider::new(vec![text_step("hi")]);
+    let mock = MockProvider::new(vec![text_step_no_usage("hi")]);
     let mut run = Run::start(repo.builder(&mock));
     run.turn_with("hello").await;
     let (id, log) = run.current();
@@ -1392,7 +1370,7 @@ async fn human_edit_after_a_cancelled_command_turn_is_a_conflict() {
     let mock = MockProvider::new(vec![
         tools_step(vec![bash("b1", "sleep 30")]),
         tools_step(vec![write("w1", "a.txt", "two\n")]),
-        text_step("second"),
+        text_step_no_usage("second"),
     ]);
     let mut run = Run::start(repo.builder(&mock));
     run.engine
@@ -1436,7 +1414,7 @@ async fn an_offline_edit_after_a_crash_in_a_command_turn_is_a_conflict() {
     };
     let mock = MockProvider::new(vec![
         tools_step(vec![bash("b1", "printf 'cmd\\n' > c.txt")]),
-        text_step("done"),
+        text_step_no_usage("done"),
     ]);
     let mut run = Run::start(patient(repo.builder(&mock)));
     let id = run.engine.session_id().to_string();
@@ -1505,9 +1483,9 @@ fn ignoring_logs() -> Repo {
 fn writes_gen_log() -> MockProvider {
     MockProvider::new(vec![
         tools_step(vec![write("w1", "a.txt", "one\n")]),
-        text_step("first"),
+        text_step_no_usage("first"),
         tools_step(vec![write("w2", "gen.log", "generated\n")]),
-        text_step("second"),
+        text_step_no_usage("second"),
     ])
 }
 
@@ -1634,7 +1612,7 @@ async fn an_engine_never_runs_without_the_lease() {
     let repo = Repo::git_repo();
     let lease = tautly_core::Lease::shared(repo.home(), &repo.root()).unwrap();
     let held = lease.try_exclusive().unwrap();
-    let mock = MockProvider::new(vec![text_step("never")]);
+    let mock = MockProvider::new(vec![text_step_no_usage("never")]);
     let mut run = Run::start(EngineBuilder {
         lease_wait: Duration::from_millis(300),
         ..repo.builder(&mock)
@@ -1743,9 +1721,9 @@ async fn overwritten_outside_git() -> (Repo, String) {
     let repo = Repo::plain();
     let mock = MockProvider::new(vec![
         tools_step(vec![write("w1", "a.txt", "one\n")]),
-        text_step("first"),
+        text_step_no_usage("first"),
         tools_step(vec![write("w2", "a.txt", "two\n")]),
-        text_step("second"),
+        text_step_no_usage("second"),
     ]);
     let mut run = run_two_turns(&repo, &mock).await;
     let a = run.current().0;
@@ -1847,9 +1825,9 @@ async fn restore_backup_counts_a_mode_change_of_a_file_the_restore_created() {
     let repo = Repo::plain();
     let mock = MockProvider::new(vec![
         tools_step(vec![write("w1", "n.txt", "one\n")]),
-        text_step("first"),
+        text_step_no_usage("first"),
         tools_step(vec![write("w2", "n.txt", "two\n")]),
-        text_step("second"),
+        text_step_no_usage("second"),
     ]);
     let mut run = run_two_turns(&repo, &mock).await;
     let a = run.current().0;
@@ -1904,9 +1882,9 @@ async fn restore_backup_never_removes_a_file_a_human_changed() {
     let repo = Repo::plain();
     let mock = MockProvider::new(vec![
         tools_step(vec![write("w1", "a.txt", "one\n")]),
-        text_step("first"),
+        text_step_no_usage("first"),
         tools_step(vec![write("w2", "n.txt", "new\n")]),
-        text_step("second"),
+        text_step_no_usage("second"),
     ]);
     let mut run = run_two_turns(&repo, &mock).await;
     let a = run.current().0;
@@ -1960,7 +1938,11 @@ async fn unanswered(repo: &Repo, how: NoResponse) -> Run {
         )),
         NoResponse::Cancel | NoResponse::Crash => MockTurn::Stall,
     };
-    let mock = MockProvider::new(vec![text_step("first"), second, text_step("third")]);
+    let mock = MockProvider::new(vec![
+        text_step_no_usage("first"),
+        second,
+        text_step_no_usage("third"),
+    ]);
     let mut run = Run::start(repo.builder(&mock));
     let id = run.engine.session_id().to_string();
     run.turn_with("one").await;
@@ -1992,7 +1974,7 @@ async fn unanswered(repo: &Repo, how: NoResponse) -> Run {
     std::fs::write(&log, lines[..=request].join("\n") + "\n").unwrap();
     Run::start(EngineBuilder {
         resume: Some(id),
-        ..repo.builder(&MockProvider::new(vec![text_step("third")]))
+        ..repo.builder(&MockProvider::new(vec![text_step_no_usage("third")]))
     })
 }
 
@@ -2117,7 +2099,7 @@ async fn a_log_holding_a_null_replay_speed_resumes_forks_rewinds_and_compares() 
     let repo = Repo::git_repo();
     let mock = MockProvider::new(vec![
         tools_step(vec![write("w1", "a.txt", "one\n")]),
-        text_step("first"),
+        text_step_no_usage("first"),
     ]);
     let mut run = Run::start(repo.builder(&mock));
     let id = run.engine.session_id().to_string();
@@ -2137,7 +2119,7 @@ async fn a_log_holding_a_null_replay_speed_resumes_forks_rewinds_and_compares() 
         resume: Some(id),
         ..repo.builder(&MockProvider::new(vec![
             tools_step(vec![write("w2", "a.txt", "two\n")]),
-            text_step("second"),
+            text_step_no_usage("second"),
         ]))
     });
     run.engine
@@ -2270,7 +2252,7 @@ async fn a_large_tool_input_is_one_blob_both_records_name_and_every_reader_resol
             write("w1", "big.txt", &big),
             write("w2", "s.txt", small),
         ]),
-        text_step("done"),
+        text_step_no_usage("done"),
     ]);
     let mut run = Run::start(repo.builder(&mock));
     run.turn_with("write").await;
@@ -2373,7 +2355,7 @@ async fn a_record_this_version_cannot_read_makes_the_states_across_it_partial() 
     let mock = MockProvider::new(vec![
         tools_step(vec![write("w1", "a.txt", "one\n")]),
         tools_step(vec![bash("b1", "printf 'x\\n' > c.txt")]),
-        text_step("done"),
+        text_step_no_usage("done"),
     ]);
     let mut run = Run::start(repo.builder(&mock));
     run.turn_with("go").await;
@@ -2418,7 +2400,7 @@ async fn a_switch_closes_the_targets_cut_turn_before_it_writes_there() {
     // precedes the switch's own records, so compare's wall time leaves the downtime out.
     let repo = Repo::git_repo();
     let lived = Instant::now();
-    let mut run = Run::start(repo.builder(&MockProvider::new(vec![text_step("one")])));
+    let mut run = Run::start(repo.builder(&MockProvider::new(vec![text_step_no_usage("one")])));
     let target = run.engine.session_id().to_string();
     run.turn_with("one").await;
     let log = run.current().1;
@@ -2434,7 +2416,7 @@ async fn a_switch_closes_the_targets_cut_turn_before_it_writes_there() {
     std::fs::write(&log, text).unwrap();
     let start_t = line["t"].as_u64().unwrap();
 
-    let mut run = Run::start(repo.builder(&MockProvider::new(vec![text_step("other")])));
+    let mut run = Run::start(repo.builder(&MockProvider::new(vec![text_step_no_usage("other")])));
     run.turn_with("elsewhere").await;
     // Time no session of the target ran.
     tokio::time::sleep(Duration::from_millis(1500)).await;
@@ -2558,13 +2540,13 @@ async fn a_restore_that_fails_midway_puts_back_what_it_can_and_logs_how_it_ended
             write("w2", "b.txt", "one\n"),
             write("w3", "c.txt", "one\n"),
         ]),
-        text_step("first"),
+        text_step_no_usage("first"),
         tools_step(vec![
             write("w4", "a.txt", "two\n"),
             write("w5", "b.txt", "two\n"),
             write("w6", "c.txt", "two\n"),
         ]),
-        text_step("second"),
+        text_step_no_usage("second"),
     ]);
     let armed = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let sb: Arc<dyn Sandbox> = Arc::new(FailC {
@@ -2628,12 +2610,12 @@ async fn a_restore_never_writes_through_a_link_or_over_a_directory() {
             write("w1", "sub/x.txt", "one\n"),
             write("w2", "d.txt", "one\n"),
         ]),
-        text_step("first"),
+        text_step_no_usage("first"),
         tools_step(vec![
             write("w3", "sub/x.txt", "two\n"),
             write("w4", "d.txt", "two\n"),
         ]),
-        text_step("second"),
+        text_step_no_usage("second"),
     ]);
     let mut run = run_two_turns(&repo, &mock).await;
     let log = run.current().1;

@@ -4,9 +4,10 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tautly_provider::mock::{call, tools_step};
 
 use async_trait::async_trait;
-use serde_json::{Value, json};
+use serde_json::json;
 use tautly_core::routing::{SideRunner, SideUsage, side_model_id};
 use tautly_core::{
     BudgetLimits, Command, Config, Engine, EngineBuilder, Event, FinishReason, RoutingConfig,
@@ -250,24 +251,6 @@ fn config(small_price: Option<&str>) -> Config {
     };
     c.permissions.mode = Mode::Yolo;
     c
-}
-
-fn call(id: &str, name: &str, args: Value) -> ProviderEvent {
-    ProviderEvent::ToolCall {
-        id: id.into(),
-        name: name.into(),
-        input_json: args.to_string(),
-    }
-}
-
-/// A response with tool calls; it reports no usage (the mock's numbers would calibrate the
-/// token estimator far off).
-fn tools_step(calls: Vec<ProviderEvent>) -> MockTurn {
-    let mut evs = calls;
-    evs.push(ProviderEvent::Done {
-        stop: StopReason::ToolUse,
-    });
-    MockTurn::Events(evs)
 }
 
 struct Fx {

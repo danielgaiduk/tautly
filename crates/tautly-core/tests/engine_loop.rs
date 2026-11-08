@@ -4,16 +4,17 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use tautly_provider::mock::{call, text_step, tools_step, usage};
 
 use async_trait::async_trait;
-use serde_json::{Value, json};
+use serde_json::json;
 use tautly_core::{
     Command, Config, Engine, EngineBuilder, ErrorKind, Event, FinishReason, SessionRecord,
     Workspace,
 };
 use tautly_provider::{
     Block, CanonicalRequest, Catalog, Content, MockProvider, MockTurn, ModelId, ProviderError,
-    ProviderEvent, RawUsage, StopReason,
+    ProviderEvent, StopReason,
 };
 use tautly_sandbox::{
     Child, FileMeta, HttpResponse, LocalSandbox, Mode, Sandbox, SandboxError, SpawnSpec, Url,
@@ -48,43 +49,6 @@ fn config(mode: Mode) -> Config {
     };
     c.permissions.mode = mode;
     c
-}
-
-fn call(id: &str, name: &str, args: Value) -> ProviderEvent {
-    ProviderEvent::ToolCall {
-        id: id.into(),
-        name: name.into(),
-        input_json: args.to_string(),
-    }
-}
-
-fn usage() -> ProviderEvent {
-    ProviderEvent::Usage(RawUsage {
-        input: 100,
-        output: 10,
-        cache_read: 0,
-        cache_write: 0,
-    })
-}
-
-/// A response with tool calls. It reports no usage: the mock's numbers would calibrate
-/// the token estimator far off.
-fn tools_step(calls: Vec<ProviderEvent>) -> MockTurn {
-    let mut evs = calls;
-    evs.push(ProviderEvent::Done {
-        stop: StopReason::ToolUse,
-    });
-    MockTurn::Events(evs)
-}
-
-fn text_step(text: &str) -> MockTurn {
-    MockTurn::Events(vec![
-        ProviderEvent::TextDelta(text.into()),
-        usage(),
-        ProviderEvent::Done {
-            stop: StopReason::EndTurn,
-        },
-    ])
 }
 
 struct Fx {

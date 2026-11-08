@@ -5,8 +5,9 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
+use tautly_provider::mock::{call, tools_step};
 
-use serde_json::{Value, json};
+use serde_json::json;
 use tautly_core::{
     CliOverrides, Command, Config, DEFAULT_TEST_COMMANDS, EngineBuilder, EngineError, Event,
     EvidenceConfig, EvidenceTracker, FinishReason, TestEvidence, TestMatcher,
@@ -453,22 +454,6 @@ edit_format = "str_replace"
     };
     c.permissions.mode = Mode::Yolo;
     c
-}
-
-fn call(id: &str, name: &str, args: Value) -> ProviderEvent {
-    ProviderEvent::ToolCall {
-        id: id.into(),
-        name: name.into(),
-        input_json: args.to_string(),
-    }
-}
-
-fn tools_step(calls: Vec<ProviderEvent>) -> MockTurn {
-    let mut evs = calls;
-    evs.push(ProviderEvent::Done {
-        stop: StopReason::ToolUse,
-    });
-    MockTurn::Events(evs)
 }
 
 fn text_step() -> MockTurn {

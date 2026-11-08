@@ -7,6 +7,7 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
+use tautly_provider::mock::call;
 
 use regex::Regex;
 use serde_json::{Value, json};
@@ -63,14 +64,6 @@ fn config(mode: Mode, priced: bool) -> Config {
     };
     c.permissions.mode = mode;
     c
-}
-
-fn call(id: &str, name: &str, args: Value) -> ProviderEvent {
-    ProviderEvent::ToolCall {
-        id: id.into(),
-        name: name.into(),
-        input_json: args.to_string(),
-    }
 }
 
 fn bash(id: &str, command: &str) -> ProviderEvent {

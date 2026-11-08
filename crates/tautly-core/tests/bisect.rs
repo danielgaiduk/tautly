@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command as Process;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use tautly_provider::mock::{call, text_step_no_usage, tools_step};
 
 use async_trait::async_trait;
 use serde_json::{Value, json};
@@ -194,28 +195,12 @@ fn files(root: &Path) -> BTreeMap<String, String> {
     out
 }
 
-fn call(id: &str, name: &str, args: Value) -> ProviderEvent {
-    ProviderEvent::ToolCall {
-        id: id.into(),
-        name: name.into(),
-        input_json: args.to_string(),
-    }
-}
-
 fn write(id: &str, path: &str, content: &str) -> ProviderEvent {
     call(id, "write", json!({ "path": path, "content": content }))
 }
 
 fn bash(id: &str, command: &str) -> ProviderEvent {
     call(id, "bash", json!({ "command": command }))
-}
-
-fn tools_step(calls: Vec<ProviderEvent>) -> MockTurn {
-    let mut evs = calls;
-    evs.push(ProviderEvent::Done {
-        stop: StopReason::ToolUse,
-    });
-    MockTurn::Events(evs)
 }
 
 fn said_step(text: &str, calls: Vec<ProviderEvent>) -> MockTurn {
@@ -225,15 +210,6 @@ fn said_step(text: &str, calls: Vec<ProviderEvent>) -> MockTurn {
         stop: StopReason::ToolUse,
     });
     MockTurn::Events(evs)
-}
-
-fn text_step(text: &str) -> MockTurn {
-    MockTurn::Events(vec![
-        ProviderEvent::TextDelta(text.into()),
-        ProviderEvent::Done {
-            stop: StopReason::EndTurn,
-        },
-    ])
 }
 
 struct Run {
@@ -288,7 +264,7 @@ fn edit_breaks_at_3() -> Vec<MockTurn> {
             vec![write("w2", "a.txt", "bad\n")],
         ),
         tools_step(vec![write("w3", "y.txt", "y\n")]),
-        text_step("done"),
+        text_step_no_usage("done"),
     ]
 }
 
@@ -471,7 +447,7 @@ async fn bisect_covers_bash_side_effects() {
                 )],
             ),
             tools_step(vec![write("w3", "z.txt", "z\n")]),
-            text_step("done"),
+            text_step_no_usage("done"),
         ])
         .await;
     let plan = bisect::plan(&reader(&log), "./check.sh", None, None).unwrap();
@@ -731,7 +707,7 @@ async fn prepass_narrows_range_with_fewer_runs() {
             "v\n",
         )]));
     }
-    steps.push(text_step("done"));
+    steps.push(text_step_no_usage("done"));
     let log = repo.session(steps).await;
     let r = reader(&log);
     assert_eq!(bisect::prepass(&r, "./check.sh"), Some((3, 5)));
@@ -981,7 +957,7 @@ async fn a_logged_endpoint_that_does_not_hold_falls_back() {
             tools_step(vec![write("w3", "a.txt", "bad\n")]),
             tools_step(vec![bash("b2", "./check.sh")]),
             tools_step(vec![write("w4", "r.txt", "r\n")]),
-            text_step("done"),
+            text_step_no_usage("done"),
         ])
         .await;
     let plan = bisect::plan(&reader(&log), "./check.sh", None, None).unwrap();
@@ -1061,7 +1037,7 @@ async fn prepass_reads_a_command_kept_in_a_blob() {
             tools_step(vec![bash("b1", &long)]),
             tools_step(vec![write("w1", "a.txt", "bad\n")]),
             tools_step(vec![bash("b2", &long)]),
-            text_step("done"),
+            text_step_no_usage("done"),
         ])
         .await;
     let text = std::fs::read_to_string(&log).unwrap();

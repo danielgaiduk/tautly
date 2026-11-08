@@ -8,11 +8,10 @@ use std::path::{Path, PathBuf};
 use std::process::Command as Process;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use tautly_provider::mock::text_step;
 
 use tautly_core::{Command, Config, Engine, EngineBuilder, Event, SessionRecord};
-use tautly_provider::{
-    Catalog, MockProvider, MockTurn, ModelId, ProviderEvent, RawUsage, StopReason,
-};
+use tautly_provider::{Catalog, MockProvider, MockTurn, ModelId, ProviderEvent, StopReason};
 use tautly_sandbox::Mode;
 use tautly_session::SessionReader;
 use tokio::sync::mpsc;
@@ -44,21 +43,6 @@ edit_format = "str_replace"
     // that would change what these tests see. Tests of the limit set their own.
     c.checkpoints.timeout_ms = 120_000;
     c
-}
-
-fn text_step(text: &str) -> MockTurn {
-    MockTurn::Events(vec![
-        ProviderEvent::TextDelta(text.into()),
-        ProviderEvent::Usage(RawUsage {
-            input: 100,
-            output: 10,
-            cache_read: 0,
-            cache_write: 0,
-        }),
-        ProviderEvent::Done {
-            stop: StopReason::EndTurn,
-        },
-    ])
 }
 
 /// The first `git` on `PATH`.

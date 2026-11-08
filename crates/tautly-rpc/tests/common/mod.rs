@@ -7,12 +7,13 @@ use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
+pub use tautly_provider::mock::{call, text_step, tools_step};
 
 use serde_json::Value;
 use tautly_core::{
     CliOverrides, Config, Engine, EngineBuilder, Event, Mode, ModelId, Workspace, Workspaces,
 };
-use tautly_provider::{Catalog, MockProvider, MockTurn, ProviderEvent, RawUsage, StopReason};
+use tautly_provider::{Catalog, MockProvider};
 use tautly_rpc::{EngineFactory, SessionSpec};
 use tautly_sandbox::{LocalSandbox, Sandbox};
 use tempfile::TempDir;
@@ -56,37 +57,6 @@ pub fn config(mode: Mode) -> Config {
     };
     c.permissions.mode = mode;
     c
-}
-
-pub fn call(id: &str, name: &str, args: Value) -> ProviderEvent {
-    ProviderEvent::ToolCall {
-        id: id.into(),
-        name: name.into(),
-        input_json: args.to_string(),
-    }
-}
-
-pub fn tools_step(calls: Vec<ProviderEvent>) -> MockTurn {
-    let mut evs = calls;
-    evs.push(ProviderEvent::Done {
-        stop: StopReason::ToolUse,
-    });
-    MockTurn::Events(evs)
-}
-
-pub fn text_step(text: &str) -> MockTurn {
-    MockTurn::Events(vec![
-        ProviderEvent::TextDelta(text.into()),
-        ProviderEvent::Usage(RawUsage {
-            input: 100,
-            output: 10,
-            cache_read: 0,
-            cache_write: 0,
-        }),
-        ProviderEvent::Done {
-            stop: StopReason::EndTurn,
-        },
-    ])
 }
 
 pub struct Fx {
