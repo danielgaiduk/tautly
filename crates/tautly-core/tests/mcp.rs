@@ -323,6 +323,56 @@ async fn repo_server_approval_request_and_answer_are_logged() {
     assert!(answered > asked, "{logged:?}");
 }
 
+/// Review M7: a `SetModel` whose provider build waits (a keychain prompt) still lets a
+/// repository server's approval be answered at once.
+#[tokio::test]
+async fn an_mcp_approval_is_answered_while_a_model_switch_builds() {
+    let fx = Fx::new();
+    fx.project_server("echo", &[]);
+    let (cfg, _) = fx.loaded(Mode::Ask);
+    let mock = MockProvider::new(vec![]);
+    // The first build blocks until the test lets it go; later ones (the side model) do not.
+    let (release, held) = std::sync::mpsc::channel::<()>();
+    let held = Arc::new(Mutex::new(Some(held)));
+    let factory: tautly_core::ProviderFactory = {
+        let mock = mock.clone();
+        Arc::new(move |_: &ModelId| {
+            let first = held.lock().unwrap().take();
+            if let Some(rx) = first {
+                let _ = rx.recv();
+            }
+            Ok(Arc::new(mock.clone()) as Arc<dyn tautly_provider::Provider>)
+        })
+    };
+    let mut run = start(EngineBuilder {
+        interactive: true,
+        provider_factory: Some(factory),
+        side_provider: Some(Arc::new(mock.clone())),
+        ..fx.waiting_builder(cfg, &mock)
+    });
+    let events = run
+        .until(|e| matches!(e, Event::McpServerApprovalRequested { .. }))
+        .await;
+    let (request_id, ..) = approval_request(&events).unwrap();
+    run.send(Command::SetModel {
+        id: None,
+        model: ModelId::from("anthropic/another-model"),
+    })
+    .await;
+    // Give the switch time to reach the (blocked) build before the answer arrives.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    run.send(Command::Approve {
+        request_id,
+        session_rule: None,
+    })
+    .await;
+    // Before the build is let go: with the answer deferred this times out.
+    run.until_state("echo", McpState::Ready).await;
+    let _ = release.send(());
+    run.until(|e| matches!(e, Event::ModelChanged { .. })).await;
+    run.shutdown().await;
+}
+
 #[tokio::test]
 async fn approval_remembered_by_root_and_launch_hash() {
     let fx = Fx::new();

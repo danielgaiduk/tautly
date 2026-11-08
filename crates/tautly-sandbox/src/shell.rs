@@ -1300,6 +1300,26 @@ const DANGEROUS_ENV: &[&str] = &[
     "RUSTC_WORKSPACE_WRAPPER",
     "SSH_ASKPASS",
     "SUDO_ASKPASS",
+    // Interpreter and toolchain search paths and flags: they choose the code that loads.
+    "NODE_PATH",
+    "RUBYLIB",
+    "PERLLIB",
+    "GCONV_PATH",
+    "GOFLAGS",
+    "GOTOOLCHAIN",
+    "RUSTC",
+    "RUSTDOC",
+    "RUSTFLAGS",
+    "RUSTDOCFLAGS",
+    "RUSTUP_TOOLCHAIN",
+    "CC",
+    "CXX",
+    "CLASSPATH",
+    "JDK_JAVA_OPTIONS",
+    "DOTNET_STARTUP_HOOKS",
+    "PHPRC",
+    "PHP_INI_SCAN_DIR",
+    "BUNDLE_GEMFILE",
 ];
 /// Prefixes of dangerous environment variable families.
 const DANGEROUS_ENV_PREFIXES: &[&str] = &[
@@ -1311,6 +1331,9 @@ const DANGEROUS_ENV_PREFIXES: &[&str] = &[
     "BASH_FUNC_",
     "CARGO_",
     "NPM_CONFIG_",
+    "YARN_",
+    "GEM_",
+    "LUA_",
 ];
 
 /// Whether assigning `name` in a command's environment can make it run other code.

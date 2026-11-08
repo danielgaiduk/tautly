@@ -209,8 +209,9 @@ deny = ["bash(git push*)", "bash(rm -*r*)"]
 Rules are `tool(glob)` or a bare `tool`; deny beats allow. Shell input is parsed so every
 command in a pipeline or `&&` chain must pass, and write redirects are matched
 structurally. Writing a protected path (`.git/`, `.tautly/`, `.github/workflows/`,
-`.vscode/`, `.idea/`, `Makefile`, `package.json`, `Cargo.toml`, `build.rs`, `.envrc`,
-shell rc files, …) always asks, in every mode. Nothing logged in a session ever counts as
+`.vscode/`, `.idea/`, `.cargo/config.toml`, `Makefile`, `package.json`, `Cargo.toml`,
+`build.rs`, `rust-toolchain.toml`, `.npmrc`, `.yarnrc.yml`, `bunfig.toml`, `.envrc`, shell
+rc files, …) always asks, in every mode. Nothing logged in a session ever counts as
 approval. The full rules: [policy reference](docs/user/policy.md).
 
 Tautly confines file access to the work tree and applies these rules itself; there is no

@@ -107,6 +107,11 @@ pub async fn run(args: Args, env: &Env, cli: &Cli) -> anyhow::Result<i32> {
             );
             return Ok(1);
         }
+        // Only write-tool paths are refused this way; kept for completeness.
+        Decision::Refuse { reason } => {
+            eprintln!("tautly: refused: {}", printable(&reason));
+            return Ok(1);
+        }
         Decision::Ask { reason } => Some(reason),
         Decision::Allow => None,
     };

@@ -922,18 +922,51 @@ impl Actor {
                         },
                         Command::SetModel { model, .. } => {
                             // The provider build may wait on a keychain prompt: keep taking
-                            // commands meanwhile (a replay among them is refused), and let a
+                            // commands meanwhile (a replay among them is refused), answer
+                            // approvals at once (an MCP server may wait on one), and let a
                             // `Shutdown` abandon the switch.
                             let mut early = Vec::new();
                             let unbound = s.events.clone();
                             s.events = unbound.replying().tagged(&cmd);
-                            let stop = until_shutdown(
-                                &mut commands,
-                                &mut early,
-                                &self.events,
-                                &self.session_id,
-                            );
-                            s.set_model(model, stop).await;
+                            {
+                                let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+                                let mut stop_tx = Some(stop_tx);
+                                let mut switch = std::pin::pin!(s.set_model(model, async {
+                                    let _ = stop_rx.await;
+                                }));
+                                // Ends when the switch does (the stop sender lives till then).
+                                // An arm body runs to its end (the switch is neither polled nor
+                                // dropped meanwhile), so an answer is logged and applied whole.
+                                loop {
+                                    tokio::select! {
+                                        biased;
+                                        () = &mut switch => break,
+                                        cmd = commands.recv(), if stop_tx.is_some() => {
+                                            let cmd = cmd.unwrap_or(Command::Shutdown);
+                                            let answer = matches!(
+                                                cmd,
+                                                Command::Approve { .. } | Command::Deny { .. }
+                                            );
+                                            if answer {
+                                                let (q, st) = (&mut queue, &mut stopping);
+                                                self.received(cmd, false, None, true, q, st).await;
+                                            } else if cmd == Command::Shutdown {
+                                                early.push(cmd);
+                                                if let Some(tx) = stop_tx.take() {
+                                                    let _ = tx.send(());
+                                                }
+                                            } else if early.len() >= COMMAND_CAPACITY {
+                                                let id = &self.session_id;
+                                                for ev in refusal(&cmd, &too_many(), None, id) {
+                                                    self.events.try_emit(ev);
+                                                }
+                                            } else {
+                                                early.push(cmd);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                             s.events = unbound;
                             for cmd in early {
                                 self.received(cmd, false, None, true, &mut queue, &mut stopping)

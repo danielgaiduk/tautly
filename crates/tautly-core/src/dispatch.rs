@@ -403,6 +403,9 @@ impl Session {
             Decision::Deny { rule } => Err(Outcome::refused(ToolResult::error(format!(
                 "denied by the permission rule `{rule}`; the call did not run"
             )))),
+            Decision::Refuse { reason } => Err(Outcome::refused(ToolResult::error(format!(
+                "refused ({reason}); the call did not run"
+            )))),
             Decision::Ask { reason } => {
                 let (bases, rule) = self.ask(p.call, tool, &args, reason, turn, ctl).await?;
                 if let Some(rule) = rule {

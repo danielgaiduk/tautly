@@ -9,7 +9,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::effect::Effect;
 use crate::protected::{
-    Resolved, argv_word_reason, normalize, path_reason, rebase, redirect_reason, resolve_links,
+    Resolved, argv_word_reason, normalize, outside_reason, path_reason, rebase, redirect_reason,
+    resolve_links,
 };
 use crate::runners::{WRAPPERS, base};
 use crate::shell::{SimpleCommand, is_dangerous_env, parse_commands};
@@ -42,6 +43,12 @@ pub enum Decision {
     Deny {
         /// The deny rule that matched.
         rule: String,
+    },
+    /// Refuse it: no approval could make it work (a write tool's path outside the
+    /// workspace, which the sandbox will not write).
+    Refuse {
+        /// Why it cannot run.
+        reason: String,
     },
 }
 
@@ -400,8 +407,8 @@ impl Policy {
             .map(|_| rule)
     }
 
-    /// Order: deny rules, protected paths, unparseable commands, allow rules (configured
-    /// and session), mode default.
+    /// Order: deny rules, write-tool paths outside the workspace (refused), protected
+    /// paths, unparseable commands, allow rules (configured and session), mode default.
     ///
     /// Write paths are judged both as written and after following symlinks under
     /// the workspace root (read from disk at decision time), so a committed
@@ -418,10 +425,23 @@ impl Policy {
         if let Some(d) = self.denied(tool, &subjects) {
             return d;
         }
+        if let Subjects::Paths(ps) = &subjects
+            && let Some(reason) = ps.iter().find_map(|p| outside_reason(&self.root, &p.raw))
+        {
+            return Decision::Refuse { reason };
+        }
         if let Some(reason) = self.needs_approval(&subjects) {
             return Decision::Ask { reason };
         }
         let rules: Vec<&Rule> = self.allow.iter().chain(&self.session).collect();
+        // A loopback, link-local or private address (cloud metadata, local services)
+        // needs a rule naming that very host; `web_fetch(*)` and yolo do not reach it.
+        if let Subjects::Host(h) = &subjects
+            && let Some(reason) = local_host_reason(h)
+            && !rules.iter().any(|r| r.text == format!("{tool}({h})"))
+        {
+            return Decision::Ask { reason };
+        }
         if self.allows(&rules, tool, &subjects) {
             return Decision::Allow;
         }
@@ -783,23 +803,29 @@ fn deny_argvs(argv: &[String]) -> Vec<Vec<String>> {
     out
 }
 
+/// Git global options that take their value as the next word when not written `--opt=val`.
+const GIT_VALUED: &[&str] = &[
+    "-C",
+    "-c",
+    "--git-dir",
+    "--work-tree",
+    "--namespace",
+    "--config-env",
+    "--super-prefix",
+    "--exec-path",
+];
+
 /// `git <args>` without the global options before its subcommand (`-C <dir>`, `-c k=v`,
 /// `--git-dir[=]…`, `--no-pager`, …): any leading option word, and the value of those that
 /// take one as the next word.
 fn without_git_options(argv: &[String]) -> Vec<String> {
-    const VALUED: &[&str] = &[
-        "-C",
-        "-c",
-        "--git-dir",
-        "--work-tree",
-        "--namespace",
-        "--config-env",
-        "--super-prefix",
-        "--exec-path",
-    ];
     let mut i = 1;
     while let Some(w) = argv.get(i).filter(|w| w.starts_with('-')) {
-        i += if VALUED.contains(&w.as_str()) { 2 } else { 1 };
+        i += if GIT_VALUED.contains(&w.as_str()) {
+            2
+        } else {
+            1
+        };
     }
     let mut out = vec![argv[0].clone()];
     out.extend(argv.iter().skip(i).cloned());
@@ -1005,24 +1031,97 @@ fn subject_str(raw: &str, rel: &Option<PathBuf>) -> String {
     rel.as_deref().map_or_else(|| raw.to_string(), path_str)
 }
 
-/// `git config` that may set values, or any `git -c`, can plant hooks/aliases.
+/// A git remote argument naming a repository on this machine by path.
+/// shortcut: a bare relative name (`evil`) that is a directory, or a remote configured
+/// earlier with a local URL, is not recognised; checking would need the disk and config.
+fn is_local_remote(w: &str) -> bool {
+    w == "."
+        || w == ".."
+        || ["/", "./", "../", "~", "file://"]
+            .iter()
+            .any(|p| w.starts_with(p))
+}
+
+/// Why a (canonical) host is local: a loopback, unspecified, link-local, private or
+/// shared (CGNAT) literal address, or a `localhost` name.
+/// shortcut: literal addresses only; a public name that resolves to a private address
+/// (or is rebound to one) is not caught. Upgrade by resolving in `web_fetch` and pinning
+/// the connection to the checked address.
+fn local_host_reason(host: &str) -> Option<String> {
+    use std::net::{IpAddr, Ipv4Addr};
+    let v4 = |ip: Ipv4Addr| {
+        ip.is_loopback()
+            || ip.is_private()
+            || ip.is_link_local()
+            || ip.is_unspecified()
+            || ip.is_broadcast()
+            || (ip.octets()[0] == 100 && ip.octets()[1] & 0xc0 == 64)
+    };
+    let local = match host.parse::<IpAddr>() {
+        Ok(IpAddr::V4(ip)) => v4(ip),
+        Ok(IpAddr::V6(ip)) => {
+            let first = ip.segments()[0];
+            ip.is_loopback()
+                || ip.is_unspecified()
+                || first & 0xfe00 == 0xfc00
+                || first & 0xffc0 == 0xfe80
+                || ip.to_ipv4_mapped().is_some_and(v4)
+        }
+        Err(_) => host == "localhost" || host.ends_with(".localhost"),
+    };
+    local.then(|| format!("{host} is a local or private address"))
+}
+
+/// `git config` that may set values, any `git -c`, and the global options that choose
+/// whose configuration applies or which `git-*` programs run (`--config-env`,
+/// `--exec-path`, `--git-dir`, `--work-tree`) can plant hooks/aliases.
 fn git_reason(argv: &[String]) -> Option<String> {
+    const PLANTS: &[&str] = &["--config-env", "--exec-path", "--git-dir", "--work-tree"];
     let i = argv
         .iter()
         .position(|w| w == "git" || w.ends_with("/git"))?;
     let mut args = argv[i + 1..].iter();
     while let Some(a) = args.next() {
-        if a == "-C" {
-            args.next();
-        } else if a == "-c" || (a.starts_with("-c") && !a.starts_with("--")) {
+        let name = a.split_once('=').map_or(a.as_str(), |(n, _)| n);
+        if a == "-c" || (a.starts_with("-c") && !a.starts_with("--")) {
             return Some("git -c overrides configuration".into());
+        } else if PLANTS.contains(&name) {
+            return Some(format!("git {name} chooses configuration or programs"));
+        } else if GIT_VALUED.contains(&a.as_str()) {
+            args.next();
         } else if !a.starts_with('-') {
-            if a != "config" {
-                return None;
+            let rest: Vec<&str> = args.map(String::as_str).collect();
+            let named = |opts: &[&str]| {
+                rest.iter()
+                    .map(|w| w.split_once('=').map_or(*w, |(n, _)| n))
+                    .find(|n| opts.contains(n))
+            };
+            // Programs a transport runs, given on the command line.
+            const PACK: &[&str] = &["--upload-pack", "--receive-pack", "--exec"];
+            match a.as_str() {
+                "config" => {}
+                "init" | "clone" => {
+                    let short_u = a == "clone" && rest.contains(&"-u");
+                    return named(&["--template"])
+                        .or(named(PACK))
+                        .or(short_u.then_some("-u"))
+                        .map(|o| format!("git {a} {o} chooses hooks or programs to run"));
+                }
+                // A local repository's hooks run on push; a local remote can be
+                // planted for a later push (`git remote add x ../evil`).
+                "push" | "fetch" | "pull" | "remote" => {
+                    if let Some(o) = named(PACK) {
+                        return Some(format!("git {a} {o} chooses a program to run"));
+                    }
+                    return rest
+                        .iter()
+                        .find(|w| is_local_remote(w))
+                        .map(|w| format!("git {a} to the local repository {w} can run its hooks"));
+                }
+                _ => return None,
             }
             const READ: &[&str] = &["--get", "--get-all", "--get-regexp", "--list", "-l"];
-            let rest: Vec<&String> = args.collect();
-            return if rest.iter().any(|r| READ.contains(&r.as_str())) {
+            return if rest.iter().any(|r| READ.contains(r)) {
                 None
             } else {
                 Some("git config may modify configuration".into())

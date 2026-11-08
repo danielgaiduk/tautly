@@ -20,15 +20,24 @@ Set it with `[permissions] mode = "..."` or for one run with `--approve auto-edi
 
 ## The order of the decision
 
-1. **Deny rules.** A matching deny rule refuses the call, in every mode.
+1. **Deny rules.** A matching deny rule refuses the call, in every mode. An `edit` or
+   `write` of a path outside the work tree (as written, or through a symlink) is refused
+   too: the sandbox never writes there, so there is nothing to approve.
 2. **Always-ask checks.** Even in `yolo`, the call asks when it:
-   - writes a protected path, or a path outside the work tree;
+   - writes a protected path, or (a shell redirect) a path outside the work tree;
    - is a command that cannot be parsed (an `xargs` command line, heredoc tricks, words
      the parser cannot place);
    - is a command whose arguments or redirects name a protected path, that sets a
      dangerous environment variable for itself, that runs outside the work tree after a
-     `cd`, that changes git configuration (`git config`, `git -c`), or that escapes the
-     session's process cleanup (`setsid`, daemonizers, shell job control).
+     `cd`, that changes git configuration or chooses whose configuration and programs
+     git uses (`git config`, `git -c`, `--config-env`, `--exec-path`, `--git-dir`,
+     `--work-tree`), or that escapes the
+     session's process cleanup (`setsid`, daemonizers, shell job control);
+   - is a `web_fetch` of a loopback, link-local, private or shared (CGNAT) literal
+     address (`127.0.0.1`, `169.254.169.254`, `10.x`, `fd00::1`, …) or of `localhost`,
+     unless an allow rule names that exact host (`web_fetch(127.0.0.1)`; `web_fetch(*)`
+     and a bare `web_fetch` do not count). Only literal addresses are recognised: a public
+     name that resolves to a private address is not caught.
 3. **Allow rules** (from configuration and "allow for this session" answers).
 4. **The mode's default.**
 
@@ -41,11 +50,16 @@ sandbox. A memory entry `remember` proposes is written only after you approve it
 ## Protected paths
 
 Writing any of these always asks, whatever the mode or rules (case-insensitive, at any
-depth): directories `.git/`, `.tautly/`, `.vscode/`, `.idea/`, `.github/workflows/`, and
-files `.envrc`, `.gitconfig`, `Makefile`, `GNUmakefile`, `package.json`, `Cargo.toml`,
-`build.rs`, `.bashrc`, `.zshrc`, `.profile`, `.bash_profile`, `.zprofile`, `.zshenv`,
+depth): directories `.git/`, `.tautly/`, `.vscode/`, `.idea/`, `.github/workflows/`, the
+files `config` and `config.toml` inside a `.cargo/` directory, and files `.envrc`,
+`.gitconfig`, `Makefile`, `GNUmakefile`, `package.json`, `Cargo.toml`, `build.rs`,
+`rust-toolchain`, `rust-toolchain.toml`, `.npmrc`, `.yarnrc`, `.yarnrc.yml`,
+`.pnpmfile.cjs`, `bunfig.toml`, `.bashrc`, `.zshrc`, `.profile`, `.bash_profile`, `.zprofile`, `.zshenv`,
 `.zlogin`, `.zlogout`, `.bash_login`, `.bash_logout`, `config.fish`. These are files a
-trusted tool later executes. A path is judged both as written and after following
+trusted tool later executes, or configuration that names a program it runs (a cargo
+`runner` or `rustc-wrapper`, npm's `script-shell`, yarn's `yarnPath`, bun's `preload`, a
+rustup toolchain `path`), so an allowed `cargo test` or `npm test` cannot be turned into
+something else by a file the agent wrote. A path is judged both as written and after following
 symlinks, so `NOTES.md -> .git/config` counts as `.git/config`.
 
 ## Rule syntax
@@ -96,6 +110,19 @@ spellings: `find -delete`, a script or another program can do the same thing. Us
 patterns for what must never run (`bash(rm -*r*)`, `bash(git*push*)`) and keep `yolo` for
 disposable environments. Allow rules never use these extra forms (`bash(cargo test)` does
 not allow `time cargo test`).
+
+**What `bash(git *)` covers.** It allows ordinary git subcommands, but these always ask
+(options as `--opt=value` or `--opt value`): `git config` that may write, `git -c`, the
+global options `--config-env`, `--exec-path`, `--git-dir` and `--work-tree`, a `GIT_*`
+assignment in front of the command, `git init`/`git clone --template`, the transport
+programs `--upload-pack`, `--receive-pack` and `--exec` (and `git clone -u`), and
+`git push`, `fetch`, `pull` or `remote` with a remote written as a local path (`/…`,
+`./…`, `../…`, `~…`, `file://…`, `.`, `..`). Pushing to a repository on this machine runs
+that repository's hooks (`pre-receive`, `update`, `post-receive`), and those hooks are
+outside what the policy can see: a remote given by a bare name that happens to be a
+directory, or a remote configured earlier with a local URL, is not recognised. Writing
+`.git/` and `.gitconfig` in the work tree asks, but that does not cover other
+repositories, so allow `git push` only to remotes you trust.
 
 ## Session rules ("allow for this session")
 

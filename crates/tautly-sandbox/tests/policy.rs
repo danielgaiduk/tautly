@@ -29,6 +29,9 @@ fn exec(cmd: &str) -> Effect {
 fn asks(d: Decision) -> bool {
     matches!(d, Decision::Ask { .. })
 }
+fn refuses(d: Decision) -> bool {
+    matches!(d, Decision::Refuse { .. })
+}
 
 #[test]
 fn dotdot_after_a_missing_component_cannot_dodge_the_protected_list() {
@@ -190,7 +193,7 @@ fn unresolvable_targets_ask_in_yolo() {
             "{t}"
         );
     }
-    assert!(asks(p(Mode::Yolo).decide(
+    assert!(refuses(p(Mode::Yolo).decide(
         "write",
         &write("/etc/passwd"),
         None
@@ -278,7 +281,7 @@ fn path_rules_match_normalized_paths() {
         );
     }
     assert!(asks(p.decide("edit", &write("docs/../src/a.rs"), None)));
-    assert!(asks(p.decide("edit", &write("docs/../../x"), None)));
+    assert!(refuses(p.decide("edit", &write("docs/../../x"), None)));
     assert_eq!(
         p.decide("edit", &write("./docs/a.md"), None),
         Decision::Allow
@@ -337,6 +340,121 @@ fn git_config_writes_and_dash_c_ask() {
             Decision::Allow,
             "{cmd}"
         );
+    }
+}
+#[test]
+fn git_global_options_that_choose_config_or_binaries_ask_under_an_allow_rule() {
+    for mode in [Mode::Ask, Mode::AutoEdit, Mode::Yolo] {
+        let allow = with_rules(mode, &["bash(git *)"], &[]);
+        for cmd in [
+            "git -c core.hooksPath=. commit -m x",
+            "git --config-env=core.hooksPath=PWD commit -m x",
+            "git --config-env core.hooksPath=PWD commit -m x",
+            "git --exec-path=. foo",
+            "git --exec-path . foo",
+            "git --git-dir=fake.git --work-tree=. commit -m x",
+            "git --git-dir fake.git commit -m x",
+            "git --work-tree=. commit -m x",
+            "git --work-tree . commit -m x",
+            "git -C sub --git-dir=x log",
+            "git --namespace n config core.hooksPath .",
+        ] {
+            assert!(
+                asks(allow.decide("bash", &exec("git"), Some(cmd))),
+                "{mode:?}: {cmd}"
+            );
+        }
+        for cmd in ["git log", "git -C sub status", "git --no-pager log"] {
+            assert_eq!(
+                allow.decide("bash", &exec("git"), Some(cmd)),
+                Decision::Allow,
+                "{mode:?}: {cmd}"
+            );
+        }
+    }
+}
+#[test]
+fn git_templates_local_remotes_and_pack_programs_ask_under_an_allow_rule() {
+    for mode in [Mode::Ask, Mode::AutoEdit, Mode::Yolo] {
+        let allow = with_rules(mode, &["bash(git *)"], &[]);
+        for cmd in [
+            "git init --template=tpl",
+            "git init --template tpl repo",
+            "git clone --template=tpl https://x/y.git",
+            "git clone --template tpl https://x/y.git",
+            "git clone -u ./x https://x/y.git",
+            "git clone --upload-pack=./x https://x/y.git",
+            "git push /tmp/evil main",
+            "git push ./evil main",
+            "git push ../evil HEAD:main",
+            "git push ~/evil main",
+            "git push file:///tmp/evil main",
+            "git push -f .. main",
+            "git push --receive-pack=./x origin main",
+            "git push --exec ./x origin main",
+            "git fetch ../evil",
+            "git pull /tmp/evil main",
+            "git fetch --upload-pack ./x origin",
+            "git remote add evil ../evil",
+            "git remote set-url origin /tmp/evil",
+        ] {
+            assert!(
+                asks(allow.decide("bash", &exec("git"), Some(cmd))),
+                "{mode:?}: {cmd}"
+            );
+        }
+        for cmd in [
+            "git init",
+            "git clone https://x/y.git",
+            "git clone ../local-copy",
+            "git push origin main",
+            "git push -u origin HEAD:refs/heads/x",
+            "git fetch origin",
+            "git pull --rebase origin main",
+            "git remote add up https://x/y.git",
+        ] {
+            assert_eq!(
+                allow.decide("bash", &exec("git"), Some(cmd)),
+                Decision::Allow,
+                "{mode:?}: {cmd}"
+            );
+        }
+    }
+}
+#[test]
+fn tool_configs_that_name_programs_to_run_are_protected() {
+    let yolo = p(Mode::Yolo);
+    for f in [
+        ".cargo/config.toml",
+        ".cargo/config",
+        "sub/.cargo/config.toml",
+        ".Cargo/Config.TOML",
+        ".npmrc",
+        "web/.npmrc",
+        ".yarnrc.yml",
+        ".yarnrc",
+        ".pnpmfile.cjs",
+        "bunfig.toml",
+        "pkg/BunFig.toml",
+        "rust-toolchain.toml",
+        "rust-toolchain",
+    ] {
+        assert!(is_protected(std::path::Path::new(f)), "{f}");
+        assert!(asks(yolo.decide("write", &write(f), None)), "{f}");
+    }
+    assert!(asks(yolo.decide(
+        "bash",
+        &exec("echo"),
+        Some("echo '[target.x]' >> .cargo/config.toml")
+    )));
+    // Neighbours are not: a `config.toml` elsewhere, other files under `.cargo`.
+    for f in [
+        "config.toml",
+        "app/config",
+        ".cargo/notes.md",
+        ".npmrc.example",
+    ] {
+        assert!(!is_protected(std::path::Path::new(f)), "{f}");
     }
 }
 #[test]
@@ -466,6 +584,25 @@ fn dangerous_env_assignments_ask_in_every_mode() {
         "sudo LD_PRELOAD=x ls",
         "export PATH=/tmp/evil",
         "declare -x GIT_SSH_COMMAND=x",
+        "NODE_PATH=. node a.js",
+        "RUBYLIB=. ruby a.rb",
+        "GEM_PATH=. ruby a.rb",
+        "GEM_HOME=. gem list",
+        "GCONV_PATH=. iconv -l",
+        "GOFLAGS=-toolexec=./x go test",
+        "GOTOOLCHAIN=path go test",
+        "PERLLIB=. perl a.pl",
+        "LUA_INIT=@x.lua lua a.lua",
+        "RUSTC=./x cargo test",
+        "RUSTFLAGS='-C linker=./x' cargo test",
+        "RUSTUP_TOOLCHAIN=./tc cargo test",
+        "CC=./x make",
+        "CLASSPATH=. java A",
+        "JDK_JAVA_OPTIONS=-javaagent:x.jar java A",
+        "DOTNET_STARTUP_HOOKS=./x.dll dotnet run",
+        "PHPRC=. php a.php",
+        "YARN_YARN_PATH=./x.js yarn test",
+        "BUNDLE_GEMFILE=./x bundle exec rake",
     ] {
         assert!(asks(allow.decide("bash", &exec("x"), Some(cmd))), "{cmd}");
         assert!(
@@ -603,10 +740,12 @@ mod symlinks {
                 "docs/hooks/pre-commit",
                 "x",
                 "docs/hooks/../config",
-                "out/passwd",
-                "loop1",
             ] {
                 assert!(asks(p.decide("write", &write(f), None)), "{f}");
+            }
+            // A link out of the root, or a loop: the sandbox would never write it.
+            for f in ["out/passwd", "loop1"] {
+                assert!(refuses(p.decide("write", &write(f), None)), "{f}");
             }
             let abs = root.join("NOTES.md");
             assert!(asks(p.decide("write", &write(abs.to_str().unwrap()), None)));
@@ -636,11 +775,7 @@ mod symlinks {
     fn dotdot_over_a_missing_component_still_follows_symlinks() {
         let (_t, root) = repo();
         let p = policy(&root, Mode::Yolo, &["write"], &[]);
-        for f in [
-            "missing/../docs/hooks/pre-commit",
-            "missing/../NOTES.md",
-            "missing/../out/passwd",
-        ] {
+        for f in ["missing/../docs/hooks/pre-commit", "missing/../NOTES.md"] {
             assert!(asks(p.decide("write", &write(f), None)), "{f}");
             let abs = root.join(f);
             assert!(
@@ -648,6 +783,14 @@ mod symlinks {
                 "{f}"
             );
         }
+        let f = "missing/../out/passwd";
+        assert!(refuses(p.decide("write", &write(f), None)), "{f}");
+        let abs = root.join(f);
+        assert!(refuses(p.decide(
+            "write",
+            &write(abs.to_str().unwrap()),
+            None
+        )));
         assert_eq!(
             p.decide("write", &write("missing/../src/main.rs"), None),
             Decision::Allow
@@ -881,6 +1024,48 @@ fn net(host: &str) -> Effect {
     }
 }
 
+#[test]
+fn local_and_private_addresses_ask_unless_a_rule_names_the_host() {
+    let local = [
+        "127.0.0.1",
+        "127.1.2.3",
+        "10.0.0.1",
+        "172.16.5.4",
+        "192.168.1.1",
+        "169.254.169.254",
+        "100.64.0.1",
+        "0.0.0.0",
+        "::1",
+        "::",
+        "fe80::1",
+        "fd00::1",
+        "::ffff:169.254.169.254",
+        "localhost",
+        "api.localhost",
+    ];
+    for mode in [Mode::Ask, Mode::AutoEdit, Mode::Yolo] {
+        let glob = with_rules(mode, &["web_fetch", "web_fetch(*)"], &[]);
+        for h in local {
+            assert!(
+                asks(glob.decide("web_fetch", &net(h), None)),
+                "{mode:?} {h}"
+            );
+            let named = with_rules(mode, &[&format!("web_fetch({h})")], &[]);
+            assert_eq!(
+                named.decide("web_fetch", &net(h), None),
+                Decision::Allow,
+                "{mode:?} {h}"
+            );
+        }
+        for h in ["example.com", "8.8.8.8", "172.32.0.1", "2001:db8::1"] {
+            assert_eq!(
+                glob.decide("web_fetch", &net(h), None),
+                Decision::Allow,
+                "{mode:?} {h}"
+            );
+        }
+    }
+}
 #[test]
 fn network_asks_in_ask_and_auto_edit_and_allows_in_yolo() {
     for mode in [Mode::Ask, Mode::AutoEdit] {
@@ -1867,14 +2052,50 @@ fn dotdot_spellings_of_protected_paths_ask_with_the_normalized_name() {
         let r = reason(path);
         assert!(r.contains("protected path: .git/"), "{path}: {r}");
     }
+    // A write tool cannot write outside the root at all: refused, not asked.
     for path in [
         "./../.git/config",
         "/ws/../.git/config",
         "/elsewhere/.git/config",
     ] {
-        let r = reason(path);
-        assert!(r.contains("outside workspace"), "{path}: {r}");
+        match pol.decide("write", &write(path), None) {
+            Decision::Refuse { reason } => {
+                assert!(reason.contains("outside workspace"), "{path}: {reason}")
+            }
+            d => panic!("{path}: {d:?}"),
+        }
     }
+}
+#[test]
+fn write_tool_paths_outside_the_root_are_refused_in_every_mode_and_under_any_rule() {
+    for mode in [Mode::Ask, Mode::AutoEdit, Mode::Yolo] {
+        let pol = with_rules(mode, &["write", "edit(**)", "write(/tmp/*)"], &[]);
+        for (tool, path) in [
+            ("write", "/tmp/x"),
+            ("edit", "../x"),
+            ("write", "a/../../x"),
+        ] {
+            assert!(
+                matches!(
+                    pol.decide(tool, &write(path), None),
+                    Decision::Refuse { .. }
+                ),
+                "{mode:?} {tool} {path}"
+            );
+        }
+        // A deny rule still names itself first.
+        let d = with_rules(mode, &[], &["write"]);
+        assert!(matches!(
+            d.decide("write", &write("/tmp/x"), None),
+            Decision::Deny { .. }
+        ));
+    }
+    // A shell redirect outside the root can work once approved: it still asks.
+    assert!(asks(p(Mode::Yolo).decide(
+        "bash",
+        &exec("echo"),
+        Some("echo x > /tmp/x")
+    )));
 }
 
 /// Review C1: `[` then a newline runs the next line as a command. A deny rule on it
