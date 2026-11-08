@@ -63,7 +63,7 @@ pub use self::materialize::{MaterializeReport, materialize};
 use self::materialize::{fail, materialize_inner};
 use crate::checkpoint::{CheckpointError, Checkpointer, Point, Skip};
 use crate::lease::{ExclusiveGuard, LeaseError};
-use crate::protocol::{ErrorKind, Event, FinishReason};
+use crate::protocol::{Command, ErrorKind, Event, FinishReason};
 use crate::record::{CheckpointPoint, RestoreBy, RestoreOutcome, SessionRecord};
 use crate::resume::{Continue, Rebuilt, ResumeError, branch, discard, rebuild, rebuild_with};
 use crate::session::Session;
@@ -229,6 +229,8 @@ pub(crate) struct StepCounter {
     open: Option<(u32, u32)>,
     /// The open step's response so far.
     resp: Response,
+    /// A user turn is running (between its `TurnStart` and `TurnEnd`).
+    running: bool,
 }
 
 impl StepCounter {
@@ -237,6 +239,7 @@ impl StepCounter {
         match rec {
             SessionRecord::TurnStart { turn, .. } => {
                 self.close();
+                self.running = true;
                 self.done = self.done.saturating_add(1);
                 Some((self.done, *turn))
             }
@@ -259,6 +262,14 @@ impl StepCounter {
             | SessionRecord::Uncompacted { .. }
             | SessionRecord::Undone { .. }
             | SessionRecord::WritesLost { late: true, .. } => {
+                self.running &= !matches!(rec, SessionRecord::TurnEnd { .. });
+                self.close();
+                None
+            }
+            // A pin sent between turns is part of what the next step is built from.
+            SessionRecord::Command(Command::Pin { .. } | Command::Unpin { .. })
+                if !self.running =>
+            {
                 self.close();
                 None
             }

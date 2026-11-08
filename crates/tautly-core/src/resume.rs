@@ -1778,6 +1778,20 @@ mod tests {
             args_blob: None,
         });
         assert_same_last_step(&recs, "a lone ToolCall record");
+        // Review M5: a pin sent between turns (no turn running) starts the next step's
+        // inputs: rebuild ends the open step there.
+        for cmd in [
+            Command::Pin { text: "p".into() },
+            Command::Unpin { text: "p".into() },
+        ] {
+            let mut recs = text_step(1);
+            recs.remove(1);
+            recs.push(SessionRecord::Command(cmd.clone()));
+            recs.push(SessionRecord::Provider(
+                tautly_provider::ProviderEvent::TextDelta("late".into()),
+            ));
+            assert_same_last_step(&recs, &format!("after {cmd:?} between turns"));
+        }
     }
 
     /// `step_at_offset` at the end of a log of `recs` is the last step `rebuild` knows.
