@@ -253,10 +253,15 @@ fn longest_backtick_run(text: &str) -> usize {
 /// A prompt that is one of the advertised slash commands.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Slash {
+    /// `/compact`: summarize the conversation now.
     Compact,
+    /// `/undo [N]`: undo the last turn's changes, or turn N's.
     Undo(Option<u32>),
+    /// `/diff [N]`: show what the session, or turn N, changed.
     Diff(Option<u32>),
+    /// `/cost`: the last turn's and the session's cost.
     Cost,
+    /// `/pin <text>`: keep a note in the context.
     Pin(String),
     /// A known command with arguments it does not take: its usage line.
     Usage(&'static str),

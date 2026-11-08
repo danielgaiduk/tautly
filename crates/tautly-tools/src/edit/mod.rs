@@ -32,16 +32,21 @@ use crate::{AppliedEffect, Tool, ToolCx, ToolError, ToolResult};
 /// Why an edit could not be applied.
 #[derive(Debug, thiserror::Error)]
 pub enum EditError {
+    /// The file was not read in this session.
     #[error("read the file first (use `read`) before editing it")]
     NotRead,
+    /// The file changed since it was last read.
     #[error("file changed since last read; read it again before editing")]
     Stale,
+    /// The file is not text the edit tool can handle (the reason).
     #[error("{0}")]
     Undecodable(&'static str),
+    /// The sandbox refused or failed the write.
     #[error(transparent)]
     Sandbox(#[from] SandboxError),
 }
 
+/// `edit`: changes a file in the session's edit format (str_replace, patch or hashline).
 pub struct EditTool;
 
 #[derive(Deserialize)]

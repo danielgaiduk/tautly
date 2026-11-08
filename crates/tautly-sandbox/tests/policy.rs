@@ -351,7 +351,8 @@ fn mode_kebab_case_with_snake_alias() {
 #[test]
 fn path_scoped_rules_for_read_only_tools_rejected() {
     for t in [
-        "read", "grep", "glob", "outline", "symbol", "refs", "recall",
+        "read", "grep", "glob", "outline", "symbol", "refs", "recall", "find", "pin", "state",
+        "remember",
     ] {
         for (allow, deny) in [
             (vec![format!("{t}(src/**)")], vec![]),

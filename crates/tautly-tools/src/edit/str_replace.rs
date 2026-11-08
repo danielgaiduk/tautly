@@ -4,16 +4,22 @@ use std::path::Path;
 
 use super::tolerant::{Located, RepairStage, adapt_new_text, line_span, locate, locate_structural};
 
+/// Why the text to replace could not be placed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MatchError {
     /// No stage matched. `candidates` are 1-based start lines of similar windows;
     /// `nearest` is the best window (start line, line-numbered text).
     NotFound {
+        /// 1-based start lines of similar windows.
         candidates: Vec<usize>,
+        /// The most similar window: start line and line-numbered text.
         nearest: Option<(usize, String)>,
     },
     /// More than one match; 1-based start lines.
-    Ambiguous { lines: Vec<usize> },
+    Ambiguous {
+        /// The 1-based start line of each match.
+        lines: Vec<usize>,
+    },
     /// A repaired match whose `new` text carries copied `read` artifacts (line numbers or
     /// hashline anchors) on some lines but not all: stripping them would guess, keeping them
     /// would write them into the file.
@@ -28,7 +34,9 @@ pub fn apply(text: &str, old: &str, new: &str) -> Result<String, MatchError> {
 /// An edit located and spliced into the text.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Spliced {
+    /// The new text.
     pub text: String,
+    /// The stage that located the match.
     pub stage: RepairStage,
     /// 1-based first and last lines of the original text that were replaced.
     pub lines: (usize, usize),

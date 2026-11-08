@@ -9,6 +9,7 @@ use serde_json::Value;
 pub struct ModelId(String);
 
 impl ModelId {
+    /// The id as written.
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -57,19 +58,27 @@ mod b64 {
     }
 }
 
+/// Who a message is from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Role {
+    /// System instructions.
     System,
+    /// The user, or tool results.
     User,
+    /// The model.
     Assistant,
 }
 
+/// A reasoning effort level.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Effort {
+    /// Little thinking.
     Low,
+    /// Moderate thinking.
     Medium,
+    /// Much thinking.
     High,
 }
 
@@ -85,83 +94,127 @@ impl Effort {
     }
 }
 
+/// How much a request asks the model to think.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Reasoning {
+    /// A thinking-token budget (budget-style models).
     Budget(u32),
+    /// An effort level (effort-style models).
     Effort(Effort),
 }
 
+/// Where a prompt-cache breakpoint goes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CachePoint {
+    /// After the system blocks.
     AfterSystem,
+    /// After the tool definitions.
     AfterTools,
+    /// After message `n` (0-based).
     AfterMessage(usize),
 }
 
+/// One block of the system prompt.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Block {
+    /// Text.
     Text(String),
+    /// An image.
     Image {
+        /// Its MIME type.
         media_type: String,
+        /// Its bytes (base64 when serialized).
         #[serde(with = "b64")]
         data: Vec<u8>,
     },
 }
 
+/// One part of a message.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Content {
+    /// Text.
     Text(String),
+    /// An image.
     Image {
+        /// Its MIME type.
         media_type: String,
+        /// Its bytes (base64 when serialized).
         #[serde(with = "b64")]
         data: Vec<u8>,
     },
+    /// A tool call the model made.
     ToolUse {
+        /// The call id.
         id: String,
+        /// The tool's name.
         name: String,
+        /// The arguments.
         input: Value,
     },
+    /// The result of a tool call.
     ToolResult {
+        /// The id of the call it answers.
         id: String,
+        /// The output the model sees.
         output: String,
+        /// Whether the call failed.
         is_error: bool,
     },
+    /// The model's thinking text.
     Reasoning {
+        /// The text.
         text: String,
+        /// The provider's signature, sent back with the text (Anthropic).
         signature: Option<String>,
     },
     /// Reasoning the provider returned encrypted (Anthropic `redacted_thinking`). Opaque:
     /// sent back verbatim to the provider that produced it, dropped by every other adapter.
     RedactedReasoning {
+        /// The opaque data, as received.
         data: String,
     },
 }
 
+/// One message of the conversation.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Message {
+    /// Who it is from.
     pub role: Role,
+    /// Its parts, in order.
     pub content: Vec<Content>,
 }
 
+/// A tool as offered to the model.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolSpec {
+    /// The tool's name.
     pub name: String,
+    /// What it does, for the model.
     pub description: String,
+    /// The JSON Schema of its arguments.
     pub schema: Value,
 }
 
+/// A request in provider-neutral form; each adapter translates it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CanonicalRequest {
+    /// The model.
     pub model: ModelId,
+    /// The system prompt.
     pub system: Vec<Block>,
+    /// The tools offered.
     pub tools: Vec<ToolSpec>,
+    /// The conversation.
     pub messages: Vec<Message>,
+    /// Most output tokens to generate.
     pub max_output: u32,
+    /// How much to think (None: no reasoning).
     pub reasoning: Option<Reasoning>,
+    /// Where to put prompt-cache breakpoints (adapters with explicit caching).
     pub cache_breakpoints: Vec<CachePoint>,
     /// The last message of `messages` is the volatile tail (the working state, which
     /// changes on almost every request) and sits after the last cache breakpoint. Adapters
@@ -176,28 +229,43 @@ pub struct CanonicalRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(remote = "Self", rename_all = "snake_case")]
 pub enum StopReason {
+    /// The model finished.
     EndTurn,
+    /// The model wants tool results.
     ToolUse,
+    /// The output token limit was reached.
     MaxTokens,
+    /// A stop sequence was produced.
     StopSequence,
+    /// The model refused.
     Refusal,
+    /// Another reason, as the provider named it.
     Other(String),
     /// A stop reason this version does not know (read back from a newer log).
     Unknown,
 }
 
+/// Token usage as a provider reports it.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RawUsage {
+    /// Input tokens not read from the cache.
     pub input: u64,
+    /// Output tokens (thinking included).
     pub output: u64,
+    /// Input tokens read from the prompt cache.
     pub cache_read: u64,
+    /// Input tokens written to the prompt cache.
     pub cache_write: u64,
 }
 
+/// Rate-limit headroom a provider reported.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Quota {
+    /// Requests left in the window.
     pub remaining_requests: Option<u64>,
+    /// Tokens left in the window.
     pub remaining_tokens: Option<u64>,
+    /// When the window resets.
     pub reset_at: Option<SystemTime>,
 }
 
@@ -206,16 +274,22 @@ pub struct Quota {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(remote = "Self", rename_all = "snake_case")]
 pub enum ProviderEvent {
+    /// Text of the answer.
     TextDelta(String),
+    /// Thinking text.
     ReasoningDelta(String),
     /// Signature of the thinking block just streamed; send it back with the reasoning text.
     ReasoningSignature(String),
     /// An encrypted reasoning block (opaque data); keep it as
     /// [`Content::RedactedReasoning`] and send it back unchanged.
     RedactedReasoning(String),
+    /// A complete tool call.
     ToolCall {
+        /// The call id.
         id: String,
+        /// The tool's name.
         name: String,
+        /// The arguments, as the JSON text the model wrote.
         input_json: String,
     },
     /// Usage so far of this response, cumulative: a later `Usage` replaces an earlier one
@@ -224,8 +298,11 @@ pub enum ProviderEvent {
     /// Usage of an earlier attempt that [`crate::Retrying`] discarded and retried: billed,
     /// but it describes no response. Add it to the cost; never calibrate with it.
     DiscardedUsage(RawUsage),
+    /// Rate-limit headroom.
     Quota(Quota),
+    /// The response ended.
     Done {
+        /// Why.
         stop: StopReason,
     },
     /// An event this version does not know (read back from a newer log); ignored.

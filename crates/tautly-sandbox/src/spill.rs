@@ -10,9 +10,13 @@ pub const SPILL_DIR: &str = ".tautly/tmp/spill";
 /// What [`cleanup_spills`] did.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SpillCleanup {
+    /// Spill files removed.
     pub removed: usize,
+    /// Bytes freed.
     pub freed_bytes: u64,
+    /// Spill files kept.
     pub kept: usize,
+    /// Bytes kept.
     pub kept_bytes: u64,
 }
 

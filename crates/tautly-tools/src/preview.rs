@@ -49,6 +49,7 @@ pub struct DiffPreview {
     pub unified: String,
     /// Lines in the full (uncapped) diff.
     pub lines: u32,
+    /// Whether the diff was cut short.
     pub truncated: bool,
 }
 
@@ -56,14 +57,18 @@ pub struct DiffPreview {
 /// file it starts from, keyed by the sandbox-resolved path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Preview {
+    /// The diff.
     pub diff: DiffPreview,
+    /// The files the call starts from.
     pub bases: Vec<Base>,
 }
 
 /// Lines one file's diff adds and removes (0 for a binary file).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct LineCounts {
+    /// Lines added.
     pub added: u32,
+    /// Lines removed.
     pub removed: u32,
 }
 

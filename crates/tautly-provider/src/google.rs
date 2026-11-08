@@ -23,6 +23,7 @@ use crate::{
     Reasoning, Role, StopReason,
 };
 
+/// The Google Gemini API adapter.
 #[derive(Clone)]
 pub struct GoogleProvider {
     client: reqwest::Client,
@@ -32,6 +33,7 @@ pub struct GoogleProvider {
 }
 
 impl GoogleProvider {
+    /// An adapter sending requests to `base_url` with `api_key`, sized by `catalog`.
     pub fn new(api_key: String, base_url: Url, catalog: Arc<Catalog>) -> Self {
         let client = tautly_sandbox::http_client_builder()
             .connect_timeout(Duration::from_secs(15))

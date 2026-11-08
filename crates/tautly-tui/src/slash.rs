@@ -13,10 +13,14 @@ pub enum Slash {
     Undo(Option<u32>),
     /// `/resume [n|id]`: list the work tree's last sessions, or resume one.
     Resume(Option<String>),
+    /// `/compact`: compact the conversation now.
     Compact,
+    /// `/pin <text>`: keep `text` in the context.
     Pin(String),
+    /// `/unpin <text>`: remove that pin.
     Unpin(String),
-    Fork,
+    /// `/fork [label]`: branch the conversation at the tip, optionally labelled.
+    Fork(Option<String>),
     /// `/rewind N`: show the dry run, ask, then rewind files and conversation to step N
     /// as a new branch.
     Rewind(u32),
@@ -30,7 +34,9 @@ pub enum Slash {
     Replay(Option<String>),
     /// `/reasoning <level>`: how hard the model thinks from the next request on.
     Reasoning(tautly_core::ReasoningLevel),
+    /// `/memory consolidate`: propose merging and pruning project memory.
     MemoryConsolidate,
+    /// `/help`: list the commands.
     Help,
     /// Anything else (or a known command with arguments it does not take): the help is
     /// printed.
@@ -49,7 +55,7 @@ commands:
   /compact             compact the conversation now
   /pin <text>          keep <text> in the context
   /unpin <text>        remove that pin
-  /fork                branch the conversation into a new session
+  /fork [label]        branch the conversation into a new session
   /rewind N            rewind files and conversation to step N as a new branch
   /tree                this project's sessions as a tree (* marks the current one)
   /switch <label|id|n> continue another branch (n: its line in /tree), files included
@@ -83,7 +89,7 @@ pub fn parse(line: &str) -> Option<Slash> {
         ("compact", None) => Slash::Compact,
         ("pin", Some(t)) => Slash::Pin(t),
         ("unpin", Some(t)) => Slash::Unpin(t),
-        ("fork", None) => Slash::Fork,
+        ("fork", a) => Slash::Fork(a),
         ("rewind", Some(a)) => a.parse::<u32>().map_or_else(|_| unknown(), Slash::Rewind),
         ("tree", None) => Slash::Tree,
         ("switch", Some(a)) => Slash::Switch(a),
@@ -116,6 +122,11 @@ mod tests {
         assert_eq!(parse("/rewind 3"), Some(Slash::Rewind(3)));
         assert_eq!(parse("/rewind 0"), Some(Slash::Rewind(0)));
         assert_eq!(parse("/tree"), Some(Slash::Tree));
+        assert_eq!(parse("/fork"), Some(Slash::Fork(None)));
+        assert_eq!(
+            parse("/fork try-b"),
+            Some(Slash::Fork(Some("try-b".into())))
+        );
         assert_eq!(parse("/switch try-b"), Some(Slash::Switch("try-b".into())));
         assert_eq!(parse("/label main"), Some(Slash::Label("main".into())));
         assert_eq!(parse("/replay"), Some(Slash::Replay(None)));

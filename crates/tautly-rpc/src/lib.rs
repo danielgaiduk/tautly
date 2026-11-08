@@ -13,6 +13,7 @@ pub use server::{EngineFactory, FactoryError, Server, SessionSpec, command_for, 
 /// What ends a server with an error.
 #[derive(Debug, thiserror::Error)]
 pub enum RpcError {
+    /// Reading the client's input failed.
     #[error("cannot read the client's input: {0}")]
     Input(std::io::Error),
 }

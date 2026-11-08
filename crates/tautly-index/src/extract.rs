@@ -22,7 +22,9 @@ const MAX_REF_NAME_BYTES: usize = 128;
 /// Symbols (with an empty `path`) and `(1-based line, name)` references of one file.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Extracted {
+    /// The file's definitions.
     pub symbols: Vec<SymbolRow>,
+    /// The file's references: 1-based line and identifier.
     pub refs: Vec<(u32, String)>,
 }
 

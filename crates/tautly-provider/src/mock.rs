@@ -9,9 +9,12 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{CanonicalRequest, Provider, ProviderError, ProviderEvent, RawUsage, StopReason};
 
+/// One scripted response.
 #[derive(Debug, Clone)]
 pub enum MockTurn {
+    /// Yields these events.
     Events(Vec<ProviderEvent>),
+    /// Fails with this error.
     Error(ProviderError),
     /// Yields the events, then a `Transient` error.
     DropAfter(Vec<ProviderEvent>),
@@ -32,6 +35,7 @@ pub struct MockProvider {
 }
 
 impl MockProvider {
+    /// A provider answering successive requests from `script`.
     pub fn new(script: Vec<MockTurn>) -> Self {
         let state = State {
             script: script.into(),

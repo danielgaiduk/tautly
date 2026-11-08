@@ -9,25 +9,37 @@ use crate::tokens::TokenEstimator;
 /// Flat estimate for one image; providers bill images by size, which the context does not see.
 const IMAGE_TOKENS: u32 = 1_000;
 
+/// One turn of the history: the user's message and everything up to the next one.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Turn {
+    /// The turn's messages, in order.
     pub messages: Vec<Message>,
 }
 
+/// Estimated tokens per part of a request.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Breakdown {
+    /// The system prompt.
     pub system: u32,
+    /// The tool definitions.
     pub tools: u32,
+    /// The `<agents_md>` block.
     pub agents_md: u32,
+    /// The memory index.
     pub memory: u32,
+    /// The repository map.
     pub repo_map: u32,
+    /// Pinned items.
     pub pinned: u32,
+    /// The working state.
     pub state: u32,
+    /// The conversation history.
     pub history: u32,
 }
 
 impl Breakdown {
+    /// The sum of every part.
     pub fn total(&self) -> u32 {
         self.system
             + self.tools
@@ -40,12 +52,17 @@ impl Breakdown {
     }
 }
 
+/// How full the context is, as the engine reports it after assembling a request.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ContextStatus {
+    /// Estimated tokens of the request.
     pub used: u32,
+    /// The model's context window.
     pub budget: u32,
+    /// `used`, by part.
     pub breakdown: Breakdown,
+    /// Problems to show the user (pins or use over a share of the window).
     pub warnings: Vec<String>,
     /// Tokens of fixed-size estimates (images) in `used`, which calibration leaves out of
     /// its sample: what the measured request contained, not what the history holds later.
@@ -72,9 +89,12 @@ pub struct ContextStatus {
 /// counts everything any adapter sends.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum ReasoningWire {
+    /// Signed thinking and redacted thinking (Anthropic).
     #[default]
     Thinking,
+    /// Replayed reasoning items only (OpenAI).
     Items,
+    /// No reasoning (Google, OpenAI-compatible endpoints).
     None,
 }
 

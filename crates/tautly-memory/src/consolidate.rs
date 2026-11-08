@@ -44,14 +44,14 @@ fn json_array(reply: &str) -> &str {
 
 impl MemoryStore {
     /// The prompt asking the side model to propose merges and deletions. It carries at most
-    /// [`MAX_PROMPT_TOKENS`] of entries, verified and newer ones first; the prompt says how
+    /// `MAX_PROMPT_TOKENS` of entries, verified and newer ones first; the prompt says how
     /// many were left out.
     pub fn consolidation_request(&self) -> String {
         self.consolidation_request_within(MAX_PROMPT_TOKENS)
     }
 
     /// [`consolidation_request`](Self::consolidation_request) with at most `max_tokens`
-    /// (and never more than [`MAX_PROMPT_TOKENS`]) of entries: for a side model with a
+    /// (and never more than `MAX_PROMPT_TOKENS`) of entries: for a side model with a
     /// smaller window.
     pub fn consolidation_request_within(&self, max_tokens: u32) -> String {
         let max_bytes = max_tokens.min(MAX_PROMPT_TOKENS) as usize * 4;

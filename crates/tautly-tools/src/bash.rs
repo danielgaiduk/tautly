@@ -60,6 +60,7 @@ const SHELL_STATE_ENV: &[&str] = &[
     "PS4",
 ];
 
+/// `bash`: runs a shell command in the workspace.
 pub struct BashTool;
 
 #[derive(Deserialize)]

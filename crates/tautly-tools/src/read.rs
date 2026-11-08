@@ -21,6 +21,7 @@ const MAX_TARGETS: usize = 10;
 const BOTH: &str = "pass either `path` or `targets`, not both";
 const NEITHER: &str = "pass `path`, or `targets` to read several";
 
+/// `read`: reads files (or a symbol), with diff-on-re-read.
 pub struct ReadTool;
 
 #[derive(Deserialize)]

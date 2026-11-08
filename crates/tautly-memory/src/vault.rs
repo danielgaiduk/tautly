@@ -153,7 +153,7 @@ fn split_link(inner: &str) -> (&str, &str, Option<&str>) {
 }
 
 /// The targets of the `[[target]]`, `[[target|label]]` and `[[target#heading]]` links in
-/// `body`, as written, each once, at most [`MAX_LINKS`].
+/// `body`, as written, each once, at most `MAX_LINKS`.
 pub fn parse_links(body: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for (_, inner) in links(body) {

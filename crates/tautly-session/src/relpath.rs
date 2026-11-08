@@ -18,14 +18,19 @@ pub struct RelPath(String);
 /// Why a [`RelPath`] cannot be resolved under a root.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ConfineError {
+    /// The path is empty.
     #[error("empty path")]
     Empty,
+    /// The path is absolute.
     #[error("path {0:?} is absolute")]
     Absolute(String),
+    /// The path has a `..` component.
     #[error("path {0:?} has a `..` component")]
     ParentDir(String),
+    /// The path holds a NUL byte.
     #[error("path contains a NUL byte")]
     Nul,
+    /// The path has an empty or `.` component.
     #[error("path {0:?} has an empty or `.` component")]
     CurDir(String),
 }

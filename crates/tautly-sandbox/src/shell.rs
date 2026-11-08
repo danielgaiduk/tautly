@@ -24,7 +24,9 @@ pub struct SimpleCommand {
     /// the workspace root (empty = the root itself) or absolute; earlier `cd`/`pushd`
     /// in the same input change it. Relative paths in the command resolve against each.
     pub cwds: Vec<PathBuf>,
+    /// The words, unquoted.
     pub argv: Vec<String>,
+    /// The file redirections.
     pub redirects: Vec<Redirect>,
 }
 
@@ -33,7 +35,9 @@ pub struct SimpleCommand {
 /// are not listed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Redirect {
+    /// The file, as written.
     pub target: String,
+    /// Whether it writes the file.
     pub write: bool,
 }
 

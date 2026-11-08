@@ -25,6 +25,7 @@ use crate::{
     RawUsage, Reasoning, Role, StopReason,
 };
 
+/// The adapter for OpenAI-compatible Chat Completions endpoints (`compat:<name>`).
 #[derive(Clone)]
 pub struct CompatProvider {
     client: reqwest::Client,

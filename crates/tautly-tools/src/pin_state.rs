@@ -12,18 +12,25 @@ use tautly_sandbox::{Effect, Sandbox};
 use crate::spec::{parse_args, tool_spec};
 use crate::{Tool, ToolCx, ToolError, ToolResult};
 
+/// Where a plan step stands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StepStatus {
+    /// Not started.
     Pending,
+    /// Being worked on.
     InProgress,
+    /// Finished.
     Done,
 }
 
+/// One step of the task plan.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PlanStep {
+    /// What the step is.
     pub text: String,
+    /// Where it stands.
     pub status: StepStatus,
 }
 
@@ -34,8 +41,10 @@ pub struct StatePatch {
     /// Replaces the whole plan when present.
     #[serde(default)]
     pub plan: Option<Vec<PlanStep>>,
+    /// Decisions to record.
     #[serde(default)]
     pub decisions_add: Vec<String>,
+    /// Open questions to add.
     #[serde(default)]
     pub questions_add: Vec<String>,
     /// 0-based indices of open questions to mark resolved, in the order the state
@@ -47,7 +56,9 @@ pub struct StatePatch {
 /// What the engine does with a `pin` or `state` call.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ContextOp {
+    /// Pin this text to the context.
     Pin(String),
+    /// Update the task state.
     StateUpdate(StatePatch),
     /// A memory entry the model proposes; the engine asks the user before writing it.
     Remember(MemoryDraft),
@@ -91,7 +102,9 @@ pub fn parse_context_op(tool: &str, args: &Value) -> Option<ContextOp> {
     }
 }
 
+/// `pin`: keeps a short constraint or fact in every request.
 pub struct PinTool;
+/// `state`: updates the structured task state (plan, decisions, open questions).
 pub struct StateTool;
 
 #[async_trait]

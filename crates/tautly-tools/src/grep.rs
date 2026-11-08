@@ -18,6 +18,7 @@ use crate::{Tool, ToolCx, ToolError, ToolResult};
 const MAX_MATCHES: usize = 500;
 const MAX_FILE_BYTES: u64 = 10 * 1024 * 1024;
 
+/// `grep`: searches file contents with a regular expression.
 pub struct GrepTool;
 
 #[derive(Deserialize)]

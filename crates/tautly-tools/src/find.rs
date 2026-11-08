@@ -21,6 +21,7 @@ const TEXT_PER_FILE: usize = 5;
 /// Longest snippet, in characters.
 const SNIPPET_CHARS: usize = 160;
 
+/// `find`: searches symbol definitions, file paths (fuzzy) and file text at once.
 pub struct FindTool;
 
 #[derive(Deserialize)]

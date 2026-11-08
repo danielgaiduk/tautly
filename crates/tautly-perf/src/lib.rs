@@ -7,6 +7,7 @@ use std::time::Duration;
 #[path = "../../../benches/perf/gen_repo.rs"]
 pub mod gen_repo;
 
+/// One mebibyte, in bytes.
 pub const MB: u64 = 1024 * 1024;
 
 /// Resident set size of process `pid` now, in bytes (`ps -o rss=`, which both macOS and

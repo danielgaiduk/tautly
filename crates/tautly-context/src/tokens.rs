@@ -5,6 +5,7 @@ const EMA_ALPHA: f64 = 0.3;
 const MIN_RATIO: f64 = 0.5;
 const MAX_RATIO: f64 = 2.0;
 
+/// Estimates tokens as bytes / 4, scaled by a ratio calibrated against provider usage.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TokenEstimator {
     ratio: f64,
@@ -17,6 +18,7 @@ impl Default for TokenEstimator {
 }
 
 impl TokenEstimator {
+    /// The current calibration ratio (between 0.5 and 2).
     pub fn ratio(&self) -> f64 {
         self.ratio
     }
