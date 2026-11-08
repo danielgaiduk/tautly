@@ -158,7 +158,7 @@ impl MemoryStore {
                     if body.is_empty() {
                         return Err(MemoryError::EmptyBody);
                     }
-                    let tokens = body.len().div_ceil(4) as u32;
+                    let tokens = crate::approx_tokens(body);
                     if tokens > MAX_BODY_TOKENS {
                         return Err(MemoryError::TooLong {
                             tokens,

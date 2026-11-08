@@ -862,7 +862,7 @@ fn load_entries(dir: &Path) -> Result<Loaded, MemoryError> {
 fn load_entry(path: &Path) -> Result<(MemoryEntry, u64), String> {
     let text = read_nofollow(path, MAX_ENTRY_BYTES, false)?;
     let mut entry = MemoryEntry::from_markdown(&text)?;
-    let tokens = entry.body.len().div_ceil(4) as u32;
+    let tokens = crate::approx_tokens(&entry.body);
     if tokens > MAX_BODY_TOKENS {
         return Err(format!(
             "the body is about {tokens} tokens; the limit is {MAX_BODY_TOKENS}"

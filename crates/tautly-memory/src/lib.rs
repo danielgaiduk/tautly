@@ -28,6 +28,12 @@ pub use search::{Hit, HitSource};
 pub use store::MemoryStore;
 pub use vault::parse_links;
 
+/// About four bytes per token, the rule a draft is checked with wherever it is counted
+/// (the `remember` tool, the store, consolidation and the engine must agree).
+pub fn approx_tokens(s: &str) -> u32 {
+    s.len().div_ceil(4) as u32
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum MemoryError {
     #[error("{}: {source}", path.display())]
