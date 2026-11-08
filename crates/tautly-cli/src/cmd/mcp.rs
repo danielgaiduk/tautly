@@ -41,7 +41,7 @@ pub async fn run(cmd: Cmd, env: &Env) -> anyhow::Result<i32> {
 async fn list(env: &Env) -> anyhow::Result<i32> {
     let loaded = Config::load(env.root(), CliOverrides::default())?;
     for warning in &loaded.warnings {
-        eprintln!("tautly: {warning}");
+        eprintln!("tautly: {}", tautly_core::printable_multiline(warning));
     }
     let config = loaded.config;
     let sandbox = env.workspace.sandbox();
@@ -55,7 +55,7 @@ async fn list(env: &Env) -> anyhow::Result<i32> {
     )
     .await;
     for warning in &plan.warnings {
-        eprintln!("tautly: {warning}");
+        eprintln!("tautly: {}", tautly_core::printable_multiline(warning));
     }
     if plan.servers.is_empty() {
         println!(

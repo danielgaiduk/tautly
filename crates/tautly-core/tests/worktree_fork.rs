@@ -495,6 +495,60 @@ async fn worktree_hooks_not_run() {
     assert!(!marker.exists(), "a hook ran");
 }
 
+/// Whether this git runs hooks declared in configuration (git 2.54 and later); see the
+/// copy in `tests/checkpoint.rs`.
+fn config_hooks_supported() -> bool {
+    let text = git_in(Path::new("."), &["version"]).unwrap_or_default();
+    let text = text.trim();
+    let v: Vec<u32> = text
+        .trim_start_matches("git version ")
+        .split(['.', ' '])
+        .take(2)
+        .filter_map(|p| p.parse().ok())
+        .collect();
+    let ok = v.len() == 2 && (v[0], v[1]) >= (2, 54);
+    if !ok {
+        assert!(
+            std::env::var_os("TAUTLY_REQUIRE_CONFIG_HOOKS").is_none(),
+            "{text} predates config-based hooks"
+        );
+        eprintln!("note: skipped, {text} predates config-based hooks (git 2.54)");
+    }
+    ok
+}
+
+/// CP5 review C1: a hook the configuration declares (`hook.<name>.*`) runs neither when
+/// the fork's worktree is added and checked out nor when the fork is deleted.
+#[tokio::test]
+async fn config_declared_hooks_not_run_on_fork_or_delete() {
+    if !config_hooks_supported() {
+        return;
+    }
+    let repo = Repo::git_repo();
+    let (_, log) = two_turn_session(&repo).await;
+    let marker = repo.home().join("hook-ran");
+    let touch = format!("touch '{}'", marker.display());
+    repo.git(&["config", "hook.x.command", &touch]).unwrap();
+    for e in [
+        "reference-transaction",
+        "post-index-change",
+        "post-checkout",
+    ] {
+        repo.git(&["config", "--add", "hook.x.event", e]).unwrap();
+    }
+    let made = fork(&repo, &log, 3).await.unwrap();
+    assert!(made.worktree.join("a.txt").exists());
+    delete(&repo, &repo.root(), &made.session_id, false)
+        .await
+        .unwrap();
+    assert!(!made.worktree.exists());
+    assert!(!marker.exists(), "a configured hook ran");
+    // Control: git itself runs it.
+    repo.git(&["update-ref", "refs/heads/control", "HEAD"])
+        .unwrap();
+    assert!(marker.exists(), "the hook was not set up to run");
+}
+
 #[tokio::test]
 async fn non_git_root_refuses() {
     let repo = Repo::plain();

@@ -1337,6 +1337,12 @@ impl Session {
     async fn undo_command(&mut self, turn: Option<u32>, dry_run: bool) {
         // Make everything logged so far readable.
         self.checkpoint().await;
+        // Exclusive across the check and the write, as for rewind and switch: another live
+        // session's tool must not write in between (CP5 review M3).
+        let _lease = match (!dry_run).then(|| self.exclusive()).transpose() {
+            Ok(guard) => guard,
+            Err(e) => return self.time_travel_failed("undo", e).await,
+        };
         let path = self.log.path();
         let guard = match &self.checkpoints {
             Some(c) => Some(Arc::clone(c).lock_owned().await),

@@ -475,3 +475,112 @@ fn undo_with_global_excludes(symlinked: bool) {
     let has = |needle: &[u8]| objects.windows(needle.len()).any(|w| w == needle);
     assert!(!has(b"tautly-excludes") && !has(b"2e7365637265740a"));
 }
+
+fn write_step(id: &str, path: &str, content: &str) -> MockTurn {
+    MockTurn::Events(vec![
+        ProviderEvent::ToolCall {
+            id: id.into(),
+            name: "write".into(),
+            input_json: serde_json::json!({ "path": path, "content": content }).to_string(),
+        },
+        ProviderEvent::Done {
+            stop: StopReason::ToolUse,
+        },
+    ])
+}
+
+/// Send `text` and wait for the turn's end.
+async fn turn(engine: &Engine, events: &mut mpsc::Receiver<Event>, text: &str) {
+    engine
+        .send(Command::SendMessage { text: text.into() })
+        .await
+        .unwrap();
+    while !matches!(next(events).await, Event::TurnFinished { .. }) {}
+}
+
+/// CP5 review I2: an absolute `PATH` entry inside the repository (direnv's `PATH_add bin`,
+/// an activated `.venv/bin`) is skipped for git run in a linked worktree of it too: the
+/// fork's checkout, its own session's checkpoints, a bisect's moves and `sessions delete`.
+#[test]
+fn an_in_repo_path_entry_is_skipped_for_worktree_git() {
+    let git = real_git();
+    let repo = repo(&git);
+    let root = repo.path().canonicalize().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let home = home.path().canonicalize().unwrap();
+    let marker = home.join("repo-git-ran");
+    std::fs::create_dir(root.join("bin")).unwrap();
+    std::fs::write(
+        root.join("bin/git"),
+        format!(
+            "#!/bin/sh\necho \"$*\" >> '{}'\nexec '{}' \"$@\"\n",
+            marker.display(),
+            git.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(root.join("bin/git"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    let path = format!(
+        "{}:{}:/bin:/usr/bin",
+        root.join("bin").display(),
+        git.parent().unwrap().display()
+    );
+    with_path(Path::new(&path), async {
+        let (main, mut events) = engine(
+            &root,
+            &home,
+            vec![
+                write_step("w1", "a.txt", "one\n"),
+                text_step("first"),
+                write_step("w2", "a.txt", "two\n"),
+                text_step("second"),
+            ],
+        );
+        turn(&main, &mut events, "one").await;
+        turn(&main, &mut events, "two").await;
+        let log = main.session_path().to_path_buf();
+        stop(main, events).await;
+        let sb: Arc<dyn tautly_sandbox::Sandbox> =
+            Arc::new(tautly_sandbox::LocalSandbox::new(root.clone()).unwrap());
+        let made = tautly_core::worktree::fork_to_worktree(
+            Arc::clone(&sb),
+            &home,
+            &log,
+            tautly_core::worktree::ForkRequest {
+                at: Some(3),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(made.worktree.join("a.txt")).unwrap(),
+            "one\n"
+        );
+        // The fork's own session (its checkpoints are taken in the worktree).
+        let (fork, mut fork_events) = engine(&made.worktree, &home, vec![text_step("hi")]);
+        turn(&fork, &mut fork_events, "hi").await;
+        stop(fork, fork_events).await;
+        // A bisect moves its worktree from state to state.
+        let reader = SessionReader::<SessionRecord>::open(&log).unwrap();
+        let plan = tautly_core::bisect::plan(&reader, "! grep -q two a.txt", None, None).unwrap();
+        let runner = tautly_core::bisect::BashRunner::new(
+            Vec::new(),
+            tokio_util::sync::CancellationToken::new(),
+        );
+        let out = tautly_core::bisect::run(&plan, sb.as_ref(), &runner, WAIT)
+            .await
+            .unwrap();
+        assert_eq!(out.first_bad, Some(5));
+        tautly_core::sessions::delete_with(&home, sb.as_ref(), &made.session_id, false)
+            .await
+            .unwrap();
+        assert!(!made.worktree.exists());
+    });
+    let ran = std::fs::read_to_string(&marker).unwrap_or_default();
+    assert!(
+        ran.is_empty(),
+        "the repository's git ran: {}",
+        ran.lines().next().unwrap_or("")
+    );
+}

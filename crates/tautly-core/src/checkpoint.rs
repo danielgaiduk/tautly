@@ -455,6 +455,8 @@ impl<'a> Git<'a> {
     /// - Every `protocol.<name>.allow` it sets becomes `never` (`protocol.allow=never`
     ///   alone does not override them), so a lazy fetch from a promisor remote can reach
     ///   no transport (an `ext::` URL runs a command).
+    /// - Every hook it declares (`hook.<name>.*`, git 2.54) is disabled and loses its
+    ///   events: `core.hooksPath=/dev/null` only moves the directory of file hooks.
     ///
     /// Names git cannot take on the command line fail the call (no snapshot, rather than
     /// a program run).
@@ -467,7 +469,7 @@ impl<'a> Git<'a> {
     /// Within [`CONFIG_READ_TIMEOUT`] as well as `deadline`; running out of the former is
     /// [`Fail::ConfigTimeout`].
     async fn read_config(&self, deadline: Instant) -> Result<RepoConfig, Fail> {
-        let wanted = r"^(filter\..+|protocol\..+\.allow|extensions\.partialclone|remote\..+\.(promisor|partialclonefilter))$";
+        let wanted = r"^(filter\..+|hook\..+|protocol\..+\.allow|extensions\.partialclone|remote\..+\.(promisor|partialclonefilter))$";
         let cap = Instant::now() + CONFIG_READ_TIMEOUT;
         let out = match self
             .exec(
@@ -789,6 +791,7 @@ fn parse_raw_diff(out: &[u8]) -> Result<Vec<Change>, Fail> {
 /// key without a value) of the keys [`Git::read_config`] asks for.
 fn parse_config(out: &[u8]) -> Result<RepoConfig, Fail> {
     let mut filters = std::collections::BTreeSet::new();
+    let mut hooks = std::collections::BTreeSet::new();
     let mut protocols = std::collections::BTreeSet::new();
     let mut config = RepoConfig::default();
     for entry in out.split(|&b| b == 0).filter(|e| !e.is_empty()) {
@@ -809,6 +812,16 @@ fn parse_config(out: &[u8]) -> Result<RepoConfig, Fail> {
                 return Err(unusable("filter driver", name));
             }
             filters.insert(name.to_string());
+        } else if let Some(rest) = key.strip_prefix("hook.") {
+            // `hook.<name>.<var>`: a hook declared in configuration (git 2.54), which
+            // `core.hooksPath` does not switch off. (`hook.<var>` declares none.)
+            let Some((name, _var)) = rest.rsplit_once('.') else {
+                continue;
+            };
+            if name.contains('=') {
+                return Err(unusable("hook", name));
+            }
+            hooks.insert(name.to_string());
         } else if let Some(name) = key
             .strip_prefix("protocol.")
             .and_then(|rest| rest.strip_suffix(".allow"))
@@ -837,6 +850,13 @@ fn parse_config(out: &[u8]) -> Result<RepoConfig, Fail> {
         for setting in ["clean=", "smudge=", "process=", "required=false"] {
             config.overrides.push("-c".to_string());
             config.overrides.push(format!("filter.{name}.{setting}"));
+        }
+    }
+    // An empty `event` clears the hook's events; a git without `enabled` ignores it.
+    for name in hooks {
+        for setting in ["enabled=false", "event="] {
+            config.overrides.push("-c".to_string());
+            config.overrides.push(format!("hook.{name}.{setting}"));
         }
     }
     for name in protocols {
@@ -2048,6 +2068,9 @@ fn plain_relative(p: &Path) -> bool {
 /// there ([`tautly_sandbox::which_outside`], the rule every program tautly starts by a
 /// bare name follows): absolute entries outside the root only. Returned as found, links
 /// not resolved, so a shim that dispatches on its name still sees `git`.
+///
+/// When `root` is a linked worktree (a fork's, a bisect's), entries inside the main work
+/// tree are skipped as well, by the same rule (CP5 review I2).
 pub(crate) fn git_on_path(root: &Path) -> Option<PathBuf> {
     tautly_sandbox::which_outside("git", &std::env::var_os("PATH")?, root)
 }
@@ -2894,7 +2917,8 @@ mod tests {
     fn config_read_switches_off_filters_and_protocols() {
         let out = b"filter.lfs.clean\ngit-lfs clean\0filter.a.b.smudge\nx\0\
 protocol.ext.allow\nalways\0protocol.my.proto.allow\nuser\0\
-remote.origin.promisor\nfalse\0";
+remote.origin.promisor\nfalse\0hook.x.command\ntouch m\0hook.a.b.event\npost-checkout\0\
+hook.jobs\n4\0";
         let config = parse_config(out).unwrap();
         let settings: Vec<&str> = config
             .overrides
@@ -2912,6 +2936,15 @@ remote.origin.promisor\nfalse\0";
             settings.contains(&"protocol.my.proto.allow=never"),
             "{settings:?}"
         );
+        for s in [
+            "hook.x.enabled=false",
+            "hook.x.event=",
+            "hook.a.b.enabled=false",
+            "hook.a.b.event=",
+        ] {
+            assert!(settings.contains(&s), "{settings:?}");
+        }
+        assert!(!settings.iter().any(|s| s.starts_with("hook.jobs")));
         assert!(!config.partial_clone);
         // A promisor remote (a key without a value is true) or the extension.
         for out in [
@@ -2923,6 +2956,7 @@ remote.origin.promisor\nfalse\0";
             assert!(parse_config(out).unwrap().partial_clone);
         }
         assert!(parse_config(b"protocol.a=b.allow\nalways\0").is_err());
+        assert!(parse_config(b"hook.a=b.command\nx\0").is_err());
     }
 
     #[test]

@@ -864,7 +864,7 @@ impl Session {
         self.events = unbound;
     }
 
-    async fn time_travel_failed(&self, what: &str, e: TtError) {
+    pub(crate) async fn time_travel_failed(&self, what: &str, e: TtError) {
         let hint = matches!(e, TtError::Failed { .. }).then(|| {
             "check the files named; `git status` and the snapshot ref show what changed".into()
         });
@@ -879,7 +879,7 @@ impl Session {
     }
 
     /// The working-tree lease, exclusively.
-    fn exclusive(&self) -> Result<ExclusiveGuard, TtError> {
+    pub(crate) fn exclusive(&self) -> Result<ExclusiveGuard, TtError> {
         match &self.lease {
             Some(lease) => Ok(lease.try_exclusive()?),
             None => Err(TtError::NoLease),

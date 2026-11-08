@@ -397,6 +397,59 @@ async fn bisect_finds_first_failing_step() {
     repo.assert_no_leftovers();
 }
 
+/// Whether this git runs hooks declared in configuration (git 2.54 and later); see the
+/// copy in `tests/checkpoint.rs`.
+fn config_hooks_supported() -> bool {
+    let text = git_in(Path::new("."), &["version"]).unwrap_or_default();
+    let text = text.trim();
+    let v: Vec<u32> = text
+        .trim_start_matches("git version ")
+        .split(['.', ' '])
+        .take(2)
+        .filter_map(|p| p.parse().ok())
+        .collect();
+    let ok = v.len() == 2 && (v[0], v[1]) >= (2, 54);
+    if !ok {
+        assert!(
+            std::env::var_os("TAUTLY_REQUIRE_CONFIG_HOOKS").is_none(),
+            "{text} predates config-based hooks"
+        );
+        eprintln!("note: skipped, {text} predates config-based hooks (git 2.54)");
+    }
+    ok
+}
+
+/// CP5 review C1: a hook the configuration declares (`hook.<name>.*`) runs at no bisect
+/// step (worktree add, checkout, clean, remove).
+#[tokio::test]
+async fn config_declared_hooks_not_run_by_bisect() {
+    if !config_hooks_supported() {
+        return;
+    }
+    let repo = Repo::new();
+    let log = repo.session(edit_breaks_at_3()).await;
+    let marker = repo.home().join("hook-ran");
+    let touch = format!("touch '{}'", marker.display());
+    repo.git(&["config", "hook.x.command", &touch]).unwrap();
+    for e in [
+        "reference-transaction",
+        "post-index-change",
+        "post-checkout",
+    ] {
+        repo.git(&["config", "--add", "hook.x.event", e]).unwrap();
+    }
+    let plan = bisect::plan(&reader(&log), "./check.sh", None, None).unwrap();
+    let out = bisect::run(&plan, &repo.sandbox(), &Probe::default(), TIMEOUT)
+        .await
+        .unwrap();
+    assert_eq!(out.first_bad, Some(3));
+    assert!(!marker.exists(), "a configured hook ran");
+    // Control: git itself runs it.
+    repo.git(&["update-ref", "refs/heads/control", "HEAD"])
+        .unwrap();
+    assert!(marker.exists(), "the hook was not set up to run");
+}
+
 #[tokio::test]
 async fn bisect_covers_bash_side_effects() {
     let repo = Repo::new();

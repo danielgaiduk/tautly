@@ -78,6 +78,37 @@ fn protected_paths_ask_even_in_yolo() {
         assert!(asks(p(Mode::Yolo).decide("write", &write(f), None)), "{f}");
     }
 }
+/// CP5 review C1 follow-up: git reads `.gitconfig` once a common setup step includes it
+/// (`include.path = ../.gitconfig`), so it is protected at any depth, as `.git/config` is.
+#[test]
+fn gitconfig_is_protected_at_any_depth() {
+    let yolo = p(Mode::Yolo);
+    for f in [
+        ".gitconfig",
+        "sub/dir/.gitconfig",
+        ".GitConfig",
+        ".git/config",
+    ] {
+        assert!(is_protected(std::path::Path::new(f)), "{f}");
+        for tool in ["write", "edit"] {
+            assert!(asks(yolo.decide(tool, &write(f), None)), "{tool} {f}");
+        }
+    }
+    assert!(asks(yolo.decide(
+        "bash",
+        &exec("echo"),
+        Some("echo '[hook \"x\"]' >> .gitconfig")
+    )));
+    // Neighbours are not.
+    for f in [
+        ".gitignore",
+        ".gitattributes",
+        "docs/gitconfig.md",
+        ".gitconfig.example",
+    ] {
+        assert!(!is_protected(std::path::Path::new(f)), "{f}");
+    }
+}
 #[test]
 fn protected_redirect_in_bash_asks_in_yolo() {
     assert!(asks(p(Mode::Yolo).decide(
@@ -1678,6 +1709,78 @@ fn deny_rules_see_through_wrapper_prefixes() {
     // Allow rules are not widened.
     let allow = with_rules(Mode::Ask, &["bash(cargo test)"], &[]);
     assert!(asks(allow.decide("bash", &sh, Some("time cargo test"))));
+}
+
+// --- CP5 review M2: path-qualified programs, git's global options, xargs, rm clusters ---
+#[test]
+fn deny_rules_catch_more_spellings() {
+    let sh = exec("sh");
+    let pol = with_rules(Mode::Yolo, &[], &["bash(git push*)", "bash(rm -rf*)"]);
+    for raw in [
+        "/usr/bin/git push",
+        "./git push",
+        "git -C . push",
+        "git --no-pager push",
+        "git -P push",
+        "git -c k=v push",
+        "git --git-dir=.git --work-tree=. push",
+        "git --git-dir .git push",
+        "git -C sub -c a=b --no-pager push origin",
+        "timeout 5 /usr/bin/git -C sub push",
+        "rm -rf src",
+        "rm -fr src",
+        "rm -r -f src",
+        "rm -f -r src",
+        "rm -vfr src",
+        "rm -f -v -r src",
+        "rm --recursive --force src",
+        "rm --force -r src",
+        "/bin/rm -fr src",
+        "sudo rm -fr src",
+        // Any number of flags, in any order (CP5 re-review N2).
+        "rm -vdRrf src",
+        "rm -vdxPrf src",
+        "rm -v -d -x -P -r -f src",
+        "rm --no-preserve-root -vdrf /",
+    ] {
+        assert!(
+            matches!(pol.decide("bash", &sh, Some(raw)), Decision::Deny { .. }),
+            "{raw}"
+        );
+    }
+    // `xargs` runs its input as part of a command: it asks, in yolo too.
+    for raw in [
+        "echo push | xargs git",
+        "xargs rm -rf < list",
+        "nice xargs ls",
+    ] {
+        assert!(asks(pol.decide("bash", &sh, Some(raw))), "{raw}");
+    }
+    for raw in [
+        "git -C . status",
+        "/usr/bin/git status",
+        "git --no-pager log",
+        "rm -f a.o",
+        "rm -r build",
+        "rm -vdxP build",
+    ] {
+        assert_eq!(pol.decide("bash", &sh, Some(raw)), Decision::Allow, "{raw}");
+    }
+    // A flag word without `*` names exactly those flags; what follows still matches.
+    let exact = with_rules(Mode::Yolo, &[], &["bash(rm -rf /)"]);
+    for raw in ["rm -fr /", "rm -r -f /", "rm -f --recursive /"] {
+        assert!(
+            matches!(exact.decide("bash", &sh, Some(raw)), Decision::Deny { .. }),
+            "{raw}"
+        );
+    }
+    for raw in ["rm -rfv /", "rm -fr /tmp"] {
+        assert_eq!(
+            exact.decide("bash", &sh, Some(raw)),
+            Decision::Allow,
+            "{raw}"
+        );
+    }
 }
 
 // --- re-review 4 T30-N11: `0<&3` ---
