@@ -258,3 +258,69 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    /// A store with one approval (`k`) in a fresh directory below `t`.
+    fn approved(t: &Path) -> PathBuf {
+        let path = t.join("new/dir/mcp-approvals.json");
+        ApprovalStore::open(&path).approve("k", t, "srv").unwrap();
+        path
+    }
+
+    #[test]
+    fn a_new_store_directory_is_private() {
+        let t = tempfile::tempdir().unwrap();
+        let path = approved(t.path());
+        let mode = std::fs::metadata(parent(&path))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o700, "{mode:o}");
+        assert!(ApprovalStore::open(&path).is_approved("k"));
+    }
+
+    #[test]
+    fn an_oversized_store_approves_nothing() {
+        let t = tempfile::tempdir().unwrap();
+        let path = approved(t.path());
+        let mut text = std::fs::read(&path).unwrap();
+        text.resize(usize::try_from(MAX_FILE_BYTES).unwrap() + 1, b' ');
+        std::fs::write(&path, &text).unwrap();
+        assert!(
+            serde_json::from_slice::<File>(&text).is_ok(),
+            "still valid JSON"
+        );
+        assert!(!ApprovalStore::open(&path).is_approved("k"));
+    }
+
+    #[test]
+    fn a_fifo_in_place_of_the_store_is_an_empty_store_at_once() {
+        let t = tempfile::tempdir().unwrap();
+        let path = t.path().join("mcp-approvals.json");
+        let c = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: mkfifo with a valid NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        let started = Instant::now();
+        assert!(!ApprovalStore::open(&path).is_approved("k"));
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn the_lock_file_is_never_followed_through_a_link() {
+        let t = tempfile::tempdir().unwrap();
+        let path = approved(t.path());
+        let victim = t.path().join("victim");
+        std::fs::write(&victim, "keep").unwrap();
+        let lock = lock_path(&path);
+        let _ = std::fs::remove_file(&lock);
+        std::os::unix::fs::symlink(&victim, &lock).unwrap();
+        let mut store = ApprovalStore::open(&path);
+        assert!(store.approve("other", t.path(), "srv2").is_err());
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep");
+        assert!(!ApprovalStore::open(&path).is_approved("other"));
+    }
+}

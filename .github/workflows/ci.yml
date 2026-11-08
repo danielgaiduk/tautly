@@ -24,6 +24,18 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo clippy -p tautly --all-targets --features mock -- -D warnings
 
+  # Advisories, licences, duplicate/wildcard bans and sources (deny.toml). The tool version is
+  # pinned; the advisory database is fetched fresh on every run.
+  deny:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny@0.20.2
+      - run: cargo deny check
+
   # Performance gates (spec 9.1), release build on both OSes: cold start and idle
   # RSS (benches/perf/startup.sh, relative to the merge-base's binary), then the in-process
   # gates in benches/perf/ (crate tautly-perf, all `#[ignore]`, one at a time so timings and

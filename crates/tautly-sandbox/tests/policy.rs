@@ -1800,3 +1800,78 @@ fn exact_deny_rule_is_not_dodged_by_a_descriptor_number() {
         );
     }
 }
+
+// --- quality Q1: rm deny rules written with long options, a starred flag word and a path ---
+#[test]
+fn rm_deny_rules_match_by_flag_set_whatever_the_rule_spelling() {
+    let sh = exec("sh");
+    let denied = |pol: &Policy, raw: &str| {
+        matches!(pol.decide("bash", &sh, Some(raw)), Decision::Deny { .. })
+    };
+    // Exact flags given as long options in the rule: the same set in any spelling.
+    let long = with_rules(Mode::Yolo, &[], &["bash(rm --recursive --force /*)"]);
+    for raw in [
+        "rm --recursive --force /x",
+        "rm -r --force /x",
+        "rm -fr /x",
+        "rm -rf /x",
+        "rm -rf -- /x",
+    ] {
+        assert!(denied(&long, raw), "{raw}");
+    }
+    for raw in ["rm -r /x", "rm -rfv /x", "rm -rf x", "rm --recursive /x"] {
+        assert!(!denied(&long, raw), "{raw}");
+    }
+    // A starred flag word followed by a pattern: more flags may follow, then the pattern.
+    let star = with_rules(Mode::Yolo, &[], &["bash(rm -rf* /*)"]);
+    for raw in [
+        "rm -rfv /x",
+        "rm -v --recursive -f /x",
+        "rm -rf --one-file-system /x",
+        "rm -rfv -- /x",
+    ] {
+        assert!(denied(&star, raw), "{raw}");
+    }
+    for raw in ["rm -r /x", "rm -rfv x"] {
+        assert!(!denied(&star, raw), "{raw}");
+    }
+    // `rm` with no flag word is a plain glob rule.
+    let plain = with_rules(Mode::Yolo, &[], &["bash(rm /*)"]);
+    assert!(denied(&plain, "rm /x"));
+    assert!(!denied(&plain, "rm -f /x"));
+}
+
+#[test]
+fn rule_matches_a_read_only_call_only_for_its_own_tool() {
+    let pol = p(Mode::Ask);
+    let ro = Effect::ReadOnly;
+    assert!(pol.rule_matches("read", "read", &ro, None).unwrap());
+    assert!(!pol.rule_matches("grep", "read", &ro, None).unwrap());
+    assert!(!pol.rule_matches("bash(ls*)", "read", &ro, None).unwrap());
+}
+
+// --- quality Q1: `..` in tool paths, relative and absolute, cannot reach .git unnoticed ---
+#[test]
+fn dotdot_spellings_of_protected_paths_ask_with_the_normalized_name() {
+    let pol = p(Mode::Yolo);
+    let reason = |path: &str| match pol.decide("write", &write(path), None) {
+        Decision::Ask { reason, .. } => reason,
+        d => panic!("{path}: {d:?}"),
+    };
+    for path in [
+        "sub/../.git/hooks/x",
+        "/ws/sub/../.git/config",
+        "/ws/./a/b/../../.git/config",
+    ] {
+        let r = reason(path);
+        assert!(r.contains("protected path: .git/"), "{path}: {r}");
+    }
+    for path in [
+        "./../.git/config",
+        "/ws/../.git/config",
+        "/elsewhere/.git/config",
+    ] {
+        let r = reason(path);
+        assert!(r.contains("outside workspace"), "{path}: {r}");
+    }
+}

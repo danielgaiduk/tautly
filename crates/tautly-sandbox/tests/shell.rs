@@ -1258,3 +1258,97 @@ fn leading_descriptor_of_a_redirect_is_not_an_argv_word() {
     assert_eq!(parse_commands("cmd 0 <&3").unwrap()[0].argv, ["cmd", "0"]);
     assert_eq!(parse_commands("cmd 0").unwrap()[0].argv, ["cmd", "0"]);
 }
+
+// ---- quality Q1: arithmetic literals, fail-closed arms, printf -v and option parsing ----
+
+#[test]
+fn arithmetic_operands_must_be_literals_that_cannot_run_code() {
+    for s in [
+        "for ((i=0;i<$(id);i++)); do :; done",
+        "for ((i=$(id);;)); do :; done",
+        "echo ${a[$(id)]}",
+        "[[ $(id) -eq 1 ]]",
+        "[[ 1 -ne $(id) ]]",
+        "echo $((16#$(id)))",
+        "echo $((2#$x))",
+    ] {
+        assert!(parse_commands(s).is_err(), "{s}");
+    }
+    for s in [
+        "for ((;;)); do break; done",
+        "echo $((0x1f + 16#ff))",
+        "echo $((2#101 * 8#17))",
+        "echo ${a[3]}",
+        "[[ 1 -le 2 ]]",
+    ] {
+        assert!(parse_commands(s).is_ok(), "{s}");
+    }
+}
+
+#[test]
+fn hidden_writes_and_unknown_constructs_fail_closed() {
+    // A write with no command, a word glued across a continuation.
+    for s in ["> /etc/x", ">> log", "ec\\\nho hi", "rm -r\\\nf /"] {
+        assert!(parse_commands(s).is_err(), "{s:?}");
+    }
+    // A `select` loop's body is analyzed like any other.
+    let c = parse_commands("select x in a b; do rm $x; done").unwrap();
+    assert_eq!(argv0s(&c), ["rm"]);
+    let c = parse_commands("echo hi >file").unwrap();
+    assert_eq!(
+        c[0].redirects,
+        vec![Redirect {
+            target: "file".into(),
+            write: true
+        }]
+    );
+    // A continuation between words is only whitespace.
+    let c = parse_commands("echo a \\\nb").unwrap();
+    assert_eq!(c[0].argv, ["echo", "a", "b"]);
+}
+
+#[test]
+fn printf_v_names_and_option_operands_are_judged_as_written() {
+    // `printf -v` names a variable: only a static name may pass.
+    for s in [
+        "printf -v \"$name\" '%d' \"$x\"",
+        "printf -v 'a[$(id)]' %s x",
+        // `-v` takes the next word as the name, so `--` is the name here (as in bash).
+        "printf -v -- foo %s \"$x\"",
+        "echo ${a[1}",
+    ] {
+        assert!(parse_commands(s).is_err(), "{s}");
+    }
+    let c = parse_commands("printf -v foo %s x").unwrap();
+    assert_eq!(c[0].argv, ["printf", "-v", "foo", "%s", "x"]);
+    // After `--` a word that looks like an option is an operand, kept literally.
+    let c = parse_commands("rm -- -rf").unwrap();
+    assert_eq!(c[0].argv, ["rm", "--", "-rf"]);
+    // Backslash escapes are removed as bash removes them.
+    let c = parse_commands("echo \\<x \\$HOME a\\ b").unwrap();
+    assert_eq!(c[0].argv, ["echo", "<x", "$HOME", "a b"]);
+}
+
+#[test]
+fn interpreter_scripts_that_climb_out_or_read_stdin_are_unparseable() {
+    for s in [
+        "python ../evil.py",
+        "python3 a/../../evil.py",
+        "node ./../x.js",
+        "python --",
+        "python -- ../evil.py",
+        "python -",
+        "sh -s",
+        "bash -s arg",
+    ] {
+        assert!(parse_commands(s).is_err(), "{s}");
+    }
+    for s in [
+        "python a/../ok.py",
+        "python ./x.py",
+        "python -- x.py",
+        "sh ./x.sh",
+    ] {
+        assert!(parse_commands(s).is_ok(), "{s}");
+    }
+}

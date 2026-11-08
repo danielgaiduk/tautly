@@ -26,7 +26,7 @@ pub struct LocalSandbox {
 
 impl LocalSandbox {
     pub fn new(root: PathBuf) -> Result<Self, SandboxError> {
-        let client = reqwest::Client::builder()
+        let client = crate::http_client_builder()
             .timeout(std::time::Duration::from_secs(30))
             .redirect(reqwest::redirect::Policy::none())
             .build()

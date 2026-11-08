@@ -17,16 +17,16 @@ path = "src/main.rs"
 mock = ["dep:tautly-provider"]
 
 [dependencies]
-tautly-core = { path = "../tautly-core" }
-tautly-rpc = { path = "../tautly-rpc" }
-tautly-acp = { path = "../tautly-acp" }
-tautly-tui = { path = "../tautly-tui" }
-tautly-provider = { path = "../tautly-provider", optional = true }
+tautly-core = { path = "../tautly-core", version = "0.1.0" }
+tautly-rpc = { path = "../tautly-rpc", version = "0.1.0" }
+tautly-acp = { path = "../tautly-acp", version = "0.1.0" }
+tautly-tui = { path = "../tautly-tui", version = "0.1.0" }
+tautly-provider = { path = "../tautly-provider", version = "0.1.0", optional = true }
 # `tautly doctor`: the code index's state and where its database lives.
-tautly-index = { path = "../tautly-index" }
-tautly-session = { path = "../tautly-session" }
+tautly-index = { path = "../tautly-index", version = "0.1.0" }
+tautly-session = { path = "../tautly-session", version = "0.1.0" }
 # `tautly doctor`: git found on PATH as checkpoints find it (`which_outside`).
-tautly-sandbox = { path = "../tautly-sandbox" }
+tautly-sandbox = { path = "../tautly-sandbox", version = "0.1.0" }
 anyhow.workspace = true
 clap.workspace = true
 futures.workspace = true

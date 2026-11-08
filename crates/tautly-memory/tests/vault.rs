@@ -435,22 +435,27 @@ async fn applied_links_name_files_so_obsidian_resolves_them() {
 }
 
 #[tokio::test]
-async fn old_format_still_loads() {
+async fn json_valued_frontmatter_loads_and_non_yaml_is_skipped() {
     let e = setup(&[("lib.rs", "fn a(){1}")]).await;
-    // Exactly what the first version wrote: `key: <JSON>` lines, `<slug>-<hex>.md`.
+    // `key: <JSON>` lines are YAML (flow style), `<slug>-<hex>.md` a valid name.
     let old = "---\nid: \"use-pnpm-1a2b\"\ntitle: \"Use pnpm: always\"\nkind: \"convention\"\n\
                anchors: [{\"path\":\"lib.rs\",\"hash\":\"abc\"},{\"path\":\"lib.rs\",\"symbol\":\"a\",\"hash\":\"def\"}]\n\
                created: \"2026-01-01T00:00:00Z\"\nverified: \"2026-01-02T00:00:00Z\"\n---\nAlways pnpm.\n";
     fs::create_dir_all(e.dir()).unwrap();
     fs::write(e.dir().join("use-pnpm-1a2b.md"), old).unwrap();
-    // A hand-written old file with a plain scalar YAML cannot read (`: ` inside).
+    // A plain scalar YAML cannot read (`: ` inside): skipped, not half-read.
     fs::write(
         e.dir().join("hand-0001.md"),
         "---\nid: hand-0001\ntitle: Note: colon\nkind: fact\ncreated: 2026-01-01T00:00:00Z\n---\nb\n",
     )
     .unwrap();
     let mut m = e.reopen();
-    assert_eq!(m.skipped_count(), 0, "{:?}", m.skipped());
+    assert_eq!(m.skipped_count(), 1, "{:?}", m.skipped());
+    assert!(
+        m.skipped()[0].1.contains("not valid YAML"),
+        "{:?}",
+        m.skipped()
+    );
     let got = m
         .entries()
         .iter()
@@ -465,8 +470,7 @@ async fn old_format_still_loads() {
         got.verified,
         Some(UNIX_EPOCH + Duration::from_secs(1_767_312_000))
     );
-    let hand = m.entries().iter().find(|x| x.id == "hand-0001").unwrap();
-    assert_eq!(hand.title, "Note: colon");
+    assert!(m.entries().iter().all(|x| x.id != "hand-0001"));
     // Rewritten in place, in the new format, when updated.
     let mut upd = draft("Use pnpm: always", "Always pnpm, really.");
     upd.id = Some("use-pnpm-1a2b".into());

@@ -261,3 +261,44 @@ fn printable_escapes_backslashes_and_every_invisible_character() {
         "plain ü, 日本, emoji 🙂"
     );
 }
+
+/// quality Q1: an http server carrying `args`, `env` or `cwd` is refused (they would be
+/// silently dropped), and both shapes, with a `cwd`, survive being written back.
+#[test]
+fn http_servers_take_no_command_fields_and_specs_round_trip() {
+    for extra in ["args = [\"x\"]", "env = { A = \"1\" }", "cwd = \"sub\""] {
+        let text = format!("[servers.x]\nurl = \"https://h.example/mcp\"\n{extra}\n");
+        let err = toml::from_str::<McpConfig>(&text).unwrap_err().to_string();
+        assert!(
+            err.contains("`args`, `env` and `cwd` belong to a `command`, not an http server"),
+            "{extra}: {err}"
+        );
+    }
+    let servers = BTreeMap::from([
+        (
+            "local".to_string(),
+            ServerSpec::Stdio {
+                command: "srv".into(),
+                args: vec!["--x".into()],
+                env: BTreeMap::new(),
+                cwd: Some("tools/srv".into()),
+            },
+        ),
+        (
+            "remote".to_string(),
+            ServerSpec::Http {
+                url: "https://h.example/mcp".parse().unwrap(),
+                headers: BTreeMap::from([("Authorization".into(), "Bearer t".into())]),
+            },
+        ),
+    ]);
+    // Serialized and parsed back, and written into a config file and parsed back.
+    let text = toml::to_string(&BTreeMap::from([("servers", &servers)])).unwrap();
+    let cfg: McpConfig = toml::from_str(&text).unwrap();
+    assert_eq!(cfg.servers, servers, "{text}");
+    let (out, _) = import_into_toml("", &servers).unwrap();
+    assert!(out.contains("cwd = \"tools/srv\""), "{out}");
+    let parsed: toml::Table = toml::from_str(&out).unwrap();
+    let mcp: McpConfig = parsed["mcp"].clone().try_into().unwrap();
+    assert_eq!(mcp.servers, servers);
+}

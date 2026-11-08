@@ -34,7 +34,7 @@ pub struct CompatProvider {
 impl CompatProvider {
     /// `base_url` must include any version prefix the server needs (for example `/v1`).
     pub fn new(api_key: Option<String>, base_url: Url, catalog: Arc<Catalog>) -> Self {
-        let client = reqwest::Client::builder()
+        let client = tautly_sandbox::http_client_builder()
             .connect_timeout(Duration::from_secs(15))
             .build()
             .expect("reqwest client with rustls builds");

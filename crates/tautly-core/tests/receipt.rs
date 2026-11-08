@@ -796,3 +796,24 @@ fn project_layer_cannot_set_receipts() {
             .footer
     );
 }
+
+/// quality Q1: huge side-agent usage saturates instead of wrapping, leaves the cost as
+/// priced, and a saving kind this version does not know adds nothing.
+#[test]
+fn side_tokens_saturate_and_unknown_savings_count_nothing() {
+    let mut b = builder();
+    b.usage(UsageRole::Side, &usage(u64::MAX, 5, 0, 0), Some(0.25));
+    b.usage(UsageRole::Side, &usage(7, u64::MAX, 0, 0), Some(0.25));
+    b.usage(UsageRole::Unknown, &usage(1, 1, 0, 0), Some(0.5));
+    b.tool(&saved_meta(SaveKind::Unknown, 4000));
+    let r = receipt(&b.finish(Some(&PRICE), Instant::now()));
+    assert_eq!(r.side_tokens, u64::MAX);
+    assert_eq!((r.tokens_in, r.tokens_out), (u64::MAX, u64::MAX));
+    assert!(close(r.cost_usd.unwrap(), 1.0), "{r:?}");
+    assert!(!r.cost_partial);
+    assert_eq!(
+        (r.saved.index, r.saved.diff_reads, r.saved.filters),
+        (0, 0, 0)
+    );
+    assert_eq!(r.tool_calls, 1);
+}

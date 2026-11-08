@@ -8,11 +8,8 @@
 //!
 //! Read with `serde-saphyr` under a tight budget (events, nodes, depth, aliases, scalar
 //! bytes), since entry files come from the repository and may be hostile; the parser is
-//! panic-free by design and is also run under `catch_unwind`. Files of the first version
-//! (`key: <JSON>` lines) are valid YAML; a hand-edited one YAML refuses (a plain `: ` in a
-//! title) is read by the old line parser, but only when it is flat (one `key: value` per
-//! line, no indented or `- ` lines), so the two readers never disagree on structure. A
-//! property given twice is refused by both, as Obsidian flags it.
+//! panic-free by design and is also run under `catch_unwind`. A property given twice is
+//! refused, as Obsidian flags it.
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
@@ -91,7 +88,6 @@ pub(crate) fn parse(text: &str) -> Result<MemoryEntry, String> {
     let raw = match yaml(front) {
         Ok(value) => from_yaml(value)?,
         Err(Refused::Duplicate(key)) => return Err(duplicate(key.as_deref())),
-        Err(Refused::Other) if is_flat(front) => legacy(front)?,
         Err(Refused::Other) => return Err("the frontmatter is not valid YAML".into()),
     };
     let id = raw.id.ok_or("missing `id`")?;
@@ -142,14 +138,6 @@ fn duplicate(key: Option<&str>) -> String {
         ),
         None => "a property is given twice".into(),
     }
-}
-
-/// One `key: value` per line: no indented lines and no `- ` list items.
-fn is_flat(front: &str) -> bool {
-    front
-        .lines()
-        .filter(|l| !l.trim().is_empty())
-        .all(|l| !l.starts_with(char::is_whitespace) && !l.starts_with('-'))
 }
 
 /// The frontmatter as YAML, or why not.
@@ -256,51 +244,6 @@ fn anchor_list(v: Value) -> Result<Vec<RawAnchor>, String> {
             })
         })
         .collect()
-}
-
-/// The first version's reader: one `key: value` per line, values JSON or plain scalars,
-/// `anchors` a JSON list.
-fn legacy(front: &str) -> Result<Raw, String> {
-    let mut raw = Raw::default();
-    let mut seen: Vec<&str> = Vec::new();
-    for line in front.lines().filter(|l| !l.trim().is_empty()) {
-        let (key, value) = line.split_once(':').ok_or_else(|| {
-            format!(
-                "bad frontmatter line `{}`",
-                sanitize_title(line).chars().take(80).collect::<String>()
-            )
-        })?;
-        let key = key.trim();
-        if seen.contains(&key) {
-            return Err(duplicate(Some(key)));
-        }
-        seen.push(key);
-        match key {
-            "id" => raw.id = Some(scalar(value)?),
-            "title" => raw.title = Some(scalar(value)?),
-            "kind" => raw.kind = Some(scalar(value)?),
-            "created" => raw.created = Some(scalar(value)?),
-            "verified" => raw.verified = Some(scalar(value)?),
-            "anchors" => {
-                raw.anchors =
-                    serde_json::from_str(value.trim()).map_err(|e| format!("bad anchors: {e}"))?
-            }
-            _ => {}
-        }
-    }
-    Ok(raw)
-}
-
-/// A scalar of the old format: double-quoted (JSON escapes), single-quoted, or plain.
-fn scalar(raw: &str) -> Result<String, String> {
-    let raw = raw.trim();
-    if raw.starts_with('"') {
-        return serde_json::from_str(raw).map_err(|e| format!("bad string {raw}: {e}"));
-    }
-    if raw.len() >= 2 && raw.starts_with('\'') && raw.ends_with('\'') {
-        return Ok(raw[1..raw.len() - 1].replace("''", "'"));
-    }
-    Ok(raw.to_string())
 }
 
 /// The text before the closing `---` line, and the text after it.
@@ -447,12 +390,10 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_properties_are_refused_by_both_readers() {
-        // YAML reader (block list present) and the old line reader (flat lines) agree.
+    fn duplicate_properties_are_refused() {
         for front in [
             "id: a-1\nid: b-2\ntitle: t\nkind: fact\ncreated: 2026-01-01\n",
             "id: a-1\ntitle: t\nkind: fact\ncreated: 2026-01-01\ntags:\n  - x\ntitle: u\n",
-            "id: a-1\ntitle: Note: colon\ntitle: other\nkind: fact\ncreated: 2026-01-01\n",
         ] {
             let err = parse(&file(front)).unwrap_err();
             assert!(err.contains("duplicate"), "{front:?}: {err}");
@@ -460,12 +401,10 @@ mod tests {
     }
 
     #[test]
-    fn the_old_line_reader_reads_only_flat_frontmatter() {
-        // Flat lines YAML refuses (a plain `: `): the old reader.
-        let flat = "id: x-1\ntitle: Note: colon\nkind: fact\ncreated: 2026-01-01\n";
-        assert_eq!(parse(&file(flat)).unwrap().title, "Note: colon");
-        // With block structure YAML has the last word: refused, not half-read.
+    fn frontmatter_yaml_refuses_is_refused_not_half_read() {
+        // A plain `: ` in a value is not YAML: refused, flat or not.
         for front in [
+            "id: x-1\ntitle: Note: colon\nkind: fact\ncreated: 2026-01-01\n",
             "id: x-1\ntitle: Note: colon\nkind: fact\ncreated: 2026-01-01\nextra:\n  nested: y\n",
             "id: x-1\ntitle: Note: colon\nkind: fact\ncreated: 2026-01-01\nlist:\n- y\n",
         ] {

@@ -702,24 +702,12 @@ impl Inner {
 /// A connection, its listed tools, and a warning when the listing was cut short.
 type Connected = (Arc<Connection>, Vec<rmcp::model::Tool>, Option<String>);
 
-/// The reqwest client for streamable HTTP: rustls on the `ring` provider the rest of the
-/// workspace uses (rmcp is built without a TLS provider of its own), the webpki roots,
-/// HTTP/1.1, no redirects (a server must not move the session to another host), and no
-/// idle connection pool (rmcp's advice for its transport).
-fn http_client() -> Result<reqwest013::Client, String> {
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let roots = rustls::RootCertStore {
-        roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
-    };
-    let mut tls = rustls::ClientConfig::builder_with_provider(provider)
-        .with_safe_default_protocol_versions()
-        .map_err(|e| format!("TLS setup failed: {e}"))?
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-    tls.alpn_protocols = vec![b"http/1.1".to_vec()];
-    reqwest013::Client::builder()
-        .tls_backend_preconfigured(tls)
-        .redirect(reqwest013::redirect::Policy::none())
+/// The reqwest client for streamable HTTP: the workspace's TLS setup (rustls on `ring`, the
+/// webpki roots, HTTP/1.1), no redirects (a server must not move the session to another
+/// host), and no idle connection pool (rmcp's advice for its transport).
+fn http_client() -> Result<reqwest::Client, String> {
+    tautly_sandbox::http_client_builder()
+        .redirect(reqwest::redirect::Policy::none())
         .pool_max_idle_per_host(0)
         .build()
         .map_err(|e| format!("HTTP client setup failed: {e}"))

@@ -357,3 +357,51 @@ fn signals_kill_the_check_and_clean_up() {
         );
     }
 }
+
+/// quality Q1: at a terminal it asks, and anything but yes runs nothing.
+#[test]
+fn declining_at_the_prompt_runs_nothing() {
+    use std::io::Write as _;
+    use std::os::fd::{FromRawFd as _, OwnedFd};
+    let s = Scratch::new();
+    let id = s.session(true);
+    let ran = s.home.path().join("ran");
+    let test = format!("touch {}; ./check.sh", ran.display());
+    for answer in ["n\n", "\n", "nope\n"] {
+        let (mut master, mut slave) = (0, 0);
+        // SAFETY: openpty writes two descriptors into the pointers it is given; the
+        // optional name, termios and window size are null.
+        let rc = unsafe {
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(rc, 0, "openpty failed");
+        // SAFETY: both descriptors were just opened by openpty and are owned here alone.
+        let (master, slave) =
+            unsafe { (OwnedFd::from_raw_fd(master), OwnedFd::from_raw_fd(slave)) };
+        let child = s
+            .command(&["bisect", &id, "--test", &test])
+            .stdin(Stdio::from(slave))
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut master = std::fs::File::from(master);
+        master.write_all(answer.as_bytes()).unwrap();
+        let out = child.wait_with_output().unwrap();
+        assert_eq!(out.status.code(), Some(1), "{answer:?}: {}", stderr(&out));
+        let said = stdout(&out);
+        assert!(
+            said.contains("run it? [y/N] nothing was run\n"),
+            "{answer:?}: {said}"
+        );
+        assert!(!said.contains("--yes"), "{said}");
+        assert!(!ran.exists(), "{answer:?}: the check ran");
+        assert!(s.worktrees().is_empty(), "{:?}", s.worktrees());
+    }
+}

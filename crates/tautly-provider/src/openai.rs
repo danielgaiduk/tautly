@@ -37,7 +37,7 @@ pub struct OpenAiProvider {
 
 impl OpenAiProvider {
     pub fn new(api_key: String, base_url: Url, catalog: Arc<Catalog>) -> Self {
-        let client = reqwest::Client::builder()
+        let client = tautly_sandbox::http_client_builder()
             .connect_timeout(Duration::from_secs(15))
             .build()
             .expect("reqwest client with rustls builds");

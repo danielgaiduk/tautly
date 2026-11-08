@@ -695,7 +695,7 @@ impl Session {
             return;
         };
         let (extra, first) = mcp.tools_for_turn(cancel).await;
-        let tools = registry(&self.info.caps, extra);
+        let tools = registry(extra);
         let specs: Vec<ToolSpec> = tools.iter().map(|t| t.spec(&self.info.caps)).collect();
         if specs != self.specs && !first {
             let mcp_names = |s: &[ToolSpec]| -> Vec<String> {
@@ -831,4 +831,44 @@ fn read_bounded(path: &Path) -> Result<Option<String>, String> {
         return Err(format!("larger than {MAX_MCP_JSON_BYTES} bytes"));
     }
     Ok(Some(String::from_utf8_lossy(&bytes).into_owned()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::check_private_pycache;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn mode(p: &std::path::Path) -> u32 {
+        std::fs::symlink_metadata(p).unwrap().permissions().mode() & 0o777
+    }
+
+    #[test]
+    fn the_private_pycache_dir_must_be_a_private_directory_outside_the_root() {
+        let home = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let dir = home.path().join("mcp-pycache");
+        // Missing: made, 0700.
+        check_private_pycache(&dir, root.path()).unwrap();
+        assert_eq!(mode(&dir), 0o700);
+        // Too open: tightened to 0700.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+        check_private_pycache(&dir, root.path()).unwrap();
+        assert_eq!(mode(&dir), 0o700);
+        // A file, a link, a directory in the workspace: refused, nothing changed.
+        let file = home.path().join("file");
+        std::fs::write(&file, "x").unwrap();
+        let err = check_private_pycache(&file, root.path()).unwrap_err();
+        assert_eq!(err, "it is not a directory");
+        let target = home.path().join("target");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let link = home.path().join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let err = check_private_pycache(&link, root.path()).unwrap_err();
+        assert_eq!(err, "it is a symbolic link");
+        assert_eq!(mode(&target), 0o755);
+        let inside = root.path().join(".cache");
+        let err = check_private_pycache(&inside, root.path()).unwrap_err();
+        assert!(err.contains("inside the workspace"), "{err}");
+    }
 }

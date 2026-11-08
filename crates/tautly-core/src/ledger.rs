@@ -817,3 +817,54 @@ fn write(ledger: &Ledger, r: &Row) -> Result<()> {
         ledger.record(&r.session, &r.model, &r.usage, r.cost)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row(cost: f64) -> Row {
+        Row {
+            session: "s".into(),
+            model: ModelId::from("m/x"),
+            usage: RawUsage {
+                input: 1,
+                output: 2,
+                cache_read: 0,
+                cache_write: 0,
+            },
+            cost: Some(cost),
+            estimated: false,
+        }
+    }
+
+    /// A writer that is behind (here: not started yet) holds `PENDING_ROWS` rows; each row
+    /// past that is refused with a message, and the queued ones are all written once it
+    /// runs: none lost, none twice.
+    #[tokio::test]
+    async fn a_full_queue_drops_rows_with_a_message_and_writes_the_rest() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.db");
+        let ledger = CostLedger::new(path.clone());
+        for _ in 0..PENDING_ROWS {
+            ledger.record(row(0.25)).unwrap();
+        }
+        for _ in 0..5 {
+            let why = ledger.record(row(100.0)).unwrap_err();
+            assert!(why.contains("so this one was dropped"), "{why}");
+        }
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        ledger.start(EventSink::new(tx));
+        ledger.flush(Duration::from_secs(60)).await;
+        let totals = Ledger::open(&path).unwrap().session_totals("s").unwrap();
+        assert_eq!(totals.requests, PENDING_ROWS as u64);
+        assert_eq!(totals.tokens(), 3 * PENDING_ROWS as u64);
+        assert!(
+            (totals.usd - 0.25 * PENDING_ROWS as f64).abs() < 1e-6,
+            "{totals:?}"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "no warning: nothing failed to write"
+        );
+    }
+}

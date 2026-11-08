@@ -272,3 +272,14 @@ cache_ttl_s = 3600
     .unwrap();
     assert_eq!(c.get(&"anthropic/long".into()).cache_ttl_s, Some(3600));
 }
+
+#[test]
+fn openrouter_claude_sonnet_costs_what_anthropic_charges() {
+    let c = Catalog::builtin();
+    let direct = c.get(&"anthropic/claude-sonnet-5-5".into()).price.unwrap();
+    let routed = c
+        .get(&"compat:openrouter/anthropic/claude-sonnet-5.5".into())
+        .price
+        .unwrap();
+    assert_eq!(routed, direct);
+}
