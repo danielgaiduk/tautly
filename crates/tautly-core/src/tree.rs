@@ -9,7 +9,6 @@
 //! holds its log's writer lock.
 
 use std::collections::HashMap;
-use std::os::fd::AsRawFd;
 use std::path::Path;
 use std::time::UNIX_EPOCH;
 
@@ -190,9 +189,11 @@ fn held(path: &Path) -> bool {
     let Ok(file) = std::fs::File::open(path) else {
         return false;
     };
-    // SAFETY: flock on a file descriptor we own; the lock goes with the file.
-    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) };
-    rc != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EWOULDBLOCK)
+    // The lock goes with the file.
+    matches!(
+        crate::lease::flock(&file, libc::LOCK_SH | libc::LOCK_NB),
+        Err(e) if e.raw_os_error() == Some(libc::EWOULDBLOCK)
+    )
 }
 
 /// Depth-first: roots by start time, each followed by its branches.

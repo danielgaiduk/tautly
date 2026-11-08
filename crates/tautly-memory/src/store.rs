@@ -752,10 +752,7 @@ impl MemoryStore {
         if !valid_session_id(session_id) {
             return Err(MemoryError::BadId(session_id.to_string()));
         }
-        fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(&self.data_home)
+        tautly_session::paths::create_private_dir_all(&self.data_home)
             .map_err(io_err(&self.data_home))?;
         let path = write_private(&self.episodes_chain, &format!("{session_id}.md"), markdown)?;
         *self.episodes.lock().unwrap_or_else(PoisonError::into_inner) = None;

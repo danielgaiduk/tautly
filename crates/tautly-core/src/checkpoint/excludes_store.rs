@@ -8,13 +8,11 @@
 
 use std::collections::HashSet;
 use std::fs;
-use std::io::Write;
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
-static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+use tautly_session::files::write_private_atomic;
+use tautly_session::paths::create_private_dir_all;
 
 /// Rules files younger than this are never pruned: their entry may be on its way.
 const RULES_GRACE: Duration = Duration::from_secs(600);
@@ -37,12 +35,12 @@ impl ExcludesStore {
         }
         let digest = blake3::hash(rules).to_hex().to_string();
         let kept = self.dir.join("rules");
-        private_dir(&kept)?;
+        create_private_dir_all(&kept)?;
         let file = kept.join(&digest);
         if !file.exists() {
-            write_atomically(&kept, &file, rules)?;
+            write_private_atomic(&file, rules, false)?;
         }
-        write_atomically(&self.dir, &self.dir.join(commit), digest.as_bytes())
+        write_private_atomic(&self.dir.join(commit), digest.as_bytes(), false)
     }
 
     /// The store's directory.
@@ -113,36 +111,6 @@ fn is_lower_hex(b: u8) -> bool {
 /// A SHA-1 or SHA-256 object id, as git prints it.
 fn is_object_id(s: &str) -> bool {
     matches!(s.len(), 40 | 64) && s.bytes().all(is_lower_hex)
-}
-
-fn private_dir(dir: &Path) -> std::io::Result<()> {
-    fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(dir)
-}
-
-/// Write `bytes` to `dest` (in `dir`) through a temporary file, mode 0600.
-fn write_atomically(dir: &Path, dest: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    private_dir(dir)?;
-    let tmp = dir.join(format!(
-        ".tmp-{}-{}",
-        std::process::id(),
-        TMP_COUNTER.fetch_add(1, Ordering::Relaxed)
-    ));
-    let result = (|| {
-        let mut f = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&tmp)?;
-        f.write_all(bytes)?;
-        fs::rename(&tmp, dest)
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&tmp);
-    }
-    result
 }
 
 #[cfg(test)]

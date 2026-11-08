@@ -31,6 +31,7 @@ mod record;
 mod relpath;
 mod writer;
 
+pub mod files;
 pub mod paths;
 
 pub use blobs::BlobRef;
