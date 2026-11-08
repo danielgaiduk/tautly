@@ -29,18 +29,26 @@ no test touches your real keychain or a local Ollama.
 Set `TAUTLY_HOME` to a scratch directory while you experiment: it moves both the config
 home and the data home (sessions, index, ledger) there.
 
-## The checks CI runs
+## Checks
 
-Run these before you send a change; they are what the `ci` workflow gates on:
+The `ci` workflow gates on these; run them before you send a change:
 
 ```sh
-cargo fmt --all --check
+cargo fmt --all -- --check
 cargo test --workspace --features tautly/mock
 cargo clippy --workspace --all-targets -- -D warnings
 cargo clippy -p tautly --all-targets --features mock -- -D warnings
-RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
 cargo deny check                     # advisories, licences, bans, sources (deny.toml)
 ```
+
+Also run locally (not yet in CI) when you touch doc comments:
+
+```sh
+RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --exclude tautly-core
+```
+
+The full-workspace build still fails on known broken intra-doc links in `tautly-core`;
+drop `--exclude tautly-core` once those are fixed.
 
 Without `--features tautly/mock` the binary's end-to-end tests (`mock_cli`, `first_run`,
 `auth`, `doctor`, `repl_pty`, `fork`, `bisect`, `eval`) are skipped.
@@ -87,7 +95,7 @@ Rules the code keeps:
 - **Bounded by construction.** Channels are bounded, tool output is capped and spilled to
   disk, logs are streamed. New buffers need a cap.
 - Errors are typed per crate (`thiserror`); `anyhow` only in `tautly-cli`.
-- Every public item has a doc comment (`cargo doc` runs with `-D warnings`).
+- New public items need a doc comment.
 
 ## Tests and the testkit
 

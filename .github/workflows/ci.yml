@@ -16,8 +16,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: clippy
+          components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
       # One run, with the `tautly` binary's scripted provider (`--mock-script`) on, so its
       # end-to-end tests run too without building the workspace a second time.
       - run: cargo test --workspace --features tautly/mock

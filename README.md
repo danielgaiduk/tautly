@@ -42,10 +42,13 @@ User guides: [configuration](docs/user/configuration.md) ·
 Needs Rust 1.90 or newer and `git`.
 
 ```sh
-git clone <repo-url> tautly && cd tautly
+git clone <repo-url> tautly && cd tautly        # <repo-url>: the repository is not public yet
 cargo install --locked --path crates/tautly-cli    # the package is named `tautly`
 tautly --version
 ```
+
+`cargo install` puts the binary in `~/.cargo/bin` (or `$CARGO_HOME/bin`); make sure that
+directory is on your `PATH`.
 
 ### Prebuilt binaries (coming)
 
@@ -65,8 +68,8 @@ tautly                             # start the REPL
 ```
 
 Type a request; the agent reads, searches, edits and runs commands, asking before each
-write or command. Answer `y` (yes), `n` (no) or `a` (allow this exact call for the rest of
-the session). After each turn a receipt shows steps, time, context use, cache hits and cost.
+write or command. Answer `y` (yes), `n` (no) or `a` (allow the narrowest rule that names
+this call for the rest of the session). After each turn a receipt shows steps, time, context use, cache hits and cost.
 
 ```sh
 tautly -p "make the failing test pass" --approve auto-edit   # one headless turn
@@ -246,13 +249,13 @@ Every session is an append-only JSONL log under
 tautly sessions list                 # this work tree's sessions, newest first
 tautly sessions show <id>            # header and user turns, with step numbers
 tautly sessions export <id> --format md|jsonl
-tautly sessions delete <id>          # log, checkpoint refs, and a fork's worktree
+tautly sessions delete <id>          # log, checkpoint refs, and a fork's worktree (full id)
 tautly -c                            # continue the latest session here
-tautly --resume <id>                 # resume a specific one (an id prefix works)
+tautly --resume <id>                 # resume a specific one (the full id)
 tautly prompt show [--full]          # the system prompt, or the last request as JSON
 ```
 
-`tautly sessions restore-backup <id>` puts back files a cut-off rewind or switch kept in
+`tautly sessions restore-backup <id>` (full id) puts back files a cut-off rewind or switch kept in
 the log.
 
 ## MCP servers

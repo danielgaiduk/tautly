@@ -139,7 +139,7 @@ deny = [
   "bash(git push*)",
   "bash(rm -*r*)",
   "bash(* > .env)",
-  "web_fetch",            # no network at all
+  "web_fetch",            # no web_fetch (commands and MCP servers can still reach the network)
 ]
 ```
 

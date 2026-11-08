@@ -9,7 +9,7 @@ winning:
    **untrusted**: it may only set some keys, and most of those only towards safer values
    (see [What a project file may set](#what-a-project-file-may-set)).
 4. **Command-line flags** (`--model`, `--reasoning`, `--approve`, `--approve-memory`,
-   `--no-checkpoints`, `--no-footer`). They are yours and override every file.
+   `--budget-usd`, `--no-checkpoints`, `--no-footer`). They are yours and override every file.
 
 Tables merge key by key; arrays and scalars replace. A missing file is skipped.
 

@@ -69,7 +69,7 @@ Only paths whose content at step N differs from what the agent left are written.
 (the REPL asks you separately), nothing is written and no branch is made. A path below a
 symlink or a file, or where a directory is in the way, is **blocked** and never written.
 A backup snapshot is taken before any write; if a rewind is cut off, the next resume warns
-and `tautly sessions restore-backup <session>` puts back what it kept.
+and `tautly sessions restore-backup <full session id>` puts back what it kept.
 
 ## Branches: fork, label, tree, switch
 
@@ -78,7 +78,7 @@ and `tautly sessions restore-backup <session>` puts back what it kept.
 | Branch the conversation at the tip (files untouched) | `/fork` | | `fork {at?, label?}` |
 | Rename the current branch | `/label <name>` | | `label {label}` |
 | Show the project's sessions as a tree | `/tree` (`*` marks the current branch) | `tautly sessions tree` | `session/tree {root}` |
-| Continue another branch, its files restored | `/switch <label\|id\|n>` (`n`: its line in `/tree`) | | `switch {session_id, dry_run?, overwrite?}` |
+| Continue another branch, its files restored | `/switch <label\|id\|n>` (`n`: its line in `/tree`) | | `switch {target, dry_run?, overwrite?}` |
 
 A switch restores the target branch's files as its agent left them, under the same
 conflict, blocking and backup rules as a rewind. Switching back and forth restores each
@@ -111,7 +111,7 @@ tautly replay <session> [--speed 2] [--from-step N] [--output text|json]
 
 `--speed 0` is instant; gaps longer than 2 s are shortened. `--output json` prints each
 event wrapped as `replayed {offset, t_ms, event}`, then `replay_finished`. In the REPL:
-`/replay [id]` (Ctrl+C stops it). Over RPC: `replay {session_id?, speed?, from_step?}`.
+`/replay [id]` (Ctrl+C stops it). Over RPC: `replay {target?, speed?, from_step?}` (`target`: the session to play back).
 
 ## Compare sessions
 
@@ -145,6 +145,6 @@ never touched, and the temporary worktree is removed at the end.
 
 ## Deleting sessions
 
-`tautly sessions delete <id>` removes a session's log and its checkpoint refs, and a
+`tautly sessions delete <full id>` removes a session's log and its checkpoint refs, and a
 worktree fork's worktree (refused when that worktree has changes, unless `--force`).
 Blobs shared with other sessions of the project are kept.
