@@ -300,7 +300,7 @@ Structured record: task, plan steps with status, files read/edited with content 
 - **Time-travel hooks** (user-approved 2026-11-03, schema 1, before release). Each one captures data that can never be recovered later:
   - **H1, timestamp:** every record line carries `"t": <unix ms>` in its envelope.
   - **H2, root-relative paths:** paths in records are relative to the header's `root`. On read they are re-confined under the current root: absolute paths, `..` and NUL are refused. Events keep showing paths as before.
-  - **H3, header fields:** `project`, `label?`, `origin` (`user | fork | rewind | what_if | eval | import`), `git?: {head?, dirty?}`, `tautly_version`, `model?`, `config_hash?` (blake3 of the effective config), `tags`.
+  - **H3, header fields:** `project`, `label?`, `origin` (`user | fork | rewind | what_if | eval | import`), `git?: {head?, dirty?}`, `tautly_version`, `model?`, `config_hash?` (blake3 of what the user and project configuration files set, 6.5.1), `parent_step?` (a fork's step), `tags`.
     - `git.head` is read from the `.git` files without spawning git, so start-up stays fast. `dirty` is unknown in the header.
     - The session-start `Checkpoint` record (7.11.11) carries the authoritative head, dirty state and tree.
     - A later `Labeled{label}` record renames the session (the last one wins).
@@ -319,6 +319,72 @@ Structured record: task, plan steps with status, files read/edited with content 
   - **H10, project id:** sessions and blobs are keyed by `<project-id>` (above). The header's `root` names the worktree.
   - **Checkpoint record:** `Checkpoint{n, commit, tree, head?, dirty, turn, step, point?}`, plus `CheckpointSkipped{reason, turn, step, point?}`. The single checkpoint mechanism is the git one of 7.11.11.
     - `point` (additive, CP4 fix wave; none in older logs) says where it was taken: `session_start`, `resume_start`, `before_exec` (before a command of step `step`, so inside that step), `turn_end` (the turn's last step is `step`) or `before_restore` (before a rewind or switch writes, Task 49); a value a reader does not know reads as `unknown`. The step field alone cannot place a checkpoint at a step boundary (7.12.1).
+
+#### 6.5.1 Format freeze v1 (checkpoint 5, 2026-11-08)
+The session log format is frozen for v1 as listed here. After v1 every change is additive; a reader of v1 must read every later log without calling it corrupt. Rules (cp5 review C I2, I3):
+- **Lines.** The first line is `{"type":"header", …Header}`. Every other line is `{"type":"record","offset":N,"t":<unix ms>,"data":<record>}`, with `offset` 0, 1, 2, … and `t` non-decreasing. A line of another `type` is skipped. A torn final line is skipped (and cut at reopen); any other line that is not JSON is corruption. A reader stops at the log's length when it opened it (`SessionReader::follow` reads on).
+- **Records** are adjacently tagged: `{"type":"<record type>","data":<payload>}`. A type this version does not know reads as `Unknown` and is counted in one "written by a newer version" warning. A known type whose payload this version cannot read (a newer shape, a value it never writes, such as a non-finite float written as `null`) reads as `Unknown` too, and a `command` as `Command::Unknown`. A log is never corrupt because of a payload.
+- **Unit records may gain fields.** `pins_folded`, `reasoning_stripped` and `forked` are written without `data`; a `data` member is ignored.
+- **Nested enums carry a catch-all** (`unknown`, `#[serde(other)]` or a lenient reader): `Command`, `ProviderEvent`, `StopReason`, `FinishReason`, `UsageRole`, `CheckpointPoint`, `ApprovalKind`, `PinOrigin`, `MutationReason`, `BudgetScope`, `PersistedEffect`, `Shown`, `SaveKind`, `MemoryKind`, `Origin`, `Wrote`, `RestoreBy`, `RestoreOutcome`.
+- **Fields are additive.** A field added later is `#[serde(default)]`; `false` and `None` are not written (`skip_serializing_if`). No record-reachable type denies unknown fields.
+- **Renames.** The names below are final. Records written by the builds before the freeze still read: `edit.turn` reads as `step`; `BackupFile{blob, mode, wrote, wrote_mode}` as `{from_blob, from_mode, to, to_mode}`; `restore_begun.restore_backup: true` as `by: restore_backup` (absent or false: `unknown`); `restore_ended{applied, rolled_back}` as `outcome` (`applied`; else `rolled_back`; else `failed`).
+- **Step numbers** (7.12.1) are the context turn counter's: a user message is the step after the last one; a provider step is its `Request.step`, and uses up its number only when its response put something into the history. Every surface (tree, `state_at`, `step_at_offset`, replay, compare, bisect, rebuild, rewind, fork) counts with this one rule (`StepCounter`, `Response::answered`).
+
+Header (`tautly-session` `Header`):
+
+| Field | Meaning | Stability |
+|---|---|---|
+| `schema_version` | 1 | A reader refuses a larger one |
+| `session_id` | ULID | Frozen |
+| `created` | `SystemTime` (`secs_since_epoch`, `nanos_since_epoch`) | Frozen |
+| `root` | Canonical work tree root; record paths are relative to it | Frozen |
+| `parent` | `[session_id, offset]`: the parent and the offset of the last record the branch copied (inclusive) | Frozen; a JSON array, so it never grows (see `parent_step`) |
+| `project` | blake3 project id (6.5) | Default `""` |
+| `label?` | The name; a later `labeled` record wins | Default none |
+| `origin` | `user \| fork \| rewind \| what_if \| eval \| import \| unknown` | Catch-all |
+| `git?` | `{head?, dirty?}` read from the git files | Default none |
+| `tautly_version` | The writing build | Default `""` |
+| `model?` | The model the session started on | Default none |
+| `config_hash?` | blake3 hex of what the user and project configuration files (and the command line's overrides) set, merged, as canonical JSON (keys sorted). The running version's built-in values and catalog and the models file (`tautly models update`) are not part of it, so an upgrade or a catalog update leaves it alone (cp5 review C M10). Fork, rewind and worktree forks carry the parent's | Default none |
+| `tags` | Free-form | Default empty |
+| `parent_step?` | A fork's step `at` (cp5 review C M7) | Additive; none in older logs and for a root session: read the step from the copy (`step_at_offset`) |
+
+Records (the payload of `data`):
+
+| Type | Fields | Stability notes |
+|---|---|---|
+| `command` | A `Command`, internally tagged (`{"type":"send_message",…}`), as received (`Approve.session_rule` never logged) | Unknown or unreadable: `Command::Unknown`. Replayed by rebuild: `set_budget`, `pin`, `unpin` only. Replay `speed` is refused unless finite in 0..=1000 (RPC -32602, engine `Error`, CLI) |
+| `prefix_applied` | `agents_md?`, `repo_map?` (blobs), `system_prompt_hash`, `tools_hash`, `tools?` (blob) | `tools` additive |
+| `request` | `hash` (blob ref of the request's blake3; not stored), `turn`, `step`, `model`, `blocks{stable, pinned, history, tail}` | Frozen |
+| `provider` | A `ProviderEvent`: `text_delta`, `reasoning_delta`, `reasoning_signature`, `redacted_reasoning`, `tool_call{id, name, input_json, input_blob?}`, `usage`, `discarded_usage`, `quota`, `done{stop}` | Catch-all. A tool input over 4 KiB is `input_json: ""` with `input_blob` (the exact text; cp5 review C M6) |
+| `charged` | `role` (`main \| side \| unknown`), `model`, `usage` (`RawUsage`), `estimated` | Frozen. Removing a `RawUsage` field would break it |
+| `tool_call` | `id`, `name`, `args` (the input as the history holds it), `args_blob?` | `args_blob` names the same blob as its `provider` event when the input is over 4 KiB (`args` is then `null`); read with `record::tool_args` |
+| `tool_result` | `id`, `result_blob`, `is_error`, `effects` (`PersistedEffect`s), `meta` (`exit_code`, `error_kind`, `saved?{kind, bytes}`), `ran`, `blocked` | `ran`, `blocked`, `saved` additive; unknown effects and kinds read as `unknown` |
+| `edit` | `path`, `pre_image?`, `post_image_blob?`, `step` (alias `turn`), `asserted` | `asserted` additive, written only when true |
+| `writes_lost` | `paths`, `late` | `late` additive |
+| `undone` | `turn`, `files[{path, from_blob?, from_mode?, to?, to_mode?}]`, `backup_ref?` | Frozen |
+| `uncompacted` | `compaction`, `restored` (call ids) | Frozen |
+| `compaction` | `removed` (blobs of context turns), `summary` | Frozen |
+| `gc_applied` | `elided[[call_id, turn]]`, `reason`, `tokens_freed`, `forgotten_paths` | `reason` catch-all |
+| `memory_index_applied` | `text` | Frozen |
+| `memory_proposal` | `id`, `change{upsert?, delete}` | Kinds catch-all |
+| `memory_decision` | `id`, `approved` | Frozen |
+| `pins_folded` | — | Unit: may gain fields |
+| `start_pins` | `pins[{text, source}]` | `source` catch-all |
+| `approval_requested` | `request_id`, `kind` (`tool \| mcp_server \| memory \| unknown`), `call_id?`, `reason` | Frozen |
+| `checkpoint` | `n`, `commit`, `tree`, `head?`, `dirty`, `turn`, `step`, `point?` | `point` additive, catch-all; none or unknown reads as partial (7.12.1) |
+| `checkpoint_skipped` | `reason`, `turn`, `step`, `point?` | As `checkpoint` |
+| `labeled` | `label` | Frozen |
+| `restore_begun` | `backup_ref?`, `files[BackupFile{path, existed, from_blob?, from_mode?, to?: Wrote, to_mode?}]`, `paths`, `by` (`rewind \| switch \| restore_backup \| unknown`) | Renamed at the freeze (aliases above). `Wrote` is `{"blob": <ref>}`, `"absent"`, or a form a newer version wrote, read as not known |
+| `restore_ended` | `outcome` (`applied \| rolled_back \| failed \| unknown`) | Replaces the two bools (aliases above) |
+| `model_set` | `model` | Frozen |
+| `reasoning_stripped` | — | Unit: may gain fields |
+| `engine_error` | `message` | Frozen |
+| `turn_start` | `turn`, `text` | Frozen |
+| `forked` | — | Unit: may gain fields. A branch writes it after its copy, stamped with the copy's last `t` |
+| `turn_end` | `reason` (`FinishReason`), `evidence?`, `synthetic` | `synthetic` additive (cp5 review C M2): written by a resume after a crash (`error`) or a branch whose copy ends inside a turn (`cancelled`), stamped with the log's last `t`, left out of wall time |
+
+Cost ledger (SQLite, `PRAGMA user_version` 4): table `usage` (one row per charge) and table `receipts` (one row per turn receipt: … `cost_usd` the priced part, `cost_partial` some usage was unpriced, `estimated`). A schema-4 file an earlier build made gets `cost_partial` when opened. A newer schema is refused. Receipts show the priced part and mark the rest; `tautly receipt` takes tokens and cost from the session's `usage` rows (as `/tree` and `tautly stats` do) and shows what no receipt holds (side requests between turns, turns that did not finish) as "outside turns" (cp5 review C M1).
 
 ## 7. Token efficiency and memory
 
@@ -706,7 +772,7 @@ Every operation here creates a new branch or a new view. None truncates a log, a
   - Before any write, a backup snapshot is taken (`undo-<n>` ref, 7.11.11). A path the snapshot's tree does not hold (an ignored file, for example) has its bytes kept in the session log, in the `RestoreBegun` record, and a rollback restores it from there. If its bytes cannot be kept (over 64 MiB, or a link), the path is blocked. `RestoreBegun` names every path the restore writes. A switch records `RestoreBegun` and `RestoreEnded` in both sessions. The resume warning lists those paths, suggests `git diff <ref> -- <paths>` and restoring only those paths, and points at `tautly sessions restore-backup <session>` for log-kept bytes.
   - `restore-backup` never destroys a human edit:
     - After the restore finished (`RestoreEnded`), it is refused unless `--force`.
-    - Each kept file records what the restore wrote (`wrote`). A path whose disk content differs from that is a conflict, left alone unless `--overwrite <path>`.
+    - Each kept file records what the restore wrote (`to`, with `to_mode`). A path whose disk content differs from that is a conflict, left alone unless `--overwrite <path>`.
     - Before it writes, it keeps what it replaces as a `RestoreBegun` of its own, and ends with `RestoreEnded`.
     - Its writes pass the same symlinked-parent and resolve checks.
     - The CLI shows what it would do first. It asks y/N on a terminal; otherwise it needs `--yes`.
