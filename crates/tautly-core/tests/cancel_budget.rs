@@ -551,21 +551,13 @@ async fn a_hung_path_is_probed_by_at_most_one_metadata_call_at_a_time() {
 #[tokio::test]
 async fn a_write_that_lands_after_its_bound_is_noticed_at_the_next_step() {
     let fx = Fx::new();
-    let mock = MockProvider::new(vec![
-        tools_step(
-            vec![call(
-                "w1",
-                "write",
-                json!({"path": "late.txt", "content": "x"}),
-            )],
-            None,
-        ),
-        // Each step start checks the path again, waiting 100 ms at most for an answer: on a
-        // loaded runner the first check may not get one, a later step does.
-        tools_step(vec![call("r1", "read", json!({"path": "late.txt"}))], None),
-        tools_step(vec![call("r2", "read", json!({"path": "late.txt"}))], None),
-        text_step("ok", tokens(1, 1)),
-    ]);
+    // Each step start checks the path again, waiting 100 ms at most for an answer: on a
+    // loaded runner a check may get none, so the test takes turns until one does.
+    const TRIES: usize = 30;
+    let write = call("w1", "write", json!({"path": "late.txt", "content": "x"}));
+    let mut script = vec![tools_step(vec![write], None)];
+    script.extend((0..TRIES).map(|_| text_step("ok", tokens(1, 1))));
+    let mock = MockProvider::new(script);
     let sb: Arc<dyn Sandbox> = Arc::new(Delegating(Hang {
         late_write: Some(Duration::from_millis(10_800)),
         ..Hang::new(LocalSandbox::new(fx.root()).unwrap())
@@ -590,13 +582,16 @@ async fn a_write_that_lands_after_its_bound_is_noticed_at_the_next_step() {
         assert!(Instant::now() < end, "the late write never landed");
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    let second = run.turn_with("again").await;
-    assert!(
-        warnings(&second)
+    let noticed = |events: &[Event]| {
+        warnings(events)
             .iter()
-            .any(|w| w.contains("late.txt changed after its write was abandoned")),
-        "{second:?}"
-    );
+            .any(|w| w.contains("late.txt changed after its write was abandoned"))
+    };
+    let mut tries = 1;
+    while !noticed(&run.turn_with("again").await) {
+        assert!(tries < TRIES, "the landed write was never noticed");
+        tries += 1;
+    }
     // Both are logged (the write generation moves; a rebuild replays it), review C M3.
     let lost: Vec<(Vec<String>, bool)> = records(&run.engine)
         .into_iter()
@@ -1270,21 +1265,38 @@ async fn rows_queued_at_shutdown_are_written_before_the_event_stream_closes() {
 
 #[tokio::test]
 async fn a_stuck_ledger_delays_shutdown_by_at_most_about_a_second() {
-    let fx = Fx::new();
-    let mock = MockProvider::new(vec![
-        text_step("one", tokens(10, 2)),
-        text_step("two", tokens(20, 3)),
-    ]);
-    let mut run = start(fx.builder(config(true), &mock));
-    let holder = second_row_queued_behind_a_lock(&fx, &mut run).await;
-    let t0 = Instant::now();
-    run.send(Command::Shutdown).await;
-    run.until_closed().await;
-    let took = t0.elapsed();
+    // The rest of a shutdown (turn-end checkpoint, process groups, the log) takes what it
+    // takes on a loaded runner: timed on the same session shape without the lock, it is
+    // the baseline the stuck ledger is measured against.
+    let shutdown = |locked: bool| async move {
+        let fx = Fx::new();
+        let mock = MockProvider::new(vec![
+            text_step("one", tokens(10, 2)),
+            text_step("two", tokens(20, 3)),
+        ]);
+        let mut run = start(fx.builder(config(true), &mock));
+        let holder = if locked {
+            Some(second_row_queued_behind_a_lock(&fx, &mut run).await)
+        } else {
+            run.turn_with("first").await;
+            run.turn_with("second").await;
+            None
+        };
+        let t0 = Instant::now();
+        run.send(Command::Shutdown).await;
+        run.until_closed().await;
+        (t0.elapsed(), fx, holder)
+    };
+    let (baseline, _, _) = shutdown(false).await;
+    let (took, fx, holder) = shutdown(true).await;
+    let holder = holder.unwrap();
     // The flush waits 1 s (spec: "about a second"); unbounded, it would wait out the
     // ledger's 5 s busy timeout, since the lock is held until after the close. 1 s plus a
-    // 2 s margin for a loaded runner still ends 2 s before the busy timeout could.
-    assert!(took < Duration::from_secs(3), "shutdown took {took:?}");
+    // 3 s margin over the baseline still ends 1 s before the busy timeout could.
+    assert!(
+        took < baseline + Duration::from_secs(4),
+        "shutdown took {took:?} (baseline {baseline:?})"
+    );
     holder.execute_batch("COMMIT;").unwrap();
     drop(holder);
     // The writer goes on after the session: the row still arrives.

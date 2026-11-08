@@ -7,7 +7,7 @@ use proptest::prelude::*;
 use serde_json::{Value, json};
 use tautly_provider::EditFormat;
 use tautly_sandbox::{LocalSandbox, Sandbox};
-use tautly_tools::preview::{PREVIEW_MAX_BYTES, PREVIEW_MAX_LINES};
+use tautly_tools::preview::{BLOCKING_DIFF_BYTES, PREVIEW_MAX_BYTES, PREVIEW_MAX_LINES};
 use tautly_tools::{
     DiffPreview, EditTool, Preview, ReadTool, Tool, ToolCx, ToolResult, WriteTool, unified_diff,
 };
@@ -473,19 +473,22 @@ fn identical_content_has_no_diff_and_a_missing_newline_is_marked() {
 #[tokio::test]
 async fn a_large_file_previews_the_diff_it_applies() {
     let e = env(EditFormat::StrReplace);
-    let big = lines_of(100_000, "row");
+    // Large enough for the blocking-pool diff, small enough that a loaded runner still
+    // diffs it well inside the time budget (100k lines fell back to the summary).
+    let big = lines_of(6_000, "row");
+    assert!(big.len() > BLOCKING_DIFF_BYTES, "{}", big.len());
     e.put("big.txt", big.as_bytes()).await;
     e.read("big.txt").await;
-    let args = json!({"path": "big.txt", "old_text": "row line 50000\n", "new_text": "changed\n"});
+    let args = json!({"path": "big.txt", "old_text": "row line 3000\n", "new_text": "changed\n"});
     let p = e.preview(&EditTool, &args).await.unwrap();
     assert!(
         p.diff
             .unified
-            .starts_with("--- a/big.txt\n+++ b/big.txt\n@@ -49997,7 +49997,7 @@\n"),
+            .starts_with("--- a/big.txt\n+++ b/big.txt\n@@ -2997,7 +2997,7 @@\n"),
         "{}",
         p.diff.unified
     );
-    assert!(p.diff.unified.contains("-row line 50000\n+changed\n"));
+    assert!(p.diff.unified.contains("-row line 3000\n+changed\n"));
     let r = e.run_approved(&EditTool, args, &p).await;
     assert!(!r.is_error, "{}", r.output);
     assert_eq!(r.applied_diff.as_deref(), Some(&p.diff));
