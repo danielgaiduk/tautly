@@ -593,3 +593,55 @@ async fn a_fork_right_after_a_cancel_leaves_the_recovered_checkpoint_in_the_pare
         .count();
     assert!(n <= 1, "branch: {branch_recs:?}");
 }
+
+#[tokio::test]
+async fn undo_after_a_cancel_reverts_the_cancelled_commands_writes() {
+    // Re-review CP5-ENG concern 4: the recovered turn-end checkpoint (logged after the
+    // `TurnEnd`) is the turn's end for undo, so Ctrl-C then `/undo` reverts the command.
+    let repo = Repo::new();
+    let mock = MockProvider::new(vec![tools_step(vec![bash(
+        "b1",
+        "echo x > f.txt; echo changed > a.txt; sleep 30",
+    )])]);
+    let mut run = Run::start(repo.builder(&mock));
+    run.engine
+        .send(Command::SendMessage { text: "one".into() })
+        .await
+        .unwrap();
+    wait_for(&mut run.events, |e| matches!(e, Event::ToolStarted { .. })).await;
+    let f = repo.root().join("f.txt");
+    let deadline = tokio::time::Instant::now() + WAIT;
+    while !(f.exists()
+        && std::fs::read_to_string(repo.root().join("a.txt")).unwrap() == "changed\n")
+    {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the command never wrote"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    run.engine.send(Command::Cancel).await.unwrap();
+    wait_for(&mut run.events, |e| matches!(e, Event::TurnFinished { .. })).await;
+    run.engine
+        .send(Command::Undo {
+            id: None,
+            turn: None,
+            dry_run: false,
+        })
+        .await
+        .unwrap();
+    let ev = wait_for(&mut run.events, |e| {
+        matches!(e, Event::Undone { .. } | Event::Error { .. })
+    })
+    .await;
+    let Event::Undone { note, .. } = &ev else {
+        panic!("{ev:?}")
+    };
+    assert!(!note.as_deref().unwrap_or("").contains("skipped"), "{ev:?}");
+    assert!(!f.exists(), "{ev:?}");
+    assert_eq!(
+        std::fs::read_to_string(repo.root().join("a.txt")).unwrap(),
+        "zero\n"
+    );
+    run.stop().await;
+}

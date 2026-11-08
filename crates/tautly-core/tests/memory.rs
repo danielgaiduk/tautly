@@ -758,6 +758,55 @@ async fn over_budget_index_adds_warning() {
     );
 }
 
+/// `ConsolidateFinished` for one proposed deletion, in a session with `approve_memory` set
+/// as given and `interactive` as given.
+async fn consolidate_counts(approve_memory: bool, interactive: bool) -> Event {
+    let fx = Fx::new();
+    fx.entry_file("c", "c", "Old note");
+    let reply = json!([{"delete": "c"}]);
+    let mock = MockProvider::new(vec![text_step(&reply.to_string())]);
+    let mut cfg = config(Mode::Ask);
+    cfg.approve_memory = approve_memory;
+    let mut run = start(EngineBuilder {
+        interactive,
+        ..fx.ready(cfg, &mock).await
+    });
+    run.send(Command::ConsolidateMemory { id: None }).await;
+    let end = run
+        .until(|e| matches!(e, Event::ConsolidateFinished { .. }))
+        .await;
+    end.last().cloned().unwrap()
+}
+
+#[tokio::test]
+async fn consolidate_counts_what_was_saved_and_what_was_not() {
+    // Review CP5-ENG concern 3: the counts come from each proposal's outcome.
+    let headless = consolidate_counts(false, false).await;
+    assert!(
+        matches!(
+            headless,
+            Event::ConsolidateFinished {
+                applied: 0,
+                failed: 1,
+                ..
+            }
+        ),
+        "{headless:?}"
+    );
+    let auto = consolidate_counts(true, false).await;
+    assert!(
+        matches!(
+            auto,
+            Event::ConsolidateFinished {
+                applied: 1,
+                failed: 0,
+                ..
+            }
+        ),
+        "{auto:?}"
+    );
+}
+
 #[tokio::test]
 async fn consolidate_emits_proposals_and_applies_only_approved() {
     let fx = Fx::new();
