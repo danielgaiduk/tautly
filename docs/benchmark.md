@@ -1,6 +1,7 @@
 # Benchmarks
 
-Tautly is measured in three ways. Only the deterministic replay gate runs in CI. Everything
+Tautly is measured in three ways. CI runs only the deterministic replay gate, plus
+`shellcheck` and a doctest on the Terminal-Bench kit (the `benchmark-kit` job). Everything
 that calls a real model is run by hand, or by the nightly workflow with repository secrets.
 
 | What | Measures | Real calls | Where |
@@ -31,7 +32,7 @@ that calls a real model is run by hand, or by the nightly workflow with reposito
 
 ## Reproduce
 
-### `tautly eval` (Task 34)
+### `tautly eval`
 
 ```sh
 # Deterministic replay gate, no network (what CI runs):
@@ -73,7 +74,9 @@ export ANTHROPIC_API_KEY=...
 TAUTLY_TB_MODEL=anthropic/claude-sonnet-5-5 TRIALS=5 benchmarks/terminal-bench/run.sh
 ```
 
-Harbor writes a job directory per run under `benchmarks/terminal-bench/results/<date>/`,
+`run.sh` checks before any container starts that `TAUTLY_BINARY` is executable and that the
+model's key variable is set. Harbor writes a job directory per run (named after the model
+and the start time) under `benchmarks/terminal-bench/results/<date>/`, which git ignores,
 with per-trial rewards and the agent logs. Each trial's `tautly.jsonl` is the full event
 stream, and Harbor's `n_input_tokens`, `n_cache_tokens`, `n_output_tokens` and `cost_usd`
 are filled from it.
@@ -85,27 +88,40 @@ export ANTHROPIC_API_KEY=... OPENAI_API_KEY=... GEMINI_API_KEY=...   # any subse
 cargo test -p tautly --features mock --test live_smoke -- --ignored --nocapture
 ```
 
-- Each provider without a key prints `SKIPPED` and passes. Ollama runs only when
+- Each provider without a key prints `SKIPPED` and passes. With `TAUTLY_LIVE_REQUIRE=1`
+  (the nightly sets it) a cloud provider without its key fails instead, so a missing or
+  expired secret cannot produce a green run that tested nothing. Ollama runs only when
   localhost:11434 answers and the model is pulled.
 - Override the models with `TAUTLY_LIVE_ANTHROPIC_MODEL`, `TAUTLY_LIVE_OPENAI_MODEL`,
   `TAUTLY_LIVE_GOOGLE_MODEL` and `TAUTLY_LIVE_OLLAMA_MODEL`. The defaults are
   `anthropic/claude-sonnet-5-5`, `openai/gpt-5`, `google/gemini-3-pro` and
-  `compat:ollama/qwen2.5-coder:7b`.
+  `compat:ollama/qwen2.5-coder:7b`. A bare Ollama tag gets the `compat:ollama/` prefix.
 - `*_fixes_failing_test` creates a git repo with a failing Python unit test. It runs
   `tautly -p "make the failing test pass" --approve auto-edit --output json --budget-usd 0.50`,
   then asserts exit 0, an unchanged test file and a passing test. It needs `python3` and `git`.
+- Every test prints what the run spent. For the cloud providers it asserts the spend stayed
+  within $0.75: the $0.50 budget plus the one step that may overshoot it.
+- Every child process starts from an empty environment plus `PATH`, `TMPDIR`, `LANG` and a
+  scratch `HOME`. That covers tautly, git, and the Python the model wrote. Only tautly gets a
+  key, and only its own. Each child runs in its own process group and is killed with its
+  children on timeout (600 s for tautly, 60 s for git, 120 s for the tests). So the
+  model-written code never sees the nightly's secrets or the runner's tokens.
 - `--features mock` makes the scratch keychain file effective, so the run never opens your OS
-  keychain. Keys come only from the environment.
+  keychain.
+- The nightly runs at 04:17 UTC and on demand, one run at a time. GitHub disables scheduled
+  workflows after 60 days without repository activity. If the nightly stops appearing,
+  re-enable it on the Actions tab.
 
-## Reasoning continuity
+## Cache continuity
 
 The working state is sent as a tail message after the history (`<working_state>`). The
-question is whether that tail costs the provider its prompt cache or its carried-over
-reasoning in a tool loop. `*_reasoning_continuity` runs a three-hop read chain (`hop1.txt`
-names `hop2.txt`, and so on) and prints one row per provider request:
+question is whether that tail costs the provider its prompt cache in a tool loop.
+`*_cache_continuity` runs a three-hop read chain. `start.txt` names the next file, and so on.
+The names cannot be guessed, so the reads cannot be batched. The test prints one row per
+provider request:
 
 ```
-CONTINUITY [openai] openai/gpt-5
+CACHE CONTINUITY [openai] openai/gpt-5
   step  tokens_in  cache_read  tokens_out  cache_hit
      1       4210           0         310       0.00
      2        180        4224         95       0.96
@@ -121,18 +137,20 @@ How to read it:
   most of the prompt (cache_hit close to 1). If the last step reads nothing from the cache,
   the test fails with "continuity lost". Gemini's implicit cache is best-effort, so its
   numbers are printed but not asserted.
-- **Reasoning re-done (read by eye):** `tokens_out` includes reasoning tokens. A hop only has
-  to read one file, so it should stay small. If every hop spends about as many output tokens
-  as step 1, the model is reasoning from scratch each step: its earlier reasoning was dropped.
-- **Limits:**
-  - The engine sends no explicit reasoning setting (`CanonicalRequest.reasoning` is `None`).
-    Anthropic therefore runs without extended thinking, and its row measures only the cache.
-  - OpenAI and Gemini reason by their defaults.
-  - The CLI has no switch to drop the working-state tail, so there is no without-tail run to
-    compare against. Use the step-1 row as the reference instead.
+- **Hint, read by eye:** `tokens_out` includes reasoning tokens. A hop only has to read one
+  file, so its output should stay small. If every hop spends about as many output tokens as
+  step 1, OpenAI or Gemini (which reason by default) may be dropping earlier reasoning. This
+  is only a hint, not a test.
 
-**If continuity is lost** (the cache assertion fails twice in a row, or hop rows re-reason),
-switch that adapter to the documented `volatile_tail` placement:
+**Reasoning continuity is not tested yet.** The engine sends no reasoning setting
+(`CanonicalRequest.reasoning` is `None`), so Anthropic runs without extended thinking. The
+CLI also has no switch to drop the working-state tail, so there is no with-and-without
+comparison. The real check comes with the lane that lets the engine enable reasoning:
+compare `reasoning_tokens` with and without the tail, or have the model quote its step-1
+reasoning. Until then, a green `*_cache_continuity` says nothing about reasoning.
+
+**If cache continuity is lost** (the cache assertion fails twice in a row), switch that
+adapter to the documented `volatile_tail` placement:
 
 - Put the working state inside the last tool result's content instead of a separate message:
   - Anthropic: in the `tool_result` content blocks;

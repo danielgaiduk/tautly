@@ -2,19 +2,27 @@
 //! with `cargo test -p tautly --test live_smoke -- --ignored --nocapture`.
 //!
 //! - A provider whose key variable is unset or empty is skipped (the test prints
-//!   `SKIPPED` and passes without touching the network). Ollama is skipped when nothing
-//!   answers on localhost:11434 or the model is not pulled.
-//! - Keys come only from the environment. The child gets only the one key it needs, a
-//!   scratch `TAUTLY_HOME`/`HOME`, and `TAUTLY_TEST_SECRET_STORE` pointing at an empty file
-//!   (a build with `--features mock` then never opens the OS keychain).
+//!   `SKIPPED` and passes without touching the network). With `TAUTLY_LIVE_REQUIRE=1` (the
+//!   nightly) a cloud provider without its key fails instead, so a missing secret cannot
+//!   turn the run green. Ollama is skipped when nothing answers on localhost:11434 or the
+//!   model is not pulled.
+//! - Every child (tautly, git, the model-written Python) starts from an empty environment
+//!   plus `PATH`, `TMPDIR`, `LANG` and a scratch `HOME`, in its own process group, killed
+//!   with its children on timeout. Only tautly gets a key, and only the one it needs, with a
+//!   scratch `TAUTLY_HOME` and `TAUTLY_TEST_SECRET_STORE` pointing at an empty file (a build
+//!   with `--features mock` then never opens the OS keychain).
 //! - Models: the brief's ids, overridable with `TAUTLY_LIVE_ANTHROPIC_MODEL`,
-//!   `TAUTLY_LIVE_OPENAI_MODEL`, `TAUTLY_LIVE_GOOGLE_MODEL`, `TAUTLY_LIVE_OLLAMA_MODEL`.
+//!   `TAUTLY_LIVE_OPENAI_MODEL`, `TAUTLY_LIVE_GOOGLE_MODEL`, `TAUTLY_LIVE_OLLAMA_MODEL` (an
+//!   Ollama tag without the `compat:ollama/` prefix gets it).
 //!
-//! How to read the continuity tests: docs/benchmark.md, "Reasoning continuity".
+//! How to read the cache continuity tests: docs/benchmark.md, "Cache continuity". They
+//! check the prompt cache only; a reasoning-continuity check comes with the lane that lets
+//! the engine enable reasoning (it sends `reasoning: None` today).
 
 use std::fs::File;
 use std::io::{Read as _, Write as _};
 use std::net::{SocketAddr, TcpStream};
+use std::os::unix::process::CommandExt as _;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -22,15 +30,14 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 use tempfile::TempDir;
 
-/// Every provider key variable; the child inherits none but the one it needs.
-const KEY_VARS: &[&str] = &[
-    "ANTHROPIC_API_KEY",
-    "OPENAI_API_KEY",
-    "GEMINI_API_KEY",
-    "OPENROUTER_API_KEY",
-];
 const RUN_TIMEOUT: Duration = Duration::from_secs(600);
+const GIT_TIMEOUT: Duration = Duration::from_secs(60);
+const PYTHON_TIMEOUT: Duration = Duration::from_secs(120);
 const OLLAMA_PORT: u16 = 11434;
+/// The session budget each run is given, and the most it may report spending (the cap is
+/// checked between steps, so one step may overshoot).
+const BUDGET_USD: &str = "0.50";
+const MAX_SPENT_USD: f64 = 0.75;
 
 struct Provider {
     name: &'static str,
@@ -79,7 +86,11 @@ fn nonempty_env(var: &str) -> Option<String> {
 
 impl Provider {
     fn model(&self) -> String {
-        nonempty_env(self.model_var).unwrap_or_else(|| self.default_model.to_string())
+        let model = nonempty_env(self.model_var).unwrap_or_else(|| self.default_model.to_string());
+        if self.key_var.is_none() && !model.starts_with("compat:ollama/") {
+            return format!("compat:ollama/{model}");
+        }
+        model
     }
 
     /// Why this provider cannot run here, or `None` when it can.
@@ -102,9 +113,18 @@ impl Provider {
         }
     }
 
-    /// Print why the test is skipped and return true, or return false to run it.
+    /// Print why the test is skipped and return true, or return false to run it. Under
+    /// `TAUTLY_LIVE_REQUIRE=1` a cloud provider that would be skipped fails instead.
     fn skipped(&self, test: &str) -> bool {
         match self.skip_reason() {
+            Some(why)
+                if self.key_var.is_some() && nonempty_env("TAUTLY_LIVE_REQUIRE").is_some() =>
+            {
+                panic!(
+                    "{test} [{}]: {why}, and TAUTLY_LIVE_REQUIRE is set",
+                    self.name
+                )
+            }
             Some(why) => {
                 println!("SKIPPED {test} [{}]: {why}", self.name);
                 true
@@ -126,21 +146,62 @@ fn ollama_tags() -> Option<String> {
     Some(body)
 }
 
-fn git(dir: &Path, args: &[&str]) {
-    let st = Command::new("git")
-        .args([
-            "-c",
-            "user.name=tautly-live",
-            "-c",
-            "user.email=live@tautly.test",
-        ])
-        .args(args)
+/// `program` in `dir` with an empty environment plus `PATH`, `TMPDIR`, `LANG` and
+/// `HOME=home`, in a process group of its own, output discarded. No provider key, CI token
+/// or runner variable reaches it.
+fn isolated(program: &str, dir: &Path, home: &Path) -> Command {
+    let mut cmd = Command::new(program);
+    cmd.env_clear()
         .current_dir(dir)
+        .env("HOME", home)
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_NOSYSTEM", "1")
-        .status()
-        .expect("git runs");
-    assert!(st.success(), "git {args:?} failed");
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .process_group(0);
+    for var in ["PATH", "TMPDIR", "LANG"] {
+        if let Some(v) = std::env::var_os(var) {
+            cmd.env(var, v);
+        }
+    }
+    cmd
+}
+
+/// Run `cmd` to its exit code; past `timeout` its whole process group is killed and the
+/// result is `None` (so is death by a signal).
+fn run_bounded(cmd: &mut Command, timeout: Duration) -> Option<i32> {
+    let mut child = cmd.spawn().expect("child starts");
+    let start = Instant::now();
+    loop {
+        if let Some(st) = child.try_wait().unwrap() {
+            return st.code();
+        }
+        if start.elapsed() > timeout {
+            let pgid = i32::try_from(child.id()).unwrap();
+            // SAFETY: kill(2) on our child's own process group; no memory is involved.
+            unsafe { libc::kill(-pgid, libc::SIGKILL) };
+            let _ = child.wait();
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn git(dir: &Path, args: &[&str]) {
+    let mut cmd = isolated("git", dir, dir);
+    cmd.args([
+        "-c",
+        "user.name=tautly-live",
+        "-c",
+        "user.email=live@tautly.test",
+    ])
+    .args(args);
+    assert_eq!(
+        run_bounded(&mut cmd, GIT_TIMEOUT),
+        Some(0),
+        "git {args:?} failed"
+    );
 }
 
 /// A git repository holding `files`, committed.
@@ -185,6 +246,27 @@ impl Run {
             .collect()
     }
 
+    /// What every `usage` event says it cost, side model and session-end episode included.
+    fn spent_usd(&self) -> f64 {
+        self.events
+            .iter()
+            .filter(|e| e["type"] == "usage")
+            .filter_map(|e| e["cost_usd"].as_f64())
+            .sum()
+    }
+
+    /// Print the spend and, for a priced (cloud) provider, assert `--budget-usd` held.
+    fn check_budget(&self, p: &Provider) {
+        let spent = self.spent_usd();
+        println!("  spent ${spent:.4} of ${BUDGET_USD} [{}]", p.name);
+        if p.key_var.is_some() {
+            assert!(
+                spent <= MAX_SPENT_USD,
+                "spent ${spent:.4}: --budget-usd {BUDGET_USD} did not hold"
+            );
+        }
+    }
+
     fn report(&self) -> String {
         let errors: Vec<&Value> = self
             .events
@@ -208,40 +290,18 @@ fn run_tautly(p: &Provider, work: &Path, prompt: &str, extra: &[&str]) -> Run {
     let err_path = home.path().join("stderr.txt");
     let model = p.model();
 
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_tautly"));
+    let mut cmd = isolated(env!("CARGO_BIN_EXE_tautly"), work, home.path());
     cmd.args(["-p", prompt, "--output", "json", "--model", &model])
         .args(extra)
-        .current_dir(work)
         .env("TAUTLY_HOME", home.path())
-        .env("HOME", home.path())
         .env("TAUTLY_TEST_SECRET_STORE", &store)
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env_remove("XDG_CONFIG_HOME")
-        .env_remove("XDG_DATA_HOME")
-        .stdin(Stdio::null())
-        // Files, not pipes: the poll loop below never reads, so a pipe could fill and block.
+        // Files, not pipes: the poll loop never reads, so a pipe could fill and block.
         .stdout(File::create(&out_path).unwrap())
         .stderr(File::create(&err_path).unwrap());
-    for var in KEY_VARS {
-        cmd.env_remove(var);
-    }
     if let Some(var) = p.key_var {
         cmd.env(var, nonempty_env(var).unwrap());
     }
-
-    let mut child = cmd.spawn().expect("tautly starts");
-    let start = Instant::now();
-    let code = loop {
-        if let Some(st) = child.try_wait().unwrap() {
-            break st.code();
-        }
-        if start.elapsed() > RUN_TIMEOUT {
-            let _ = child.kill();
-            let _ = child.wait();
-            break None;
-        }
-        std::thread::sleep(Duration::from_millis(200));
-    };
+    let code = run_bounded(&mut cmd, RUN_TIMEOUT);
     let events = std::fs::read_to_string(&out_path)
         .unwrap()
         .lines()
@@ -257,15 +317,11 @@ fn run_tautly(p: &Provider, work: &Path, prompt: &str, extra: &[&str]) -> Run {
 const CALC: &str = "def add(a, b):\n    return a - b\n";
 const TEST_CALC: &str = "import unittest\n\nfrom calc import add\n\n\nclass AddTest(unittest.TestCase):\n    def test_add(self):\n        self.assertEqual(add(2, 3), 5)\n\n\nif __name__ == \"__main__\":\n    unittest.main()\n";
 
+/// Runs code the model wrote: isolated (no keys) and bounded (an endless loop is killed).
 fn unittest_passes(dir: &Path) -> bool {
-    Command::new("python3")
-        .args(["-m", "unittest", "-q", "test_calc"])
-        .current_dir(dir)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .expect("python3 runs")
-        .success()
+    let mut cmd = isolated("python3", dir, dir);
+    cmd.args(["-m", "unittest", "-q", "test_calc"]);
+    run_bounded(&mut cmd, PYTHON_TIMEOUT) == Some(0)
 }
 
 /// Step 1, first bullet: a temp repo with a failing unit test; the model makes it pass.
@@ -283,10 +339,11 @@ fn fix_failing_test(p: &Provider) {
         p,
         dir.path(),
         "make the failing test pass",
-        &["--approve", "auto-edit", "--budget-usd", "0.50"],
+        &["--approve", "auto-edit", "--budget-usd", BUDGET_USD],
     );
     assert_eq!(run.code, Some(0), "{}", run.report());
     assert!(run.completed(), "turn did not complete: {}", run.report());
+    run.check_budget(p);
     assert_eq!(
         std::fs::read_to_string(dir.path().join("test_calc.py")).unwrap(),
         TEST_CALC,
@@ -300,28 +357,31 @@ fn fix_failing_test(p: &Provider) {
     println!("PASSED fix_failing_test [{}] with {}", p.name, p.model());
 }
 
-/// Step 1, second bullet: a three-step tool loop (each file names the next). It checks
-/// that the provider accepts the replayed history (for OpenAI: reasoning items next to
-/// id-less items) and prints per-step numbers; on providers with a dependable prompt cache
-/// the last step must read from it, else the working-state tail is breaking the prefix.
-fn reasoning_continuity(p: &Provider) {
-    if p.skipped("reasoning_continuity") {
+/// Step 1, second bullet, cache half: a three-step tool loop (each file names the next,
+/// under names that cannot be guessed, so the reads cannot be batched). It checks that the
+/// provider accepts the replayed history (for OpenAI: reasoning items next to id-less
+/// items) and prints per-step numbers; on providers with a dependable prompt cache the last
+/// step must read from it, else the working-state tail is breaking the prefix. Reasoning
+/// continuity itself is not checked: the engine does not enable reasoning yet.
+fn cache_continuity(p: &Provider) {
+    if p.skipped("cache_continuity") {
         return;
     }
     let dir = repo(&[
-        ("hop1.txt", "Next file: hop2.txt\n"),
-        ("hop2.txt", "Next file: hop3.txt\n"),
-        ("hop3.txt", "DONE. The codeword is PERIWINKLE-42.\n"),
+        ("start.txt", "Next file: q7-maple.txt\n"),
+        ("q7-maple.txt", "Next file: z3-harbor.txt\n"),
+        ("z3-harbor.txt", "DONE. The codeword is PERIWINKLE-42.\n"),
     ]);
-    let prompt = "Read hop1.txt with the read tool. Each file names the next file to read; \
-                  read them one per step, in order, until a file says DONE. Then reply with \
-                  only the codeword it gives.";
-    let run = run_tautly(p, dir.path(), prompt, &["--budget-usd", "0.50"]);
+    let prompt = "Read start.txt with the read tool. Each file names the next file to read; \
+                  make one tool call per step, never several at once, and follow the chain \
+                  until a file says DONE. Then reply with only the codeword it gives.";
+    let run = run_tautly(p, dir.path(), prompt, &["--budget-usd", BUDGET_USD]);
     assert_eq!(run.code, Some(0), "{}", run.report());
     assert!(run.completed(), "turn did not complete: {}", run.report());
+    run.check_budget(p);
 
     let steps = run.main_steps();
-    println!("CONTINUITY [{}] {}", p.name, p.model());
+    println!("CACHE CONTINUITY [{}] {}", p.name, p.model());
     println!("  step  tokens_in  cache_read  tokens_out  cache_hit");
     for (i, u) in steps.iter().enumerate() {
         let tin = u["tokens_in"].as_u64().unwrap_or(0);
@@ -349,9 +409,28 @@ fn reasoning_continuity(p: &Provider) {
         assert!(
             last["cache_read"].as_u64().unwrap_or(0) > 0,
             "continuity lost: the last step read nothing from the prompt cache ({last}); \
-             see docs/benchmark.md, \"Reasoning continuity\" (volatile_tail placement)"
+             see docs/benchmark.md, \"Cache continuity\" (volatile_tail placement)"
         );
     }
+}
+
+/// Not live: the isolation the live tests rely on. `cargo test` sets `CARGO` for this
+/// process, so a child that still sees it inherited the environment.
+#[test]
+fn isolated_children_get_a_clean_environment_and_a_deadline() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut clean = isolated("sh", dir.path(), dir.path());
+    clean.args([
+        "-c",
+        r#"[ -z "$CARGO" ] && [ -n "$PATH" ] && [ -d "$HOME" ]"#,
+    ]);
+    assert_eq!(run_bounded(&mut clean, GIT_TIMEOUT), Some(0));
+
+    let mut stuck = isolated("sh", dir.path(), dir.path());
+    stuck.args(["-c", "sleep 30 & sleep 30"]);
+    let start = Instant::now();
+    assert_eq!(run_bounded(&mut stuck, Duration::from_millis(300)), None);
+    assert!(start.elapsed() < Duration::from_secs(5));
 }
 
 #[test]
@@ -380,18 +459,18 @@ fn ollama_fixes_failing_test() {
 
 #[test]
 #[ignore = "live: needs ANTHROPIC_API_KEY"]
-fn anthropic_reasoning_continuity() {
-    reasoning_continuity(&ANTHROPIC);
+fn anthropic_cache_continuity() {
+    cache_continuity(&ANTHROPIC);
 }
 
 #[test]
 #[ignore = "live: needs OPENAI_API_KEY"]
-fn openai_reasoning_continuity() {
-    reasoning_continuity(&OPENAI);
+fn openai_cache_continuity() {
+    cache_continuity(&OPENAI);
 }
 
 #[test]
 #[ignore = "live: needs GEMINI_API_KEY"]
-fn google_reasoning_continuity() {
-    reasoning_continuity(&GOOGLE);
+fn google_cache_continuity() {
+    cache_continuity(&GOOGLE);
 }

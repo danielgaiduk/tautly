@@ -28,6 +28,10 @@ the pin, check those names first.
   cache reads), `n_cache_tokens`, `n_output_tokens` and `cost_usd`. Self-check:
   `python3 -m doctest tautly_usage.py`.
 - `run.sh`: runs `TRIALS` attempts per task (default 5) on one fixed model.
+  - It checks first that the binary is executable and the model's key variable is set.
+  - Extra arguments go to `harbor run`, for example `run.sh --n-tasks 1` for a smoke run.
+  - Each job directory is named after the model and the start time, so runs never collide.
+    `results/` is ignored by git.
 
 ## Run
 

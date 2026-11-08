@@ -37,7 +37,18 @@ $ tautly -p "Say hello in five words."; echo "exit=$?"
 $ tautly doctor; echo "exit=$?"
 ```
 
+`TAUTLY_HOME` isolates the configuration and data, not the OS keychain. A key stored
+earlier with `tautly auth add` (service `tautly`) can still be found, and then the run is
+not zero-config. Check before you start, and remove any key you find (or note it under
+Result):
+
+```sh
+$ for a in anthropic openai google openrouter; do security find-generic-password -s tautly -a "$a" >/dev/null 2>&1 && echo "stored: $a"; done   # macOS
+$ for a in anthropic openai google openrouter; do secret-tool lookup service tautly username "$a" >/dev/null 2>&1 && echo "stored: $a"; done   # Linux (attribute names may differ by keyring)
+```
+
 Success looks like:
+- no `stored:` line was printed above;
 - stderr announces the provider and model it detected from the one key in the environment;
 - an answer is printed and the first `exit=0`;
 - doctor reports no failing check, and the second `exit=0`;
@@ -103,24 +114,28 @@ Use any real stdio server. The example uses the reference filesystem server (nee
 
 ```sh
 $ mkdir -p /tmp/mcp-files && echo "the secret is 7341" > /tmp/mcp-files/secret.txt
-$ cat >> "${TAUTLY_HOME:-$HOME/.config/tautly}/config.toml" <<'EOF'
+$ cfg="${TAUTLY_HOME:-${XDG_CONFIG_HOME:-$HOME/.config}/tautly}"; mkdir -p "$cfg"
+$ cat >> "$cfg/config.toml" <<'EOF'
 [mcp.servers.fs]
 command = "npx"
 args = ["-y", "@modelcontextprotocol/server-filesystem", "/tmp/mcp-files"]
 EOF
+$ cd "$(mktemp -d)" && git init -q          # a throwaway directory: the next run uses yolo
 $ tautly mcp list
-$ tautly -p "Using the fs MCP server's tools, read secret.txt and tell me the secret." --output json > mcp-run.jsonl; echo "exit=$?"
+$ tautly -p "Using the fs MCP server's tools, read secret.txt and tell me the secret." --approve yolo --output json > mcp-run.jsonl; echo "exit=$?"
 $ grep -E '"tool_call_proposed"|"tool_finished"' mcp-run.jsonl
 ```
+
+Headless, an MCP call would otherwise be denied, because it asks for approval and nobody
+can answer. `--approve yolo` allows it, which is why the run is in a throwaway directory.
+To test the approval prompt as well, ask the same question in the REPL (`tautly`) and
+approve with `y`.
 
 Success looks like:
 - `tautly mcp list` shows `fs` as ready with a tool count above 0;
 - the event stream has a `tool_call_proposed` whose `tool` starts with `mcp__fs__`, and a
   matching `tool_finished` with `"is_error":false`;
 - the answer contains `7341`, and `exit=0`.
-
-If the call is denied headless, approve it in the REPL instead (`tautly`, then ask the same
-question).
 
 **Result:** PASS / FAIL — server used, notes, issue link:
 
@@ -163,31 +178,65 @@ From a checkout of this repository, with whichever keys you have:
 
 ```sh
 $ export ANTHROPIC_API_KEY=... OPENAI_API_KEY=... GEMINI_API_KEY=...
-$ cargo test -p tautly --features mock --test live_smoke -- --ignored --nocapture 2>&1 | tee live-smoke.log
-$ grep -E '^(SKIPPED|PASSED|test result)' live-smoke.log
-$ grep -A8 '^CONTINUITY' live-smoke.log
+$ set -o pipefail
+$ cargo test -p tautly --features mock --test live_smoke -- --ignored --nocapture 2>&1 | tee live-smoke.log; echo "exit=$?"
+$ grep -E '^(SKIPPED|PASSED|test result)|spent' live-smoke.log
+$ grep -A8 '^CACHE CONTINUITY' live-smoke.log
 ```
 
-Success looks like:
-- `test result: ok`, and every provider you have a key for shows `PASSED
-  fix_failing_test` rather than `SKIPPED`;
-- each `CONTINUITY` table has 3 or more steps.
+To make a missing key fail rather than skip, as the nightly does, add
+`TAUTLY_LIVE_REQUIRE=1`.
 
-How to read the continuity tables: see `docs/benchmark.md`, "Reasoning continuity". **If a
-`*_reasoning_continuity` test fails** with "continuity lost", re-run it once. A second
-failure means applying the documented `volatile_tail` placement for that adapter: the
-working state goes inside the last tool result, with the last cache breakpoint on the block
-before it. Open an issue for that adapter. Do not change adapters on a single failure.
+Success looks like:
+- `test result: ok` and `exit=0`. Every provider you have a key for shows `PASSED
+  fix_failing_test`, not `SKIPPED`;
+- each `spent` line is at most $0.75;
+- each `CACHE CONTINUITY` table has 3 or more steps.
+
+How to read the tables: see `docs/benchmark.md`, "Cache continuity". **If a
+`*_cache_continuity` test fails** with "continuity lost", re-run it once. A second failure
+means applying the documented `volatile_tail` placement for that adapter: the working state
+goes inside the last tool result, with the last cache breakpoint on the block before it.
+Open an issue for that adapter. Do not change adapters on a single failure.
+
+These tests check the prompt cache only. **Reasoning continuity is not checked here.** The
+engine does not enable reasoning yet, and the real check comes with the
+reasoning-enablement lane.
 
 | Test | anthropic | openai | google | ollama |
 |---|---|---|---|---|
 | fixes_failing_test | | | | |
-| reasoning_continuity | | | | n/a |
+| cache_continuity | | | | n/a |
 
-Paste the `CONTINUITY` tables here:
+Paste the `CACHE CONTINUITY` tables here:
 
 ```
 ```
+
+---
+
+## 7. Terminal-Bench smoke run: keys stay out of the logs
+
+The adapter passes provider keys to Harbor's `exec` through `env=`. Confirm on the first real
+run that Harbor does not write that environment into the job's logs or config. Use one task
+and one attempt (needs Docker, `pip install 'harbor==0.25.0'` and the Linux release binary;
+see `benchmarks/terminal-bench/README.md`):
+
+```sh
+$ export TAUTLY_BINARY=/path/to/tautly-x86_64-unknown-linux-musl/tautly ANTHROPIC_API_KEY=...
+$ TRIALS=1 OUT=/tmp/tb-smoke benchmarks/terminal-bench/run.sh --n-tasks 1; echo "exit=$?"
+$ grep -rlF "$ANTHROPIC_API_KEY" /tmp/tb-smoke && echo "KEY LEAKED" || echo "no key in logs"
+$ find /tmp/tb-smoke -name tautly.jsonl | head -1 | xargs head -3
+```
+
+Success looks like:
+- `exit=0`, and the job has a trial result: a pass or a fail, either way the harness ran;
+- `no key in logs`. If `KEY LEAKED` prints, stop. Delete `/tmp/tb-smoke`, rotate the key,
+  and open an issue to pass keys through a file instead;
+- `tautly.jsonl` starts with `session_changed`, and the trial's Harbor result shows
+  non-zero `n_input_tokens`.
+
+**Result:** PASS / FAIL — notes, issue link:
 
 ---
 
@@ -201,5 +250,6 @@ Paste the `CONTINUITY` tables here:
 | 4 | Real stdio MCP server | | |
 | 5 | One real task per adapter | | |
 | 6 | Live smoke | | |
+| 7 | Terminal-Bench smoke, no key in logs | | |
 
 Accepted for daily use: yes / no

@@ -71,3 +71,12 @@ jobs:
       - run: ./target/x86_64-unknown-linux-musl/release/tautly --version
       # Second proof: no dynamic loader dependencies (glibc ldd says one of these two).
       - run: ldd target/x86_64-unknown-linux-musl/release/tautly 2>&1 | grep -Eq 'not a dynamic executable|statically linked'
+
+  # The benchmark kit's scripts only (benchmarks/terminal-bench): no live benchmark run in CI.
+  benchmark-kit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - run: shellcheck benchmarks/terminal-bench/*.sh
+      - run: python3 -I -m doctest benchmarks/terminal-bench/tautly_usage.py
