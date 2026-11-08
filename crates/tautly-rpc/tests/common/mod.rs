@@ -7,12 +7,12 @@ use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
-pub use tautly_provider::mock::{call, text_step, tools_step};
 
 use serde_json::Value;
 use tautly_core::{
     CliOverrides, Config, Engine, EngineBuilder, Event, Mode, ModelId, Workspace, Workspaces,
 };
+pub use tautly_provider::mock::{call, text_step, tools_step};
 use tautly_provider::{Catalog, MockProvider};
 use tautly_rpc::{EngineFactory, SessionSpec};
 use tautly_sandbox::{LocalSandbox, Sandbox};

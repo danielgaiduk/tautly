@@ -5,7 +5,6 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
-use tautly_provider::mock::{call, text_step_no_usage, tools_step};
 
 use async_trait::async_trait;
 use serde_json::json;
@@ -15,6 +14,7 @@ use tautly_core::{
 };
 use tautly_mcp::approvals::key;
 use tautly_mcp::{APPROVALS_FILE, ApprovalStore};
+use tautly_provider::mock::{call, text_step_no_usage, tools_step};
 use tautly_provider::{
     CanonicalRequest, Catalog, MockProvider, MockTurn, ModelId, ProviderEvent, StopReason,
 };

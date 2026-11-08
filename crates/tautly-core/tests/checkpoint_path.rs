@@ -8,9 +8,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command as Process;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tautly_provider::mock::text_step;
 
 use tautly_core::{Command, Config, Engine, EngineBuilder, Event, SessionRecord};
+use tautly_provider::mock::text_step;
 use tautly_provider::{Catalog, MockProvider, MockTurn, ModelId, ProviderEvent, StopReason};
 use tautly_sandbox::Mode;
 use tautly_session::SessionReader;

@@ -7,7 +7,6 @@ use std::path::{Path, PathBuf};
 use std::process::Command as Process;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tautly_provider::mock::{call, text_step, tools_step};
 
 use serde_json::json;
 use tautly_core::checkpoint::{self, skip_warning};
@@ -16,6 +15,7 @@ use tautly_core::{
     CheckpointConfig, Checkpointer, CliOverrides, Command, Config, Engine, EngineBuilder, Event,
     SessionRecord, Skip, sessions,
 };
+use tautly_provider::mock::{call, text_step, tools_step};
 use tautly_provider::{Catalog, MockProvider, ModelId, ProviderEvent};
 use tautly_sandbox::{LocalSandbox, Mode, Sandbox};
 use tautly_session::SessionReader;

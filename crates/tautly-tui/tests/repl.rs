@@ -7,7 +7,6 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
-use tautly_provider::mock::call;
 
 use regex::Regex;
 use serde_json::{Value, json};
@@ -16,6 +15,7 @@ use tautly_core::{
     FinishReason, SaveKind, Saved, SessionReader, SessionRecord, TestEvidence, ToolMetaView,
     Workspace,
 };
+use tautly_provider::mock::call;
 use tautly_provider::{
     Catalog, MockProvider, MockTurn, ModelId, ProviderEvent, RawUsage, StopReason,
 };

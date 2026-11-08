@@ -3,12 +3,12 @@
 
 use std::sync::Arc;
 use std::time::Duration;
-use tautly_provider::mock::{call, text_step_no_usage, tools_step};
 
 use serde_json::{Value, json};
 use tautly_core::{
     Command, Config, DiffFile, DiffPreview, DiffStatus, Engine, EngineBuilder, Event, FinishReason,
 };
+use tautly_provider::mock::{call, text_step_no_usage, tools_step};
 use tautly_provider::{Catalog, MockProvider, ModelId, ProviderEvent};
 use tautly_sandbox::Mode;
 use tempfile::TempDir;

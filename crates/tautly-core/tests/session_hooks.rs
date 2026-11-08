@@ -5,11 +5,11 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
-use tautly_provider::mock::{call, text_step, tools_step};
 
 use serde_json::json;
 use tautly_core::record::{ApprovalKind, SessionRecord, session_label};
 use tautly_core::{Command, Config, Engine, EngineBuilder, Event, FinishReason, Workspace};
+use tautly_provider::mock::{call, text_step, tools_step};
 use tautly_provider::{Block, CanonicalRequest, Catalog, MockProvider, ModelId};
 use tautly_sandbox::{LocalSandbox, Mode, Sandbox};
 use tautly_session::{BlobRef, HeaderInit, SessionReader, SessionWriter, paths};

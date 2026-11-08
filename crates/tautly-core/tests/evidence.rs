@@ -5,13 +5,13 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
-use tautly_provider::mock::{call, tools_step};
 
 use serde_json::json;
 use tautly_core::{
     CliOverrides, Command, Config, DEFAULT_TEST_COMMANDS, EngineBuilder, EngineError, Event,
     EvidenceConfig, EvidenceTracker, FinishReason, TestEvidence, TestMatcher,
 };
+use tautly_provider::mock::{call, tools_step};
 use tautly_provider::{
     Catalog, MockProvider, MockTurn, ModelId, ProviderEvent, RawUsage, StopReason,
 };

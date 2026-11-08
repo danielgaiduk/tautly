@@ -6,13 +6,13 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
-use tautly_provider::mock::call;
 
 use async_trait::async_trait;
 use serde_json::{Value, json};
 use tautly_core::record::ApprovalKind;
 use tautly_core::replay::{self, REPLAYED_ID_PREFIX};
 use tautly_core::{Command, Config, EngineBuilder, Event, SessionRecord, UsageRole};
+use tautly_provider::mock::call;
 use tautly_provider::{
     Catalog, MockProvider, MockTurn, ModelId, ProviderEvent, RawUsage, StopReason,
 };

@@ -5,7 +5,6 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, UNIX_EPOCH};
-use tautly_provider::mock::{call, text_step, tools_step};
 
 use serde_json::{Value, json};
 use tautly_core::record::UndoneFile;
@@ -14,6 +13,7 @@ use tautly_core::{
     BudgetScope, Command, Config, Engine, EngineBuilder, Event, FinishReason, Ledger,
     SessionRecord, Workspace,
 };
+use tautly_provider::mock::{call, text_step, tools_step};
 use tautly_provider::{
     CanonicalRequest, Catalog, Content, MockProvider, MockTurn, ModelId, ProviderError,
     ProviderEvent, ToolSpec,

@@ -8,12 +8,12 @@ use std::path::{Path, PathBuf};
 use std::process::Command as Process;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tautly_provider::mock::{call, text_step_no_usage, tools_step};
 
 use async_trait::async_trait;
 use serde_json::{Value, json};
 use tautly_core::bisect::{self, BashRunner, BisectError, Endpoint, TestRunner, Verdict};
 use tautly_core::{Command, Config, EngineBuilder, Event, SessionRecord};
+use tautly_provider::mock::{call, text_step_no_usage, tools_step};
 use tautly_provider::{Catalog, MockProvider, MockTurn, ModelId, ProviderEvent, StopReason};
 use tautly_sandbox::{LocalSandbox, Mode};
 use tautly_session::SessionReader;

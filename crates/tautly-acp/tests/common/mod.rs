@@ -8,13 +8,13 @@ use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-pub use tautly_provider::mock::{call, text_step, usage};
 
 use serde_json::{Value, json};
 use tautly_acp::{AcpEngineFactory, AcpError, Bridge, shared_factory};
 use tautly_core::{
     Config, EngineBuilder, Mode, ModelId, ProviderFactory, ServerSpec, Workspace, Workspaces,
 };
+pub use tautly_provider::mock::{call, text_step, usage};
 use tautly_provider::{Catalog, MockProvider, MockTurn, Provider, ProviderEvent, StopReason};
 use tempfile::TempDir;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, DuplexStream, WriteHalf};

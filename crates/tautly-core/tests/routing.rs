@@ -4,7 +4,6 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tautly_provider::mock::{call, tools_step};
 
 use async_trait::async_trait;
 use serde_json::json;
@@ -13,6 +12,7 @@ use tautly_core::{
     BudgetLimits, Command, Config, Engine, EngineBuilder, Event, FinishReason, RoutingConfig,
     UsageRole,
 };
+use tautly_provider::mock::{call, tools_step};
 use tautly_provider::{
     CanonicalRequest, Catalog, MockProvider, MockTurn, ModelId, ProviderError, ProviderEvent,
     RawUsage, SideModel, StopReason,

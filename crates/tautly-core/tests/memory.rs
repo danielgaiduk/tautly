@@ -5,7 +5,6 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tautly_provider::mock::{call, text_step, tools_step};
 
 use serde_json::json;
 use tautly_core::{
@@ -13,6 +12,7 @@ use tautly_core::{
     UsageRole, Workspace,
 };
 use tautly_memory::{MemoryDraft, MemoryKind};
+use tautly_provider::mock::{call, text_step, tools_step};
 use tautly_provider::{
     Block, CanonicalRequest, Catalog, Content, MockProvider, MockTurn, ModelId, ProviderError,
     ProviderEvent,

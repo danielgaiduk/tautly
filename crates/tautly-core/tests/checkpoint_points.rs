@@ -8,11 +8,11 @@ use std::path::{Path, PathBuf};
 use std::process::Command as Process;
 use std::sync::Arc;
 use std::time::Duration;
-use tautly_provider::mock::{call, text_step_no_usage, tools_step};
 
 use serde_json::{Value, json};
 use tautly_core::record::CheckpointPoint;
 use tautly_core::{Command, Config, EngineBuilder, Event, SessionRecord};
+use tautly_provider::mock::{call, text_step_no_usage, tools_step};
 use tautly_provider::{Catalog, MockProvider, ModelId, ProviderEvent};
 use tautly_sandbox::Mode;
 use tautly_session::{BlobRef, RelPath, SessionReader};
