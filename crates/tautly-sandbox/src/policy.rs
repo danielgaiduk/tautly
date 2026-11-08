@@ -434,6 +434,14 @@ impl Policy {
             return Decision::Ask { reason };
         }
         let rules: Vec<&Rule> = self.allow.iter().chain(&self.session).collect();
+        // A loopback, link-local or private address (cloud metadata, local services)
+        // needs a rule naming that very host; `web_fetch(*)` and yolo do not reach it.
+        if let Subjects::Host(h) = &subjects
+            && let Some(reason) = local_host_reason(h)
+            && !rules.iter().any(|r| r.text == format!("{tool}({h})"))
+        {
+            return Decision::Ask { reason };
+        }
         if self.allows(&rules, tool, &subjects) {
             return Decision::Allow;
         }
@@ -1021,6 +1029,36 @@ fn path_str(rel: &Path) -> String {
 /// The string path rules match: normalized when possible, else the raw path.
 fn subject_str(raw: &str, rel: &Option<PathBuf>) -> String {
     rel.as_deref().map_or_else(|| raw.to_string(), path_str)
+}
+
+/// Why a (canonical) host is local: a loopback, unspecified, link-local, private or
+/// shared (CGNAT) literal address, or a `localhost` name.
+/// shortcut: literal addresses only; a public name that resolves to a private address
+/// (or is rebound to one) is not caught. Upgrade by resolving in `web_fetch` and pinning
+/// the connection to the checked address.
+fn local_host_reason(host: &str) -> Option<String> {
+    use std::net::{IpAddr, Ipv4Addr};
+    let v4 = |ip: Ipv4Addr| {
+        ip.is_loopback()
+            || ip.is_private()
+            || ip.is_link_local()
+            || ip.is_unspecified()
+            || ip.is_broadcast()
+            || (ip.octets()[0] == 100 && ip.octets()[1] & 0xc0 == 64)
+    };
+    let local = match host.parse::<IpAddr>() {
+        Ok(IpAddr::V4(ip)) => v4(ip),
+        Ok(IpAddr::V6(ip)) => {
+            let first = ip.segments()[0];
+            ip.is_loopback()
+                || ip.is_unspecified()
+                || first & 0xfe00 == 0xfc00
+                || first & 0xffc0 == 0xfe80
+                || ip.to_ipv4_mapped().is_some_and(v4)
+        }
+        Err(_) => host == "localhost" || host.ends_with(".localhost"),
+    };
+    local.then(|| format!("{host} is a local or private address"))
 }
 
 /// `git config` that may set values, any `git -c`, and the global options that choose

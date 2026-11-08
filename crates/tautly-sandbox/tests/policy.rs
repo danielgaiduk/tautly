@@ -977,6 +977,48 @@ fn net(host: &str) -> Effect {
 }
 
 #[test]
+fn local_and_private_addresses_ask_unless_a_rule_names_the_host() {
+    let local = [
+        "127.0.0.1",
+        "127.1.2.3",
+        "10.0.0.1",
+        "172.16.5.4",
+        "192.168.1.1",
+        "169.254.169.254",
+        "100.64.0.1",
+        "0.0.0.0",
+        "::1",
+        "::",
+        "fe80::1",
+        "fd00::1",
+        "::ffff:169.254.169.254",
+        "localhost",
+        "api.localhost",
+    ];
+    for mode in [Mode::Ask, Mode::AutoEdit, Mode::Yolo] {
+        let glob = with_rules(mode, &["web_fetch", "web_fetch(*)"], &[]);
+        for h in local {
+            assert!(
+                asks(glob.decide("web_fetch", &net(h), None)),
+                "{mode:?} {h}"
+            );
+            let named = with_rules(mode, &[&format!("web_fetch({h})")], &[]);
+            assert_eq!(
+                named.decide("web_fetch", &net(h), None),
+                Decision::Allow,
+                "{mode:?} {h}"
+            );
+        }
+        for h in ["example.com", "8.8.8.8", "172.32.0.1", "2001:db8::1"] {
+            assert_eq!(
+                glob.decide("web_fetch", &net(h), None),
+                Decision::Allow,
+                "{mode:?} {h}"
+            );
+        }
+    }
+}
+#[test]
 fn network_asks_in_ask_and_auto_edit_and_allows_in_yolo() {
     for mode in [Mode::Ask, Mode::AutoEdit] {
         assert!(asks(p(mode).decide("web_fetch", &net("example.com"), None)));

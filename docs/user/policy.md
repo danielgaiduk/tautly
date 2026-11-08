@@ -32,7 +32,12 @@ Set it with `[permissions] mode = "..."` or for one run with `--approve auto-edi
      `cd`, that changes git configuration or chooses whose configuration and programs
      git uses (`git config`, `git -c`, `--config-env`, `--exec-path`, `--git-dir`,
      `--work-tree`), or that escapes the
-     session's process cleanup (`setsid`, daemonizers, shell job control).
+     session's process cleanup (`setsid`, daemonizers, shell job control);
+   - is a `web_fetch` of a loopback, link-local, private or shared (CGNAT) literal
+     address (`127.0.0.1`, `169.254.169.254`, `10.x`, `fd00::1`, …) or of `localhost`,
+     unless an allow rule names that exact host (`web_fetch(127.0.0.1)`; `web_fetch(*)`
+     and a bare `web_fetch` do not count). Only literal addresses are recognised: a public
+     name that resolves to a private address is not caught.
 3. **Allow rules** (from configuration and "allow for this session" answers).
 4. **The mode's default.**
 
