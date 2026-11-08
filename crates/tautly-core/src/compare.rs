@@ -529,7 +529,7 @@ impl Tally {
                     }
                 }
             }
-            SessionRecord::Unknown => self.unknown += 1,
+            SessionRecord::Unknown | SessionRecord::Unreadable => self.unknown += 1,
             rec @ SessionRecord::WritesLost { .. } if ran_command(rec) => self.commands += 1,
             _ => {}
         }

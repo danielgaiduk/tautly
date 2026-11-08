@@ -1,4 +1,4 @@
-//! T    state.base = base.map(|(_, commit)| commit);me travel (spec 7.12): the files at a step             if base_at.is_none_or(|b| *offset > b) {oundary ([`state_at`]), the files the
+//! Time travel (spec 7.12): the files at a step boundary ([`state_at`]), the files the
 //! agent left ([`expected_tip`]), and materializing one in place of the other without
 //! clobbering human edits ([`materialize`]); plus the engine's `Rewind` and `Switch`.
 //!
@@ -74,6 +74,10 @@ use crate::undo::{LiveLog, UndoError, UndoLog};
 const NOTE_NO_CHECKPOINT: &str = "only tool edits are restored; command effects are not \
      (no checkpoint follows that step: outside git, checkpoints off, or the session stopped \
      mid-turn)";
+
+/// The note of a state across a record this version cannot read (cp5 FMT re-review N1).
+const NOTE_UNREADABLE: &str = "a record written by a newer version of tautly, which this one \
+     cannot read, lies between; it may have changed files";
 
 /// The files of a session at some point: the tree of checkpoint commit `base` with
 /// `overlay` applied (each path's content as a blob of the log's store; none: absent).
@@ -337,7 +341,9 @@ fn slim(rec: SessionRecord) -> Option<SessionRecord> {
         | SessionRecord::WritesLost { .. }
         | SessionRecord::TurnEnd { .. }
         | SessionRecord::Checkpoint { .. }
-        | SessionRecord::CheckpointSkipped { .. }) => rec,
+        | SessionRecord::CheckpointSkipped { .. }
+        // It may have changed files: the states across it are partial.
+        | SessionRecord::Unreadable) => rec,
         _ => return None,
     })
 }
@@ -493,12 +499,13 @@ fn state_in(b: &Boundaries, at: u32, later: bool) -> Result<FileState, TtError> 
     };
     let turn_end_seen = turn.is_some_and(|t| b.first_turn_end.get(&t).is_some_and(|&i| i < start));
     let mut reverts = Vec::new();
-    let (mut skipped, mut lost) = (false, false);
+    let (mut skipped, mut lost, mut unreadable) = (false, false, false);
     let mut chosen = None;
     for (i, (_, rec)) in w.recs.iter().enumerate().skip(start) {
         match rec {
             SessionRecord::CheckpointSkipped { .. } => skipped = true,
             SessionRecord::WritesLost { .. } => lost = true,
+            SessionRecord::Unreadable => unreadable = true,
             SessionRecord::Checkpoint { .. } => {
                 chosen = Some(i);
                 break;
@@ -508,7 +515,12 @@ fn state_in(b: &Boundaries, at: u32, later: bool) -> Result<FileState, TtError> 
     }
     state.overlay = earliest(reverts);
     let Some(i) = chosen else {
-        state.partial = Some(NOTE_NO_CHECKPOINT.to_string());
+        let mut note = NOTE_NO_CHECKPOINT.to_string();
+        if unreadable {
+            note.push_str("; ");
+            note.push_str(NOTE_UNREADABLE);
+        }
+        state.partial = Some(note);
         return Ok(state);
     };
     let SessionRecord::Checkpoint { commit, point, .. } = &w.recs[i].1 else {
@@ -525,6 +537,9 @@ fn state_in(b: &Boundaries, at: u32, later: bool) -> Result<FileState, TtError> 
         notes.push(format!(
             "writes of unknown outcome happened after step {at}"
         ));
+    }
+    if unreadable {
+        notes.push(NOTE_UNREADABLE.to_string());
     }
     match point {
         Some(CheckpointPoint::ResumeStart | CheckpointPoint::BeforeRestore) => {
@@ -644,6 +659,8 @@ pub fn expected_tip(reader: &SessionReader<SessionRecord>) -> Result<FileState, 
     let base_at = base.as_ref().map(|(offset, _)| *offset);
     let mut overlay: BTreeMap<RelPath, Option<BlobRef>> = BTreeMap::new();
     let mut unknown = std::collections::BTreeSet::new();
+    // A record this version cannot read follows the base (N1).
+    let mut unreadable = false;
     let mut written: BTreeMap<RelPath, Option<BlobRef>> = BTreeMap::new();
     let mut writes = Writes::default();
     // The pairs: the last checkpoint, what was written since, whether a command ran.
@@ -693,6 +710,8 @@ pub fn expected_tip(reader: &SessionReader<SessionRecord>) -> Result<FileState, 
             cut = false;
             continue;
         }
+        unreadable |=
+            matches!(rec, SessionRecord::Unreadable) && base_at.is_none_or(|b| *offset > b);
         command |= ran_command(rec);
         for (path, value) in writes.see(rec) {
             between.insert(path.clone(), value.clone());
@@ -721,13 +740,18 @@ pub fn expected_tip(reader: &SessionReader<SessionRecord>) -> Result<FileState, 
     state.base = base.map(|(_, commit)| commit);
     state.overlay = overlay.into_iter().collect();
     state.written = written.into_iter().collect();
-    state.partial = (!unknown.is_empty()).then(|| {
+    let mut notes = Vec::new();
+    if !unknown.is_empty() {
         let names: Vec<&str> = unknown.iter().map(RelPath::as_str).collect();
-        format!(
+        notes.push(format!(
             "the content a tool left in {} was not captured",
             names.join(", ")
-        )
-    });
+        ));
+    }
+    if unreadable {
+        notes.push(NOTE_UNREADABLE.to_string());
+    }
+    state.partial = (!notes.is_empty()).then(|| notes.join("; "));
     Ok(state)
 }
 
@@ -856,6 +880,19 @@ async fn branch_tip(
     let numbers = (cut.checkpoints.max_n + 1, cut.turn_count, at);
     let made = restored_checkpoint(cp, reader, Some(base), &overlay, numbers).await?;
     Ok(made.into_iter().collect())
+}
+
+/// The log ends after a `TurnStart` with no `TurnEnd` (a crash mid-turn).
+fn ends_inside_a_turn(reader: &SessionReader<SessionRecord>) -> Result<bool, TtError> {
+    let mut open = false;
+    for rec in reader.records() {
+        match rec?.1 {
+            SessionRecord::TurnStart { .. } => open = true,
+            SessionRecord::TurnEnd { .. } => open = false,
+            _ => {}
+        }
+    }
+    Ok(open)
 }
 
 /// The highest checkpoint number, the user turn and the step a log ends on.
@@ -1174,6 +1211,19 @@ impl Session {
                 let mut cp = guard.as_deref_mut().map(|g| &mut g.cp);
                 let mut writer = opened;
                 let there = SessionReader::<SessionRecord>::open(&found)?;
+                // A session that stopped mid-turn gets its missing `TurnEnd`, as on resume,
+                // before the switch writes anything there: stamped at its last record, so
+                // the time no session ran is not the turn's (cp5 FMT re-review N3).
+                if let Some(w) = writer.as_mut()
+                    && ends_inside_a_turn(&there)?
+                {
+                    w.append_at_last(&SessionRecord::TurnEnd {
+                        reason: FinishReason::Error,
+                        evidence: None,
+                        synthetic: true,
+                    })?;
+                    w.checkpoint()?;
+                }
                 let here = SessionReader::<SessionRecord>::open(&current)?;
                 let target = expected_tip(&there)?;
                 let expected = expected_tip(&here)?;
@@ -1220,16 +1270,6 @@ impl Session {
                     }
                     let there = SessionReader::<SessionRecord>::open(&found)?;
                     let r = rebuild_with(&there, None, Some(&calibration))?;
-                    // A session that stopped mid-turn gets its missing `TurnEnd`, as on
-                    // resume.
-                    if r.incomplete_turn {
-                        writer.append_at_last(&SessionRecord::TurnEnd {
-                            reason: FinishReason::Error,
-                            evidence: None,
-                            synthetic: true,
-                        })?;
-                        writer.checkpoint()?;
-                    }
                     Ok::<_, TtError>(r)
                 }
                 .await;

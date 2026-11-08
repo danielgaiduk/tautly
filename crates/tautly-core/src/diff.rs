@@ -1,4 +1,4 @@
-//! `Command::Diff` (spec 7.11.4): } if turn.is_none_or(|t| t == current) => {he net change per file that the session's tools made,
+//! `Command::Diff` (spec 7.11.4): the net change per file that the session's tools made,
 //! from the session log's `Edit` records (each holds the file's content before that
 //! change) and the disk as it is now. Changes made by commands are not included.
 

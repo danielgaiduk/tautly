@@ -269,6 +269,11 @@ pub enum SessionRecord {
     /// A record type this version does not know (read only; never written).
     #[serde(skip)]
     Unknown,
+    /// A record of a type this version knows whose payload it cannot read: a newer shape
+    /// (read only; never written). It may have changed files, so every time-travel state
+    /// across it is partial (cp5 FMT re-review N1).
+    #[serde(skip)]
+    Unreadable,
 }
 
 /// blake3 hex of each part of a request (H6): `stable` the system blocks and tools,
@@ -579,10 +584,10 @@ pub fn tool_args(
 /// this version ignores (spec 6.5: unit records may gain fields).
 const UNIT_TYPES: &[&str] = &["pins_folded", "reasoning_stripped", "forked"];
 
-/// A line that is valid JSON reads as a record whatever its payload (spec 6.5): an unknown
-/// type, or a known one whose payload this version cannot read (a newer shape, a value it
-/// never writes), reads as `Unknown` (a command's as `Command::Unknown`), never as a
-/// corrupt log. Payloads of the builds before the format freeze are upgraded first.
+/// A line that is valid JSON reads as a record whatever its payload (spec 6.5.1): an unknown
+/// type reads as `Unknown`, a known one whose payload this version cannot read (a newer
+/// shape, a value it never writes) as `Unreadable` (a command's as `Command::Unknown`),
+/// never as a corrupt log. Payloads of the builds before the format freeze are upgraded first.
 impl<'de> Deserialize<'de> for SessionRecord {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         let mut value = Value::deserialize(d)?;
@@ -604,7 +609,7 @@ impl<'de> Deserialize<'de> for SessionRecord {
         Ok(match SessionRecord::deserialize(value) {
             Ok(rec) => rec,
             Err(_) if ty == "command" => SessionRecord::Command(Command::Unknown),
-            Err(_) => SessionRecord::Unknown,
+            Err(_) => SessionRecord::Unreadable,
         })
     }
 }
@@ -868,7 +873,7 @@ mod tests {
         // A known type with a payload this version cannot read is not a corrupt log.
         assert_eq!(
             serde_json::from_str::<SessionRecord>(r#"{"type":"request","data":7}"#).unwrap(),
-            SessionRecord::Unknown
+            SessionRecord::Unreadable
         );
         // A line that is not JSON is.
         assert!(serde_json::from_str::<SessionRecord>(r#"{"type":"request","#).is_err());
@@ -981,7 +986,7 @@ mod tests {
         );
         assert_eq!(
             read(r#"{"type":"turn_start","data":{"turn":"one"}}"#),
-            SessionRecord::Unknown
+            SessionRecord::Unreadable
         );
     }
 

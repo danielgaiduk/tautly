@@ -450,7 +450,12 @@ async fn state_at_with_skipped_checkpoint_is_partial() {
         tools_step(vec![bash("b2", "true")]),
         text_step("done"),
     ]);
-    let mut run = Run::start(repo.builder(&mock));
+    // A generous checkpoint time limit: one skipped under load is another partial case.
+    let patient = |mut b: EngineBuilder| {
+        b.config.checkpoints.timeout_ms = 120_000;
+        b
+    };
+    let mut run = Run::start(patient(repo.builder(&mock)));
     run.engine
         .send(Command::SendMessage { text: "one".into() })
         .await
@@ -473,7 +478,7 @@ async fn state_at_with_skipped_checkpoint_is_partial() {
         tools_step(vec![write("w1", "a.txt", "one\n")]),
         text_step("first"),
     ]);
-    let mut run = Run::start(repo.builder(&mock));
+    let mut run = Run::start(patient(repo.builder(&mock)));
     run.turn_with("one").await;
     let log = run.current().1;
     run.stop().await;
@@ -2263,4 +2268,115 @@ async fn a_large_tool_input_is_one_blob_both_records_name_and_every_reader_resol
     assert!(!branch.contains(&big[..5000]));
     assert!(branch.contains(blob));
     run.stop().await;
+}
+
+// ------------------------------------------- cp5 FMT re-review N1: unreadable records
+
+/// `log` with the checkpoint whose `point` is `which` given a newer `point` shape this
+/// version cannot read; the rewritten log's path.
+fn with_unreadable_checkpoint(log: &Path, which: &str) -> PathBuf {
+    let text = std::fs::read_to_string(log).unwrap();
+    let mut lines = text.lines();
+    let mut out = vec![lines.next().unwrap().to_string()];
+    for l in lines {
+        let mut v: Value = serde_json::from_str(l).unwrap();
+        if v["data"]["type"] == "checkpoint" && v["data"]["data"]["point"] == which {
+            v["data"]["data"]["point"] = json!({ "from_the_future": which });
+        }
+        out.push(v.to_string());
+    }
+    let rewritten = log.with_extension(format!("{which}-unreadable.jsonl"));
+    std::fs::write(&rewritten, out.join("\n") + "\n").unwrap();
+    rewritten
+}
+
+#[tokio::test]
+async fn a_record_this_version_cannot_read_makes_the_states_across_it_partial() {
+    // Steps: 1 user, 2 write a=one, 3 a command that creates c.txt (after its before_exec
+    // checkpoint), 4 text.
+    let repo = Repo::git_repo();
+    let mock = MockProvider::new(vec![
+        tools_step(vec![write("w1", "a.txt", "one\n")]),
+        tools_step(vec![bash("b1", "printf 'x\\n' > c.txt")]),
+        text_step("done"),
+    ]);
+    let mut run = Run::start(repo.builder(&mock));
+    run.turn_with("go").await;
+    let log = run.current().1;
+    run.stop().await;
+    let exact = state_at(&reader(&log), 2).unwrap();
+    assert_eq!(exact.partial, None, "{exact:?}");
+
+    // The reviewer's probe: the before_exec checkpoint reads as Unreadable; the next
+    // checkpoint (after the command) must not be taken as exact for step 2.
+    let probe = with_unreadable_checkpoint(&log, "before_exec");
+    let r = reader(&probe);
+    assert!(
+        records(&probe)
+            .iter()
+            .any(|rec| matches!(rec, SessionRecord::Unreadable))
+    );
+    let s = state_at(&r, 2).unwrap();
+    assert_ne!(s.base, exact.base);
+    assert!(
+        s.partial
+            .as_deref()
+            .is_some_and(|p| p.contains("newer version")),
+        "{s:?}"
+    );
+
+    // After the expected tip's base: the tip is partial too.
+    let probe = with_unreadable_checkpoint(&log, "turn_end");
+    let tip = expected_tip(&reader(&probe)).unwrap();
+    assert!(
+        tip.partial
+            .as_deref()
+            .is_some_and(|p| p.contains("newer version")),
+        "{tip:?}"
+    );
+    assert!(expected_tip(&reader(&log)).unwrap().partial.is_none());
+}
+
+#[tokio::test]
+async fn a_switch_closes_the_targets_cut_turn_before_it_writes_there() {
+    // cp5 FMT re-review N3: the synthetic end is stamped at the target's last record and
+    // precedes the switch's own records, so compare's wall time leaves the downtime out.
+    let repo = Repo::git_repo();
+    let mut run = Run::start(repo.builder(&MockProvider::new(vec![text_step("one")])));
+    let target = run.engine.session_id().to_string();
+    run.turn_with("one").await;
+    let log = run.current().1;
+    run.stop().await;
+    // A crash inside the next turn: the log ends on its `TurnStart`.
+    let mut line: Value = serde_json::from_str(raw_lines(&log).last().unwrap()).unwrap();
+    line["offset"] = json!(line["offset"].as_u64().unwrap() + 1);
+    line["data"] = json!({"type": "turn_start", "data": {"turn": 2, "text": "two"}});
+    let mut text = std::fs::read_to_string(&log).unwrap();
+    text.push_str(&format!("{line}\n"));
+    std::fs::write(&log, text).unwrap();
+    let start_t = line["t"].as_u64().unwrap();
+
+    let mut run = Run::start(repo.builder(&MockProvider::new(vec![text_step("other")])));
+    run.turn_with("elsewhere").await;
+    // Time no session of the target ran.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    run.switch(&target, &[]).await.done();
+    run.stop().await;
+    let lines = typed_lines(&log);
+    let started = lines
+        .iter()
+        .rposition(|(ty, _, d)| ty == "turn_start" && d["turn"] == 2)
+        .unwrap();
+    let (ty, t, d) = &lines[started + 1];
+    assert_eq!(ty, "turn_end", "{lines:?}");
+    assert_eq!(d["synthetic"], true);
+    assert_eq!(*t, start_t);
+    let synthetic = lines
+        .iter()
+        .filter(|(ty, _, d)| ty == "turn_end" && d["synthetic"] == true)
+        .count();
+    assert_eq!(synthetic, 1);
+    let s =
+        tautly_core::compare::summarize_at(&reader(&log), None, &Catalog::default(), None).unwrap();
+    assert!(s.wall_ms < 1500, "{}", s.wall_ms);
 }

@@ -528,7 +528,7 @@ impl Replay<'_> {
                 self.restoring = Some((backup_ref, paths, !files.is_empty(), own))
             }
             SessionRecord::RestoreEnded { .. } => self.restoring = None,
-            SessionRecord::Unknown => self.unknown += 1,
+            SessionRecord::Unknown | SessionRecord::Unreadable => self.unknown += 1,
         }
         Flow::Go
     }

@@ -348,7 +348,7 @@ impl Events<'_> {
             } => {
                 vec![Event::TurnFinished { reason, evidence }]
             }
-            SessionRecord::Unknown => {
+            SessionRecord::Unknown | SessionRecord::Unreadable => {
                 self.unknown += 1;
                 Vec::new()
             }

@@ -359,7 +359,7 @@ pub fn plan(
     };
     let (mut lo, mut hi) = (lo0, hi0);
     let (mut good_from, mut bad_from) = (given(good), given(bad));
-    if let Some((g, b)) = prepass_in(walked.records(), test) {
+    if let Some((g, b)) = prepass_in(reader, walked.records(), test) {
         if good.is_none() && g > lo && g < hi && exact.contains_key(&g) {
             lo = g;
             good_from = Endpoint::Logged;
@@ -423,10 +423,14 @@ pub fn prepass(reader: &SessionReader<SessionRecord>, test: &str) -> Option<(u32
         };
         recs.push(rec);
     }
-    prepass_in(&recs, test)
+    prepass_in(reader, &recs, test)
 }
 
-fn prepass_in(recs: &[(u64, SessionRecord)], test: &str) -> Option<(u32, u32)> {
+fn prepass_in(
+    reader: &SessionReader<SessionRecord>,
+    recs: &[(u64, SessionRecord)],
+    test: &str,
+) -> Option<(u32, u32)> {
     let test = normalize(test);
     let mut steps = StepCounter::default();
     let mut by_step: BTreeMap<u32, StepRuns> = BTreeMap::new();
@@ -442,8 +446,15 @@ fn prepass_in(recs: &[(u64, SessionRecord)], test: &str) -> Option<(u32, u32)> {
                     ..StepRuns::default()
                 });
             }
-            SessionRecord::ToolCall { id, name, args, .. } => {
+            SessionRecord::ToolCall {
+                id,
+                name,
+                args,
+                args_blob,
+            } => {
                 if let Some((s, _)) = owner {
+                    // A command over 4 KiB is in a blob (cp5 FMT re-review N4).
+                    let args = crate::record::tool_args(reader, args, args_blob.as_ref());
                     let matches = name == "bash"
                         && args
                             .get("command")
