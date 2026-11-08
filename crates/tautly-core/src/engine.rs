@@ -159,6 +159,10 @@ pub struct EngineBuilder {
     /// How long the session waits at start for the working-tree lease while a rewind or
     /// switch elsewhere holds it (spec 7.12.1); then it fails to start. Default 30 s.
     pub lease_wait: Duration,
+    /// How long the first request waits for the repo map and memory index, built in the
+    /// background at start, before it goes without them. Default 300 ms; tests that check
+    /// what the first request carries wait longer, so a loaded machine cannot change it.
+    pub startup_wait: Duration,
 }
 
 impl EngineBuilder {
@@ -180,6 +184,7 @@ impl EngineBuilder {
             pre_exec: None,
             secret_store: None,
             lease_wait: LEASE_WAIT,
+            startup_wait: crate::session::STARTUP_WAIT,
         }
     }
 
@@ -358,6 +363,7 @@ impl EngineBuilder {
             max_turns: config.max_turns,
             compaction_threshold: config.compaction_threshold,
             startup: None,
+            startup_wait: self.startup_wait,
             latest_compaction: None,
             pending_memory_index: None,
             memory: MemoryState::new(MemoryMode::new(config.approve_memory, self.interactive)),

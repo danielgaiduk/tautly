@@ -42,8 +42,8 @@ use tautly_core::detect::{
 };
 use tautly_core::{
     BudgetScope, CliOverrides, Command, Config, Engine, EngineBuilder, Event, LoadedConfig, Mode,
-    ModelId, ProviderSetupError, Workspaces, install_signal_handlers, install_termination_handlers,
-    provider_for_with,
+    ModelId, ProviderSetupError, Workspaces, hold_signal_router, install_signal_handlers,
+    install_termination_handlers, provider_for_with,
 };
 use tautly_rpc::{EngineFactory, OutputFormat, Server, run_oneshot};
 use tokio::io::BufReader;
@@ -571,6 +571,7 @@ async fn rpc(
     // as on a disconnect, exiting with the signal's code once they have.
     let signalled = Arc::new(AtomicI32::new(0));
     let terminated = terminated()?;
+    let _hold = hold_signal_router()?;
     let stop = {
         let signalled = Arc::clone(&signalled);
         async move { signalled.store(terminated.await, Ordering::SeqCst) }
@@ -625,6 +626,7 @@ async fn acp(cli: &Cli) -> anyhow::Result<i32> {
     });
     let signalled = Arc::new(AtomicI32::new(0));
     let terminated = terminated()?;
+    let _hold = hold_signal_router()?;
     let stop = {
         let signalled = Arc::clone(&signalled);
         async move { signalled.store(terminated.await, Ordering::SeqCst) }

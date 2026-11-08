@@ -35,7 +35,7 @@ use crate::workspace::Workspace;
 
 /// How long the first request waits for the repo map and the memory index (Task 38 note):
 /// past this the slots stay empty for the session, so the stable prefix never changes.
-const STARTUP_WAIT: Duration = Duration::from_millis(300);
+pub(crate) const STARTUP_WAIT: Duration = Duration::from_millis(300);
 /// Spill files older than this are removed at engine start.
 const SPILL_MAX_AGE: Duration = Duration::from_secs(7 * 24 * 3600);
 /// The spill store is cut back to this size at engine start.
@@ -422,6 +422,8 @@ pub(crate) struct Session {
     pub max_turns: u32,
     pub compaction_threshold: Option<f32>,
     pub startup: Option<Startup>,
+    /// See [`crate::EngineBuilder::startup_wait`].
+    pub startup_wait: Duration,
     /// The latest compaction, for `Uncompact` (Task 26); older ones live only in the log.
     pub latest_compaction: Option<CompactionRecord>,
     /// A memory index text waiting for the next cache epoch (spec 7.4/7.7). Set by the
@@ -754,7 +756,7 @@ impl Session {
         let Some(startup) = self.startup.as_mut() else {
             return;
         };
-        let Some(ready) = take_prefix(&mut startup.prefix, STARTUP_WAIT, cancel).await else {
+        let Some(ready) = take_prefix(&mut startup.prefix, self.startup_wait, cancel).await else {
             return;
         };
         match ready {

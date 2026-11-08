@@ -419,8 +419,11 @@ const REPO: &[(&str, &[u8])] = &[
 ];
 
 async fn repo(built: common::Built) -> common::Env {
-    let e = common::env(REPO, built).await;
+    let mut e = common::env(REPO, built).await;
     let root = e.sb.root().to_path_buf();
+    // The link is made with the watcher stopped: its handling of the event (a reindex of
+    // the path, then a refresh, in the background) would race the refresh below.
+    e.stop_watcher();
     std::os::unix::fs::symlink(root.join("real"), root.join("linked")).unwrap();
     // The index learns about the new link on its next refresh.
     if built != common::Built::None {
@@ -428,6 +431,7 @@ async fn repo(built: common::Built) -> common::Env {
         if built == common::Built::Full {
             e.index.build_trigrams().await.unwrap();
         }
+        e.start_watcher();
     }
     e
 }

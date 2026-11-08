@@ -180,6 +180,29 @@ pub fn install_termination_handlers(engine: &Engine) -> std::io::Result<()> {
     })
 }
 
+/// Held by a server that ends on SIGTERM and SIGHUP by itself (`tautly --rpc` and `acp`
+/// close their sessions and exit with the signal's code): see [`hold_signal_router`].
+pub struct ServerHold {
+    _commands: mpsc::Sender<Command>,
+}
+
+/// Count the server as alive to the router behind [`install_signal_handlers`] while the
+/// returned hold lives. Without it the server's own shutdown races the router: should
+/// the sessions be gone by the time the router hears the same SIGTERM, it would find no
+/// session alive and end the process at once, before the server has said the sessions
+/// closed or exited with 143. With it the first such signal is the server's to handle,
+/// and a second one still escalates. Must be called inside a Tokio runtime.
+pub fn hold_signal_router() -> std::io::Result<ServerHold> {
+    let (tx, mut rx) = mpsc::channel(1);
+    install_into(&INSTALLED, listen, |router| {
+        router.add_channel(tx.downgrade(), ProcessGroups::default());
+    })?;
+    // Commands for the server are dropped (it hears the signals itself), and taken at
+    // once so the router never counts it as stuck.
+    tokio::spawn(async move { while rx.recv().await.is_some() {} });
+    Ok(ServerHold { _commands: tx })
+}
+
 /// [`install_signal_handlers`] on `slot`: start the listener with `listen` unless it runs,
 /// then `register` the engine with the router.
 fn install_into(
@@ -400,5 +423,21 @@ mod tests {
             Command::Shutdown
         );
         assert_eq!(p.command(Signal::Hangup, Instant::now()), Command::Shutdown);
+    }
+
+    #[tokio::test]
+    async fn a_server_hold_leaves_the_first_terminate_to_the_server() {
+        // Its sessions already gone, as when the server closed them on the same signal.
+        let escalated = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&escalated);
+        let router = SignalRouter::new(move |sig| seen.lock().unwrap().push(sig));
+        let (tx, mut rx) = mpsc::channel(1);
+        router.add_channel(tx.downgrade(), ProcessGroups::default());
+        tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        router.deliver(Signal::Terminate).await;
+        assert!(escalated.lock().unwrap().is_empty());
+        router.deliver(Signal::Terminate).await;
+        assert_eq!(*escalated.lock().unwrap(), [Signal::Terminate]);
+        drop(tx);
     }
 }

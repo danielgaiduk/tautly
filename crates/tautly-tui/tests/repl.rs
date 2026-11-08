@@ -1031,7 +1031,7 @@ async fn memory_proposal_and_mcp_server_approval_use_y_n() {
     let sb: Arc<dyn Sandbox> = Arc::new(LocalSandbox::new(fx.root()).unwrap());
     let ws = Workspace::new(sb, fx.home.path());
     ws.start();
-    assert!(ws.wait_ready(WAIT).await, "index never became ready");
+    assert!(ws.wait_ready_or_failed().await, "index never became ready");
     for _ in 0..300 {
         if ws.memory().is_some() {
             break;
@@ -1118,7 +1118,7 @@ async fn ready_workspace(fx: &Fx) -> Arc<Workspace> {
     let sb: Arc<dyn Sandbox> = Arc::new(LocalSandbox::new(fx.root()).unwrap());
     let ws = Workspace::new(sb, fx.home.path());
     ws.start();
-    assert!(ws.wait_ready(WAIT).await, "index never became ready");
+    assert!(ws.wait_ready_or_failed().await, "index never became ready");
     for _ in 0..300 {
         if ws.memory().is_some() {
             return ws;
@@ -1651,8 +1651,18 @@ async fn compact_returns_to_the_prompt_after_the_summary() {
         &mock,
     )
     .await;
-    // The summary was asked for, and the next message ran after it.
-    assert_eq!(mock.requests().len(), 7, "{}", ran.out);
+    // The summary was asked for, and the next message ran after it. The session-end
+    // episode is left out: it is asked for only if the memory store opened in time.
+    let turns = mock
+        .requests()
+        .iter()
+        .filter(|r| {
+            !r.system.iter().any(
+                |b| matches!(b, tautly_provider::Block::Text(t) if t.starts_with("You keep a private notebook")),
+            )
+        })
+        .count();
+    assert_eq!(turns, 7, "{}", ran.out);
     let compacted = ran
         .out
         .find("compacted")

@@ -280,6 +280,24 @@ impl Workspace {
         .await
         .unwrap_or(false)
     }
+
+    /// Wait, with no time limit, until the index has finished its first refresh (true) or
+    /// never will: it could not be opened, or that refresh failed (false; see
+    /// [`Index::last_error`]). For callers that must not guess how long a loaded machine
+    /// takes, such as tests.
+    pub async fn wait_ready_or_failed(&self) -> bool {
+        let Some(index) = self.opened().await.index.clone() else {
+            return false;
+        };
+        // shortcut: a failed refresh is polled for (it has no signal of its own); fine at
+        // 50 ms for the callers this serves.
+        while !index.wait_ready(Duration::from_millis(50)).await {
+            if index.last_error().is_some() && !index.is_ready() {
+                return false;
+            }
+        }
+        true
+    }
 }
 
 /// The workspaces of a process's sessions (spec 3.4): one per root, opened by the first

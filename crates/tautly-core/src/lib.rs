@@ -66,8 +66,8 @@ pub use provider_setup::{
 pub use receipt::{ReceiptBuilder, Savings};
 pub use record::SessionRecord;
 pub use signals::{
-    Signal, SignalPolicy, SignalRouter, handle_signals, install_signal_handlers,
-    install_termination_handlers,
+    ServerHold, Signal, SignalPolicy, SignalRouter, handle_signals, hold_signal_router,
+    install_signal_handlers, install_termination_handlers,
 };
 pub use timetravel::{FileState, MaterializeReport, TtError};
 pub use tree::TreeNode;

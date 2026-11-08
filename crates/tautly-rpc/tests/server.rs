@@ -782,7 +782,7 @@ async fn interactive_memory_proposal_waits_for_approve_memory() {
         .to_string();
     // The memory store opens with the index, after session start.
     let ws = made.lock().unwrap().workspaces[0].upgrade().unwrap();
-    assert!(ws.wait_ready(WAIT).await);
+    assert!(ws.wait_ready_or_failed().await);
     while ws.memory().is_none() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
@@ -895,7 +895,7 @@ async fn two_sessions_share_one_index_and_route_events_by_session_id() {
     }
     let ws = made.lock().unwrap().workspaces[0].upgrade().unwrap();
     assert!(
-        ws.wait_ready(WAIT).await,
+        ws.wait_ready_or_failed().await,
         "the shared index never became ready"
     );
     let index = ws.index().unwrap();
