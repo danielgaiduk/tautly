@@ -52,7 +52,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           toolchain: nightly
-      - run: cargo install --locked cargo-fuzz
+      - run: cargo install --locked cargo-fuzz --version 0.13.2
       - run: cargo +nightly fuzz build
         working-directory: fuzz
       - name: Run each target for 60 s

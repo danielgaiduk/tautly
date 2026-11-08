@@ -51,17 +51,45 @@ fn marker_is_a_word(src: &str) -> bool {
     let keyword = |w: &str| {
         matches!(
             w,
-            "for" | "case" | "in" | "select" | "function" | "do" | "done" | "then" | "else"
-                | "elif" | "fi" | "esac" | "if" | "while" | "until" | "!" | "{" | "}"
-                | "time" | "coproc" | "declare" | "typeset" | "local" | "export"
+            "for"
+                | "case"
+                | "in"
+                | "select"
+                | "function"
+                | "do"
+                | "done"
+                | "then"
+                | "else"
+                | "elif"
+                | "fi"
+                | "esac"
+                | "if"
+                | "while"
+                | "until"
+                | "!"
+                | "{"
+                | "}"
+                | "time"
+                | "coproc"
+                | "declare"
+                | "typeset"
+                | "local"
+                | "export"
                 | "readonly"
-                // A test's operands are judged in its syntax tree (arithmetic, `-v`
-                // names, substitutions), not as argv: `[ … ]` parses as `[[`.
-                | "["
         )
     };
     let words: Vec<&str> = src.split_whitespace().collect();
     if words.iter().any(|w| keyword(w)) {
+        return false;
+    }
+    // A test's operands are judged in its syntax tree (arithmetic, `-v` names,
+    // substitutions), not as argv (`[ … ]` parses as `[[`): a marker between `[` and `]`
+    // on one line is no command word. One on the line after a `[` is (review C1).
+    let in_test = src.lines().any(|line| {
+        let t: Vec<&str> = line.split_whitespace().collect();
+        (0..t.len()).any(|k| t[k] == "@" && t[..k].contains(&"[") && t[k + 1..].contains(&"]"))
+    });
+    if in_test {
         return false;
     }
     // After a file redirect operator the marker is its target; after any other
@@ -155,8 +183,13 @@ fuzz_target!(|data: &[u8]| {
         };
         let plain = !words().any(|w| w.contains(['(', ')', '\'']) || w.contains(" > "))
             && c.redirects.iter().all(|r| !r.write || normal(&r.target));
-        if plain && !c.argv.is_empty() {
-            assert!(exact.is_some(), "no exact rule for {src:?} ({c:?})");
+        // The parse deadline may refuse a later parse of the same input (review M4).
+        let refused = || {
+            parse_commands(src)
+                .is_err_and(|e| e.0.contains("took too long") || e.0.contains("still running"))
+        };
+        if plain && !c.argv.is_empty() && exact.is_none() && !refused() {
+            panic!("no exact rule for {src:?} ({c:?})");
         }
     }
     if !pattern_ok {
