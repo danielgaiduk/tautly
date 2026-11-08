@@ -8,6 +8,12 @@ tautly eval --tasks evals/starter --model anthropic/claude-sonnet-5-5 --jobs 4 -
 tautly eval report results.json --markdown
 ```
 
+> **Task directories are trusted code.** `setup.sh` and `verify.sh` run as you, unconfined
+> (Tautly has no OS sandbox before 1.5), and every starter task sets `approve = "yolo"`,
+> so the shell commands the model chooses run unconfined too, apart from deny rules and
+> protected paths. Run `benchmarks/tokens/run.sh` and any third-party task set in a VM or
+> container, not on a machine whose files you care about.
+
 `starter/` holds 50 tasks (15 bug fixes, 10 small features, 10 refactors or renames,
 5 multi-file edits, 5 test-writing tasks and 5 configuration or build fixes) in Python,
 TypeScript, Rust and Go. Running them needs `git`, `bash`, `python3`, Node.js 22.18 or
@@ -39,17 +45,23 @@ there: write the files, then `git init` and commit them. A setup that exits non-
 fails the task with reason `setup_failed`.
 
 `verify.sh` runs at the root of the repository after the agent's turn ends. Exit 0
-passes. The starter tasks check that their test files still match the first commit,
-then run the tests. The test-writing tasks also run the new tests against broken
+passes. `EVAL_BASE` holds the commit setup made (the runner reads it before the agent
+starts, so rewriting history cannot move it). The starter tasks check that their
+protected files (tests, or the code under test) still match it, then run the tests. The test-writing tasks also run the new tests against broken
 implementations, which must fail.
 
-Both scripts run through the bash tool with a time limit of `timeout_s` (at most 600 s)
-and without provider keys in their environment.
+Both scripts run through the bash tool with a time limit of `timeout_s` (at most 600 s),
+without provider keys in their environment, and offline: `GOPROXY=off`,
+`GOTOOLCHAIN=local`, `GOFLAGS=-mod=readonly`, `CARGO_NET_OFFLINE=true`,
+`npm_config_offline=true` and `npm_config_update_notifier=false`.
 
 ## Runs
 
-Each run gets its own temporary directory, never the current work tree. The directory
-is removed afterwards, whatever happened. `tautly -p <prompt> --output json` works there
+Each run gets its own private (0700) temporary directory, never the current work tree.
+The directory is removed afterwards, whatever happened, and so are the code index, lock
+and memory episodes the run left in the data home. Its session (marked `origin: eval`,
+tag `eval`) is removed too unless `--keep-logs` is given; each result names it as
+`session_id`. The cost ledger keeps the runs' rows: they are real spending. `tautly -p <prompt> --output json` works there
 under the normal policy and sandbox. A run passes when its turn completes, it spent no
 more than `budget_usd` (the session-end episode included), and `verify.sh` exits 0.
 Otherwise `reason` says why it failed: `setup_failed`, `budget`, `timeout`, `max_turns`,
@@ -62,8 +74,12 @@ Otherwise `reason` says why it failed: `setup_failed`, `budget`, `timeout`, `max
 
 `replay/<id>.json` is a scripted provider session for the starter task `<id>`. Ten tasks
 have one, and their responses read, re-read, outline, look up symbols, edit, run the
-tests and recall. `tautly eval --replay evals/replay` replays them deterministically with
-the mock provider and compares tokens per solved task with `baseline.json`. It needs a
+tests and recall. `tautly eval --replay evals/replay` replays them with the mock provider
+and compares tokens per solved task with `baseline.json`. The scripts carry no usage, so
+the figure is the engine's own estimate of each request it sends: system prompt, tools,
+context and tool output all count. It varies by well under 1% between runs (the code
+index may or may not be ready, and temporary paths differ); every replayed task must
+pass. It needs a
 build with the `mock` feature:
 
 ```sh

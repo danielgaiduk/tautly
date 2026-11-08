@@ -44,7 +44,7 @@ use tautly_context::Context;
 use tautly_mcp::ServerSpec;
 use tautly_provider::{ModelId, Provider, Retrying};
 use tautly_sandbox::{LocalSandbox, Policy, PolicyError, Sandbox, SandboxError};
-use tautly_session::{HeaderInit, SessionWriter};
+use tautly_session::{HeaderInit, Origin, SessionWriter};
 use tautly_tools::{ProcessGroups, ReadTracker, registry};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -159,6 +159,9 @@ pub struct EngineBuilder {
     /// How long the session waits at start for the working-tree lease while a rewind or
     /// switch elsewhere holds it (spec 7.12.1); then it fails to start. Default 30 s.
     pub lease_wait: Duration,
+    /// Who started a new session (its header's `origin`); `tautly eval` runs mark theirs
+    /// `eval`, with the header tag `eval`. Default `user`.
+    pub origin: Origin,
 }
 
 impl EngineBuilder {
@@ -180,6 +183,7 @@ impl EngineBuilder {
             pre_exec: None,
             secret_store: None,
             lease_wait: LEASE_WAIT,
+            origin: Origin::User,
         }
     }
 
@@ -275,6 +279,11 @@ impl EngineBuilder {
         let init = HeaderInit {
             model: Some(config.model.as_str().to_string()),
             config_hash: Some(config.hash()),
+            origin: self.origin,
+            tags: match self.origin {
+                Origin::Eval => vec!["eval".to_string()],
+                _ => Vec::new(),
+            },
             ..HeaderInit::default()
         };
         let writer = match &self.resume {

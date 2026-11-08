@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 # Exits 0 when task py-tests-slugify is solved (run at the root of its repository).
 set -euo pipefail
+# tautly eval passes the commit setup made; run by hand, the first commit.
+base=${EVAL_BASE:-$(git rev-list --max-parents=0 HEAD | tail -n 1)}
+for f in 'slug.py'; do
+  git diff --quiet "$base" -- "$f" || { echo "$f was changed; it must stay as the task gave it"; exit 1; }
+done
 test -f test_slug.py || { echo 'test_slug.py is missing'; exit 1; }
 python3 -m unittest -q test_slug
 # The new tests must fail against broken implementation 1.

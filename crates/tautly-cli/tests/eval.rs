@@ -12,14 +12,25 @@ use serde_json::{Value, json};
 
 const MODEL: &str = "anthropic/claude-sonnet-5-5";
 
-/// Write task `id` under `dir`: its `task.toml` (after `id` and `prompt`), setup and
-/// verify scripts.
+/// Write task `id` under `dir`: its `task.toml` (after `id`, `prompt` and `approve =
+/// "yolo"`), setup and verify scripts.
 fn task(dir: &Path, id: &str, toml: &str, setup: &str, verify: &str) {
+    task_with(
+        dir,
+        id,
+        &format!("approve = \"yolo\"\n{toml}"),
+        setup,
+        verify,
+    );
+}
+
+/// [`task`] without the `approve` line.
+fn task_with(dir: &Path, id: &str, toml: &str, setup: &str, verify: &str) {
     let d = dir.join(id);
     std::fs::create_dir_all(&d).unwrap();
     std::fs::write(
         d.join("task.toml"),
-        format!("id = \"{id}\"\nprompt = \"do the task\"\napprove = \"yolo\"\n{toml}"),
+        format!("id = \"{id}\"\nprompt = \"do the task\"\n{toml}"),
     )
     .unwrap();
     std::fs::write(d.join("setup.sh"), setup).unwrap();
@@ -96,7 +107,11 @@ fn runs_task_in_temp_git_worktree_and_cleans_up() {
     let tasks = s.home.path().join("tasks");
     let marks = s.home.path().join("marks");
     std::fs::create_dir_all(&marks).unwrap();
-    let setup = format!("{GIT_SETUP}pwd -P > \"$EVAL_MARKS/$(basename \"$PWD\")\"\n");
+    // The run's directory is private (0700): setup fails otherwise.
+    let setup = format!(
+        "{GIT_SETUP}[ \"$(ls -ld . | cut -c1-10)\" = drwx------ ] || exit 9\n\
+         pwd -P > \"$EVAL_MARKS/$(basename \"$PWD\")\"\n"
+    );
     task(
         &tasks,
         "edit-one",
@@ -154,6 +169,22 @@ fn runs_task_in_temp_git_worktree_and_cleans_up() {
     assert!(!ran[0].exists(), "{} was not removed", ran[0].display());
     // Nothing was written in the current work tree.
     assert_eq!(std::fs::read_dir(s.work.path()).unwrap().count(), 0);
+    // The run named its session, then left no session, index or lock behind (I4).
+    assert!(ok["session_id"].is_string(), "{results}");
+    assert_eq!(leftovers(s.home.path()), Vec::<String>::new());
+}
+
+/// What runs left in the data home under `sessions/`, `index/`, `locks/` and `memory/`.
+fn leftovers(home: &Path) -> Vec<String> {
+    let mut out = Vec::new();
+    for dir in ["sessions", "index", "locks", "memory"] {
+        if let Ok(entries) = std::fs::read_dir(home.join(dir)) {
+            out.extend(
+                entries.map(|e| format!("{dir}/{}", e.unwrap().file_name().to_string_lossy())),
+            );
+        }
+    }
+    out
 }
 
 #[test]
@@ -230,7 +261,8 @@ fn edit_format_override_applied() {
         let tasks = s.home.path().join("tasks");
         task(&tasks, "t", "", "exit 0\n", "exit 0\n");
         let script = s.script(json!([text_turn("ok", usage(10, 1, 0))]));
-        let extra: Vec<&str> = flag.map(|f| vec!["--edit-format", f]).unwrap_or_default();
+        let mut extra: Vec<&str> = flag.map(|f| vec!["--edit-format", f]).unwrap_or_default();
+        extra.push("--keep-logs");
         let (out, results) = eval(&s, Some(&script), &tasks, &extra);
         assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
         assert_eq!(
@@ -451,4 +483,181 @@ fn report_markdown_golden() {
     let out = s.run(&["eval", "report", &fixture.to_string_lossy(), "--markdown"]);
     assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
     insta::assert_snapshot!(stdout(&out));
+}
+
+#[test]
+fn keep_logs_keeps_an_eval_session() {
+    let s = Scratch::new();
+    let tasks = s.home.path().join("tasks");
+    task(&tasks, "t", "", "git init -q\n", "exit 0\n");
+    let script = s.script(json!([text_turn("ok", usage(10, 1, 0))]));
+    let (out, r) = eval(&s, Some(&script), &tasks, &["--keep-logs"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let id = entry(&r, "t")["session_id"].as_str().unwrap().to_string();
+    // The kept log is the run's, marked as an eval session; index and lock are gone.
+    let left = leftovers(s.home.path());
+    assert!(left.iter().all(|l| l.starts_with("sessions/")), "{left:?}");
+    let log = std::fs::read_dir(s.home.path().join("sessions"))
+        .unwrap()
+        .map(|p| p.unwrap().path().join(format!("{id}.jsonl")))
+        .find(|p| p.exists())
+        .expect("the run's log");
+    let header: Value = serde_json::from_str(
+        std::fs::read_to_string(log)
+            .unwrap()
+            .lines()
+            .next()
+            .unwrap(),
+    )
+    .unwrap();
+    let header = header.to_string();
+    assert!(header.contains(r#""origin":"eval""#), "{header}");
+    assert!(header.contains(r#""eval""#), "{header}");
+}
+
+/// Whether any process's command line contains `needle`.
+fn running(needle: &str) -> bool {
+    let out = std::process::Command::new("ps")
+        .args(["-axww", "-o", "command="])
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .any(|l| l.contains(needle) && !l.contains("ps -axww"))
+}
+
+/// A task whose run sleeps in a bash call: its setup records the run's directory.
+fn sleeping_task(s: &Scratch, toml: &str, secs: u32) -> (PathBuf, PathBuf, String) {
+    let tasks = s.home.path().join("tasks");
+    let marks = s.home.path().join("marks");
+    std::fs::create_dir_all(&marks).unwrap();
+    task(
+        &tasks,
+        "slow",
+        toml,
+        &format!("git init -q\npwd -P > '{}/ran'\n", marks.display()),
+        "exit 0\n",
+    );
+    let script = s.script(json!([
+        turn(
+            vec![call(
+                "b1",
+                "bash",
+                json!({"command": format!("sleep {secs}")})
+            )],
+            "tool_use"
+        ),
+        text_turn("done", usage(10, 1, 0)),
+    ]));
+    (tasks, marks, script)
+}
+
+fn ran_dir(marks: &Path) -> PathBuf {
+    PathBuf::from(std::fs::read_to_string(marks.join("ran")).unwrap().trim())
+}
+
+#[test]
+fn timeout_stops_the_run_and_cleans_up() {
+    let s = Scratch::new();
+    // Long enough for setup under load; the run sleeps far longer.
+    let (tasks, marks, script) = sleeping_task(&s, "timeout_s = 8\n", 47);
+    let (out, r) = eval(&s, Some(&script), &tasks, &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert_eq!(entry(&r, "slow")["reason"], "timeout", "{r}");
+    assert!(!ran_dir(&marks).exists());
+    assert!(!running("sleep 47"), "the run's command survived");
+    assert_eq!(leftovers(s.home.path()), Vec::<String>::new());
+}
+
+#[test]
+fn cancel_stops_the_run_and_cleans_up() {
+    let s = Scratch::new();
+    let (tasks, marks, script) = sleeping_task(&s, "", 53);
+    let out_path = s.home.path().join("results.json");
+    let mut child = s
+        .command(&[
+            "--mock-script",
+            &script,
+            "eval",
+            "--tasks",
+            &tasks.to_string_lossy(),
+            "--model",
+            MODEL,
+            "--out",
+            &out_path.to_string_lossy(),
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let start = std::time::Instant::now();
+    while !running("sleep 53") {
+        assert!(
+            start.elapsed().as_secs() < 30,
+            "the run never started its command"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    // SAFETY: a signal to our own child.
+    unsafe { libc::kill(child.id() as i32, libc::SIGINT) };
+    let status = child.wait().unwrap();
+    assert_eq!(status.code(), Some(130));
+    let r: Value = serde_json::from_slice(&std::fs::read(&out_path).unwrap()).unwrap();
+    assert_eq!(entry(&r, "slow")["reason"], "cancelled", "{r}");
+    assert!(!ran_dir(&marks).exists());
+    assert!(!running("sleep 53"), "the run's command survived");
+}
+
+#[test]
+fn without_approve_asks_are_denied() {
+    let s = Scratch::new();
+    let tasks = s.home.path().join("tasks");
+    // Passes only when the bash call never ran.
+    task_with(&tasks, "plain", "", "git init -q\n", "[ ! -e made ]\n");
+    let script = s.script(json!([
+        turn(
+            vec![call("b1", "bash", json!({"command": "touch made"}))],
+            "tool_use"
+        ),
+        text_turn("done", usage(10, 1, 0)),
+    ]));
+    let (out, r) = eval(&s, Some(&script), &tasks, &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert_eq!(entry(&r, "plain")["passed"], true, "{r}");
+}
+
+/// A replay set of one task whose setup writes `lines` lines that the script reads, with
+/// no scripted usage: the engine counts what it sends. Its tokens per solved task.
+fn replayed_tokens(lines: usize) -> f64 {
+    let s = Scratch::new();
+    let evals = s.home.path().join("evals");
+    let setup = format!(
+        "git init -q\nfor i in $(seq {lines}); do echo \"line $i of the file\"; done > big.txt\n"
+    );
+    task(&evals.join("starter"), "big", "", &setup, "exit 0\n");
+    std::fs::create_dir_all(evals.join("replay")).unwrap();
+    let script = json!([
+        turn(
+            vec![call("r1", "read", json!({"path": "big.txt"}))],
+            "tool_use"
+        ),
+        turn(vec![json!({"text_delta": "read it"})], "end_turn"),
+    ]);
+    std::fs::write(evals.join("replay/big.json"), script.to_string()).unwrap();
+    let out_path = s.home.path().join("r.json");
+    let out = replay(
+        &s,
+        &evals,
+        &["--update-baseline", "--out", &out_path.to_string_lossy()],
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let r: Value = serde_json::from_slice(&std::fs::read(&out_path).unwrap()).unwrap();
+    r["summary"]["tokens_per_solved_task"].as_f64().unwrap()
+}
+
+#[test]
+fn replay_measures_what_the_engine_sends() {
+    let small = replayed_tokens(20);
+    let large = replayed_tokens(400);
+    assert!(large > small * 1.1, "small {small}, large {large}");
 }

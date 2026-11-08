@@ -97,8 +97,9 @@ struct MetaRepr {
     counts: Option<TestCounts>,
     #[serde(default)]
     saved: Option<Saved>,
+    /// Any value: one that is not a known stage name reads as none (fully lenient).
     #[serde(default)]
-    repair: Option<String>,
+    repair: Option<serde_json::Value>,
 }
 
 impl<'de> Deserialize<'de> for ToolMeta {
@@ -117,6 +118,8 @@ impl<'de> Deserialize<'de> for ToolMeta {
             saved: r.saved,
             repair: r
                 .repair
+                .as_ref()
+                .and_then(serde_json::Value::as_str)
                 .and_then(|n| RepairStage::ALL.into_iter().find(|s| s.name() == n)),
         })
     }

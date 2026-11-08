@@ -8,14 +8,6 @@
    }
   },
   {
-   "usage": {
-    "input": 300,
-    "output": 80,
-    "cache_read": 2800,
-    "cache_write": 0
-   }
-  },
-  {
    "done": {
     "stop": "tool_use"
    }
@@ -27,14 +19,6 @@
     "id": "c1",
     "name": "read",
     "input_json": "{\"path\": \"serialize.py\"}"
-   }
-  },
-  {
-   "usage": {
-    "input": 450,
-    "output": 120,
-    "cache_read": 3200,
-    "cache_write": 0
    }
   },
   {
@@ -52,14 +36,6 @@
    }
   },
   {
-   "usage": {
-    "input": 600,
-    "output": 160,
-    "cache_read": 3600,
-    "cache_write": 0
-   }
-  },
-  {
    "done": {
     "stop": "tool_use"
    }
@@ -71,14 +47,6 @@
     "id": "c3",
     "name": "outline",
     "input_json": "{\"path\": \"models.py\"}"
-   }
-  },
-  {
-   "usage": {
-    "input": 750,
-    "output": 80,
-    "cache_read": 4000,
-    "cache_write": 0
    }
   },
   {
@@ -96,14 +64,6 @@
    }
   },
   {
-   "usage": {
-    "input": 900,
-    "output": 120,
-    "cache_read": 4400,
-    "cache_write": 0
-   }
-  },
-  {
    "done": {
     "stop": "tool_use"
    }
@@ -115,14 +75,6 @@
     "id": "c5",
     "name": "edit",
     "input_json": "{\"path\": \"models.py\", \"old_text\": \"    name: str\", \"new_text\": \"    name: str\\n    email: str\"}"
-   }
-  },
-  {
-   "usage": {
-    "input": 1050,
-    "output": 160,
-    "cache_read": 4800,
-    "cache_write": 0
    }
   },
   {
@@ -140,14 +92,6 @@
    }
   },
   {
-   "usage": {
-    "input": 1200,
-    "output": 80,
-    "cache_read": 5200,
-    "cache_write": 0
-   }
-  },
-  {
    "done": {
     "stop": "tool_use"
    }
@@ -159,14 +103,6 @@
     "id": "c7",
     "name": "edit",
     "input_json": "{\"path\": \"validate.py\", \"old_text\": \"        raise ValueError(\\\"name is required\\\")\", \"new_text\": \"        raise ValueError(\\\"name is required\\\")\\n    if \\\"@\\\" not in user.email:\\n        raise ValueError(\\\"email is not valid\\\")\"}"
-   }
-  },
-  {
-   "usage": {
-    "input": 1350,
-    "output": 120,
-    "cache_read": 5600,
-    "cache_write": 0
    }
   },
   {
@@ -184,14 +120,6 @@
    }
   },
   {
-   "usage": {
-    "input": 1500,
-    "output": 160,
-    "cache_read": 6000,
-    "cache_write": 0
-   }
-  },
-  {
    "done": {
     "stop": "tool_use"
    }
@@ -203,14 +131,6 @@
     "id": "c9",
     "name": "bash",
     "input_json": "{\"command\": \"python3 -m unittest -q test_user\"}"
-   }
-  },
-  {
-   "usage": {
-    "input": 1650,
-    "output": 80,
-    "cache_read": 6400,
-    "cache_write": 0
    }
   },
   {
@@ -228,14 +148,6 @@
    }
   },
   {
-   "usage": {
-    "input": 1800,
-    "output": 120,
-    "cache_read": 6800,
-    "cache_write": 0
-   }
-  },
-  {
    "done": {
     "stop": "tool_use"
    }
@@ -244,14 +156,6 @@
  [
   {
    "text_delta": "Done: the change is made and the tests pass."
-  },
-  {
-   "usage": {
-    "input": 1950,
-    "output": 40,
-    "cache_read": 7200,
-    "cache_write": 0
-   }
   },
   {
    "done": {

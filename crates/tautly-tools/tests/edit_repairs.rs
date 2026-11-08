@@ -447,4 +447,7 @@ async fn meta_names_the_repair_stage() {
     let newer: tautly_tools::ToolMeta =
         serde_json::from_value(json!({"exit_code": null, "repair": "telepathic"})).unwrap();
     assert_eq!(newer.repair, None);
+    let odd: tautly_tools::ToolMeta =
+        serde_json::from_value(json!({"exit_code": 1, "repair": 7})).unwrap();
+    assert_eq!((odd.repair, odd.exit_code), (None, Some(1)));
 }

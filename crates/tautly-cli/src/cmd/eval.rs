@@ -3,13 +3,17 @@
 //! - `tautly eval --tasks <dir> --model <id> [--edit-format str_replace|patch|hashline]
 //!   [--jobs N] [--trials N] [--out results.json]` runs every task of `<dir>` (each a
 //!   directory with `task.toml`, `setup.sh` and `verify.sh`; see `evals/README.md`) `N`
-//!   times. A run gets a fresh temporary directory, never the current work tree: `setup.sh`
-//!   makes the task's repository there, `tautly -p <prompt> --output json` works on it
-//!   under the normal policy and sandbox (approvals only as the task file says, a budget of
-//!   its `budget_usd`, killed after `timeout_s`), and `verify.sh` decides (exit 0 passes).
-//!   The directory is removed afterwards, whatever happened (a failure, Ctrl-C, a panic).
-//!   The scripts run like `bisect`'s checks: through the bash tool, without the provider
-//!   keys in their environment, killed with their process groups.
+//!   times. A run gets a fresh, private (0700) temporary directory, never the current work
+//!   tree: `setup.sh` makes the task's repository there, `tautly -p <prompt> --output json
+//!   --eval-run` works on it under the normal policy and sandbox (approvals only as the
+//!   task file says, a budget of its `budget_usd`, killed after `timeout_s`; its session is
+//!   marked `origin: eval`), and `verify.sh` decides (exit 0 passes), given the commit
+//!   setup made as `EVAL_BASE` (read by the hardened git before the agent runs). The
+//!   directory is removed afterwards, whatever happened (a failure, Ctrl-C, a panic), and
+//!   so are the run's code index, lock, memory episodes and, without `--keep-logs`, its
+//!   session; the cost ledger keeps its rows. The scripts run like `bisect`'s checks:
+//!   through the bash tool, offline, without the provider keys in their environment,
+//!   killed with their process groups.
 //! - Figures come from the run's event stream: tokens and cost from its `usage` events
 //!   (each priced at its own model by the run; the session-end episode's usage arrives
 //!   after the turn finished and is counted, and also shown on its own), edit failures
@@ -29,6 +33,7 @@
 //! signal after Ctrl-C, SIGTERM or SIGHUP (the results so far are still written).
 
 use std::collections::{BTreeMap, VecDeque};
+use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -40,7 +45,11 @@ use futures::StreamExt as _;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tautly_core::bisect::{BashRunner, CancellationToken, TestRunner as _, Verdict};
-use tautly_core::{CliOverrides, Config, printable, printable_multiline, provider_key_vars};
+use tautly_core::config::CheckpointConfig;
+use tautly_core::{
+    Checkpointer, CliOverrides, Config, printable, printable_multiline, provider_key_vars,
+};
+use tautly_sandbox::LocalSandbox;
 use tokio::io::{AsyncBufReadExt as _, AsyncRead, BufReader};
 
 use super::bisect::Signals;
@@ -89,6 +98,9 @@ pub struct Args {
     /// With --replay: write the measured figure as the new baseline.
     #[arg(long, requires = "replay")]
     update_baseline: bool,
+    /// Keep each run's session log in the data home (removed by default).
+    #[arg(long)]
+    keep_logs: bool,
 }
 
 #[derive(Debug, clap::Subcommand)]
@@ -157,10 +169,13 @@ pub async fn run(args: Args, cli: &Cli) -> anyhow::Result<i32> {
         replay: replay.clone(),
         env_remove: provider_key_vars(&config),
         cancel: cancel.clone(),
+        data_home: tautly_core::data_home().context("cannot find the data directory")?,
+        keep_logs: args.keep_logs,
     };
     let caught = Arc::new(AtomicI32::new(0));
     let watcher = tokio::spawn(Signals::new()?.cancel(cancel.clone(), Arc::clone(&caught)));
-    // Trial by trial: each trial covers the whole set before the next starts.
+    // Queued trial by trial; with --jobs > 1 runs of the next trial may start before the
+    // last one finishes, which is fine: every run is isolated.
     let jobs: Vec<(&Task, u32)> = (1..=args.trials)
         .flat_map(|n| tasks.iter().map(move |t| (t, n)))
         .collect();
@@ -197,7 +212,7 @@ pub async fn run(args: Args, cli: &Cli) -> anyhow::Result<i32> {
         return Ok(128 + caught.load(Ordering::SeqCst).max(0));
     }
     match &replay {
-        Some(dir) => regression_gate(dir, &results.summary, args.update_baseline),
+        Some(dir) => regression_gate(dir, &results, args.update_baseline),
         None => Ok(0),
     }
 }
@@ -311,6 +326,9 @@ struct Runner {
     replay: Option<PathBuf>,
     env_remove: Vec<String>,
     cancel: CancellationToken,
+    /// Where runs leave their sessions, code indexes and locks.
+    data_home: PathBuf,
+    keep_logs: bool,
 }
 
 /// One run's figures, from its event stream.
@@ -319,6 +337,8 @@ struct Runner {
 struct TaskResult {
     id: String,
     trial: u32,
+    /// The run's session (its log is kept only with `--keep-logs`).
+    session_id: Option<String>,
     passed: bool,
     /// Why it did not pass: `setup_failed`, `budget`, `timeout`, `max_turns`,
     /// `cancelled`, `error` or `verify_failed`.
@@ -394,15 +414,21 @@ impl Runner {
     /// Set up, run and verify `task` in a temporary directory removed on return (or
     /// unwinding); why it did not pass, if it did not.
     async fn attempt(&self, task: &Task, r: &mut TaskResult) -> anyhow::Result<Option<String>> {
+        // Private: on a shared /tmp nobody else reads the task's files or the agent's edits.
         let tmp = tempfile::Builder::new()
             .prefix("tautly-eval-")
+            .permissions(std::fs::Permissions::from_mode(0o700))
             .tempdir()
             .context("cannot make a temporary directory")?;
         let work = tmp.path().canonicalize()?;
         let scripts = BashRunner::new(self.env_remove.clone(), self.cancel.clone());
         let script_timeout = Duration::from_secs(task.timeout_s.min(MAX_SCRIPT_S));
         let setup = scripts
-            .run(&work, &bash(&task.dir.join("setup.sh")), script_timeout)
+            .run(
+                &work,
+                &bash(&task.dir.join("setup.sh"), None),
+                script_timeout,
+            )
             .await;
         if setup != Verdict::Good {
             return Ok(Some(if self.cancel.is_cancelled() {
@@ -416,6 +442,16 @@ impl Runner {
                 "setup_failed".to_string()
             }));
         }
+        // What the run leaves in the data home goes when this does (also on an error).
+        let _artifacts = Artifacts {
+            data_home: self.data_home.clone(),
+            hash: tautly_session::paths::project_hash(&work),
+            id: tautly_session::paths::project_id(&work),
+            keep_logs: self.keep_logs,
+        };
+        // The commit setup made, for verify to compare protected files with: the agent
+        // cannot rewrite it.
+        let base = head_commit(&work).await;
         let (ended, finish, stderr) = self.run_tautly(task, &work, r).await?;
         let reason = match ended {
             Ended::Cancelled => Some("cancelled"),
@@ -442,7 +478,11 @@ impl Runner {
             return Ok(Some(why.to_string()));
         }
         let verify = scripts
-            .run(&work, &bash(&task.dir.join("verify.sh")), script_timeout)
+            .run(
+                &work,
+                &bash(&task.dir.join("verify.sh"), base.as_deref()),
+                script_timeout,
+            )
             .await;
         Ok(match verify {
             Verdict::Good => None,
@@ -468,7 +508,7 @@ impl Runner {
         if let Some(s) = script {
             cmd.arg("--mock-script").arg(s);
         }
-        cmd.args(["-p", &task.prompt, "--output", "json"])
+        cmd.args(["-p", &task.prompt, "--output", "json", "--eval-run"])
             .args(["--budget-usd", &task.budget_usd.to_string()]);
         if let Some(m) = &self.model {
             cmd.args(["--model", m]);
@@ -542,9 +582,64 @@ impl Drop for Group {
     }
 }
 
-/// `bash '<path>'`, quoted for the shell.
-fn bash(path: &Path) -> String {
-    format!("bash '{}'", path.to_string_lossy().replace('\'', r"'\''"))
+/// What task scripts get in their environment so no toolchain reaches the network.
+const OFFLINE_ENV: &str = "GOPROXY=off GOTOOLCHAIN=local GOFLAGS=-mod=readonly \
+                           CARGO_NET_OFFLINE=true npm_config_offline=true \
+                           npm_config_update_notifier=false";
+
+/// `bash '<path>'` quoted for the shell, offline, with `EVAL_BASE=<commit>` when given.
+fn bash(path: &Path, base: Option<&str>) -> String {
+    let base = base
+        .filter(|c| !c.is_empty() && c.chars().all(|ch| ch.is_ascii_hexdigit()))
+        .map(|c| format!("EVAL_BASE={c} "))
+        .unwrap_or_default();
+    let path = path.to_string_lossy().replace('\'', r"'\''");
+    format!("{OFFLINE_ENV} {base}bash '{path}'")
+}
+
+/// The commit HEAD of the repository at `work` names, by the checkpoints' hardened git.
+async fn head_commit(work: &Path) -> Option<String> {
+    let sb = Arc::new(LocalSandbox::new(work.to_path_buf()).ok()?);
+    let cp = Checkpointer::new(
+        sb,
+        work.to_path_buf(),
+        "eval".into(),
+        CheckpointConfig::default(),
+    )?;
+    cp.head_commit().await
+}
+
+/// A run's code index, lock, memory episodes and (without `--keep-logs`) session, all
+/// keyed by its temporary root; removed on drop. The cost ledger's rows stay: they are
+/// real spending.
+struct Artifacts {
+    data_home: PathBuf,
+    hash: String,
+    id: String,
+    keep_logs: bool,
+}
+
+impl Drop for Artifacts {
+    fn drop(&mut self) {
+        let plain = |s: &str| !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric());
+        if !plain(&self.hash) || !plain(&self.id) {
+            return;
+        }
+        let h = &self.data_home;
+        if let Ok(entries) = std::fs::read_dir(h.join("index")) {
+            let prefix = format!("{}.", self.hash);
+            for e in entries.flatten() {
+                if e.file_name().to_string_lossy().starts_with(&prefix) {
+                    let _ = std::fs::remove_file(e.path());
+                }
+            }
+        }
+        let _ = std::fs::remove_file(h.join("locks").join(format!("{}.lock", self.hash)));
+        let _ = std::fs::remove_dir_all(h.join("memory").join(&self.id));
+        if !self.keep_logs {
+            let _ = std::fs::remove_dir_all(h.join("sessions").join(&self.id));
+        }
+    }
 }
 
 /// Sum the JSON events of `out` into `r`; `finish` is the turn's finish reason once it
@@ -555,11 +650,14 @@ async fn events(
     finish: &mut Option<String>,
 ) {
     let Some(out) = out else { return };
-    let mut lines = BufReader::new(out).lines();
-    while let Ok(Some(line)) = lines.next_line().await {
-        if let Ok(ev) = serde_json::from_str::<Value>(&line) {
+    let mut reader = BufReader::new(out);
+    let mut line = Vec::new();
+    // Bytes, not lines of text: a line that is not UTF-8 must not stop the draining.
+    while matches!(reader.read_until(b'\n', &mut line).await, Ok(n) if n > 0) {
+        if let Ok(ev) = serde_json::from_slice::<Value>(&line) {
             see(r, finish, &ev);
         }
+        line.clear();
     }
 }
 
@@ -602,6 +700,12 @@ fn see(r: &mut TaskResult, finish: &mut Option<String>, ev: &Value) {
                     .or_default() += 1;
             }
         }
+        Some("session_changed") if r.session_id.is_none() => {
+            r.session_id = ev
+                .get("session_id")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+        }
         Some("turn_finished") => {
             let reason = ev
                 .get("reason")
@@ -616,12 +720,14 @@ fn see(r: &mut TaskResult, finish: &mut Option<String>, ev: &Value) {
 /// Keep the last lines of `err` in `tail`.
 async fn keep_tail(err: Option<impl AsyncRead + Unpin>, tail: &mut VecDeque<String>) {
     let Some(err) = err else { return };
-    let mut lines = BufReader::new(err).lines();
-    while let Ok(Some(line)) = lines.next_line().await {
+    let mut reader = BufReader::new(err);
+    let mut line = Vec::new();
+    while matches!(reader.read_until(b'\n', &mut line).await, Ok(n) if n > 0) {
         if tail.len() == STDERR_LINES {
             tail.pop_front();
         }
-        tail.push_back(line);
+        tail.push_back(String::from_utf8_lossy(&line).trim_end().to_string());
+        line.clear();
     }
 }
 
@@ -756,9 +862,9 @@ fn tokens(v: Option<f64>) -> String {
     v.map_or_else(|| "-".to_string(), |v| thousands(v.round() as u64))
 }
 
-/// The cost with its marks: `?` when it covers only the priced part, `(est.)`.
-fn cost(s: &Summary) -> String {
-    let mut c = usd(Some(s.total_cost_usd));
+/// `amount` with the marks of `s`: `?` when it covers only the priced part, `(est.)`.
+fn cost(s: &Summary, amount: f64) -> String {
+    let mut c = usd(Some(amount));
     if s.cost_partial {
         c.push('?');
     }
@@ -792,7 +898,11 @@ fn summary_text(results: &Results, tasks: usize) -> String {
         "passed: {solved} of {runs} ({})\n",
         pct(Some(s.pass_rate))
     ));
-    out.push_str(&format!("cost: {}\n", cost(s)));
+    out.push_str(&format!("cost: {}\n", cost(s, s.total_cost_usd)));
+    if s.trials > 1 {
+        let per = s.mean.total_cost_usd.unwrap_or(0.0);
+        out.push_str(&format!("  per trial: {}\n", cost(s, per)));
+    }
     out.push_str(&format!(
         "  of which session-end episodes: {}\n",
         usd(Some(s.episode_cost_usd))
@@ -838,9 +948,24 @@ struct Baseline {
     tokens_per_solved_task: f64,
 }
 
-/// Compare `summary` with `<dir>/../baseline.json` (or rewrite it); the exit code.
-fn regression_gate(dir: &Path, summary: &Summary, update: bool) -> anyhow::Result<i32> {
+/// Compare the results' tokens per solved task with `<dir>/../baseline.json` (or rewrite
+/// it); every replayed task must pass. The exit code.
+fn regression_gate(dir: &Path, results: &Results, update: bool) -> anyhow::Result<i32> {
     let path = dir.parent().unwrap_or(dir).join("baseline.json");
+    let failed: Vec<&str> = results
+        .tasks
+        .iter()
+        .filter(|t| !t.passed)
+        .map(|t| t.id.as_str())
+        .collect();
+    if !failed.is_empty() {
+        eprintln!(
+            "tautly: replayed tasks failed, so the figure is not comparable: {}",
+            printable(&failed.join(", "))
+        );
+        return Ok(1);
+    }
+    let summary = &results.summary;
     let Some(now) = summary.tokens_per_solved_task else {
         eprintln!("tautly: no replayed task was solved, so there is no figure to compare");
         return Ok(1);
@@ -912,7 +1037,7 @@ fn report(files: &[PathBuf], markdown: bool) -> anyhow::Result<i32> {
         "Pass rate",
         "Tokens per solved task",
         "Cache hit ratio",
-        "Cost",
+        "Cost per trial",
     ];
     let rows: Vec<[String; 5]> = all.iter().map(row).collect();
     print!(
@@ -941,12 +1066,14 @@ fn row(r: &Results) -> [String; 5] {
         pass,
         tokens(s.tokens_per_solved_task),
         pct(s.cache_hit_ratio),
-        cost(s),
+        // Per trial, so results with different trial counts compare.
+        cost(s, s.mean.total_cost_usd.unwrap_or(s.total_cost_usd)),
     ]
 }
 
 fn markdown_table(header: &[&str; 5], rows: &[[String; 5]]) -> String {
-    let cell = |c: &str| c.replace('|', "\\|");
+    // `\` first, so a trailing backslash cannot escape the cell's closing `|`.
+    let cell = |c: &str| c.replace('\\', "\\\\").replace('|', "\\|");
     let mut out = format!("| {} |\n|---|---:|---:|---:|---:|\n", header.join(" | "));
     for r in rows {
         let cells: Vec<String> = r.iter().map(|c| cell(c)).collect();
@@ -1021,6 +1148,25 @@ mod tests {
 
     #[test]
     fn scripts_are_quoted_for_the_shell() {
-        assert_eq!(bash(Path::new("/a b/it's.sh")), r"bash '/a b/it'\''s.sh'");
+        let cmd = bash(Path::new("/a b/it's.sh"), None);
+        assert!(cmd.ends_with(r" bash '/a b/it'\''s.sh'"), "{cmd}");
+        assert!(cmd.starts_with("GOPROXY=off "), "{cmd}");
+        let cmd = bash(Path::new("/v.sh"), Some("abc123"));
+        assert!(cmd.ends_with(" EVAL_BASE=abc123 bash '/v.sh'"), "{cmd}");
+        // Only a commit id is passed on.
+        assert!(!bash(Path::new("/v.sh"), Some("x; rm")).contains("EVAL_BASE"));
+    }
+
+    #[test]
+    fn markdown_cells_escape_backslash_then_bar() {
+        let row = [
+            "a\\".to_string(),
+            "b|c".into(),
+            "".into(),
+            "".into(),
+            "".into(),
+        ];
+        let t = markdown_table(&["1", "2", "3", "4", "5"], &[row]);
+        assert!(t.contains(r"| a\\ | b\|c |"), "{t}");
     }
 }

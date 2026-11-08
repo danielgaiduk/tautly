@@ -42,7 +42,7 @@ use tautly_core::detect::{
 };
 use tautly_core::{
     BudgetScope, CliOverrides, Command, Config, EditFormat, Engine, EngineBuilder, Event,
-    LoadedConfig, Mode, ModelId, ProviderSetupError, Workspaces, install_signal_handlers,
+    LoadedConfig, Mode, ModelId, Origin, ProviderSetupError, Workspaces, install_signal_handlers,
     install_termination_handlers, provider_for_with,
 };
 use tautly_rpc::{EngineFactory, OutputFormat, Server, run_oneshot};
@@ -123,6 +123,10 @@ struct Cli {
     /// (`tautly eval --edit-format` passes it to each run).
     #[arg(long, value_name = "FORMAT", value_parser = parse_edit_format, hide = true)]
     edit_format: Option<EditFormat>,
+
+    /// Mark the session as a `tautly eval` run (header origin and tag `eval`).
+    #[arg(long, hide = true)]
+    eval_run: bool,
 
     /// Take no git checkpoints before commands (undo then reverts only the agent's edits).
     #[arg(long)]
@@ -266,6 +270,8 @@ struct Settings {
     overrides: CliOverrides,
     /// `--edit-format`: applied to the session's model in its catalog.
     edit_format: Option<EditFormat>,
+    /// `--eval-run`: new sessions get the origin `eval`.
+    eval_run: bool,
     data_home: PathBuf,
     approve_mcp: bool,
     secrets: local::Secrets,
@@ -294,6 +300,7 @@ impl Settings {
         Ok(Settings {
             overrides: cli.overrides(),
             edit_format: cli.edit_format,
+            eval_run: cli.eval_run,
             data_home: tautly_core::data_home().context("cannot find the data directory")?,
             approve_mcp: cli.approve_mcp,
             secrets: local::secrets(),
@@ -410,6 +417,11 @@ impl Settings {
             client_mcp,
             approve_mcp: self.approve_mcp,
             data_home: Some(self.data_home.clone()),
+            origin: if self.eval_run {
+                Origin::Eval
+            } else {
+                Origin::User
+            },
             #[cfg(feature = "mock")]
             provider: self.provider.clone(),
             ..EngineBuilder::from_loaded(loaded, root)
