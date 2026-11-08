@@ -766,3 +766,110 @@ fn open_rejects_a_newer_schema_version() {
         Err(Error::UnsupportedSchema { .. })
     ));
 }
+
+// ---- quality Q1: integrity checks, the closed sink, logs of another project ----
+
+/// A finished log of three records, as its lines (header first).
+fn three_record_lines(env: &Env) -> (PathBuf, Vec<String>) {
+    let mut w = env.writer();
+    for t in ["a", "b", "c"] {
+        w.append(&msg(t)).unwrap();
+    }
+    w.checkpoint().unwrap();
+    let path = w.path().to_path_buf();
+    drop(w);
+    let text = fs::read_to_string(&path).unwrap();
+    (path, text.lines().map(|l| format!("{l}\n")).collect())
+}
+
+fn first_error(path: &Path) -> Error {
+    let r = SessionReader::<Rec>::open(path).unwrap();
+    r.records()
+        .find_map(Result::err)
+        .expect("the log reads as corrupt")
+}
+
+#[test]
+fn a_missing_middle_record_is_corruption_naming_the_offsets() {
+    let env = Env::new();
+    let (path, lines) = three_record_lines(&env);
+    let without_b: String = [&lines[0], &lines[1], &lines[3]]
+        .into_iter()
+        .cloned()
+        .collect();
+    fs::write(&path, without_b).unwrap();
+    match first_error(&path) {
+        Error::Corrupt { line, reason, .. } => {
+            assert_eq!(line, 3);
+            assert_eq!(reason, "expected offset 1, found 2");
+        }
+        e => panic!("{e:?}"),
+    }
+}
+
+#[test]
+fn a_second_header_is_corruption() {
+    let env = Env::new();
+    let (path, lines) = three_record_lines(&env);
+    let doubled: String = [&lines[0], &lines[1], &lines[0], &lines[2]]
+        .into_iter()
+        .cloned()
+        .collect();
+    fs::write(&path, doubled).unwrap();
+    match first_error(&path) {
+        Error::Corrupt { line, reason, .. } => {
+            assert_eq!(line, 3);
+            assert_eq!(reason, "unexpected second header");
+        }
+        e => panic!("{e:?}"),
+    }
+}
+
+#[test]
+fn a_log_that_starts_with_a_record_has_a_bad_header() {
+    let env = Env::new();
+    let (path, lines) = three_record_lines(&env);
+    fs::write(&path, lines[1..].concat()).unwrap();
+    match SessionReader::<Rec>::open(&path) {
+        Err(Error::BadHeader { reason, .. }) => assert_eq!(reason, "first line is not a header"),
+        Err(e) => panic!("{e:?}"),
+        Ok(_) => panic!("opened a log without a header"),
+    }
+}
+
+#[test]
+fn appends_after_close_fail_and_leave_the_log_as_it_was() {
+    let env = Env::new();
+    let mut w = env.writer();
+    w.append(&msg("a")).unwrap();
+    w.close().unwrap();
+    let before = fs::read(w.path()).unwrap();
+    assert!(w.append(&msg("b")).is_err());
+    assert_eq!(fs::read(w.path()).unwrap(), before);
+    let (recs, _) = read_all(w.path());
+    assert_eq!(recs, [(0, msg("a"))]);
+}
+
+#[test]
+fn a_fork_log_is_never_created_beside_another_projects_log() {
+    let env = Env::new();
+    let w = env.writer();
+    let beside = w.path().to_path_buf();
+    let other = tempfile::tempdir().unwrap();
+    let entries = fs::read_dir(env.project_dir()).unwrap().count();
+    match SessionWriter::<Rec>::create_beside(&beside, other.path(), None, HeaderInit::default()) {
+        Err(Error::OtherProject { log, .. }) => assert_eq!(log, beside),
+        Err(e) => panic!("{e:?}"),
+        Ok(_) => panic!("created a log in another project's directory"),
+    }
+    assert_eq!(fs::read_dir(env.project_dir()).unwrap().count(), entries);
+    // The same project is fine.
+    let fork = SessionWriter::<Rec>::create_beside(
+        &beside,
+        env.project.path(),
+        None,
+        HeaderInit::default(),
+    )
+    .unwrap();
+    assert_eq!(fork.path().parent(), beside.parent());
+}
