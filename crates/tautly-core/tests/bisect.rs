@@ -1069,3 +1069,47 @@ async fn prepass_reads_a_command_kept_in_a_blob() {
     // Passes before step 2 (boundary 1), fails before step 4 (boundary 3).
     assert_eq!(bisect::prepass(&reader(&log), &long), Some((1, 3)));
 }
+
+/// quality Q1: a dead bisect's worktree path that became a symbolic link is removed as a
+/// link: what it points at is never deleted.
+#[tokio::test]
+async fn sweep_removes_a_link_in_place_of_a_dead_bisect_worktree_not_its_target() {
+    let repo = Repo::new();
+    let log = repo.session(edit_breaks_at_3()).await;
+    let plan = bisect::plan(&reader(&log), "./check.sh", None, None).unwrap();
+    let base = repo
+        .home()
+        .join("worktrees")
+        .join(reader(&log).header().project.clone());
+    let dead = crashed_bisect(&repo, &base, "01JBXZ3QK8R9T0V5W6X7Y8Z9AG");
+    let precious = tempfile::tempdir().unwrap();
+    std::fs::write(precious.path().join("sentinel"), "keep").unwrap();
+    std::fs::remove_dir_all(&dead).unwrap();
+    std::os::unix::fs::symlink(precious.path(), &dead).unwrap();
+
+    let out = bisect::run(&plan, &repo.sandbox(), &Probe::default(), TIMEOUT).await;
+    assert!(out.is_ok(), "{out:?}");
+    assert_eq!(
+        std::fs::read_to_string(precious.path().join("sentinel")).unwrap(),
+        "keep"
+    );
+    assert!(
+        std::fs::symlink_metadata(&dead).is_err(),
+        "the link is gone"
+    );
+    repo.assert_no_leftovers();
+}
+
+#[tokio::test]
+async fn a_range_whose_good_step_is_not_before_its_bad_one_is_refused() {
+    let repo = Repo::new();
+    let log = repo.session(edit_breaks_at_3()).await;
+    for (good, bad) in [(3, 3), (4, 2)] {
+        match bisect::plan(&reader(&log), "./check.sh", Some(good), Some(bad)) {
+            Err(bisect::BisectError::BadRange { good: g, bad: b }) => {
+                assert_eq!((g, b), (good, bad));
+            }
+            other => panic!("{good}..{bad}: {other:?}"),
+        }
+    }
+}

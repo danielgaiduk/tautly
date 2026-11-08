@@ -2459,3 +2459,241 @@ async fn a_switch_closes_the_targets_cut_turn_before_it_writes_there() {
     // The downtime (1.5 s and the other session) would add at least 1,500 ms.
     assert!(s.wall_ms <= lived, "{} > {lived}", s.wall_ms);
 }
+
+// ------------------------------------------- quality Q1: failed restores, links, dirs
+
+/// A sandbox whose next write to `c.txt` fails once armed (once: the rollback's own write
+/// of it then goes through).
+struct FailC {
+    sb: LocalSandbox,
+    armed: Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[async_trait::async_trait]
+impl Sandbox for FailC {
+    fn root(&self) -> &Path {
+        self.sb.root()
+    }
+    fn resolve(&self, p: &Path) -> Result<PathBuf, tautly_sandbox::SandboxError> {
+        self.sb.resolve(p)
+    }
+    async fn read(&self, p: &Path) -> Result<Vec<u8>, tautly_sandbox::SandboxError> {
+        self.sb.read(p).await
+    }
+    async fn metadata(
+        &self,
+        p: &Path,
+    ) -> Result<tautly_sandbox::FileMeta, tautly_sandbox::SandboxError> {
+        self.sb.metadata(p).await
+    }
+    async fn write_atomic(
+        &self,
+        p: &Path,
+        bytes: &[u8],
+        mode: Option<u32>,
+    ) -> Result<(), tautly_sandbox::SandboxError> {
+        if p.file_name().is_some_and(|n| n == "c.txt")
+            && self.armed.swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(tautly_sandbox::SandboxError::Denied("disk full".into()));
+        }
+        self.sb.write_atomic(p, bytes, mode).await
+    }
+    async fn remove_file(&self, p: &Path) -> Result<(), tautly_sandbox::SandboxError> {
+        self.sb.remove_file(p).await
+    }
+    async fn spill(&self, bytes: &[u8]) -> Result<PathBuf, tautly_sandbox::SandboxError> {
+        self.sb.spill(bytes).await
+    }
+    async fn spill_stream(
+        &self,
+    ) -> Result<Option<(PathBuf, tautly_sandbox::SpillWriter)>, tautly_sandbox::SandboxError> {
+        self.sb.spill_stream().await
+    }
+    async fn spawn(
+        &self,
+        spec: tautly_sandbox::SpawnSpec,
+    ) -> Result<tautly_sandbox::Child, tautly_sandbox::SandboxError> {
+        self.sb.spawn(spec).await
+    }
+    fn walker(&self, base: &Path) -> Result<ignore::WalkBuilder, tautly_sandbox::SandboxError> {
+        self.sb.walker(base)
+    }
+    async fn http_get(
+        &self,
+        url: &tautly_sandbox::Url,
+    ) -> Result<tautly_sandbox::HttpResponse, tautly_sandbox::SandboxError> {
+        self.sb.http_get(url).await
+    }
+}
+
+/// The outcomes of the `RestoreEnded` records of `log`, each after its `RestoreBegun`.
+fn restore_outcomes(log: &Path) -> Vec<tautly_core::record::RestoreOutcome> {
+    let mut out = Vec::new();
+    let mut open = false;
+    for rec in records(log) {
+        match rec {
+            SessionRecord::RestoreBegun { .. } => {
+                assert!(!open, "a RestoreBegun before the last one ended");
+                open = true;
+            }
+            SessionRecord::RestoreEnded { outcome } => {
+                assert!(open, "a RestoreEnded without its RestoreBegun");
+                open = false;
+                out.push(outcome);
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+#[tokio::test]
+async fn a_restore_that_fails_midway_puts_back_what_it_can_and_logs_how_it_ended() {
+    use tautly_core::record::RestoreOutcome;
+    let repo = Repo::plain();
+    let mock = MockProvider::new(vec![
+        tools_step(vec![
+            write("w1", "a.txt", "one\n"),
+            write("w2", "b.txt", "one\n"),
+            write("w3", "c.txt", "one\n"),
+        ]),
+        text_step("first"),
+        tools_step(vec![
+            write("w4", "a.txt", "two\n"),
+            write("w5", "b.txt", "two\n"),
+            write("w6", "c.txt", "two\n"),
+        ]),
+        text_step("second"),
+    ]);
+    let armed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let sb: Arc<dyn Sandbox> = Arc::new(FailC {
+        sb: LocalSandbox::new(repo.root()).unwrap(),
+        armed: Arc::clone(&armed),
+    });
+    let mut run = Run::start(EngineBuilder {
+        sandbox: Some(sb),
+        ..repo.builder(&mock)
+    });
+    run.turn_with("one").await;
+    run.turn_with("two").await;
+    let log = run.current().1;
+
+    // The third write fails: the two before it are put back.
+    armed.store(true, std::sync::atomic::Ordering::SeqCst);
+    let err = run.rewind(3, false, &[]).await.error();
+    assert!(err.contains("disk full"), "{err}");
+    assert!(err.contains("were put back as they were"), "{err}");
+    for f in ["a.txt", "b.txt", "c.txt"] {
+        assert_eq!(repo.read(f).as_deref(), Some("two\n"), "{f}");
+    }
+    assert_eq!(restore_outcomes(&log), [RestoreOutcome::RolledBack]);
+
+    // Again, with a link and a file over the read limit among the originals: those two are
+    // not kept, so they cannot be put back, and the error names them; the file that was
+    // kept still goes back byte for byte.
+    let b = repo.root().join("b.txt");
+    std::fs::remove_file(&b).unwrap();
+    std::os::unix::fs::symlink("a.txt", &b).unwrap();
+    let big = vec![b'x'; 64 * 1024 * 1024 + 1];
+    std::fs::write(repo.root().join("c.txt"), &big).unwrap();
+    armed.store(true, std::sync::atomic::Ordering::SeqCst);
+    let err = run.rewind(3, false, &["b.txt", "c.txt"]).await.error();
+    assert!(err.contains("could NOT all be put back"), "{err}");
+    assert!(
+        err.contains("not kept, so not put back: b.txt, c.txt"),
+        "{err}"
+    );
+    assert_eq!(repo.read("a.txt").as_deref(), Some("two\n"));
+    assert_eq!(
+        std::fs::read(repo.root().join("c.txt")).unwrap().len(),
+        big.len()
+    );
+    assert_eq!(
+        restore_outcomes(&log),
+        [RestoreOutcome::RolledBack, RestoreOutcome::Failed]
+    );
+    // Still on the session it started from.
+    assert_eq!(run.current().1, log);
+    run.stop().await;
+}
+
+#[tokio::test]
+async fn a_restore_never_writes_through_a_link_or_over_a_directory() {
+    let repo = Repo::plain();
+    let outside = tempfile::tempdir().unwrap();
+    std::fs::write(outside.path().join("x.txt"), "outside\n").unwrap();
+    let mock = MockProvider::new(vec![
+        tools_step(vec![
+            write("w1", "sub/x.txt", "one\n"),
+            write("w2", "d.txt", "one\n"),
+        ]),
+        text_step("first"),
+        tools_step(vec![
+            write("w3", "sub/x.txt", "two\n"),
+            write("w4", "d.txt", "two\n"),
+        ]),
+        text_step("second"),
+    ]);
+    let mut run = run_two_turns(&repo, &mock).await;
+    let log = run.current().1;
+    // A repository can plant `sub -> /elsewhere`; a directory can take a file's place.
+    std::fs::remove_dir_all(repo.root().join("sub")).unwrap();
+    std::os::unix::fs::symlink(outside.path(), repo.root().join("sub")).unwrap();
+    std::fs::remove_file(repo.root().join("d.txt")).unwrap();
+    std::fs::create_dir(repo.root().join("d.txt")).unwrap();
+
+    let (_branch, report) = run.rewind(3, false, &["sub/x.txt", "d.txt"]).await.done();
+    assert!(!report.applied, "{report:?}");
+    assert_eq!(report.blocked, ["d.txt", "sub/x.txt"]);
+    let note = report.note.unwrap_or_default();
+    assert!(
+        note.contains("blocked, a directory is in the way: d.txt"),
+        "{note}"
+    );
+    assert!(
+        note.contains("blocked, a symbolic link or a file is above it"),
+        "{note}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(outside.path().join("x.txt")).unwrap(),
+        "outside\n"
+    );
+    assert!(repo.root().join("d.txt").is_dir());
+    // Nothing was written, so no branch was made and no restore was logged.
+    assert_eq!(run.current().1, log);
+    assert!(restore_outcomes(&log).is_empty());
+    run.stop().await;
+}
+
+#[test]
+fn a_tool_edit_whose_result_was_not_captured_is_named_in_the_tip() {
+    let repo = Repo::plain();
+    let mut w = tautly_session::SessionWriter::<SessionRecord>::create_in(
+        repo.home(),
+        &repo.root(),
+        tautly_session::HeaderInit::default(),
+    )
+    .unwrap();
+    let path = |p: &str| tautly_session::RelPath::from_abs(&repo.root(), &repo.root().join(p));
+    let kept = w.blob(b"kept\n").unwrap();
+    // big.bin existed before (a pre-image) and has no post-image: not captured.
+    for (p, post) in [("a.txt", Some(kept.clone())), ("big.bin", None)] {
+        w.append(&SessionRecord::Edit {
+            path: path(p).unwrap(),
+            pre_image: Some(kept.clone()),
+            post_image_blob: post,
+            step: 2,
+            asserted: false,
+        })
+        .unwrap();
+    }
+    w.checkpoint().unwrap();
+    let tip = expected_tip(&reader(w.path())).unwrap();
+    assert_eq!(
+        tip.partial.as_deref(),
+        Some("the content a tool left in big.bin was not captured")
+    );
+    let paths: Vec<&str> = tip.overlay.iter().map(|(p, _)| p.as_str()).collect();
+    assert_eq!(paths, ["a.txt"]);
+}

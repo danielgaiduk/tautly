@@ -2306,3 +2306,55 @@ async fn linked_worktree_still_takes_checkpoints() {
     cp.snapshot_now().await.unwrap();
     assert_eq!(main.refs("refs/tautly/"), ["refs/tautly/checkpoints/w/1"]);
 }
+
+/// quality Q1: a refusal names the later turns that changed the file (by commands, seen
+/// between their checkpoints), so the user knows what to undo first; a human edit is told
+/// apart.
+#[tokio::test]
+async fn undo_of_an_early_turn_names_the_later_turns_that_changed_its_files() {
+    let repo = build_repo();
+    let step = |id: &str, text: &str| {
+        tools_step(vec![bash(id, &format!("printf '{text}\\n' > tracked.txt"))])
+    };
+    let mock = MockProvider::new(vec![
+        step("b1", "one"),
+        text_step("1"),
+        step("b2", "two"),
+        text_step("2"),
+        tools_step(vec![bash("b3", "printf 'x\\n' > other.txt")]),
+        text_step("3"),
+        step("b4", "four"),
+        text_step("4"),
+    ]);
+    let mut run = start(repo.builder(config(), &mock));
+    for t in ["1", "2", "3", "4"] {
+        run.turn_with(t).await;
+    }
+    let answer = run.undo(Some(1), false).await;
+    let Event::Error { message, hint, .. } = &answer else {
+        panic!("{answer:?}")
+    };
+    assert!(message.contains("changed by later turns"), "{message}");
+    assert!(message.contains("tracked.txt"), "{message}");
+    // Turn 3 changed another file only.
+    assert_eq!(
+        hint.as_deref(),
+        Some("undo the later turns first, newest first (2, 4)")
+    );
+    assert_eq!(repo.read("tracked.txt").as_deref(), Some("four\n"));
+    // A file only a human changed after the turn: not a later turn's doing.
+    repo.write("other.txt", "human\n");
+    let answer = run.undo(Some(3), false).await;
+    run.stop().await;
+    let Event::Error { message, hint, .. } = &answer else {
+        panic!("{answer:?}")
+    };
+    assert!(message.contains("changed since the turn"), "{message}");
+    assert!(
+        hint.as_deref()
+            .unwrap_or("")
+            .contains("edited after the turn"),
+        "{hint:?}"
+    );
+    assert_eq!(repo.read("other.txt").as_deref(), Some("human\n"));
+}
