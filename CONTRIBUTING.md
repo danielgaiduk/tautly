@@ -39,16 +39,8 @@ cargo test --workspace --features tautly/mock
 cargo clippy --workspace --all-targets -- -D warnings
 cargo clippy -p tautly --all-targets --features mock -- -D warnings
 cargo deny check                     # advisories, licences, bans, sources (deny.toml)
+RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
 ```
-
-Also run locally (not yet in CI) when you touch doc comments:
-
-```sh
-RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --exclude tautly-core
-```
-
-The full-workspace build still fails on known broken intra-doc links in `tautly-core`;
-drop `--exclude tautly-core` once those are fixed.
 
 Without `--features tautly/mock` the binary's end-to-end tests (`mock_cli`, `first_run`,
 `auth`, `doctor`, `repl_pty`, `fork`, `bisect`, `eval`) are skipped.

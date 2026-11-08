@@ -24,6 +24,9 @@ jobs:
       - run: cargo test --workspace --features tautly/mock
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo clippy -p tautly --all-targets --features mock -- -D warnings
+      - run: cargo doc --workspace --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
 
   # Advisories, licences, duplicate/wildcard bans and sources (deny.toml). The tool version is
   # pinned; the advisory database is fetched fresh on every run.
