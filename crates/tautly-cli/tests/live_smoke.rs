@@ -284,16 +284,22 @@ impl Run {
 /// developer's home, keychain and other keys.
 fn run_tautly(p: &Provider, work: &Path, prompt: &str, extra: &[&str]) -> Run {
     let home = tempfile::tempdir().unwrap();
-    let store = home.path().join("secrets.json");
+    run_tautly_in(p, work, home.path(), prompt, extra)
+}
+
+/// [`run_tautly`] with the scratch home (`HOME` and `TAUTLY_HOME`) given, so a later run
+/// can continue the session (`--continue`) and read the user configuration there.
+fn run_tautly_in(p: &Provider, work: &Path, home: &Path, prompt: &str, extra: &[&str]) -> Run {
+    let store = home.join("secrets.json");
     std::fs::write(&store, "{}").unwrap();
-    let out_path = home.path().join("events.jsonl");
-    let err_path = home.path().join("stderr.txt");
+    let out_path = home.join("events.jsonl");
+    let err_path = home.join("stderr.txt");
     let model = p.model();
 
-    let mut cmd = isolated(env!("CARGO_BIN_EXE_tautly"), work, home.path());
+    let mut cmd = isolated(env!("CARGO_BIN_EXE_tautly"), work, home);
     cmd.args(["-p", prompt, "--output", "json", "--model", &model])
         .args(extra)
-        .env("TAUTLY_HOME", home.path())
+        .env("TAUTLY_HOME", home)
         .env("TAUTLY_TEST_SECRET_STORE", &store)
         // Files, not pipes: the poll loop never reads, so a pipe could fill and block.
         .stdout(File::create(&out_path).unwrap())
@@ -414,6 +420,110 @@ fn cache_continuity(p: &Provider) {
     }
 }
 
+/// The record types of the session log under `home` (one session), in order.
+fn log_record_types(home: &Path) -> Vec<String> {
+    let mut logs = Vec::new();
+    for project in std::fs::read_dir(home.join("sessions")).unwrap() {
+        for e in std::fs::read_dir(project.unwrap().path()).unwrap() {
+            let path = e.unwrap().path();
+            if path.extension().is_some_and(|x| x == "jsonl") {
+                logs.push(path);
+            }
+        }
+    }
+    assert_eq!(logs.len(), 1, "{logs:?}");
+    std::fs::read_to_string(&logs[0])
+        .unwrap()
+        .lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .filter_map(|v| v["data"]["type"].as_str().map(str::to_string))
+        .collect()
+}
+
+/// History edits mid-session (Anthropic): the provider must accept the next request after
+/// a GC stub replaced a superseded tool result, a compaction summarized the oldest turns
+/// and a session pin was folded into `<pinned>` (each at a cold cache epoch). The user
+/// configuration makes the epochs happen: a 1 s cache lifetime (engine-side only, never
+/// sent) and a compaction threshold any context passes.
+fn history_edits(p: &Provider) {
+    if p.skipped("history_edits") {
+        return;
+    }
+    let dir = repo(&[("notes.txt", "The build uses make.\n")]);
+    let home = tempfile::tempdir().unwrap();
+    let config = home.path().join(".config/tautly");
+    std::fs::create_dir_all(&config).unwrap();
+    let model = p.model();
+    std::fs::write(
+        config.join("config.toml"),
+        format!(
+            "compaction_threshold = 0.01\n\
+             [catalog_overrides.models.\"{model}\"]\n\
+             context_window = 1000000\nmax_output = 128000\nparallel_tools = true\n\
+             reasoning = \"effort_always\"\ncache = \"explicit\"\nimages = true\n\
+             edit_format = \"str_replace\"\ncache_ttl_s = 1\n\
+             [catalog_overrides.models.\"{model}\".price]\n\
+             input = 2.0\noutput = 10.0\ncache_read = 0.2\ncache_write = 2.5\n"
+        ),
+    )
+    .unwrap();
+    let budget = ["--budget-usd", BUDGET_USD];
+    let first = run_tautly_in(
+        p,
+        dir.path(),
+        home.path(),
+        "Read notes.txt with the read tool. Then call the pin tool once with the text \
+         'The codeword is LAVENDER-7.' Then read notes.txt again with the read tool. Make \
+         one tool call per step. Then reply with only the word DONE.",
+        &budget,
+    );
+    assert_eq!(first.code, Some(0), "{}", first.report());
+    assert!(
+        first.completed(),
+        "turn 1 did not complete: {}",
+        first.report()
+    );
+    first.check_budget(p);
+    // Past the cache lifetime: the next turn starts a cold epoch.
+    std::thread::sleep(Duration::from_secs(2));
+    let continued = [&budget[..], &["--continue"]].concat();
+    let second = run_tautly_in(
+        p,
+        dir.path(),
+        home.path(),
+        "What is the codeword? Reply with only the codeword.",
+        &continued,
+    );
+    assert_eq!(second.code, Some(0), "{}", second.report());
+    assert!(
+        second.completed(),
+        "turn 2 did not complete: {}",
+        second.report()
+    );
+    second.check_budget(p);
+    assert!(
+        second.text().contains("LAVENDER-7"),
+        "the pinned codeword was lost: {:?}: {}",
+        second.text(),
+        second.report()
+    );
+    // Each edit happened (at a step of turn 1 that started past the lifetime, or at the
+    // start of turn 2 at the latest) and a request went out after it; both turns completed,
+    // so the provider accepted it.
+    let types = log_record_types(home.path());
+    for edit in ["gc_applied", "compaction", "pins_folded"] {
+        let at = types
+            .iter()
+            .position(|t| t == edit)
+            .unwrap_or_else(|| panic!("no {edit} in the session: {types:?}"));
+        assert!(
+            types[at..].iter().any(|t| t == "request"),
+            "no request after {edit}: {types:?}"
+        );
+    }
+    println!("PASSED history_edits [{}] with {model}", p.name);
+}
+
 /// Not live: the isolation the live tests rely on. `cargo test` sets `CARGO` for this
 /// process, so a child that still sees it inherited the environment.
 #[test]
@@ -473,4 +583,10 @@ fn openai_cache_continuity() {
 #[ignore = "live: needs GEMINI_API_KEY"]
 fn google_cache_continuity() {
     cache_continuity(&GOOGLE);
+}
+
+#[test]
+#[ignore = "live: needs ANTHROPIC_API_KEY"]
+fn anthropic_history_edits() {
+    history_edits(&ANTHROPIC);
 }
