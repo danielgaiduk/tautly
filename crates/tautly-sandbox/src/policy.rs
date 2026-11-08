@@ -15,6 +15,7 @@ use crate::runners::{WRAPPERS, base};
 use crate::shell::{SimpleCommand, is_dangerous_env, parse_commands};
 use crate::shell_state::unwrap_prefixes;
 
+/// The permission mode: what runs without asking.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Mode {
@@ -27,27 +28,47 @@ pub enum Mode {
     Yolo,
 }
 
+/// What the policy says about one tool call.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Decision {
+    /// Run it.
     Allow,
-    Ask { reason: String },
-    Deny { rule: String },
+    /// Ask the user first, saying why.
+    Ask {
+        /// Why approval is needed.
+        reason: String,
+    },
+    /// Refuse it, naming the deny rule.
+    Deny {
+        /// The deny rule that matched.
+        rule: String,
+    },
 }
 
 /// Rules use the syntax `tool(glob)`; a bare `tool` matches any invocation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PolicyConfig {
+    /// The mode.
     pub mode: Mode,
+    /// Allow rules.
     #[serde(default)]
     pub allow: Vec<String>,
+    /// Deny rules.
     #[serde(default)]
     pub deny: Vec<String>,
 }
 
+/// Why a policy cannot be built from its configuration.
 #[derive(Debug, thiserror::Error)]
 pub enum PolicyError {
+    /// A rule that cannot be parsed.
     #[error("malformed rule {rule:?}: {why}")]
-    MalformedRule { rule: String, why: String },
+    MalformedRule {
+        /// The rule as written.
+        rule: String,
+        /// What is wrong with it.
+        why: String,
+    },
 }
 
 /// Tools whose effect is always `ReadOnly` and carries no paths, so a glob could never match.
@@ -275,6 +296,7 @@ impl PathSubject {
     }
 }
 
+/// The permission policy of one workspace: mode, rules and session rules.
 #[derive(Debug)]
 pub struct Policy {
     mode: Mode,
@@ -286,6 +308,7 @@ pub struct Policy {
 }
 
 impl Policy {
+    /// Parse the rules of `cfg` for a workspace at `root`.
     pub fn new(cfg: PolicyConfig, root: PathBuf) -> Result<Policy, PolicyError> {
         let parse = |v: &[String]| {
             v.iter()
@@ -301,6 +324,7 @@ impl Policy {
         })
     }
 
+    /// The workspace root.
     pub fn root(&self) -> &Path {
         &self.root
     }
@@ -342,7 +366,7 @@ impl Policy {
     /// parentheses (which a rule cannot hold). The rule returned always
     /// [matches](Self::rule_matches) the call.
     ///
-    /// Every write operator is written ` > ` in the rule ([`allow_subject`]):
+    /// Every write operator is written ` > ` in the rule (`allow_subject`):
     /// `cargo test 2> out.txt` offers `bash(cargo test > out.txt)`, which also allows `>`,
     /// `>>` or `&>` to that same file (the same target, so nothing more is written to).
     pub fn exact_rule(&self, tool: &str, effect: &Effect, raw_cmd: Option<&str>) -> Option<String> {

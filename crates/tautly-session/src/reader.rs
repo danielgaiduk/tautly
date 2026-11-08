@@ -35,6 +35,7 @@ pub struct SessionReader<R: DeserializeOwned> {
 }
 
 impl<R: DeserializeOwned> SessionReader<R> {
+    /// Open the log at `path` and read its header.
     pub fn open(path: &Path) -> Result<Self> {
         let bad = |reason: &str| Error::BadHeader {
             path: path.to_path_buf(),
@@ -74,6 +75,7 @@ impl<R: DeserializeOwned> SessionReader<R> {
         })
     }
 
+    /// The log's header.
     pub fn header(&self) -> &Header {
         &self.header
     }
@@ -119,6 +121,7 @@ impl<R: DeserializeOwned> SessionReader<R> {
         }
     }
 
+    /// The bytes of blob `r`, checked against its hash.
     pub fn read_blob(&self, r: &BlobRef) -> Result<Vec<u8>> {
         self.blobs.get(r)
     }
@@ -266,15 +269,21 @@ impl<R: DeserializeOwned> Iterator for Records<R> {
 /// One session in the listing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionSummary {
+    /// The session id.
     pub id: String,
+    /// When the session was created (header time).
     pub created: SystemTime,
+    /// The log file.
     pub path: PathBuf,
+    /// When the log file was last written.
     pub last_modified: SystemTime,
     /// The work tree the session ran in (the header's canonical root).
     pub root: PathBuf,
     /// The header's label; a later `Labeled` record (read by the engine) renames it.
     pub label: Option<String>,
+    /// Why the session exists.
     pub origin: Origin,
+    /// For a fork: the parent session id and record offset.
     pub parent: Option<(String, u64)>,
 }
 

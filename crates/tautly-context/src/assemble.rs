@@ -20,6 +20,7 @@ const PINNED_WARN_PERCENT: u64 = 10;
 const USED_WARN_PERCENT: u64 = 80;
 
 impl Context {
+    /// Build the request for `model` with `tools`, and report what it holds.
     pub fn assemble(
         &self,
         caps: &Capabilities,

@@ -33,13 +33,20 @@ const STRUCTURAL_SIMILARITY: f32 = 0.8;
 /// Longest a similarity comparison may run before settling for an approximate ratio.
 const SIMILARITY_TIMEOUT: Duration = Duration::from_millis(200);
 
+/// The stage of the tolerant applier that located an edit (spec 7.9), in the order tried.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RepairStage {
+    /// The text as given.
     Exact,
+    /// After normalizing line endings, BOMs, typographic characters, trailing whitespace and copied `read` artifacts.
     Normalized,
+    /// Ignoring whitespace at line starts and ends.
     Whitespace,
+    /// Like `Whitespace`, but the block is indented by one uniform offset (re-indented on apply).
     Indentation,
+    /// Unique first and last lines (trimmed), the lines between near-identical.
     Anchor,
+    /// The code index's symbol of similar text (str_replace only).
     Structural,
 }
 
@@ -86,10 +93,12 @@ impl RepairStage {
     }
 }
 
+/// Where an edit's `old` text was found.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Located {
     /// Byte range in the searched text to replace.
     pub range: Range<usize>,
+    /// The stage that found it.
     pub stage: RepairStage,
     /// Set when the model's block is indented by one uniform number of columns more
     /// (negative: fewer) than the file's matched lines. [`adapt_new_text`] already applies
@@ -193,7 +202,7 @@ fn locate_with(text: &str, old: &str, whole_lines: bool) -> Result<Located, Matc
 
 /// Stage 5: the symbol the first definition line of `old` names, located in `text` by
 /// parsing it (never a stale index). The symbol's lines are the range to replace when their
-/// source resembles `old` (ratio >= [`STRUCTURAL_SIMILARITY`], and the non-blank lines pair up one-to-one, each
+/// source resembles `old` (ratio >= `STRUCTURAL_SIMILARITY`, and the non-blank lines pair up one-to-one, each
 /// pair that alike) and exactly one same-named symbol does, provided `old` is exactly one symbol. `Ok(None)` when `old` is not exactly one definition
 /// or nothing resembles it.
 pub fn locate_structural(

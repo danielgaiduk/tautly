@@ -14,48 +14,66 @@ use regex::Regex;
 use super::str_replace::MatchError;
 use super::tolerant::{RepairStage, adapt_new_text, line_span, locate_lines};
 
+/// What a patch does to one file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PatchOp {
     /// The file's new content (LF line endings).
     Update(String),
     /// A new file's content.
     Add(String),
+    /// Delete the file.
     Delete,
 }
 
+/// The kind of change a patch makes to a file (see [`Touched`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
+    /// `*** Update File`.
     Update,
+    /// `*** Add File`.
     Add,
+    /// `*** Delete File`.
     Delete,
 }
 
 /// A file a patch touches.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Touched {
+    /// The file, as the patch names it.
     pub path: PathBuf,
+    /// What the patch does to it.
     pub kind: Kind,
 }
 
+/// Why a patch could not be applied.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PatchError {
     /// Malformed patch text.
     Format(String),
     /// Valid syntax the tool does not support (renames).
     Unsupported(String),
+    /// A file named by more than one entry.
     DuplicateFile(PathBuf),
+    /// An update or delete of a file that does not exist.
     NotFound(PathBuf),
+    /// An add of a file that already exists.
     AlreadyExists(PathBuf),
     /// Hunk `hunk` (1-based) of `path` could not be placed.
     Hunk {
+        /// The file.
         path: PathBuf,
+        /// The hunk's number, 1-based.
         hunk: usize,
+        /// Why it could not be placed.
         error: MatchError,
     },
     /// Hunks `a` and `b` (1-based) of `path` cover overlapping lines.
     Overlap {
+        /// The file.
         path: PathBuf,
+        /// The first hunk, 1-based.
         a: usize,
+        /// The second hunk, 1-based.
         b: usize,
     },
 }
@@ -93,8 +111,11 @@ impl std::error::Error for PatchError {}
 /// One file's result, with the hunks that needed a tolerant stage.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Applied {
+    /// The file.
     pub path: PathBuf,
+    /// What happens to it.
     pub op: PatchOp,
+    /// The hunks a tolerant stage placed.
     pub repairs: Vec<Repair>,
 }
 
@@ -103,6 +124,7 @@ pub struct Applied {
 pub struct Repair {
     /// 1-based hunk number.
     pub hunk: usize,
+    /// The stage that placed it.
     pub stage: RepairStage,
     /// 1-based first and last lines of the original file the hunk replaced.
     pub lines: (usize, usize),

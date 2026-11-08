@@ -42,6 +42,7 @@ pub fn key(root: &Path, name: &str, spec: &ServerSpec) -> String {
 /// An approval key, and whether an approval under it may be remembered.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApprovalKey {
+    /// The key itself (see [`key`]).
     pub key: String,
     /// False when a file the command line names could not be hashed (too big,
     /// unreadable, not a regular file), or when the command line can drop the private
@@ -147,6 +148,7 @@ impl ApprovalStore {
         }
     }
 
+    /// Whether the user has approved the server under `key`.
     pub fn is_approved(&self, key: &str) -> bool {
         self.file.approvals.contains_key(key)
     }

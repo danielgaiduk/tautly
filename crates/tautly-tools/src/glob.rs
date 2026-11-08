@@ -13,6 +13,7 @@ use crate::{Tool, ToolCx, ToolError, ToolResult};
 
 const MAX_RESULTS: usize = 1000;
 
+/// `glob`: lists files matching a glob pattern.
 pub struct GlobTool;
 
 #[derive(Deserialize)]

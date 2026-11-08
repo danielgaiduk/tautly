@@ -23,11 +23,15 @@ pub const HISTORY_ENTRIES: usize = 1000;
 /// One answer from the user.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Line {
+    /// A line of text (without the newline).
     Text(String),
+    /// Ctrl+C.
     CtrlC,
+    /// Ctrl+D (or the end of input).
     CtrlD,
 }
 
+/// Where the REPL reads its input: the terminal, or a script in tests.
 #[async_trait]
 pub trait LineSource: Send {
     /// A line typed at `prompt` (a message or a slash command).
@@ -49,6 +53,7 @@ pub struct ScriptedSource {
 }
 
 impl ScriptedSource {
+    /// A source answering with `lines`, then Ctrl+D.
     pub fn new(lines: Vec<Line>) -> Self {
         ScriptedSource {
             lines: lines.into(),
@@ -57,6 +62,7 @@ impl ScriptedSource {
         }
     }
 
+    /// A source answering with lines sent on the returned channel, then Ctrl+D once it closes.
     pub fn channel() -> (mpsc::UnboundedSender<Line>, Self) {
         let (tx, rx) = mpsc::unbounded_channel();
         let source = ScriptedSource {

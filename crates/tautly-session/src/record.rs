@@ -14,8 +14,11 @@ pub const SCHEMA_VERSION: u32 = 1;
 /// still reads.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Header {
+    /// The log format version (see [`SCHEMA_VERSION`](crate::SCHEMA_VERSION)).
     pub schema_version: u32,
+    /// The session's id.
     pub session_id: String,
+    /// When the session was created.
     pub created: SystemTime,
     /// The canonical work tree root (for a worktree: the worktree, not the main checkout).
     /// Paths in records are relative to it.
@@ -30,6 +33,7 @@ pub struct Header {
     /// The branch name; a later `Labeled` record (written by the engine) renames it.
     #[serde(default)]
     pub label: Option<String>,
+    /// Why the session exists.
     #[serde(default)]
     pub origin: Origin,
     /// Inside git: the `HEAD` commit at session start, read from the git files. `dirty`
@@ -46,6 +50,7 @@ pub struct Header {
     /// built-in values or the models file), written by the engine.
     #[serde(default)]
     pub config_hash: Option<String>,
+    /// Free-form tags (`eval` for eval runs).
     #[serde(default)]
     pub tags: Vec<String>,
     /// For a fork: the step it branched at (`parent`'s offset names the last record it
@@ -80,7 +85,9 @@ pub enum Origin {
 /// The repository state a header records.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GitState {
+    /// The `HEAD` commit id, when there is one.
     pub head: Option<String>,
+    /// Whether the work tree had uncommitted changes (None: unknown).
     pub dirty: Option<bool>,
 }
 
@@ -90,10 +97,15 @@ pub struct GitState {
 pub struct HeaderInit {
     /// For a fork: (parent session id, parent record offset).
     pub parent: Option<(String, u64)>,
+    /// The branch name.
     pub label: Option<String>,
+    /// Why the session exists.
     pub origin: Origin,
+    /// The model the session starts with.
     pub model: Option<String>,
+    /// The configuration hash ([`Header::config_hash`]).
     pub config_hash: Option<String>,
+    /// Free-form tags.
     pub tags: Vec<String>,
     /// For a fork: the step it branched at.
     pub parent_step: Option<u32>,
@@ -106,6 +118,7 @@ pub struct Entry<R> {
     pub offset: u64,
     /// When it was appended, in Unix milliseconds; 0 when the line has no `t`.
     pub t_ms: u64,
+    /// The record.
     pub rec: R,
 }
 

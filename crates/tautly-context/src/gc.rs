@@ -46,6 +46,7 @@ pub fn is_elided_stub(output: &str) -> bool {
 pub struct GcRecord {
     /// Each elided result, oldest first.
     pub elided: Vec<GcElision>,
+    /// Estimated tokens the elisions freed.
     pub tokens_freed: u32,
     /// Why the scheduler allowed the collection.
     pub reason: MutationReason,
@@ -72,8 +73,11 @@ pub struct GcElision {
 /// One target of a read result.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReadTarget {
+    /// The file.
     pub path: PathBuf,
+    /// The lines requested.
     pub range: LineRange,
+    /// How they were shown.
     pub shown: Shown,
 }
 
@@ -81,7 +85,9 @@ pub struct ReadTarget {
 /// matches on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResultMeta {
+    /// The tool-call id.
     pub call_id: String,
+    /// The tool's name.
     pub tool: String,
     /// The session turn the result belongs to, as the engine numbered it.
     pub turn: u32,

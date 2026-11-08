@@ -13,6 +13,7 @@ use crate::cap::{OUTPUT_CAP, cap_text};
 use crate::spec::{decode_text, parse_args, tool_spec};
 use crate::{Tool, ToolCx, ToolError, ToolResult};
 
+/// `web_fetch`: fetches a URL as text, optionally answering a question about it with the side model.
 pub struct WebFetchTool;
 
 /// A `question` is answered in at most this many tokens (spec 7.5).

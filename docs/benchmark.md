@@ -148,10 +148,10 @@ How to read it:
   step 1, OpenAI or Gemini (which reason by default) may be dropping earlier reasoning. This
   is only a hint, not a test.
 
-**Reasoning continuity is not tested yet.** The engine sends no reasoning setting
-(`CanonicalRequest.reasoning` is `None`), so Anthropic runs without extended thinking. The
-CLI also has no switch to drop the working-state tail, so there is no with-and-without
-comparison. The real check comes with the lane that lets the engine enable reasoning:
+**Reasoning continuity is not tested yet.** The engine now sends a reasoning setting
+(`reasoning`, default `auto`: medium effort or a 12k thinking budget on models that can
+reason), but the live tests check only the prompt cache, and the CLI has no switch to drop
+the working-state tail, so there is no with-and-without comparison. A real check would
 compare `reasoning_tokens` with and without the tail, or have the model quote its step-1
 reasoning. Until then, a green `*_cache_continuity` says nothing about reasoning.
 

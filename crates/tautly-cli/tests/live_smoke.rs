@@ -16,8 +16,8 @@
 //!   Ollama tag without the `compat:ollama/` prefix gets it).
 //!
 //! How to read the cache continuity tests: docs/benchmark.md, "Cache continuity". They
-//! check the prompt cache only; a reasoning-continuity check comes with the lane that lets
-//! the engine enable reasoning (it sends `reasoning: None` today).
+//! check the prompt cache only; reasoning continuity (the engine sends the configured
+//! `reasoning` level, `auto` by default) is not checked yet.
 
 use std::fs::File;
 use std::io::{Read as _, Write as _};
@@ -368,7 +368,7 @@ fn fix_failing_test(p: &Provider) {
 /// provider accepts the replayed history (for OpenAI: reasoning items next to id-less
 /// items) and prints per-step numbers; on providers with a dependable prompt cache the last
 /// step must read from it, else the working-state tail is breaking the prefix. Reasoning
-/// continuity itself is not checked: the engine does not enable reasoning yet.
+/// continuity itself is not checked.
 fn cache_continuity(p: &Provider) {
     if p.skipped("cache_continuity") {
         return;

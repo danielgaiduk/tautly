@@ -1,11 +1,23 @@
 //! Canonical provider types, capabilities, model catalog and cost accounting.
+//!
+//! The engine builds one provider-neutral [`CanonicalRequest`] per step; an adapter
+//! ([`anthropic`], [`openai`], [`google`], [`compat`] for OpenAI-compatible endpoints)
+//! translates it and streams back [`ProviderEvent`]s. [`Retrying`] wraps an adapter with
+//! backoff on transient errors. The [`Catalog`] (`catalog/models.toml`) holds each model's
+//! [`Capabilities`] and [`Price`]; [`cost_usd`] prices usage with it. [`MockProvider`]
+//! replays scripted responses for tests.
 
 pub mod anthropic;
+/// Provider-neutral requests, messages and stream events.
 pub mod canonical;
+/// What a model supports.
 pub mod capabilities;
+/// The model catalog: capabilities and prices.
 pub mod catalog;
 pub mod compat;
+/// Cost of usage at a catalog price.
 pub mod cost;
+/// Provider errors.
 pub mod error;
 pub mod google;
 pub mod openai;
@@ -41,6 +53,7 @@ pub trait SideModel: Send + Sync {
         usize::MAX
     }
 
+    /// Send one request; the answer's text.
     async fn complete(
         &self,
         system: &str,
@@ -51,7 +64,9 @@ pub trait SideModel: Send + Sync {
 
 /// A streaming model backend. Adapters implement this; the engine wraps them in [`Retrying`].
 pub trait Provider: Send + Sync {
+    /// The provider's name, for messages.
     fn name(&self) -> &str;
+    /// Send `req` and stream the response; `cancel` stops it.
     fn stream(
         &self,
         req: CanonicalRequest,

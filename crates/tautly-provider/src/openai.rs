@@ -27,6 +27,7 @@ use crate::{
     ProviderEvent, RawUsage, Reasoning, Role, StopReason,
 };
 
+/// The OpenAI Responses API adapter.
 #[derive(Clone)]
 pub struct OpenAiProvider {
     client: reqwest::Client,
@@ -36,6 +37,7 @@ pub struct OpenAiProvider {
 }
 
 impl OpenAiProvider {
+    /// An adapter sending requests to `base_url` with `api_key`, sized by `catalog`.
     pub fn new(api_key: String, base_url: Url, catalog: Arc<Catalog>) -> Self {
         let client = tautly_sandbox::http_client_builder()
             .connect_timeout(Duration::from_secs(15))

@@ -35,7 +35,9 @@ pub fn tool_prompt(rule: Option<&str>) -> String {
 /// How the user answered a tool call's approval.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ToolAnswer {
+    /// Approve this one call.
     Once,
+    /// Refuse this call.
     Deny,
     /// Approve, and allow what this rule matches for the session.
     Always(String),

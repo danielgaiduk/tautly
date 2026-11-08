@@ -25,6 +25,7 @@ pub struct LocalSandbox {
 }
 
 impl LocalSandbox {
+    /// A sandbox on `root` (canonicalized).
     pub fn new(root: PathBuf) -> Result<Self, SandboxError> {
         let client = crate::http_client_builder()
             .timeout(std::time::Duration::from_secs(30))

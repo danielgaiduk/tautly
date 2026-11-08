@@ -52,10 +52,13 @@ const COMPACT_PROMPT: &str = include_str!("../prompts/compact.md");
 ///   against the removed read). Like collection's `GcRecord::forgotten_paths`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CompactionRecord {
+    /// The turns the summary replaced, kept so the compaction can be undone.
     pub removed_turns: Vec<Turn>,
     /// The summary as generated, without the `<summary>` wrapper.
     pub summary: String,
+    /// Session turn number of the first removed turn.
     pub first_removed_turn: u32,
+    /// Session turn number of the last removed turn.
     pub last_removed_turn: u32,
     /// Every path a tool result of the removed turns read or wrote (from
     /// [`Context::results`]), in first-seen order. Turns an earlier compaction removed are
@@ -77,7 +80,12 @@ pub enum CompactError {
     /// The summary would not make the context smaller (estimated tokens of the summary
     /// turn and of the removed turns).
     #[error("the summary ({summary} tokens) is not smaller than the {removed} tokens it replaces")]
-    SummaryTooLong { summary: u32, removed: u32 },
+    SummaryTooLong {
+        /// Estimated tokens of the summary turn.
+        summary: u32,
+        /// Estimated tokens of the turns it would replace.
+        removed: u32,
+    },
 }
 
 /// Why [`Context::uncompact`] did nothing.
@@ -85,7 +93,12 @@ pub enum CompactError {
 pub enum UncompactError {
     /// Restoring would need `needed` estimated tokens, over the `budget`.
     #[error("restoring the compacted turns needs {needed} tokens, over the budget of {budget}")]
-    TooLarge { needed: u32, budget: u32 },
+    TooLarge {
+        /// Estimated tokens restoring would need.
+        needed: u32,
+        /// The tokens available.
+        budget: u32,
+    },
     /// The record's summary is not the first turn of the history: a later compaction or
     /// edit came after it. Compactions are undone newest first.
     #[error("this compaction is not the latest one and cannot be undone yet")]

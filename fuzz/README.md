@@ -46,15 +46,15 @@ the owning crate before fixing it.
 
 - Nightly CI (`.github/workflows/nightly.yml`, job `fuzz`): 60 s per target, a smoke run
   that catches regressions in the committed corpus and the shallow paths.
+- Before a release or after changing a parser: 10 to 15 minutes each for
+  `shell_policy`, `session_reader` and `rpc_acp`, 5 minutes each for the rest. The
+  targets are independent; run them in parallel, one per core.
 
 The shell parse has a 2 s deadline (`tautly-sandbox`, `PARSE_DEADLINE`): an input past
 it is Unparseable, and until that parse ends (minutes for the known tree-sitter case,
 `crates/tautly-sandbox/tests/fixtures/slow_parse.sh`) every later parse in the process
 is refused. `shell_policy` accepts those refusals, but a run then checks little: never
 add a slow input to `corpus/`.
-- Before a release or after changing a parser: 10 to 15 minutes each for
-  `shell_policy`, `session_reader` and `rpc_acp`, 5 minutes each for the rest. The
-  targets are independent; run them in parallel, one per core.
 
 ## Corpus
 

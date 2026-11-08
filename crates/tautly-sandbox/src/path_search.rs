@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 /// name one the repository ships), an entry inside the root by name or once links are
 /// resolved, and a candidate whose resolved path is inside the root. "Inside" also means
 /// inside any work tree of the root's repository: a path one of whose ancestors has a
-/// `.git` resolving to the root's common git directory ([`common_dir`]): the main tree of
+/// `.git` resolving to the root's common git directory (`common_dir`): the main tree of
 /// a linked worktree, a sibling worktree, or the submodule checkout a fork was made from.
 ///
 /// The candidate is returned as found (`<entry>/<name>`, links not resolved), so a

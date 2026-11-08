@@ -34,6 +34,7 @@ pub enum MutationReason {
 /// When the last provider request went out and how much of it the cache holds.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CacheClock {
+    /// When the last request went out (None: no request yet).
     pub last_request: Option<Instant>,
     /// Tokens of the request prefix up to its last cache breakpoint.
     pub cached_prefix_tokens: u32,

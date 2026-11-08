@@ -40,6 +40,11 @@ toml.workspace = true
 tempfile.workspace = true
 libc.workspace = true
 
+# The clap doc comments are `--help` text, where `<provider>/<model>` placeholders are meant
+# literally, not as HTML.
+[lints.rustdoc]
+invalid_html_tags = "allow"
+
 [dev-dependencies]
 tempfile.workspace = true
 serde_json.workspace = true

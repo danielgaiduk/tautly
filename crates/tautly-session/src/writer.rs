@@ -199,14 +199,17 @@ impl<R: Serialize> SessionWriter<R> {
         Ok(copied)
     }
 
+    /// The log's header.
     pub fn header(&self) -> &Header {
         &self.header
     }
 
+    /// The session's id.
     pub fn session_id(&self) -> &str {
         &self.header.session_id
     }
 
+    /// The log file.
     pub fn path(&self) -> &Path {
         &self.path
     }

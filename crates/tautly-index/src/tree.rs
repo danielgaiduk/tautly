@@ -21,7 +21,9 @@ use crate::store::{Index, Inner};
 pub struct FileEntry {
     /// Root-relative path.
     pub path: PathBuf,
+    /// Size in bytes.
     pub size: u64,
+    /// Last modification time.
     pub mtime: SystemTime,
     /// blake3 hex of the content as last indexed; empty for files over the size cap,
     /// which are never read.
@@ -287,6 +289,7 @@ impl TreeView {
         self.entries(rows)
     }
 
+    /// The entry for root-relative `path`, if the tree has that file.
     pub fn get(&self, path: &Path) -> Option<FileEntry> {
         let key = self.inner.key(path);
         let slot = self.data().get(&key)?;
@@ -300,10 +303,12 @@ impl TreeView {
         self.data().contains_or_under(&key)
     }
 
+    /// The number of files in the tree.
     pub fn len(&self) -> usize {
         self.data().len()
     }
 
+    /// Whether the tree has no files.
     pub fn is_empty(&self) -> bool {
         self.data().len() == 0
     }

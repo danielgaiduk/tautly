@@ -56,10 +56,13 @@ pub struct ReplOptions {
     pub models: Option<ModelLister>,
 }
 
+/// What stops the REPL with an error.
 #[derive(Debug, thiserror::Error)]
 pub enum ReplError {
+    /// The terminal could not be read or written.
     #[error("terminal: {0}")]
     Io(#[from] std::io::Error),
+    /// The engine failed.
     #[error("{0}")]
     Engine(#[from] EngineError),
 }

@@ -12,7 +12,9 @@ pub const MAX_LINE: usize = 8 * 1024 * 1024;
 pub const PARSE_ERROR: i64 = -32700;
 /// Valid JSON that is not a request.
 pub const INVALID_REQUEST: i64 = -32600;
+/// No such method.
 pub const METHOD_NOT_FOUND: i64 = -32601;
+/// The params do not fit the method.
 pub const INVALID_PARAMS: i64 = -32602;
 /// A session could not be created, or a command could not be handed over.
 pub const SESSION_FAILED: i64 = -32000;
@@ -26,12 +28,16 @@ pub const UNSUPPORTED_PROTOCOL: i64 = -32003;
 /// A JSON-RPC error object.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Error {
+    /// One of the error code constants of this module.
     pub code: i64,
+    /// A one-line description.
     pub message: String,
+    /// More detail, when there is any.
     pub data: Option<Value>,
 }
 
 impl Error {
+    /// An error without `data`.
     pub fn new(code: i64, message: impl Into<String>) -> Error {
         Error {
             code,
@@ -40,6 +46,7 @@ impl Error {
         }
     }
 
+    /// The same error with `data`.
     pub fn with_data(mut self, data: Value) -> Error {
         self.data = Some(data);
         self
@@ -61,21 +68,31 @@ impl Error {
 pub enum Incoming {
     /// Answered with a response carrying `id`.
     Request {
+        /// The request id, echoed in the response.
         id: Value,
+        /// The method name.
         method: String,
+        /// The params (`null` when absent).
         params: Value,
     },
     /// No `id`: never answered, not even with an error.
-    Notification { method: String, params: Value },
+    Notification {
+        /// The method name.
+        method: String,
+        /// The params (`null` when absent).
+        params: Value,
+    },
 }
 
 impl Incoming {
+    /// The method name.
     pub fn method(&self) -> &str {
         match self {
             Incoming::Request { method, .. } | Incoming::Notification { method, .. } => method,
         }
     }
 
+    /// The params (`null` when absent).
     pub fn params(&self) -> &Value {
         match self {
             Incoming::Request { params, .. } | Incoming::Notification { params, .. } => params,

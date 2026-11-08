@@ -8,12 +8,15 @@ use tautly_tools::{AppliedEffect, PlanStep, StatePatch, StepStatus};
 use crate::sanitize;
 use crate::tokens::TokenEstimator;
 
+/// What the working state notes about one file.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FileNote {
     /// Hex blake3 hash of the file as last read, or as written by the last edit. Shown
     /// only for edited files.
     pub read_hash: Option<String>,
+    /// The session edited it.
     pub edited: bool,
+    /// The session deleted it.
     pub deleted: bool,
     /// A command that may write ran since this file was last read or edited.
     pub maybe_stale: bool,
@@ -22,12 +25,18 @@ pub struct FileNote {
     pub last_turn: u32,
 }
 
+/// The structured task state the model keeps with the `state` tool, plus files the engine tracks.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct WorkingState {
+    /// A one-line task description, when one is set.
     pub task: Option<String>,
+    /// The plan.
     pub plan: Vec<PlanStep>,
+    /// Files read, edited or deleted, by path.
     pub files: BTreeMap<PathBuf, FileNote>,
+    /// Decisions recorded.
     pub decisions: Vec<String>,
+    /// Open questions.
     pub questions: Vec<String>,
     /// At most 10 are rendered, within 300 tokens; set by the engine.
     pub failed_attempts: Vec<String>,
@@ -89,6 +98,7 @@ impl WorkingState {
         }
     }
 
+    /// Apply a `state` tool call: replace the plan, add decisions and questions, resolve questions by index.
     pub fn apply_patch(&mut self, patch: StatePatch) {
         if let Some(plan) = patch.plan {
             self.plan = plan;
@@ -114,6 +124,7 @@ impl WorkingState {
         }
     }
 
+    /// Whether there is nothing to render.
     pub fn is_empty(&self) -> bool {
         self.task.is_none()
             && self.plan.is_empty()

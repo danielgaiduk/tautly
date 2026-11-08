@@ -52,6 +52,7 @@ pub struct Bridge {
 }
 
 impl Bridge {
+    /// A bridge whose sessions come from `factory`.
     pub fn new(factory: AcpEngineFactory) -> Bridge {
         Bridge {
             factory,

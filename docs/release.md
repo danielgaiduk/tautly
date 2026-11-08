@@ -75,8 +75,13 @@ step 2 is done the `publish-homebrew-formula` job fails after the GitHub release
 The actions in `.github/workflows/ci.yml` are pinned to tags, because the commit SHAs could not be
 resolved without contacting GitHub. Replace them with commit SHAs (keeping the tag in a comment):
 
-- `dtolnay/rust-toolchain@stable` (three jobs)
-- `Swatinem/rust-cache@v2` (two jobs)
+- `actions/checkout@v4` (every job)
+- `dtolnay/rust-toolchain@stable` (six jobs)
+- `Swatinem/rust-cache@v2` (four jobs)
+- `actions/cache@v4`, `actions/setup-go@v5`, `actions/setup-node@v4`,
+  `taiki-e/install-action@v2` (one job each)
+
+`.github/workflows/nightly.yml` already pins every action to a commit.
 
 The `dist-plan` job also downloads the cargo-dist installer by version (`v0.34.0`) with no hash
 check, as the generated `release.yml` does. The actions in `release.yml` are all first-party.
