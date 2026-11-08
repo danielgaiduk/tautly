@@ -111,12 +111,18 @@ patterns for what must never run (`bash(rm -*r*)`, `bash(git*push*)`) and keep `
 disposable environments. Allow rules never use these extra forms (`bash(cargo test)` does
 not allow `time cargo test`).
 
-**What `bash(git *)` covers.** It allows ordinary git subcommands, but never the
-invocations that change what git runs: `git config` that may write, `git -c`, and the
-global options `--config-env`, `--exec-path`, `--git-dir` and `--work-tree` (as
-`--opt=value` or `--opt value`) always ask, as does a `GIT_*` assignment in front of the
-command. Configuration git reads from the work tree (`.git/`, `.gitconfig`) is protected,
-so the agent cannot plant hooks there either.
+**What `bash(git *)` covers.** It allows ordinary git subcommands, but these always ask
+(options as `--opt=value` or `--opt value`): `git config` that may write, `git -c`, the
+global options `--config-env`, `--exec-path`, `--git-dir` and `--work-tree`, a `GIT_*`
+assignment in front of the command, `git init`/`git clone --template`, the transport
+programs `--upload-pack`, `--receive-pack` and `--exec` (and `git clone -u`), and
+`git push`, `fetch`, `pull` or `remote` with a remote written as a local path (`/…`,
+`./…`, `../…`, `~…`, `file://…`, `.`, `..`). Pushing to a repository on this machine runs
+that repository's hooks (`pre-receive`, `update`, `post-receive`), and those hooks are
+outside what the policy can see: a remote given by a bare name that happens to be a
+directory, or a remote configured earlier with a local URL, is not recognised. Writing
+`.git/` and `.gitconfig` in the work tree asks, but that does not cover other
+repositories, so allow `git push` only to remotes you trust.
 
 ## Session rules ("allow for this session")
 

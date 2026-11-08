@@ -1031,6 +1031,17 @@ fn subject_str(raw: &str, rel: &Option<PathBuf>) -> String {
     rel.as_deref().map_or_else(|| raw.to_string(), path_str)
 }
 
+/// A git remote argument naming a repository on this machine by path.
+/// shortcut: a bare relative name (`evil`) that is a directory, or a remote configured
+/// earlier with a local URL, is not recognised; checking would need the disk and config.
+fn is_local_remote(w: &str) -> bool {
+    w == "."
+        || w == ".."
+        || ["/", "./", "../", "~", "file://"]
+            .iter()
+            .any(|p| w.starts_with(p))
+}
+
 /// Why a (canonical) host is local: a loopback, unspecified, link-local, private or
 /// shared (CGNAT) literal address, or a `localhost` name.
 /// shortcut: literal addresses only; a public name that resolves to a private address
@@ -1079,12 +1090,38 @@ fn git_reason(argv: &[String]) -> Option<String> {
         } else if GIT_VALUED.contains(&a.as_str()) {
             args.next();
         } else if !a.starts_with('-') {
-            if a != "config" {
-                return None;
+            let rest: Vec<&str> = args.map(String::as_str).collect();
+            let named = |opts: &[&str]| {
+                rest.iter()
+                    .map(|w| w.split_once('=').map_or(*w, |(n, _)| n))
+                    .find(|n| opts.contains(n))
+            };
+            // Programs a transport runs, given on the command line.
+            const PACK: &[&str] = &["--upload-pack", "--receive-pack", "--exec"];
+            match a.as_str() {
+                "config" => {}
+                "init" | "clone" => {
+                    let short_u = a == "clone" && rest.contains(&"-u");
+                    return named(&["--template"])
+                        .or(named(PACK))
+                        .or(short_u.then_some("-u"))
+                        .map(|o| format!("git {a} {o} chooses hooks or programs to run"));
+                }
+                // A local repository's hooks run on push; a local remote can be
+                // planted for a later push (`git remote add x ../evil`).
+                "push" | "fetch" | "pull" | "remote" => {
+                    if let Some(o) = named(PACK) {
+                        return Some(format!("git {a} {o} chooses a program to run"));
+                    }
+                    return rest
+                        .iter()
+                        .find(|w| is_local_remote(w))
+                        .map(|w| format!("git {a} to the local repository {w} can run its hooks"));
+                }
+                _ => return None,
             }
             const READ: &[&str] = &["--get", "--get-all", "--get-regexp", "--list", "-l"];
-            let rest: Vec<&String> = args.collect();
-            return if rest.iter().any(|r| READ.contains(&r.as_str())) {
+            return if rest.iter().any(|r| READ.contains(r)) {
                 None
             } else {
                 Some("git config may modify configuration".into())

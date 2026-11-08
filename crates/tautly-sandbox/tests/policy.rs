@@ -374,6 +374,54 @@ fn git_global_options_that_choose_config_or_binaries_ask_under_an_allow_rule() {
     }
 }
 #[test]
+fn git_templates_local_remotes_and_pack_programs_ask_under_an_allow_rule() {
+    for mode in [Mode::Ask, Mode::AutoEdit, Mode::Yolo] {
+        let allow = with_rules(mode, &["bash(git *)"], &[]);
+        for cmd in [
+            "git init --template=tpl",
+            "git init --template tpl repo",
+            "git clone --template=tpl https://x/y.git",
+            "git clone --template tpl https://x/y.git",
+            "git clone -u ./x https://x/y.git",
+            "git clone --upload-pack=./x https://x/y.git",
+            "git push /tmp/evil main",
+            "git push ./evil main",
+            "git push ../evil HEAD:main",
+            "git push ~/evil main",
+            "git push file:///tmp/evil main",
+            "git push -f .. main",
+            "git push --receive-pack=./x origin main",
+            "git push --exec ./x origin main",
+            "git fetch ../evil",
+            "git pull /tmp/evil main",
+            "git fetch --upload-pack ./x origin",
+            "git remote add evil ../evil",
+            "git remote set-url origin /tmp/evil",
+        ] {
+            assert!(
+                asks(allow.decide("bash", &exec("git"), Some(cmd))),
+                "{mode:?}: {cmd}"
+            );
+        }
+        for cmd in [
+            "git init",
+            "git clone https://x/y.git",
+            "git clone ../local-copy",
+            "git push origin main",
+            "git push -u origin HEAD:refs/heads/x",
+            "git fetch origin",
+            "git pull --rebase origin main",
+            "git remote add up https://x/y.git",
+        ] {
+            assert_eq!(
+                allow.decide("bash", &exec("git"), Some(cmd)),
+                Decision::Allow,
+                "{mode:?}: {cmd}"
+            );
+        }
+    }
+}
+#[test]
 fn tool_configs_that_name_programs_to_run_are_protected() {
     let yolo = p(Mode::Yolo);
     for f in [
