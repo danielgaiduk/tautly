@@ -1,0 +1,1 @@
+printf -v foo %s x

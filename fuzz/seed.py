@@ -63,7 +63,7 @@ for s, pat in [
 ]:
     put("shell_policy", s + "\0" + pat)
 # Regressions the fuzzer found (see the tests in crates/tautly-sandbox/tests/shell.rs).
-for s in ["A=1;FOX=2 time", "command -p", " < @ \nc", "p0>.", "a | ex=$ @"]:
+for s in ["A=1;FOX=2 time", "command -p", " < @ \nc", "p0>.", "a | ex=$ @", "[a = @ ]"]:
     put("shell_policy", s)
 
 # 2. Session logs.

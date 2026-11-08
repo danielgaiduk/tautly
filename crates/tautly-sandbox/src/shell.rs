@@ -255,6 +255,17 @@ fn walk(
             // `[ … ]` is the ordinary `[` command, so `>` and `<` inside it are redirects
             // (`[ a > Z ]` truncates `Z`); only `[[ … ]]` compares. The grammar reads both
             // as comparisons, so a single-bracket test holding one fails closed.
+            // `[a` is a word to bash (the command `[a`), not a test: the bracket must
+            // stand alone.
+            let glued = node.child(0).is_some_and(|c| {
+                src.get(c.end_byte())
+                    .is_some_and(|b| !b.is_ascii_whitespace())
+            });
+            if glued {
+                return Err(Unparseable(
+                    "`[` glued to a word: bash runs that word as a command".into(),
+                ));
+            }
             let single = node.child(0).is_some_and(|c| text(c, src) == "[");
             if single && holds_redirect(node, src) {
                 return Err(Unparseable(

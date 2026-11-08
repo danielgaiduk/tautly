@@ -1300,6 +1300,22 @@ fn a_read_redirection_without_a_command_is_unparseable() {
     assert!(parse_commands("c < f").is_ok());
 }
 
+/// Fuzzing (shell_policy): `[a = b ]` is the command `[a` in bash (the bracket is part of
+/// the word), but the grammar reads a test: it is unparseable rather than a harmless `[[`.
+#[test]
+fn a_bracket_glued_to_a_word_is_not_a_test() {
+    for s in ["[a = b ]", "[[a = b ]]", "x && [rm -rf ]"] {
+        assert!(
+            parse_commands(s).is_err(),
+            "{s:?} parsed as {:?}",
+            parse_commands(s)
+        );
+    }
+    for s in ["[ a = b ]", "[[ a = b ]]", "[\ta ]"] {
+        assert!(parse_commands(s).is_ok(), "{s:?}");
+    }
+}
+
 /// Fuzzing (shell_policy): an assignment whose value is a lone `$` (`ex=$ cmd`) is bash's
 /// literal `$`, and `cmd` still runs with it in its environment: the command after it is
 /// in the parse, or the input is unparseable.
