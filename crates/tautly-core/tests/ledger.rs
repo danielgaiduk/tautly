@@ -231,6 +231,7 @@ fn a_v3_ledger_migrates_to_receipts_and_reopens() {
         cache_write: 0,
         side_tokens: 0,
         cost_usd: Some(0.5),
+        cost_partial: true,
         wall_ms: 7,
         cache_hit_ratio: None,
         steps: 1,
@@ -262,7 +263,28 @@ fn a_v3_ledger_migrates_to_receipts_and_reopens() {
         (rows[0].turn, rows[0].wall_ms, rows[0].project.as_str()),
         (1, 7, "p")
     );
+    assert!(rows[0].cost_partial);
     assert_eq!(ledger.session_totals("s").unwrap().requests, 1);
+
+    // A schema-4 file an earlier build made, before `receipts.cost_partial` (cp5 review C
+    // M1): the column is added, its rows read as not partial.
+    let early = dir.path().join("early.sqlite");
+    Ledger::open(&early)
+        .unwrap()
+        .record_receipt("s", "p", dir.path(), &receipt)
+        .unwrap();
+    let conn = rusqlite::Connection::open(&early).unwrap();
+    conn.execute_batch("ALTER TABLE receipts DROP COLUMN cost_partial;")
+        .unwrap();
+    drop(conn);
+    let ledger = Ledger::open(&early).unwrap();
+    let rows = ledger.session_receipts("s").unwrap();
+    assert_eq!(rows.len(), 1);
+    assert!(!rows[0].cost_partial);
+    ledger
+        .record_receipt("s", "p", dir.path(), &receipt)
+        .unwrap();
+    assert!(ledger.session_receipts("s").unwrap()[1].cost_partial);
 }
 
 #[test]

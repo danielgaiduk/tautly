@@ -58,6 +58,7 @@ struct Receipt {
     cache_write: u64,
     side_tokens: u64,
     cost_usd: Option<f64>,
+    cost_partial: bool,
     wall_ms: u64,
     cache_hit_ratio: Option<f64>,
     steps: u32,
@@ -76,6 +77,7 @@ fn receipt(ev: &Event) -> Receipt {
             cache_write,
             side_tokens,
             cost_usd,
+            cost_partial,
             wall_ms,
             cache_hit_ratio,
             steps,
@@ -92,6 +94,7 @@ fn receipt(ev: &Event) -> Receipt {
             cache_write: *cache_write,
             side_tokens: *side_tokens,
             cost_usd: *cost_usd,
+            cost_partial: *cost_partial,
             wall_ms: *wall_ms,
             cache_hit_ratio: *cache_hit_ratio,
             steps: *steps,
@@ -126,11 +129,17 @@ fn receipt_sums_main_and_side_and_reports_side_tokens() {
     assert_eq!((r.steps, r.tool_calls), (2, 1));
     assert_eq!(r.saved.cache_read_tokens, 310);
 
-    // One unpriced entry makes the cost unknown.
+    // An unpriced entry leaves the priced part, marked partial (cp5 review C M1).
     let mut b = builder();
     b.usage(UsageRole::Main, &usage(10, 1, 0, 0), Some(0.5));
     b.usage(UsageRole::Side, &usage(10, 1, 0, 0), None);
-    assert_eq!(receipt(&b.finish(None, Instant::now())).cost_usd, None);
+    let r = receipt(&b.finish(None, Instant::now()));
+    assert_eq!((r.cost_usd, r.cost_partial), (Some(0.5), true));
+    // Nothing priced: no amount.
+    let mut b = builder();
+    b.usage(UsageRole::Side, &usage(10, 1, 0, 0), None);
+    let r = receipt(&b.finish(None, Instant::now()));
+    assert_eq!((r.cost_usd, r.cost_partial), (None, true));
 }
 
 #[test]

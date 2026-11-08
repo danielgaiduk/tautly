@@ -48,7 +48,9 @@ const V2: &str = "ALTER TABLE usage ADD COLUMN estimated INTEGER NOT NULL DEFAUL
 const V3: &str = "CREATE INDEX IF NOT EXISTS usage_session ON usage(session);";
 /// Version 3 to 4 (and part of a new ledger): one row per turn receipt (spec 7.11.1).
 /// `at` is unix milliseconds, `root` the root's bytes; the `saved_*` columns are the
-/// receipt's token estimates.
+/// receipt's token estimates. `cost_partial`: some usage had no known price, so
+/// `cost_usd` covers the rest (added to schema 4 before its release; [`V4_COST_PARTIAL`]
+/// adds it to a file an earlier build of schema 4 made).
 const V4: &str = "
 CREATE TABLE IF NOT EXISTS receipts (
     id INTEGER PRIMARY KEY,
@@ -73,11 +75,16 @@ CREATE TABLE IF NOT EXISTS receipts (
     saved_filters INTEGER NOT NULL,
     cache_usd REAL,
     total_usd REAL,
-    estimated INTEGER NOT NULL DEFAULT 0
+    estimated INTEGER NOT NULL DEFAULT 0,
+    cost_partial INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS receipts_session ON receipts(session);
 CREATE INDEX IF NOT EXISTS receipts_at ON receipts(at);
 ";
+
+/// A schema-4 file made before `receipts.cost_partial` existed gets it (cp5 review C M1).
+const V4_COST_PARTIAL: &str =
+    "ALTER TABLE receipts ADD COLUMN cost_partial INTEGER NOT NULL DEFAULT 0;";
 
 #[derive(Debug, thiserror::Error)]
 pub enum LedgerError {
@@ -184,7 +191,10 @@ pub struct StoredReceipt {
     pub cache_read: u64,
     pub cache_write: u64,
     pub side_tokens: u64,
+    /// The priced usage's cost (none: nothing was priced).
     pub cost_usd: Option<f64>,
+    /// Some usage had no known price: `cost_usd` covers the rest.
+    pub cost_partial: bool,
     pub wall_ms: u64,
     pub steps: u32,
     pub tool_calls: u32,
@@ -268,7 +278,7 @@ impl Ledger {
             ));
         }
         conn.pragma_update(None, "synchronous", "NORMAL")?;
-        if version < SCHEMA_VERSION {
+        if version < SCHEMA_VERSION || !has_cost_partial(&conn)? {
             until_not_busy(|| migrate(&conn))?;
         }
         Ok((
@@ -383,6 +393,7 @@ impl Ledger {
             cache_write,
             side_tokens,
             cost_usd,
+            cost_partial,
             wall_ms,
             steps,
             tool_calls,
@@ -399,8 +410,8 @@ impl Ledger {
             "INSERT INTO receipts (session, project, root, turn, model, at, tokens_in, \
              tokens_out, cache_read, cache_write, side_tokens, cost_usd, wall_ms, steps, \
              tool_calls, saved_index, saved_diff_reads, saved_context_gc, saved_filters, \
-             cache_usd, total_usd, estimated) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, \
-             ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)",
+             cache_usd, total_usd, estimated, cost_partial) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, \
+             ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)",
             params![
                 session,
                 project,
@@ -424,6 +435,7 @@ impl Ledger {
                 finite(saved.cache_usd),
                 finite(saved.total_usd),
                 estimated,
+                cost_partial,
             ],
         )?;
         Ok(())
@@ -524,7 +536,8 @@ impl Ledger {
             "SELECT session, project, root, turn, model, at, tokens_in, tokens_out, \
              cache_read, cache_write, side_tokens, cost_usd, wall_ms, steps, tool_calls, \
              saved_index, saved_diff_reads, saved_context_gc, saved_filters, cache_usd, \
-             total_usd, estimated FROM receipts WHERE session = ?1 ORDER BY turn, id",
+             total_usd, estimated, cost_partial FROM receipts WHERE session = ?1 ORDER BY \
+             turn, id",
         )?;
         let rows = stmt.query_map(params![session], |r| {
             let cache_read = n(r.get(8)?);
@@ -554,6 +567,7 @@ impl Ledger {
                     total_usd: r.get(20)?,
                 },
                 estimated: r.get(21)?,
+                cost_partial: r.get(22)?,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -562,6 +576,15 @@ impl Ledger {
     fn conn(&self) -> std::sync::MutexGuard<'_, Connection> {
         self.conn.lock().unwrap_or_else(PoisonError::into_inner)
     }
+}
+
+/// The receipts table has its `cost_partial` column (an empty or new file: no).
+fn has_cost_partial(conn: &Connection) -> rusqlite::Result<bool> {
+    conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('receipts') WHERE name = 'cost_partial'",
+        [],
+        |r| r.get::<_, i64>(0).map(|n| n > 0),
+    )
 }
 
 /// Bring the schema to [`SCHEMA_VERSION`] in one write transaction (the version is read
@@ -582,6 +605,9 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
         }
         if version < 4 {
             conn.execute_batch(V4)?;
+        }
+        if !has_cost_partial(conn)? {
+            conn.execute_batch(V4_COST_PARTIAL)?;
         }
         if version < SCHEMA_VERSION {
             conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;

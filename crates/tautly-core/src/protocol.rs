@@ -297,8 +297,12 @@ pub enum Event {
         cache_read: u64,
         cache_write: u64,
         side_tokens: u64,
-        /// `None` when some usage had no known price.
+        /// The priced usage's cost (none: nothing was priced).
         cost_usd: Option<f64>,
+        /// Some usage was on a model without a known price: `cost_usd` covers the rest.
+        /// Sent only when true.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        cost_partial: bool,
         wall_ms: u64,
         cache_hit_ratio: Option<f64>,
         steps: u32,
