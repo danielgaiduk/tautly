@@ -18,7 +18,7 @@
 //! always ends with `TurnEnd`. A context overflow reported by the provider triggers one
 //! compaction (`forced`) and one retry of the step (spec 6.4).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::PoisonError;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -33,7 +33,7 @@ use tautly_provider::{
     CanonicalRequest, Content, Message, ModelId, Price, ProviderError, ProviderEvent, Quota,
     RawUsage, Role, StopReason, cost_usd,
 };
-use tautly_session::RelPath;
+use tautly_session::{BlobRef, RelPath};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -45,7 +45,7 @@ use crate::model_switch::rejects_reasoning;
 use crate::protocol::{BudgetScope, Command, ErrorKind, Event, FinishReason, UsageRole};
 use crate::provider_setup::provider_label;
 use crate::receipt::ReceiptBuilder;
-use crate::record::{CheckpointPoint, SessionRecord};
+use crate::record::{BLOB_INPUT, CheckpointPoint, INLINE_INPUT_MAX, SessionRecord};
 use crate::routing::{Side, model_failed};
 use crate::session::Session;
 
@@ -501,10 +501,32 @@ impl Session {
                 }
             };
             overflow_retried = false;
+            // An input over the inline limit goes to one blob that the event and the
+            // `ToolCall` record both name (cp5 review C M6); inline if the blob fails.
+            let mut blobs: HashMap<String, BlobRef> = HashMap::new();
+            for c in &resp.logged {
+                if let ProviderEvent::ToolCall { id, input_json, .. } = c
+                    && input_json.len() > INLINE_INPUT_MAX
+                    && let Some(b) = self.blob(input_json.as_bytes()).await
+                {
+                    blobs.insert(id.clone(), b);
+                }
+            }
             self.log_all(
                 resp.logged
                     .iter()
                     .cloned()
+                    .map(|ev| match ev {
+                        ProviderEvent::ToolCall { id, name, .. } if blobs.contains_key(&id) => {
+                            let input_json = format!("{BLOB_INPUT}{}", blobs[&id].as_str());
+                            ProviderEvent::ToolCall {
+                                id,
+                                name,
+                                input_json,
+                            }
+                        }
+                        ev => ev,
+                    })
                     .map(SessionRecord::Provider)
                     .collect(),
             )
@@ -545,10 +567,17 @@ impl Session {
             self.log_all(
                 resp.calls
                     .iter()
-                    .map(|c| SessionRecord::ToolCall {
-                        id: c.id.clone(),
-                        name: c.name.clone(),
-                        args: c.input(),
+                    .map(|c| {
+                        let args_blob = blobs.get(&c.id).cloned();
+                        SessionRecord::ToolCall {
+                            id: c.id.clone(),
+                            name: c.name.clone(),
+                            args: match args_blob {
+                                Some(_) => serde_json::Value::Null,
+                                None => c.input(),
+                            },
+                            args_blob,
+                        }
                     })
                     .collect(),
             )

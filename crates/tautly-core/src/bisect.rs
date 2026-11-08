@@ -442,7 +442,7 @@ fn prepass_in(recs: &[(u64, SessionRecord)], test: &str) -> Option<(u32, u32)> {
                     ..StepRuns::default()
                 });
             }
-            SessionRecord::ToolCall { id, name, args } => {
+            SessionRecord::ToolCall { id, name, args, .. } => {
                 if let Some((s, _)) = owner {
                     let matches = name == "bash"
                         && args
@@ -785,7 +785,13 @@ fn step_info(log: &Path, step: u32) -> Result<(Option<u32>, Vec<String>, String)
         }
         turn = Some(t);
         match rec {
-            SessionRecord::ToolCall { name, args, .. } => {
+            SessionRecord::ToolCall {
+                name,
+                args,
+                args_blob,
+                ..
+            } => {
+                let args = crate::record::tool_args(&reader, &args, args_blob.as_ref());
                 calls.push(format!("{name}: {}", target(&name, &args)));
             }
             SessionRecord::Provider(ProviderEvent::TextDelta(t)) => text.push_str(&t),

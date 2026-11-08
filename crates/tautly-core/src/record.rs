@@ -77,11 +77,16 @@ pub enum SessionRecord {
         estimated: bool,
     },
     /// A tool call of the response before it. `args` is the input as it stands in the
-    /// history: an empty object when the model's JSON did not parse.
+    /// history: an empty object when the model's JSON did not parse. An input over
+    /// [`INLINE_INPUT_MAX`] bytes is in the blob `args_blob` instead (`args` null): the
+    /// exact text the provider sent, the same blob its `Provider` event names, so the log
+    /// and every branch copy hold it once (cp5 review C M6). Read it with [`tool_args`].
     ToolCall {
         id: String,
         name: String,
         args: Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        args_blob: Option<BlobRef>,
     },
     /// The result returned to the model for call `id` (after the engine's own changes,
     /// e.g. a refused pin), with what the call did to files. Effects on paths that cannot
@@ -496,9 +501,77 @@ const KNOWN_TYPES: &[&str] = &[
     "turn_end",
 ];
 
+/// Tool inputs longer than this many bytes are logged as a blob (cp5 review C M6).
+pub const INLINE_INPUT_MAX: usize = 4096;
+
+/// In memory, a `Provider` tool call event whose input is in a blob holds this prefix and
+/// the blob's hash as its `input_json`; the log line holds `input_json: ""` and
+/// `input_blob: <hash>`. No JSON text starts with a NUL. Read it with [`resolved_event`].
+pub(crate) const BLOB_INPUT: &str = "\u{0}blob:";
+
 impl Serialize for SessionRecord {
     fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        if let SessionRecord::Provider(ProviderEvent::ToolCall {
+            id,
+            name,
+            input_json,
+        }) = self
+            && let Some(blob) = input_json.strip_prefix(BLOB_INPUT)
+        {
+            let data = serde_json::json!({"tool_call": {
+                "id": id, "name": name, "input_json": "", "input_blob": blob,
+            }});
+            return serde_json::json!({"type": "provider", "data": data}).serialize(s);
+        }
         SessionRecord::serialize(self, s)
+    }
+}
+
+/// `ev` with a tool call's input read back from its blob (the blob form of
+/// [`BLOB_INPUT`]); every other event as it is. A blob that cannot be read leaves the input
+/// empty (an empty object in the history), with the error.
+pub(crate) fn resolved_event(
+    reader: &SessionReader<SessionRecord>,
+    ev: ProviderEvent,
+) -> (ProviderEvent, Option<tautly_session::Error>) {
+    match ev {
+        ProviderEvent::ToolCall {
+            id,
+            name,
+            input_json,
+        } if input_json.starts_with(BLOB_INPUT) => {
+            let read =
+                BlobRef::parse(&input_json[BLOB_INPUT.len()..]).and_then(|b| reader.read_blob(&b));
+            let (input_json, error) = match read {
+                Ok(bytes) => (String::from_utf8_lossy(&bytes).into_owned(), None),
+                Err(e) => (String::new(), Some(e)),
+            };
+            let ev = ProviderEvent::ToolCall {
+                id,
+                name,
+                input_json,
+            };
+            (ev, error)
+        }
+        ev => (ev, None),
+    }
+}
+
+/// A `ToolCall` record's input: `args`, or read from `args_blob` as the history holds it
+/// (an empty object when it is not a JSON object, or cannot be read).
+pub fn tool_args(
+    reader: &SessionReader<SessionRecord>,
+    args: &Value,
+    args_blob: Option<&BlobRef>,
+) -> Value {
+    match args_blob {
+        None => args.clone(),
+        Some(b) => reader
+            .read_blob(b)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+            .filter(Value::is_object)
+            .unwrap_or_else(|| Value::Object(Default::default())),
     }
 }
 
@@ -536,12 +609,21 @@ impl<'de> Deserialize<'de> for SessionRecord {
     }
 }
 
-/// Payload fields written by builds before the format freeze, in their frozen form.
+/// A payload in its in-memory form: fields written by builds before the format freeze in
+/// their frozen form, and a tool call input kept in a blob as [`BLOB_INPUT`].
 fn upgrade(ty: &str, data: &mut serde_json::Map<String, Value>) {
     let flag = |data: &mut serde_json::Map<String, Value>, k: &str| {
         data.remove(k).and_then(|v| v.as_bool()) == Some(true)
     };
     match ty {
+        // A tool call input kept in a blob: its in-memory form (`BLOB_INPUT`).
+        "provider" => {
+            if let Some(Value::Object(call)) = data.get_mut("tool_call")
+                && let Some(Value::String(blob)) = call.remove("input_blob")
+            {
+                call.insert("input_json".into(), format!("{BLOB_INPUT}{blob}").into());
+            }
+        }
         "restore_begun" if !data.contains_key("by") => {
             if flag(data, "restore_backup") {
                 data.insert("by".into(), "restore_backup".into());
@@ -865,6 +947,29 @@ mod tests {
     }
 
     #[test]
+    fn a_tool_call_input_in_a_blob_round_trips_through_its_log_form() {
+        let blob = "c".repeat(64);
+        let rec = SessionRecord::Provider(ProviderEvent::ToolCall {
+            id: "w1".into(),
+            name: "write".into(),
+            input_json: format!("{BLOB_INPUT}{blob}"),
+        });
+        let v = serde_json::to_value(&rec).unwrap();
+        assert_eq!(v["data"]["tool_call"]["input_json"], "");
+        assert_eq!(v["data"]["tool_call"]["input_blob"], blob.as_str());
+        assert_eq!(serde_json::from_value::<SessionRecord>(v).unwrap(), rec);
+        // An inline input is written as before.
+        let inline = SessionRecord::Provider(ProviderEvent::ToolCall {
+            id: "w2".into(),
+            name: "write".into(),
+            input_json: "{}".into(),
+        });
+        let v = serde_json::to_value(&inline).unwrap();
+        assert!(v["data"]["tool_call"].get("input_blob").is_none());
+        assert_eq!(serde_json::from_value::<SessionRecord>(v).unwrap(), inline);
+    }
+
+    #[test]
     fn a_payload_this_version_cannot_read_is_unknown_not_corrupt() {
         // cp5 review C I2: a non-finite speed was logged as `null`.
         let read = |line: &str| -> SessionRecord {
@@ -974,6 +1079,7 @@ mod tests {
                 id: String::new(),
                 name: String::new(),
                 args: Value::Null,
+                args_blob: None,
             },
             SessionRecord::ToolResult {
                 id: String::new(),

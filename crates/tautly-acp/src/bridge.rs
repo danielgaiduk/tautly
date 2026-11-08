@@ -1514,7 +1514,13 @@ fn replay(log: &Path, root: &Path) -> Vec<Value> {
                 "content": ContentBlock::text(text),
             })),
             SessionRecord::Provider(ProviderEvent::TextDelta(text)) => out.push(chunk(&text)),
-            SessionRecord::ToolCall { id, name, args } => {
+            SessionRecord::ToolCall {
+                id,
+                name,
+                args,
+                args_blob,
+            } => {
+                let args = tautly_core::record::tool_args(&reader, &args, args_blob.as_ref());
                 calls.insert(id, (name, args));
             }
             SessionRecord::ToolResult {

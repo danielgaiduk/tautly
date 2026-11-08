@@ -309,13 +309,22 @@ fn slim(rec: SessionRecord) -> Option<SessionRecord> {
         SessionRecord::Provider(ev) => {
             SessionRecord::Provider(slim_event(&ev).unwrap_or(ProviderEvent::Unknown))
         }
-        SessionRecord::ToolCall { id, name, args } => {
-            let args = if name == "bash" {
-                args
-            } else {
-                serde_json::Value::Null
+        SessionRecord::ToolCall {
+            id,
+            name,
+            args,
+            args_blob,
+        } => {
+            let (args, args_blob) = match name.as_str() {
+                "bash" => (args, args_blob),
+                _ => (serde_json::Value::Null, None),
             };
-            SessionRecord::ToolCall { id, name, args }
+            SessionRecord::ToolCall {
+                id,
+                name,
+                args,
+                args_blob,
+            }
         }
         SessionRecord::TurnStart { turn, .. } => SessionRecord::TurnStart {
             turn,

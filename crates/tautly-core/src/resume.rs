@@ -366,6 +366,14 @@ impl Replay<'_> {
     fn apply(&mut self, rec: SessionRecord) -> Flow {
         match rec {
             SessionRecord::Provider(ev) => {
+                // A tool call's input kept in a blob is read back.
+                let (ev, unread) = crate::record::resolved_event(self.reader, ev);
+                if let Some(e) = unread {
+                    self.warn(format!(
+                        "a tool call's input could not be read back ({e}); it is rebuilt as \
+                         an empty object"
+                    ));
+                }
                 if let Some(step) = &mut self.step {
                     step.resp.push(ev);
                     step.responded = true;

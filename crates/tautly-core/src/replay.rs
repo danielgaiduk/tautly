@@ -252,7 +252,13 @@ impl Events<'_> {
                 usage,
                 estimated,
             } => vec![self.usage(role, Some(&model), usage, None, estimated)],
-            SessionRecord::ToolCall { id, name, args } => {
+            SessionRecord::ToolCall {
+                id,
+                name,
+                args,
+                args_blob,
+            } => {
+                let args = crate::record::tool_args(self.reader, &args, args_blob.as_ref());
                 self.calls.insert(id.clone(), (name.clone(), args.clone()));
                 vec![Event::ToolCallProposed {
                     call_id: id,

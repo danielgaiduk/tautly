@@ -152,6 +152,7 @@ impl Log {
                 id: id.into(),
                 name: name.into(),
                 args: json!({}),
+                args_blob: None,
             },
         );
         let result_blob = self.blob(b"result");

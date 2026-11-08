@@ -813,6 +813,7 @@ async fn replayed_request_ids_not_answerable() {
             id: "w1".into(),
             name: "write".into(),
             args: json!({"path": "a.txt", "content": "pwned\n"}),
+            args_blob: None,
         },
         SessionRecord::ApprovalRequested {
             request_id: "approval-1".into(),

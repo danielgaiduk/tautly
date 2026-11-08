@@ -2177,3 +2177,90 @@ async fn fork_at_zero_accepts_what_rewind_zero_accepts_and_headers_name_the_step
     assert_eq!(node.parent, Some((parent, parent_tip)));
     run.stop().await;
 }
+
+// ------------------------------------------------ cp5 review C M6: large tool inputs
+
+#[tokio::test]
+async fn a_large_tool_input_is_one_blob_both_records_name_and_every_reader_resolves() {
+    let repo = Repo::git_repo();
+    let big = "x".repeat(10_000) + "\n";
+    let small = "small\n";
+    let mock = MockProvider::new(vec![
+        tools_step(vec![
+            write("w1", "big.txt", &big),
+            write("w2", "s.txt", small),
+        ]),
+        text_step("done"),
+    ]);
+    let mut run = Run::start(repo.builder(&mock));
+    run.turn_with("write").await;
+    let log = run.current().1;
+    let lines = typed_lines(&log);
+    let event = lines
+        .iter()
+        .find(|(ty, _, d)| ty == "provider" && d["tool_call"]["id"] == "w1")
+        .map(|(_, _, d)| d["tool_call"].clone())
+        .unwrap();
+    let call = lines
+        .iter()
+        .find(|(ty, _, d)| ty == "tool_call" && d["id"] == "w1")
+        .map(|(_, _, d)| d.clone())
+        .unwrap();
+    // One blob: the exact input text, named by both.
+    let blob = event["input_blob"]
+        .as_str()
+        .expect("the event names a blob");
+    assert_eq!(event["input_json"], "");
+    assert_eq!(call["args_blob"], blob);
+    assert_eq!(call["args"], Value::Null);
+    let r = reader(&log);
+    let bytes = r
+        .read_blob(&tautly_session::BlobRef::parse(blob).unwrap())
+        .unwrap();
+    let input = serde_json::to_string(&json!({ "path": "big.txt", "content": big })).unwrap();
+    assert_eq!(bytes, input.as_bytes());
+    // A small input stays inline.
+    let small_event = lines
+        .iter()
+        .find(|(ty, _, d)| ty == "provider" && d["tool_call"]["id"] == "w2")
+        .map(|(_, _, d)| d["tool_call"].clone())
+        .unwrap();
+    assert!(small_event.get("input_blob").is_none());
+    assert!(
+        small_event["input_json"]
+            .as_str()
+            .unwrap()
+            .contains("s.txt")
+    );
+
+    // Rebuild resolves it: the history holds the call's input.
+    let rebuilt = rebuild(&r, None).unwrap();
+    let used = rebuilt
+        .context
+        .history
+        .iter()
+        .flat_map(|t| &t.messages)
+        .flat_map(|m| &m.content)
+        .find_map(|c| match c {
+            tautly_provider::Content::ToolUse { id, input, .. } if id == "w1" => {
+                Some(input.clone())
+            }
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(used["content"], big);
+    // Replay resolves it.
+    let proposed = tautly_core::replay::events(&r, None)
+        .find_map(|(_, _, ev)| match ev {
+            Event::ToolCallProposed { call_id, args, .. } if call_id == "w1" => Some(args),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(proposed["content"], big);
+    // A branch shares the blob rather than copying the input.
+    run.rewind(3, false, &[]).await.done();
+    let branch = std::fs::read_to_string(run.current().1).unwrap();
+    assert!(!branch.contains(&big[..5000]));
+    assert!(branch.contains(blob));
+    run.stop().await;
+}
