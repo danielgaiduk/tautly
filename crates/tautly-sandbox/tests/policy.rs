@@ -340,6 +340,37 @@ fn git_config_writes_and_dash_c_ask() {
     }
 }
 #[test]
+fn git_global_options_that_choose_config_or_binaries_ask_under_an_allow_rule() {
+    for mode in [Mode::Ask, Mode::AutoEdit, Mode::Yolo] {
+        let allow = with_rules(mode, &["bash(git *)"], &[]);
+        for cmd in [
+            "git -c core.hooksPath=. commit -m x",
+            "git --config-env=core.hooksPath=PWD commit -m x",
+            "git --config-env core.hooksPath=PWD commit -m x",
+            "git --exec-path=. foo",
+            "git --exec-path . foo",
+            "git --git-dir=fake.git --work-tree=. commit -m x",
+            "git --git-dir fake.git commit -m x",
+            "git --work-tree=. commit -m x",
+            "git --work-tree . commit -m x",
+            "git -C sub --git-dir=x log",
+            "git --namespace n config core.hooksPath .",
+        ] {
+            assert!(
+                asks(allow.decide("bash", &exec("git"), Some(cmd))),
+                "{mode:?}: {cmd}"
+            );
+        }
+        for cmd in ["git log", "git -C sub status", "git --no-pager log"] {
+            assert_eq!(
+                allow.decide("bash", &exec("git"), Some(cmd)),
+                Decision::Allow,
+                "{mode:?}: {cmd}"
+            );
+        }
+    }
+}
+#[test]
 fn mode_kebab_case_with_snake_alias() {
     let k: PolicyConfig = serde_json::from_str(r#"{"mode":"auto-edit"}"#).unwrap();
     assert_eq!(k.mode, Mode::AutoEdit);

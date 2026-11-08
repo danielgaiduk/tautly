@@ -783,23 +783,29 @@ fn deny_argvs(argv: &[String]) -> Vec<Vec<String>> {
     out
 }
 
+/// Git global options that take their value as the next word when not written `--opt=val`.
+const GIT_VALUED: &[&str] = &[
+    "-C",
+    "-c",
+    "--git-dir",
+    "--work-tree",
+    "--namespace",
+    "--config-env",
+    "--super-prefix",
+    "--exec-path",
+];
+
 /// `git <args>` without the global options before its subcommand (`-C <dir>`, `-c k=v`,
 /// `--git-dir[=]…`, `--no-pager`, …): any leading option word, and the value of those that
 /// take one as the next word.
 fn without_git_options(argv: &[String]) -> Vec<String> {
-    const VALUED: &[&str] = &[
-        "-C",
-        "-c",
-        "--git-dir",
-        "--work-tree",
-        "--namespace",
-        "--config-env",
-        "--super-prefix",
-        "--exec-path",
-    ];
     let mut i = 1;
     while let Some(w) = argv.get(i).filter(|w| w.starts_with('-')) {
-        i += if VALUED.contains(&w.as_str()) { 2 } else { 1 };
+        i += if GIT_VALUED.contains(&w.as_str()) {
+            2
+        } else {
+            1
+        };
     }
     let mut out = vec![argv[0].clone()];
     out.extend(argv.iter().skip(i).cloned());
@@ -1005,17 +1011,23 @@ fn subject_str(raw: &str, rel: &Option<PathBuf>) -> String {
     rel.as_deref().map_or_else(|| raw.to_string(), path_str)
 }
 
-/// `git config` that may set values, or any `git -c`, can plant hooks/aliases.
+/// `git config` that may set values, any `git -c`, and the global options that choose
+/// whose configuration applies or which `git-*` programs run (`--config-env`,
+/// `--exec-path`, `--git-dir`, `--work-tree`) can plant hooks/aliases.
 fn git_reason(argv: &[String]) -> Option<String> {
+    const PLANTS: &[&str] = &["--config-env", "--exec-path", "--git-dir", "--work-tree"];
     let i = argv
         .iter()
         .position(|w| w == "git" || w.ends_with("/git"))?;
     let mut args = argv[i + 1..].iter();
     while let Some(a) = args.next() {
-        if a == "-C" {
-            args.next();
-        } else if a == "-c" || (a.starts_with("-c") && !a.starts_with("--")) {
+        let name = a.split_once('=').map_or(a.as_str(), |(n, _)| n);
+        if a == "-c" || (a.starts_with("-c") && !a.starts_with("--")) {
             return Some("git -c overrides configuration".into());
+        } else if PLANTS.contains(&name) {
+            return Some(format!("git {name} chooses configuration or programs"));
+        } else if GIT_VALUED.contains(&a.as_str()) {
+            args.next();
         } else if !a.starts_with('-') {
             if a != "config" {
                 return None;

@@ -27,7 +27,9 @@ Set it with `[permissions] mode = "..."` or for one run with `--approve auto-edi
      the parser cannot place);
    - is a command whose arguments or redirects name a protected path, that sets a
      dangerous environment variable for itself, that runs outside the work tree after a
-     `cd`, that changes git configuration (`git config`, `git -c`), or that escapes the
+     `cd`, that changes git configuration or chooses whose configuration and programs
+     git uses (`git config`, `git -c`, `--config-env`, `--exec-path`, `--git-dir`,
+     `--work-tree`), or that escapes the
      session's process cleanup (`setsid`, daemonizers, shell job control).
 3. **Allow rules** (from configuration and "allow for this session" answers).
 4. **The mode's default.**
