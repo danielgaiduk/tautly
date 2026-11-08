@@ -330,7 +330,11 @@ impl Events<'_> {
                 replaces: Vec::new(),
             }],
             SessionRecord::TurnEnd { reason, evidence } => {
-                vec![Event::TurnFinished { reason, evidence }]
+                vec![Event::TurnFinished {
+                    id: None,
+                    reason,
+                    evidence,
+                }]
             }
             SessionRecord::Unknown => {
                 self.unknown += 1;

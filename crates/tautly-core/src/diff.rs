@@ -110,6 +110,7 @@ pub async fn session_diff(
         })
         .collect();
     Ok(Event::SessionDiff {
+        id: None,
         turn,
         files,
         unified: diff.unified,

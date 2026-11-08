@@ -236,7 +236,11 @@ impl Run {
     }
 
     async fn turn_with(&mut self, text: &str) -> Vec<Event> {
-        self.send(Command::SendMessage { text: text.into() }).await;
+        self.send(Command::SendMessage {
+            id: None,
+            text: text.into(),
+        })
+        .await;
         self.until(|e| matches!(e, Event::TurnFinished { .. }))
             .await
     }
@@ -1636,7 +1640,11 @@ async fn undo_uses_the_excludes_of_the_turns_start() {
         text_step("done"),
     ]);
     let mut run = start(repo.builder(config(), &mock));
-    run.send(Command::SendMessage { text: "go".into() }).await;
+    run.send(Command::SendMessage {
+        id: None,
+        text: "go".into(),
+    })
+    .await;
     let began = Instant::now();
     while !repo.path("ready").exists() {
         assert!(began.elapsed() < WAIT, "the command did not start");

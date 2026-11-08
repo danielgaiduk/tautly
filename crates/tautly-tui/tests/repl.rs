@@ -257,7 +257,9 @@ fn logged_commands(log: &Path) -> Vec<Command> {
                 assert!(
                     !matches!(
                         c,
-                        Command::Undo { .. }
+                        Command::SendMessage { .. }
+                            | Command::Diff { .. }
+                            | Command::Undo { .. }
                             | Command::Fork { .. }
                             | Command::Rewind { .. }
                             | Command::Switch { .. }
@@ -524,6 +526,7 @@ fn tool_row_format() {
 #[test]
 fn coloured_diff_only_with_color_option() {
     let ev = Event::SessionDiff {
+        id: None,
         turn: None,
         files: vec![DiffFile {
             path: "a.rs".into(),
@@ -622,6 +625,7 @@ fn evidence(stale: bool, edits_since: u32) -> TestEvidence {
 fn evidence_line_fresh_stale_and_none() {
     let opts = plain();
     let end = |evidence| Event::TurnFinished {
+        id: None,
         reason: FinishReason::Completed,
         evidence,
     };
@@ -850,8 +854,14 @@ async fn slash_commands_map() {
             id: None,
             model: ModelId::from("compat:nowhere/x"),
         },
-        Command::Diff { turn: Some(2) },
-        Command::Diff { turn: None },
+        Command::Diff {
+            id: None,
+            turn: Some(2),
+        },
+        Command::Diff {
+            id: None,
+            turn: None,
+        },
         Command::Undo {
             id: None,
             turn: None,
@@ -953,6 +963,7 @@ async fn resume_without_arg_lists_last_10_sessions_and_with_arg_rebuilds_engine(
         ids.push(engine.session_id().to_string());
         engine
             .send(Command::SendMessage {
+                id: None,
                 text: format!("task-{i:02}\nmore"),
             })
             .await

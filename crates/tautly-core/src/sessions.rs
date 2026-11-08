@@ -290,7 +290,7 @@ fn first_prompt(log: &Path) -> Option<String> {
         };
         let text = match rec {
             SessionRecord::TurnStart { text, .. } => text,
-            SessionRecord::Command(crate::Command::SendMessage { text }) => text,
+            SessionRecord::Command(crate::Command::SendMessage { id: _, text }) => text,
             _ => continue,
         };
         let line = text.lines().find(|l| !l.trim().is_empty()).unwrap_or("");

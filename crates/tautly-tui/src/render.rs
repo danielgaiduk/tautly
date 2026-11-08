@@ -406,7 +406,11 @@ pub fn event(e: &Event, st: &mut RenderState, opts: &ReplOptions) -> Option<Stri
             let text = footer(&r, st.ctx, session);
             Some(st.line(paint(DIM, &text)))
         }
-        Event::TurnFinished { reason, evidence } => {
+        Event::TurnFinished {
+            id: _,
+            reason,
+            evidence,
+        } => {
             let mut lines = Vec::new();
             match reason {
                 FinishReason::Completed => {}

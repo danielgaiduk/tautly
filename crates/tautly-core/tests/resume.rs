@@ -189,7 +189,11 @@ impl Run {
     }
 
     async fn say(&self, text: &str) {
-        self.send(Command::SendMessage { text: text.into() }).await;
+        self.send(Command::SendMessage {
+            id: None,
+            text: text.into(),
+        })
+        .await;
     }
 
     async fn next(&mut self) -> Event {
@@ -550,7 +554,7 @@ fn resume_after_crash_mid_turn_marks_incomplete_and_continues_on_next_message() 
     );
     assert!(recs[n + 1..].iter().any(|r| matches!(
         r,
-        SessionRecord::Command(Command::SendMessage { text }) if text == "second message"
+        SessionRecord::Command(Command::SendMessage { id: _, text }) if text == "second message"
     )));
     let after = rebuild_at(&path, None);
     assert!(!after.incomplete_turn);

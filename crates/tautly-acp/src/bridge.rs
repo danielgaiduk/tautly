@@ -20,7 +20,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use serde_json::{Value, json};
 use tautly_core::{
     Command, DiffPreview, EffectView, Engine, Event, FinishReason, McpState, MemoryChange,
-    ProviderEvent, SessionReader, SessionRecord, TestEvidence, printable,
+    SessionReader, SessionRecord, TestEvidence, printable,
 };
 use tautly_rpc::jsonrpc::{
     self, Error, INVALID_PARAMS, INVALID_REQUEST, Line, MAX_LINE, METHOD_NOT_FOUND,
@@ -453,9 +453,8 @@ impl Conn {
             // history, and the first update goes out before the rest is read.
             let (tx, mut rx) = mpsc::channel(REPLAY_BOUND);
             tokio::task::spawn_blocking(move || {
-                replay(&log, &root, &mut |u| {
-                    let _ = tx.blocking_send(u);
-                });
+                // A dropped receiver (the connection went away) stops the reader.
+                replay(&log, &root, &mut |u| tx.blocking_send(u).is_ok());
             });
             while let Some(u) = rx.recv().await {
                 self.update(&session.id, u).await;
@@ -498,14 +497,26 @@ impl Conn {
         // earlier (cancelled) prompt never answers this one.
         let cmd_id = session.next_id();
         let (until, command) = match map::slash(&text) {
-            None => (Until::Turn, Command::SendMessage { text }),
+            None => (
+                Until::Turn,
+                Command::SendMessage {
+                    id: Some(cmd_id.clone()),
+                    text,
+                },
+            ),
             Some(Slash::Compact) => (
                 Until::Compact,
                 Command::Compact {
                     id: Some(cmd_id.clone()),
                 },
             ),
-            Some(Slash::Diff(turn)) => (Until::Diff, Command::Diff { turn }),
+            Some(Slash::Diff(turn)) => (
+                Until::Diff,
+                Command::Diff {
+                    id: Some(cmd_id.clone()),
+                    turn,
+                },
+            ),
             // A dry run first: the editor is asked before anything is undone (spec
             // 7.11.8's `/undo`).
             Some(Slash::Undo(turn)) => (
@@ -662,8 +673,7 @@ struct ModelSwitch {
 
 struct Waiter {
     until: Until,
-    /// The correlation id of the command whose answer this waits for (None: a turn, or
-    /// `/diff`, which carry none).
+    /// The correlation id of the command whose answer this waits for.
     cmd_id: Option<String>,
     /// `session/cancel` came: the prompt answers `cancelled` whatever the turn says.
     cancelled: bool,
@@ -1100,7 +1110,11 @@ async fn on_event(conn: &Arc<Conn>, s: &Arc<Session>, ev: Event) {
         ev @ Event::TurnReceipt { .. } => {
             lock(&s.st).receipt = Some(ev);
         }
-        Event::TurnFinished { reason, evidence } => turn_finished(conn, s, reason, evidence).await,
+        Event::TurnFinished {
+            id,
+            reason,
+            evidence,
+        } => turn_finished(conn, s, id, reason, evidence).await,
         Event::Error {
             id, message, hint, ..
         } => {
@@ -1138,9 +1152,9 @@ async fn on_event(conn: &Arc<Conn>, s: &Arc<Session>, ev: Event) {
             let (command, compacting) = {
                 let mut st = lock(&s.st);
                 st.last_error = Some(text.clone());
-                // `/diff` carries no id; an undo's error echoes the undo's.
+                // A `/diff` or undo error echoes its command's id.
                 let command = st.waiter.take_if(|w| match w.until {
-                    Until::Diff => true,
+                    Until::Diff => w.cmd_id == id,
                     Until::UndoPreview | Until::Undone => w.cmd_id == id,
                     _ => false,
                 });
@@ -1161,8 +1175,10 @@ async fn on_event(conn: &Arc<Conn>, s: &Arc<Session>, ev: Event) {
                 tell(conn, s, "error", &text, None, false).await;
             }
         }
-        Event::SessionDiff { files, unified, .. } => {
-            let waiter = lock(&s.st).take_waiter(Until::Diff, None);
+        Event::SessionDiff {
+            id, files, unified, ..
+        } => {
+            let waiter = lock(&s.st).take_waiter(Until::Diff, id.as_deref());
             if let Some(w) = waiter {
                 let text = if files.is_empty() {
                     "no changes by Tautly's tools in this scope".to_string()
@@ -1267,6 +1283,7 @@ fn tool_update(u: ToolCallUpdate) -> Value {
 async fn turn_finished(
     conn: &Conn,
     s: &Session,
+    id: Option<String>,
     reason: FinishReason,
     evidence: Option<TestEvidence>,
 ) {
@@ -1278,7 +1295,7 @@ async fn turn_finished(
     let (waiter, receipt, error) = {
         let mut st = lock(&s.st);
         (
-            st.take_waiter(Until::Turn, None),
+            st.take_waiter(Until::Turn, id.as_deref()),
             st.receipt.clone(),
             st.last_error.take(),
         )
@@ -1522,79 +1539,85 @@ fn call_edits(path: &Path, id: &str) -> Option<Vec<FileChange>> {
 }
 
 /// The updates that replay a resumed session (spec 7.11.9): its user messages, the
-/// agent's messages and its tool calls in their final state. Blocking file I/O.
-fn replay(log: &Path, root: &Path, out: &mut dyn FnMut(Value)) {
+/// agent's messages and its tool calls in their final state, from core's playback mapping
+/// ([`tautly_core::replay::events`]) with each finished edit's diff from the `Edit` records
+/// behind its result (a rewind's asserted contents left out, as in turn diffs). `out`
+/// returning false (nobody reads any more) stops it. Blocking file I/O.
+fn replay(log: &Path, root: &Path, out: &mut dyn FnMut(Value) -> bool) {
     let Ok(reader) = SessionReader::<SessionRecord>::open(log) else {
         return;
     };
-    let mut calls: HashMap<String, (String, Value)> = HashMap::new();
-    // A finished call waits for the `Edit` records behind its result.
-    let mut open: Option<(ToolCall, Vec<ToolCallContent>)> = None;
-    let flush = |open: &mut Option<(ToolCall, Vec<ToolCallContent>)>,
-                 out: &mut dyn FnMut(Value)| {
-        if let Some((mut call, diffs)) = open.take() {
-            call.content.extend(diffs);
-            let mut v = serde_json::to_value(call).unwrap_or_default();
-            v["sessionUpdate"] = json!("tool_call");
-            out(v);
-        }
-    };
+    // Each call's `Edit` records (blob references only), read ahead of the events.
+    let mut edits: HashMap<String, Vec<SessionRecord>> = HashMap::new();
+    let mut after: Option<String> = None;
     for rec in reader.records() {
         let Ok((_, rec)) = rec else {
             break;
         };
-        if let SessionRecord::Edit {
-            path,
-            pre_image,
-            post_image_blob,
-            ..
-        } = &rec
-            && let Some((_, diffs)) = &mut open
-        {
-            let text = |b: &Option<_>| match b {
-                Some(b) => reader
-                    .read_blob(b)
-                    .ok()
-                    .and_then(|v| String::from_utf8(v).ok())
-                    .map(Some),
-                None => Some(None),
-            };
-            if let (Some(old), Some(new)) = (text(pre_image), text(post_image_blob))
-                && let Some(d) = map::diff_content(
-                    &map::absolute(root, path.as_str()),
-                    old.as_deref(),
-                    new.as_deref().unwrap_or(""),
-                )
-            {
-                diffs.push(d);
-            }
-            continue;
-        }
-        flush(&mut open, out);
         match rec {
-            SessionRecord::TurnStart { text, .. } => out(json!({
+            SessionRecord::ToolResult { id, .. } => after = Some(id),
+            rec @ SessionRecord::Edit {
+                asserted: false, ..
+            } => {
+                if let Some(id) = &after {
+                    edits.entry(id.clone()).or_default().push(rec);
+                }
+            }
+            _ => after = None,
+        }
+    }
+    let text = |b: &Option<_>| match b {
+        Some(b) => reader
+            .read_blob(b)
+            .ok()
+            .and_then(|v| String::from_utf8(v).ok())
+            .map(Some),
+        None => Some(None),
+    };
+    let mut calls: HashMap<String, (String, Value)> = HashMap::new();
+    for (_, _, ev) in tautly_core::replay::events(&reader, None) {
+        let update = match ev {
+            Event::UserMessage { text } => json!({
                 "sessionUpdate": "user_message_chunk",
                 "content": ContentBlock::text(text),
-            })),
-            SessionRecord::Provider(ProviderEvent::TextDelta(text)) => out(chunk(&text)),
-            SessionRecord::ToolCall { id, name, args } => {
-                calls.insert(id, (name, args));
+            }),
+            Event::TextDelta { text } => chunk(&text),
+            Event::ToolCallProposed {
+                call_id,
+                tool,
+                args,
+            } => {
+                calls.insert(call_id, (tool, args));
+                continue;
             }
-            SessionRecord::ToolResult {
-                id,
-                result_blob,
+            Event::ToolFinished {
+                call_id,
+                output,
                 is_error,
                 blocked,
                 ..
             } => {
-                let (tool, args) = calls.remove(&id).unwrap_or_default();
-                let output = reader
-                    .read_blob(&result_blob)
-                    .ok()
-                    .map(|b| String::from_utf8_lossy(&b).into_owned())
-                    .unwrap_or_default();
+                let (tool, args) = calls.remove(&call_id).unwrap_or_default();
+                let mut content = vec![map::output_content(&output)];
+                for rec in edits.remove(&call_id).unwrap_or_default() {
+                    if let SessionRecord::Edit {
+                        path,
+                        pre_image,
+                        post_image_blob,
+                        ..
+                    } = &rec
+                        && let (Some(old), Some(new)) = (text(pre_image), text(post_image_blob))
+                        && let Some(d) = map::diff_content(
+                            &map::absolute(root, path.as_str()),
+                            old.as_deref(),
+                            new.as_deref().unwrap_or(""),
+                        )
+                    {
+                        content.push(d);
+                    }
+                }
                 let call = ToolCall {
-                    tool_call_id: id,
+                    tool_call_id: call_id,
                     title: map::tool_title(&tool, &args),
                     kind: map::tool_kind(&tool),
                     status: if is_error || blocked {
@@ -1602,16 +1625,20 @@ fn replay(log: &Path, root: &Path, out: &mut dyn FnMut(Value)) {
                     } else {
                         ToolCallStatus::Completed
                     },
-                    content: vec![map::output_content(&output)],
+                    content,
                     locations: map::locations(root, &args),
                     raw_input: Some(args),
                 };
-                open = Some((call, Vec::new()));
+                let mut v = serde_json::to_value(call).unwrap_or_default();
+                v["sessionUpdate"] = json!("tool_call");
+                v
             }
-            _ => {}
+            _ => continue,
+        };
+        if !out(update) {
+            return;
         }
     }
-    flush(&mut open, out);
 }
 
 /// What session `id` has cost so far, from the cost ledger under `data_home` (None: no

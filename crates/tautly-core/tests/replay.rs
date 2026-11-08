@@ -220,7 +220,11 @@ impl Run {
 
     /// Wait until the session has started (a command answered between turns).
     async fn settle(&mut self) {
-        self.send(Command::Diff { turn: None }).await;
+        self.send(Command::Diff {
+            id: None,
+            turn: None,
+        })
+        .await;
         self.until(|e| matches!(e, Event::SessionDiff { .. })).await;
     }
 
@@ -318,6 +322,7 @@ async fn golden_session(fx: &Fx) -> (String, Vec<Event>) {
     let mock = golden_script();
     let mut run = Run::start(fx.builder(&mock, Mode::Ask, true));
     run.send(Command::SendMessage {
+        id: None,
         text: "do it".into(),
     })
     .await;
@@ -695,6 +700,7 @@ async fn from_step_skips_earlier_steps() {
                 text: "second".into()
             },
             Event::TurnFinished {
+                id: None,
                 reason: tautly_core::FinishReason::Completed,
                 evidence: None
             },
@@ -776,7 +782,11 @@ async fn replay_during_turn_errors() {
     let (id, _) = two_turns(&fx);
     let mock = MockProvider::new(vec![MockTurn::Stall]);
     let mut run = Run::start(fx.builder(&mock, Mode::Yolo, false));
-    run.send(Command::SendMessage { text: "hi".into() }).await;
+    run.send(Command::SendMessage {
+        id: None,
+        text: "hi".into(),
+    })
+    .await;
     run.until(|e| matches!(e, Event::TurnStarted)).await;
     run.send(Command::Replay {
         id: None,

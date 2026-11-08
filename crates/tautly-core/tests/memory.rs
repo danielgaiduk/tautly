@@ -226,7 +226,11 @@ impl Run {
     }
 
     async fn turn_with(&mut self, text: &str) -> Vec<Event> {
-        self.send(Command::SendMessage { text: text.into() }).await;
+        self.send(Command::SendMessage {
+            id: None,
+            text: text.into(),
+        })
+        .await;
         self.until(|e| matches!(e, Event::TurnFinished { .. }))
             .await
     }
@@ -603,6 +607,7 @@ async fn stale_flag_appears_at_next_cache_epoch() {
     assert_eq!(
         events.last(),
         Some(&Event::TurnFinished {
+            id: None,
             reason: FinishReason::Completed,
             evidence: None
         })
@@ -688,6 +693,7 @@ async fn episode_written_after_compaction() {
     assert_eq!(
         events.last(),
         Some(&Event::TurnFinished {
+            id: None,
             reason: FinishReason::Completed,
             evidence: None
         }),

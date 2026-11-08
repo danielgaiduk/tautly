@@ -323,6 +323,7 @@ fn figures_count_from_fork_point_not_shared_prefix() {
     a.at(
         10_600,
         SessionRecord::Command(tautly_core::Command::SendMessage {
+            id: None,
             text: "queued".into(),
         }),
     );

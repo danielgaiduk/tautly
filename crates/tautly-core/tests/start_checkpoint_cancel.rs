@@ -110,7 +110,10 @@ impl Run {
     /// after it, and its reason.
     async fn cancel_at(&mut self, at: impl Fn(&Event) -> bool) -> (Duration, FinishReason) {
         self.engine
-            .send(Command::SendMessage { text: "go".into() })
+            .send(Command::SendMessage {
+                id: None,
+                text: "go".into(),
+            })
             .await
             .unwrap();
         while !at(&self.next().await) {}

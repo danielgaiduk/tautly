@@ -2612,7 +2612,7 @@ impl CheckpointJob {
         if let Ok(Err(failure)) = tokio::task::spawn_blocking(move || log.append(&rec)).await
             && let Some(ev) = failure.event()
         {
-            self.events.emit(ev).await;
+            self.events.untagged().emit(ev).await;
         }
     }
 }

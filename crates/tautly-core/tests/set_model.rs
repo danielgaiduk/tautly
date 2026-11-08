@@ -192,7 +192,11 @@ impl Run {
     }
 
     async fn say(&self, text: &str) {
-        self.send(Command::SendMessage { text: text.into() }).await;
+        self.send(Command::SendMessage {
+            id: None,
+            text: text.into(),
+        })
+        .await;
     }
 
     async fn next(&mut self) -> Event {

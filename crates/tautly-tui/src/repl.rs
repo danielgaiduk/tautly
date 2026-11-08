@@ -150,10 +150,17 @@ where
             let exit = match slash::parse(&text) {
                 Some(cmd) => self.slash(cmd).await?,
                 None => {
-                    self.send(Command::SendMessage { text }).await?;
+                    let id = self.next_id();
+                    self.send(Command::SendMessage {
+                        id: Some(id.clone()),
+                        text,
+                    })
+                    .await?;
                     matches!(
-                        self.pump(|e| matches!(e, Event::TurnFinished { .. }))
-                            .await?,
+                        self.pump(|e| {
+                            matches!(e, Event::TurnFinished { .. }) && e.answers(Some(&id))
+                        })
+                        .await?,
                         Pumped::Exit
                     )
                 }
@@ -426,10 +433,18 @@ where
                 self.print_line(&text).await?;
             }
             Slash::Diff(turn) => {
-                self.send(Command::Diff { turn }).await?;
+                let id = self.next_id();
+                self.send(Command::Diff {
+                    id: Some(id.clone()),
+                    turn,
+                })
+                .await?;
                 return Ok(exit(
-                    self.pump(|e| matches!(e, Event::SessionDiff { .. } | Event::Error { .. }))
-                        .await?,
+                    self.pump(|e| {
+                        matches!(e, Event::SessionDiff { .. } | Event::Error { .. })
+                            && e.answers(Some(&id))
+                    })
+                    .await?,
                 ));
             }
             Slash::Undo(turn) => return self.undo(turn).await,

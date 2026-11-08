@@ -253,7 +253,10 @@ impl Run {
 
     async fn turn_with(&mut self, text: &str) {
         self.engine
-            .send(Command::SendMessage { text: text.into() })
+            .send(Command::SendMessage {
+                id: None,
+                text: text.into(),
+            })
             .await
             .unwrap();
         while !matches!(self.next().await, Event::TurnFinished { .. }) {}

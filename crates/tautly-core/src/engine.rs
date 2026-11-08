@@ -619,7 +619,8 @@ fn too_many() -> String {
 }
 
 /// The events that end a command the engine does not run (`why`): an `Error` (for a
-/// `SetModel`, the `cannot switch to <model>:` refusal its client recognises), then the end
+/// event its client waits for, if it has one. The end event echoes the command's correlation
+/// id, and so does the `Error` when it is the answer ([`Command::error_answers`]).
 /// event its client waits for, if it has one. Both echo the command's correlation id.
 fn refusal(cmd: &Command, why: &str, hint: Option<&str>, session_id: &str) -> Vec<Event> {
     let id = cmd.id().map(str::to_string);
@@ -631,7 +632,7 @@ fn refusal(cmd: &Command, why: &str, hint: Option<&str>, session_id: &str) -> Ve
         _ => (ErrorKind::Internal, why.to_string()),
     };
     let mut out = vec![Event::Error {
-        id: id.clone(),
+        id: if cmd.error_answers() { id } else { None },
         kind,
         message,
         retryable: false,
@@ -647,6 +648,7 @@ fn failed_answer(cmd: &Command, session_id: &str) -> Option<Event> {
     let id = cmd.id().map(str::to_string);
     Some(match cmd {
         Command::SendMessage { .. } => Event::TurnFinished {
+            id,
             reason: FinishReason::Error,
             evidence: None,
         },
@@ -820,7 +822,7 @@ impl Actor {
                         continue;
                     };
                     let job = match cmd.clone() {
-                        Command::SendMessage { text } => Job::Turn(text),
+                        Command::SendMessage { id: _, text } => Job::Turn(text),
                         Command::Compact { .. } => Job::Compact,
                         Command::ConsolidateMemory { .. } => Job::Consolidate,
                         Command::Undo { turn, dry_run, .. } => Job::Undo { turn, dry_run },
@@ -857,13 +859,13 @@ impl Actor {
                             speed,
                             from_step,
                         },
-                        Command::SetModel { model, id } => {
+                        Command::SetModel { model, .. } => {
                             // The provider build may wait on a keychain prompt: keep taking
                             // commands meanwhile (a replay among them is refused), and let a
                             // `Shutdown` abandon the switch.
                             let mut early = Vec::new();
                             let unbound = s.events.clone();
-                            s.events = unbound.replying().tagged(id.as_deref());
+                            s.events = unbound.replying().tagged(&cmd);
                             let stop = until_shutdown(
                                 &mut commands,
                                 &mut early,
@@ -1020,19 +1022,17 @@ impl Actor {
         } = &cmd
             && self.approvals.kind(request_id) == Some(ApprovalFor::McpServer)
         {
-            self.events
-                .emit_last(Event::Error {
-                    id: None,
-                    kind: ErrorKind::Policy,
-                    message: format!(
-                        "session_rule applies to tool calls only: the MCP server approval \
-                         `{}` is still pending",
-                        crate::printable(request_id)
-                    ),
-                    retryable: false,
-                    hint: Some("approve or deny it without a session_rule".into()),
-                })
-                .await;
+            self.answer_later(vec![Event::Error {
+                id: None,
+                kind: ErrorKind::Policy,
+                message: format!(
+                    "session_rule applies to tool calls only: the MCP server approval `{}` \
+                     is still pending",
+                    crate::printable(request_id)
+                ),
+                retryable: false,
+                hint: Some("approve or deny it without a session_rule".into()),
+            }]);
             return;
         }
         let to_inbox = matches!(
@@ -1066,12 +1066,15 @@ impl Actor {
         match cmd {
             Command::Shutdown => {
                 *stopping = true;
-                for request_id in self.approvals.deny_all("the session is shutting down") {
-                    self.events
-                        .send_or_drop(Event::ApprovalWithdrawn { request_id })
-                        .await;
-                }
+                // Stop first, then say which approvals no longer wait.
+                let withdrawn = self.approvals.deny_all("the session is shutting down");
                 self.shutdown.cancel();
+                self.answer_later(
+                    withdrawn
+                        .into_iter()
+                        .map(|request_id| Event::ApprovalWithdrawn { request_id })
+                        .collect(),
+                );
             }
             // After a crashed turn (or a failed start) every command gets the same answer,
             // plus the end its client waits for.
@@ -1119,15 +1122,13 @@ impl Actor {
             }
             // A replay is a view of a log, never queued behind live work (spec 7.12.5).
             Command::Replay { id, .. } if busy => {
-                self.events
-                    .emit_last(Event::Error {
-                        id,
-                        kind: ErrorKind::Internal,
-                        message: crate::replay::REPLAY_BUSY.into(),
-                        retryable: false,
-                        hint: None,
-                    })
-                    .await;
+                self.answer_later(vec![Event::Error {
+                    id,
+                    kind: ErrorKind::Internal,
+                    message: crate::replay::REPLAY_BUSY.into(),
+                    retryable: false,
+                    hint: None,
+                }]);
             }
             other => queue.push_back(other),
         }
@@ -1173,7 +1174,7 @@ impl Actor {
     fn spawn_job(&self, mut session: Session, job: Job, cmd: Command) -> Running {
         let cancel = self.shutdown.child_token();
         let (inbox_tx, inbox_rx) = mpsc::channel(COMMAND_CAPACITY);
-        let reply_to = cmd.id().map(str::to_string);
+        let answering = session.events.tagged(&cmd);
         let mut ctl = TurnControl {
             cancel: cancel.clone(),
             inbox: inbox_rx,
@@ -1190,9 +1191,9 @@ impl Actor {
                 (id.to_string(), path.to_path_buf());
         };
         let handle = tokio::spawn(async move {
-            // The job's answer (and its errors) echo the command's correlation id.
+            // The job's answer echoes the command's correlation id (`EventSink::tagged`).
             let unbound = session.events.clone();
-            session.events = unbound.tagged(reply_to.as_deref());
+            session.events = answering;
             match job {
                 Job::Turn(text) => session.run_turn(text, &mut ctl).await,
                 Job::Compact => session.compact_command(&ctl).await,
@@ -1256,7 +1257,7 @@ impl Actor {
     /// time) for a client that is behind.
     async fn idle_command(&mut self, session: &mut Session, cmd: Command) {
         let unbound = session.events.clone();
-        session.events = unbound.replying();
+        session.events = unbound.replying().tagged(&cmd);
         self.idle_command_inner(session, cmd).await;
         session.events = unbound;
     }
@@ -1267,7 +1268,7 @@ impl Actor {
             | Command::Unpin { .. }
             | Command::ApproveMemory { .. }
             | Command::RejectMemory { .. } => session.context_command(cmd).await,
-            Command::Diff { turn } => session.diff(turn).await,
+            Command::Diff { id: _, turn } => session.diff(turn).await,
             Command::Uncompact => session.uncompact_command().await,
             Command::Label { label } => {
                 session.log(SessionRecord::Labeled { label }).await;
@@ -1321,7 +1322,7 @@ impl Actor {
             l.checkpoint()
         })
         .await;
-        let events = self.events.tagged(cmd.id());
+        let events = self.events.tagged(cmd);
         events
             .send_or_drop(Event::Error {
                 id: None,
@@ -1342,16 +1343,29 @@ impl Actor {
     /// The answer to a command a lost session (a crashed job, a failed start) cannot run:
     /// an `Error`, then the end its client waits for (`TurnFinished{error}` for a message,
     /// `ReplayFinished`, `CompactFinished`, `ConsolidateFinished`; for a `SetModel` the
-    /// error is its `cannot switch to <model>:` refusal). Each waits a bounded time for
-    /// room, so a busy client still gets it.
+    /// error is its `cannot switch to <model>:` refusal), through
+    /// [`answer_later`](Self::answer_later).
     async fn refuse_lost(&self, cmd: &Command) {
         let why = format!(
             "session {} stopped after an internal error and takes no more commands",
             self.session_id
         );
         let hint = Some("resume the session to continue");
-        for ev in refusal(cmd, &why, hint, &self.session_id) {
-            self.events.emit_last(ev).await;
+        self.answer_later(refusal(cmd, &why, hint, &self.session_id));
+    }
+
+    /// Answers a client waits for, sent in order off the actor: each waits a bounded time
+    /// for room (a busy client still gets it) while the actor goes on reading `Cancel` and
+    /// `Shutdown` (re-review N1).
+    fn answer_later(&self, events: Vec<Event>) {
+        if events.is_empty() {
+            return;
         }
+        let sink = self.events.clone();
+        tokio::spawn(async move {
+            for ev in events {
+                sink.emit_last(ev).await;
+            }
+        });
     }
 }

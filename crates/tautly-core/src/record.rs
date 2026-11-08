@@ -664,7 +664,10 @@ mod tests {
     #[test]
     fn records_round_trip_and_unknown_types_are_tolerated() {
         let recs = vec![
-            SessionRecord::Command(Command::SendMessage { text: "hi".into() }),
+            SessionRecord::Command(Command::SendMessage {
+                id: None,
+                text: "hi".into(),
+            }),
             SessionRecord::Provider(ProviderEvent::TextDelta("t".into())),
             SessionRecord::GcApplied {
                 elided: vec![("c1".into(), 3)],

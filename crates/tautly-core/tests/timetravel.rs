@@ -210,7 +210,10 @@ impl Run {
 
     async fn turn_with(&mut self, text: &str) {
         self.engine
-            .send(Command::SendMessage { text: text.into() })
+            .send(Command::SendMessage {
+                id: None,
+                text: text.into(),
+            })
             .await
             .unwrap();
         self.until(|e| matches!(e, Event::TurnFinished { .. }))
@@ -464,7 +467,10 @@ async fn state_at_with_skipped_checkpoint_is_partial() {
     ]);
     let mut run = Run::start(repo.builder(&mock));
     run.engine
-        .send(Command::SendMessage { text: "one".into() })
+        .send(Command::SendMessage {
+            id: None,
+            text: "one".into(),
+        })
         .await
         .unwrap();
     run.until(|e| matches!(e, Event::ToolStarted { .. })).await;
@@ -1374,7 +1380,10 @@ async fn human_edit_after_a_cancelled_command_turn_is_a_conflict() {
     ]);
     let mut run = Run::start(repo.builder(&mock));
     run.engine
-        .send(Command::SendMessage { text: "one".into() })
+        .send(Command::SendMessage {
+            id: None,
+            text: "one".into(),
+        })
         .await
         .unwrap();
     run.until(|e| matches!(e, Event::ToolStarted { .. })).await;
@@ -1447,7 +1456,10 @@ async fn an_offline_edit_after_cancel_then_quit_is_a_conflict() {
     let mut run = Run::start(repo.builder(&mock));
     let id = run.engine.session_id().to_string();
     run.engine
-        .send(Command::SendMessage { text: "one".into() })
+        .send(Command::SendMessage {
+            id: None,
+            text: "one".into(),
+        })
         .await
         .unwrap();
     run.until(|e| matches!(e, Event::ToolStarted { .. })).await;
@@ -1617,7 +1629,10 @@ async fn an_engine_never_runs_without_the_lease() {
     };
     assert!(message.contains("cannot start the session"), "{message}");
     run.engine
-        .send(Command::SendMessage { text: "hi".into() })
+        .send(Command::SendMessage {
+            id: None,
+            text: "hi".into(),
+        })
         .await
         .unwrap();
     let seen = run.until(|e| matches!(e, Event::Error { .. })).await;

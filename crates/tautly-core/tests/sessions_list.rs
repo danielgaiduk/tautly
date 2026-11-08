@@ -67,6 +67,7 @@ fn first_message_comes_from_the_command_when_there_is_no_turn_start() {
         SessionWriter::<SessionRecord>::create_in(data.path(), work.path(), HeaderInit::default())
             .unwrap();
     w.append(&SessionRecord::Command(Command::SendMessage {
+        id: None,
         text: "  hello there ".into(),
     }))
     .unwrap();

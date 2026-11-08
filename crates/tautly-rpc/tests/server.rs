@@ -248,7 +248,10 @@ fn methods_map_to_commands() {
         (
             "send_message",
             json!({"text": "hi", "session_id": "s1"}),
-            Command::SendMessage { text: "hi".into() },
+            Command::SendMessage {
+                id: None,
+                text: "hi".into(),
+            },
         ),
         (
             "approve",
@@ -337,8 +340,22 @@ fn methods_map_to_commands() {
                 model: ModelId::from("openai/gpt-5"),
             },
         ),
-        ("diff", json!({"turn": 2}), Command::Diff { turn: Some(2) }),
-        ("diff", json!({}), Command::Diff { turn: None }),
+        (
+            "diff",
+            json!({"turn": 2}),
+            Command::Diff {
+                id: None,
+                turn: Some(2),
+            },
+        ),
+        (
+            "diff",
+            json!({}),
+            Command::Diff {
+                id: None,
+                turn: None,
+            },
+        ),
         (
             "undo",
             json!({"dry_run": true}),
@@ -422,7 +439,10 @@ fn methods_map_to_commands() {
         (
             "send_message",
             json!({"type": "shutdown", "text": "x"}),
-            Command::SendMessage { text: "x".into() },
+            Command::SendMessage {
+                id: None,
+                text: "x".into(),
+            },
         ),
     ];
     for (method, params, want) in cases {
@@ -470,7 +490,13 @@ async fn events_become_notifications_ndjson() {
     );
     let events = c.until_type(&sid, "turn_finished").await;
     assert_eq!(events.last().unwrap().1["reason"], "completed");
+    // Re-review CP5-ENG N4: without `params.id` the request's id is the correlation id.
+    assert_eq!(events.last().unwrap().1["id"], "2");
     assert_eq!(text_of(&events, &sid), "it says hello");
+    // An explicit `params.id` wins.
+    c.ok("diff", json!({"id": "mine"})).await;
+    let diffed = c.until_type(&sid, "session_diff").await;
+    assert_eq!(diffed.last().unwrap().1["id"], "mine");
     for kind in [
         "turn_started",
         "tool_call_proposed",

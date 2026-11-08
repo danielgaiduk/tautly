@@ -134,7 +134,11 @@ impl Run {
     }
 
     async fn say(&self, text: &str) {
-        self.send(Command::SendMessage { text: text.into() }).await;
+        self.send(Command::SendMessage {
+            id: None,
+            text: text.into(),
+        })
+        .await;
     }
 
     async fn next(&mut self) -> Event {
@@ -177,7 +181,7 @@ impl Run {
 
     /// `Command::Diff` and its answer (a `SessionDiff`, or an `Error`).
     async fn diff(&mut self, turn: Option<u32>) -> Event {
-        self.send(Command::Diff { turn }).await;
+        self.send(Command::Diff { id: None, turn }).await;
         self.until(|e| matches!(e, Event::SessionDiff { .. } | Event::Error { .. }))
             .await
             .pop()
@@ -224,6 +228,7 @@ fn reason(events: &[Event]) -> FinishReason {
 fn session_diff(ev: Event) -> (Option<u32>, Vec<DiffFile>, String, bool) {
     match ev {
         Event::SessionDiff {
+            id: _,
             turn,
             files,
             unified,
@@ -538,7 +543,11 @@ async fn session_diff_reply_waits_for_a_full_event_channel() {
         })
         .await;
     }
-    run.send(Command::Diff { turn: None }).await;
+    run.send(Command::Diff {
+        id: None,
+        turn: None,
+    })
+    .await;
     tokio::time::sleep(Duration::from_millis(200)).await;
     let answer = tokio::time::timeout(
         Duration::from_secs(10),
@@ -657,5 +666,11 @@ fn old_json_without_diff_fields_parses() {
     };
     assert_eq!(files[0].status, DiffStatus::Unknown);
     let cmd: Command = serde_json::from_value(json!({"type": "diff"})).unwrap();
-    assert_eq!(cmd, Command::Diff { turn: None });
+    assert_eq!(
+        cmd,
+        Command::Diff {
+            id: None,
+            turn: None
+        }
+    );
 }

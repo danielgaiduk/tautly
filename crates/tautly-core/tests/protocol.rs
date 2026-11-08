@@ -187,6 +187,7 @@ fn every_event() -> Vec<Event> {
             estimated: true,
         },
         Event::TurnFinished {
+            id: None,
             reason: FinishReason::MaxTurns,
             evidence: None,
         },
@@ -198,6 +199,7 @@ fn every_event() -> Vec<Event> {
             hint: Some("retrying in 2s".into()),
         },
         Event::SessionDiff {
+            id: None,
             turn: Some(2),
             files: vec![
                 DiffFile {
@@ -337,6 +339,7 @@ fn every_event() -> Vec<Event> {
 fn every_command() -> Vec<Command> {
     let commands = vec![
         Command::SendMessage {
+            id: None,
             text: "fix the bug".into(),
         },
         Command::Approve {
@@ -387,8 +390,14 @@ fn every_command() -> Vec<Command> {
             at: Some(5),
             label: Some("try-b".into()),
         },
-        Command::Diff { turn: None },
-        Command::Diff { turn: Some(3) },
+        Command::Diff {
+            id: None,
+            turn: None,
+        },
+        Command::Diff {
+            id: None,
+            turn: Some(3),
+        },
         Command::SetModel {
             id: None,
             model: ModelId::from("openai/gpt-5"),
@@ -507,6 +516,7 @@ fn event_json_shape_is_stable() {
 #[test]
 fn turn_finished_with_evidence_has_a_stable_shape() {
     let e = Event::TurnFinished {
+        id: None,
         reason: FinishReason::Completed,
         evidence: Some(tautly_core::TestEvidence {
             command: "cargo test -p tautly-core".into(),
@@ -861,6 +871,7 @@ fn unknown_events_and_values_read_as_unknown_not_as_errors() {
     assert_eq!(
         e,
         Event::TurnFinished {
+            id: None,
             reason: FinishReason::Unknown,
             evidence: None,
         }

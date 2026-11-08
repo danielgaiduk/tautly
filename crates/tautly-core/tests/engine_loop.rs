@@ -141,7 +141,10 @@ fn start(b: EngineBuilder) -> Run {
 impl Run {
     async fn say(&self, text: &str) {
         self.engine
-            .send(Command::SendMessage { text: text.into() })
+            .send(Command::SendMessage {
+                id: None,
+                text: text.into(),
+            })
             .await
             .unwrap();
     }
@@ -1861,6 +1864,37 @@ async fn a_command_flood_is_refused_past_capacity_and_shutdown_reports_the_rest(
         .filter(|r| matches!(r, SessionRecord::Command(Command::Pin { .. })))
         .count();
     assert_eq!(pins, 64);
+}
+
+#[tokio::test]
+async fn a_message_and_a_diff_echo_their_ids() {
+    // Re-review CP5-ENG N2 and N5.
+    let fx = Fx::new();
+    let mock = MockProvider::new(vec![text_step("hello")]);
+    let mut run = start(fx.builder(config(Mode::Ask), &mock));
+    run.engine
+        .send(Command::SendMessage {
+            id: Some("m1".into()),
+            text: "hi".into(),
+        })
+        .await
+        .unwrap();
+    let seen = run.until(|e| matches!(e, Event::TurnFinished { .. })).await;
+    assert_eq!(seen.last().unwrap().reply_id(), Some("m1"));
+    run.engine
+        .send(Command::Diff {
+            id: Some("d1".into()),
+            turn: None,
+        })
+        .await
+        .unwrap();
+    let seen = run
+        .until(|e| matches!(e, Event::SessionDiff { .. } | Event::Error { .. }))
+        .await;
+    assert!(
+        matches!(seen.last(), Some(Event::SessionDiff { id: Some(id), .. }) if id == "d1"),
+        "{seen:?}"
+    );
 }
 
 fn flood(deltas: usize, bash_calls: usize) -> MockTurn {

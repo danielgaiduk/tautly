@@ -360,7 +360,12 @@ impl Session {
             self.recover_turn_end();
         }
         self.emit_receipt().await;
-        self.emit(Event::TurnFinished { reason, evidence }).await;
+        self.emit(Event::TurnFinished {
+            id: None,
+            reason,
+            evidence,
+        })
+        .await;
     }
 
     /// The running turn's receipt, priced at the main model's price: queued for the cost

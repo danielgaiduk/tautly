@@ -137,7 +137,10 @@ impl Run {
 
     async fn turn_with(&mut self, text: &str) {
         self.engine
-            .send(Command::SendMessage { text: text.into() })
+            .send(Command::SendMessage {
+                id: None,
+                text: text.into(),
+            })
             .await
             .unwrap();
         loop {
@@ -456,7 +459,10 @@ async fn a_skipped_turn_end_makes_the_next_checkpoint_partial() {
     ]);
     let mut run = Run::start(repo.builder(&mock));
     run.engine
-        .send(Command::SendMessage { text: "one".into() })
+        .send(Command::SendMessage {
+            id: None,
+            text: "one".into(),
+        })
         .await
         .unwrap();
     loop {
@@ -531,7 +537,10 @@ async fn wait_for(events: &mut mpsc::Receiver<Event>, pick: impl Fn(&Event) -> b
 /// Cancel a turn at its first tool call, and wait for its `TurnFinished`.
 async fn cancelled_turn(run: &mut Run) {
     run.engine
-        .send(Command::SendMessage { text: "one".into() })
+        .send(Command::SendMessage {
+            id: None,
+            text: "one".into(),
+        })
         .await
         .unwrap();
     wait_for(&mut run.events, |e| matches!(e, Event::ToolStarted { .. })).await;
@@ -605,7 +614,10 @@ async fn undo_after_a_cancel_reverts_the_cancelled_commands_writes() {
     )])]);
     let mut run = Run::start(repo.builder(&mock));
     run.engine
-        .send(Command::SendMessage { text: "one".into() })
+        .send(Command::SendMessage {
+            id: None,
+            text: "one".into(),
+        })
         .await
         .unwrap();
     wait_for(&mut run.events, |e| matches!(e, Event::ToolStarted { .. })).await;

@@ -316,6 +316,9 @@ pub enum Event {
         estimated: bool,
     },
     TurnFinished {
+        /// The `id` of the command this answers, when it carried one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
         reason: FinishReason,
         /// The turn's last test run and whether it is still fresh (spec 7.11.7); absent
         /// when the turn ran none, and in events from before this field existed.
@@ -335,6 +338,9 @@ pub enum Event {
     /// the session (`turn` None) or in user turn `turn`, with the concatenated diff (capped
     /// at 2,000 lines).
     SessionDiff {
+        /// The `id` of the command this answers, when it carried one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
         turn: Option<u32>,
         files: Vec<DiffFile>,
         unified: String,
@@ -472,7 +478,9 @@ impl Event {
             | Event::Rewound { id, .. }
             | Event::Switched { id, .. }
             | Event::ReplayFinished { id, .. }
-            | Event::ConsolidateFinished { id, .. } => id.as_deref(),
+            | Event::ConsolidateFinished { id, .. }
+            | Event::SessionDiff { id, .. }
+            | Event::TurnFinished { id, .. } => id.as_deref(),
             _ => None,
         }
     }
@@ -487,7 +495,9 @@ impl Event {
         | Event::Rewound { id, .. }
         | Event::Switched { id, .. }
         | Event::ReplayFinished { id, .. }
-        | Event::ConsolidateFinished { id, .. } = self
+        | Event::ConsolidateFinished { id, .. }
+        | Event::SessionDiff { id, .. }
+        | Event::TurnFinished { id, .. } = self
             && id.is_none()
         {
             *id = Some(reply.to_string());
@@ -546,6 +556,9 @@ pub enum BudgetScope {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Command {
     SendMessage {
+        /// The client's correlation id, echoed as `id` on this command's answer.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
         text: String,
     },
     /// Allow the call behind a [`Event::ToolApprovalRequested`], or the server behind a
@@ -615,6 +628,9 @@ pub enum Command {
     /// Answered with [`Event::SessionDiff`]: the whole session (None) or user turn `turn`
     /// (1-based).
     Diff {
+        /// The client's correlation id, echoed as `id` on this command's answer.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
         turn: Option<u32>,
     },
     /// Switch the session to `model` (spec 7.11.5): at once when idle, else at the start of
@@ -710,7 +726,9 @@ impl Command {
     /// The client's correlation id, on the commands that have a terminal answer.
     pub fn id(&self) -> Option<&str> {
         match self {
-            Command::Undo { id, .. }
+            Command::SendMessage { id, .. }
+            | Command::Diff { id, .. }
+            | Command::Undo { id, .. }
             | Command::Fork { id, .. }
             | Command::Rewind { id, .. }
             | Command::Switch { id, .. }
@@ -720,6 +738,42 @@ impl Command {
             | Command::ConsolidateMemory { id } => id.as_deref(),
             _ => None,
         }
+    }
+
+    /// Give the command the correlation id `default` when it takes one and has none (the
+    /// RPC server's: the JSON-RPC request id).
+    pub fn set_default_id(&mut self, default: String) {
+        if let Command::SendMessage { id, .. }
+        | Command::Diff { id, .. }
+        | Command::Undo { id, .. }
+        | Command::Fork { id, .. }
+        | Command::Rewind { id, .. }
+        | Command::Switch { id, .. }
+        | Command::Replay { id, .. }
+        | Command::Compact { id }
+        | Command::SetModel { id, .. }
+        | Command::ConsolidateMemory { id } = self
+            && id.is_none()
+        {
+            *id = Some(default);
+        }
+    }
+
+    /// Whether an `Error` can be this command's answer (it then echoes the command's `id`):
+    /// `Undo`, `Fork`, `Rewind`, `Switch`, `SetModel` and `Diff`. The others end with their
+    /// own event (`TurnFinished`, `CompactFinished`, `ConsolidateFinished`,
+    /// `ReplayFinished`), and an `Error` before it says why, without the id; a `Replay`
+    /// refused because something runs is the exception (its `Error` is its answer).
+    pub fn error_answers(&self) -> bool {
+        matches!(
+            self,
+            Command::Undo { .. }
+                | Command::Fork { .. }
+                | Command::Rewind { .. }
+                | Command::Switch { .. }
+                | Command::SetModel { .. }
+                | Command::Diff { .. }
+        )
     }
 
     /// The command as the session log records it: an `Approve` without its
