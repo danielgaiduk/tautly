@@ -467,11 +467,6 @@ pub fn ollama_model(installed: &[String], catalog: &Catalog) -> (ModelId, Option
     (ModelId::from(format!("{prefix}{first}")), Some(warning))
 }
 
-/// [`setup_hint_with`] for the spec's variable names.
-pub fn setup_hint() -> String {
-    setup_hint_with(&KeyVars::default())
-}
-
 /// What to do when no provider is usable: the variables detection and the session read
 /// (`vars`), `tautly auth add` and Ollama.
 pub fn setup_hint_with(vars: &KeyVars) -> String {

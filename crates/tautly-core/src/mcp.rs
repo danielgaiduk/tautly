@@ -695,7 +695,7 @@ impl Session {
             return;
         };
         let (extra, first) = mcp.tools_for_turn(cancel).await;
-        let tools = registry(&self.info.caps, extra);
+        let tools = registry(extra);
         let specs: Vec<ToolSpec> = tools.iter().map(|t| t.spec(&self.info.caps)).collect();
         if specs != self.specs && !first {
             let mcp_names = |s: &[ToolSpec]| -> Vec<String> {

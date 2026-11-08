@@ -327,7 +327,7 @@ impl EngineBuilder {
         let (event_tx, event_rx) = mpsc::channel(EVENT_CAPACITY);
         let (command_tx, command_rx) = mpsc::channel(COMMAND_CAPACITY);
         // MCP tools join at the first user-turn start (`Session::refresh_mcp_tools`).
-        let tools = registry(&info.caps, Vec::new());
+        let tools = registry(Vec::new());
         let specs = tools.iter().map(|t| t.spec(&info.caps)).collect();
         let mcp = McpSetup::new(&config, self.client_mcp, self.approve_mcp, &data_home);
         let context = Context {

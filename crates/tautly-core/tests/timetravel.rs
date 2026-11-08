@@ -704,7 +704,7 @@ fn assemble(rebuilt: &tautly_core::resume::Rebuilt) -> CanonicalRequest {
         .effective_catalog()
         .get(&ModelId::from(MODEL))
         .caps;
-    let specs: Vec<_> = tautly_tools::registry(&caps, Vec::new())
+    let specs: Vec<_> = tautly_tools::registry(Vec::new())
         .iter()
         .map(|t| t.spec(&caps))
         .collect();

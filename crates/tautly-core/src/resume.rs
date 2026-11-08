@@ -165,7 +165,7 @@ impl Calibration {
     /// What a request on `model` was assembled with.
     fn assembly(&self, model: &ModelId) -> (Capabilities, Vec<ToolSpec>) {
         let caps = self.catalog.get(model).caps;
-        let specs = registry(&caps, self.extra.clone())
+        let specs = registry(self.extra.clone())
             .iter()
             .map(|t| t.spec(&caps))
             .collect();

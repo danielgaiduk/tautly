@@ -215,7 +215,7 @@ impl Session {
             .filter(|t| t.name().starts_with(MCP_TOOL_PREFIX))
             .cloned()
             .collect();
-        self.tools = registry(&info.caps, mcp);
+        self.tools = registry(mcp);
         self.specs = self.tools.iter().map(|t| t.spec(&info.caps)).collect();
         self.budgets
             .lock()

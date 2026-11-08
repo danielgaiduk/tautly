@@ -323,7 +323,7 @@ fn assembly() -> (tautly_provider::Capabilities, Vec<ToolSpec>) {
     let caps = catalog(200_000, 8_000, "str_replace")
         .get(&ModelId::from(MODEL))
         .caps;
-    let specs = tautly_tools::registry(&caps, Vec::new())
+    let specs = tautly_tools::registry(Vec::new())
         .iter()
         .map(|t| t.spec(&caps))
         .collect();

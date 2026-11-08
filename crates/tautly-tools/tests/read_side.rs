@@ -223,9 +223,9 @@ async fn glob_returns_sorted_relative_paths_and_terminates_on_symlink_cycle() {
 #[test]
 fn registry_order_is_stable() {
     let caps = Capabilities::conservative();
-    let tools = registry(&caps, Vec::new());
+    let tools = registry(Vec::new());
     // Extra (MCP) tools come after the built-in ones.
-    let with_extra = registry(&caps, vec![tools[0].clone()]);
+    let with_extra = registry(vec![tools[0].clone()]);
     assert_eq!(with_extra.len(), tools.len() + 1);
     assert_eq!(with_extra.last().unwrap().name(), "read");
     let names: Vec<_> = tools.iter().map(|t| t.name()).collect();

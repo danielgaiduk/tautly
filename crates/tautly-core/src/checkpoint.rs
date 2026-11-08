@@ -1179,11 +1179,6 @@ impl Checkpointer {
         &self.session
     }
 
-    /// New checkpoints go to `session`'s refs from now on (a fork's branch).
-    pub fn set_session(&mut self, session: String) {
-        self.session = session;
-    }
-
     pub fn config(&self) -> &CheckpointConfig {
         &self.cfg
     }
