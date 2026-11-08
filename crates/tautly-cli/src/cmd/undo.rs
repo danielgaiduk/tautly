@@ -145,7 +145,8 @@ fn print_report(report: &UndoReport, session: &LogSummary, root: &Path) {
         );
     }
     if let Some(note) = &report.note {
-        println!("note: {note}");
+        // It names files, which the repository chose (CP5 re-review N1).
+        println!("note: {}", tautly_core::printable_multiline(note));
     }
     if report.dry_run {
         println!("nothing was changed");

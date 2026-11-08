@@ -602,6 +602,29 @@ fn repository_text_never_reaches_the_terminal_raw() {
     assert_eq!(undo.status.code(), Some(0), "{}", stderr(&undo));
     assert!(out_text(&undo).contains("deleted a"), "{}", out_text(&undo));
     assert!(!out_text(&undo).contains(esc), "{:?}", out_text(&undo));
+
+    // The note naming a kept ignored file (CP5 re-review N1), in a git work tree.
+    let g = Scratch::new();
+    g.write(".gitignore", "*.log\n");
+    g.write("a.txt", "a\n");
+    git(&g, &["init", "-q"]);
+    git(&g, &["add", "-A"]);
+    git(&g, &["commit", "-q", "-m", "i"]);
+    let command = "touch 'x\u{1b}]0;owned\u{7}\u{1b}[2Jy.log' && : > .gitignore";
+    let script = g.script(
+        "n.json",
+        json!([[
+            {"tool_call": {"id": "b1", "name": "bash",
+                           "input_json": json!({"command": command}).to_string()}},
+            {"done": {"stop": "tool_use"}}
+        ], text("ok")]),
+    );
+    let out = g.run(&["-p", "go", "--approve", "yolo", "--mock-script", &script]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let undo = g.run(&["undo"]);
+    assert_eq!(undo.status.code(), Some(0), "{}", stderr(&undo));
+    assert!(out_text(&undo).contains("note:"), "{}", out_text(&undo));
+    assert!(!out_text(&undo).contains(esc), "{:?}", out_text(&undo));
 }
 
 /// CP5 review M3: `tautly undo` takes the working-tree lease exclusively, so it refuses
