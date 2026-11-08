@@ -35,7 +35,7 @@ use futures::FutureExt;
 use futures::future::join_all;
 use serde_json::Value;
 use tautly_provider::Content;
-use tautly_sandbox::{Decision, Effect, SPILL_DIR};
+use tautly_sandbox::{Decision, Effect, Mode, SPILL_DIR};
 use tautly_session::{BlobRef, RelPath};
 use tautly_tools::AppliedEffect;
 use tautly_tools::{
@@ -482,9 +482,10 @@ impl Session {
             None => (None, None),
         };
         let Some((request_id, rx)) = ctl.approvals.open(ApprovalFor::Tool) else {
+            let hint = headless_hint(self.policy.mode(), &reason);
             return Err(Outcome::refused(ToolResult::error(format!(
                 "denied: this call needs approval ({reason}), and nobody can approve it in \
-                 this session (headless); the user can allow it with --approve auto-edit or yolo"
+                 this session (headless); {hint}"
             ))));
         };
         self.log_approval(SessionRecord::ApprovalRequested {
@@ -884,8 +885,34 @@ fn broad_rule(rule: &str) -> bool {
     }
 }
 
+/// What a headless denial tells the user to do: only what would let this call run.
+fn headless_hint(mode: Mode, reason: &str) -> &'static str {
+    if reason.starts_with("protected path") || reason.starts_with("unparseable command") {
+        return "protected paths and unparseable commands always ask, so only an interactive \
+                session can run it";
+    }
+    match mode {
+        Mode::Ask => {
+            "the user can allow it with --approve auto-edit (edits) or yolo (commands too), \
+             or an allow rule"
+        }
+        Mode::AutoEdit => "the user can allow it with --approve yolo or an allow rule",
+        Mode::Yolo => "the user can allow it with an allow rule",
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn headless_hint_names_only_what_helps() {
+        let h = super::headless_hint;
+        assert!(h(Mode::AutoEdit, "protected path: Cargo.toml").contains("interactive"));
+        assert!(h(Mode::Ask, "unparseable command: x").contains("interactive"));
+        assert!(!h(Mode::AutoEdit, "command requires approval").contains("auto-edit"));
+        assert!(h(Mode::AutoEdit, "command requires approval").contains("yolo"));
+        assert!(h(Mode::Ask, "write requires approval").contains("auto-edit"));
+    }
+
     /// Re-review T30 (M1 nit): rules that match far more than one call are flagged.
     #[test]
     fn broad_rules_are_recognized() {

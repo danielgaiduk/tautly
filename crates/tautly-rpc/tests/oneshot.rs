@@ -121,7 +121,10 @@ async fn oneshot_text_prints_text_only() {
     let fx = Fx::new();
     fx.write("a.txt", "hello\n");
     let mock = MockProvider::new(vec![
-        tools_step(vec![call("c1", "read", json!({"path": "a.txt"}))]),
+        tools_step(vec![
+            tautly_provider::ProviderEvent::TextDelta("Reading it.".into()),
+            call("c1", "read", json!({"path": "a.txt"})),
+        ]),
         MockTurn::Events(vec![
             tautly_provider::ProviderEvent::TextDelta("Hello".into()),
             tautly_provider::ProviderEvent::TextDelta(", world.".into()),
@@ -138,7 +141,8 @@ async fn oneshot_text_prints_text_only() {
     )
     .await;
     assert_eq!(code, 0);
-    assert_eq!(out, "Hello, world.\n");
+    // Text after a tool starts a new paragraph, never run on from the text before it.
+    assert_eq!(out, "Reading it.\n\nHello, world.\n");
 }
 
 /// Run `prompt` through `run_oneshot_to`; the exit code, stdout and stderr.

@@ -129,9 +129,10 @@ async fn session_load_of_a_large_log_keeps_rss_bounded() {
                 PROBE,
                 format!("{}\n{}\n{id}", root.display(), home.path().display()),
             );
-        if let Some(n) = arenas {
-            cmd.env("MALLOC_ARENA_MAX", n);
-        }
+        match arenas {
+            Some(n) => cmd.env("MALLOC_ARENA_MAX", n),
+            None => cmd.env_remove("MALLOC_ARENA_MAX"),
+        };
         let out = cmd.output().unwrap();
         let text = String::from_utf8_lossy(&out.stdout);
         assert!(

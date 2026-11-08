@@ -255,6 +255,8 @@ impl<'a> Git<'a> {
         argv.extend(args.iter().map(|a| a.to_string()));
         let mut env: Vec<(String, String)> = [
             ("GIT_CONFIG_NOSYSTEM", "1"),
+            // English messages: `Skip::is_missing_object` matches git's error text.
+            ("LC_ALL", "C"),
             ("GIT_TERMINAL_PROMPT", "0"),
             ("GIT_ASKPASS", ""),
             ("GIT_PAGER", "cat"),

@@ -12,6 +12,9 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
+    # The workspace's debug build with full debug info filled the Linux runner's disk.
+    env:
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -89,6 +92,11 @@ jobs:
         env:
           TAUTLY_BASELINE_BIN: baseline/tautly
       - run: cargo test --release -p tautly -p tautly-perf --features tautly/mock -- --ignored --test-threads=1 --nocapture
+        env:
+          # glibc's per-thread malloc arenas keep freed memory resident (soak RSS +10%, ACP
+          # load +155 MB uncapped), which the RSS gates are not about; release binaries for
+          # Linux use musl. acp_load still reports the uncapped figure.
+          MALLOC_ARENA_MAX: "2"
       # Built by the test build above (the binary the integration tests run).
       - run: ./target/release/tautly eval --replay evals/replay --jobs 4
       - if: runner.os == 'Linux'

@@ -65,6 +65,7 @@ pub async fn run_oneshot_to(
         output,
         broken: false,
         last_text: None,
+        step_break: false,
     };
     let mut code = None;
     if engine
@@ -117,6 +118,8 @@ struct Printer<W, E> {
     broken: bool,
     /// The last character of text written (text output).
     last_text: Option<char>,
+    /// A tool ran since the last text: the next text starts a new paragraph.
+    step_break: bool,
 }
 
 impl<W: AsyncWrite + Unpin, E: AsyncWrite + Unpin> Printer<W, E> {
@@ -131,12 +134,21 @@ impl<W: AsyncWrite + Unpin, E: AsyncWrite + Unpin> Printer<W, E> {
             }
             OutputFormat::Text => match ev {
                 Event::TextDelta { text } => {
+                    if !text.is_empty()
+                        && std::mem::take(&mut self.step_break)
+                        && let Some(last) = self.last_text
+                    {
+                        self.write(if last == '\n' { b"\n" } else { b"\n\n" }).await;
+                    }
                     if let Some(c) = text.chars().last() {
                         self.last_text = Some(c);
                     }
                     self.write(text.as_bytes()).await;
                 }
                 ev => {
+                    if matches!(ev, Event::ToolFinished { .. }) {
+                        self.step_break = true;
+                    }
                     if let Some(line) = diagnostic(ev) {
                         // Messages may quote repository text (CP5 review M1).
                         let line = format!("tautly: {}\n", tautly_core::printable_multiline(&line));

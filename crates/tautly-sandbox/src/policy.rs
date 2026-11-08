@@ -339,6 +339,11 @@ impl Policy {
         &self.root
     }
 
+    /// The configured mode.
+    pub fn mode(&self) -> Mode {
+        self.mode
+    }
+
     /// Add an in-memory allow rule for the rest of this policy's life ("allow for this
     /// session", spec 7.11.8). It is checked with the configured allow rules, so deny
     /// rules, protected paths and unparseable commands still win over it.
