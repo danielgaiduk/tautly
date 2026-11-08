@@ -54,7 +54,7 @@ mod cmd;
 mod local;
 mod repl;
 
-/// How long, after the sessions have shut down, background work may hold up the exit.
+/// How long a session still shutting down when the client is done may hold up the exit.
 const EXIT_GRACE: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Parser)]
@@ -468,9 +468,15 @@ fn main() -> ExitCode {
             1
         }
     };
-    // Every session has shut down (its event stream ended); what may be left is blocking
-    // work such as a file watcher still starting.
-    runtime.shutdown_timeout(EXIT_GRACE);
+    // Normally every session has shut down (its event stream ended, its log closed) and
+    // nothing is worth waiting for: what is left is blocking work such as the stdin reader
+    // of `--rpc`/`acp` or a file watcher still starting. Only a session still closing (an
+    // error path) gets the grace.
+    if tautly_core::sessions_running() {
+        runtime.shutdown_timeout(EXIT_GRACE);
+    } else {
+        runtime.shutdown_background();
+    }
     ExitCode::from(u8::try_from(code).unwrap_or(1))
 }
 

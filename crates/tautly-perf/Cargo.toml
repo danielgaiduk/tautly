@@ -8,7 +8,8 @@ license.workspace = true
 publish = false
 
 # The gates live in benches/perf/ (spec 9.1). Every gate is `#[ignore]`: the CI `perf` job
-# runs them in release with `cargo test --release -p tautly-perf -- --ignored --test-threads=1`.
+# runs them in release with `cargo test --release -p tautly -p tautly-perf --features
+# tautly/mock -- --ignored --test-threads=1` (the selection of its build step: no rebuild).
 
 [dependencies]
 libc.workspace = true

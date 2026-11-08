@@ -47,7 +47,7 @@ pub use config::{
     LoadedConfig, MODELS_FILE, ProviderEntry, ProvidersConfig, ReceiptsConfig, RoutingConfig,
     TelemetryConfig, config_home, parse_models_file,
 };
-pub use engine::{Engine, EngineBuilder, EngineError, session_root};
+pub use engine::{Engine, EngineBuilder, EngineError, session_root, sessions_running};
 pub use evidence::{
     DEFAULT_TEST_COMMANDS, EvidenceConfig, EvidenceTracker, TestEvidence, TestMatcher,
 };

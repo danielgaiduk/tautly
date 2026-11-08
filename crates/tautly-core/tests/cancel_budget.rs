@@ -1370,10 +1370,10 @@ async fn a_stuck_ledger_delays_shutdown_by_at_most_about_a_second() {
     run.send(Command::Shutdown).await;
     run.until_closed().await;
     let took = t0.elapsed();
-    // The flush waits 1 s; unbounded, it would wait out the ledger's 5 s busy timeout (the
-    // lock is held until after the close). 4 s tells the two apart with room for a loaded
-    // CI runner.
-    assert!(took < Duration::from_secs(4), "shutdown took {took:?}");
+    // The flush waits 1 s (spec: "about a second"); unbounded, it would wait out the
+    // ledger's 5 s busy timeout, since the lock is held until after the close. 1 s plus a
+    // 2 s margin for a loaded runner still ends 2 s before the busy timeout could.
+    assert!(took < Duration::from_secs(3), "shutdown took {took:?}");
     holder.execute_batch("COMMIT;").unwrap();
     drop(holder);
     // The writer goes on after the session: the row still arrives.

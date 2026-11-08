@@ -172,6 +172,53 @@ async fn output_past_the_stream_threshold_spills_whole_with_head_and_tail() {
 }
 
 #[tokio::test]
+async fn a_cancel_ends_the_drain_of_pipes_an_escaped_process_holds() {
+    // The shell exits at once; a process that left the group (setsid) keeps stdout open,
+    // so the pipes would be drained for up to 5 s.
+    let s = unique_sleep();
+    let (dir, sb) = sandbox();
+    let token = CancellationToken::new();
+    let cx = cx(&dir).with_cancel(token.clone());
+    let t2 = token.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(1000)).await;
+        t2.cancel();
+    });
+    let t = Instant::now();
+    let cmd = format!(
+        "echo before; perl -e 'use POSIX; fork and exit; POSIX::setsid(); exec \"sleep\", \"{s}\"'"
+    );
+    let r = BashTool.run(json!({ "command": cmd }), &sb, &cx).await;
+    let took = t.elapsed();
+    let _ = Command::new("pkill")
+        .args(["-f", &format!("sleep {s}")])
+        .status();
+    assert!(r.output.contains("before"), "{}", r.output);
+    // Cancelled at 1 s: well before the 5 s drain cap.
+    assert!(took < Duration::from_secs(4), "{took:?}");
+}
+
+#[tokio::test]
+async fn line_oriented_output_past_the_stream_threshold_is_not_throttled() {
+    // About 39 MB of short lines: before buffering, each line was its own spill write and
+    // this took tens of seconds; now it is about a second.
+    let (dir, sb) = sandbox();
+    let t = Instant::now();
+    let r = BashTool
+        .run(json!({"command": "seq -f %.0f 1 5000000"}), &sb, &cx(&dir))
+        .await;
+    let took = t.elapsed();
+    assert!(!r.is_error, "{}", &r.output[r.output.len() - 200..]);
+    assert!(
+        r.output.contains("5000000"),
+        "{}",
+        &r.output[r.output.len() - 200..]
+    );
+    // Generous for a loaded debug build; unbuffered it took over 20 s.
+    assert!(took < Duration::from_secs(15), "{took:?}");
+}
+
+#[tokio::test]
 async fn cap_output_small_is_untouched() {
     let (_d, sb) = sandbox();
     let (text, spill) = cap_output("short", 100, &sb).await;

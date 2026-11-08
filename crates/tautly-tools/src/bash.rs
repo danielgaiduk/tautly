@@ -38,6 +38,10 @@ const MAX_CAPTURE: usize = 16 * 1024 * 1024;
 /// Output beyond this streams to a spill file, keeping only its head and tail in memory
 /// (spec 9.1: 100 MB of output, bounded RSS). Such output is not summarized by the filters.
 const STREAM_AT: usize = 4 * 1024 * 1024;
+/// Most bytes of one command's output kept in its spill file (the brief sets no limit);
+/// past it the file ends with a truncation marker. The in-memory head and tail still
+/// cover the whole output.
+const SPILL_MAX: u64 = 1024 * 1024 * 1024;
 /// Longest piece of output read as one unit; longer lines are split, so a
 /// newline-free flood never sits in memory whole.
 const MAX_CHUNK: usize = 64 * 1024;
@@ -176,8 +180,10 @@ fn spawn_reader<R: AsyncRead + Unpin + Send + 'static>(
     });
 }
 
-/// Bytes up to and including the next newline, or `MAX_CHUNK` bytes, whichever
-/// comes first. Empty at end of input.
+/// The whole lines already buffered (up to and including the last newline among them),
+/// or `MAX_CHUNK` bytes, whichever is less: a flood of short lines costs one channel
+/// message per buffer, not per line. Waits only until a newline or `MAX_CHUNK` bytes
+/// arrive. Empty at end of input.
 async fn read_chunk<R: AsyncBufRead + Unpin>(r: &mut R) -> std::io::Result<Vec<u8>> {
     let mut out = Vec::new();
     loop {
@@ -187,7 +193,7 @@ async fn read_chunk<R: AsyncBufRead + Unpin>(r: &mut R) -> std::io::Result<Vec<u
         }
         let room = MAX_CHUNK - out.len();
         let window = &buf[..buf.len().min(room)];
-        let (n, done) = match window.iter().position(|&b| b == b'\n') {
+        let (n, done) = match window.iter().rposition(|&b| b == b'\n') {
             Some(i) => (i + 1, true),
             None => (window.len(), window.len() == room),
         };
@@ -214,6 +220,9 @@ struct Streamed {
     path: PathBuf,
     file: tautly_sandbox::SpillWriter,
     total: u64,
+    /// Bytes written to the file; at most `cap`, then a truncation marker.
+    saved: u64,
+    cap: u64,
     /// The last bytes seen (at least [`OUTPUT_CAP`] once there are that many).
     tail: Vec<u8>,
     /// A write failed: the file is incomplete and is not offered.
@@ -229,13 +238,7 @@ impl Capture<'_> {
         if self.stream.is_none() && !self.in_memory && self.buf.len() + line.len() > STREAM_AT {
             match self.sb.spill_stream().await {
                 Ok(Some((path, file))) => {
-                    let mut s = Streamed {
-                        path,
-                        file,
-                        total: 0,
-                        tail: Vec::new(),
-                        broken: false,
-                    };
+                    let mut s = Streamed::new(path, file, SPILL_MAX);
                     // Only the head of what was held so far stays in memory.
                     let head = self.buf[..OUTPUT_CAP.min(self.buf.len())].to_vec();
                     s.write(&std::mem::take(&mut self.buf)).await;
@@ -256,10 +259,35 @@ impl Capture<'_> {
 }
 
 impl Streamed {
+    fn new(path: PathBuf, file: tautly_sandbox::SpillWriter, cap: u64) -> Streamed {
+        Streamed {
+            path,
+            // Output arrives a line at a time: unbuffered, every line would be its own
+            // write on the blocking pool, throttling the command 10-25x (Task 33 I1).
+            file: Box::new(tokio::io::BufWriter::with_capacity(256 * 1024, file)),
+            total: 0,
+            saved: 0,
+            cap,
+            tail: Vec::new(),
+            broken: false,
+        }
+    }
+
     async fn write(&mut self, bytes: &[u8]) {
         use tokio::io::AsyncWriteExt as _;
-        if !self.broken && self.file.write_all(bytes).await.is_err() {
-            self.broken = true;
+        if !self.broken && self.saved < self.cap {
+            let part = &bytes[..bytes.len().min((self.cap - self.saved) as usize)];
+            let mut ok = self.file.write_all(part).await.is_ok();
+            self.saved += part.len() as u64;
+            if ok && self.saved >= self.cap {
+                // An endless command (`yes`) must not fill the disk until its timeout.
+                let marker = format!(
+                    "\n… [spill truncated: only the first {} bytes of the output are saved] …\n",
+                    self.cap
+                );
+                ok = self.file.write_all(marker.as_bytes()).await.is_ok();
+            }
+            self.broken = !ok;
         }
         self.total += bytes.len() as u64;
         self.tail.extend_from_slice(bytes);
@@ -270,8 +298,8 @@ impl Streamed {
     }
 
     /// The capped text (head, omitted-bytes marker, tail, as [`cap_text`] makes it) and
-    /// the spill file, unless a write failed.
-    async fn finish(mut self, head: &[u8]) -> (String, Option<PathBuf>) {
+    /// the spill file; a file whose write failed is deleted and not offered.
+    async fn finish(mut self, head: &[u8], sb: &dyn Sandbox) -> (String, Option<PathBuf>) {
         use tokio::io::AsyncWriteExt as _;
         if self.file.flush().await.is_err() {
             self.broken = true;
@@ -284,13 +312,20 @@ impl Streamed {
             start += 1;
         }
         let tail = &self.tail[start..];
-        let omitted = self.total - head.len() as u64 - tail.len() as u64;
+        let omitted = self
+            .total
+            .saturating_sub(head.len() as u64 + tail.len() as u64);
         let text = format!(
             "{}\n… [{omitted} bytes omitted] …\n{}",
             String::from_utf8_lossy(head),
             String::from_utf8_lossy(tail)
         );
-        (text, (!self.broken).then_some(self.path))
+        if self.broken {
+            drop(self.file);
+            let _ = sb.remove_file(&self.path).await;
+            return (text, None);
+        }
+        (text, Some(self.path))
     }
 }
 
@@ -428,6 +463,14 @@ impl Tool for BashTool {
             tokio::select! {
                 biased;
                 _ = cx.cancel().cancelled(), if exit.is_none() => break Outcome::Cancelled,
+                // The shell has exited and the pipes are being drained (up to EOF_DRAIN
+                // when a process that left the group holds them): a cancel ends the drain
+                // with what was read so far.
+                _ = cx.cancel().cancelled(), if exit.is_some() => {
+                    if let Some(status) = exit {
+                        break Outcome::Exited(status);
+                    }
+                }
                 _ = tokio::time::sleep_until(deadline), if exit.is_none() => break Outcome::TimedOut,
                 line = lines.recv(), if pipes_open => match line {
                     Some(l) => cap.push(l).await,
@@ -504,7 +547,7 @@ impl Tool for BashTool {
         drop(readers);
         drop(lines);
         let streamed = match cap.stream.take() {
-            Some(s) => Some(s.finish(&cap.buf).await),
+            Some(s) => Some(s.finish(&cap.buf, sb).await),
             None => None,
         };
         // Output that streamed to a spill file is too large to summarize: head and tail.
@@ -545,5 +588,33 @@ impl Tool for BashTool {
             .and_then(|s| test_counts(s, &full, exit_code));
         r.effects.push(AppliedEffect::Exec { may_write: true });
         r
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::AsyncReadExt as _;
+
+    #[tokio::test]
+    async fn the_spill_stops_at_its_cap_with_a_marker_and_the_tail_stays_whole() {
+        let (w, mut r) = tokio::io::duplex(1 << 16);
+        let mut s = Streamed::new(PathBuf::from("x"), Box::new(w), 10);
+        s.write(b"0123456").await;
+        s.write(b"789abcdef").await;
+        s.write(b"ghij").await;
+        let dir = tempfile::tempdir().unwrap();
+        let sb = tautly_sandbox::LocalSandbox::new(dir.path().to_path_buf()).unwrap();
+        let (text, path) = s.finish(b"0123456", &sb).await;
+        assert_eq!(path, Some(PathBuf::from("x")));
+        assert!(text.ends_with("ghij"), "{text}");
+        let mut saved = Vec::new();
+        r.read_to_end(&mut saved).await.unwrap();
+        let saved = String::from_utf8(saved).unwrap();
+        assert!(
+            saved.starts_with("0123456789\n… [spill truncated"),
+            "{saved}"
+        );
+        assert!(!saved.contains("abc"), "{saved}");
     }
 }

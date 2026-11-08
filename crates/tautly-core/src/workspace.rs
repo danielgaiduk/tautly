@@ -25,6 +25,9 @@ use tokio::sync::watch;
 
 use crate::engine::{EngineError, session_root};
 
+/// The bound of [`Workspace::wait_ready_or_failed`].
+const READY_OR_FAILED_BOUND: Duration = Duration::from_secs(600);
+
 /// Why the index database could not be locked exclusively.
 #[derive(Debug, thiserror::Error)]
 pub enum IndexLockError {
@@ -281,22 +284,20 @@ impl Workspace {
         .unwrap_or(false)
     }
 
-    /// Wait, with no time limit, until the index has finished its first refresh (true) or
-    /// never will: it could not be opened, or that refresh failed (false; see
-    /// [`Index::last_error`]). For callers that must not guess how long a loaded machine
-    /// takes, such as tests.
+    /// Wait until the index has finished its first refresh (true) or never will: it could
+    /// not be opened, or that refresh failed (false; see [`Index::last_error`]). Bounded
+    /// only by [`READY_OR_FAILED_BOUND`], far beyond any loaded machine, so a readiness
+    /// regression fails instead of hanging. For callers that must not guess how long a
+    /// loaded machine takes, such as tests.
     pub async fn wait_ready_or_failed(&self) -> bool {
-        let Some(index) = self.opened().await.index.clone() else {
+        let opened = tokio::time::timeout(READY_OR_FAILED_BOUND, self.opened()).await;
+        let Some(index) = opened.ok().and_then(|o| o.index.clone()) else {
             return false;
         };
-        // shortcut: a failed refresh is polled for (it has no signal of its own); fine at
-        // 50 ms for the callers this serves.
-        while !index.wait_ready(Duration::from_millis(50)).await {
-            if index.last_error().is_some() && !index.is_ready() {
-                return false;
-            }
-        }
-        true
+        index
+            .wait_first_refresh(READY_OR_FAILED_BOUND)
+            .await
+            .unwrap_or(false)
     }
 }
 

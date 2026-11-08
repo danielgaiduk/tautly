@@ -48,3 +48,30 @@ async fn hundred_megabytes_of_output_spill_with_bounded_rss() {
     assert_eq!(spilled, 100_000_000);
     assert!(grown < 20 * MB, "peak RSS grew by {} MB", grown / MB);
 }
+
+/// Line-oriented output past the 4 MB stream threshold (Task 33 review I1): about 109 MB
+/// of short lines, each its own chunk, must not be throttled by the spill writes. (Named
+/// to run after the RSS gate, whose process-wide peak it would otherwise raise.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "perf gate"]
+async fn line_output_streams_at_full_speed() {
+    let dir = TempDir::new().unwrap();
+    let sb = LocalSandbox::new(dir.path().to_path_buf()).unwrap();
+    let cx = ToolCx::new(EditFormat::StrReplace, dir.path().join(".spill"));
+    let t = std::time::Instant::now();
+    let r = BashTool
+        .run(json!({"command": "seq -f %.0f 1 15000000"}), &sb, &cx)
+        .await;
+    let took = t.elapsed();
+    assert!(
+        !r.is_error,
+        "{}",
+        &r.output[r.output.len().saturating_sub(300)..]
+    );
+    assert!(r.output.contains("15000000"));
+    report(&format!(
+        "big output: seq 1 15000000 (about 109 MB of lines) in {:.2} s",
+        took.as_secs_f64()
+    ));
+    assert!(took < std::time::Duration::from_secs(10), "{took:?}");
+}

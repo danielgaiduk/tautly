@@ -56,6 +56,9 @@ fn gitignore_plan(root: &Path, ignore: &Path) -> Option<GitignorePlan> {
 pub(crate) struct Freshness {
     /// Set once a refresh has completed since open; the channel wakes [`Index::wait_ready`].
     ready: watch::Sender<bool>,
+    /// The outcome of the latest refresh (`None` until one ends); watcher errors, which
+    /// share [`Index::last_error`], do not touch it.
+    pub(crate) refreshed: watch::Sender<Option<bool>>,
     ready_flag: AtomicBool,
     trigrams_ready: AtomicBool,
     /// How many times [`Index::mark_stale`] was called.
@@ -80,6 +83,7 @@ impl Default for Freshness {
     fn default() -> Self {
         Freshness {
             ready: watch::Sender::new(false),
+            refreshed: watch::Sender::new(None),
             ready_flag: AtomicBool::new(false),
             trigrams_ready: AtomicBool::new(false),
             stale_marks: AtomicU64::new(0),
@@ -177,6 +181,18 @@ impl Index {
             tokio::time::timeout(timeout, rx.wait_for(|ready| *ready)).await,
             Ok(Ok(_))
         )
+    }
+
+    /// Wait up to `timeout` for the first refresh since open to end: `Some(true)` once the
+    /// index is ready, `Some(false)` when a refresh failed before it was (a watcher error
+    /// does not count), `None` when the time ran out.
+    pub async fn wait_first_refresh(&self, timeout: Duration) -> Option<bool> {
+        let mut rx = self.inner.fresh.refreshed.subscribe();
+        let ended = tokio::time::timeout(timeout, rx.wait_for(Option::is_some)).await;
+        match ended {
+            Ok(Ok(outcome)) => Some(*outcome == Some(true) || self.is_ready()),
+            _ => None,
+        }
     }
 
     /// True once [`Index::build_trigrams`] has completed since this handle was opened;

@@ -1029,18 +1029,15 @@ async fn tree_lists_parent_step_label_origin_live_current() {
         "{lines:?}"
     );
     run.stop().await;
-    // The log's lock goes with the writer, which may close a moment after the event
-    // stream ends: wait for it to be released (a loaded runner can take a while).
-    let deadline = Instant::now() + WAIT;
-    loop {
-        let nodes = tree::build(repo.home(), &repo.project(), None).unwrap();
-        assert!(nodes.iter().all(|n| !n.current));
-        if nodes.iter().all(|n| !n.live) {
-            break;
-        }
-        assert!(Instant::now() < deadline, "{nodes:?}");
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    // The log is closed (its lock released) before the event stream ends (review M6).
+    let nodes = tree::build(repo.home(), &repo.project(), None).unwrap();
+    assert!(nodes.iter().all(|n| !n.live && !n.current), "{nodes:?}");
+    // So resuming it at once finds it free, not "already open for writing".
+    let again = Run::start(EngineBuilder {
+        resume: Some(b.clone()),
+        ..repo.builder(&MockProvider::new(vec![]))
+    });
+    again.stop().await;
 }
 
 // ------------------------------------------------- fix round 1: human-owned changes

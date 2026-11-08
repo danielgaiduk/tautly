@@ -77,6 +77,9 @@ struct RouterState {
 struct Registered {
     commands: mpsc::WeakSender<Command>,
     groups: ProcessGroups,
+    /// A [`ServerHold`]: alive for SIGTERM and SIGHUP only, so Ctrl-C with no session
+    /// still ends the server at once.
+    hold: bool,
 }
 
 impl SignalRouter {
@@ -95,8 +98,16 @@ impl SignalRouter {
     }
 
     fn add_channel(&self, commands: mpsc::WeakSender<Command>, groups: ProcessGroups) {
+        self.register(commands, groups, false);
+    }
+
+    fn register(&self, commands: mpsc::WeakSender<Command>, groups: ProcessGroups, hold: bool) {
         let mut st = self.lock();
-        st.engines.push(Registered { commands, groups });
+        st.engines.push(Registered {
+            commands,
+            groups,
+            hold,
+        });
         st.shutdown_sent = false;
     }
 
@@ -107,7 +118,8 @@ impl SignalRouter {
     pub async fn deliver(&self, sig: Signal) {
         let mut st = self.lock();
         let live = |e: &Registered| e.commands.upgrade().filter(|tx| !tx.is_closed());
-        let alive: Vec<_> = st.engines.iter().filter_map(live).collect();
+        let counts = |e: &&Registered| !(e.hold && sig == Signal::Interrupt);
+        let alive: Vec<_> = st.engines.iter().filter(counts).filter_map(live).collect();
         if st.shutdown_sent || alive.is_empty() {
             return self.escalate(st, sig);
         }
@@ -195,7 +207,7 @@ pub struct ServerHold {
 pub fn hold_signal_router() -> std::io::Result<ServerHold> {
     let (tx, mut rx) = mpsc::channel(1);
     install_into(&INSTALLED, listen, |router| {
-        router.add_channel(tx.downgrade(), ProcessGroups::default());
+        router.register(tx.downgrade(), ProcessGroups::default(), true);
     })?;
     // Commands for the server are dropped (it hears the signals itself), and taken at
     // once so the router never counts it as stuck.
@@ -432,12 +444,19 @@ mod tests {
         let seen = Arc::clone(&escalated);
         let router = SignalRouter::new(move |sig| seen.lock().unwrap().push(sig));
         let (tx, mut rx) = mpsc::channel(1);
-        router.add_channel(tx.downgrade(), ProcessGroups::default());
+        router.register(tx.downgrade(), ProcessGroups::default(), true);
         tokio::spawn(async move { while rx.recv().await.is_some() {} });
         router.deliver(Signal::Terminate).await;
         assert!(escalated.lock().unwrap().is_empty());
         router.deliver(Signal::Terminate).await;
         assert_eq!(*escalated.lock().unwrap(), [Signal::Terminate]);
+        // Review M3: a hold does not count for Ctrl-C; with no session it exits at once.
+        router.register(tx.downgrade(), ProcessGroups::default(), true);
+        router.deliver(Signal::Interrupt).await;
+        assert_eq!(
+            *escalated.lock().unwrap(),
+            [Signal::Terminate, Signal::Interrupt]
+        );
         drop(tx);
     }
 }

@@ -419,11 +419,8 @@ const REPO: &[(&str, &[u8])] = &[
 ];
 
 async fn repo(built: common::Built) -> common::Env {
-    let mut e = common::env(REPO, built).await;
+    let e = common::env(REPO, built).await;
     let root = e.sb.root().to_path_buf();
-    // The link is made with the watcher stopped: its handling of the event (a reindex of
-    // the path, then a refresh, in the background) would race the refresh below.
-    e.stop_watcher();
     std::os::unix::fs::symlink(root.join("real"), root.join("linked")).unwrap();
     // The index learns about the new link on its next refresh.
     if built != common::Built::None {
@@ -431,7 +428,15 @@ async fn repo(built: common::Built) -> common::Env {
         if built == common::Built::Full {
             e.index.build_trigrams().await.unwrap();
         }
-        e.start_watcher();
+        // The watcher also handles the link's creation (a reindex of the path, then a
+        // refresh of its own), racing the refresh above. A cookie written now comes back
+        // only once it has: from then on the index has converged.
+        e.index.mark_stale();
+        e.index
+            .refresh_stale_in_background()
+            .unwrap()
+            .await
+            .unwrap();
     }
     e
 }

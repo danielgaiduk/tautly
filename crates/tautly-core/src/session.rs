@@ -329,6 +329,14 @@ impl Log {
         Self::fail(&mut g, r)
     }
 
+    /// Flush, fsync and close the log, releasing its lock now (session end, before the
+    /// event stream closes), whoever else still holds this handle.
+    pub fn close(&self) -> Result<(), LogFailure> {
+        let mut g = self.lock();
+        let r = g.writer.close();
+        Self::fail(&mut g, r)
+    }
+
     /// The log file.
     pub fn path(&self) -> PathBuf {
         self.lock().writer.path().to_path_buf()

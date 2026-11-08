@@ -61,6 +61,11 @@ pub struct CompactionRecord {
     /// [`Context::results`]), in first-seen order. Turns an earlier compaction removed are
     /// not listed again.
     pub forgotten_paths: Vec<PathBuf>,
+    /// The removed turns' entries of [`Context::results`], taken out with them (the list
+    /// would otherwise grow for the whole session, Task 33 review I3) and put back by
+    /// [`Context::uncompact`]. Not logged: a resume rebuilds them by replaying the log.
+    #[serde(skip)]
+    pub removed_results: Vec<crate::gc::ResultMeta>,
 }
 
 /// Why [`Context::apply_compaction`] did nothing.
@@ -328,6 +333,10 @@ impl Context {
             }
         }
         let removed_turns: Vec<Turn> = self.history.splice(..removed, [replacement]).collect();
+        let (removed_results, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut self.results)
+            .into_iter()
+            .partition(|r| r.turn <= last_removed_turn);
+        self.results = kept;
         // The summary stands in the slot of the last turn it replaced.
         self.first_turn = last_removed_turn;
         CompactionRecord {
@@ -336,6 +345,7 @@ impl Context {
             first_removed_turn,
             last_removed_turn,
             forgotten_paths,
+            removed_results,
         }
     }
 
@@ -365,6 +375,8 @@ impl Context {
             return Err(UncompactError::TooLarge { needed, budget });
         }
         self.history.splice(..1, rec.removed_turns.iter().cloned());
+        self.results
+            .splice(..0, rec.removed_results.iter().cloned());
         self.first_turn = rec.first_removed_turn;
         Ok(())
     }

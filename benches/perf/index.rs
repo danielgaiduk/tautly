@@ -92,11 +92,16 @@ async fn reindex_is_not_blocked_by_top_referenced() {
         overlapped += usize::from(during);
         times.push(took);
     }
-    // A query that ends before the reindex starts (overlapped < 20) cannot block it anyway.
+    let worst = *times.iter().max().unwrap();
     let reindex = median(times);
     report(&format!(
-        "index: reindex started during top_referenced {} (median of 20, {overlapped} overlapped)",
-        ms(reindex)
+        "index: reindex started during top_referenced {} median, {} max (20 runs, {overlapped} overlapped)",
+        ms(reindex),
+        ms(worst)
     ));
+    // Not vacuous: the query (150 ms on 20,000 files) was running for most reindexes.
+    assert!(overlapped >= 15, "only {overlapped} of 20 overlapped");
+    // The brief: the reindex "stays < 50 ms", every time.
+    assert!(worst < Duration::from_millis(50), "{worst:?}");
     assert!(reindex < Duration::from_millis(50), "{reindex:?}");
 }

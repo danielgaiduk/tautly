@@ -8,8 +8,9 @@
 //!
 //! `cargo test --release -p tautly-perf --test soak -- --ignored`
 
+use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 
 use futures::StreamExt as _;
 use futures::stream::BoxStream;
@@ -23,6 +24,30 @@ use tautly_sandbox::Mode;
 use tokio_util::sync::CancellationToken;
 
 const MODEL: &str = "mock/test";
+/// Live bytes of the Rust heap: this binary's allocator counts them.
+static LIVE: AtomicI64 = AtomicI64::new(0);
+
+struct Counting;
+
+// SAFETY: every call is passed to the system allocator unchanged; only a counter moves.
+unsafe impl GlobalAlloc for Counting {
+    unsafe fn alloc(&self, l: Layout) -> *mut u8 {
+        LIVE.fetch_add(l.size() as i64, Ordering::Relaxed);
+        unsafe { System.alloc(l) }
+    }
+    unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
+        LIVE.fetch_sub(l.size() as i64, Ordering::Relaxed);
+        unsafe { System.dealloc(p, l) }
+    }
+    unsafe fn realloc(&self, p: *mut u8, l: Layout, new: usize) -> *mut u8 {
+        LIVE.fetch_add(new as i64 - l.size() as i64, Ordering::Relaxed);
+        unsafe { System.realloc(p, l, new) }
+    }
+}
+
+#[global_allocator]
+static ALLOC: Counting = Counting;
+
 const TURNS_PER_10_MIN: usize = 20;
 const TURNS: usize = 24 * TURNS_PER_10_MIN;
 
@@ -147,6 +172,7 @@ async fn four_hour_session_keeps_rss_flat() {
 
     let (mut compactions, mut tool_errors) = (0, 0);
     let mut samples: Vec<(usize, u64)> = Vec::new();
+    let mut heap: Vec<(f64, f64)> = Vec::new();
     for turn in 1..=TURNS {
         engine
             .send(Command::SendMessage {
@@ -165,6 +191,10 @@ async fn four_hour_session_keeps_rss_flat() {
         }
         if turn % TURNS_PER_10_MIN == 0 {
             samples.push((turn / TURNS_PER_10_MIN * 10, rss()));
+            heap.push((
+                (turn / TURNS_PER_10_MIN * 10) as f64,
+                LIVE.load(Ordering::Relaxed) as f64,
+            ));
         }
     }
     engine.send(Command::Shutdown).await.unwrap();
@@ -179,12 +209,36 @@ async fn four_hour_session_keeps_rss_flat() {
         .iter()
         .map(|(min, r)| format!("{min}m {:.1}", *r as f64 / MB as f64))
         .collect();
+    // A linear leak can hide inside ±10% of RSS over 4 h (Task 33 review I3): fit a line to
+    // the live Rust heap from the first hour on (after warm-up) and project it over 4 h.
+    // The heap, not RSS: RSS also holds what SQLite allocates (outside this allocator, its
+    // page caches fill up to cache_size) and memory the system allocator keeps.
+    let late: Vec<(f64, f64)> = heap.iter().copied().filter(|p| p.0 >= 60.0).collect();
+    let n = late.len() as f64;
+    let (mx, my) = (
+        late.iter().map(|p| p.0).sum::<f64>() / n,
+        late.iter().map(|p| p.1).sum::<f64>() / n,
+    );
+    let slope = late.iter().map(|p| (p.0 - mx) * (p.1 - my)).sum::<f64>()
+        / late.iter().map(|p| (p.0 - mx).powi(2)).sum::<f64>();
+    let heap_base = heap[0].1.max(1.0);
+    let growth = slope * 240.0 / heap_base;
     report(&format!(
         "soak: {TURNS} turns (4 h simulated), {compactions} compactions, {tool_errors} tool errors; \
-         RSS MB {}; worst deviation from the 10-minute mark {:.1}%",
+         RSS MB {}; worst deviation from the 10-minute mark {:.1}%; live heap {:.2} -> {:.2} MB, \
+         fitted growth {:.1}% per 4 h",
         readings.join(", "),
-        worst * 100.0
+        worst * 100.0,
+        heap_base / MB as f64,
+        heap.last().unwrap().1 / MB as f64,
+        growth * 100.0
     ));
+    // Before the fix the heap grew about 0.4 KB per tool result: +160% over the 4 h.
+    assert!(
+        growth < 0.10,
+        "the live heap grows linearly: {:.1}% per 4 h",
+        growth * 100.0
+    );
     assert!(
         compactions >= 4,
         "the session should compact repeatedly: {compactions}"

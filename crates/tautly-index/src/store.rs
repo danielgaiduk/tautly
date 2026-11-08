@@ -733,6 +733,8 @@ impl Inner {
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         *slot = result.as_ref().err().map(ToString::to_string);
+        drop(slot);
+        self.fresh.refreshed.send_replace(Some(result.is_ok()));
     }
 
     /// Run database work on the blocking pool, so a long transaction holding the
