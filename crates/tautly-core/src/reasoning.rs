@@ -23,6 +23,7 @@ pub enum ReasoningLevel {
 }
 
 impl ReasoningLevel {
+    /// The accepted level names, for messages.
     pub const NAMES: &str = "auto, off, low, medium or high";
 
     /// What a request to a model of reasoning `style` carries: nothing when off or when

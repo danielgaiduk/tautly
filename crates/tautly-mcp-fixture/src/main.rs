@@ -439,6 +439,12 @@ async fn main() {
     {
         tokio::time::sleep(Duration::from_millis(ms)).await;
     }
+    // A start the test controls: the server answers only once this file exists.
+    if let Some(gate) = std::env::var_os("ECHO_START_GATE") {
+        while !std::path::Path::new(&gate).exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
     write_pids();
     match args.get(1).map(String::as_str) {
         Some("http") => serve_http(args.get(2).expect("URL_FILE")).await,

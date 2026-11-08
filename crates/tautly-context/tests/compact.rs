@@ -112,7 +112,7 @@ fn rich_ctx() -> Context {
     c.pinned
         .push(Pinned::new("never touch prod", PinSource::User));
     c.pinned.push(Pinned::new("use tabs", PinSource::Config));
-    c.state.task = Some("migrate the parser".into());
+    c.state.decisions.push("migrate the parser".into());
     c.state.plan = vec![PlanStep {
         text: "write tests".into(),
         status: StepStatus::InProgress,

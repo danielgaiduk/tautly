@@ -23,7 +23,7 @@ pub fn flock(file: &File, op: libc::c_int) -> io::Result<()> {
 }
 
 /// Take an exclusive, non-blocking advisory lock held until `file` is dropped; `false` when
-/// it is still busy after a few tries over ~50 ms. A reader that only looks (the session
+/// it is still busy after a few tries over ~40 ms. A reader that only looks (the session
 /// tree's liveness probe holds a shared lock for an instant) must not make a lock fail.
 pub fn lock_exclusive_retrying(file: &File) -> io::Result<bool> {
     for attempt in 0..5 {
@@ -42,7 +42,9 @@ pub fn lock_exclusive_retrying(file: &File) -> io::Result<bool> {
 /// Replace `dest` with `bytes` through a temporary file in its directory (created 0700 when
 /// missing), mode 0600; with `sync`, the data is on disk before the rename.
 pub fn write_private_atomic(dest: &Path, bytes: &[u8], sync: bool) -> io::Result<()> {
-    let dir = dest.parent().expect("a file path has a parent");
+    let dir = dest
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "the path has no parent"))?;
     create_private_dir_all(dir)?;
     let tmp = dir.join(format!(
         ".tmp-{}-{}",
@@ -65,4 +67,15 @@ pub fn write_private_atomic(dest: &Path, bytes: &[u8], sync: bool) -> io::Result
         let _ = fs::remove_file(&tmp);
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn a_path_without_a_parent_is_an_error_not_a_panic() {
+        let err = super::write_private_atomic(Path::new("/"), b"x", false).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    use std::path::Path;
 }

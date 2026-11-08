@@ -5,7 +5,7 @@
 
 use std::time::{Duration, Instant};
 
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex};
 
 use futures::{Stream, StreamExt};
 use tautly_tools::ProcessGroups;
@@ -19,6 +19,7 @@ use crate::protocol::Command;
 /// Two interrupts this close together mean "exit".
 pub const DOUBLE_INTERRUPT: Duration = Duration::from_secs(2);
 
+/// A process signal the engine reacts to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Signal {
     /// SIGINT (Ctrl-C).
@@ -36,6 +37,7 @@ pub struct SignalPolicy {
 }
 
 impl SignalPolicy {
+    /// The command signal `sig` at `now` maps to.
     pub fn command(&mut self, sig: Signal, now: Instant) -> Command {
         match sig {
             Signal::Interrupt => {
@@ -153,7 +155,7 @@ impl SignalRouter {
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, RouterState> {
-        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+        crate::lock(&self.state)
     }
 }
 
@@ -222,7 +224,7 @@ fn install_into(
     listen: impl FnOnce(&Arc<SignalRouter>) -> std::io::Result<JoinHandle<()>>,
     register: impl FnOnce(&SignalRouter),
 ) -> std::io::Result<()> {
-    let mut installed = slot.lock().unwrap_or_else(PoisonError::into_inner);
+    let mut installed = crate::lock(slot);
     let router = match installed.take() {
         Some((router, listener)) if !listener.is_finished() => {
             *installed = Some((Arc::clone(&router), listener));

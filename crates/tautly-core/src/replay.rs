@@ -39,13 +39,13 @@ use serde_json::Value;
 use tautly_context::MutationReason;
 use tautly_mcp::printable;
 use tautly_provider::{Catalog, ModelId, ProviderEvent, Quota, RawUsage, cost_usd};
-use tautly_session::{Entry, RelPath, SessionReader};
+use tautly_session::{Entry, RelPath};
 use tautly_tools::PersistedEffect;
 use tokio::sync::mpsc;
 
 use crate::protocol::{EffectView, ErrorKind, Event, ToolMetaView, UsageRole};
 use crate::provider_setup::provider_label;
-use crate::record::{ApprovalKind, SessionRecord};
+use crate::record::{ApprovalKind, RecordLog, SessionRecord};
 use crate::session::Session;
 use crate::timetravel::{StepCounter, TtError, step_at_offset};
 use crate::turn::TurnControl;
@@ -69,7 +69,7 @@ pub const REPLAYED_ID_PREFIX: &str = "replayed:";
 /// numbering: a user message's step starts at its `TurnStart`, a provider step at its
 /// `Request`) are skipped; a step past the last one yields nothing. Reads the log and its
 /// blobs, nothing else. A record that cannot be read ends the stream with a warning.
-pub fn events(reader: &SessionReader<SessionRecord>, from_step: Option<u32>) -> Events<'_> {
+pub fn events(reader: &RecordLog, from_step: Option<u32>) -> Events<'_> {
     Events {
         reader,
         entries: Box::new(reader.entries()),
@@ -119,7 +119,7 @@ struct Response {
 
 /// See [`events`].
 pub struct Events<'a> {
-    reader: &'a SessionReader<SessionRecord>,
+    reader: &'a RecordLog,
     entries: Box<dyn Iterator<Item = tautly_session::Result<Entry<SessionRecord>>> + 'a>,
     root: PathBuf,
     catalog: Option<Catalog>,
@@ -483,8 +483,8 @@ fn read(
             None => current,
             Some(id) => find(data_home, root, id)?,
         };
-        let reader = SessionReader::<SessionRecord>::open(&path)
-            .map_err(|e| format!("cannot read session {id}: {e}"))?;
+        let reader =
+            RecordLog::open(&path).map_err(|e| format!("cannot read session {id}: {e}"))?;
         if let Some(at) = from_step {
             let last = step_at_offset(&reader, u64::MAX);
             if at > last {

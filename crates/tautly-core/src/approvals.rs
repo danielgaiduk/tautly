@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex};
 
 use serde_json::Value;
 use tautly_sandbox::{Effect, Mode, Policy, PolicyConfig};
@@ -140,7 +140,7 @@ impl Approvals {
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Pending> {
-        self.pending.lock().unwrap_or_else(PoisonError::into_inner)
+        crate::lock(&self.pending)
     }
 }
 

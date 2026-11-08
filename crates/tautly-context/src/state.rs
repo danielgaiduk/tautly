@@ -1,4 +1,4 @@
-//! Structured working state: task, plan, files touched, decisions, questions.
+//! Structured working state: plan, files touched, decisions, questions.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -28,10 +28,6 @@ pub struct FileNote {
 /// The structured task state the model keeps with the `state` tool, plus files the engine tracks.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct WorkingState {
-    /// A one-line task description, when one is set. Spec 6.3 lists it in the record,
-    /// but the engine does not set it yet: setting it must reach both the live turn and
-    /// every rebuild path, or their requests diverge.
-    pub task: Option<String>,
     /// The plan.
     pub plan: Vec<PlanStep>,
     /// Files read, edited or deleted, by path.
@@ -128,8 +124,7 @@ impl WorkingState {
 
     /// Whether there is nothing to render.
     pub fn is_empty(&self) -> bool {
-        self.task.is_none()
-            && self.plan.is_empty()
+        self.plan.is_empty()
             && self.files.is_empty()
             && self.decisions.is_empty()
             && self.questions.is_empty()
@@ -144,9 +139,6 @@ impl WorkingState {
             return None;
         }
         let mut out = String::from("<working_state>\n");
-        if let Some(task) = &self.task {
-            out.push_str(&format!("task: {task}\n"));
-        }
         if !self.plan.is_empty() {
             out.push_str("plan:\n");
             for (i, step) in self.plan.iter().enumerate() {

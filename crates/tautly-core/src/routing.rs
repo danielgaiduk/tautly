@@ -10,11 +10,11 @@
 //!
 //! A side model that fails for good falls back to the main model for the rest of the
 //! session (`Session::side_to_main`). A `SetModel` resolves the side route again for the
-//! new main model ([`Side::resolve_with`]), which also ends such a fallback: an explicit
+//! new main model (`Side::resolve_with`), which also ends such a fallback: an explicit
 //! switch is a fresh start, and a side model that still fails falls back again, with its
 //! one warning.
 
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -89,8 +89,8 @@ pub(crate) fn model_failed(e: &ProviderError) -> bool {
 const WINDOW_RESERVE_TOKENS: u32 = 2_500;
 
 /// A [`SideModel`] backed by a provider. Every request's usage goes to `usage`; a request
-/// that fails with [`model_failed`] is remembered for the session
-/// ([`Side::take_failure`]).
+/// that fails with `model_failed` is remembered for the session
+/// (`Side::take_failure`).
 ///
 /// Usage can be under-reported: a request that fails before any content arrives reports
 /// nothing, even if the provider billed for it.
@@ -215,8 +215,7 @@ impl SideModel for SideRunner {
                 Err(e) => {
                     meter.settle(false);
                     if model_failed(&e) {
-                        *self.failure.lock().unwrap_or_else(PoisonError::into_inner) =
-                            Some(e.to_string());
+                        *crate::lock(&self.failure) = Some(e.to_string());
                     }
                     return Err(e);
                 }
@@ -262,10 +261,7 @@ impl Side {
 
     /// Why a tool's side request failed for good ([`model_failed`]), once.
     pub fn take_failure(&self) -> Option<String> {
-        self.failure
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .take()
+        crate::lock(&self.failure).take()
     }
 
     /// The side route of a session whose main provider is `main` (already wrapped in

@@ -15,7 +15,7 @@ use std::fs::{File, OpenOptions};
 use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, PoisonError, RwLock, Weak};
+use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::Duration;
 
 use tautly_index::{Index, WatchHandle};
@@ -78,6 +78,23 @@ pub(crate) struct Opened {
     _index_lock: Option<File>,
 }
 
+impl Drop for Opened {
+    /// Stopping the watcher joins its event thread, which can take seconds on a loaded
+    /// machine: off the async workers, as starting it is, or it stalls every task on the
+    /// runtime (the shutdown's bounded ledger flush among them).
+    fn drop(&mut self) {
+        let watch = self
+            ._watch
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let (Some(watch), Ok(rt)) = (watch, tokio::runtime::Handle::try_current()) {
+            rt.spawn_blocking(move || drop(watch));
+        }
+    }
+}
+
+/// One work tree's shared parts (sandbox, index, data home) for the sessions on it.
 pub struct Workspace {
     sandbox: Arc<dyn Sandbox>,
     data_home: PathBuf,
@@ -223,6 +240,7 @@ impl Workspace {
         }
     }
 
+    /// The work tree root.
     pub fn root(&self) -> &Path {
         self.sandbox.root()
     }
@@ -248,6 +266,7 @@ impl Workspace {
         }
     }
 
+    /// The sandbox every session of this work tree uses.
     pub fn sandbox(&self) -> &Arc<dyn Sandbox> {
         &self.sandbox
     }
@@ -286,7 +305,7 @@ impl Workspace {
 
     /// Wait until the index has finished its first refresh (true) or never will: it could
     /// not be opened, or that refresh failed (false; see [`Index::last_error`]). Bounded
-    /// only by [`READY_OR_FAILED_BOUND`], far beyond any loaded machine, so a readiness
+    /// only by `READY_OR_FAILED_BOUND`, far beyond any loaded machine, so a readiness
     /// regression fails instead of hanging. For callers that must not guess how long a
     /// loaded machine takes, such as tests.
     pub async fn wait_ready_or_failed(&self) -> bool {
@@ -320,6 +339,7 @@ impl Workspaces {
         }
     }
 
+    /// The data home sessions are logged under.
     pub fn data_home(&self) -> &Path {
         &self.data_home
     }
@@ -329,7 +349,7 @@ impl Workspaces {
     /// `LocalSandbox` (nothing is opened until a session starts it).
     pub fn get(&self, start: &Path) -> Result<Arc<Workspace>, EngineError> {
         let root = session_root(start)?;
-        let mut open = self.open.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut open = crate::lock(&self.open);
         open.retain(|_, ws| ws.strong_count() > 0);
         if let Some(ws) = open.get(&root).and_then(Weak::upgrade) {
             return Ok(ws);

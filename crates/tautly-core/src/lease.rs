@@ -232,6 +232,9 @@ mod tests {
         let gate = open(&a.gate).unwrap();
         flock(&gate, libc::LOCK_EX).unwrap();
         assert!(matches!(a.try_exclusive(), Err(LeaseError::Busy)));
+        // Unlocked before the close, as the guard does: a child another test thread forks
+        // now holds a copy of the descriptor, which would keep a plain close's lock.
+        flock(&gate, libc::LOCK_UN).unwrap();
         drop(gate);
         assert!(a.try_exclusive().is_ok());
     }

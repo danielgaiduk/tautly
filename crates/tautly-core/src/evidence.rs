@@ -107,7 +107,7 @@ impl TestMatcher {
     /// Whether any parsed component of `raw_cmd` matches a test pattern, the way a
     /// permission rule sees it (the words, with and without leading `NAME=VALUE`
     /// assignments). A command that cannot be parsed is not a test run, and neither is a
-    /// component that only compiles or lists tests ([`COMPILE_ONLY_FLAGS`]).
+    /// component that only compiles or lists tests (`COMPILE_ONLY_FLAGS`).
     ///
     /// It is a heuristic over the command line, not a proof: `cargo test --help` or
     /// `true || cargo test` still count, and a run's exit code and counts are what say
@@ -168,6 +168,7 @@ pub struct EvidenceTracker {
 }
 
 impl EvidenceTracker {
+    /// A tracker with no test run seen yet.
     pub fn new(matcher: Arc<TestMatcher>) -> Self {
         EvidenceTracker {
             matcher,

@@ -576,7 +576,7 @@ async fn tool_finished(conn: &Arc<Conn>, s: &Arc<Session>, ev: Event) {
         ..
     } = ev
     else {
-        return;
+        unreachable!("tool_finished is only called with a ToolFinished event");
     };
     let mut content = vec![map::output_content(&output)];
     let edited = effects

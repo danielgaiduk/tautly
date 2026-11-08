@@ -8,6 +8,7 @@ use crate::config::ProviderEntry;
 /// `compat:<name>`).
 pub const KEYCHAIN_SERVICE: &str = "tautly";
 
+/// Why a provider key could not be read or stored.
 #[derive(Debug, thiserror::Error)]
 pub enum AuthError {
     #[error("environment variable {name} is not valid unicode")]

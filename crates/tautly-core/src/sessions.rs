@@ -8,7 +8,7 @@ use tautly_sandbox::Sandbox;
 
 use crate::checkpoint::{self, CheckpointError};
 use crate::engine::EngineError;
-use crate::record::SessionRecord;
+use crate::record::{RecordLog, SessionRecord};
 
 /// What [`delete`] removed.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -21,6 +21,7 @@ pub struct Deleted {
     pub worktree: Option<PathBuf>,
 }
 
+/// Why a session could not be deleted.
 #[derive(Debug, thiserror::Error)]
 pub enum DeleteError {
     #[error("no session {0} in this project")]
@@ -102,9 +103,7 @@ pub async fn delete_with(
     // Held until the log is gone, so no engine opens it meanwhile.
     let lock = lock_if_idle(&log, id)?;
     // A worktree fork's worktree goes first: a dirty one refuses the whole deletion.
-    let header = tautly_session::SessionReader::<SessionRecord>::open(&log)?
-        .header()
-        .clone();
+    let header = RecordLog::open(&log)?.header().clone();
     let fork = header.origin == tautly_session::Origin::WhatIf;
     if fork && header.root == root {
         // It could not remove the worktree it runs in (review I1).
@@ -154,7 +153,7 @@ pub async fn delete_with(
 /// The commit a worktree fork's worktree began at: the `restored` checkpoint its log wrote
 /// after `Forked` (none: not found).
 fn fork_start(log: &Path) -> Result<Option<String>, DeleteError> {
-    let reader = tautly_session::SessionReader::<SessionRecord>::open(log)?;
+    let reader = RecordLog::open(log)?;
     let mut forked = false;
     for rec in reader.records() {
         match rec?.1 {
@@ -273,7 +272,7 @@ pub fn list_in(data_home: &Path, project: &Path, limit: usize) -> Vec<SessionSum
 /// The first line of the log's first user message, cut to [`FIRST_PROMPT_CHARS`]; none when
 /// the log has no user turn (or cannot be read).
 fn first_prompt(log: &Path) -> Option<String> {
-    let reader = tautly_session::SessionReader::<SessionRecord>::open(log).ok()?;
+    let reader = RecordLog::open(log).ok()?;
     for rec in reader.records() {
         let Ok((_, rec)) = rec else {
             break;
@@ -329,6 +328,7 @@ pub struct RestoreBackupOptions {
     pub include_own: bool,
 }
 
+/// Why a rewind or switch backup could not be restored.
 #[derive(Debug, thiserror::Error)]
 pub enum BackupError {
     #[error("no session {0} in this project")]
@@ -392,7 +392,7 @@ pub async fn restore_backup(
         .find(|s| s.id == id)
         .map(|s| s.path)
         .ok_or_else(|| BackupError::NotFound(id.to_string()))?;
-    let reader = tautly_session::SessionReader::<SessionRecord>::open(&log)?;
+    let reader = RecordLog::open(&log)?;
     let mut last = None;
     let mut ended = None;
     // The last `RestoreBegun` was passed over (its own, without `include_own`): the

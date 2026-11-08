@@ -1,8 +1,9 @@
 //! The cost ledger (spec 4.6): one SQLite row per provider response, across sessions and
 //! processes, at `<data home>/ledger.sqlite`.
 
+use crate::lock;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, params};
@@ -86,6 +87,7 @@ CREATE INDEX IF NOT EXISTS receipts_at ON receipts(at);
 const V4_COST_PARTIAL: &str =
     "ALTER TABLE receipts ADD COLUMN cost_partial INTEGER NOT NULL DEFAULT 0;";
 
+/// Why the cost ledger could not be read or written.
 #[derive(Debug, thiserror::Error)]
 pub enum LedgerError {
     #[error("cost ledger: {0}")]
@@ -114,6 +116,7 @@ impl LedgerError {
     }
 }
 
+/// A cost-ledger result.
 pub type Result<T> = std::result::Result<T, LedgerError>;
 
 /// Usage summed over ledger rows.
@@ -289,6 +292,7 @@ impl Ledger {
         ))
     }
 
+    /// Add one request's usage and cost to the ledger.
     pub fn record(
         &self,
         session: &str,
@@ -574,7 +578,7 @@ impl Ledger {
     }
 
     fn conn(&self) -> std::sync::MutexGuard<'_, Connection> {
-        self.conn.lock().unwrap_or_else(PoisonError::into_inner)
+        crate::lock(&self.conn)
     }
 }
 
@@ -690,10 +694,6 @@ impl Drop for CostLedger {
     fn drop(&mut self) {
         lock(&self.sink).take();
     }
-}
-
-fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 impl CostLedger {

@@ -726,7 +726,11 @@ async fn first_request_waits_up_to_startup_timeout() {
 #[tokio::test]
 async fn late_server_joins_at_next_user_turn_once() {
     let fx = Fx::new();
-    let mut cfg = with_user_server(Mode::Yolo, &[("ECHO_START_DELAY_MS", "1500")]);
+    // The server answers once the test opens the gate, after the first turn: a fixed delay
+    // raced the first turn's start-up on a loaded runner, so the server could be ready
+    // before the first request (and was then rightly offered in it).
+    let gate = fx.home.path().join("echo-gate");
+    let mut cfg = with_user_server(Mode::Yolo, &[("ECHO_START_GATE", gate.to_str().unwrap())]);
     cfg.mcp.startup_timeout_ms = 100;
     let state = |n: &str| call(n, "state", json!({"decisions_add": [n]}));
     let mock = MockProvider::new(vec![
@@ -736,10 +740,16 @@ async fn late_server_joins_at_next_user_turn_once() {
         tools_step(vec![state("c")]),
         text_step_no_usage("turn 2"),
     ]);
-    let mut run = start(fx.waiting_builder(cfg, &mock));
+    // No wait for the repo map: on a loaded runner the index can take longer than an
+    // event wait, and nothing here depends on it.
+    let mut run = start(EngineBuilder {
+        startup_wait: Duration::ZERO,
+        ..fx.waiting_builder(cfg, &mock)
+    });
     run.turn_with("one").await;
     let reqs = mock.requests();
     assert!(mcp_names(&reqs[0]).is_empty() && mcp_names(&reqs[1]).is_empty());
+    std::fs::write(&gate, "").unwrap();
     run.until_state("echo", McpState::Ready).await;
     let events = run.turn_with("two").await;
     assert!(

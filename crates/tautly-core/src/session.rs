@@ -193,10 +193,7 @@ impl EventSink {
     /// One of a cancelled turn's last events: the drop warning (if any), then `ev`, within
     /// the [`FINISH_GRACE`] the turn's first such event started.
     async fn finish(&self, ev: Event) {
-        let deadline = *self
-            .finish_by
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
+        let deadline = *crate::lock(&self.finish_by)
             .get_or_insert_with(|| tokio::time::Instant::now() + FINISH_GRACE);
         let n = self.dropped.swap(0, Ordering::Relaxed);
         if n > 0 {
@@ -308,7 +305,7 @@ impl Log {
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, LogInner> {
-        self.inner.lock().unwrap_or_else(PoisonError::into_inner)
+        crate::lock(&self.inner)
     }
 
     pub fn append(&self, rec: &SessionRecord) -> Result<(), LogFailure> {
