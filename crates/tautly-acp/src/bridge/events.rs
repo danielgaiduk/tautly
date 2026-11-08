@@ -376,48 +376,7 @@ async fn on_event(conn: &Arc<Conn>, s: &Arc<Session>, ev: Event) {
             };
             conn.update(&s.id, tool_update(u)).await;
         }
-        Event::ToolFinished {
-            call_id,
-            output,
-            is_error,
-            blocked,
-            effects,
-            diff,
-            ..
-        } => {
-            let mut content = vec![map::output_content(&output)];
-            let edited = effects
-                .iter()
-                .any(|e| matches!(e, EffectView::Edited { .. } | EffectView::Deleted { .. }));
-            let status = if is_error || blocked {
-                ToolCallStatus::Failed
-            } else {
-                ToolCallStatus::Completed
-            };
-            let (conn2, s2) = (Arc::clone(conn), Arc::clone(s));
-            let send = async move {
-                if edited && !is_error {
-                    content.extend(finished_diffs(&s2, &call_id, &effects, diff).await);
-                }
-                let u = ToolCallUpdate {
-                    tool_call_id: call_id,
-                    status: Some(status),
-                    content: Some(content),
-                    ..ToolCallUpdate::default()
-                };
-                conn2.update(&s2.id, tool_update(u)).await;
-            };
-            if edited && !is_error {
-                // Its diff may need a log read: built off the forwarder, so the turn's
-                // events keep flowing (this call's last update, so its order holds).
-                let done = tokio::spawn(send);
-                let mut st = lock(&s.st);
-                st.building.retain(|h| !h.is_finished());
-                st.building.push(done);
-            } else {
-                send.await;
-            }
-        }
+        ev @ Event::ToolFinished { .. } => tool_finished(conn, s, ev).await,
         Event::Usage { cost_usd, .. } => {
             let update = {
                 let mut st = lock(&s.st);
@@ -523,67 +482,7 @@ async fn on_event(conn: &Arc<Conn>, s: &Arc<Session>, ev: Event) {
         } => turn_finished(conn, s, id, reason, evidence).await,
         Event::Error {
             id, message, hint, ..
-        } => {
-            // A failed model switch is the switch's answer, never the turn's or a
-            // command's: it echoes the `SetModel`'s correlation id.
-            let switch = {
-                let mut st = lock(&s.st);
-                st.switch
-                    .take_if(|sw| id.as_deref() == Some(sw.id.as_str()))
-            };
-            let text = match hint {
-                Some(h) => format!("{message}\nhint: {h}"),
-                None => message,
-            };
-            if let Some(sw) = switch {
-                match sw.reply {
-                    Some(reply) => {
-                        let _ = reply.send(Err(text));
-                    }
-                    None => {
-                        // Answered at once during a turn: put the real model back.
-                        let options = {
-                            let st = lock(&s.st);
-                            st.models.is_some().then(|| st.options())
-                        };
-                        if let Some(o) = options {
-                            conn.update(
-                                &s.id,
-                                json!({"sessionUpdate": "config_option_update", "configOptions": o}),
-                            )
-                            .await;
-                        }
-                        tell(conn, s, "error", &text, None, true).await;
-                    }
-                }
-                return;
-            }
-            let (command, compacting) = {
-                let mut st = lock(&s.st);
-                st.last_error = Some(text.clone());
-                // A `/diff` or undo error echoes its command's id.
-                let command = st.waiter.take_if(|w| match w.until {
-                    Until::Diff => w.cmd_id == id,
-                    Until::UndoPreview | Until::Undone => w.cmd_id == id,
-                    _ => false,
-                });
-                (
-                    command,
-                    st.waiter
-                        .as_ref()
-                        .is_some_and(|w| w.until == Until::Compact),
-                )
-            };
-            if let Some(w) = command {
-                conn.update(&s.id, chunk(&format!("error: {text}"))).await;
-                let _ = w.reply.send(Ok(StopReason::EndTurn));
-            } else if compacting {
-                // Shown; the compaction still ends with `CompactFinished`.
-                conn.update(&s.id, chunk(&format!("error: {text}\n"))).await;
-            } else {
-                tell(conn, s, "error", &text, None, false).await;
-            }
-        }
+        } => error(conn, s, id, message, hint).await,
         Event::SessionDiff {
             id, files, unified, ..
         } => {
@@ -610,28 +509,7 @@ async fn on_event(conn: &Arc<Conn>, s: &Arc<Session>, ev: Event) {
             let list = undo_list(&restored, &deleted, note.as_deref());
             if dry_run {
                 let nothing = restored.is_empty() && deleted.is_empty();
-                let asking = {
-                    let mut st = lock(&s.st);
-                    match &mut st.waiter {
-                        Some(w) if w.until == Until::UndoPreview && w.cmd_id == id && !nothing => {
-                            w.until = Until::UndoAsk;
-                            true
-                        }
-                        _ => false,
-                    }
-                };
-                if asking {
-                    let (conn, s) = (Arc::clone(conn), Arc::clone(s));
-                    tokio::spawn(async move { ask_undo(&conn, &s, turn, list).await });
-                    return;
-                }
-                let waiter = lock(&s.st).take_waiter(Until::UndoPreview, id.as_deref());
-                if let Some(w) = waiter {
-                    let text = format!("nothing to undo in turn {turn}{list}");
-                    conn.update(&s.id, chunk(&text)).await;
-                    let _ = w.reply.send(Ok(StopReason::EndTurn));
-                }
-                return;
+                return undo_preview(conn, s, id, turn, nothing, list).await;
             }
             let waiter = lock(&s.st).take_waiter(Until::Undone, id.as_deref());
             if let Some(w) = waiter {
@@ -683,6 +561,155 @@ async fn on_event(conn: &Arc<Conn>, s: &Arc<Session>, ev: Event) {
             }
         }
         _ => {}
+    }
+}
+
+/// A finished call's last update, with the diffs of what it edited.
+async fn tool_finished(conn: &Arc<Conn>, s: &Arc<Session>, ev: Event) {
+    let Event::ToolFinished {
+        call_id,
+        output,
+        is_error,
+        blocked,
+        effects,
+        diff,
+        ..
+    } = ev
+    else {
+        return;
+    };
+    let mut content = vec![map::output_content(&output)];
+    let edited = effects
+        .iter()
+        .any(|e| matches!(e, EffectView::Edited { .. } | EffectView::Deleted { .. }));
+    let status = if is_error || blocked {
+        ToolCallStatus::Failed
+    } else {
+        ToolCallStatus::Completed
+    };
+    let (conn2, s2) = (Arc::clone(conn), Arc::clone(s));
+    let send = async move {
+        if edited && !is_error {
+            content.extend(finished_diffs(&s2, &call_id, &effects, diff).await);
+        }
+        let u = ToolCallUpdate {
+            tool_call_id: call_id,
+            status: Some(status),
+            content: Some(content),
+            ..ToolCallUpdate::default()
+        };
+        conn2.update(&s2.id, tool_update(u)).await;
+    };
+    if edited && !is_error {
+        // Its diff may need a log read: built off the forwarder, so the turn's
+        // events keep flowing (this call's last update, so its order holds).
+        let done = tokio::spawn(send);
+        let mut st = lock(&s.st);
+        st.building.retain(|h| !h.is_finished());
+        st.building.push(done);
+    } else {
+        send.await;
+    }
+}
+
+/// An `Error`: a failed model switch's answer, a command's, or shown.
+async fn error(
+    conn: &Arc<Conn>,
+    s: &Arc<Session>,
+    id: Option<String>,
+    message: String,
+    hint: Option<String>,
+) {
+    // A failed model switch is the switch's answer, never the turn's or a
+    // command's: it echoes the `SetModel`'s correlation id.
+    let switch = {
+        let mut st = lock(&s.st);
+        st.switch
+            .take_if(|sw| id.as_deref() == Some(sw.id.as_str()))
+    };
+    let text = match hint {
+        Some(h) => format!("{message}\nhint: {h}"),
+        None => message,
+    };
+    if let Some(sw) = switch {
+        match sw.reply {
+            Some(reply) => {
+                let _ = reply.send(Err(text));
+            }
+            None => {
+                // Answered at once during a turn: put the real model back.
+                let options = {
+                    let st = lock(&s.st);
+                    st.models.is_some().then(|| st.options())
+                };
+                if let Some(o) = options {
+                    conn.update(
+                        &s.id,
+                        json!({"sessionUpdate": "config_option_update", "configOptions": o}),
+                    )
+                    .await;
+                }
+                tell(conn, s, "error", &text, None, true).await;
+            }
+        }
+        return;
+    }
+    let (command, compacting) = {
+        let mut st = lock(&s.st);
+        st.last_error = Some(text.clone());
+        // A `/diff` or undo error echoes its command's id.
+        let command = st.waiter.take_if(|w| match w.until {
+            Until::Diff => w.cmd_id == id,
+            Until::UndoPreview | Until::Undone => w.cmd_id == id,
+            _ => false,
+        });
+        (
+            command,
+            st.waiter
+                .as_ref()
+                .is_some_and(|w| w.until == Until::Compact),
+        )
+    };
+    if let Some(w) = command {
+        conn.update(&s.id, chunk(&format!("error: {text}"))).await;
+        let _ = w.reply.send(Ok(StopReason::EndTurn));
+    } else if compacting {
+        // Shown; the compaction still ends with `CompactFinished`.
+        conn.update(&s.id, chunk(&format!("error: {text}\n"))).await;
+    } else {
+        tell(conn, s, "error", &text, None, false).await;
+    }
+}
+
+/// An undo's dry run: ask the editor whether to undo (`/undo`), or answer the preview.
+async fn undo_preview(
+    conn: &Arc<Conn>,
+    s: &Arc<Session>,
+    id: Option<String>,
+    turn: u32,
+    nothing: bool,
+    list: String,
+) {
+    let asking = {
+        let mut st = lock(&s.st);
+        match &mut st.waiter {
+            Some(w) if w.until == Until::UndoPreview && w.cmd_id == id && !nothing => {
+                w.until = Until::UndoAsk;
+                true
+            }
+            _ => false,
+        }
+    };
+    if asking {
+        let (conn, s) = (Arc::clone(conn), Arc::clone(s));
+        tokio::spawn(async move { ask_undo(&conn, &s, turn, list).await });
+        return;
+    }
+    let waiter = lock(&s.st).take_waiter(Until::UndoPreview, id.as_deref());
+    if let Some(w) = waiter {
+        let text = format!("nothing to undo in turn {turn}{list}");
+        conn.update(&s.id, chunk(&text)).await;
+        let _ = w.reply.send(Ok(StopReason::EndTurn));
     }
 }
 
