@@ -37,6 +37,37 @@ pub(crate) fn transient(msg: impl Into<String>) -> ProviderError {
     }
 }
 
+/// The error body's message, or `HTTP <status>` when it has none.
+pub(crate) fn http_msg(status: u16, msg: String) -> String {
+    if msg.is_empty() {
+        format!("HTTP {status}")
+    } else {
+        msg
+    }
+}
+
+/// The error for an HTTP error status, the same for every adapter. `overflow` tells
+/// whether a 400's message reads as a context overflow.
+pub(crate) fn map_http_status(
+    status: u16,
+    retry_after: Option<Duration>,
+    msg: String,
+    overflow: impl FnOnce(&str) -> bool,
+) -> ProviderError {
+    let msg = http_msg(status, msg);
+    match status {
+        429 | 500..=504 => ProviderError::Transient {
+            status: Some(status),
+            retry_after,
+            msg,
+        },
+        401 | 403 => ProviderError::Auth(msg),
+        400 if overflow(&msg) => ProviderError::ContextOverflow(msg),
+        400..=499 => ProviderError::InvalidRequest(msg),
+        _ => ProviderError::Other(format!("HTTP {status}: {msg}")),
+    }
+}
+
 /// Parse a Go-style duration such as `1s`, `6m0s` or `20ms`.
 fn parse_go_duration(s: &str) -> Option<Duration> {
     let mut rest = s.trim();
