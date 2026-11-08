@@ -177,7 +177,11 @@ pub fn to_wire(req: &CanonicalRequest) -> Value {
         "model": req.model.model(),
         "max_tokens": req.max_output,
         "stream": true,
-        "messages": messages,
+        // A message left empty (only unsigned reasoning) is rejected by the API: not sent.
+        "messages": messages
+            .into_iter()
+            .filter(|m| m["content"].as_array().is_some_and(|c| !c.is_empty()))
+            .collect::<Vec<_>>(),
     });
     if !system.is_empty() {
         body["system"] = system.into();

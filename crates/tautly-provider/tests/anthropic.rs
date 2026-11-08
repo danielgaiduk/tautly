@@ -130,6 +130,38 @@ fn reasoning_budget_maps_to_thinking() {
     assert!(to_wire(&base_req()).get("thinking").is_none());
 }
 
+/// Review M6: a message left with nothing to send (only unsigned reasoning, from a
+/// stream cut before its signature) is dropped, not sent as `"content": []`.
+#[test]
+fn a_message_holding_only_unsigned_reasoning_is_not_sent() {
+    let mut req = base_req();
+    req.messages = vec![
+        Message {
+            role: Role::User,
+            content: vec![Content::Text("one".into())],
+        },
+        Message {
+            role: Role::Assistant,
+            content: vec![Content::Reasoning {
+                text: "cut off".into(),
+                signature: None,
+            }],
+        },
+        Message {
+            role: Role::User,
+            content: vec![Content::Text("two".into())],
+        },
+    ];
+    req.cache_breakpoints = vec![CachePoint::AfterMessage(2)];
+    let w = to_wire(&req);
+    let msgs = w["messages"].as_array().unwrap();
+    assert_eq!(msgs.len(), 2, "{msgs:?}");
+    assert!(msgs.iter().all(|m| m["role"] == "user"));
+    // The breakpoint stays on the message it named.
+    assert_eq!(msgs[1]["content"][0]["text"], "two");
+    assert!(msgs[1]["content"][0].get("cache_control").is_some());
+}
+
 #[test]
 fn wire_basics_and_message_mapping() {
     let mut req = base_req();
