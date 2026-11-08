@@ -315,18 +315,25 @@ fn walk(
             // `[ … ]` is the ordinary `[` command, so `>` and `<` inside it are redirects
             // (`[ a > Z ]` truncates `Z`); only `[[ … ]]` compares. The grammar reads both
             // as comparisons, so a single-bracket test holding one fails closed.
-            // `[a` is a word to bash (the command `[a`), not a test: the bracket must
-            // stand alone.
-            let glued = node.child(0).is_some_and(|c| {
-                src.get(c.end_byte())
-                    .is_some_and(|b| !b.is_ascii_whitespace())
-            });
+            // `[a` is a word to bash (the command `[a`), not a test: the bracket must be
+            // followed by a space or tab. A newline (or form feed) instead ends the `[`
+            // command, and bash runs the next line as a command of its own.
+            let glued = node
+                .child(0)
+                .is_some_and(|c| !matches!(src.get(c.end_byte()), Some(b' ' | b'\t')));
             if glued {
                 return Err(Unparseable(
-                    "`[` glued to a word: bash runs that word as a command".into(),
+                    "`[` not followed by a space or tab: bash runs what follows as a command"
+                        .into(),
                 ));
             }
             let single = node.child(0).is_some_and(|c| text(c, src) == "[");
+            // `[` is an ordinary command: a newline anywhere in it ends it there.
+            if single && text(node, src).contains(['\n', '\x0c']) {
+                return Err(Unparseable(
+                    "newline inside `[ … ]`: bash ends the `[` command there".into(),
+                ));
+            }
             if single && holds_redirect(node, src) {
                 return Err(Unparseable(
                     "redirect inside `[ … ]`: the `[` command, unlike `[[ … ]]`, redirects on \

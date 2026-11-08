@@ -1304,7 +1304,18 @@ fn a_read_redirection_without_a_command_is_unparseable() {
 /// the word), but the grammar reads a test: it is unparseable rather than a harmless `[[`.
 #[test]
 fn a_bracket_glued_to_a_word_is_not_a_test() {
-    for s in ["[a = b ]", "[[a = b ]]", "x && [rm -rf ]"] {
+    // Review C1: bash ends the `[` command at a newline (or form feed) after it, and runs
+    // the next line as its own command; the grammar reads one test.
+    for s in [
+        "[a = b ]",
+        "[[a = b ]]",
+        "x && [rm -rf ]",
+        "[\nrm -rf x ]",
+        "ls; [\nrm -rf x ]",
+        "[ -f a ] && [\nrm -rf x ]",
+        "[ a\nrm -rf x ]",
+        "[\x0crm -rf x ]",
+    ] {
         assert!(
             parse_commands(s).is_err(),
             "{s:?} parsed as {:?}",
