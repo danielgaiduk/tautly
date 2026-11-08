@@ -878,86 +878,11 @@ fn restrict_project_layer(
     }
 
     if let Some(Value::Table(budget)) = layer.get_mut("budget") {
-        retain_known(budget, &["turn", "session"], "budget", &mut ignore);
-        for scope in ["turn", "session"] {
-            let Some(Value::Table(project)) = budget.get_mut(scope) else {
-                continue;
-            };
-            retain_known(
-                project,
-                &["max_usd", "max_tokens"],
-                &format!("budget.{scope}"),
-                &mut ignore,
-            );
-            let user = so_far
-                .get("budget")
-                .and_then(Value::as_table)
-                .and_then(|b| b.get(scope))
-                .and_then(Value::as_table);
-            for key in ["max_usd", "max_tokens"] {
-                if !tightens(project, user, key, None) {
-                    project.remove(key);
-                    ignore(&format!("budget.{scope}.{key}"), loosening);
-                }
-            }
-        }
+        restrict_budget(budget, so_far, &mut ignore);
     }
 
     if let Some(Value::Array(pins)) = layer.get_mut("pins") {
-        // The user's pins stay (first), the project's are added after them.
-        let mut all: Vec<Value> = so_far
-            .get("pins")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
-        let mut total = 0;
-        let (mut empty, mut too_big, mut over_cap) = (0, 0, 0);
-        let mut full = false;
-        for pin in std::mem::take(pins) {
-            let Value::String(text) = &pin else {
-                continue; // dropped by `drop_unusable_values`
-            };
-            if all.contains(&pin) {
-                continue; // an exact duplicate adds nothing
-            }
-            if text.trim().is_empty() {
-                empty += 1;
-            } else if text.len() > MAX_PIN_BYTES {
-                too_big += 1;
-            } else if full || total + text.len() > MAX_PROJECT_PINS_BYTES {
-                full = true;
-                over_cap += 1;
-            } else {
-                total += text.len();
-                all.push(pin);
-            }
-        }
-        *pins = all;
-        let plural = |n: usize| if n == 1 { "pin" } else { "pins" };
-        if empty > 0 {
-            ignore(
-                "pins",
-                &format!("dropped {empty} empty project {}", plural(empty)),
-            );
-        }
-        if too_big > 0 {
-            ignore(
-                "pins",
-                &format!(
-                    "dropped {too_big} project {} over the {MAX_PIN_BYTES} byte limit",
-                    plural(too_big)
-                ),
-            );
-        }
-        if over_cap > 0 {
-            ignore(
-                "pins",
-                &format!(
-                    "dropped {over_cap} project {} over the {MAX_PROJECT_PINS_BYTES} byte cap",
-                    plural(over_cap)
-                ),
-            );
-        }
+        restrict_pins(pins, so_far, &mut ignore);
     }
 
     if let Some(Value::Table(perms)) = layer.get_mut("permissions") {
@@ -1083,6 +1008,93 @@ fn drop_unusable_values(layer: &mut Table, ignore: &mut impl FnMut(&str, &str)) 
 /// An integer from 1 to `max`.
 fn whole_number(v: &Value, max: i64) -> bool {
     matches!(v, Value::Integer(i) if (1..=max).contains(i))
+}
+
+/// `budget` limits of a project layer: known keys only, each only lower than the user's.
+fn restrict_budget(budget: &mut Table, so_far: &Table, ignore: &mut impl FnMut(&str, &str)) {
+    let loosening = "a project config can only lower this limit";
+    retain_known(budget, &["turn", "session"], "budget", ignore);
+    for scope in ["turn", "session"] {
+        let Some(Value::Table(project)) = budget.get_mut(scope) else {
+            continue;
+        };
+        retain_known(
+            project,
+            &["max_usd", "max_tokens"],
+            &format!("budget.{scope}"),
+            ignore,
+        );
+        let user = so_far
+            .get("budget")
+            .and_then(Value::as_table)
+            .and_then(|b| b.get(scope))
+            .and_then(Value::as_table);
+        for key in ["max_usd", "max_tokens"] {
+            if !tightens(project, user, key, None) {
+                project.remove(key);
+                ignore(&format!("budget.{scope}.{key}"), loosening);
+            }
+        }
+    }
+}
+
+/// Project `pins`: after the user's, without duplicates, empty or oversized ones, within
+/// the cap.
+fn restrict_pins(pins: &mut Vec<Value>, so_far: &Table, ignore: &mut impl FnMut(&str, &str)) {
+    // The user's pins stay (first), the project's are added after them.
+    let mut all: Vec<Value> = so_far
+        .get("pins")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let mut total = 0;
+    let (mut empty, mut too_big, mut over_cap) = (0, 0, 0);
+    let mut full = false;
+    for pin in std::mem::take(pins) {
+        let Value::String(text) = &pin else {
+            continue; // dropped by `drop_unusable_values`
+        };
+        if all.contains(&pin) {
+            continue; // an exact duplicate adds nothing
+        }
+        if text.trim().is_empty() {
+            empty += 1;
+        } else if text.len() > MAX_PIN_BYTES {
+            too_big += 1;
+        } else if full || total + text.len() > MAX_PROJECT_PINS_BYTES {
+            full = true;
+            over_cap += 1;
+        } else {
+            total += text.len();
+            all.push(pin);
+        }
+    }
+    *pins = all;
+    let plural = |n: usize| if n == 1 { "pin" } else { "pins" };
+    if empty > 0 {
+        ignore(
+            "pins",
+            &format!("dropped {empty} empty project {}", plural(empty)),
+        );
+    }
+    if too_big > 0 {
+        ignore(
+            "pins",
+            &format!(
+                "dropped {too_big} project {} over the {MAX_PIN_BYTES} byte limit",
+                plural(too_big)
+            ),
+        );
+    }
+    if over_cap > 0 {
+        ignore(
+            "pins",
+            &format!(
+                "dropped {over_cap} project {} over the {MAX_PROJECT_PINS_BYTES} byte cap",
+                plural(over_cap)
+            ),
+        );
+    }
 }
 
 /// Take the project layer's `[mcp.servers]` out of it: they never merge with the user's
