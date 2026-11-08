@@ -5,71 +5,38 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::process::Command as Process;
 use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::{Value, json};
 use tautly_core::timetravel::step_at_offset;
 use tautly_core::worktree::{self, ForkRequest, WtError};
-use tautly_core::{Command, Config, EngineBuilder, Event, ProviderFactory, SessionRecord};
-use tautly_provider::{
-    Catalog, MockProvider, MockTurn, ModelId, Provider, ProviderEvent, StopReason,
-};
+use tautly_core::{Config, EngineBuilder, ProviderFactory, SessionRecord};
+use tautly_provider::mock::{call, text_step_no_usage, tools_step};
+use tautly_provider::{Catalog, MockProvider, ModelId, Provider, ProviderEvent};
 use tautly_sandbox::{LocalSandbox, Mode, Sandbox};
 use tautly_session::{Origin, SessionReader};
-use tempfile::TempDir;
-use tokio::sync::mpsc;
+use tautly_testkit::{MODEL, start};
+use tautly_testkit::{Repo, git_in};
 
-const MODEL: &str = "mock/test";
 const OTHER: &str = "anthropic/other";
-const WAIT: Duration = Duration::from_secs(30);
 
 // ------------------------------------------------------------------------ fixtures
 
-struct Repo {
-    dir: TempDir,
-    home: TempDir,
+/// `a.txt`, the file of a plain work tree.
+const A: &[(&str, &str)] = &[("a.txt", "zero\n")];
+/// `a.txt` and `b.txt`, committed in a repository.
+const AB: &[(&str, &str)] = &[("a.txt", "zero\n"), ("b.txt", "bee\n")];
+
+trait RepoExt {
+    fn home(&self) -> PathBuf;
+    fn sandbox(&self) -> Arc<dyn Sandbox>;
+    fn builder(&self, mock: &MockProvider) -> EngineBuilder;
 }
 
-impl Repo {
-    /// A git repository with `a.txt` and `b.txt` committed.
-    fn git_repo() -> Repo {
-        let repo = Repo::plain();
-        repo.git(&["init", "-q", "-b", "main"]);
-        repo.write("a.txt", "zero\n");
-        repo.write("b.txt", "bee\n");
-        repo.git(&["add", "-A"]);
-        repo.git(&["commit", "-q", "-m", "init"]);
-        repo
-    }
-
-    /// A directory that is not a git work tree, with `a.txt`.
-    fn plain() -> Repo {
-        let repo = Repo {
-            dir: tempfile::tempdir().unwrap(),
-            home: tempfile::tempdir().unwrap(),
-        };
-        repo.write("a.txt", "zero\n");
-        repo
-    }
-
-    fn root(&self) -> PathBuf {
-        self.dir.path().canonicalize().unwrap()
-    }
-
+impl RepoExt for Repo {
     fn home(&self) -> PathBuf {
         self.home.path().canonicalize().unwrap()
-    }
-
-    fn write(&self, rel: &str, text: &str) {
-        let p = self.root().join(rel);
-        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
-        std::fs::write(p, text).unwrap();
-    }
-
-    fn git(&self, args: &[&str]) -> Option<String> {
-        git_in(&self.root(), args)
     }
 
     fn sandbox(&self) -> Arc<dyn Sandbox> {
@@ -84,20 +51,6 @@ impl Repo {
             ..EngineBuilder::new(config(), self.dir.path())
         }
     }
-}
-
-fn git_in(dir: &Path, args: &[&str]) -> Option<String> {
-    let out = Process::new("git")
-        .current_dir(dir)
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .args(["-c", "user.name=T", "-c", "user.email=t@example.com"])
-        .args(args)
-        .output()
-        .unwrap();
-    out.status
-        .success()
-        .then(|| String::from_utf8(out.stdout).unwrap())
 }
 
 fn config() -> Config {
@@ -153,14 +106,6 @@ fn files(root: &Path) -> BTreeMap<String, String> {
     out
 }
 
-fn call(id: &str, name: &str, args: Value) -> ProviderEvent {
-    ProviderEvent::ToolCall {
-        id: id.into(),
-        name: name.into(),
-        input_json: args.to_string(),
-    }
-}
-
 fn write(id: &str, path: &str, content: &str) -> ProviderEvent {
     call(id, "write", json!({ "path": path, "content": content }))
 }
@@ -169,79 +114,23 @@ fn bash(id: &str, command: &str) -> ProviderEvent {
     call(id, "bash", json!({ "command": command }))
 }
 
-fn tools_step(calls: Vec<ProviderEvent>) -> MockTurn {
-    let mut evs = calls;
-    evs.push(ProviderEvent::Done {
-        stop: StopReason::ToolUse,
-    });
-    MockTurn::Events(evs)
-}
-
-fn text_step(text: &str) -> MockTurn {
-    MockTurn::Events(vec![
-        ProviderEvent::TextDelta(text.into()),
-        ProviderEvent::Done {
-            stop: StopReason::EndTurn,
-        },
-    ])
-}
-
 /// Two turns: (1 user, 2 write a=one, 3 text) and (4 user, 5 write a=two and run a
 /// command that changes b.txt and creates c.txt, 6 text).
 fn two_turns() -> MockProvider {
     MockProvider::new(vec![
         tools_step(vec![write("w1", "a.txt", "one\n")]),
-        text_step("first"),
+        text_step_no_usage("first"),
         tools_step(vec![
             write("w2", "a.txt", "two\n"),
             bash("b1", "printf 'changed\\n' > b.txt && printf 'x\\n' > c.txt"),
         ]),
-        text_step("second"),
+        text_step_no_usage("second"),
     ])
-}
-
-struct Run {
-    engine: tautly_core::Engine,
-    events: mpsc::Receiver<Event>,
-}
-
-impl Run {
-    fn start(b: EngineBuilder) -> Run {
-        let (engine, events) = b.build().unwrap();
-        Run { engine, events }
-    }
-
-    async fn next(&mut self) -> Event {
-        tokio::time::timeout(WAIT, self.events.recv())
-            .await
-            .expect("timed out waiting for an event")
-            .expect("event channel closed")
-    }
-
-    async fn turn_with(&mut self, text: &str) {
-        self.engine
-            .send(Command::SendMessage {
-                id: None,
-                text: text.into(),
-            })
-            .await
-            .unwrap();
-        while !matches!(self.next().await, Event::TurnFinished { .. }) {}
-    }
-
-    async fn stop(mut self) {
-        self.engine.send(Command::Shutdown).await.unwrap();
-        while tokio::time::timeout(WAIT, self.events.recv())
-            .await
-            .expect("the engine did not stop")
-            .is_some()
-        {}
-    }
 }
 
 /// A finished two-turn session in `repo`: its id and log.
 async fn two_turn_session(repo: &Repo) -> (String, PathBuf) {
-    let mut run = Run::start(repo.builder(&two_turns()));
+    let mut run = start(repo.builder(&two_turns()));
     run.turn_with("one").await;
     run.turn_with("two").await;
     let (id, log) = run.engine.current_session();
@@ -302,7 +191,7 @@ fn logs(home: &Path) -> Vec<PathBuf> {
 
 #[tokio::test]
 async fn fork_at_n_creates_worktree_with_state_at_n_and_original_tree_and_index_untouched() {
-    let repo = Repo::git_repo();
+    let repo = Repo::git_repo(AB);
     let (_, log) = two_turn_session(&repo).await;
     let before = files(&repo.root());
     let index = std::fs::read(repo.root().join(".git/index")).unwrap();
@@ -341,7 +230,7 @@ async fn fork_at_n_creates_worktree_with_state_at_n_and_original_tree_and_index_
 
 #[tokio::test]
 async fn fork_session_has_parent_origin_what_if_and_records_up_to_n() {
-    let repo = Repo::git_repo();
+    let repo = Repo::git_repo(AB);
     let (parent, log) = two_turn_session(&repo).await;
     let made = fork(&repo, &log, 3).await.unwrap();
     let child = reader(&made.log);
@@ -374,11 +263,11 @@ async fn fork_session_has_parent_origin_what_if_and_records_up_to_n() {
         .unwrap();
     assert!(refs.contains(&made.session_id), "{refs}");
     // A resumed fork continues in its worktree with the copied context.
-    let mut run = Run::start(EngineBuilder {
+    let mut run = start(EngineBuilder {
         resume: Some(made.session_id.clone()),
         ..EngineBuilder {
             root: made.worktree.clone(),
-            ..repo.builder(&MockProvider::new(vec![text_step("again")]))
+            ..repo.builder(&MockProvider::new(vec![text_step_no_usage("again")]))
         }
     });
     run.turn_with("three").await;
@@ -396,7 +285,7 @@ async fn fork_session_has_parent_origin_what_if_and_records_up_to_n() {
 
 #[tokio::test]
 async fn fork_shares_blob_dir_with_parent() {
-    let repo = Repo::git_repo();
+    let repo = Repo::git_repo(AB);
     let (_, log) = two_turn_session(&repo).await;
     let made = fork(&repo, &log, 3).await.unwrap();
     assert_eq!(made.log.parent(), log.parent());
@@ -416,7 +305,7 @@ async fn fork_shares_blob_dir_with_parent() {
 
 #[tokio::test]
 async fn model_override_applied_before_first_message() {
-    let repo = Repo::git_repo();
+    let repo = Repo::git_repo(AB);
     let (_, log) = two_turn_session(&repo).await;
     let made = worktree::fork_to_worktree(
         repo.sandbox(),
@@ -431,8 +320,8 @@ async fn model_override_applied_before_first_message() {
     )
     .await
     .unwrap();
-    let mock = MockProvider::new(vec![text_step("from the other")]);
-    let mut run = Run::start(EngineBuilder {
+    let mock = MockProvider::new(vec![text_step_no_usage("from the other")]);
+    let mut run = start(EngineBuilder {
         resume: Some(made.session_id.clone()),
         root: made.worktree.clone(),
         ..repo.builder(&mock)
@@ -473,7 +362,7 @@ async fn model_override_applied_before_first_message() {
 
 #[tokio::test]
 async fn worktree_hooks_not_run() {
-    let repo = Repo::git_repo();
+    let repo = Repo::git_repo(AB);
     let (_, log) = two_turn_session(&repo).await;
     let marker = repo.home().join("hook-ran");
     let hook = format!("#!/bin/sh\necho ran > '{}'\n", marker.display());
@@ -533,7 +422,7 @@ async fn config_declared_hooks_not_run_on_fork_or_delete() {
     if !config_hooks_supported() {
         return;
     }
-    let repo = Repo::git_repo();
+    let repo = Repo::git_repo(AB);
     let (_, log) = two_turn_session(&repo).await;
     let marker = repo.home().join("hook-ran");
     let touch = format!("touch '{}'", marker.display());
@@ -560,7 +449,7 @@ async fn config_declared_hooks_not_run_on_fork_or_delete() {
 
 #[tokio::test]
 async fn non_git_root_refuses() {
-    let repo = Repo::plain();
+    let repo = Repo::plain(A);
     let (_, log) = two_turn_session(&repo).await;
     let refused = fork(&repo, &log, 3).await;
     assert!(matches!(refused, Err(WtError::NotGit(_))), "{refused:?}");
@@ -572,12 +461,12 @@ async fn non_git_root_refuses() {
 async fn partial_state_refused_with_note() {
     // A session that stopped mid-turn (its log cut after a command's result): no
     // checkpoint follows that step, so its files are not known exactly.
-    let repo = Repo::git_repo();
+    let repo = Repo::git_repo(AB);
     let mock = MockProvider::new(vec![
         tools_step(vec![bash("b1", "printf 'cmd\\n' > c.txt")]),
-        text_step("done"),
+        text_step_no_usage("done"),
     ]);
-    let mut run = Run::start(repo.builder(&mock));
+    let mut run = start(repo.builder(&mock));
     run.turn_with("go").await;
     let log = run.engine.current_session().1;
     run.stop().await;
@@ -602,7 +491,7 @@ async fn partial_state_refused_with_note() {
 async fn copied_records_resolve_under_the_new_root_only() {
     // Review Focus 14: a record path that would leave the root is refused before
     // anything is made.
-    let repo = Repo::git_repo();
+    let repo = Repo::git_repo(AB);
     let (_, log) = two_turn_session(&repo).await;
     let text = std::fs::read_to_string(&log).unwrap();
     let mut lines: Vec<Value> = text
@@ -625,7 +514,7 @@ async fn copied_records_resolve_under_the_new_root_only() {
 
 #[tokio::test]
 async fn an_unknown_step_is_refused_before_anything_is_made() {
-    let repo = Repo::git_repo();
+    let repo = Repo::git_repo(AB);
     let (_, log) = two_turn_session(&repo).await;
     let refused = fork(&repo, &log, 9).await;
     assert!(
@@ -684,7 +573,7 @@ async fn worktree_scoped_filters_never_run_on_fork_or_delete() {
     // (`includeIf gitdir:**/worktrees/**`, and a worktree's own `config.worktree`) is
     // switched off as well: the worktree is checked out, and checked for changes, in its
     // own configuration's context.
-    let repo = Repo::git_repo();
+    let repo = Repo::git_repo(AB);
     repo.write(".gitattributes", "*.txt filter=wt\n*.md filter=wt2\n");
     repo.write("n.md", "note\n");
     repo.git(&["add", "-A"]).unwrap();
@@ -785,7 +674,7 @@ async fn worktree_scoped_filters_never_run_on_fork_or_delete() {
 #[tokio::test]
 async fn delete_from_inside_the_fork_refuses_and_keeps_everything() {
     // Review I1.
-    let repo = Repo::git_repo();
+    let repo = Repo::git_repo(AB);
     let (_, log) = two_turn_session(&repo).await;
     let made = fork(&repo, &log, 3).await.unwrap();
     let refused = delete(&repo, &made.worktree, &made.session_id, true).await;
@@ -802,10 +691,10 @@ async fn delete_from_inside_the_fork_refuses_and_keeps_everything() {
 #[tokio::test]
 async fn delete_refuses_while_a_live_session_uses_the_worktree() {
     // Review I2: a session (not the fork's own) running in the fork's worktree.
-    let repo = Repo::git_repo();
+    let repo = Repo::git_repo(AB);
     let (_, log) = two_turn_session(&repo).await;
     let made = fork(&repo, &log, 3).await.unwrap();
-    let live = Run::start(EngineBuilder {
+    let live = start(EngineBuilder {
         root: made.worktree.clone(),
         ..repo.builder(&MockProvider::new(vec![]))
     });
@@ -830,7 +719,7 @@ async fn delete_refuses_while_a_live_session_uses_the_worktree() {
 #[tokio::test]
 async fn delete_names_ignored_files_and_needs_force_for_them() {
     // Review M8 (and M2: decided from tautly's own status, not git's message).
-    let repo = Repo::git_repo();
+    let repo = Repo::git_repo(AB);
     repo.write(".gitignore", "*.log\n");
     repo.git(&["add", "-A"]).unwrap();
     repo.git(&["commit", "-q", "-m", "ignore"]).unwrap();
@@ -867,7 +756,7 @@ async fn delete_names_ignored_files_and_needs_force_for_them() {
 #[tokio::test]
 async fn a_dir_inside_a_worktree_of_the_repository_is_refused() {
     // Review M3.
-    let repo = Repo::git_repo();
+    let repo = Repo::git_repo(AB);
     let (_, log) = two_turn_session(&repo).await;
     let at = |dir: PathBuf| ForkRequest {
         at: Some(3),
@@ -902,7 +791,7 @@ async fn a_populated_submodule_refuses_delete_and_its_filter_never_runs() {
     // Re-review N1: a submodule's own configuration (its git dir under the fork's admin
     // directory) is never read by tautly's status, and a worktree holding one is not
     // removed without --force, as git itself refuses.
-    let repo = Repo::git_repo();
+    let repo = Repo::git_repo(AB);
     let (_, log) = two_turn_session(&repo).await;
     let made = fork(&repo, &log, 3).await.unwrap();
     let source = tempfile::tempdir().unwrap();
@@ -972,7 +861,7 @@ async fn a_populated_submodule_refuses_delete_and_its_filter_never_runs() {
 #[tokio::test]
 async fn a_commit_only_the_forks_head_reaches_refuses_delete() {
     // Re-review N3: the fork's HEAD is detached; a commit made there would be lost.
-    let repo = Repo::git_repo();
+    let repo = Repo::git_repo(AB);
     let (_, log) = two_turn_session(&repo).await;
     let made = fork(&repo, &log, 3).await.unwrap();
     git_in(
@@ -1009,7 +898,7 @@ async fn a_commit_only_the_forks_head_reaches_refuses_delete() {
 async fn a_symlink_dir_is_refused_and_left_alone() {
     // Re-review N2: a link given as the directory (dangling or not) is never followed or
     // removed.
-    let repo = Repo::git_repo();
+    let repo = Repo::git_repo(AB);
     let (_, log) = two_turn_session(&repo).await;
     let target = repo.home().join("target");
     std::fs::create_dir(&target).unwrap();
@@ -1044,7 +933,7 @@ async fn a_symlink_dir_is_refused_and_left_alone() {
 #[tokio::test]
 async fn a_default_dir_inside_the_repository_names_dir_and_tautly_home() {
     // Re-review N5: the data home is inside the project's own work tree.
-    let repo = Repo::git_repo();
+    let repo = Repo::git_repo(AB);
     let (_, log) = two_turn_session(&repo).await;
     let home = repo.root().join(".data");
     let refused = worktree::fork_to_worktree(
@@ -1069,7 +958,7 @@ async fn a_default_dir_inside_the_repository_names_dir_and_tautly_home() {
 
 #[tokio::test]
 async fn a_dot_git_symlink_refuses_the_fork() {
-    let repo = Repo::git_repo();
+    let repo = Repo::git_repo(AB);
     let (_, log) = two_turn_session(&repo).await;
     // The repository moved away and `.git` became a link to it: never followed.
     let moved = tempfile::tempdir().unwrap();
@@ -1088,7 +977,7 @@ async fn a_dot_git_symlink_refuses_the_fork() {
 #[tokio::test]
 async fn a_fork_whose_log_cannot_be_written_leaves_no_worktree_behind() {
     use std::os::unix::fs::PermissionsExt;
-    let repo = Repo::git_repo();
+    let repo = Repo::git_repo(AB);
     let (_, log) = two_turn_session(&repo).await;
     // The worktree shares the project's session directory: make it read-only.
     let sessions = log.parent().unwrap().to_path_buf();
@@ -1112,7 +1001,7 @@ async fn a_fork_whose_log_cannot_be_written_leaves_no_worktree_behind() {
 
 #[tokio::test]
 async fn fork_into_copies_the_records_up_to_the_cut() {
-    let repo = Repo::git_repo();
+    let repo = Repo::git_repo(AB);
     let (parent, log) = two_turn_session(&repo).await;
     let r = reader(&log);
     let id = worktree::fork_into(

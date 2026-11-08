@@ -752,10 +752,7 @@ impl MemoryStore {
         if !valid_session_id(session_id) {
             return Err(MemoryError::BadId(session_id.to_string()));
         }
-        fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(&self.data_home)
+        tautly_session::paths::create_private_dir_all(&self.data_home)
             .map_err(io_err(&self.data_home))?;
         let path = write_private(&self.episodes_chain, &format!("{session_id}.md"), markdown)?;
         *self.episodes.lock().unwrap_or_else(PoisonError::into_inner) = None;
@@ -865,7 +862,7 @@ fn load_entries(dir: &Path) -> Result<Loaded, MemoryError> {
 fn load_entry(path: &Path) -> Result<(MemoryEntry, u64), String> {
     let text = read_nofollow(path, MAX_ENTRY_BYTES, false)?;
     let mut entry = MemoryEntry::from_markdown(&text)?;
-    let tokens = entry.body.len().div_ceil(4) as u32;
+    let tokens = crate::approx_tokens(&entry.body);
     if tokens > MAX_BODY_TOKENS {
         return Err(format!(
             "the body is about {tokens} tokens; the limit is {MAX_BODY_TOKENS}"

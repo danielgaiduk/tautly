@@ -8,23 +8,19 @@ use std::process::Command as Process;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use serde_json::{Value, json};
+use serde_json::json;
 use tautly_core::checkpoint::{self, skip_warning};
 use tautly_core::undo::{UndoError, undo};
 use tautly_core::{
-    CheckpointConfig, Checkpointer, CliOverrides, Command, Config, Engine, EngineBuilder, Event,
+    CheckpointConfig, Checkpointer, CliOverrides, Command, Config, EngineBuilder, Event,
     SessionRecord, Skip, sessions,
 };
-use tautly_provider::{
-    Catalog, MockProvider, MockTurn, ModelId, ProviderEvent, RawUsage, StopReason,
-};
+use tautly_provider::mock::{call, text_step, tools_step};
+use tautly_provider::{MockProvider, ModelId, ProviderEvent};
 use tautly_sandbox::{LocalSandbox, Mode, Sandbox};
 use tautly_session::SessionReader;
+use tautly_testkit::{MODEL, Run, WAIT, catalog, start};
 use tempfile::TempDir;
-use tokio::sync::mpsc;
-
-const MODEL: &str = "mock/test";
-const WAIT: Duration = Duration::from_secs(30);
 
 // ------------------------------------------------------------------------ fixtures
 
@@ -137,25 +133,10 @@ impl Repo {
     }
 }
 
-fn catalog() -> Catalog {
-    Catalog::from_toml(&format!(
-        r#"[models."{MODEL}"]
-context_window = 200000
-max_output = 8000
-parallel_tools = true
-reasoning = "none"
-cache = "none"
-images = false
-edit_format = "str_replace"
-"#
-    ))
-    .unwrap()
-}
-
 fn config() -> Config {
     let mut c = Config {
         model: ModelId::from(MODEL),
-        catalog_overrides: Some(catalog()),
+        catalog_overrides: Some(catalog(200_000, 8000, "str_replace")),
         ..Config::default()
     };
     c.permissions.mode = Mode::Yolo;
@@ -163,14 +144,6 @@ fn config() -> Config {
     // that would change what these tests see. Tests of the limit set their own.
     c.checkpoints.timeout_ms = 120_000;
     c
-}
-
-fn call(id: &str, name: &str, args: Value) -> ProviderEvent {
-    ProviderEvent::ToolCall {
-        id: id.into(),
-        name: name.into(),
-        input_json: args.to_string(),
-    }
 }
 
 fn bash(id: &str, command: &str) -> ProviderEvent {
@@ -181,73 +154,13 @@ fn write(id: &str, path: &str, content: &str) -> ProviderEvent {
     call(id, "write", json!({ "path": path, "content": content }))
 }
 
-fn tools_step(calls: Vec<ProviderEvent>) -> MockTurn {
-    let mut evs = calls;
-    evs.push(ProviderEvent::Done {
-        stop: StopReason::ToolUse,
-    });
-    MockTurn::Events(evs)
+trait RunExt {
+    async fn undo(&mut self, turn: Option<u32>, dry_run: bool) -> Event;
+    async fn fork(&mut self) -> String;
+    async fn fork_at(&mut self, at: Option<u32>) -> String;
 }
 
-fn text_step(text: &str) -> MockTurn {
-    MockTurn::Events(vec![
-        ProviderEvent::TextDelta(text.into()),
-        ProviderEvent::Usage(RawUsage {
-            input: 100,
-            output: 10,
-            cache_read: 0,
-            cache_write: 0,
-        }),
-        ProviderEvent::Done {
-            stop: StopReason::EndTurn,
-        },
-    ])
-}
-
-struct Run {
-    engine: Engine,
-    events: mpsc::Receiver<Event>,
-}
-
-fn start(b: EngineBuilder) -> Run {
-    let (engine, events) = b.build().unwrap();
-    Run { engine, events }
-}
-
-impl Run {
-    async fn send(&self, cmd: Command) {
-        self.engine.send(cmd).await.unwrap();
-    }
-
-    async fn next(&mut self) -> Event {
-        tokio::time::timeout(WAIT, self.events.recv())
-            .await
-            .expect("timed out waiting for an event")
-            .expect("event channel closed")
-    }
-
-    async fn until(&mut self, pred: impl Fn(&Event) -> bool) -> Vec<Event> {
-        let mut out = Vec::new();
-        loop {
-            let ev = self.next().await;
-            let done = pred(&ev);
-            out.push(ev);
-            if done {
-                return out;
-            }
-        }
-    }
-
-    async fn turn_with(&mut self, text: &str) -> Vec<Event> {
-        self.send(Command::SendMessage {
-            id: None,
-            text: text.into(),
-        })
-        .await;
-        self.until(|e| matches!(e, Event::TurnFinished { .. }))
-            .await
-    }
-
+impl RunExt for Run {
     /// Send `Undo` and wait for its answer (`Undone`, or the `Error`).
     async fn undo(&mut self, turn: Option<u32>, dry_run: bool) -> Event {
         self.send(Command::Undo {
@@ -281,13 +194,6 @@ impl Run {
             Some(Event::SessionChanged { id: _, session_id }) => session_id.clone(),
             other => panic!("the fork failed: {other:?}"),
         }
-    }
-
-    async fn stop(mut self) {
-        self.send(Command::Shutdown).await;
-        let closed =
-            tokio::time::timeout(WAIT, async { while self.events.recv().await.is_some() {} }).await;
-        assert!(closed.is_ok(), "the engine did not stop");
     }
 }
 

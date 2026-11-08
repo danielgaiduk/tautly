@@ -7,6 +7,7 @@ use std::time::Duration;
 use common::{BlockingSandbox, Fixture, HookSandbox, eventually, paths, write_all};
 use tautly_index::{Index, RefreshStats};
 use tautly_sandbox::LocalSandbox;
+use tautly_testkit::Delegating;
 
 const WATCH_WAIT: Duration = Duration::from_secs(2);
 
@@ -342,9 +343,9 @@ async fn reindex_honors_the_sandbox_walkers_own_filter() {
         t.path(),
         &[("ok/y.rs", "fn y() {}\n"), ("blocked/x.rs", "fn x() {}\n")],
     );
-    let sb = Arc::new(BlockingSandbox {
+    let sb = Arc::new(Delegating(BlockingSandbox {
         inner: LocalSandbox::new(t.path().to_path_buf()).unwrap(),
-    });
+    }));
     let idx = Index::open(&t.path().join(".index.db"), sb).unwrap();
     idx.refresh().await.unwrap();
     assert_eq!(paths(&idx.tree().glob("**/*", Path::new("."))), ["ok/y.rs"]);
@@ -507,7 +508,9 @@ async fn files_reachable_through_in_root_symlinks_are_indexed_like_the_tools_see
     }
 }
 
-fn probe_fixture(extra: &[(&str, &str)]) -> (Fixture, Arc<common::ProbeSandbox>, Arc<Index>) {
+fn probe_fixture(
+    extra: &[(&str, &str)],
+) -> (Fixture, Arc<Delegating<common::ProbeSandbox>>, Arc<Index>) {
     let mut files = vec![
         (".gitignore", "target/\n"),
         ("src/a.rs", "fn a() {}\n"),
@@ -898,13 +901,13 @@ async fn a_refresh_that_started_before_the_mark_does_not_clear_it() {
     let fx = sample();
     let slot: Arc<std::sync::OnceLock<Arc<Index>>> = Arc::default();
     let hook_slot = Arc::clone(&slot);
-    let sb = Arc::new(HookSandbox {
+    let sb = Arc::new(Delegating(HookSandbox {
         inner: LocalSandbox::new(fx.root.path().to_path_buf()).unwrap(),
         // Runs after the refresh has started scanning.
         on_walk: std::sync::Mutex::new(Some(Box::new(move || {
             hook_slot.get().unwrap().mark_stale();
         }))),
-    });
+    }));
     let idx = Arc::new(Index::open(&fx.root.path().join(".index.db"), sb).unwrap());
     slot.set(Arc::clone(&idx)).ok();
     idx.refresh().await.unwrap();
@@ -962,10 +965,10 @@ async fn background_refresh_runs_again_for_a_mark_made_during_it() {
     let fx = sample();
     let slot: Arc<std::sync::OnceLock<Arc<Index>>> = Arc::default();
     let hook_slot = Arc::clone(&slot);
-    let sb = Arc::new(HookSandbox {
+    let sb = Arc::new(Delegating(HookSandbox {
         inner: LocalSandbox::new(fx.root.path().to_path_buf()).unwrap(),
         on_walk: std::sync::Mutex::new(None),
-    });
+    }));
     let idx = Arc::new(Index::open(&fx.root.path().join(".index.db"), sb.clone()).unwrap());
     slot.set(Arc::clone(&idx)).ok();
     idx.refresh().await.unwrap();

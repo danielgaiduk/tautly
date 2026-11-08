@@ -2,17 +2,13 @@
 //! through the engine with a scripted provider and a real sandbox on a temporary directory.
 
 use std::sync::Arc;
-use std::time::Duration;
 
-use serde_json::{Value, json};
-use tautly_core::{Command, Config, Engine, EngineBuilder, Event, FinishReason};
+use serde_json::json;
+use tautly_core::{Command, Config, EngineBuilder, Event, FinishReason};
+use tautly_provider::mock::{call, text_step_no_usage};
 use tautly_provider::{Catalog, MockProvider, MockTurn, ModelId, ProviderEvent, StopReason};
 use tautly_sandbox::Mode;
-use tempfile::TempDir;
-use tokio::sync::mpsc;
-
-const MODEL: &str = "mock/test";
-const WAIT: Duration = Duration::from_secs(30);
+use tautly_testkit::{Fx, MODEL, Run, WAIT, start};
 
 fn config(deny: &[&str]) -> Config {
     let catalog = Catalog::from_toml(&format!(
@@ -38,14 +34,6 @@ edit_format = "str_replace"
     c
 }
 
-fn call(id: &str, name: &str, args: Value) -> ProviderEvent {
-    ProviderEvent::ToolCall {
-        id: id.into(),
-        name: name.into(),
-        input_json: args.to_string(),
-    }
-}
-
 fn bash(id: &str, command: &str) -> ProviderEvent {
     call(id, "bash", json!({ "command": command }))
 }
@@ -59,59 +47,29 @@ fn step(c: ProviderEvent) -> MockTurn {
     ])
 }
 
-fn text_step(text: &str) -> MockTurn {
-    MockTurn::Events(vec![
-        ProviderEvent::TextDelta(text.into()),
-        ProviderEvent::Done {
-            stop: StopReason::EndTurn,
-        },
-    ])
+trait FxExt {
+    fn start(&self, cfg: Config, mock: &MockProvider, resume: Option<String>) -> Run;
 }
 
-struct Fx {
-    dir: TempDir,
-    home: TempDir,
-}
-
-impl Fx {
-    fn new() -> Fx {
-        Fx {
-            dir: tempfile::tempdir().unwrap(),
-            home: tempfile::tempdir().unwrap(),
-        }
-    }
-
+impl FxExt for Fx {
     fn start(&self, cfg: Config, mock: &MockProvider, resume: Option<String>) -> Run {
-        let (engine, events) = EngineBuilder {
+        start(EngineBuilder {
             provider: Some(Arc::new(mock.clone())),
             data_home: Some(self.home.path().to_path_buf()),
             interactive: true,
             resume,
             ..EngineBuilder::new(cfg, self.dir.path())
-        }
-        .build()
-        .unwrap();
-        Run { engine, events }
+        })
     }
 }
 
-struct Run {
-    engine: Engine,
-    events: mpsc::Receiver<Event>,
+trait RunExt {
+    async fn until_ask_or_end(&mut self, seen: &mut Vec<Event>) -> Option<String>;
+    async fn approve(&self, request_id: String, rule: Option<&str>);
+    async fn shutdown(self);
 }
 
-impl Run {
-    async fn send(&self, cmd: Command) {
-        self.engine.send(cmd).await.unwrap();
-    }
-
-    async fn next(&mut self) -> Event {
-        tokio::time::timeout(WAIT, self.events.recv())
-            .await
-            .expect("timed out waiting for an event")
-            .expect("event channel closed")
-    }
-
+impl RunExt for Run {
     /// Events up to the next approval request (its id) or the end of the turn (None).
     async fn until_ask_or_end(&mut self, seen: &mut Vec<Event>) -> Option<String> {
         loop {
@@ -190,7 +148,7 @@ async fn session_rule_allows_matching_call() {
     let mock = MockProvider::new(vec![
         step(bash("b1", "echo  hi")),
         step(bash("b2", "echo hi")),
-        text_step("done"),
+        text_step_no_usage("done"),
     ]);
     let mut run = fx.start(config(&[]), &mock, None);
     run.send(Command::SendMessage {
@@ -222,7 +180,10 @@ async fn session_rule_allows_matching_call() {
 #[tokio::test]
 async fn session_rule_not_persisted_and_gone_after_resume() {
     let fx = Fx::new();
-    let mock = MockProvider::new(vec![step(bash("b1", "echo hi")), text_step("done")]);
+    let mock = MockProvider::new(vec![
+        step(bash("b1", "echo hi")),
+        text_step_no_usage("done"),
+    ]);
     let mut run = fx.start(config(&[]), &mock, None);
     let id = run.engine.session_id().to_string();
     let log = run.engine.session_path().to_path_buf();
@@ -244,7 +205,10 @@ async fn session_rule_not_persisted_and_gone_after_resume() {
     assert!(!text.contains("bash(echo hi)"), "{text}");
     assert!(!fx.dir.path().join(".tautly/config.toml").exists());
 
-    let mock = MockProvider::new(vec![step(bash("b2", "echo hi")), text_step("done")]);
+    let mock = MockProvider::new(vec![
+        step(bash("b2", "echo hi")),
+        text_step_no_usage("done"),
+    ]);
     let mut run = fx.start(config(&[]), &mock, Some(id));
     run.send(Command::SendMessage {
         id: None,
@@ -265,7 +229,7 @@ async fn deny_rule_beats_session_rule() {
     let mock = MockProvider::new(vec![
         step(bash("b1", "echo hi")),
         step(bash("b2", "echo bye")),
-        text_step("done"),
+        text_step_no_usage("done"),
     ]);
     let mut run = fx.start(config(&["bash(echo bye*)"]), &mock, None);
     run.send(Command::SendMessage {
@@ -307,7 +271,7 @@ async fn protected_path_still_asks_with_session_rule() {
         step(call("r1", "read", json!({ "path": "Cargo.toml" }))),
         step(edit("e1", "\"a\"", "\"b\"")),
         step(edit("e2", "\"b\"", "\"c\"")),
-        text_step("done"),
+        text_step_no_usage("done"),
     ]);
     let mut run = fx.start(config(&[]), &mock, None);
     run.send(Command::SendMessage {
@@ -337,7 +301,7 @@ async fn non_matching_session_rule_approves_once_and_warns() {
         step(bash("b1", "echo hi")),
         step(bash("b2", "echo hi")),
         step(bash("b3", "echo hi")),
-        text_step("done"),
+        text_step_no_usage("done"),
     ]);
     let mut run = fx.start(config(&[]), &mock, None);
     run.send(Command::SendMessage {
@@ -390,7 +354,7 @@ async fn exact_rule_does_not_cover_a_write_redirect() {
     let mock = MockProvider::new(vec![
         step(bash("b1", "echo hi")),
         step(bash("b2", "echo hi > a.txt")),
-        text_step("done"),
+        text_step_no_usage("done"),
     ]);
     let mut run = fx.start(config(&[]), &mock, None);
     run.send(Command::SendMessage {
@@ -416,7 +380,7 @@ async fn broad_session_rule_says_so() {
     let mock = MockProvider::new(vec![
         step(bash("b1", "echo hi")),
         step(bash("b2", "ls")),
-        text_step("done"),
+        text_step_no_usage("done"),
     ]);
     let mut run = fx.start(config(&[]), &mock, None);
     run.send(Command::SendMessage {

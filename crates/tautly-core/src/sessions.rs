@@ -1,7 +1,6 @@
 //! Session store operations outside a running engine (spec 6.5): `tautly sessions
 //! delete`, and the session `--continue` picks.
 
-use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -202,20 +201,11 @@ fn lock_if_idle(log: &Path, id: &str) -> Result<std::fs::File, DeleteError> {
         .map_err(io)?;
     // A busy lock is tried again briefly: the session tree's liveness probe holds a shared
     // lock for an instant.
-    for attempt in 0..5 {
-        // SAFETY: flock on a file descriptor we own; no memory is shared.
-        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
-            return Ok(file);
-        }
-        let err = std::io::Error::last_os_error();
-        if err.raw_os_error() != Some(libc::EWOULDBLOCK) {
-            return Err(io(err));
-        }
-        if attempt < 4 {
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
+    match tautly_session::files::lock_exclusive_retrying(&file) {
+        Ok(true) => Ok(file),
+        Ok(false) => Err(DeleteError::Running(id.to_string())),
+        Err(e) => Err(io(e)),
     }
-    Err(DeleteError::Running(id.to_string()))
 }
 
 /// Longest [`SessionSummary::first_prompt`], in characters.

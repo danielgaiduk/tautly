@@ -5,42 +5,43 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::process::Command as Process;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use serde_json::{Value, json};
 use tautly_core::bisect::{self, BashRunner, BisectError, Endpoint, TestRunner, Verdict};
-use tautly_core::{Command, Config, EngineBuilder, Event, SessionRecord};
-use tautly_provider::{Catalog, MockProvider, MockTurn, ModelId, ProviderEvent, StopReason};
+use tautly_core::{Config, EngineBuilder, SessionRecord};
+use tautly_provider::mock::{call, text_step_no_usage, tools_step};
+use tautly_provider::{MockProvider, MockTurn, ModelId, ProviderEvent, StopReason};
 use tautly_sandbox::{LocalSandbox, Mode};
 use tautly_session::SessionReader;
-use tempfile::TempDir;
-use tokio::sync::mpsc;
+use tautly_testkit::{MODEL, catalog, start};
+use tautly_testkit::{Repo, git_in};
 use tokio_util::sync::CancellationToken;
 
-const MODEL: &str = "mock/test";
-const WAIT: Duration = Duration::from_secs(30);
 const TIMEOUT: Duration = Duration::from_secs(60);
 /// Passes while `a.txt` says `good`.
 const CHECK: &str = "#!/bin/sh\ngrep -q good a.txt\n";
 
 // ------------------------------------------------------------------------ fixtures
 
-struct Repo {
-    dir: TempDir,
-    home: TempDir,
+trait RepoExt {
+    fn new() -> Self;
+    fn home(&self) -> PathBuf;
+    fn sandbox(&self) -> LocalSandbox;
+    fn builder(&self, mock: &MockProvider) -> EngineBuilder;
+    async fn session(&self, steps: Vec<MockTurn>) -> PathBuf;
+    fn snapshot(&self) -> (BTreeMap<String, String>, Vec<u8>, String, String);
+    fn leftovers(&self) -> (Vec<String>, Vec<PathBuf>);
+    fn assert_no_leftovers(&self);
 }
 
-impl Repo {
+impl RepoExt for Repo {
     /// A git repository with `a.txt` (`good`), an executable `check.sh` and a
     /// `.gitignore` of `cache/` committed.
     fn new() -> Repo {
-        let repo = Repo {
-            dir: tempfile::tempdir().unwrap(),
-            home: tempfile::tempdir().unwrap(),
-        };
+        let repo = Repo::plain(&[]);
         repo.git(&["init", "-q", "-b", "main"]);
         repo.write("a.txt", "good\n");
         repo.write("check.sh", CHECK);
@@ -56,22 +57,8 @@ impl Repo {
         repo
     }
 
-    fn root(&self) -> PathBuf {
-        self.dir.path().canonicalize().unwrap()
-    }
-
     fn home(&self) -> PathBuf {
         self.home.path().canonicalize().unwrap()
-    }
-
-    fn write(&self, rel: &str, text: &str) {
-        let p = self.root().join(rel);
-        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
-        std::fs::write(p, text).unwrap();
-    }
-
-    fn git(&self, args: &[&str]) -> Option<String> {
-        git_in(&self.root(), args)
     }
 
     fn sandbox(&self) -> LocalSandbox {
@@ -88,7 +75,7 @@ impl Repo {
 
     /// A finished one-turn session in this repository running `steps`: its log.
     async fn session(&self, steps: Vec<MockTurn>) -> PathBuf {
-        let mut run = Run::start(self.builder(&MockProvider::new(steps)));
+        let mut run = start(self.builder(&MockProvider::new(steps)));
         run.turn_with("go").await;
         let (_, log) = run.engine.current_session();
         run.stop().await;
@@ -134,33 +121,8 @@ impl Repo {
     }
 }
 
-fn git_in(dir: &Path, args: &[&str]) -> Option<String> {
-    let out = Process::new("git")
-        .current_dir(dir)
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .args(["-c", "user.name=T", "-c", "user.email=t@example.com"])
-        .args(args)
-        .output()
-        .unwrap();
-    out.status
-        .success()
-        .then(|| String::from_utf8(out.stdout).unwrap())
-}
-
 fn config() -> Config {
-    let catalog = Catalog::from_toml(&format!(
-        r#"[models."{MODEL}"]
-context_window = 200000
-max_output = 8000
-parallel_tools = true
-reasoning = "none"
-cache = "none"
-images = false
-edit_format = "str_replace"
-"#
-    ))
-    .unwrap();
+    let catalog = catalog(200_000, 8000, "str_replace");
     let mut cfg = Config {
         model: ModelId::from(MODEL),
         catalog_overrides: Some(catalog),
@@ -194,28 +156,12 @@ fn files(root: &Path) -> BTreeMap<String, String> {
     out
 }
 
-fn call(id: &str, name: &str, args: Value) -> ProviderEvent {
-    ProviderEvent::ToolCall {
-        id: id.into(),
-        name: name.into(),
-        input_json: args.to_string(),
-    }
-}
-
 fn write(id: &str, path: &str, content: &str) -> ProviderEvent {
     call(id, "write", json!({ "path": path, "content": content }))
 }
 
 fn bash(id: &str, command: &str) -> ProviderEvent {
     call(id, "bash", json!({ "command": command }))
-}
-
-fn tools_step(calls: Vec<ProviderEvent>) -> MockTurn {
-    let mut evs = calls;
-    evs.push(ProviderEvent::Done {
-        stop: StopReason::ToolUse,
-    });
-    MockTurn::Events(evs)
 }
 
 fn said_step(text: &str, calls: Vec<ProviderEvent>) -> MockTurn {
@@ -225,54 +171,6 @@ fn said_step(text: &str, calls: Vec<ProviderEvent>) -> MockTurn {
         stop: StopReason::ToolUse,
     });
     MockTurn::Events(evs)
-}
-
-fn text_step(text: &str) -> MockTurn {
-    MockTurn::Events(vec![
-        ProviderEvent::TextDelta(text.into()),
-        ProviderEvent::Done {
-            stop: StopReason::EndTurn,
-        },
-    ])
-}
-
-struct Run {
-    engine: tautly_core::Engine,
-    events: mpsc::Receiver<Event>,
-}
-
-impl Run {
-    fn start(b: EngineBuilder) -> Run {
-        let (engine, events) = b.build().unwrap();
-        Run { engine, events }
-    }
-
-    async fn next(&mut self) -> Event {
-        tokio::time::timeout(WAIT, self.events.recv())
-            .await
-            .expect("timed out waiting for an event")
-            .expect("event channel closed")
-    }
-
-    async fn turn_with(&mut self, text: &str) {
-        self.engine
-            .send(Command::SendMessage {
-                id: None,
-                text: text.into(),
-            })
-            .await
-            .unwrap();
-        while !matches!(self.next().await, Event::TurnFinished { .. }) {}
-    }
-
-    async fn stop(mut self) {
-        self.engine.send(Command::Shutdown).await.unwrap();
-        while tokio::time::timeout(WAIT, self.events.recv())
-            .await
-            .expect("the engine did not stop")
-            .is_some()
-        {}
-    }
 }
 
 fn reader(path: &Path) -> SessionReader<SessionRecord> {
@@ -288,7 +186,7 @@ fn edit_breaks_at_3() -> Vec<MockTurn> {
             vec![write("w2", "a.txt", "bad\n")],
         ),
         tools_step(vec![write("w3", "y.txt", "y\n")]),
-        text_step("done"),
+        text_step_no_usage("done"),
     ]
 }
 
@@ -471,7 +369,7 @@ async fn bisect_covers_bash_side_effects() {
                 )],
             ),
             tools_step(vec![write("w3", "z.txt", "z\n")]),
-            text_step("done"),
+            text_step_no_usage("done"),
         ])
         .await;
     let plan = bisect::plan(&reader(&log), "./check.sh", None, None).unwrap();
@@ -731,7 +629,7 @@ async fn prepass_narrows_range_with_fewer_runs() {
             "v\n",
         )]));
     }
-    steps.push(text_step("done"));
+    steps.push(text_step_no_usage("done"));
     let log = repo.session(steps).await;
     let r = reader(&log);
     assert_eq!(bisect::prepass(&r, "./check.sh"), Some((3, 5)));
@@ -981,7 +879,7 @@ async fn a_logged_endpoint_that_does_not_hold_falls_back() {
             tools_step(vec![write("w3", "a.txt", "bad\n")]),
             tools_step(vec![bash("b2", "./check.sh")]),
             tools_step(vec![write("w4", "r.txt", "r\n")]),
-            text_step("done"),
+            text_step_no_usage("done"),
         ])
         .await;
     let plan = bisect::plan(&reader(&log), "./check.sh", None, None).unwrap();
@@ -1061,7 +959,7 @@ async fn prepass_reads_a_command_kept_in_a_blob() {
             tools_step(vec![bash("b1", &long)]),
             tools_step(vec![write("w1", "a.txt", "bad\n")]),
             tools_step(vec![bash("b2", &long)]),
-            text_step("done"),
+            text_step_no_usage("done"),
         ])
         .await;
     let text = std::fs::read_to_string(&log).unwrap();

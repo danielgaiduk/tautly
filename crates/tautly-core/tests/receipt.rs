@@ -2,25 +2,22 @@
 //! `TurnReceipt` event the engine emits before every `TurnFinished`, the ledger row it
 //! leaves, and the configuration that controls the REPL footer.
 
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use serde_json::json;
 use tautly_core::{
-    CliOverrides, Command, Config, Engine, EngineBuilder, Event, FinishReason, Ledger,
-    ReceiptBuilder, Savings, UsageRole,
+    CliOverrides, Command, Config, EngineBuilder, Event, FinishReason, Ledger, ReceiptBuilder,
+    Savings, UsageRole,
 };
 use tautly_provider::{
     Catalog, MockProvider, MockTurn, ModelId, Price, ProviderEvent, RawUsage, StopReason,
 };
 use tautly_sandbox::Mode;
+use tautly_testkit::{Fx, MODEL, Run, WAIT, start};
 use tautly_tools::{SaveKind, Saved, ToolMeta};
 use tempfile::TempDir;
-use tokio::sync::mpsc;
 
-const MODEL: &str = "mock/test";
-const WAIT: Duration = Duration::from_secs(30);
 const PRICE_TOML: &str = "input = 3.0\noutput = 15.0\ncache_read = 0.3\ncache_write = 3.75";
 const PRICE: Price = Price {
     input: 3.0,
@@ -304,94 +301,18 @@ fn text_step(text: &str, u: RawUsage) -> MockTurn {
     ])
 }
 
-struct Fx {
-    dir: TempDir,
-    home: TempDir,
+trait FxExt {
+    fn start(&self, cfg: Config, mock: &MockProvider) -> Run;
+    fn ledger(&self) -> Ledger;
 }
 
-impl Fx {
-    fn new() -> Fx {
-        Fx {
-            dir: tempfile::tempdir().unwrap(),
-            home: tempfile::tempdir().unwrap(),
-        }
-    }
-
-    fn root(&self) -> PathBuf {
-        self.dir.path().canonicalize().unwrap()
-    }
-
-    fn builder(&self, cfg: Config, mock: &MockProvider) -> EngineBuilder {
-        EngineBuilder {
-            provider: Some(Arc::new(mock.clone())),
-            data_home: Some(self.home.path().to_path_buf()),
-            ..EngineBuilder::new(cfg, self.dir.path())
-        }
-    }
-
+impl FxExt for Fx {
     fn start(&self, cfg: Config, mock: &MockProvider) -> Run {
-        launch(self.builder(cfg, mock))
-    }
-
-    fn write(&self, rel: &str, text: &str) {
-        std::fs::write(self.dir.path().join(rel), text).unwrap();
+        start(self.builder(cfg, mock))
     }
 
     fn ledger(&self) -> Ledger {
         Ledger::open(&self.home.path().join("ledger.sqlite")).unwrap()
-    }
-}
-
-struct Run {
-    engine: Engine,
-    events: mpsc::Receiver<Event>,
-}
-
-fn launch(b: EngineBuilder) -> Run {
-    let (engine, events) = b.build().unwrap();
-    Run { engine, events }
-}
-
-impl Run {
-    /// Shut down and wait for the event stream to close (the log is released).
-    async fn stop(mut self) {
-        self.send(Command::Shutdown).await;
-        let closed =
-            tokio::time::timeout(WAIT, async { while self.events.recv().await.is_some() {} }).await;
-        assert!(closed.is_ok(), "the engine did not stop");
-    }
-
-    async fn send(&self, cmd: Command) {
-        self.engine.send(cmd).await.unwrap();
-    }
-
-    async fn next(&mut self) -> Event {
-        tokio::time::timeout(WAIT, self.events.recv())
-            .await
-            .expect("timed out waiting for an event")
-            .expect("event channel closed")
-    }
-
-    async fn until(&mut self, pred: impl Fn(&Event) -> bool) -> Vec<Event> {
-        let mut out = Vec::new();
-        loop {
-            let ev = self.next().await;
-            let done = pred(&ev);
-            out.push(ev);
-            if done {
-                return out;
-            }
-        }
-    }
-
-    async fn turn_with(&mut self, text: &str) -> Vec<Event> {
-        self.send(Command::SendMessage {
-            id: None,
-            text: text.into(),
-        })
-        .await;
-        self.until(|e| matches!(e, Event::TurnFinished { .. }))
-            .await
     }
 }
 
@@ -640,7 +561,7 @@ async fn context_gc_counts_elisions_through_the_engine_and_across_a_resume() {
         tools_step(vec![bash("b2", "echo again")], usage(10, 1, 0, 0)),
         text_step("done again", usage(10, 1, 0, 0)),
     ]);
-    let mut run = launch(EngineBuilder {
+    let mut run = start(EngineBuilder {
         resume: Some(id),
         ..fx.builder(config(100), &mock)
     });
@@ -700,7 +621,7 @@ async fn side_and_estimated_usage_through_the_engine() {
     script.push(text_step("done", usage(100, 10, 0, 0)));
     let main = MockProvider::new(script);
     let side = MockProvider::new(vec![text_step("SUMMARY-TEXT", usage(2000, 300, 0, 0))]);
-    let mut run = launch(EngineBuilder {
+    let mut run = start(EngineBuilder {
         side_provider: Some(Arc::new(side.clone())),
         ..fx.builder(cfg, &main)
     });

@@ -53,22 +53,11 @@ impl Sink for Closed {
 /// (the session tree's liveness probe holds a shared lock for an instant) must not make an
 /// open fail.
 fn lock_exclusive(file: &File, path: &Path) -> Result<()> {
-    use std::os::fd::AsRawFd;
-    for attempt in 0..5 {
-        // SAFETY: plain syscall on a file descriptor owned by `file`.
-        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-        if rc == 0 {
-            return Ok(());
-        }
-        let err = io::Error::last_os_error();
-        if err.raw_os_error() != Some(libc::EWOULDBLOCK) {
-            return Err(err.into());
-        }
-        if attempt < 4 {
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
+    if crate::files::lock_exclusive_retrying(file)? {
+        Ok(())
+    } else {
+        Err(Error::AlreadyOpen(path.to_path_buf()))
     }
-    Err(Error::AlreadyOpen(path.to_path_buf()))
 }
 
 /// Appends records to one session log.

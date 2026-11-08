@@ -5,78 +5,35 @@
 //! written out in this file ([`boundary`]).
 
 use std::path::{Path, PathBuf};
-use std::process::Command as Process;
 use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::{Value, json};
 use tautly_core::record::CheckpointPoint;
 use tautly_core::{Command, Config, EngineBuilder, Event, SessionRecord};
-use tautly_provider::{Catalog, MockProvider, MockTurn, ModelId, ProviderEvent, StopReason};
+use tautly_provider::mock::{call, text_step_no_usage, tools_step};
+use tautly_provider::{MockProvider, ModelId, ProviderEvent};
 use tautly_sandbox::Mode;
 use tautly_session::{BlobRef, RelPath, SessionReader};
-use tempfile::TempDir;
+use tautly_testkit::Repo;
+use tautly_testkit::{MODEL, Run, WAIT, catalog, start};
 use tokio::sync::mpsc;
-
-const MODEL: &str = "mock/test";
-const WAIT: Duration = Duration::from_secs(30);
 
 // ------------------------------------------------------------------------ fixtures
 
-struct Repo {
-    dir: TempDir,
-    home: TempDir,
+trait RepoExt {
+    fn new() -> Self;
+    fn builder(&self, mock: &MockProvider) -> EngineBuilder;
 }
 
-impl Repo {
+impl RepoExt for Repo {
     /// A repository with `a.txt` committed.
     fn new() -> Repo {
-        let repo = Repo {
-            dir: tempfile::tempdir().unwrap(),
-            home: tempfile::tempdir().unwrap(),
-        };
-        repo.git(&["init", "-q", "-b", "main"]);
-        repo.write("a.txt", "zero\n");
-        repo.git(&["add", "-A"]);
-        repo.git(&["commit", "-q", "-m", "init"]);
-        repo
-    }
-
-    fn root(&self) -> PathBuf {
-        self.dir.path().canonicalize().unwrap()
-    }
-
-    fn write(&self, rel: &str, text: &str) {
-        std::fs::write(self.root().join(rel), text).unwrap();
-    }
-
-    fn git(&self, args: &[&str]) -> Option<String> {
-        let out = Process::new("git")
-            .current_dir(self.root())
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .args(["-c", "user.name=T", "-c", "user.email=t@example.com"])
-            .args(args)
-            .output()
-            .unwrap();
-        out.status
-            .success()
-            .then(|| String::from_utf8(out.stdout).unwrap())
+        Repo::git_repo(&[("a.txt", "zero\n")])
     }
 
     fn builder(&self, mock: &MockProvider) -> EngineBuilder {
-        let catalog = Catalog::from_toml(&format!(
-            r#"[models."{MODEL}"]
-context_window = 200000
-max_output = 8000
-parallel_tools = true
-reasoning = "none"
-cache = "none"
-images = false
-edit_format = "str_replace"
-"#
-        ))
-        .unwrap();
+        let catalog = catalog(200_000, 8000, "str_replace");
         let mut cfg = Config {
             model: ModelId::from(MODEL),
             catalog_overrides: Some(catalog),
@@ -94,14 +51,6 @@ edit_format = "str_replace"
     }
 }
 
-fn call(id: &str, name: &str, args: Value) -> ProviderEvent {
-    ProviderEvent::ToolCall {
-        id: id.into(),
-        name: name.into(),
-        input_json: args.to_string(),
-    }
-}
-
 fn write(id: &str, path: &str, content: &str) -> ProviderEvent {
     call(id, "write", json!({ "path": path, "content": content }))
 }
@@ -110,55 +59,13 @@ fn bash(id: &str, command: &str) -> ProviderEvent {
     call(id, "bash", json!({ "command": command }))
 }
 
-fn tools_step(calls: Vec<ProviderEvent>) -> MockTurn {
-    let mut evs = calls;
-    evs.push(ProviderEvent::Done {
-        stop: StopReason::ToolUse,
-    });
-    MockTurn::Events(evs)
+trait RunExt {
+    async fn stop_log(self) -> PathBuf;
 }
 
-fn text_step(text: &str) -> MockTurn {
-    MockTurn::Events(vec![
-        ProviderEvent::TextDelta(text.into()),
-        ProviderEvent::Done {
-            stop: StopReason::EndTurn,
-        },
-    ])
-}
-
-struct Run {
-    engine: tautly_core::Engine,
-    events: mpsc::Receiver<Event>,
-}
-
-impl Run {
-    fn start(b: EngineBuilder) -> Run {
-        let (engine, events) = b.build().unwrap();
-        Run { engine, events }
-    }
-
-    async fn turn_with(&mut self, text: &str) {
-        self.engine
-            .send(Command::SendMessage {
-                id: None,
-                text: text.into(),
-            })
-            .await
-            .unwrap();
-        loop {
-            let ev = tokio::time::timeout(WAIT, self.events.recv())
-                .await
-                .expect("timed out waiting for an event")
-                .expect("event channel closed");
-            if matches!(ev, Event::TurnFinished { .. }) {
-                return;
-            }
-        }
-    }
-
+impl RunExt for Run {
     /// Shut down; the log's path.
-    async fn stop(mut self) -> PathBuf {
+    async fn stop_log(mut self) -> PathBuf {
         let path = self.engine.session_path().to_path_buf();
         self.engine.send(Command::Shutdown).await.unwrap();
         while tokio::time::timeout(WAIT, self.events.recv())
@@ -288,19 +195,19 @@ async fn checkpoints_record_where_they_were_taken() {
     let repo = Repo::new();
     let mock = MockProvider::new(vec![
         tools_step(vec![bash("b1", "true")]),
-        text_step("done"),
+        text_step_no_usage("done"),
     ]);
-    let mut run = Run::start(repo.builder(&mock));
+    let mut run = start(repo.builder(&mock));
     let id = run.engine.session_id().to_string();
     run.turn_with("one").await;
-    let path = run.stop().await;
-    let mock = MockProvider::new(vec![text_step("again")]);
-    let mut run = Run::start(EngineBuilder {
+    let path = run.stop_log().await;
+    let mock = MockProvider::new(vec![text_step_no_usage("again")]);
+    let mut run = start(EngineBuilder {
         resume: Some(id),
         ..repo.builder(&mock)
     });
     run.turn_with("two").await;
-    run.stop().await;
+    run.stop_log().await;
     let got: Vec<Option<CheckpointPoint>> = points(&records(&path))
         .into_iter()
         .map(|(p, _)| p)
@@ -323,15 +230,15 @@ async fn at_a_turn_end_the_turn_end_checkpoint_is_exact_and_ignores_later_human_
     let repo = Repo::new();
     let mock = MockProvider::new(vec![
         tools_step(vec![write("w1", "a.txt", "one\n")]),
-        text_step("first"),
+        text_step_no_usage("first"),
         tools_step(vec![bash("b1", "printf 'two\\n' > b.txt")]),
-        text_step("second"),
+        text_step_no_usage("second"),
     ]);
-    let mut run = Run::start(repo.builder(&mock));
+    let mut run = start(repo.builder(&mock));
     run.turn_with("one").await;
     repo.write("a.txt", "human\n");
     run.turn_with("two").await;
-    let log = run.stop().await;
+    let log = run.stop_log().await;
     let recs = records(&log);
 
     let b = boundary(&recs, 3).unwrap();
@@ -357,11 +264,11 @@ async fn mid_turn_the_next_before_exec_with_the_edits_between_reverted_is_exact(
             write("w2", "a.txt", "two\n"),
             bash("b1", "printf 'x\\n' > c.txt"),
         ]),
-        text_step("done"),
+        text_step_no_usage("done"),
     ]);
-    let mut run = Run::start(repo.builder(&mock));
+    let mut run = start(repo.builder(&mock));
     run.turn_with("go").await;
-    let log = run.stop().await;
+    let log = run.stop_log().await;
     let recs = records(&log);
 
     // After step 2: step 3's `BeforeExec` holds its write, which is reverted.
@@ -390,12 +297,12 @@ async fn after_a_crash_the_resume_checkpoint_is_partial() {
             write("w1", "a.txt", "one\n"),
             bash("b1", "printf 'y\\n' > d.txt"),
         ]),
-        text_step("done"),
+        text_step_no_usage("done"),
     ]);
-    let mut run = Run::start(repo.builder(&mock));
+    let mut run = start(repo.builder(&mock));
     let id = run.engine.session_id().to_string();
     run.turn_with("go").await;
-    let log = run.stop().await;
+    let log = run.stop_log().await;
     let recs = records(&log);
     let cut = recs
         .iter()
@@ -407,13 +314,13 @@ async fn after_a_crash_the_resume_checkpoint_is_partial() {
     std::fs::write(&log, kept.join("\n") + "\n").unwrap();
     repo.write("a.txt", "human\n");
 
-    let mock = MockProvider::new(vec![text_step("resumed")]);
-    let mut run = Run::start(EngineBuilder {
+    let mock = MockProvider::new(vec![text_step_no_usage("resumed")]);
+    let mut run = start(EngineBuilder {
         resume: Some(id),
         ..repo.builder(&mock)
     });
     run.turn_with("again").await;
-    run.stop().await;
+    run.stop_log().await;
     let recs = records(&log);
     let b = boundary(&recs, 2).unwrap();
     assert_eq!(b.point, Some(CheckpointPoint::ResumeStart), "{b:?}");
@@ -458,9 +365,9 @@ async fn a_skipped_turn_end_makes_the_next_checkpoint_partial() {
     let mock = MockProvider::new(vec![
         tools_step(vec![bash("b1", "sleep 30")]),
         tools_step(vec![bash("b2", "true")]),
-        text_step("done"),
+        text_step_no_usage("done"),
     ]);
-    let mut run = Run::start(repo.builder(&mock));
+    let mut run = start(repo.builder(&mock));
     run.engine
         .send(Command::SendMessage {
             id: None,
@@ -488,7 +395,7 @@ async fn a_skipped_turn_end_makes_the_next_checkpoint_partial() {
         }
     }
     run.turn_with("two").await;
-    let log = run.stop().await;
+    let log = run.stop_log().await;
     let recs = records(&log);
     assert!(recs.iter().any(|r| matches!(
         r,
@@ -568,7 +475,7 @@ async fn a_fork_right_after_a_cancel_leaves_the_recovered_checkpoint_in_the_pare
     // a fork sent at once must wait for it, so its record lands in the parent.
     let repo = Repo::new();
     let mock = MockProvider::new(vec![tools_step(vec![bash("b1", "sleep 30")])]);
-    let mut run = Run::start(repo.builder(&mock));
+    let mut run = start(repo.builder(&mock));
     let parent = run.engine.session_path().to_path_buf();
     cancelled_turn(&mut run).await;
     run.engine
@@ -586,7 +493,7 @@ async fn a_fork_right_after_a_cancel_leaves_the_recovered_checkpoint_in_the_pare
     assert_eq!(answer.reply_id(), Some("f-1"), "{answer:?}");
     let branch = run.engine.current_session().1;
     assert_ne!(branch, parent);
-    run.stop().await;
+    run.stop_log().await;
     let parent_recs = records(&parent);
     let end = parent_recs
         .iter()
@@ -615,7 +522,7 @@ async fn undo_after_a_cancel_reverts_the_cancelled_commands_writes() {
         "b1",
         "echo x > f.txt; echo changed > a.txt; sleep 30",
     )])]);
-    let mut run = Run::start(repo.builder(&mock));
+    let mut run = start(repo.builder(&mock));
     run.engine
         .send(Command::SendMessage {
             id: None,
@@ -658,5 +565,5 @@ async fn undo_after_a_cancel_reverts_the_cancelled_commands_writes() {
         std::fs::read_to_string(repo.root().join("a.txt")).unwrap(),
         "zero\n"
     );
-    run.stop().await;
+    run.stop_log().await;
 }

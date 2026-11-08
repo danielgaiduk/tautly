@@ -6,24 +6,21 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use async_trait::async_trait;
-use serde_json::{Value, json};
+use serde_json::json;
 use tautly_core::{
     BudgetLimits, BudgetScope, Command, Config, Engine, EngineBuilder, Event, FinishReason, Ledger,
     SessionRecord, Signal, SignalRouter, UsageRole, handle_signals, install_signal_handlers,
 };
+use tautly_provider::mock::call;
 use tautly_provider::{
     CanonicalRequest, Catalog, Content, MockProvider, MockTurn, ModelId, ProviderEvent, Quota,
     RawUsage, StopReason,
 };
-use tautly_sandbox::{
-    Child, FileMeta, HttpResponse, LocalSandbox, Mode, Sandbox, SandboxError, SpawnSpec, Url,
-};
+use tautly_sandbox::{FileMeta, LocalSandbox, Mode, Sandbox, SandboxError};
 use tautly_session::SessionReader;
-use tempfile::TempDir;
+use tautly_testkit::{Delegate, Delegating};
+use tautly_testkit::{Fx, MODEL, Run, WAIT, start};
 use tokio::sync::mpsc;
-
-const MODEL: &str = "mock/test";
-const WAIT: Duration = Duration::from_secs(30);
 
 fn catalog(price: Option<&str>) -> Catalog {
     let price = price
@@ -54,14 +51,6 @@ fn config(priced: bool) -> Config {
     };
     c.permissions.mode = Mode::Yolo;
     c
-}
-
-fn call(id: &str, name: &str, args: Value) -> ProviderEvent {
-    ProviderEvent::ToolCall {
-        id: id.into(),
-        name: name.into(),
-        input_json: args.to_string(),
-    }
 }
 
 fn bash(id: &str, cmd: &str) -> ProviderEvent {
@@ -97,35 +86,12 @@ fn text_step(text: &str, usage: RawUsage) -> MockTurn {
     ])
 }
 
-struct Fx {
-    dir: TempDir,
-    home: TempDir,
+trait FxExt {
+    fn ledger(&self) -> Ledger;
+    async fn ledger_rows(&self, n: u64) -> tautly_core::Totals;
 }
 
-impl Fx {
-    fn new() -> Fx {
-        Fx {
-            dir: tempfile::tempdir().unwrap(),
-            home: tempfile::tempdir().unwrap(),
-        }
-    }
-
-    fn root(&self) -> PathBuf {
-        self.dir.path().canonicalize().unwrap()
-    }
-
-    fn write(&self, rel: &str, text: &str) {
-        std::fs::write(self.dir.path().join(rel), text).unwrap();
-    }
-
-    fn builder(&self, cfg: Config, mock: &MockProvider) -> EngineBuilder {
-        EngineBuilder {
-            provider: Some(Arc::new(mock.clone())),
-            data_home: Some(self.home.path().to_path_buf()),
-            ..EngineBuilder::new(cfg, self.dir.path())
-        }
-    }
-
+impl FxExt for Fx {
     fn ledger(&self) -> Ledger {
         Ledger::open(&self.home.path().join("ledger.sqlite")).unwrap()
     }
@@ -146,56 +112,15 @@ impl Fx {
     }
 }
 
-struct Run {
-    engine: Engine,
-    events: mpsc::Receiver<Event>,
+trait RunExt {
+    async fn turn(&mut self) -> Vec<Event>;
+    async fn until_closed(&mut self) -> Vec<Event>;
 }
 
-fn start(b: EngineBuilder) -> Run {
-    let (engine, events) = b.build().unwrap();
-    Run { engine, events }
-}
-
-impl Run {
-    async fn say(&self, text: &str) {
-        self.send(Command::SendMessage {
-            id: None,
-            text: text.into(),
-        })
-        .await;
-    }
-
-    async fn send(&self, cmd: Command) {
-        self.engine.send(cmd).await.unwrap();
-    }
-
-    async fn next(&mut self) -> Event {
-        tokio::time::timeout(WAIT, self.events.recv())
-            .await
-            .expect("timed out waiting for an event")
-            .expect("event channel closed")
-    }
-
-    async fn until(&mut self, pred: impl Fn(&Event) -> bool) -> Vec<Event> {
-        let mut out = Vec::new();
-        loop {
-            let ev = self.next().await;
-            let done = pred(&ev);
-            out.push(ev);
-            if done {
-                return out;
-            }
-        }
-    }
-
+impl RunExt for Run {
     async fn turn(&mut self) -> Vec<Event> {
         self.until(|e| matches!(e, Event::TurnFinished { .. }))
             .await
-    }
-
-    async fn turn_with(&mut self, text: &str) -> Vec<Event> {
-        self.say(text).await;
-        self.turn().await
     }
 
     /// Every event until the engine closes the channel.
@@ -368,12 +293,9 @@ fn hangs(p: &Path) -> bool {
 }
 
 #[async_trait]
-impl Sandbox for Hang {
-    fn root(&self) -> &Path {
-        self.sb.root()
-    }
-    fn resolve(&self, p: &Path) -> Result<PathBuf, SandboxError> {
-        self.sb.resolve(p)
+impl Delegate for Hang {
+    fn inner(&self) -> &LocalSandbox {
+        &self.sb
     }
     async fn read(&self, p: &Path) -> Result<Vec<u8>, SandboxError> {
         if hangs(p) {
@@ -418,9 +340,6 @@ impl Sandbox for Hang {
         }
         r
     }
-    async fn remove_file(&self, p: &Path) -> Result<(), SandboxError> {
-        self.sb.remove_file(p).await
-    }
     async fn spill(&self, bytes: &[u8]) -> Result<PathBuf, SandboxError> {
         if let Some(d) = self.stall_after_write
             && self.written.load(std::sync::atomic::Ordering::SeqCst)
@@ -428,15 +347,6 @@ impl Sandbox for Hang {
             tokio::time::sleep(d).await;
         }
         self.sb.spill(bytes).await
-    }
-    async fn spawn(&self, spec: SpawnSpec) -> Result<Child, SandboxError> {
-        self.sb.spawn(spec).await
-    }
-    fn walker(&self, base: &Path) -> Result<ignore::WalkBuilder, SandboxError> {
-        self.sb.walker(base)
-    }
-    async fn http_get(&self, url: &Url) -> Result<HttpResponse, SandboxError> {
-        self.sb.http_get(url).await
     }
 }
 
@@ -458,7 +368,7 @@ async fn a_call_that_ignores_cancel_is_abandoned_and_its_step_baselines_forgotte
     ]);
     let hang = Hang::new(LocalSandbox::new(fx.root()).unwrap());
     let reads_done = Arc::clone(&hang.reads_done);
-    let sb: Arc<dyn Sandbox> = Arc::new(hang);
+    let sb: Arc<dyn Sandbox> = Arc::new(Delegating(hang));
     let mut run = start(EngineBuilder {
         sandbox: Some(sb),
         ..fx.builder(config(false), &mock)
@@ -507,11 +417,11 @@ async fn a_write_cancelled_after_its_commit_is_awaited_and_its_edit_recorded() {
         )],
         None,
     )]);
-    let sb: Arc<dyn Sandbox> = Arc::new(Hang {
+    let sb: Arc<dyn Sandbox> = Arc::new(Delegating(Hang {
         // Longer than the 150 ms an abandoned call gets.
         stall_after_write: Some(Duration::from_millis(600)),
         ..Hang::new(LocalSandbox::new(fx.root()).unwrap())
-    });
+    }));
     let mut run = start(EngineBuilder {
         sandbox: Some(sb),
         ..fx.builder(config(false), &mock)
@@ -561,7 +471,8 @@ async fn a_write_stuck_past_its_bound_is_abandoned_and_reported() {
         )],
         None,
     )]);
-    let sb: Arc<dyn Sandbox> = Arc::new(Hang::new(LocalSandbox::new(fx.root()).unwrap()));
+    let sb: Arc<dyn Sandbox> =
+        Arc::new(Delegating(Hang::new(LocalSandbox::new(fx.root()).unwrap())));
     let mut run = start(EngineBuilder {
         sandbox: Some(sb),
         ..fx.builder(config(false), &mock)
@@ -610,7 +521,7 @@ async fn a_hung_path_is_probed_by_at_most_one_metadata_call_at_a_time() {
     ]);
     let hang = Hang::new(LocalSandbox::new(fx.root()).unwrap());
     let probes = Arc::clone(&hang.hung_metadata);
-    let sb: Arc<dyn Sandbox> = Arc::new(hang);
+    let sb: Arc<dyn Sandbox> = Arc::new(Delegating(hang));
     let mut run = start(EngineBuilder {
         sandbox: Some(sb),
         ..fx.builder(config(false), &mock)
@@ -655,10 +566,10 @@ async fn a_write_that_lands_after_its_bound_is_noticed_at_the_next_step() {
         tools_step(vec![call("r2", "read", json!({"path": "late.txt"}))], None),
         text_step("ok", tokens(1, 1)),
     ]);
-    let sb: Arc<dyn Sandbox> = Arc::new(Hang {
+    let sb: Arc<dyn Sandbox> = Arc::new(Delegating(Hang {
         late_write: Some(Duration::from_millis(10_800)),
         ..Hang::new(LocalSandbox::new(fx.root()).unwrap())
-    });
+    }));
     let mut run = start(EngineBuilder {
         sandbox: Some(sb),
         ..fx.builder(config(false), &mock)
@@ -1431,7 +1342,9 @@ async fn with_no_session_alive_a_signal_escalates_and_the_router_keeps_none_aliv
     let run = start(fx.builder(config(false), &MockProvider::new(vec![])));
     let (router, escalated) = router();
     router.add(&run.engine);
-    let Run { engine, mut events } = run;
+    let Run {
+        engine, mut events, ..
+    } = run;
     drop(engine);
     let closed = tokio::time::timeout(WAIT, async { while events.recv().await.is_some() {} }).await;
     assert!(closed.is_ok(), "the router kept the engine running");

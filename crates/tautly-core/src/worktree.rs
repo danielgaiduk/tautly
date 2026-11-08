@@ -315,7 +315,6 @@ impl MadeDirs {
 /// The worktree's parent directories (private, as the data home's are); `dir` itself
 /// must not exist, or be empty.
 fn make_dir(dir: &Path) -> Result<MadeDirs, WtError> {
-    use std::os::unix::fs::DirBuilderExt;
     let io = |err| WtError::Io {
         path: dir.to_path_buf(),
         err,
@@ -342,11 +341,7 @@ fn make_dir(dir: &Path) -> Result<MadeDirs, WtError> {
         .collect();
     parents.reverse();
     if let Some(parent) = dir.parent() {
-        std::fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(parent)
-            .map_err(io)?;
+        tautly_session::paths::create_private_dir_all(parent).map_err(io)?;
     }
     Ok(MadeDirs {
         dir: dir.to_path_buf(),

@@ -7,7 +7,7 @@ use futures::StreamExt;
 use futures::stream::{self, BoxStream};
 use tokio_util::sync::CancellationToken;
 
-use crate::{CanonicalRequest, Provider, ProviderError, ProviderEvent};
+use crate::{CanonicalRequest, Provider, ProviderError, ProviderEvent, RawUsage, StopReason};
 
 #[derive(Debug, Clone)]
 pub enum MockTurn {
@@ -82,4 +82,54 @@ impl Provider for MockProvider {
             .boxed(),
         }
     }
+}
+
+/// A tool call as the model sends it.
+pub fn call(id: &str, name: &str, args: serde_json::Value) -> ProviderEvent {
+    ProviderEvent::ToolCall {
+        id: id.into(),
+        name: name.into(),
+        input_json: args.to_string(),
+    }
+}
+
+/// Usage of 100 input and 10 output tokens.
+pub fn usage() -> ProviderEvent {
+    ProviderEvent::Usage(RawUsage {
+        input: 100,
+        output: 10,
+        cache_read: 0,
+        cache_write: 0,
+    })
+}
+
+/// A response with tool calls. It reports no usage: the mock's numbers would calibrate
+/// the token estimator far off.
+pub fn tools_step(calls: Vec<ProviderEvent>) -> MockTurn {
+    let mut evs = calls;
+    evs.push(ProviderEvent::Done {
+        stop: StopReason::ToolUse,
+    });
+    MockTurn::Events(evs)
+}
+
+/// A final text answer that reports [`usage`].
+pub fn text_step(text: &str) -> MockTurn {
+    MockTurn::Events(vec![
+        ProviderEvent::TextDelta(text.into()),
+        usage(),
+        ProviderEvent::Done {
+            stop: StopReason::EndTurn,
+        },
+    ])
+}
+
+/// A final text answer that reports no usage.
+pub fn text_step_no_usage(text: &str) -> MockTurn {
+    MockTurn::Events(vec![
+        ProviderEvent::TextDelta(text.into()),
+        ProviderEvent::Done {
+            stop: StopReason::EndTurn,
+        },
+    ])
 }

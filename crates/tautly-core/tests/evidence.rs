@@ -6,15 +6,15 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use serde_json::{Value, json};
+use serde_json::json;
 use tautly_core::{
     CliOverrides, Command, Config, DEFAULT_TEST_COMMANDS, EngineBuilder, EngineError, Event,
     EvidenceConfig, EvidenceTracker, FinishReason, TestEvidence, TestMatcher,
 };
-use tautly_provider::{
-    Catalog, MockProvider, MockTurn, ModelId, ProviderEvent, RawUsage, StopReason,
-};
+use tautly_provider::mock::{call, tools_step};
+use tautly_provider::{MockProvider, MockTurn, ModelId, ProviderEvent, RawUsage, StopReason};
 use tautly_sandbox::Mode;
+use tautly_testkit::catalog;
 use tautly_tools::{AppliedEffect, TestCounts, ToolMeta, ToolResult};
 use tempfile::TempDir;
 
@@ -430,18 +430,7 @@ const MODEL: &str = "mock/test";
 const WAIT: Duration = Duration::from_secs(30);
 
 fn config(patterns: &[&str]) -> Config {
-    let catalog = Catalog::from_toml(&format!(
-        r#"[models."{MODEL}"]
-context_window = 200000
-max_output = 8000
-parallel_tools = true
-reasoning = "none"
-cache = "none"
-images = false
-edit_format = "str_replace"
-"#
-    ))
-    .unwrap();
+    let catalog = catalog(200_000, 8000, "str_replace");
     let mut c = Config {
         model: ModelId::from(MODEL),
         catalog_overrides: Some(catalog),
@@ -453,22 +442,6 @@ edit_format = "str_replace"
     };
     c.permissions.mode = Mode::Yolo;
     c
-}
-
-fn call(id: &str, name: &str, args: Value) -> ProviderEvent {
-    ProviderEvent::ToolCall {
-        id: id.into(),
-        name: name.into(),
-        input_json: args.to_string(),
-    }
-}
-
-fn tools_step(calls: Vec<ProviderEvent>) -> MockTurn {
-    let mut evs = calls;
-    evs.push(ProviderEvent::Done {
-        stop: StopReason::ToolUse,
-    });
-    MockTurn::Events(evs)
 }
 
 fn text_step() -> MockTurn {

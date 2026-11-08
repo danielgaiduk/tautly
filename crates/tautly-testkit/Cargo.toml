@@ -1,0 +1,17 @@
+[package]
+name = "tautly-testkit"
+description = "Helpers shared by the Tautly crates' tests: the engine harness, fixtures and a delegating sandbox"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+tautly-core = { path = "../tautly-core" }
+tautly-provider = { path = "../tautly-provider" }
+tautly-sandbox = { path = "../tautly-sandbox" }
+async-trait.workspace = true
+ignore.workspace = true
+tempfile.workspace = true
+tokio.workspace = true

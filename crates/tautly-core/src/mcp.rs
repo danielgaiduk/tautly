@@ -155,12 +155,9 @@ fn private_pycache(
 /// Make `dir` (0700) when missing and check it (see [`private_pycache`]); the problem
 /// otherwise.
 fn check_private_pycache(dir: &Path, root: &Path) -> Result<(), String> {
-    use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
     if dir.symlink_metadata().is_err() {
-        std::fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(dir)
+        tautly_session::paths::create_private_dir_all(dir)
             .map_err(|e| format!("it could not be made: {e}"))?;
     }
     let meta = dir

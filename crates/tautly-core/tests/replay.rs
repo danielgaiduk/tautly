@@ -12,20 +12,18 @@ use serde_json::{Value, json};
 use tautly_core::record::ApprovalKind;
 use tautly_core::replay::{self, REPLAYED_ID_PREFIX};
 use tautly_core::{Command, Config, EngineBuilder, Event, SessionRecord, UsageRole};
+use tautly_provider::mock::call;
 use tautly_provider::{
     Catalog, MockProvider, MockTurn, ModelId, ProviderEvent, RawUsage, StopReason,
 };
-use tautly_sandbox::{
-    Child, FileMeta, HttpResponse, LocalSandbox, Mode, Sandbox, SandboxError, SpawnSpec, Url,
-};
+use tautly_sandbox::{Child, LocalSandbox, Mode, Sandbox, SandboxError, SpawnSpec};
 use tautly_session::{BlobRef, HeaderInit, SessionReader, SessionWriter};
+use tautly_testkit::{Delegate, Delegating};
+use tautly_testkit::{MODEL, Run, WAIT, start};
 use tautly_tools::ToolMeta;
 use tempfile::TempDir;
-use tokio::sync::mpsc;
 
-const MODEL: &str = "mock/test";
 const SIDE: &str = "mock/side";
-const WAIT: Duration = Duration::from_secs(30);
 
 // ------------------------------------------------------------------------ fixtures
 
@@ -144,80 +142,22 @@ struct Counting {
 }
 
 #[async_trait]
-impl Sandbox for Counting {
-    fn root(&self) -> &Path {
-        self.inner.root()
-    }
-    fn resolve(&self, p: &Path) -> Result<PathBuf, SandboxError> {
-        self.inner.resolve(p)
-    }
-    async fn read(&self, p: &Path) -> Result<Vec<u8>, SandboxError> {
-        self.inner.read(p).await
-    }
-    async fn metadata(&self, p: &Path) -> Result<FileMeta, SandboxError> {
-        self.inner.metadata(p).await
-    }
-    async fn write_atomic(
-        &self,
-        p: &Path,
-        bytes: &[u8],
-        mode: Option<u32>,
-    ) -> Result<(), SandboxError> {
-        self.inner.write_atomic(p, bytes, mode).await
-    }
-    async fn remove_file(&self, p: &Path) -> Result<(), SandboxError> {
-        self.inner.remove_file(p).await
-    }
-    async fn spill(&self, bytes: &[u8]) -> Result<PathBuf, SandboxError> {
-        self.inner.spill(bytes).await
+impl Delegate for Counting {
+    fn inner(&self) -> &LocalSandbox {
+        &self.inner
     }
     async fn spawn(&self, spec: SpawnSpec) -> Result<Child, SandboxError> {
         self.spawns.fetch_add(1, Ordering::SeqCst);
         self.inner.spawn(spec).await
     }
-    fn walker(&self, base: &Path) -> Result<ignore::WalkBuilder, SandboxError> {
-        self.inner.walker(base)
-    }
-    async fn http_get(&self, url: &Url) -> Result<HttpResponse, SandboxError> {
-        self.inner.http_get(url).await
-    }
 }
 
-struct Run {
-    engine: tautly_core::Engine,
-    events: mpsc::Receiver<Event>,
+trait RunExt {
+    async fn settle(&mut self);
+    async fn replay(&mut self, session: &str, speed: f32, from_step: Option<u32>) -> Vec<Event>;
 }
 
-impl Run {
-    fn start(b: EngineBuilder) -> Run {
-        let (engine, events) = b.build().unwrap();
-        Run { engine, events }
-    }
-
-    async fn send(&self, cmd: Command) {
-        self.engine.send(cmd).await.unwrap();
-    }
-
-    async fn next(&mut self) -> Event {
-        tokio::time::timeout(WAIT, self.events.recv())
-            .await
-            .expect("timed out waiting for an event")
-            .expect("event channel closed")
-    }
-
-    /// Events until one `until` accepts (included).
-    async fn until(&mut self, until: impl Fn(&Event) -> bool) -> Vec<Event> {
-        let mut seen = Vec::new();
-        loop {
-            let ev = self.next().await;
-            let done = until(&ev);
-            seen.push(ev);
-            if done {
-                return seen;
-            }
-        }
-    }
-
+impl RunExt for Run {
     /// Wait until the session has started (a command answered between turns).
     async fn settle(&mut self) {
         self.send(Command::Diff {
@@ -240,15 +180,6 @@ impl Run {
         self.until(|e| matches!(e, Event::ReplayFinished { .. }))
             .await
     }
-
-    async fn stop(mut self) {
-        self.send(Command::Shutdown).await;
-        while tokio::time::timeout(WAIT, self.events.recv())
-            .await
-            .expect("the engine did not stop")
-            .is_some()
-        {}
-    }
 }
 
 /// The events inside the `Replayed` ones, in order.
@@ -267,14 +198,6 @@ fn finished(seen: &[Event]) -> (u32, bool) {
             events, cancelled, ..
         }) => (*events, *cancelled),
         other => panic!("no ReplayFinished at the end: {other:?}"),
-    }
-}
-
-fn call(id: &str, name: &str, args: Value) -> ProviderEvent {
-    ProviderEvent::ToolCall {
-        id: id.into(),
-        name: name.into(),
-        input_json: args.to_string(),
     }
 }
 
@@ -320,7 +243,7 @@ fn golden_script() -> MockProvider {
 /// session id and its live events.
 async fn golden_session(fx: &Fx) -> (String, Vec<Event>) {
     let mock = golden_script();
-    let mut run = Run::start(fx.builder(&mock, Mode::Ask, true));
+    let mut run = start(fx.builder(&mock, Mode::Ask, true));
     run.send(Command::SendMessage {
         id: None,
         text: "do it".into(),
@@ -425,7 +348,7 @@ fn comparable(events: &[Event]) -> Vec<Event> {
 async fn replay_reemits_logged_stream_in_order() {
     let fx = Fx::new();
     let (id, live) = golden_session(&fx).await;
-    let mut run = Run::start(fx.builder(&MockProvider::new(vec![]), Mode::Ask, true));
+    let mut run = start(fx.builder(&MockProvider::new(vec![]), Mode::Ask, true));
     let seen = run.replay(&id, 0.0, None).await;
     let replayed = inner(&seen);
     assert_eq!(
@@ -473,11 +396,11 @@ async fn replay_makes_no_provider_requests_or_spawns() {
     std::fs::write(fx.root().join("a.txt"), "human\n").unwrap();
     let mock = MockProvider::new(vec![]);
     let spawns = Arc::new(AtomicUsize::new(0));
-    let sandbox: Arc<dyn Sandbox> = Arc::new(Counting {
+    let sandbox: Arc<dyn Sandbox> = Arc::new(Delegating(Counting {
         inner: LocalSandbox::new(fx.root()).unwrap(),
         spawns: Arc::clone(&spawns),
-    });
-    let mut run = Run::start(EngineBuilder {
+    }));
+    let mut run = start(EngineBuilder {
         sandbox: Some(sandbox),
         ..fx.builder(&mock, Mode::Yolo, false)
     });
@@ -557,7 +480,7 @@ async fn replay_paces_by_timestamps_scaled_and_capped_at_2s() {
     // And the engine, on a paused clock.
     let fx = Fx::new();
     let id = paced_log(&fx);
-    let mut run = Run::start(fx.builder(&MockProvider::new(vec![]), Mode::Yolo, false));
+    let mut run = start(fx.builder(&MockProvider::new(vec![]), Mode::Yolo, false));
     run.settle().await;
     tokio::time::pause();
     run.send(Command::Replay {
@@ -621,7 +544,7 @@ async fn speed_zero_is_instant() {
         ),
     ];
     let (id, _) = fx.craft(&recs, &[]);
-    let mut run = Run::start(fx.builder(&MockProvider::new(vec![]), Mode::Yolo, false));
+    let mut run = start(fx.builder(&MockProvider::new(vec![]), Mode::Yolo, false));
     run.settle().await;
     let begin = std::time::Instant::now();
     let seen = run.replay(&id, 0.0, None).await;
@@ -716,7 +639,7 @@ async fn from_step_skips_earlier_steps() {
     assert_eq!(offsets, [4, 4, 6, 7]);
 
     // The engine: the same, and a step past the last is refused.
-    let mut run = Run::start(fx.builder(&MockProvider::new(vec![]), Mode::Yolo, false));
+    let mut run = start(fx.builder(&MockProvider::new(vec![]), Mode::Yolo, false));
     run.settle().await;
     let seen = run.replay(&id, 0.0, Some(3)).await;
     assert_eq!(inner(&seen), texts(Some(3)));
@@ -742,7 +665,7 @@ async fn cancel_stops_with_finished_cancelled() {
         })
         .collect();
     let (id, _) = fx.craft(&recs, &[]);
-    let mut run = Run::start(fx.builder(&MockProvider::new(vec![]), Mode::Yolo, false));
+    let mut run = start(fx.builder(&MockProvider::new(vec![]), Mode::Yolo, false));
     run.settle().await;
     run.send(Command::Replay {
         id: None,
@@ -784,7 +707,7 @@ async fn replay_during_turn_errors() {
     let fx = Fx::new();
     let (id, _) = two_turns(&fx);
     let mock = MockProvider::new(vec![MockTurn::Stall]);
-    let mut run = Run::start(fx.builder(&mock, Mode::Yolo, false));
+    let mut run = start(fx.builder(&mock, Mode::Yolo, false));
     run.send(Command::SendMessage {
         id: None,
         text: "hi".into(),
@@ -852,7 +775,7 @@ async fn replayed_request_ids_not_answerable() {
     drop(w);
 
     let mock = MockProvider::new(vec![]);
-    let mut run = Run::start(fx.builder(&mock, Mode::Ask, true));
+    let mut run = start(fx.builder(&mock, Mode::Ask, true));
     run.settle().await;
     let seen = run.replay(&id, 0.0, None).await;
     let replayed = inner(&seen);
@@ -1079,7 +1002,7 @@ async fn replay_streams_with_bounded_memory() {
     }
     w.checkpoint().unwrap();
     drop(w);
-    let mut run = Run::start(fx.builder(&MockProvider::new(vec![]), Mode::Yolo, false));
+    let mut run = start(fx.builder(&MockProvider::new(vec![]), Mode::Yolo, false));
     run.settle().await;
     run.send(Command::Replay {
         id: None,
@@ -1196,7 +1119,7 @@ async fn replayed_memory_proposals_cannot_be_approved() {
     .unwrap();
     w.checkpoint().unwrap();
     drop(w);
-    let mut run = Run::start(fx.builder(&MockProvider::new(vec![]), Mode::Ask, true));
+    let mut run = start(fx.builder(&MockProvider::new(vec![]), Mode::Ask, true));
     run.settle().await;
     let seen = run.replay(&id, 0.0, None).await;
     let Some(Event::MemoryProposed { proposal_id, .. }) = inner(&seen).first().cloned() else {
@@ -1221,7 +1144,7 @@ async fn replayed_memory_proposals_cannot_be_approved() {
 async fn shutdown_during_a_replay_finishes_it_cancelled() {
     let fx = Fx::new();
     let (id, _) = fx.craft(&texts(6, 10_000), &[]);
-    let mut run = Run::start(fx.builder(&MockProvider::new(vec![]), Mode::Yolo, false));
+    let mut run = start(fx.builder(&MockProvider::new(vec![]), Mode::Yolo, false));
     run.settle().await;
     run.send(Command::Replay {
         id: None,
@@ -1272,7 +1195,7 @@ async fn a_malformed_line_mid_log_ends_the_replay_with_a_warning() {
     );
     assert!(events.truncated());
 
-    let mut run = Run::start(fx.builder(&MockProvider::new(vec![]), Mode::Yolo, false));
+    let mut run = start(fx.builder(&MockProvider::new(vec![]), Mode::Yolo, false));
     run.settle().await;
     let seen = run.replay(&id, 0.0, None).await;
     assert_eq!(inner(&seen), got);
@@ -1284,7 +1207,7 @@ async fn a_malformed_line_mid_log_ends_the_replay_with_a_warning() {
 async fn replay_during_a_fork_is_refused_not_held() {
     let fx = Fx::new();
     let (id, _) = two_turns(&fx);
-    let mut run = Run::start(fx.builder(&MockProvider::new(vec![]), Mode::Yolo, false));
+    let mut run = start(fx.builder(&MockProvider::new(vec![]), Mode::Yolo, false));
     run.settle().await;
     // Sent back to back: the replay arrives while the fork runs.
     run.send(Command::Fork {

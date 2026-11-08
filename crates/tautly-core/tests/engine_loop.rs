@@ -1,43 +1,28 @@
 //! The engine's turn loop against a scripted provider (`MockProvider`) and a real
 //! `LocalSandbox` on a temporary directory.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use serde_json::{Value, json};
+use serde_json::json;
 use tautly_core::{
     Command, Config, Engine, EngineBuilder, ErrorKind, Event, FinishReason, SessionRecord,
     Workspace,
 };
+use tautly_provider::mock::{call, text_step, tools_step, usage};
 use tautly_provider::{
     Block, CanonicalRequest, Catalog, Content, MockProvider, MockTurn, ModelId, ProviderError,
-    ProviderEvent, RawUsage, StopReason,
+    ProviderEvent, StopReason,
 };
-use tautly_sandbox::{
-    Child, FileMeta, HttpResponse, LocalSandbox, Mode, Sandbox, SandboxError, SpawnSpec, Url,
-};
+use tautly_sandbox::{LocalSandbox, Mode, Sandbox, SandboxError};
 use tautly_session::SessionReader;
-use tempfile::TempDir;
-use tokio::sync::mpsc;
-
-const MODEL: &str = "mock/test";
-const WAIT: Duration = Duration::from_secs(30);
+use tautly_testkit::{Delegate, Delegating};
+use tautly_testkit::{Fx, MODEL, Run, WAIT, start};
 
 fn catalog(window: u32, max_output: u32) -> Catalog {
-    Catalog::from_toml(&format!(
-        r#"[models."{MODEL}"]
-context_window = {window}
-max_output = {max_output}
-parallel_tools = true
-reasoning = "none"
-cache = "none"
-images = false
-edit_format = "str_replace"
-"#
-    ))
-    .unwrap()
+    tautly_testkit::catalog(window, max_output, "str_replace")
 }
 
 fn config(mode: Mode) -> Config {
@@ -50,74 +35,11 @@ fn config(mode: Mode) -> Config {
     c
 }
 
-fn call(id: &str, name: &str, args: Value) -> ProviderEvent {
-    ProviderEvent::ToolCall {
-        id: id.into(),
-        name: name.into(),
-        input_json: args.to_string(),
-    }
+trait FxExt {
+    async fn ready_workspace(&self) -> Arc<Workspace>;
 }
 
-fn usage() -> ProviderEvent {
-    ProviderEvent::Usage(RawUsage {
-        input: 100,
-        output: 10,
-        cache_read: 0,
-        cache_write: 0,
-    })
-}
-
-/// A response with tool calls. It reports no usage: the mock's numbers would calibrate
-/// the token estimator far off.
-fn tools_step(calls: Vec<ProviderEvent>) -> MockTurn {
-    let mut evs = calls;
-    evs.push(ProviderEvent::Done {
-        stop: StopReason::ToolUse,
-    });
-    MockTurn::Events(evs)
-}
-
-fn text_step(text: &str) -> MockTurn {
-    MockTurn::Events(vec![
-        ProviderEvent::TextDelta(text.into()),
-        usage(),
-        ProviderEvent::Done {
-            stop: StopReason::EndTurn,
-        },
-    ])
-}
-
-struct Fx {
-    dir: TempDir,
-    home: TempDir,
-}
-
-impl Fx {
-    fn new() -> Fx {
-        Fx {
-            dir: tempfile::tempdir().unwrap(),
-            home: tempfile::tempdir().unwrap(),
-        }
-    }
-
-    fn root(&self) -> PathBuf {
-        self.dir.path().canonicalize().unwrap()
-    }
-
-    fn write(&self, rel: &str, text: &str) {
-        let p = self.dir.path().join(rel);
-        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
-        std::fs::write(p, text).unwrap();
-    }
-
-    fn builder(&self, cfg: Config, mock: &MockProvider) -> EngineBuilder {
-        EngineBuilder {
-            provider: Some(Arc::new(mock.clone())),
-            data_home: Some(self.home.path().to_path_buf()),
-            ..EngineBuilder::new(cfg, self.dir.path())
-        }
-    }
-
+impl FxExt for Fx {
     /// A workspace over this root whose index has finished its first refresh.
     async fn ready_workspace(&self) -> Arc<Workspace> {
         let sb: Arc<dyn Sandbox> = Arc::new(LocalSandbox::new(self.root()).unwrap());
@@ -128,47 +50,12 @@ impl Fx {
     }
 }
 
-struct Run {
-    engine: Engine,
-    events: mpsc::Receiver<Event>,
+trait RunExt {
+    async fn turn(&mut self) -> Vec<Event>;
+    async fn turn_from_start(&mut self, text: &str) -> Vec<Event>;
 }
 
-fn start(b: EngineBuilder) -> Run {
-    let (engine, events) = b.build().unwrap();
-    Run { engine, events }
-}
-
-impl Run {
-    async fn say(&self, text: &str) {
-        self.engine
-            .send(Command::SendMessage {
-                id: None,
-                text: text.into(),
-            })
-            .await
-            .unwrap();
-    }
-
-    async fn next(&mut self) -> Event {
-        tokio::time::timeout(WAIT, self.events.recv())
-            .await
-            .expect("timed out waiting for an event")
-            .expect("event channel closed")
-    }
-
-    /// Events up to and including the first that matches `pred`.
-    async fn until(&mut self, pred: impl Fn(&Event) -> bool) -> Vec<Event> {
-        let mut out = Vec::new();
-        loop {
-            let ev = self.next().await;
-            let done = pred(&ev);
-            out.push(ev);
-            if done {
-                return out;
-            }
-        }
-    }
-
+impl RunExt for Run {
     /// Events through `TurnFinished`, from `TurnStarted` if it is among them (earlier
     /// events, from session start, are dropped).
     async fn turn(&mut self) -> Vec<Event> {
@@ -182,7 +69,7 @@ impl Run {
         all[from..].to_vec()
     }
 
-    async fn turn_with(&mut self, text: &str) -> Vec<Event> {
+    async fn turn_from_start(&mut self, text: &str) -> Vec<Event> {
         self.say(text).await;
         self.turn().await
     }
@@ -278,7 +165,7 @@ async fn text_only_turn_completes() {
         },
     ])]);
     let mut run = start(fx.builder(config(Mode::Ask), &mock));
-    let events = run.turn_with("hi").await;
+    let events = run.turn_from_start("hi").await;
     let kinds: Vec<String> = events.iter().map(kind).collect();
     assert_eq!(
         kinds,
@@ -306,7 +193,7 @@ async fn tool_loop_runs_until_no_tool_calls() {
         text_step("done"),
     ]);
     let mut run = start(fx.builder(config(Mode::Ask), &mock));
-    let events = run.turn_with("read it").await;
+    let events = run.turn_from_start("read it").await;
     assert_eq!(finish_reason(&events), FinishReason::Completed);
     let reqs = mock.requests();
     assert_eq!(reqs.len(), 2);
@@ -420,7 +307,7 @@ async fn headless_ask_is_denied_without_waiting() {
         text_step("ok"),
     ]);
     let mut run = start(fx.builder(config(Mode::Ask), &mock));
-    let events = run.turn_with("write it").await;
+    let events = run.turn_from_start("write it").await;
     assert_eq!(count(&events, "tool_approval_requested"), 0);
     let f = finished(&events);
     assert!(f[0].2);
@@ -479,18 +366,12 @@ impl Probe {
 }
 
 #[async_trait]
-impl Sandbox for Probe {
-    fn root(&self) -> &Path {
-        self.inner.root()
-    }
-    fn resolve(&self, p: &Path) -> Result<PathBuf, SandboxError> {
-        self.inner.resolve(p)
+impl Delegate for Probe {
+    fn inner(&self) -> &LocalSandbox {
+        &self.inner
     }
     async fn read(&self, p: &Path) -> Result<Vec<u8>, SandboxError> {
         self.timed("read", p, self.inner.read(p)).await
-    }
-    async fn metadata(&self, p: &Path) -> Result<FileMeta, SandboxError> {
-        self.inner.metadata(p).await
     }
     async fn write_atomic(
         &self,
@@ -501,21 +382,6 @@ impl Sandbox for Probe {
         self.timed("write", p, self.inner.write_atomic(p, bytes, mode))
             .await
     }
-    async fn remove_file(&self, p: &Path) -> Result<(), SandboxError> {
-        self.inner.remove_file(p).await
-    }
-    async fn spill(&self, bytes: &[u8]) -> Result<PathBuf, SandboxError> {
-        self.inner.spill(bytes).await
-    }
-    async fn spawn(&self, spec: SpawnSpec) -> Result<Child, SandboxError> {
-        self.inner.spawn(spec).await
-    }
-    fn walker(&self, base: &Path) -> Result<ignore::WalkBuilder, SandboxError> {
-        self.inner.walker(base)
-    }
-    async fn http_get(&self, url: &Url) -> Result<HttpResponse, SandboxError> {
-        self.inner.http_get(url).await
-    }
 }
 
 #[tokio::test]
@@ -523,10 +389,10 @@ async fn read_only_calls_run_concurrently_writes_sequentially() {
     let fx = Fx::new();
     fx.write("slow_a.txt", "needle a\n");
     fx.write("slow_b.txt", "needle b\n");
-    let probe = Arc::new(Probe {
+    let probe = Arc::new(Delegating(Probe {
         inner: LocalSandbox::new(fx.root()).unwrap(),
         log: Mutex::new(Vec::new()),
-    });
+    }));
     // The shared index reads through its own sandbox, so only the tools' I/O is timed.
     let plain: Arc<dyn Sandbox> = Arc::new(LocalSandbox::new(fx.root()).unwrap());
     let mock = MockProvider::new(vec![
@@ -553,7 +419,7 @@ async fn read_only_calls_run_concurrently_writes_sequentially() {
         workspace: Some(Workspace::new(plain, fx.home.path())),
         ..fx.builder(config(Mode::Yolo), &mock)
     });
-    let events = run.turn_with("go").await;
+    let events = run.turn_from_start("go").await;
     assert_eq!(finish_reason(&events), FinishReason::Completed);
     assert!(finished(&events).iter().all(|f| !f.2), "{events:?}");
 
@@ -585,7 +451,7 @@ async fn malformed_tool_args_return_error_result_and_continue() {
         text_step("sorry"),
     ]);
     let mut run = start(fx.builder(config(Mode::Ask), &mock));
-    let events = run.turn_with("go").await;
+    let events = run.turn_from_start("go").await;
     let f = finished(&events);
     assert!(f[0].2);
     assert!(f[0].1.contains("invalid"), "{f:?}");
@@ -604,7 +470,7 @@ async fn unknown_tool_name_returns_error_result() {
         text_step("sorry"),
     ]);
     let mut run = start(fx.builder(config(Mode::Ask), &mock));
-    let events = run.turn_with("go").await;
+    let events = run.turn_from_start("go").await;
     let f = finished(&events);
     assert!(f[0].2);
     assert!(f[0].1.contains("unknown tool"), "{f:?}");
@@ -622,7 +488,7 @@ async fn policy_deny_reports_rule() {
         text_step("ok"),
     ]);
     let mut run = start(fx.builder(cfg, &mock));
-    let events = run.turn_with("go").await;
+    let events = run.turn_from_start("go").await;
     assert!(
         !events.iter().any(|e| matches!(
             e,
@@ -658,7 +524,7 @@ async fn bash_commands_do_not_see_provider_key_variables() {
         text_step("ok"),
     ]);
     let mut run = start(fx.builder(cfg, &mock));
-    let f = finished(&run.turn_with("go").await);
+    let f = finished(&run.turn_from_start("go").await);
     assert!(f[0].1.contains("home:unset path:set"), "{f:?}");
 }
 
@@ -672,7 +538,7 @@ async fn mid_stream_drop_reissues_from_last_complete_message() {
         text_step("done"),
     ]);
     let mut run = start(fx.builder(config(Mode::Yolo), &mock));
-    let events = run.turn_with("go").await;
+    let events = run.turn_from_start("go").await;
     assert_eq!(finish_reason(&events), FinishReason::Completed);
     assert_eq!(count(&events, "tool_started"), 1);
     assert_eq!(
@@ -755,7 +621,7 @@ async fn pin_and_state_tools_update_context() {
         text_step("ok"),
     ]);
     let mut run = start(fx.builder(config(Mode::Ask), &mock));
-    let events = run.turn_with("go").await;
+    let events = run.turn_from_start("go").await;
     assert!(finished(&events).iter().all(|f| !f.2), "{events:?}");
     let req = &mock.requests()[1];
     let all = serde_json::to_string(&req.messages).unwrap();
@@ -779,7 +645,7 @@ async fn refused_model_pin_is_reported_to_the_model() {
         .collect();
     let mock = MockProvider::new(vec![tools_step(pins), text_step("ok")]);
     let mut run = start(fx.builder(config(Mode::Ask), &mock));
-    let events = run.turn_with("go").await;
+    let events = run.turn_from_start("go").await;
     let f = finished(&events);
     assert_eq!(f.len(), 21);
     assert!(f[..20].iter().all(|f| !f.2));
@@ -812,7 +678,7 @@ async fn user_pin_command_pins_and_reports_refusals() {
         .until(|e| matches!(e, Event::Warning { message } if message.contains("pin")))
         .await;
     assert!(!events.is_empty());
-    run.turn_with("go").await;
+    run.turn_from_start("go").await;
     let all = serde_json::to_string(&mock.requests()[0].messages).unwrap();
     assert!(all.contains("the user rule"), "{all}");
     assert!(all.contains("[user]"), "{all}");
@@ -874,7 +740,7 @@ async fn context_gc_runs_only_at_step_start_and_emits_context_collected() {
     script.push(text_step("done"));
     let mock = MockProvider::new(script);
     let mut run = start(fx.builder(config(Mode::Ask), &mock));
-    let events = run.turn_with("read it six times").await;
+    let events = run.turn_from_start("read it six times").await;
     assert_eq!(finish_reason(&events), FinishReason::Completed);
 
     let collected: Vec<usize> = events
@@ -932,7 +798,7 @@ async fn identical_failed_call_with_no_writes_since_is_blocked() {
         text_step("ok"),
     ]);
     let mut run = start(fx.builder(config(Mode::Yolo), &mock));
-    let events = run.turn_with("go").await;
+    let events = run.turn_from_start("go").await;
     let f = finished(&events);
     assert!(f[0].2 && !f[0].3, "{f:?}");
     assert!(f[1].2 && f[1].3, "{f:?}");
@@ -951,7 +817,7 @@ async fn blocked_call_repeated_immediately_runs() {
         text_step("ok"),
     ]);
     let mut run = start(fx.builder(config(Mode::Yolo), &mock));
-    let events = run.turn_with("go").await;
+    let events = run.turn_from_start("go").await;
     let f = finished(&events);
     assert!(f[1].3, "{f:?}");
     assert!(!f[2].3, "{f:?}");
@@ -973,7 +839,7 @@ async fn write_since_failure_unblocks_retry() {
         text_step("ok"),
     ]);
     let mut run = start(fx.builder(config(Mode::Yolo), &mock));
-    let events = run.turn_with("go").await;
+    let events = run.turn_from_start("go").await;
     let f = finished(&events);
     assert!(f[0].2);
     assert!(!f[2].3, "{f:?}");
@@ -994,7 +860,7 @@ async fn failed_attempts_appear_in_working_state_capped_at_10() {
         .collect();
     let mock = MockProvider::new(vec![tools_step(calls), text_step("ok")]);
     let mut run = start(fx.builder(config(Mode::Yolo), &mock));
-    let events = run.turn_with("go").await;
+    let events = run.turn_from_start("go").await;
     assert!(finished(&events).iter().all(|f| f.2));
     let tail = tail_text(&mock.requests()[1]);
     let section = tail
@@ -1029,7 +895,7 @@ async fn edits_reindex_before_result_returned() {
         workspace: Some(ws),
         ..fx.builder(config(Mode::AutoEdit), &mock)
     });
-    let events = run.turn_with("go").await;
+    let events = run.turn_from_start("go").await;
     let f = finished(&events);
     assert!(!f[1].2, "{f:?}");
     assert_eq!(f[2].0, "s1");
@@ -1055,7 +921,7 @@ async fn max_turns_stops() {
             .collect(),
     );
     let mut run = start(fx.builder(cfg, &mock));
-    let events = run.turn_with("loop").await;
+    let events = run.turn_from_start("loop").await;
     assert_eq!(finish_reason(&events), FinishReason::MaxTurns);
     assert_eq!(mock.requests().len(), 2);
     assert_eq!(count(&events, "turn_started"), 1);
@@ -1084,7 +950,7 @@ async fn cancel_ends_the_turn_and_answers_every_call() {
     assert!(!fx.dir.path().join("o.txt").exists());
 
     // The next request answers both calls of the cancelled step.
-    run.turn_with("carry on").await;
+    run.turn_from_start("carry on").await;
     let results = tool_results(mock.requests().last().unwrap());
     let ids: Vec<&str> = results.iter().map(|r| r.0.as_str()).collect();
     assert_eq!(ids, ["w1", "r1"]);
@@ -1141,7 +1007,7 @@ async fn compaction_and_collection_apply_in_one_epoch_at_step_start() {
         "PROMPT-MARKER {}",
         "lorem ipsum dolor sit amet ".repeat(1500)
     );
-    let events = run.turn_with(&prompt).await;
+    let events = run.turn_from_start(&prompt).await;
     assert_eq!(
         finish_reason(&events),
         FinishReason::Completed,
@@ -1207,7 +1073,7 @@ async fn failed_summary_falls_back_to_dropping_the_oldest_turns() {
         "PROMPT-MARKER {}",
         "lorem ipsum dolor sit amet ".repeat(1500)
     );
-    let events = run.turn_with(&prompt).await;
+    let events = run.turn_from_start(&prompt).await;
     assert_eq!(
         finish_reason(&events),
         FinishReason::Completed,
@@ -1279,8 +1145,8 @@ async fn first_request_carries_repo_map_and_memory_index_when_ready() {
         startup_wait: WAIT,
         ..fx.builder(config(Mode::Ask), &mock)
     });
-    run.turn_with("one").await;
-    run.turn_with("two").await;
+    run.turn_from_start("one").await;
+    run.turn_from_start("two").await;
     let reqs = mock.requests();
     let memory = system_block(&reqs[0], 2);
     assert!(memory.contains("Use pnpm"), "{memory}");
@@ -1319,9 +1185,9 @@ async fn two_sessions_share_one_workspace() {
         ..fx.builder(config(Mode::AutoEdit), &mock_b)
     });
     assert_ne!(a.engine.session_id(), b.engine.session_id());
-    let ea = a.turn_with("write").await;
+    let ea = a.turn_from_start("write").await;
     assert!(!finished(&ea)[0].2, "{ea:?}");
-    let eb = b.turn_with("find").await;
+    let eb = b.turn_from_start("find").await;
     let f = finished(&eb);
     assert!(f[0].1.contains("two.rs"), "{f:?}");
     assert!(!f[0].1.contains("index building"), "{f:?}");
@@ -1374,12 +1240,12 @@ async fn request_records_keep_only_hashes_and_blob_bytes_grow_linearly() {
         .join("blobs");
     let before = dir_bytes(&blobs);
     assert_eq!(
-        finish_reason(&run.turn_with("one").await),
+        finish_reason(&run.turn_from_start("one").await),
         FinishReason::Completed
     );
     let first = dir_bytes(&blobs) - before;
     assert_eq!(
-        finish_reason(&run.turn_with("two").await),
+        finish_reason(&run.turn_from_start("two").await),
         FinishReason::Completed
     );
     let second = dir_bytes(&blobs) - before - first;
@@ -1427,7 +1293,7 @@ async fn transient_errors_before_content_are_retried_only_by_the_retry_wrapper()
     let fx = Fx::new();
     let mock = MockProvider::new((0..8).map(|_| MockTurn::Error(transient())).collect());
     let mut run = start(fx.builder(config(Mode::Ask), &mock));
-    let events = run.turn_with("hi").await;
+    let events = run.turn_from_start("hi").await;
     assert_eq!(finish_reason(&events), FinishReason::Error);
     assert_eq!(mock.requests().len(), 5, "spec 3.5: at most 5 attempts");
     assert!(events.iter().any(|e| matches!(
@@ -1452,7 +1318,7 @@ async fn a_break_after_usage_only_is_not_resent_by_the_engine() {
     // add attempts of its own.
     let mock = MockProvider::new((0..8).map(|_| MockTurn::DropAfter(vec![usage()])).collect());
     let mut run = start(fx.builder(config(Mode::Ask), &mock));
-    let events = run.turn_with("hi").await;
+    let events = run.turn_from_start("hi").await;
     assert_eq!(finish_reason(&events), FinishReason::Error);
     assert_eq!(mock.requests().len(), 5);
 }
@@ -1480,7 +1346,7 @@ async fn unpin_removes_a_pin_and_reports_unknown_text() {
     }
     run.until(|e| matches!(e, Event::Warning { message } if message.contains("no pin")))
         .await;
-    run.turn_with("go").await;
+    run.turn_from_start("go").await;
     let all = serde_json::to_string(&mock.requests()[0].messages).unwrap();
     assert!(all.contains("keep this"));
     assert!(!all.contains("drop this"));
@@ -1490,43 +1356,14 @@ async fn unpin_removes_a_pin_and_reports_unknown_text() {
 struct NoWalk(LocalSandbox);
 
 #[async_trait]
-impl Sandbox for NoWalk {
-    fn root(&self) -> &Path {
-        self.0.root()
-    }
-    fn resolve(&self, p: &Path) -> Result<PathBuf, SandboxError> {
-        self.0.resolve(p)
-    }
-    async fn read(&self, p: &Path) -> Result<Vec<u8>, SandboxError> {
-        self.0.read(p).await
-    }
-    async fn metadata(&self, p: &Path) -> Result<FileMeta, SandboxError> {
-        self.0.metadata(p).await
-    }
-    async fn write_atomic(
-        &self,
-        p: &Path,
-        bytes: &[u8],
-        mode: Option<u32>,
-    ) -> Result<(), SandboxError> {
-        self.0.write_atomic(p, bytes, mode).await
-    }
-    async fn remove_file(&self, p: &Path) -> Result<(), SandboxError> {
-        self.0.remove_file(p).await
-    }
-    async fn spill(&self, bytes: &[u8]) -> Result<PathBuf, SandboxError> {
-        self.0.spill(bytes).await
-    }
-    async fn spawn(&self, spec: SpawnSpec) -> Result<Child, SandboxError> {
-        self.0.spawn(spec).await
+impl Delegate for NoWalk {
+    fn inner(&self) -> &LocalSandbox {
+        &self.0
     }
     fn walker(&self, _base: &Path) -> Result<ignore::WalkBuilder, SandboxError> {
         Err(SandboxError::Denied(
             "walks are disabled in this test".into(),
         ))
-    }
-    async fn http_get(&self, url: &Url) -> Result<HttpResponse, SandboxError> {
-        self.0.http_get(url).await
     }
 }
 
@@ -1534,7 +1371,7 @@ impl Sandbox for NoWalk {
 async fn a_failed_index_refresh_is_reported_once() {
     let fx = Fx::new();
     fx.write("a.txt", "a\n");
-    let sb: Arc<dyn Sandbox> = Arc::new(NoWalk(LocalSandbox::new(fx.root()).unwrap()));
+    let sb: Arc<dyn Sandbox> = Arc::new(Delegating(NoWalk(LocalSandbox::new(fx.root()).unwrap())));
     let ws = Workspace::new(sb, fx.home.path());
     ws.start();
     assert!(!ws.wait_ready_or_failed().await, "the refresh did not fail");
@@ -1549,8 +1386,8 @@ async fn a_failed_index_refresh_is_reported_once() {
         workspace: Some(ws),
         ..fx.builder(config(Mode::Ask), &mock)
     });
-    let mut events = run.turn_with("one").await;
-    events.extend(run.turn_with("two").await);
+    let mut events = run.turn_from_start("one").await;
+    events.extend(run.turn_from_start("two").await);
     let n = events
         .iter()
         .filter(|e| matches!(e, Event::Warning { message } if message.contains("code index refresh failed")))
@@ -1608,7 +1445,7 @@ async fn old_spill_files_are_cleaned_at_start() {
     drop(old);
     let mock = MockProvider::new(vec![text_step("ok")]);
     let mut run = start(fx.builder(config(Mode::Ask), &mock));
-    run.turn_with("go").await;
+    run.turn_from_start("go").await;
     let deadline = Instant::now() + WAIT;
     while fx.dir.path().join(".tautly/tmp/spill/old").exists() {
         assert!(Instant::now() < deadline, "old spill file kept");
@@ -1699,7 +1536,7 @@ async fn after_a_turn_panic_every_command_is_answered_and_the_panic_is_logged() 
         data_home: Some(fx.home.path().to_path_buf()),
         ..EngineBuilder::new(config(Mode::Ask), fx.dir.path())
     });
-    let events = run.turn_with("boom").await;
+    let events = run.turn_from_start("boom").await;
     assert_eq!(finish_reason(&events), FinishReason::Error);
     assert!(events.iter().any(
         |e| matches!(e, Event::Error { message, .. } if message.contains("provider exploded on purpose"))

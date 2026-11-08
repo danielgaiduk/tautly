@@ -38,6 +38,7 @@ keyring = { workspace = true, features = ["apple-native"] }
 keyring = { workspace = true, features = ["linux-native-async-persistent", "crypto-rust"] }
 
 [dev-dependencies]
+tautly-testkit = { path = "../tautly-testkit" }
 insta.workspace = true
 ignore.workspace = true
 proptest.workspace = true

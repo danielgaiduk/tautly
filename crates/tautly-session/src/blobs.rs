@@ -1,12 +1,9 @@
 use std::fs;
-use std::io::Write;
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 
-use crate::{Error, Result, paths};
+use crate::{Error, Result};
 
 /// Content address of a blob: the blake3 hex digest (64 chars) of its bytes.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -36,8 +33,6 @@ pub(crate) struct BlobStore {
     dir: PathBuf,
 }
 
-static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
-
 impl BlobStore {
     pub(crate) fn new(project_dir: &Path) -> Self {
         Self {
@@ -60,28 +55,8 @@ impl BlobStore {
         if path.exists() {
             return Ok(r);
         }
-        let parent = path.parent().expect("blob path has a parent");
-        paths::create_private_dir_all(parent)?;
-        let tmp = parent.join(format!(
-            ".tmp-{}-{}",
-            std::process::id(),
-            TMP_COUNTER.fetch_add(1, Ordering::Relaxed)
-        ));
-        let result = (|| -> std::io::Result<()> {
-            let mut f = fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(&tmp)?;
-            f.write_all(bytes)?;
-            // Records reference this blob; it must be durable first.
-            f.sync_data()?;
-            fs::rename(&tmp, &path)
-        })();
-        if let Err(e) = result {
-            let _ = fs::remove_file(&tmp);
-            return Err(e.into());
-        }
+        // Records reference this blob; it must be durable first.
+        crate::files::write_private_atomic(&path, bytes, true)?;
         Ok(r)
     }
 

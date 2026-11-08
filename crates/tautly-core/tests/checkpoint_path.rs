@@ -10,11 +10,11 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use tautly_core::{Command, Config, Engine, EngineBuilder, Event, SessionRecord};
-use tautly_provider::{
-    Catalog, MockProvider, MockTurn, ModelId, ProviderEvent, RawUsage, StopReason,
-};
+use tautly_provider::mock::text_step;
+use tautly_provider::{MockProvider, MockTurn, ModelId, ProviderEvent, StopReason};
 use tautly_sandbox::Mode;
 use tautly_session::SessionReader;
+use tautly_testkit::catalog;
 use tokio::sync::mpsc;
 
 const MODEL: &str = "mock/test";
@@ -22,18 +22,7 @@ const WAIT: Duration = Duration::from_secs(30);
 static PATH_LOCK: Mutex<()> = Mutex::new(());
 
 fn config() -> Config {
-    let catalog = Catalog::from_toml(&format!(
-        r#"[models."{MODEL}"]
-context_window = 200000
-max_output = 8000
-parallel_tools = true
-reasoning = "none"
-cache = "none"
-images = false
-edit_format = "str_replace"
-"#
-    ))
-    .unwrap();
+    let catalog = catalog(200_000, 8000, "str_replace");
     let mut c = Config {
         model: ModelId::from(MODEL),
         catalog_overrides: Some(catalog),
@@ -44,21 +33,6 @@ edit_format = "str_replace"
     // that would change what these tests see. Tests of the limit set their own.
     c.checkpoints.timeout_ms = 120_000;
     c
-}
-
-fn text_step(text: &str) -> MockTurn {
-    MockTurn::Events(vec![
-        ProviderEvent::TextDelta(text.into()),
-        ProviderEvent::Usage(RawUsage {
-            input: 100,
-            output: 10,
-            cache_read: 0,
-            cache_write: 0,
-        }),
-        ProviderEvent::Done {
-            stop: StopReason::EndTurn,
-        },
-    ])
 }
 
 /// The first `git` on `PATH`.

@@ -6,23 +6,20 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use serde_json::{Value, json};
+use serde_json::json;
 use tautly_core::routing::{SideRunner, SideUsage, side_model_id};
 use tautly_core::{
-    BudgetLimits, Command, Config, Engine, EngineBuilder, Event, FinishReason, RoutingConfig,
-    UsageRole,
+    BudgetLimits, Command, Config, EngineBuilder, Event, FinishReason, RoutingConfig, UsageRole,
 };
+use tautly_provider::mock::{call, tools_step};
 use tautly_provider::{
     CanonicalRequest, Catalog, MockProvider, MockTurn, ModelId, ProviderError, ProviderEvent,
     RawUsage, SideModel, StopReason,
 };
-use tautly_sandbox::{
-    Child, FileMeta, HttpResponse, LocalSandbox, Mode, Sandbox, SandboxError, SpawnSpec, Url,
-};
-use tempfile::TempDir;
+use tautly_sandbox::{HttpResponse, LocalSandbox, Mode, Sandbox, SandboxError, Url};
+use tautly_testkit::{Delegate, Delegating};
+use tautly_testkit::{Fx, WAIT, start};
 use tokio::sync::mpsc;
-
-const WAIT: Duration = Duration::from_secs(30);
 
 // ---- which model -------------------------------------------------------------------
 
@@ -252,42 +249,24 @@ fn config(small_price: Option<&str>) -> Config {
     c
 }
 
-fn call(id: &str, name: &str, args: Value) -> ProviderEvent {
-    ProviderEvent::ToolCall {
-        id: id.into(),
-        name: name.into(),
-        input_json: args.to_string(),
-    }
+trait FxExt {
+    fn routed_builder(
+        &self,
+        cfg: Config,
+        main: &MockProvider,
+        side: &MockProvider,
+    ) -> EngineBuilder;
+    async fn ledger_rows(&self, n: usize) -> Vec<(String, Option<f64>, u64, u64)>;
+    fn read_ledger(&self) -> Vec<(String, Option<f64>, u64, u64)>;
 }
 
-/// A response with tool calls; it reports no usage (the mock's numbers would calibrate the
-/// token estimator far off).
-fn tools_step(calls: Vec<ProviderEvent>) -> MockTurn {
-    let mut evs = calls;
-    evs.push(ProviderEvent::Done {
-        stop: StopReason::ToolUse,
-    });
-    MockTurn::Events(evs)
-}
-
-struct Fx {
-    dir: TempDir,
-    home: TempDir,
-}
-
-impl Fx {
-    fn new() -> Fx {
-        Fx {
-            dir: tempfile::tempdir().unwrap(),
-            home: tempfile::tempdir().unwrap(),
-        }
-    }
-
-    fn root(&self) -> PathBuf {
-        self.dir.path().canonicalize().unwrap()
-    }
-
-    fn builder(&self, cfg: Config, main: &MockProvider, side: &MockProvider) -> EngineBuilder {
+impl FxExt for Fx {
+    fn routed_builder(
+        &self,
+        cfg: Config,
+        main: &MockProvider,
+        side: &MockProvider,
+    ) -> EngineBuilder {
         EngineBuilder {
             provider: Some(Arc::new(main.clone())),
             side_provider: Some(Arc::new(side.clone())),
@@ -327,41 +306,6 @@ impl Fx {
             .unwrap()
             .map(Result::unwrap)
             .collect()
-    }
-}
-
-struct Run {
-    engine: Engine,
-    events: mpsc::Receiver<Event>,
-}
-
-fn start(b: EngineBuilder) -> Run {
-    let (engine, events) = b.build().unwrap();
-    Run { engine, events }
-}
-
-impl Run {
-    /// Events through `TurnFinished`.
-    async fn turn_with(&mut self, text: &str) -> Vec<Event> {
-        self.engine
-            .send(Command::SendMessage {
-                id: None,
-                text: text.into(),
-            })
-            .await
-            .unwrap();
-        let mut out = Vec::new();
-        loop {
-            let ev = tokio::time::timeout(WAIT, self.events.recv())
-                .await
-                .expect("timed out waiting for an event")
-                .expect("event channel closed");
-            let done = matches!(ev, Event::TurnFinished { .. });
-            out.push(ev);
-            if done {
-                return out;
-            }
-        }
     }
 }
 
@@ -442,7 +386,7 @@ async fn compaction_summary_requested_from_side_model_not_main() {
     let fx = compaction_fx();
     let main = MockProvider::new(compaction_script());
     let side = MockProvider::new(vec![text_step("SUMMARY-TEXT", usage(2000, 300))]);
-    let mut run = start(fx.builder(config(Some(SMALL_PRICE)), &main, &side));
+    let mut run = start(fx.routed_builder(config(Some(SMALL_PRICE)), &main, &side));
     let events = run.turn_with(&long_prompt()).await;
     assert_eq!(
         finish_reason(&events),
@@ -497,7 +441,7 @@ async fn side_requests_stay_without_reasoning_when_the_main_model_reasons() {
         );
         cfg.catalog_overrides = Some(Catalog::from_toml(&toml).unwrap());
         cfg.reasoning = tautly_core::ReasoningLevel::High;
-        let mut run = start(fx.builder(cfg, &main, &side));
+        let mut run = start(fx.routed_builder(cfg, &main, &side));
         let events = run.turn_with(&long_prompt()).await;
         assert_eq!(
             finish_reason(&events),
@@ -572,7 +516,7 @@ async fn a_resume_without_the_ledger_counts_side_usage_priced_by_its_own_model()
     let fx = compaction_fx();
     let main = MockProvider::new(compaction_script());
     let side = MockProvider::new(vec![text_step("SUMMARY-TEXT", usage(2000, 300))]);
-    let mut run = start(fx.builder(config(Some(SMALL_PRICE)), &main, &side));
+    let mut run = start(fx.routed_builder(config(Some(SMALL_PRICE)), &main, &side));
     let id = run.engine.session_id().to_string();
     let events = run.turn_with(&long_prompt()).await;
     assert_eq!(finish_reason(&events), FinishReason::Completed);
@@ -585,7 +529,7 @@ async fn a_resume_without_the_ledger_counts_side_usage_priced_by_its_own_model()
 
     let resume = |mock: &MockProvider| EngineBuilder {
         resume: Some(id.clone()),
-        ..fx.builder(config(Some(SMALL_PRICE)), mock, &MockProvider::new(vec![]))
+        ..fx.routed_builder(config(Some(SMALL_PRICE)), mock, &MockProvider::new(vec![]))
     };
     let budget = |max_usd: Option<f64>, max_tokens: Option<u64>| Command::SetBudget {
         scope: tautly_core::BudgetScope::Session,
@@ -627,7 +571,7 @@ async fn side_usage_priced_and_recorded_with_side_model_id() {
     let fx = compaction_fx();
     let main = MockProvider::new(compaction_script());
     let side = MockProvider::new(vec![text_step("SUMMARY-TEXT", usage(2000, 300))]);
-    let mut run = start(fx.builder(config(Some(SMALL_PRICE)), &main, &side));
+    let mut run = start(fx.routed_builder(config(Some(SMALL_PRICE)), &main, &side));
     let events = run.turn_with(&long_prompt()).await;
     assert_eq!(finish_reason(&events), FinishReason::Completed);
 
@@ -660,7 +604,7 @@ async fn an_unpriced_side_model_has_no_cost_and_the_usd_budget_warns_once() {
         max_usd: Some(100.0),
         max_tokens: None,
     };
-    let mut run = start(fx.builder(cfg, &main, &side));
+    let mut run = start(fx.routed_builder(cfg, &main, &side));
     let events = run.turn_with(&long_prompt()).await;
     assert_eq!(finish_reason(&events), FinishReason::Completed);
 
@@ -686,7 +630,7 @@ async fn side_usage_has_role_side_and_counts_toward_budget_and_ledger() {
     script.push(text_step("never sent", usage(1, 1)));
     let main = MockProvider::new(script);
     let side = MockProvider::new(vec![text_step("SUMMARY-TEXT", usage(2000, 300))]);
-    let mut run = start(fx.builder(config(Some(SMALL_PRICE)), &main, &side));
+    let mut run = start(fx.routed_builder(config(Some(SMALL_PRICE)), &main, &side));
     let events = run.turn_with(&long_prompt()).await;
     assert_eq!(finish_reason(&events), FinishReason::Completed);
     let tokens = |role: UsageRole| -> u64 {
@@ -744,7 +688,7 @@ async fn the_80_percent_warning_a_side_request_causes_follows_its_usage() {
             max_usd: None,
             max_tokens,
         };
-        let mut run = start(fx.builder(cfg, &main, &side));
+        let mut run = start(fx.routed_builder(cfg, &main, &side));
         async move {
             let events = run.turn_with(&long_prompt()).await;
             run.engine.send(Command::Shutdown).await.unwrap();
@@ -780,7 +724,7 @@ async fn without_a_small_tier_the_main_model_summarizes() {
     let mut cfg = config(Some(SMALL_PRICE));
     cfg.catalog_overrides =
         Some(Catalog::from_toml(&model_toml(MAIN, None, Some(MAIN_PRICE))).unwrap());
-    let mut run = start(fx.builder(cfg, &main, &unused));
+    let mut run = start(fx.routed_builder(cfg, &main, &unused));
     let events = run.turn_with(&long_prompt()).await;
     assert_eq!(
         finish_reason(&events),
@@ -839,7 +783,7 @@ async fn compaction_is_sized_for_the_side_models_window_and_output_cap() {
     cfg.compaction_threshold = Some(0.6);
     let main = MockProvider::new(compaction_script());
     let side = MockProvider::new(vec![text_step("SUMMARY-TEXT", usage(2000, 300))]);
-    let mut run = start(fx.builder(cfg, &main, &side));
+    let mut run = start(fx.routed_builder(cfg, &main, &side));
     let prompt = format!(
         "PROMPT-MARKER {}",
         "lorem ipsum dolor sit amet ".repeat(1200)
@@ -866,7 +810,7 @@ async fn a_failing_side_model_falls_back_to_the_main_model_once_and_stays_there(
     script.insert(4, text_step("SUMMARY-TEXT", usage(2000, 300)));
     let main = MockProvider::new(script);
     let side = MockProvider::new(vec![MockTurn::Error(ProviderError::Auth("bad key".into()))]);
-    let mut run = start(fx.builder(config(Some(SMALL_PRICE)), &main, &side));
+    let mut run = start(fx.routed_builder(config(Some(SMALL_PRICE)), &main, &side));
     let events = run.turn_with(&long_prompt()).await;
     assert_eq!(
         finish_reason(&events),
@@ -921,10 +865,11 @@ async fn a_failing_side_model_falls_back_to_the_main_model_once_and_stays_there(
         text_step("done", usage(100, 10)),
     ]);
     let side = MockProvider::new(vec![MockTurn::Error(ProviderError::Auth("bad key".into()))]);
-    let sandbox: Arc<dyn Sandbox> = Arc::new(Web(LocalSandbox::new(fx.root()).unwrap()));
+    let sandbox: Arc<dyn Sandbox> =
+        Arc::new(Delegating(Web(LocalSandbox::new(fx.root()).unwrap())));
     let mut run = start(EngineBuilder {
         sandbox: Some(sandbox),
-        ..fx.builder(config(Some(SMALL_PRICE)), &main, &side)
+        ..fx.routed_builder(config(Some(SMALL_PRICE)), &main, &side)
     });
     let events = run.turn_with("go").await;
     assert_eq!(
@@ -963,38 +908,9 @@ async fn a_failing_side_model_falls_back_to_the_main_model_once_and_stays_there(
 struct Web(LocalSandbox);
 
 #[async_trait]
-impl Sandbox for Web {
-    fn root(&self) -> &std::path::Path {
-        self.0.root()
-    }
-    fn resolve(&self, p: &std::path::Path) -> Result<PathBuf, SandboxError> {
-        self.0.resolve(p)
-    }
-    async fn read(&self, p: &std::path::Path) -> Result<Vec<u8>, SandboxError> {
-        self.0.read(p).await
-    }
-    async fn metadata(&self, p: &std::path::Path) -> Result<FileMeta, SandboxError> {
-        self.0.metadata(p).await
-    }
-    async fn write_atomic(
-        &self,
-        p: &std::path::Path,
-        bytes: &[u8],
-        mode: Option<u32>,
-    ) -> Result<(), SandboxError> {
-        self.0.write_atomic(p, bytes, mode).await
-    }
-    async fn remove_file(&self, p: &std::path::Path) -> Result<(), SandboxError> {
-        self.0.remove_file(p).await
-    }
-    async fn spill(&self, bytes: &[u8]) -> Result<PathBuf, SandboxError> {
-        self.0.spill(bytes).await
-    }
-    async fn spawn(&self, spec: SpawnSpec) -> Result<Child, SandboxError> {
-        self.0.spawn(spec).await
-    }
-    fn walker(&self, base: &std::path::Path) -> Result<ignore::WalkBuilder, SandboxError> {
-        self.0.walker(base)
+impl Delegate for Web {
+    fn inner(&self) -> &LocalSandbox {
+        &self.0
     }
     async fn http_get(&self, _url: &Url) -> Result<HttpResponse, SandboxError> {
         Ok(HttpResponse {
@@ -1017,10 +933,11 @@ async fn web_fetch_question_goes_to_the_side_model_and_its_usage_is_counted() {
         text_step("done", usage(100, 10)),
     ]);
     let side = MockProvider::new(vec![text_step("42 per minute.", usage(300, 12))]);
-    let sandbox: Arc<dyn Sandbox> = Arc::new(Web(LocalSandbox::new(fx.root()).unwrap()));
+    let sandbox: Arc<dyn Sandbox> =
+        Arc::new(Delegating(Web(LocalSandbox::new(fx.root()).unwrap())));
     let mut run = start(EngineBuilder {
         sandbox: Some(sandbox),
-        ..fx.builder(config(Some(SMALL_PRICE)), &main, &side)
+        ..fx.routed_builder(config(Some(SMALL_PRICE)), &main, &side)
     });
     let events = run.turn_with("how many requests are allowed?").await;
     assert_eq!(

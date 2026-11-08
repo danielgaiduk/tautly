@@ -18,6 +18,7 @@ thiserror.workspace = true
 tokio = { workspace = true, features = ["io-util"] }
 
 [dev-dependencies]
+tautly-testkit = { path = "../tautly-testkit" }
 async-trait.workspace = true
 tautly-provider = { path = "../tautly-provider" }
 tautly-sandbox = { path = "../tautly-sandbox" }

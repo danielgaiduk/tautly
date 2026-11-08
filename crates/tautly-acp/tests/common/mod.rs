@@ -14,9 +14,8 @@ use tautly_acp::{AcpEngineFactory, AcpError, Bridge, shared_factory};
 use tautly_core::{
     Config, EngineBuilder, Mode, ModelId, ProviderFactory, ServerSpec, Workspace, Workspaces,
 };
-use tautly_provider::{
-    Catalog, MockProvider, MockTurn, Provider, ProviderEvent, RawUsage, StopReason,
-};
+pub use tautly_provider::mock::{call, text_step, usage};
+use tautly_provider::{Catalog, MockProvider, MockTurn, Provider, ProviderEvent, StopReason};
 use tempfile::TempDir;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, DuplexStream, WriteHalf};
 use tokio::sync::mpsc;
@@ -65,23 +64,6 @@ pub fn config(mode: Mode) -> Config {
     c
 }
 
-pub fn call(id: &str, name: &str, args: Value) -> ProviderEvent {
-    ProviderEvent::ToolCall {
-        id: id.into(),
-        name: name.into(),
-        input_json: args.to_string(),
-    }
-}
-
-fn usage() -> ProviderEvent {
-    ProviderEvent::Usage(RawUsage {
-        input: 100,
-        output: 10,
-        cache_read: 0,
-        cache_write: 0,
-    })
-}
-
 pub fn tools_step(calls: Vec<ProviderEvent>) -> MockTurn {
     let mut evs = calls;
     evs.push(usage());
@@ -89,16 +71,6 @@ pub fn tools_step(calls: Vec<ProviderEvent>) -> MockTurn {
         stop: StopReason::ToolUse,
     });
     MockTurn::Events(evs)
-}
-
-pub fn text_step(text: &str) -> MockTurn {
-    MockTurn::Events(vec![
-        ProviderEvent::TextDelta(text.into()),
-        usage(),
-        ProviderEvent::Done {
-            stop: StopReason::EndTurn,
-        },
-    ])
 }
 
 pub struct Fx {

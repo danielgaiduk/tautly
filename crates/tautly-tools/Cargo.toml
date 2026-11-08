@@ -30,6 +30,7 @@ tree-sitter.workspace = true
 htmd.workspace = true
 
 [dev-dependencies]
+tautly-testkit = { path = "../tautly-testkit" }
 tempfile.workspace = true
 tokio.workspace = true
 proptest.workspace = true

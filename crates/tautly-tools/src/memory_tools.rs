@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tautly_memory::{Hit, HitSource, MemoryDraft, MemoryKind, sanitize_title};
+use tautly_memory::{Hit, HitSource, MemoryDraft, MemoryKind, approx_tokens, sanitize_title};
 use tautly_provider::{Capabilities, ToolSpec};
 use tautly_sandbox::{Effect, Sandbox};
 
@@ -26,11 +26,6 @@ const RECALL_TEXT_TOKENS: u32 = RECALL_MAX_TOKENS - 400;
 const HIT_MARKER: &str = "memory hit";
 
 const PROPOSED: &str = "proposed; awaiting user approval";
-
-/// About four bytes per token, the same rule as the context estimator before calibration.
-fn est(s: &str) -> u32 {
-    s.len().div_ceil(4) as u32
-}
 
 pub struct RecallTool;
 pub struct RememberTool;
@@ -138,13 +133,13 @@ impl Tool for RecallTool {
             let mut first = true;
             loop {
                 let hits = if std::mem::take(&mut first) {
-                    store.search_fresh(&query, RECALL_TOP_K, budget, &est)
+                    store.search_fresh(&query, RECALL_TOP_K, budget, &approx_tokens)
                 } else {
-                    store.search(&query, RECALL_TOP_K, budget, &est)
+                    store.search(&query, RECALL_TOP_K, budget, &approx_tokens)
                 };
                 let note = store.staleness_error().map(str::to_string);
                 let out = format_hits(&hits, note.as_deref());
-                let tokens = est(&out);
+                let tokens = approx_tokens(&out);
                 if tokens <= RECALL_MAX_TOKENS || budget == 0 {
                     return out;
                 }
@@ -300,7 +295,7 @@ impl Tool for RememberTool {
         if let Some(memory) = cx.memory().cloned() {
             let checked = tokio::task::spawn_blocking(move || {
                 let store = memory.read().unwrap_or_else(|e| e.into_inner());
-                store.draft_to_change(draft, &est).map(|_| ())
+                store.draft_to_change(draft, &approx_tokens).map(|_| ())
             })
             .await;
             match checked {

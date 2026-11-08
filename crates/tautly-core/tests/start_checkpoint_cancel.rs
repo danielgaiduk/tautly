@@ -10,14 +10,11 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use serde_json::json;
-use tautly_core::{Command, Config, Engine, EngineBuilder, Event, FinishReason, SessionRecord};
-use tautly_provider::{Catalog, MockProvider, MockTurn, ModelId, ProviderEvent, StopReason};
+use tautly_core::{Command, Config, EngineBuilder, Event, FinishReason, SessionRecord};
+use tautly_provider::{MockProvider, MockTurn, ModelId, ProviderEvent, StopReason};
 use tautly_sandbox::Mode;
 use tautly_session::SessionReader;
-use tokio::sync::mpsc;
-
-const MODEL: &str = "mock/test";
-const WAIT: Duration = Duration::from_secs(30);
+use tautly_testkit::{MODEL, Run, WAIT, catalog, start};
 
 fn real_git() -> PathBuf {
     let path = std::env::var_os("PATH").unwrap();
@@ -28,18 +25,7 @@ fn real_git() -> PathBuf {
 }
 
 fn config() -> Config {
-    let catalog = Catalog::from_toml(&format!(
-        r#"[models."{MODEL}"]
-context_window = 200000
-max_output = 8000
-parallel_tools = true
-reasoning = "none"
-cache = "none"
-images = false
-edit_format = "str_replace"
-"#
-    ))
-    .unwrap();
+    let catalog = catalog(200_000, 8000, "str_replace");
     let mut c = Config {
         model: ModelId::from(MODEL),
         catalog_overrides: Some(catalog),
@@ -85,28 +71,19 @@ fn repo(git: &Path) -> (tempfile::TempDir, tempfile::TempDir) {
     (dir, home)
 }
 
-struct Run {
-    engine: Engine,
-    events: mpsc::Receiver<Event>,
+trait RunExt {
+    fn start(dir: &Path, home: &Path, mock: &MockProvider) -> Run;
+    async fn cancel_at(&mut self, at: impl Fn(&Event) -> bool) -> (Duration, FinishReason);
+    async fn records(self) -> Vec<SessionRecord>;
 }
 
-impl Run {
+impl RunExt for Run {
     fn start(dir: &Path, home: &Path, mock: &MockProvider) -> Run {
-        let (engine, events) = EngineBuilder {
+        start(EngineBuilder {
             provider: Some(Arc::new(mock.clone())),
             data_home: Some(home.to_path_buf()),
             ..EngineBuilder::new(config(), dir)
-        }
-        .build()
-        .unwrap();
-        Run { engine, events }
-    }
-
-    async fn next(&mut self) -> Event {
-        tokio::time::timeout(WAIT, self.events.recv())
-            .await
-            .expect("timed out waiting for an event")
-            .expect("event channel closed")
+        })
     }
 
     /// Send `Cancel` once `at` is seen (and 30 ms more); how long `TurnFinished` took

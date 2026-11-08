@@ -7,11 +7,9 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use serde_json::{Value, json};
-use std::path::PathBuf;
 use tautly_provider::EditFormat;
-use tautly_sandbox::{
-    Child, FileMeta, HttpResponse, LocalSandbox, Sandbox, SandboxError, SpawnSpec, Url,
-};
+use tautly_sandbox::{LocalSandbox, Sandbox, SandboxError};
+use tautly_testkit::{Delegate, Delegating};
 use tautly_tools::{
     EditTool, LineRange, ReadTool, ReadTracker, Tool, ToolCx, ToolResult, WriteTool,
 };
@@ -548,44 +546,15 @@ struct CancelOnRead {
 }
 
 #[async_trait]
-impl Sandbox for CancelOnRead {
-    fn root(&self) -> &Path {
-        self.inner.root()
-    }
-    fn resolve(&self, p: &Path) -> Result<PathBuf, SandboxError> {
-        self.inner.resolve(p)
+impl Delegate for CancelOnRead {
+    fn inner(&self) -> &LocalSandbox {
+        &self.inner
     }
     async fn read(&self, p: &Path) -> Result<Vec<u8>, SandboxError> {
         if p.ends_with(self.trigger) {
             self.token.cancel();
         }
         self.inner.read(p).await
-    }
-    async fn metadata(&self, p: &Path) -> Result<FileMeta, SandboxError> {
-        self.inner.metadata(p).await
-    }
-    async fn write_atomic(
-        &self,
-        p: &Path,
-        bytes: &[u8],
-        mode: Option<u32>,
-    ) -> Result<(), SandboxError> {
-        self.inner.write_atomic(p, bytes, mode).await
-    }
-    async fn remove_file(&self, p: &Path) -> Result<(), SandboxError> {
-        self.inner.remove_file(p).await
-    }
-    async fn spill(&self, bytes: &[u8]) -> Result<PathBuf, SandboxError> {
-        self.inner.spill(bytes).await
-    }
-    async fn spawn(&self, spec: SpawnSpec) -> Result<Child, SandboxError> {
-        self.inner.spawn(spec).await
-    }
-    fn walker(&self, base: &Path) -> Result<ignore::WalkBuilder, SandboxError> {
-        self.inner.walker(base)
-    }
-    async fn http_get(&self, url: &Url) -> Result<HttpResponse, SandboxError> {
-        self.inner.http_get(url).await
     }
 }
 
@@ -596,11 +565,11 @@ async fn cancelled_batched_read_commits_no_baselines() {
         e.put(f, "one\ntwo\n").await;
     }
     let token = CancellationToken::new();
-    let sb = CancelOnRead {
+    let sb = Delegating(CancelOnRead {
         inner: LocalSandbox::new(e.dir.path().to_path_buf()).unwrap(),
         token: token.clone(),
         trigger: "b.txt",
-    };
+    });
     let cx = e.cx(1, EditFormat::StrReplace).with_cancel(token);
     let args = json!({"targets": [{"path": "a.txt"}, {"path": "b.txt"}, {"path": "c.txt"}]});
     let r = ReadTool.run(args, &sb, &cx).await;
@@ -737,11 +706,11 @@ async fn cancel_during_the_last_batch_target_commits_nothing() {
         e.put(f, "one\ntwo\n").await;
     }
     let token = CancellationToken::new();
-    let sb = CancelOnRead {
+    let sb = Delegating(CancelOnRead {
         inner: LocalSandbox::new(e.dir.path().to_path_buf()).unwrap(),
         token: token.clone(),
         trigger: "b.txt",
-    };
+    });
     let cx = e.cx(1, EditFormat::StrReplace).with_cancel(token);
     let args = json!({"targets": [{"path": "a.txt"}, {"path": "b.txt"}]});
     let r = ReadTool.run(args, &sb, &cx).await;
@@ -762,11 +731,11 @@ async fn cancelled_single_read_commits_nothing() {
     let e = env();
     e.put("a.txt", "one\ntwo\n").await;
     let token = CancellationToken::new();
-    let sb = CancelOnRead {
+    let sb = Delegating(CancelOnRead {
         inner: LocalSandbox::new(e.dir.path().to_path_buf()).unwrap(),
         token: token.clone(),
         trigger: "a.txt",
-    };
+    });
     let cx = e.cx(1, EditFormat::StrReplace).with_cancel(token);
     let r = ReadTool.run(json!({"path": "a.txt"}), &sb, &cx).await;
     assert!(r.is_error, "{}", r.output);

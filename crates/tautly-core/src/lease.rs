@@ -13,8 +13,7 @@
 
 use std::fs::{File, OpenOptions};
 use std::io;
-use std::os::fd::AsRawFd;
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
@@ -79,14 +78,7 @@ pub fn lock_path(data_home: &Path, root: &Path) -> PathBuf {
     ))
 }
 
-pub(crate) fn flock(file: &File, op: libc::c_int) -> io::Result<()> {
-    // SAFETY: flock on a file descriptor `file` owns; no memory is shared.
-    if unsafe { libc::flock(file.as_raw_fd(), op) } == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
-    }
-}
+pub(crate) use tautly_session::files::flock;
 
 fn would_block(e: &io::Error) -> bool {
     e.raw_os_error() == Some(libc::EWOULDBLOCK)
@@ -95,10 +87,7 @@ fn would_block(e: &io::Error) -> bool {
 /// The lock file at `path`, created owner-only with its directory.
 pub(crate) fn open(path: &Path) -> io::Result<File> {
     if let Some(dir) = path.parent() {
-        std::fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(dir)?;
+        tautly_session::paths::create_private_dir_all(dir)?;
     }
     OpenOptions::new()
         .read(true)
@@ -201,6 +190,8 @@ impl Lease {
 
 #[cfg(test)]
 mod tests {
+    use std::os::fd::AsRawFd;
+
     use super::*;
 
     #[test]
