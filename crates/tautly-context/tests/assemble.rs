@@ -222,7 +222,7 @@ fn system_prompt_has_no_volatile_text() {
 fn breakdown_sums_to_used() {
     let mut c = ctx();
     c.apply_op(ContextOp::Pin("pin me".into())).unwrap();
-    c.state.task = Some("fix bug".into());
+    c.state.decisions.push("fix bug".into());
     c.history.push(turn("a fairly long user message to count"));
     let (_, st) = c.assemble(&caps(), &tools(), &m());
     let b = st.breakdown;
@@ -620,7 +620,7 @@ fn state_change_keeps_history_prefix_byte_identical() {
         ],
         1,
     );
-    c.state.task = Some("a different task".into());
+    c.state.decisions.push("a different task".into());
     let (b, _) = c.assemble(&caps(), &tools(), &m());
 
     let history_len = 3;
@@ -662,7 +662,7 @@ fn cache_breakpoint_precedes_state_tail() {
     );
     // State but no history: nothing to cache after the system prefix.
     let mut c = Context::default();
-    c.state.task = Some("t".into());
+    c.state.decisions.push("t".into());
     let (req, _) = c.assemble(&caps(), &[], &m());
     assert_eq!(req.messages.len(), 1);
     assert_eq!(req.cache_breakpoints, vec![CachePoint::AfterSystem]);
@@ -707,7 +707,7 @@ fn second_breakpoint_marks_previous_steps_last_message() {
     c.history.push(turn("start"));
     c.history.push(step("1"));
     c.history.push(step("2"));
-    c.state.task = Some("t".into());
+    c.state.decisions.push("t".into());
     // Messages: U A U A U (+ state tail). The previous request ended at index 2.
     let (req, _) = c.assemble(&caps(), &tools(), &m());
     assert_eq!(req.messages.len(), 6);
@@ -911,7 +911,7 @@ fn reasoning_counts_only_what_the_adapter_sends() {
 #[test]
 fn cached_prefix_is_everything_before_the_state_tail() {
     let mut c = ctx_with_history();
-    c.state.task = Some("a task".into());
+    c.state.decisions.push("a task".into());
     let (_, st) = c.assemble(&caps(), &tools(), &m());
     assert!(st.breakdown.state > 0);
     assert_eq!(st.cached_prefix, st.used - st.breakdown.state);
