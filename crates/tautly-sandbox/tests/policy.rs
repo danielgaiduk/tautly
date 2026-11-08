@@ -1737,6 +1737,11 @@ fn deny_rules_catch_more_spellings() {
         "rm --force -r src",
         "/bin/rm -fr src",
         "sudo rm -fr src",
+        // Any number of flags, in any order (CP5 re-review N2).
+        "rm -vdRrf src",
+        "rm -vdxPrf src",
+        "rm -v -d -x -P -r -f src",
+        "rm --no-preserve-root -vdrf /",
     ] {
         assert!(
             matches!(pol.decide("bash", &sh, Some(raw)), Decision::Deny { .. }),
@@ -1757,8 +1762,24 @@ fn deny_rules_catch_more_spellings() {
         "git --no-pager log",
         "rm -f a.o",
         "rm -r build",
+        "rm -vdxP build",
     ] {
         assert_eq!(pol.decide("bash", &sh, Some(raw)), Decision::Allow, "{raw}");
+    }
+    // A flag word without `*` names exactly those flags; what follows still matches.
+    let exact = with_rules(Mode::Yolo, &[], &["bash(rm -rf /)"]);
+    for raw in ["rm -fr /", "rm -r -f /", "rm -f --recursive /"] {
+        assert!(
+            matches!(exact.decide("bash", &sh, Some(raw)), Decision::Deny { .. }),
+            "{raw}"
+        );
+    }
+    for raw in ["rm -rfv /", "rm -fr /tmp"] {
+        assert_eq!(
+            exact.decide("bash", &sh, Some(raw)),
+            Decision::Allow,
+            "{raw}"
+        );
     }
 }
 
