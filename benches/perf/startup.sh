@@ -52,7 +52,8 @@ if command -v hyperfine >/dev/null; then
   # Quoted: -N splits the command as a shell would, and the paths may hold spaces.
   for b in "${bins[@]}"; do cmds+=("'$b' --version"); done
   hyperfine -N --warmup 5 --runs $RUNS --export-json "$OUT/version.json" "${cmds[@]}"
-  version=$(python3 -c 'import json,sys; print(" ".join(str(r["median"]) for r in json.load(open(sys.argv[1]))["results"]))' "$OUT/version.json")
+  # hyperfine 1.x puts "median" on each result; 2.x moved it to summary.time_wall_clock.
+  version=$(python3 -c 'import json,sys; print(" ".join(str(r["median"] if "median" in r else r["summary"]["time_wall_clock"]["median"]) for r in json.load(open(sys.argv[1]))["results"]))' "$OUT/version.json")
 else
   # shortcut: without hyperfine (local runs), python times the same 40 runs; CI installs hyperfine.
   echo "hyperfine not found: timing --version with python3" >&2

@@ -37,7 +37,11 @@ fn config() -> Config {
 
 /// The first `git` on `PATH`.
 fn real_git() -> PathBuf {
-    let path = std::env::var_os("PATH").unwrap();
+    // Under PATH_LOCK: another test may have PATH on a shim `git` it deletes afterwards.
+    let path = {
+        let _alone = PATH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::var_os("PATH").unwrap()
+    };
     std::env::split_paths(&path)
         .map(|d| d.join("git"))
         .find(|p| p.is_file())

@@ -120,38 +120,49 @@ async fn session_load_of_a_large_log_keeps_rss_bounded() {
     while events.recv().await.is_some() {}
     let size = std::fs::metadata(&log).unwrap().len();
 
-    let out = std::process::Command::new(std::env::current_exe().unwrap())
-        .args(["load_probe", "--exact", "--ignored", "--nocapture"])
-        .env(
-            PROBE,
-            format!("{}\n{}\n{id}", root.display(), home.path().display()),
-        )
-        .output()
-        .unwrap();
-    let text = String::from_utf8_lossy(&out.stdout);
-    assert!(
-        out.status.success(),
-        "{text}{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let field = |name: &str| -> u64 {
-        text.lines()
-            .find_map(|l| l.strip_prefix(name))
-            .and_then(|n| n.trim().parse().ok())
-            .unwrap_or_else(|| panic!("no {name} in {text}"))
+    // (grown RSS, updates) of one load in a fresh process; `arenas` caps glibc's malloc
+    // arenas (ignored by other allocators, as on macOS).
+    let probe = |arenas: Option<&str>| -> (u64, u64) {
+        let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
+        cmd.args(["load_probe", "--exact", "--ignored", "--nocapture"])
+            .env(
+                PROBE,
+                format!("{}\n{}\n{id}", root.display(), home.path().display()),
+            );
+        if let Some(n) = arenas {
+            cmd.env("MALLOC_ARENA_MAX", n);
+        }
+        let out = cmd.output().unwrap();
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success(),
+            "{text}{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let field = |name: &str| -> u64 {
+            text.lines()
+                .find_map(|l| l.strip_prefix(name))
+                .and_then(|n| n.trim().parse().ok())
+                .unwrap_or_else(|| panic!("no {name} in {text}"))
+        };
+        (field("load grew RSS by "), field("updates "))
     };
-    let (grown, updates) = (field("load grew RSS by "), field("updates "));
+    let (grown, updates) = probe(None);
+    let (capped, _) = probe(Some("2"));
     report(&format!(
-        "acp: session/load of a {} MB log ({turns} turns), {updates} updates, RSS grew by {:.1} MB",
+        "acp: session/load of a {} MB log ({turns} turns), {updates} updates, RSS grew by {:.1} MB ({:.1} MB with MALLOC_ARENA_MAX=2)",
         size / MB,
-        grown as f64 / MB as f64
+        grown as f64 / MB as f64,
+        capped as f64 / MB as f64
     ));
     assert!(
         updates as usize >= turns,
         "{updates} updates for {turns} turns"
     );
-    // Streaming holds a bounded window of updates, not the history.
-    assert!(grown < 64 * MB, "{grown}");
+    // Streaming holds a bounded window of updates, not the history. Gated with glibc's
+    // arenas capped: uncapped, CI's Linux grew 165 MB where macOS grew 24 MB with the same
+    // code, which points at per-thread arenas keeping freed 256 KiB answers resident.
+    assert!(capped < 64 * MB, "{capped}");
 }
 
 /// Run as a child process by the gate: loads the session it names over ACP and prints
