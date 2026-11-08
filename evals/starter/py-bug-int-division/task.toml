@@ -1,0 +1,6 @@
+id = "py-bug-int-division"
+prompt = "`average` in stats.py truncates: average([1, 2]) gives 1 instead of 1.5. Fix it; the average of an empty list should stay 0.0."
+timeout_s = 600
+budget_usd = 1.0
+tags = ["python", "bug"]
+approve = "yolo"

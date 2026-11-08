@@ -95,6 +95,7 @@ fn every_event() -> Vec<Event> {
                 exit_code: Some(1),
                 error_kind: Some("stale".into()),
                 saved: None,
+                repair: None,
             },
             diff: Some(DiffPreview {
                 unified: "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1 @@\n-a\n+b\n".into(),
@@ -805,6 +806,7 @@ fn tool_meta_view_copies_meta() {
             exit_code: Some(2),
             error_kind: Some("not_found".into()),
             saved: None,
+            repair: None,
         }
     );
     assert_eq!(

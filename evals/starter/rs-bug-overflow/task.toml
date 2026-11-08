@@ -1,0 +1,6 @@
+id = "rs-bug-overflow"
+prompt = "`mean` in src/lib.rs panics with an overflow for inputs like [200, 200]. Fix it so it returns the mean of any byte slice (0.0 for an empty one)."
+timeout_s = 600
+budget_usd = 1.0
+tags = ["rust", "bug"]
+approve = "yolo"

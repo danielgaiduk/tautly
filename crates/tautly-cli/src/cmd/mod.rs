@@ -1,7 +1,7 @@
 //! The utility commands (`tautly prompt|sessions|models|fork|undo|memory|index|mcp|stats|
-//! receipt|compare ...`): each reads or changes what a session leaves behind, in the work
+//! receipt|compare|eval ...`): each reads or changes what a session leaves behind, in the work
 //! tree of the current directory, without a model turn (`memory consolidate` and `fork
-//! --prompt` aside).
+//! --prompt` aside; `eval` runs tasks in temporary work trees of their own).
 //!
 //! Output goes to stdout, problems to stderr; the exit code is 0, or 1 when the command
 //! failed (a refused undo, an unknown session, ...). Usage errors exit 2, as clap does.
@@ -10,6 +10,7 @@ pub mod auth;
 mod bisect;
 mod compare;
 pub mod doctor;
+mod eval;
 mod fork;
 mod index;
 mod mcp;
@@ -81,10 +82,18 @@ pub enum Command {
     /// Find the step at which a check started failing, by running it on past states in a
     /// temporary worktree.
     Bisect(bisect::Args),
+    /// Run eval tasks headless, each in a temporary work tree, and report pass rate, cost and
+    /// tokens as JSON; `eval report` prints the benchmark table of results files.
+    Eval(eval::Args),
 }
 
 /// Run `command`; the exit code.
 pub async fn run(command: Command, cli: &Cli) -> anyhow::Result<i32> {
+    // Eval works in work trees of its own, never the current directory's.
+    let command = match command {
+        Command::Eval(args) => return eval::run(args, cli).await,
+        other => other,
+    };
     let env = Env::new()?;
     match command {
         Command::Prompt { cmd } => prompt::run(cmd, &env),
@@ -100,6 +109,7 @@ pub async fn run(command: Command, cli: &Cli) -> anyhow::Result<i32> {
         Command::Compare(args) => compare::run(args, &env),
         Command::Replay(args) => replay::run(args, &env).await,
         Command::Bisect(args) => bisect::run(args, &env, cli).await,
+        Command::Eval(_) => unreachable!("handled above"),
     }
 }
 

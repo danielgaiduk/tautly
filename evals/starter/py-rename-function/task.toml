@@ -1,0 +1,6 @@
+id = "py-rename-function"
+prompt = "Rename the function `calc` in billing.py to `calculate_total` and update every caller. The old name must be gone."
+timeout_s = 600
+budget_usd = 1.0
+tags = ["python", "refactor"]
+approve = "yolo"

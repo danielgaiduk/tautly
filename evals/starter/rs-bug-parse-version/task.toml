@@ -1,0 +1,6 @@
+id = "rs-bug-parse-version"
+prompt = "`parse_version(\"1.2.3\")` in src/lib.rs returns None. Fix it to parse `MAJOR.MINOR.PATCH` (and still return None for anything else)."
+timeout_s = 600
+budget_usd = 1.0
+tags = ["rust", "bug"]
+approve = "yolo"

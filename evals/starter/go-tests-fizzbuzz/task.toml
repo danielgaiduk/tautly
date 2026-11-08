@@ -1,0 +1,6 @@
+id = "go-tests-fizzbuzz"
+prompt = "Write tests for `FizzBuzz` in fizzbuzz.go in a new file fizzbuzz_test.go. Cover plain numbers, multiples of 3, of 5 and of 15."
+timeout_s = 600
+budget_usd = 1.0
+tags = ["go", "tests"]
+approve = "yolo"

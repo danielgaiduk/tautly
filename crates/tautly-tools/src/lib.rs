@@ -131,6 +131,12 @@ pub struct ToolMeta {
     /// (spec 7.11.1): an estimate the engine sums into the turn's receipt.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub saved: Option<Saved>,
+    /// The stage that located a repaired edit, persisted as its
+    /// [`name`](crate::edit::tolerant::RepairStage::name); none for an exact match and for
+    /// every other tool. Absent in older logs; a name this version does not know reads as
+    /// none. (The stage itself, not its name, keeps `ToolResult` within 128 bytes.)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repair: Option<crate::edit::tolerant::RepairStage>,
 }
 
 /// Which mechanism a [`Saved`] estimate credits.

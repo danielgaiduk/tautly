@@ -1,0 +1,6 @@
+id = "py-multi-rename-config-key"
+prompt = "Rename the configuration key `db_url` to `database_url` everywhere: defaults.py, loader.py and db.py. Keep accepting `db_url` in loader input as a deprecated alias."
+timeout_s = 600
+budget_usd = 1.0
+tags = ["python", "multi-file"]
+approve = "yolo"

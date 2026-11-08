@@ -1,0 +1,166 @@
+[
+ [
+  {
+   "tool_call": {
+    "id": "c0",
+    "name": "read",
+    "input_json": "{\"path\": \"models.py\"}"
+   }
+  },
+  {
+   "done": {
+    "stop": "tool_use"
+   }
+  }
+ ],
+ [
+  {
+   "tool_call": {
+    "id": "c1",
+    "name": "read",
+    "input_json": "{\"path\": \"serialize.py\"}"
+   }
+  },
+  {
+   "done": {
+    "stop": "tool_use"
+   }
+  }
+ ],
+ [
+  {
+   "tool_call": {
+    "id": "c2",
+    "name": "read",
+    "input_json": "{\"path\": \"validate.py\"}"
+   }
+  },
+  {
+   "done": {
+    "stop": "tool_use"
+   }
+  }
+ ],
+ [
+  {
+   "tool_call": {
+    "id": "c3",
+    "name": "outline",
+    "input_json": "{\"path\": \"models.py\"}"
+   }
+  },
+  {
+   "done": {
+    "stop": "tool_use"
+   }
+  }
+ ],
+ [
+  {
+   "tool_call": {
+    "id": "c4",
+    "name": "symbol",
+    "input_json": "{\"name\": \"User\"}"
+   }
+  },
+  {
+   "done": {
+    "stop": "tool_use"
+   }
+  }
+ ],
+ [
+  {
+   "tool_call": {
+    "id": "c5",
+    "name": "edit",
+    "input_json": "{\"path\": \"models.py\", \"old_text\": \"    name: str\", \"new_text\": \"    name: str\\n    email: str\"}"
+   }
+  },
+  {
+   "done": {
+    "stop": "tool_use"
+   }
+  }
+ ],
+ [
+  {
+   "tool_call": {
+    "id": "c6",
+    "name": "edit",
+    "input_json": "{\"path\": \"serialize.py\", \"old_text\": \"    return {\\\"name\\\": user.name}\", \"new_text\": \"    return {\\\"name\\\": user.name, \\\"email\\\": user.email}\"}"
+   }
+  },
+  {
+   "done": {
+    "stop": "tool_use"
+   }
+  }
+ ],
+ [
+  {
+   "tool_call": {
+    "id": "c7",
+    "name": "edit",
+    "input_json": "{\"path\": \"validate.py\", \"old_text\": \"        raise ValueError(\\\"name is required\\\")\", \"new_text\": \"        raise ValueError(\\\"name is required\\\")\\n    if \\\"@\\\" not in user.email:\\n        raise ValueError(\\\"email is not valid\\\")\"}"
+   }
+  },
+  {
+   "done": {
+    "stop": "tool_use"
+   }
+  }
+ ],
+ [
+  {
+   "tool_call": {
+    "id": "c8",
+    "name": "read",
+    "input_json": "{\"path\": \"models.py\"}"
+   }
+  },
+  {
+   "done": {
+    "stop": "tool_use"
+   }
+  }
+ ],
+ [
+  {
+   "tool_call": {
+    "id": "c9",
+    "name": "bash",
+    "input_json": "{\"command\": \"python3 -m unittest -q test_user\"}"
+   }
+  },
+  {
+   "done": {
+    "stop": "tool_use"
+   }
+  }
+ ],
+ [
+  {
+   "tool_call": {
+    "id": "c10",
+    "name": "recall",
+    "input_json": "{\"query\": \"how are tests run in this repository\"}"
+   }
+  },
+  {
+   "done": {
+    "stop": "tool_use"
+   }
+  }
+ ],
+ [
+  {
+   "text_delta": "Done: the change is made and the tests pass."
+  },
+  {
+   "done": {
+    "stop": "end_turn"
+   }
+  }
+ ]
+]

@@ -1,0 +1,6 @@
+id = "ts-tests-parse-duration"
+prompt = "Write tests for `parseDuration` in src/duration.ts in a new file test/duration.test.ts (node:test). Cover seconds, minutes, hours, combined forms like \"1h30m\" and invalid input throwing."
+timeout_s = 600
+budget_usd = 1.0
+tags = ["typescript", "tests"]
+approve = "yolo"
