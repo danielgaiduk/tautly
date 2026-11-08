@@ -592,9 +592,19 @@ async fn explicit_path_into_hidden_or_ignored_directory_matches_the_walker() {
 #[tokio::test]
 async fn stale_index_sends_grep_glob_and_find_to_the_walker_until_refreshed() {
     let e = repo(common::Built::Full).await;
-    e.index.mark_stale();
-    // Created behind the index's back, right after the mark.
     e.put("fresh/made.txt", b"needle from the shell\n").await;
+    // The watcher handles the new file with a refresh of its own (the tree has a link),
+    // which would clear a mark set before it finished. Wait for its signal (a cookie
+    // written after the file comes back only once the file's events are processed), then
+    // mark: with no change pending, nothing but the refresh below clears the mark.
+    e.index.mark_stale();
+    e.index
+        .refresh_stale_in_background()
+        .unwrap()
+        .await
+        .unwrap();
+    assert!(!e.index.is_stale());
+    e.index.mark_stale();
 
     e.sb.reset();
     let r = e.run(&GlobTool, json!({"pattern": "*.txt"})).await;
