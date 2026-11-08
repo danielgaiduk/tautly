@@ -630,3 +630,69 @@ async fn repository_headers_are_sent_literally_user_headers_expanded() {
     hub.shutdown().await;
     let _ = server.kill().await;
 }
+
+/// quality Q1: a server may not ask for the workspace roots or prompt the user: both
+/// requests are answered "method not found", and the server is still used.
+#[tokio::test]
+async fn server_requests_for_roots_and_elicitation_are_refused() {
+    let s = setup();
+    let replies = s.sb.root().join("replies");
+    let env = replies.to_string_lossy().into_owned();
+    let hub = hub(
+        &s,
+        vec![("ask", stdio("ask", &[("ECHO_REPLIES", &env)]))],
+        &McpConfig::default(),
+    )
+    .await;
+    let deadline = Instant::now() + WAIT;
+    let lines = loop {
+        let text = std::fs::read_to_string(&replies).unwrap_or_default();
+        let lines: Vec<Value> = text
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        if lines.len() == 2 || Instant::now() > deadline {
+            break lines;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    let mut ids: Vec<&str> = lines.iter().map(|l| l["id"].as_str().unwrap()).collect();
+    ids.sort_unstable();
+    assert_eq!(ids, ["r1", "r2"], "{lines:?}");
+    for l in &lines {
+        assert_eq!(l["error"]["code"], -32601, "{l}");
+        assert!(l.get("result").is_none(), "{l}");
+    }
+    let r = call(&s, &find(&hub, "mcp__ask__echo"), json!({"text": "still"})).await;
+    assert_eq!(r.output, "still");
+    hub.shutdown().await;
+}
+
+/// quality Q1: a server that exits during its handshake fails, and the process group it
+/// started goes with it (no shutdown needed).
+#[tokio::test]
+async fn a_server_dying_in_its_handshake_fails_and_leaves_no_process() {
+    let s = setup();
+    let pid_file = s.sb.root().join("pids");
+    let pid_env = pid_file.to_string_lossy().into_owned();
+    let hub = hub(
+        &s,
+        vec![("dies", stdio("die", &[("ECHO_PID_FILE", &pid_env)]))],
+        &McpConfig::default(),
+    )
+    .await;
+    let pids: Vec<i32> = wait_for_file(&pid_file)
+        .await
+        .lines()
+        .map(|l| l.parse().unwrap())
+        .collect();
+    let status = &hub.status()[0];
+    assert_eq!(status.state, McpState::Failed, "{status:?}");
+    let end = Instant::now() + Duration::from_secs(5);
+    while pids.iter().any(|&p| alive(p)) && Instant::now() < end {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(!pids.iter().any(|&p| alive(p)), "{pids:?} still running");
+    assert!(hub.ready_tools().is_empty());
+    hub.shutdown().await;
+}

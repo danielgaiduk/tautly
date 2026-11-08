@@ -1477,3 +1477,74 @@ fn the_cli_reasoning_flag_wins_over_a_project() {
     };
     assert_eq!(f.load(cli).unwrap().reasoning, ReasoningLevel::High);
 }
+
+/// quality Q1: malformed `mcp.servers` in a repository's config are ignored with a
+/// warning (capped), never fatal and never in effect.
+#[test]
+fn malformed_project_mcp_servers_are_ignored_with_bounded_warnings() {
+    let f = Fixture::new();
+    f.project("[mcp]\nservers = \"x\"\n");
+    let loaded = f.load_full(CliOverrides::default()).unwrap();
+    assert!(loaded.config.project_mcp_servers.is_empty());
+    assert!(
+        loaded
+            .warnings
+            .iter()
+            .any(|w| w.contains("ignored `mcp.servers`: not a table")),
+        "{:?}",
+        loaded.warnings
+    );
+
+    let mut text = String::from("[mcp.servers.good]\ncommand = \"srv\"\n");
+    for i in 0..50 {
+        text.push_str(&format!(
+            "[mcp.servers.bad{i:02}]\nargs = [\"no command\"]\n"
+        ));
+    }
+    f.project(&text);
+    let loaded = f.load_full(CliOverrides::default()).unwrap();
+    let names: Vec<&String> = loaded.config.project_mcp_servers.keys().collect();
+    assert_eq!(names, ["good"]);
+    let one_each = loaded
+        .warnings
+        .iter()
+        .filter(|w| w.contains("ignored `mcp.servers.bad"))
+        .count();
+    assert_eq!(one_each, 20, "{:?}", loaded.warnings);
+    assert!(
+        loaded
+            .warnings
+            .iter()
+            .any(|w| w.contains("and 30 more ignored MCP servers")),
+        "{:?}",
+        loaded.warnings
+    );
+}
+
+/// quality Q1: a store that only reads refuses to store, as "unavailable" (so callers
+/// point at the environment variable), never silently.
+#[test]
+fn a_read_only_secret_store_refuses_to_store() {
+    struct ReadOnly;
+    impl tautly_core::SecretStore for ReadOnly {
+        fn get(&self, _: &str, _: &str) -> Result<Option<String>, tautly_core::AuthError> {
+            Ok(Some("stored".into()))
+        }
+    }
+    use tautly_core::SecretStore as _;
+    match ReadOnly.set("tautly", "anthropic", "k") {
+        Err(tautly_core::AuthError::KeychainUnavailable(why)) => {
+            assert!(why.contains("read-only"), "{why}");
+        }
+        other => panic!("{other:?}"),
+    }
+    let key = api_key_with(
+        "anthropic",
+        &ProviderEntry::default(),
+        &env_of(&[]),
+        &ReadOnly,
+    )
+    .unwrap()
+    .key;
+    assert_eq!(key.as_deref(), Some("stored"));
+}

@@ -125,3 +125,25 @@ fn auth_add_without_a_keychain_points_at_the_env_variable() {
         assert!(err.contains(var), "{provider}: {err}");
     }
 }
+
+/// quality Q1: a keychain that fails (not merely absent) is reported as such, the exit is
+/// non-zero, and the key is never printed.
+#[test]
+fn auth_add_reports_a_failing_keychain_without_the_key() {
+    let s = Scratch::new();
+    let key = "sk-secret-NEVER-PRINT-5151";
+    std::fs::write(s.store_path(), "{ not json").unwrap();
+    let out = s.run_with_stdin(
+        &mut s.command(&["auth", "add", "anthropic", "--stdin"]),
+        &format!("{key}\n"),
+    );
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    let err = stderr(&out);
+    assert!(err.contains("keychain: test secret store"), "{err}");
+    assert!(!err.contains("no keychain available"), "{err}");
+    assert!(!stdout(&out).contains("NEVER") && !err.contains("NEVER"));
+    assert_eq!(
+        std::fs::read_to_string(s.store_path()).unwrap(),
+        "{ not json"
+    );
+}

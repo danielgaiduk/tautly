@@ -2358,3 +2358,38 @@ async fn undo_of_an_early_turn_names_the_later_turns_that_changed_its_files() {
     );
     assert_eq!(repo.read("other.txt").as_deref(), Some("human\n"));
 }
+
+/// quality Q1: a session whose log another process holds (a running engine) is never
+/// deleted.
+#[tokio::test]
+async fn sessions_delete_refuses_a_session_whose_log_is_held() {
+    let repo = Repo::with(&[("a.txt", "a\n")]);
+    let mock = MockProvider::new(vec![text_step("done")]);
+    let mut run = start(repo.builder(config(), &mock));
+    run.turn_with("hi").await;
+    let (id, path) = run.engine.current_session();
+    run.stop().await;
+    let held = std::fs::File::open(&path).unwrap();
+    // SAFETY: flock on a descriptor this test owns.
+    assert_eq!(
+        unsafe { libc::flock(std::os::fd::AsRawFd::as_raw_fd(&held), libc::LOCK_EX) },
+        0
+    );
+    let sb = repo.sandbox();
+    let refused = sessions::delete(repo.home.path(), sb.as_ref(), &id).await;
+    assert!(
+        matches!(&refused, Err(sessions::DeleteError::Running(r)) if *r == id),
+        "{refused:?}"
+    );
+    assert!(path.exists());
+    assert!(
+        !repo
+            .refs(&format!("refs/tautly/checkpoints/{id}/"))
+            .is_empty()
+    );
+    drop(held);
+    sessions::delete(repo.home.path(), sb.as_ref(), &id)
+        .await
+        .unwrap();
+    assert!(!path.exists());
+}

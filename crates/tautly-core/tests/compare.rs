@@ -939,3 +939,34 @@ fn an_unreadable_ancestor_log_falls_back_to_the_branch_copy() {
         Some((a.id.clone(), 4))
     );
 }
+
+/// quality Q1: a file whose content is gone from the blob store is named in a note and
+/// left out of the line counts; the other files still count.
+#[test]
+fn a_blob_missing_from_the_store_is_noted_and_the_rest_still_counts() {
+    let h = Home::new();
+    let (p, last) = parent(&h);
+    let mut a = h.fork(&p, last, "a");
+    a.turn(10_000, 2, "a");
+    a.request(10_100, 2, 4, "m/a");
+    a.edit(10_200, 4, "kept.txt", None, Some("x\ny\n"));
+    a.edit(10_300, 4, "lost.txt", None, Some("only here, then lost\n"));
+    a.end(11_000, None);
+    let a = a.done();
+    let hex = blake3::hash(b"only here, then lost\n").to_hex().to_string();
+    let (head, rest) = hex.split_at(2);
+    let blob = a.path.parent().unwrap().join("blobs").join(head).join(rest);
+    std::fs::remove_file(&blob).unwrap();
+
+    let s = sum(&a.reader(), Some(2));
+    assert_eq!((s.added, s.removed), (2, 0), "{s:?}");
+    assert!(
+        s.notes.iter().any(|n| n.contains(
+            "the content of 1 file is missing from the session's blob store; its lines are not counted"
+        )),
+        "{:?}",
+        s.notes
+    );
+    let files: Vec<&String> = s.files.iter().collect();
+    assert_eq!(files, ["kept.txt", "lost.txt"]);
+}

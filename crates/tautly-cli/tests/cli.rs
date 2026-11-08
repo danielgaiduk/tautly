@@ -681,3 +681,60 @@ fn mcp_import_refuses_what_is_not_mcp_json() {
     assert!(stderr(&out).contains("bad.json"), "{}", stderr(&out));
     assert!(!s.config().exists());
 }
+
+/// quality Q1: `sessions restore-backup` says what it would put back and, without a
+/// terminal to ask at, changes nothing unless given `--yes`.
+#[test]
+fn restore_backup_needs_yes_without_a_terminal() {
+    use tautly_core::SessionRecord;
+    use tautly_core::record::{BackupFile, RestoreBy, Wrote};
+    use tautly_session::{HeaderInit, RelPath, SessionWriter};
+    let s = Scratch::new();
+    let root = s.work.path().canonicalize().unwrap();
+    std::fs::write(root.join("a.txt"), "restored\n").unwrap();
+    // A rewind cut off after its write: what a.txt held before is kept in the log.
+    let id = {
+        let mut w =
+            SessionWriter::<SessionRecord>::create_in(s.home.path(), &root, HeaderInit::default())
+                .unwrap();
+        let before = w.blob(b"mine\n").unwrap();
+        let wrote = w.blob(b"restored\n").unwrap();
+        let path = RelPath::from_abs(&root, &root.join("a.txt")).unwrap();
+        w.append(&SessionRecord::RestoreBegun {
+            backup_ref: None,
+            files: vec![BackupFile {
+                path: path.clone(),
+                existed: true,
+                from_blob: Some(before),
+                from_mode: Some(0o644),
+                to: Some(Wrote::Blob(wrote)),
+                to_mode: Some(0o644),
+            }],
+            paths: vec![path],
+            by: RestoreBy::Rewind,
+        })
+        .unwrap();
+        w.checkpoint().unwrap();
+        w.session_id().to_string()
+    };
+    let out = s.run(&["sessions", "restore-backup", &id]);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    let said = stdout(&out);
+    assert!(said.contains("would put back: a.txt"), "{said}");
+    assert!(
+        said.contains("nothing was changed: run it again with --yes to put these back"),
+        "{said}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("a.txt")).unwrap(),
+        "restored\n"
+    );
+
+    let out = s.run(&["sessions", "restore-backup", &id, "--yes"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert!(stdout(&out).contains("put back: a.txt"), "{}", stdout(&out));
+    assert_eq!(
+        std::fs::read_to_string(root.join("a.txt")).unwrap(),
+        "mine\n"
+    );
+}

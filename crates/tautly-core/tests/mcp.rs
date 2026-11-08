@@ -1650,3 +1650,54 @@ async fn a_resumed_session_whose_mcp_tools_are_gone_warns_once_at_its_first_requ
     };
     assert_eq!((differ(&two), differ(&three)), (1, 0), "{two:?}");
 }
+
+/// quality Q1: approvals that cannot be read approve nothing (a remembered server asks
+/// again), and an approval that cannot be saved holds for this session only, said so.
+#[tokio::test]
+async fn unreadable_approvals_fail_closed_and_unsaved_ones_last_one_session() {
+    use tautly_core::{Approval, plan_servers};
+    let fx = Fx::new();
+    fx.project_server("echo", &[]);
+    let (cfg, _) = fx.loaded(Mode::Ask);
+    let k = key(&fx.root(), "echo", &cfg.project_mcp_servers["echo"]);
+    fx.approvals().approve(&k, &fx.root(), "echo").unwrap();
+    // The approvals file is replaced by a directory: it cannot be read or written.
+    let file = fx.home.path().join(APPROVALS_FILE);
+    std::fs::remove_file(&file).unwrap();
+    std::fs::create_dir(&file).unwrap();
+    let sb = tautly_sandbox::LocalSandbox::new(fx.root()).unwrap();
+    let plan = plan_servers(
+        &cfg.mcp,
+        &cfg.project_mcp_servers,
+        &[],
+        false,
+        fx.home.path(),
+        &sb,
+    )
+    .await;
+    let echo = plan.servers.iter().find(|s| s.name == "echo").unwrap();
+    assert_eq!(echo.approval, Approval::Pending);
+
+    let mock = MockProvider::new(vec![]);
+    let mut run = start(EngineBuilder {
+        interactive: true,
+        ..fx.builder(cfg, &mock)
+    });
+    let events = run
+        .until(|e| matches!(e, Event::McpServerApprovalRequested { .. }))
+        .await;
+    let (request_id, _, _, _) = approval_request(&events).expect("asked again");
+    run.send(Command::Approve {
+        request_id,
+        session_rule: None,
+    })
+    .await;
+    let events = run.until_state("echo", McpState::Ready).await;
+    run.shutdown().await;
+    assert!(
+        events.iter().any(|e| matches!(e, Event::Warning { message }
+            if message.contains("could not be saved; it is approved for this session only"))),
+        "{events:?}"
+    );
+    assert!(file.is_dir());
+}

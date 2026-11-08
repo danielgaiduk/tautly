@@ -751,3 +751,43 @@ fn argv_that_can_drop_the_bytecode_prefix_is_never_remembered() {
         assert_eq!(k.key, approval_key(&repo, "s", spec).key, "{spec:?}");
     }
 }
+
+/// quality Q1: a launch file over the bounds, a directory with more entries than the file
+/// budget, or a FIFO named as the script can never be remembered: each start keys
+/// differently, so a stored approval never matches and the server is asked about again.
+#[test]
+fn launch_files_over_the_bounds_are_never_approvable() {
+    use tautly_mcp::approvals::approval_key;
+    let repo = tempfile::tempdir().unwrap();
+    let repo = repo.path().canonicalize().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    std::fs::write(repo.join("big.py"), "#".repeat(1024 * 1024 + 1)).unwrap();
+    std::fs::create_dir(repo.join("many")).unwrap();
+    for i in 0..4001 {
+        std::fs::write(repo.join(format!("many/{i}.js")), "").unwrap();
+    }
+    let fifo = std::ffi::CString::new(repo.join("pipe.py").as_os_str().as_encoded_bytes()).unwrap();
+    // SAFETY: mkfifo with a valid NUL-terminated path.
+    assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+    for spec in [
+        stdio("python3", &["big.py"], &[]),
+        stdio("node", &["many"], &[]),
+        stdio("python3", &["pipe.py"], &[]),
+    ] {
+        let first = approval_key(&repo, "s", &spec);
+        assert!(!first.rememberable, "{spec:?}");
+        let mut store = ApprovalStore::open(&data.path().join(APPROVALS_FILE));
+        store.approve(&first.key, &repo, "s").unwrap();
+        let again = approval_key(&repo, "s", &spec);
+        assert!(
+            !ApprovalStore::open(&data.path().join(APPROVALS_FILE)).is_approved(&again.key),
+            "{spec:?}"
+        );
+    }
+    // Within the bounds the same server is remembered.
+    std::fs::write(repo.join("big.py"), "print(1)\n").unwrap();
+    let spec = stdio("python3", &["big.py"], &[]);
+    let k = approval_key(&repo, "s", &spec);
+    assert!(k.rememberable);
+    assert_eq!(k.key, approval_key(&repo, "s", &spec).key);
+}
