@@ -30,6 +30,14 @@ pub struct WatchHandle {
     _watcher: RecommendedWatcher,
 }
 
+impl WatchHandle {
+    /// Tell the watcher thread to stop at once. Dropping the handle does this too, then
+    /// closes the OS watch, which can take seconds (it joins the OS event thread).
+    pub fn signal_stop(&self) {
+        self.stop.store(true, Ordering::Release);
+    }
+}
+
 impl Drop for WatchHandle {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
