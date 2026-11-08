@@ -1725,4 +1725,82 @@ mod tests {
         assert!(made.is_err());
         assert_eq!(logs(home.path()), Vec::<PathBuf>::new());
     }
+
+    /// Fuzzing (timetravel): rebuild ends a step at every record that starts the next
+    /// one's inputs (an epoch, a model switch, a fork, a late lost write), so a response
+    /// event after one lands in no step; the time-travel numbering must end the step there
+    /// too, or `state_at` knows a step `rebuild` does not.
+    #[test]
+    fn rebuild_and_time_travel_end_a_step_at_the_same_records() {
+        let blob = BlobRef::parse(&"a".repeat(64)).unwrap();
+        let closers = [
+            SessionRecord::Compaction {
+                removed: vec![blob.clone()],
+                summary: "s".into(),
+            },
+            SessionRecord::Forked,
+            SessionRecord::ModelSet {
+                model: ModelId::from("mock/m"),
+            },
+            SessionRecord::WritesLost {
+                paths: Vec::new(),
+                late: true,
+            },
+            SessionRecord::PinsFolded,
+        ];
+        for closer in closers {
+            // Step 2 gets a `Done` and no content (unanswered), then the closer, then text.
+            let mut recs = vec![SessionRecord::TurnStart {
+                turn: 1,
+                text: "go".into(),
+            }];
+            recs.extend(text_step(2));
+            recs.remove(2); // the text delta
+            recs.push(closer.clone());
+            recs.push(SessionRecord::Provider(
+                tautly_provider::ProviderEvent::TextDelta("late".into()),
+            ));
+            assert_same_last_step(&recs, &format!("after {closer:?}"));
+        }
+        // A `ToolCall` record answers nothing on its own: rebuild takes the calls from the
+        // response's events, and a step whose response put nothing into the history
+        // shares its number with the next.
+        let mut recs = vec![SessionRecord::TurnStart {
+            turn: 1,
+            text: "go".into(),
+        }];
+        recs.extend(text_step(2));
+        recs.remove(2);
+        recs.push(SessionRecord::ToolCall {
+            id: "c".into(),
+            name: "bash".into(),
+            args: serde_json::json!({}),
+            args_blob: None,
+        });
+        assert_same_last_step(&recs, "a lone ToolCall record");
+    }
+
+    /// `step_at_offset` at the end of a log of `recs` is the last step `rebuild` knows.
+    fn assert_same_last_step(recs: &[SessionRecord], what: &str) {
+        let home = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let mut w = SessionWriter::<SessionRecord>::create_in(
+            home.path(),
+            root.path(),
+            HeaderInit::default(),
+        )
+        .unwrap();
+        for r in recs {
+            w.append(r).unwrap();
+        }
+        w.checkpoint().unwrap();
+        let reader = SessionReader::<SessionRecord>::open(w.path()).unwrap();
+        let last = crate::timetravel::step_at_offset(&reader, u64::MAX);
+        match rebuild(&reader, Some(last + 1)) {
+            Err(ResumeError::NoSuchStep { last: rebuilt, .. }) => {
+                assert_eq!(rebuilt, last, "{what}")
+            }
+            other => panic!("{what}: {:?}", other.map(|_| ())),
+        }
+    }
 }
