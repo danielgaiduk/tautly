@@ -6,8 +6,11 @@
 //! statically is reported as [`Unparseable`].
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, mpsc};
+use std::time::Duration;
 
-use tree_sitter::{Node, Parser};
+use tree_sitter::{Node, Parser, Tree};
 
 use crate::runners::{base, reject_unanalyzable, runs_module};
 use crate::shell_state::{Cwd, unwrap_prefixes};
@@ -45,15 +48,19 @@ pub struct Unparseable(pub String);
 /// recursive walk far from the stack limit on crafted input.
 const MAX_DEPTH: usize = 256;
 
+/// Longest the grammar may take on one input (normal commands take microseconds). Its
+/// error recovery can run for minutes on a short crafted input, where no progress
+/// callback is consulted, so the parse runs on a worker thread that is abandoned at this
+/// deadline.
+const PARSE_DEADLINE: Duration = Duration::from_secs(2);
+
+/// An abandoned parse is still running. Every parse is refused until it ends, so at most
+/// one worker is ever stuck.
+static STUCK: AtomicBool = AtomicBool::new(false);
+
 /// Parse `src` into the flat list of simple commands it would run.
 pub fn parse_commands(src: &str) -> Result<Vec<SimpleCommand>, Unparseable> {
-    let mut parser = Parser::new();
-    parser
-        .set_language(&tree_sitter_bash::LANGUAGE.into())
-        .map_err(|e| Unparseable(format!("bash grammar unavailable: {e}")))?;
-    let tree = parser
-        .parse(src, None)
-        .ok_or_else(|| Unparseable("parser produced no tree".into()))?;
+    let tree = parse_tree(src)?;
     let root = tree.root_node();
     if root.has_error() {
         return Err(Unparseable(describe_error(root, src)));
@@ -72,6 +79,59 @@ pub fn parse_commands(src: &str) -> Result<Vec<SimpleCommand>, Unparseable> {
         }
     }
     Ok(out)
+}
+
+/// The grammar's tree of `src`, parsed on a worker thread within [`PARSE_DEADLINE`].
+fn parse_tree(src: &str) -> Result<Tree, Unparseable> {
+    if STUCK.load(Ordering::Acquire) {
+        return Err(Unparseable(
+            "an earlier command's parse is still running past its deadline".into(),
+        ));
+    }
+    let (tx, rx) = mpsc::sync_channel(1);
+    let owned = src.to_string();
+    // Set by the caller at the deadline: only an abandoned worker clears `STUCK`.
+    let abandoned = Arc::new(AtomicBool::new(false));
+    let mine = Arc::clone(&abandoned);
+    std::thread::Builder::new()
+        .name("shell-parse".into())
+        .spawn(move || {
+            let mut parser = Parser::new();
+            let tree = parser
+                .set_language(&tree_sitter_bash::LANGUAGE.into())
+                .map_err(|e| format!("bash grammar unavailable: {e}"))
+                .and_then(|()| {
+                    parser
+                        .parse(&owned, None)
+                        .ok_or_else(|| "parser produced no tree".to_string())
+                });
+            // Sent before `mine` is read: a caller that marks it abandoned afterwards
+            // still finds the tree (`try_recv` below) and clears `STUCK` itself.
+            let _ = tx.send(tree);
+            if mine.load(Ordering::SeqCst) {
+                STUCK.store(false, Ordering::Release);
+            }
+        })
+        .map_err(|e| Unparseable(format!("cannot start the shell parser: {e}")))?;
+    match rx.recv_timeout(PARSE_DEADLINE) {
+        Ok(tree) => tree.map_err(Unparseable),
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            STUCK.store(true, Ordering::Release);
+            abandoned.store(true, Ordering::SeqCst);
+            // It may have ended between the timeout and the stores.
+            if let Ok(tree) = rx.try_recv() {
+                STUCK.store(false, Ordering::Release);
+                return tree.map_err(Unparseable);
+            }
+            Err(Unparseable(format!(
+                "parsing took too long (over {} s): the input is too complex to analyze",
+                PARSE_DEADLINE.as_secs()
+            )))
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            Err(Unparseable("the shell parser stopped unexpectedly".into()))
+        }
+    }
 }
 
 /// Bash deletes a backslash-newline pair before tokenizing, so `.g\<nl>it` is the
