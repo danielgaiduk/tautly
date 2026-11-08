@@ -21,6 +21,7 @@ pub struct Deleted {
     pub worktree: Option<PathBuf>,
 }
 
+/// Why a session could not be deleted.
 #[derive(Debug, thiserror::Error)]
 pub enum DeleteError {
     #[error("no session {0} in this project")]
@@ -327,6 +328,7 @@ pub struct RestoreBackupOptions {
     pub include_own: bool,
 }
 
+/// Why a rewind or switch backup could not be restored.
 #[derive(Debug, thiserror::Error)]
 pub enum BackupError {
     #[error("no session {0} in this project")]

@@ -130,6 +130,7 @@ impl AttemptLedger {
         }
     }
 
+    /// The write generation: moves whenever files may have changed.
     pub fn generation(&self) -> u64 {
         self.generation
     }

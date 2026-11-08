@@ -37,6 +37,7 @@ pub enum BudgetState {
 }
 
 impl Budget {
+    /// Where this spend stands against the budget.
     pub fn check(&self, spent_usd: f64, spent_tokens: u64) -> BudgetState {
         let share = self.share(spent_usd, spent_tokens);
         if share >= 1.0 {

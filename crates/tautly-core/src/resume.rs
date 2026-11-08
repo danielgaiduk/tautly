@@ -135,6 +135,7 @@ pub(crate) struct LoggedCheckpoints {
     pub last: Option<(u32, String, String)>,
 }
 
+/// Why a session could not be rebuilt from its log.
 #[derive(Debug, thiserror::Error)]
 pub enum ResumeError {
     #[error("cannot read the session log: {0}")]
@@ -190,7 +191,7 @@ pub(crate) fn open(
     Ok(SessionWriter::<SessionRecord>::reopen(&found.path)?)
 }
 
-/// Why [`open`] failed.
+/// Why `open` failed.
 #[derive(Debug, thiserror::Error)]
 pub enum OpenError {
     #[error("no session {0} ran in this work tree")]

@@ -51,6 +51,7 @@ use crate::timetravel::{FileState, TtError, copy_count, state_at, step_at_offset
 /// What a state without a checkpoint is refused with, when it has no note of its own.
 const NOTE_NO_BASE: &str = "no checkpoint follows that step";
 
+/// Why a worktree fork failed.
 #[derive(Debug, thiserror::Error)]
 pub enum WtError {
     #[error("a worktree fork needs a git work tree: {0}")]

@@ -10,7 +10,7 @@
 //!
 //! A side model that fails for good falls back to the main model for the rest of the
 //! session (`Session::side_to_main`). A `SetModel` resolves the side route again for the
-//! new main model ([`Side::resolve_with`]), which also ends such a fallback: an explicit
+//! new main model (`Side::resolve_with`), which also ends such a fallback: an explicit
 //! switch is a fresh start, and a side model that still fails falls back again, with its
 //! one warning.
 
@@ -89,8 +89,8 @@ pub(crate) fn model_failed(e: &ProviderError) -> bool {
 const WINDOW_RESERVE_TOKENS: u32 = 2_500;
 
 /// A [`SideModel`] backed by a provider. Every request's usage goes to `usage`; a request
-/// that fails with [`model_failed`] is remembered for the session
-/// ([`Side::take_failure`]).
+/// that fails with `model_failed` is remembered for the session
+/// (`Side::take_failure`).
 ///
 /// Usage can be under-reported: a request that fails before any content arrives reports
 /// nothing, even if the provider billed for it.

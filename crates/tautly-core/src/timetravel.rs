@@ -134,6 +134,7 @@ impl FileState {
     }
 }
 
+/// Why a time-travel command (rewind, switch, state at a step) failed.
 #[derive(Debug, thiserror::Error)]
 pub enum TtError {
     #[error("cannot read or write the session log: {0}")]

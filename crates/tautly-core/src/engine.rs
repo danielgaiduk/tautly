@@ -20,7 +20,7 @@
 //! group the session's commands left behind is terminated.
 //!
 //! A resumed session (`EngineBuilder::resume`) starts from its log, rebuilt by
-//! [`resume`](crate::resume) in the actor before it takes commands (the model of its last
+//! [`resume`] in the actor before it takes commands (the model of its last
 //! `ModelSet`, and the `ModelSet` and `ReasoningStripped` records replayed at their
 //! positions); `Fork` moves the engine to a branch of its log, and `Compact`/`Uncompact`
 //! run between turns (all queued behind a running turn). `Compact` sends a summary
@@ -108,6 +108,7 @@ pub fn sessions_running() -> bool {
     SESSIONS_RUNNING.load(std::sync::atomic::Ordering::SeqCst) > 0
 }
 
+/// Why the engine could not be built or reached.
 #[derive(Debug, thiserror::Error)]
 pub enum EngineError {
     #[error("the engine has stopped")]
@@ -195,6 +196,7 @@ pub struct EngineBuilder {
 }
 
 impl EngineBuilder {
+    /// A builder for a session on `root` with `config` and default parts.
     pub fn new(config: Config, root: impl Into<PathBuf>) -> Self {
         EngineBuilder {
             config,
@@ -218,6 +220,7 @@ impl EngineBuilder {
         }
     }
 
+    /// [`EngineBuilder::new`] with a loaded configuration, whose warnings the session reports.
     pub fn from_loaded(loaded: LoadedConfig, root: impl Into<PathBuf>) -> Self {
         EngineBuilder {
             config_warnings: loaded.warnings,

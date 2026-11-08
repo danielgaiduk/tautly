@@ -19,6 +19,7 @@ use crate::protocol::Command;
 /// Two interrupts this close together mean "exit".
 pub const DOUBLE_INTERRUPT: Duration = Duration::from_secs(2);
 
+/// A process signal the engine reacts to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Signal {
     /// SIGINT (Ctrl-C).
@@ -36,6 +37,7 @@ pub struct SignalPolicy {
 }
 
 impl SignalPolicy {
+    /// The command signal `sig` at `now` maps to.
     pub fn command(&mut self, sig: Signal, now: Instant) -> Command {
         match sig {
             Signal::Interrupt => {

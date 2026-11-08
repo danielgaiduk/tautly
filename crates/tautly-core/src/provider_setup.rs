@@ -20,7 +20,7 @@ const OPENAI_URL: &str = "https://api.openai.com";
 const GOOGLE_URL: &str = "https://generativelanguage.googleapis.com";
 
 /// Builds the provider for a model (`SetModel`). It may read the keychain, which can block,
-/// so the engine calls it on the blocking pool. The default is [`provider_for`] with the
+/// so the engine calls it on the blocking pool. The default is `provider_for` with the
 /// session's configuration; tests inject their own so they never touch the keychain.
 pub type ProviderFactory =
     Arc<dyn Fn(&ModelId) -> Result<Arc<dyn Provider>, ProviderSetupError> + Send + Sync>;
@@ -130,7 +130,7 @@ pub(crate) fn provider_for(
     )
 }
 
-/// [`provider_for`] with the environment and the keychain injected (a client that checks
+/// `provider_for` with the environment and the keychain injected (a client that checks
 /// the key before it starts a session; tests). Compat models use
 /// [`Config::effective_compat`], so the built-in `openrouter` and `ollama` entries work
 /// without configuration. A native provider (`anthropic`, `openai`, `google`) without a

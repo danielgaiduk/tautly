@@ -97,6 +97,7 @@ pub struct BranchSummary {
     pub notes: Vec<String>,
 }
 
+/// Why a comparison could not be made.
 #[derive(Debug, thiserror::Error)]
 pub enum CompareError {
     #[error("cannot read the session log: {0}")]

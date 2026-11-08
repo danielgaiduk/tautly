@@ -47,6 +47,7 @@ pub struct Run {
     pub wait: Duration,
 }
 
+/// Build the engine and wrap it in a [`Run`].
 pub fn start(b: EngineBuilder) -> Run {
     let (engine, events) = b.build().unwrap();
     Run {
@@ -57,10 +58,12 @@ pub fn start(b: EngineBuilder) -> Run {
 }
 
 impl Run {
+    /// Send a command.
     pub async fn send(&self, cmd: Command) {
         self.engine.send(cmd).await.unwrap();
     }
 
+    /// Send a user message.
     pub async fn say(&self, text: &str) {
         self.send(Command::SendMessage {
             id: None,
@@ -69,6 +72,7 @@ impl Run {
         .await;
     }
 
+    /// The next event, failing the test after [`Run::wait`].
     pub async fn next(&mut self) -> Event {
         tokio::time::timeout(self.wait, self.events.recv())
             .await
@@ -124,6 +128,7 @@ impl Default for Fx {
 }
 
 impl Fx {
+    /// A fresh work tree and data home.
     pub fn new() -> Fx {
         Fx {
             dir: tempfile::tempdir().unwrap(),
@@ -131,6 +136,7 @@ impl Fx {
         }
     }
 
+    /// The work tree, canonical.
     pub fn root(&self) -> PathBuf {
         self.dir.path().canonicalize().unwrap()
     }
@@ -187,6 +193,7 @@ impl Repo {
     }
 
     /// A git repository with `files` committed on `main`.
+    /// A git repository with `files` committed on `main`.
     pub fn git_repo(files: &[(&str, &str)]) -> Repo {
         let repo = Repo::plain(&[]);
         repo.git(&["init", "-q", "-b", "main"]);
@@ -198,6 +205,7 @@ impl Repo {
         repo
     }
 
+    /// The repository's work tree, canonical.
     pub fn root(&self) -> PathBuf {
         self.dir.path().canonicalize().unwrap()
     }
@@ -209,6 +217,7 @@ impl Repo {
         std::fs::write(p, text).unwrap();
     }
 
+    /// The text of `rel`, if it can be read.
     pub fn read(&self, rel: &str) -> Option<String> {
         std::fs::read_to_string(self.root().join(rel)).ok()
     }
@@ -226,17 +235,22 @@ impl Repo {
 /// (no spill file; stdio servers refused) unless the test overrides them.
 #[async_trait]
 pub trait Delegate: Send + Sync {
+    /// The sandbox calls are forwarded to.
     fn inner(&self) -> &LocalSandbox;
 
+    /// Forwards [`Sandbox::resolve`].
     fn resolve(&self, p: &Path) -> Result<PathBuf, SandboxError> {
         self.inner().resolve(p)
     }
+    /// Forwards [`Sandbox::read`].
     async fn read(&self, p: &Path) -> Result<Vec<u8>, SandboxError> {
         self.inner().read(p).await
     }
+    /// Forwards [`Sandbox::metadata`].
     async fn metadata(&self, p: &Path) -> Result<FileMeta, SandboxError> {
         self.inner().metadata(p).await
     }
+    /// Forwards [`Sandbox::write_atomic`].
     async fn write_atomic(
         &self,
         p: &Path,
@@ -245,29 +259,34 @@ pub trait Delegate: Send + Sync {
     ) -> Result<(), SandboxError> {
         self.inner().write_atomic(p, bytes, mode).await
     }
+    /// Forwards [`Sandbox::remove_file`].
     async fn remove_file(&self, p: &Path) -> Result<(), SandboxError> {
         self.inner().remove_file(p).await
     }
+    /// Forwards [`Sandbox::spill`].
     async fn spill(&self, bytes: &[u8]) -> Result<PathBuf, SandboxError> {
         self.inner().spill(bytes).await
     }
-    // `spill_stream` and `spawn_stdio` do not forward: they copy the `Sandbox` trait
-    // defaults, as the wrappers did, and must be kept equal to them.
+    /// The [`Sandbox::spill_stream`] default: no spill file.
     async fn spill_stream(&self) -> Result<Option<(PathBuf, SpillWriter)>, SandboxError> {
         Ok(None)
     }
+    /// Forwards [`Sandbox::spawn`].
     async fn spawn(&self, spec: SpawnSpec) -> Result<Child, SandboxError> {
         self.inner().spawn(spec).await
     }
+    /// The [`Sandbox::spawn_stdio`] default: refused.
     async fn spawn_stdio(&self, spec: SpawnSpec) -> Result<Child, SandboxError> {
         let _ = spec;
         Err(SandboxError::Denied(
             "this sandbox cannot run stdio servers".into(),
         ))
     }
+    /// Forwards [`Sandbox::walker`].
     fn walker(&self, base: &Path) -> Result<ignore::WalkBuilder, SandboxError> {
         self.inner().walker(base)
     }
+    /// Forwards [`Sandbox::http_get`].
     async fn http_get(&self, url: &Url) -> Result<HttpResponse, SandboxError> {
         self.inner().http_get(url).await
     }

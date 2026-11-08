@@ -26,6 +26,10 @@
 //! 7.11.2): the first key in the environment or the keychain, else a local Ollama. The
 //! choice is announced on stderr; nothing found is an error with a setup hint.
 
+// The clap help text is these doc comments: `<name>` placeholders are meant for the
+// terminal, not HTML, and must not change for rustdoc.
+#![allow(rustdoc::invalid_html_tags)]
+
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;

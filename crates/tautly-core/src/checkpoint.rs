@@ -141,7 +141,7 @@ pub enum Skip {
     #[error("the work tree's .git is a symbolic link (checkpoints are off for this session)")]
     GitDirSymlink,
     /// Reading the repository's git configuration did not finish in
-    /// [`CONFIG_READ_TIMEOUT`] for the second snapshot in a row: an include that never ends
+    /// `CONFIG_READ_TIMEOUT` for the second snapshot in a row: an include that never ends
     /// (a FIFO), which every later git call would wait on too.
     #[error(
         "reading the repository's git configuration took too long (an include that never \
@@ -167,6 +167,7 @@ pub struct RestorePlan {
     pub deleted: Vec<PathBuf>,
 }
 
+/// Why a checkpoint operation failed.
 #[derive(Debug, thiserror::Error)]
 pub enum CheckpointError {
     #[error("git is not available")]
@@ -436,6 +437,7 @@ impl Checkpointer {
         &self.session
     }
 
+    /// The checkpoint settings this checkpointer runs with.
     pub fn config(&self) -> &CheckpointConfig {
         &self.cfg
     }
@@ -818,7 +820,7 @@ impl Checkpointer {
 
     /// The remotes a push to would publish this repository's checkpoint refs to (and the
     /// untracked files they hold): `remote.<name>.mirror` set, or a push refspec that can
-    /// name a ref below `refs/tautly/` ([`pushes_checkpoints`]). Empty when the
+    /// name a ref below `refs/tautly/` (`pushes_checkpoints`). Empty when the
     /// configuration cannot be read.
     pub async fn publishing_remotes(&self) -> Vec<String> {
         let git = Git {

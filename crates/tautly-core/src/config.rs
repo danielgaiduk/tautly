@@ -46,6 +46,7 @@ pub const OLLAMA_URL: &str = "http://localhost:11434/v1";
 /// What loading says when `[telemetry] enabled = true` (spec 2.4: reserved, ignored).
 pub const TELEMETRY_WARNING: &str = "[telemetry] OpenTelemetry export is post-v1; ignored";
 
+/// Why the configuration could not be loaded.
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
     #[error("cannot read {}: {source}", path.display())]
@@ -248,6 +249,7 @@ impl Default for Config {
     }
 }
 
+/// The `[providers]` table: per-provider endpoints and key variables.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProvidersConfig {
@@ -281,6 +283,7 @@ fn default_auto_detect() -> bool {
     true
 }
 
+/// One provider's endpoint and key variable overrides.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProviderEntry {
@@ -290,6 +293,7 @@ pub struct ProviderEntry {
     pub api_key_env: Option<String>,
 }
 
+/// An OpenAI-compatible endpoint (`[[providers.compat]]`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CompatEntry {
@@ -327,6 +331,7 @@ pub struct BudgetConfig {
     pub session: BudgetLimits,
 }
 
+/// The `[telemetry]` table.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TelemetryConfig {
@@ -337,6 +342,7 @@ pub struct TelemetryConfig {
     pub endpoint: Option<Url>,
 }
 
+/// The `[routing]` table: which model does side work.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RoutingConfig {

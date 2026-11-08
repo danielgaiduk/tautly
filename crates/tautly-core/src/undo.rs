@@ -100,6 +100,7 @@ impl UndoReport {
     }
 }
 
+/// Why an undo could not run.
 #[derive(Debug, thiserror::Error)]
 pub enum UndoError {
     #[error("cannot read or write the session log: {0}")]

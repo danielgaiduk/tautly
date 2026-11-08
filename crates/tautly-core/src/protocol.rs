@@ -70,6 +70,7 @@ pub enum FinishReason {
     Unknown,
 }
 
+/// What kind of failure an [`Event::Error`] reports.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ErrorKind {
@@ -539,6 +540,7 @@ pub struct DiffFile {
     pub removed: u32,
 }
 
+/// How a file changed in a session diff.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DiffStatus {
@@ -813,10 +815,12 @@ pub mod lossy_path {
 
     use serde::{Deserialize, Deserializer, Serializer};
 
+    /// The path as (lossy) text.
     pub fn serialize<S: Serializer>(path: &Path, s: S) -> Result<S::Ok, S::Error> {
         s.serialize_str(&path.to_string_lossy())
     }
 
+    /// A path from its text.
     pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<PathBuf, D::Error> {
         Ok(PathBuf::from(String::deserialize(d)?))
     }

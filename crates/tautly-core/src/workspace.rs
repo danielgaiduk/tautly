@@ -78,6 +78,7 @@ pub(crate) struct Opened {
     _index_lock: Option<File>,
 }
 
+/// One work tree's shared parts (sandbox, index, data home) for the sessions on it.
 pub struct Workspace {
     sandbox: Arc<dyn Sandbox>,
     data_home: PathBuf,
@@ -223,6 +224,7 @@ impl Workspace {
         }
     }
 
+    /// The work tree root.
     pub fn root(&self) -> &Path {
         self.sandbox.root()
     }
@@ -248,6 +250,7 @@ impl Workspace {
         }
     }
 
+    /// The sandbox every session of this work tree uses.
     pub fn sandbox(&self) -> &Arc<dyn Sandbox> {
         &self.sandbox
     }
@@ -286,7 +289,7 @@ impl Workspace {
 
     /// Wait until the index has finished its first refresh (true) or never will: it could
     /// not be opened, or that refresh failed (false; see [`Index::last_error`]). Bounded
-    /// only by [`READY_OR_FAILED_BOUND`], far beyond any loaded machine, so a readiness
+    /// only by `READY_OR_FAILED_BOUND`, far beyond any loaded machine, so a readiness
     /// regression fails instead of hanging. For callers that must not guess how long a
     /// loaded machine takes, such as tests.
     pub async fn wait_ready_or_failed(&self) -> bool {
@@ -320,6 +323,7 @@ impl Workspaces {
         }
     }
 
+    /// The data home sessions are logged under.
     pub fn data_home(&self) -> &Path {
         &self.data_home
     }

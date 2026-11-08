@@ -19,6 +19,7 @@ pub const SESSION_DIFF_MAX_LINES: u32 = 2000;
 /// an event of many megabytes.
 pub const SESSION_DIFF_MAX_BYTES: usize = 256 * 1024;
 
+/// Why a session diff could not be made.
 #[derive(Debug, thiserror::Error)]
 pub enum DiffError {
     #[error("cannot read the session log: {0}")]

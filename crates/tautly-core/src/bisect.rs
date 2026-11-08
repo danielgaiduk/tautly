@@ -244,6 +244,7 @@ pub struct BisectOutcome {
     pub notes: Vec<String>,
 }
 
+/// Why a bisect could not run or finish.
 #[derive(Debug, thiserror::Error)]
 pub enum BisectError {
     #[error("{0}")]
