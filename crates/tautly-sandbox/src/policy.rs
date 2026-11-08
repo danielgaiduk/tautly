@@ -50,9 +50,12 @@ pub enum PolicyError {
     MalformedRule { rule: String, why: String },
 }
 
-/// Tools whose effect is always `ReadOnly` and carries no paths, so a glob could never match.
+/// Built-in tools whose effect is always `ReadOnly` and carries no paths, so a glob could
+/// never match: a path-scoped rule for one is refused at parse time. Only parsing reads
+/// this list; [`Policy::decide`] judges a call by its effect, never by tool name.
 const READ_ONLY_TOOLS: &[&str] = &[
-    "read", "grep", "glob", "outline", "symbol", "refs", "recall",
+    "read", "grep", "glob", "outline", "symbol", "refs", "recall", "find", "pin", "state",
+    "remember",
 ];
 
 /// MCP tools (`mcp__<server>__<tool>`) are matched by name only, and the name may be a
