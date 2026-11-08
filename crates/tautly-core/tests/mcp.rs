@@ -740,7 +740,12 @@ async fn late_server_joins_at_next_user_turn_once() {
         tools_step(vec![state("c")]),
         text_step_no_usage("turn 2"),
     ]);
-    let mut run = start(fx.waiting_builder(cfg, &mock));
+    // No wait for the repo map: on a loaded runner the index can take longer than an
+    // event wait, and nothing here depends on it.
+    let mut run = start(EngineBuilder {
+        startup_wait: Duration::ZERO,
+        ..fx.waiting_builder(cfg, &mock)
+    });
     run.turn_with("one").await;
     let reqs = mock.requests();
     assert!(mcp_names(&reqs[0]).is_empty() && mcp_names(&reqs[1]).is_empty());
