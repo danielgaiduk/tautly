@@ -30,6 +30,24 @@ impl Sink for File {
     }
 }
 
+/// What a closed writer writes to: nothing.
+struct Closed;
+
+impl Write for Closed {
+    fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+        Err(io::Error::other("the session log is closed"))
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Sink for Closed {
+    fn sync(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 /// Take an exclusive, non-blocking advisory lock held until `file` is dropped. A lock
 /// that is busy is tried again a few times over ~50 ms first: a reader that only looks
 /// (the session tree's liveness probe holds a shared lock for an instant) must not make an
@@ -254,6 +272,20 @@ impl<R: Serialize> SessionWriter<R> {
         self.check_usable()?;
         let synced = self.out.flush().and_then(|()| self.out.get_mut().sync());
         synced.map_err(|e| self.poison(e))
+    }
+
+    /// Flush and fsync the log, then close its file, which releases the writer lock at
+    /// once (not whenever the last handle to the writer goes): a client that resumes the
+    /// session right after it ended finds it free. Every later call fails as on a
+    /// poisoned writer.
+    pub fn close(&mut self) -> Result<()> {
+        let synced = self.checkpoint();
+        let old = std::mem::replace(&mut self.out, BufWriter::new(Box::new(Closed)));
+        // Already flushed; the file (and its lock) goes here.
+        drop(old.into_parts());
+        self.poisoned
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        synced
     }
 
     /// Store `bytes` content-addressed; identical bytes are stored once.

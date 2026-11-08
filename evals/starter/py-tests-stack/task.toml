@@ -1,0 +1,6 @@
+id = "py-tests-stack"
+prompt = "Write unit tests for the `BoundedStack` class in bounded.py in a new file test_bounded.py (unittest): push and pop order, `pop` on an empty stack raising IndexError, and `push` past the capacity raising OverflowError."
+timeout_s = 600
+budget_usd = 1.0
+tags = ["python", "tests"]
+approve = "yolo"

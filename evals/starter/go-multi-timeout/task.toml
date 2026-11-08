@@ -1,0 +1,6 @@
+id = "go-multi-timeout"
+prompt = "Plumb a request timeout through: add `Timeout time.Duration` to `Config` in config.go (default 30s in `DefaultConfig`), and make `NewClient` in client.go copy it into `Client.timeout`, exposed by a `Timeout()` method."
+timeout_s = 600
+budget_usd = 1.0
+tags = ["go", "multi-file"]
+approve = "yolo"

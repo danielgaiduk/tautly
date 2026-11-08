@@ -3220,6 +3220,7 @@ dependencies = [
  "reqwest 0.12.28",
  "rpassword",
  "rusqlite",
+ "serde",
  "serde_json",
  "tautly-acp",
  "tautly-core",
@@ -3231,6 +3232,7 @@ dependencies = [
  "tautly-tui",
  "tempfile",
  "tokio",
+ "toml",
  "wiremock",
 ]
 
@@ -3389,6 +3391,26 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tokio",
+]
+
+[[package]]
+name = "tautly-perf"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "futures",
+ "libc",
+ "serde_json",
+ "tautly-acp",
+ "tautly-context",
+ "tautly-core",
+ "tautly-index",
+ "tautly-provider",
+ "tautly-sandbox",
+ "tautly-tools",
+ "tempfile",
+ "tokio",
+ "tokio-util",
 ]
 
 [[package]]

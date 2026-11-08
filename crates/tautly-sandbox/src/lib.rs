@@ -11,7 +11,7 @@ mod shell_state;
 mod spill;
 mod walk;
 
-pub use effect::{Effect, FileMeta, HttpResponse, Sandbox, SandboxError, SpawnSpec};
+pub use effect::{Effect, FileMeta, HttpResponse, Sandbox, SandboxError, SpawnSpec, SpillWriter};
 pub use local::LocalSandbox;
 pub use path_search::{which_outside, which_outside_or_skipped};
 pub use policy::{Decision, Mode, Policy, PolicyConfig, PolicyError};

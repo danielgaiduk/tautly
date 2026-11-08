@@ -136,7 +136,7 @@ impl Fx {
         let sb: Arc<dyn Sandbox> = Arc::new(self.sandbox());
         let ws = Workspace::new(sb, self.home.path());
         ws.start();
-        assert!(ws.wait_ready(WAIT).await, "index never became ready");
+        assert!(ws.wait_ready_or_failed().await, "index never became ready");
         ws
     }
 
@@ -414,6 +414,8 @@ async fn resume_rebuilds_context_identically() {
     let mock = MockProvider::new(turn_a_script());
     let mut run = start(EngineBuilder {
         workspace: Some(fx.ready_workspace().await),
+        // The repo map and memory index in the first request, however loaded the runner.
+        startup_wait: WAIT,
         ..fx.builder(config(Mode::AutoEdit), &mock)
     });
     run_turn_a(&mut run).await;
@@ -427,6 +429,8 @@ async fn resume_rebuilds_context_identically() {
     let live_mock = MockProvider::new(script);
     let mut live = start(EngineBuilder {
         workspace: Some(fx.ready_workspace().await),
+        // The repo map and memory index in the first request, however loaded the runner.
+        startup_wait: WAIT,
         ..fx.builder(config(Mode::AutoEdit), &live_mock)
     });
     run_turn_a(&mut live).await;
@@ -454,6 +458,8 @@ async fn resume_rebuilds_context_identically() {
     let resumed_mock = MockProvider::new(vec![text_step("done B")]);
     let mut resumed = start(EngineBuilder {
         workspace: Some(fx.ready_workspace().await),
+        // The repo map and memory index in the first request, however loaded the runner.
+        startup_wait: WAIT,
         ..fx.resume(config(Mode::AutoEdit), &resumed_mock, &id)
     });
     let events = resumed.turn_with("turn B").await;

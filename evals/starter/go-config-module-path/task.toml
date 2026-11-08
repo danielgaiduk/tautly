@@ -1,0 +1,6 @@
+id = "go-config-module-path"
+prompt = "`go build ./...` fails: main.go imports `example.com/calc/mathx` but go.mod declares another module path. Fix go.mod (not the imports)."
+timeout_s = 600
+budget_usd = 1.0
+tags = ["go", "config"]
+approve = "yolo"

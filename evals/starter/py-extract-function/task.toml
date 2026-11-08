@@ -1,0 +1,6 @@
+id = "py-extract-function"
+prompt = "signup.py checks email addresses with the same code in two places. Extract it into one function `is_valid_email(address)` used by both; behavior must not change."
+timeout_s = 600
+budget_usd = 1.0
+tags = ["python", "refactor"]
+approve = "yolo"

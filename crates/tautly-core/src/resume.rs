@@ -1444,10 +1444,16 @@ impl Session {
     /// collected again. Logged as `Uncompacted`.
     pub(crate) async fn uncompact_command(&mut self) {
         self.checkpoint().await;
+        // The compacted turns' entries are in the compaction record until it is undone.
+        let compacted = self
+            .latest_compaction
+            .iter()
+            .flat_map(|c| &c.removed_results);
         let elided: Vec<String> = self
             .context
             .results
             .iter()
+            .chain(compacted)
             .filter(|r| r.elided)
             .map(|r| r.call_id.clone())
             .collect();

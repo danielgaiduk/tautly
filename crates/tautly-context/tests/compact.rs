@@ -235,6 +235,31 @@ fn uncompact_restores_when_fits() {
 }
 
 #[test]
+fn compaction_takes_the_removed_turns_results_and_uncompact_puts_them_back() {
+    // Task 33 review I3: `results` must not grow for the whole session.
+    let mut c = ctx_with(10);
+    for turn in 1..=10 {
+        c.push_tool_result(
+            &format!("c{turn}"),
+            "bash",
+            &json!({"command": format!("echo {turn}")}),
+            &[],
+            false,
+            turn,
+        );
+    }
+    let before = c.results.clone();
+    let rec = c.apply_compaction(6, "the summary".into()).unwrap();
+    assert_eq!(
+        c.results.iter().map(|r| r.turn).collect::<Vec<_>>(),
+        [7, 8, 9, 10]
+    );
+    assert_eq!(rec.removed_results.len(), 6);
+    c.uncompact(&rec, u32::MAX).unwrap();
+    assert_eq!(c.results, before);
+}
+
+#[test]
 fn uncompact_refuses_when_too_large() {
     let mut c = ctx_with(10);
     // Big removed turns make the restored context much larger than the compacted one.

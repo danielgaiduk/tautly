@@ -1,0 +1,6 @@
+id = "go-bug-nil-map"
+prompt = "`Counter.Add` in counter.go panics with \"assignment to entry in nil map\" on a zero Counter. Make the zero value usable."
+timeout_s = 600
+budget_usd = 1.0
+tags = ["go", "bug"]
+approve = "yolo"

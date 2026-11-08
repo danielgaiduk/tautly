@@ -1,0 +1,6 @@
+id = "rs-config-workspace-members"
+prompt = "`cargo test --workspace` fails because the workspace's members list names a directory that does not exist. Fix the root Cargo.toml so both crates build and their tests pass."
+timeout_s = 600
+budget_usd = 1.0
+tags = ["rust", "config"]
+approve = "yolo"

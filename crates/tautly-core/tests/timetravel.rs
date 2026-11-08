@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command as Process;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 use tautly_core::record::{CheckpointPoint, session_label};
@@ -128,6 +128,9 @@ edit_format = "str_replace"
             ..Config::default()
         };
         cfg.permissions.mode = Mode::Yolo;
+        // A snapshot that times out turns checkpoints off for the session; under load
+        // that would change what these tests see. Tests of the limit set their own.
+        cfg.checkpoints.timeout_ms = 120_000;
         cfg
     }
 
@@ -1026,8 +1029,15 @@ async fn tree_lists_parent_step_label_origin_live_current() {
         "{lines:?}"
     );
     run.stop().await;
+    // The log is closed (its lock released) before the event stream ends (review M6).
     let nodes = tree::build(repo.home(), &repo.project(), None).unwrap();
-    assert!(nodes.iter().all(|n| !n.live && !n.current));
+    assert!(nodes.iter().all(|n| !n.live && !n.current), "{nodes:?}");
+    // So resuming it at once finds it free, not "already open for writing".
+    let again = Run::start(EngineBuilder {
+        resume: Some(b.clone()),
+        ..repo.builder(&MockProvider::new(vec![]))
+    });
+    again.stop().await;
 }
 
 // ------------------------------------------------- fix round 1: human-owned changes
@@ -2407,11 +2417,14 @@ async fn a_switch_closes_the_targets_cut_turn_before_it_writes_there() {
     // cp5 FMT re-review N3: the synthetic end is stamped at the target's last record and
     // precedes the switch's own records, so compare's wall time leaves the downtime out.
     let repo = Repo::git_repo();
+    let lived = Instant::now();
     let mut run = Run::start(repo.builder(&MockProvider::new(vec![text_step("one")])));
     let target = run.engine.session_id().to_string();
     run.turn_with("one").await;
     let log = run.current().1;
     run.stop().await;
+    // However slow the runner, the target's wall time cannot exceed its own lifetime.
+    let lived = lived.elapsed().as_millis() as u64;
     // A crash inside the next turn: the log ends on its `TurnStart`.
     let mut line: Value = serde_json::from_str(raw_lines(&log).last().unwrap()).unwrap();
     line["offset"] = json!(line["offset"].as_u64().unwrap() + 1);
@@ -2443,5 +2456,6 @@ async fn a_switch_closes_the_targets_cut_turn_before_it_writes_there() {
     assert_eq!(synthetic, 1);
     let s =
         tautly_core::compare::summarize_at(&reader(&log), None, &Catalog::default(), None).unwrap();
-    assert!(s.wall_ms < 1500, "{}", s.wall_ms);
+    // The downtime (1.5 s and the other session) would add at least 1,500 ms.
+    assert!(s.wall_ms <= lived, "{} > {lived}", s.wall_ms);
 }

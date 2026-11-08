@@ -131,6 +131,7 @@ fn compaction_record_roundtrips() {
         first_removed_turn: 1,
         last_removed_turn: 2,
         forgotten_paths: vec![PathBuf::from("/p/a.rs"), PathBuf::from("/p/b.rs")],
+        removed_results: Vec::new(),
     };
     let text = serde_json::to_string(&rec).unwrap();
     assert_eq!(

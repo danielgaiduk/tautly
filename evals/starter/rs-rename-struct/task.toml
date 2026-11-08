@@ -1,0 +1,6 @@
+id = "rs-rename-struct"
+prompt = "Rename the struct `Acct` to `Account` in src/lib.rs and src/bank.rs. The old name must be gone."
+timeout_s = 600
+budget_usd = 1.0
+tags = ["rust", "refactor"]
+approve = "yolo"

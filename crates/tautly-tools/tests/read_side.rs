@@ -428,6 +428,15 @@ async fn repo(built: common::Built) -> common::Env {
         if built == common::Built::Full {
             e.index.build_trigrams().await.unwrap();
         }
+        // The watcher also handles the link's creation (a reindex of the path, then a
+        // refresh of its own), racing the refresh above. A cookie written now comes back
+        // only once it has: from then on the index has converged.
+        e.index.mark_stale();
+        e.index
+            .refresh_stale_in_background()
+            .unwrap()
+            .await
+            .unwrap();
     }
     e
 }

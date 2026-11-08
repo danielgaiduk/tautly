@@ -377,8 +377,8 @@ enum Prepared {
         edited: String,
         /// What is written: `edited` with the file's encoding restored.
         bytes: Vec<u8>,
-        /// A tolerant stage located the change.
-        repaired: bool,
+        /// The tolerant stage that located the change (none: an exact match).
+        repair: Option<RepairStage>,
         /// The result's first line.
         summary: String,
     },
@@ -436,15 +436,15 @@ async fn prepare(args: &Value, sb: &dyn Sandbox, cx: &ToolCx) -> Result<Prepared
 
 /// Write what [`prepare`] worked out and report it, with the diff applied.
 async fn commit(p: Prepared, sb: &dyn Sandbox, cx: &ToolCx) -> ToolResult {
-    let (path, file, edited, bytes, repaired, summary) = match p {
+    let (path, file, edited, bytes, repair, summary) = match p {
         Prepared::One {
             path,
             file,
             edited,
             bytes,
-            repaired,
+            repair,
             summary,
-        } => (path, file, edited, bytes, repaired, summary),
+        } => (path, file, edited, bytes, repair, summary),
         Prepared::Patch { steps, notes } => return commit_patch(steps, notes, sb, cx).await,
     };
     if cx.cancel().is_cancelled() {
@@ -456,8 +456,15 @@ async fn commit(p: Prepared, sb: &dyn Sandbox, cx: &ToolCx) -> ToolResult {
     }
     let shown = shown_path(sb, &file.full, &path);
     let diff = display_diff(&[(shown, Some(&file.original), Some(&bytes))]).await;
-    let post_hash =
-        record_written(sb, cx, &file.full, Some(&file.original), &bytes, repaired).await;
+    let post_hash = record_written(
+        sb,
+        cx,
+        &file.full,
+        Some(&file.original),
+        &bytes,
+        repair.is_some(),
+    )
+    .await;
     let warning = join_notes([
         syntax_warning(&path, &file.text, &edited),
         reindex(cx, &path).await,
@@ -468,6 +475,7 @@ async fn commit(p: Prepared, sb: &dyn Sandbox, cx: &ToolCx) -> ToolResult {
         output.push_str(&w);
     }
     let mut r = ToolResult::ok(output);
+    r.meta.repair = repair;
     r.applied_diff = Some(Box::new(diff));
     r.effects.push(AppliedEffect::Edited {
         path: file.full,
@@ -603,7 +611,7 @@ async fn prepare_str_replace(
         file,
         edited,
         bytes,
-        repaired: stage != RepairStage::Exact,
+        repair: (stage != RepairStage::Exact).then_some(stage),
         summary,
     })
 }
@@ -647,7 +655,7 @@ async fn prepare_hashline(
         file,
         edited,
         bytes,
-        repaired: false,
+        repair: None,
     })
 }
 
@@ -665,8 +673,8 @@ struct Step {
     bytes: Vec<u8>,
     /// Set when the new content has parse errors the old content did not.
     warning: Option<String>,
-    /// A tolerant stage located one of its hunks.
-    repaired: bool,
+    /// The tolerant stage that located its first repaired hunk.
+    repair: Option<RepairStage>,
 }
 
 impl Step {
@@ -805,7 +813,7 @@ async fn prepare_patch(
             mode,
             bytes,
             warning,
-            repaired: !ap.repairs.is_empty(),
+            repair: ap.repairs.first().map(|r| r.stage),
         });
     }
     Ok(Prepared::Patch { steps, notes })
@@ -846,6 +854,7 @@ async fn commit_patch(
     }
     let sides: Vec<_> = steps.iter().map(|s| s.sides(sb)).collect();
     let diff = display_diff(&sides).await;
+    let repair = steps.iter().find_map(|s| s.repair);
 
     let mut lines = Vec::with_capacity(steps.len() + notes.len());
     let mut warnings = Vec::new();
@@ -860,7 +869,7 @@ async fn commit_patch(
                     &step.full,
                     step.original.as_deref(),
                     &step.bytes,
-                    step.repaired,
+                    step.repair.is_some(),
                 )
                 .await;
                 Some(h)
@@ -894,6 +903,7 @@ async fn commit_patch(
     lines.extend(notes);
     lines.extend(warnings);
     let mut r = ToolResult::ok(lines.join("\n"));
+    r.meta.repair = repair;
     r.effects = effects;
     r.applied_diff = Some(Box::new(diff));
     r

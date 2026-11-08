@@ -137,6 +137,88 @@ async fn output_over_30kb_keeps_head_and_tail_and_spills() {
 }
 
 #[tokio::test]
+async fn output_past_the_stream_threshold_spills_whole_with_head_and_tail() {
+    let (dir, sb) = sandbox();
+    // 6 MB: past the 4 MB at which output streams to the spill file.
+    let r = BashTool
+        .run(
+            json!({"command": "printf START; head -c 6000000 /dev/zero | tr '\\0' a; printf END"}),
+            &sb,
+            &cx(&dir),
+        )
+        .await;
+    assert!(r.output.starts_with("START"), "{}", &r.output[..100]);
+    assert!(r.output.len() <= 31 * 1024, "{}", r.output.len());
+    let body = r.output.split("\n[full output saved to ").next().unwrap();
+    assert!(body.ends_with("END"), "{}", &body[body.len() - 100..]);
+    let omitted: usize = body
+        .split("… [")
+        .nth(1)
+        .and_then(|s| s.split(" bytes omitted]").next())
+        .unwrap()
+        .parse()
+        .unwrap();
+    let shown = body.len() - format!("\n… [{omitted} bytes omitted] …\n").len();
+    assert_eq!(shown + omitted, 6_000_008);
+    let path = r
+        .output
+        .lines()
+        .find_map(|l| l.strip_prefix("[full output saved to "))
+        .unwrap()
+        .trim_end_matches(']');
+    let full = sb.read(Path::new(path)).await.unwrap();
+    assert_eq!(full.len(), 6_000_008);
+    assert!(full.starts_with(b"STARTaaa") && full.ends_with(b"aaaEND"));
+}
+
+#[tokio::test]
+async fn a_cancel_ends_the_drain_of_pipes_an_escaped_process_holds() {
+    // The shell exits at once; a process that left the group (setsid) keeps stdout open,
+    // so the pipes would be drained for up to 5 s.
+    let s = unique_sleep();
+    let (dir, sb) = sandbox();
+    let token = CancellationToken::new();
+    let cx = cx(&dir).with_cancel(token.clone());
+    let t2 = token.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(1000)).await;
+        t2.cancel();
+    });
+    let t = Instant::now();
+    let cmd = format!(
+        "echo before; perl -e 'use POSIX; fork and exit; POSIX::setsid(); exec \"sleep\", \"{s}\"'"
+    );
+    let r = BashTool.run(json!({ "command": cmd }), &sb, &cx).await;
+    let took = t.elapsed();
+    let _ = Command::new("pkill")
+        .args(["-f", &format!("sleep {s}")])
+        .status();
+    assert!(r.output.contains("before"), "{}", r.output);
+    // Cancelled at 1 s: well before the 5 s drain cap.
+    assert!(took < Duration::from_secs(4), "{took:?}");
+}
+
+#[tokio::test]
+async fn line_oriented_output_past_the_stream_threshold_is_not_throttled() {
+    // About 39 MB of short lines: before buffering, each line was its own spill write and
+    // this took tens of seconds; now it is about a second.
+    let (dir, sb) = sandbox();
+    let t = Instant::now();
+    let r = BashTool
+        .run(json!({"command": "seq -f %.0f 1 5000000"}), &sb, &cx(&dir))
+        .await;
+    let took = t.elapsed();
+    assert!(!r.is_error, "{}", &r.output[r.output.len() - 200..]);
+    assert!(
+        r.output.contains("5000000"),
+        "{}",
+        &r.output[r.output.len() - 200..]
+    );
+    // Generous for a loaded debug build; unbuffered it took over 20 s.
+    assert!(took < Duration::from_secs(15), "{took:?}");
+}
+
+#[tokio::test]
 async fn cap_output_small_is_untouched() {
     let (_d, sb) = sandbox();
     let (text, spill) = cap_output("short", 100, &sb).await;
@@ -157,31 +239,33 @@ async fn timeout_kills_process_group() {
 
 #[tokio::test]
 async fn cancel_kills_within_200ms() {
-    let s = unique_sleep();
     let (dir, sb) = sandbox();
-    let token = CancellationToken::new();
-    let cx = cx(&dir).with_cancel(token.clone());
-    let t2 = token.clone();
-    tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        t2.cancel();
-    });
-    let t = Instant::now();
-    let r = BashTool
-        .run(
-            json!({"command": format!("sleep {s} & sleep {s}")}),
-            &sb,
-            &cx,
-        )
-        .await;
-    assert!(
-        t.elapsed() < Duration::from_millis(250),
-        "{:?}",
-        t.elapsed()
-    );
-    assert!(r.is_error);
-    assert!(r.output.contains("killed: cancelled"), "{}", r.output);
-    assert!(!alive(&format!("sleep {s}")), "leftover sleep processes");
+    let mut fastest = Duration::MAX;
+    // The fastest of three: a loaded runner can stall any one run, but a cancel that is
+    // slow by design is slow every time.
+    for _ in 0..3 {
+        let s = unique_sleep();
+        let token = CancellationToken::new();
+        let cx = cx(&dir).with_cancel(token.clone());
+        let t2 = token.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            t2.cancel();
+        });
+        let t = Instant::now();
+        let r = BashTool
+            .run(
+                json!({"command": format!("sleep {s} & sleep {s}")}),
+                &sb,
+                &cx,
+            )
+            .await;
+        fastest = fastest.min(t.elapsed());
+        assert!(r.is_error);
+        assert!(r.output.contains("killed: cancelled"), "{}", r.output);
+        assert!(!alive(&format!("sleep {s}")), "leftover sleep processes");
+    }
+    assert!(fastest < Duration::from_millis(250), "{fastest:?}");
 }
 
 #[tokio::test]

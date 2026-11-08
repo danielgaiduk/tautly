@@ -77,6 +77,9 @@ struct RouterState {
 struct Registered {
     commands: mpsc::WeakSender<Command>,
     groups: ProcessGroups,
+    /// A [`ServerHold`]: alive for SIGTERM and SIGHUP only, so Ctrl-C with no session
+    /// still ends the server at once.
+    hold: bool,
 }
 
 impl SignalRouter {
@@ -95,8 +98,16 @@ impl SignalRouter {
     }
 
     fn add_channel(&self, commands: mpsc::WeakSender<Command>, groups: ProcessGroups) {
+        self.register(commands, groups, false);
+    }
+
+    fn register(&self, commands: mpsc::WeakSender<Command>, groups: ProcessGroups, hold: bool) {
         let mut st = self.lock();
-        st.engines.push(Registered { commands, groups });
+        st.engines.push(Registered {
+            commands,
+            groups,
+            hold,
+        });
         st.shutdown_sent = false;
     }
 
@@ -107,7 +118,8 @@ impl SignalRouter {
     pub async fn deliver(&self, sig: Signal) {
         let mut st = self.lock();
         let live = |e: &Registered| e.commands.upgrade().filter(|tx| !tx.is_closed());
-        let alive: Vec<_> = st.engines.iter().filter_map(live).collect();
+        let counts = |e: &&Registered| !(e.hold && sig == Signal::Interrupt);
+        let alive: Vec<_> = st.engines.iter().filter(counts).filter_map(live).collect();
         if st.shutdown_sent || alive.is_empty() {
             return self.escalate(st, sig);
         }
@@ -178,6 +190,29 @@ pub fn install_termination_handlers(engine: &Engine) -> std::io::Result<()> {
     install_into(&TERMINATION, listen_termination, |router| {
         router.add(engine)
     })
+}
+
+/// Held by a server that ends on SIGTERM and SIGHUP by itself (`tautly --rpc` and `acp`
+/// close their sessions and exit with the signal's code): see [`hold_signal_router`].
+pub struct ServerHold {
+    _commands: mpsc::Sender<Command>,
+}
+
+/// Count the server as alive to the router behind [`install_signal_handlers`] while the
+/// returned hold lives. Without it the server's own shutdown races the router: should
+/// the sessions be gone by the time the router hears the same SIGTERM, it would find no
+/// session alive and end the process at once, before the server has said the sessions
+/// closed or exited with 143. With it the first such signal is the server's to handle,
+/// and a second one still escalates. Must be called inside a Tokio runtime.
+pub fn hold_signal_router() -> std::io::Result<ServerHold> {
+    let (tx, mut rx) = mpsc::channel(1);
+    install_into(&INSTALLED, listen, |router| {
+        router.register(tx.downgrade(), ProcessGroups::default(), true);
+    })?;
+    // Commands for the server are dropped (it hears the signals itself), and taken at
+    // once so the router never counts it as stuck.
+    tokio::spawn(async move { while rx.recv().await.is_some() {} });
+    Ok(ServerHold { _commands: tx })
 }
 
 /// [`install_signal_handlers`] on `slot`: start the listener with `listen` unless it runs,
@@ -400,5 +435,28 @@ mod tests {
             Command::Shutdown
         );
         assert_eq!(p.command(Signal::Hangup, Instant::now()), Command::Shutdown);
+    }
+
+    #[tokio::test]
+    async fn a_server_hold_leaves_the_first_terminate_to_the_server() {
+        // Its sessions already gone, as when the server closed them on the same signal.
+        let escalated = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&escalated);
+        let router = SignalRouter::new(move |sig| seen.lock().unwrap().push(sig));
+        let (tx, mut rx) = mpsc::channel(1);
+        router.register(tx.downgrade(), ProcessGroups::default(), true);
+        tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        router.deliver(Signal::Terminate).await;
+        assert!(escalated.lock().unwrap().is_empty());
+        router.deliver(Signal::Terminate).await;
+        assert_eq!(*escalated.lock().unwrap(), [Signal::Terminate]);
+        // Review M3: a hold does not count for Ctrl-C; with no session it exits at once.
+        router.register(tx.downgrade(), ProcessGroups::default(), true);
+        router.deliver(Signal::Interrupt).await;
+        assert_eq!(
+            *escalated.lock().unwrap(),
+            [Signal::Terminate, Signal::Interrupt]
+        );
+        drop(tx);
     }
 }

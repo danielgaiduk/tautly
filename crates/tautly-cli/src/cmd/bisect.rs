@@ -176,15 +176,15 @@ const SIGHUP: i32 = 1;
 const SIGINT: i32 = 2;
 const SIGTERM: i32 = 15;
 
-/// Ctrl-C, SIGTERM and SIGHUP, watched from when this is made.
-struct Signals {
+/// Ctrl-C, SIGTERM and SIGHUP, watched from when this is made (`eval` watches them too).
+pub(super) struct Signals {
     int: Signal,
     term: Signal,
     hup: Signal,
 }
 
 impl Signals {
-    fn new() -> std::io::Result<Signals> {
+    pub(super) fn new() -> std::io::Result<Signals> {
         Ok(Signals {
             int: signal(SignalKind::interrupt())?,
             term: signal(SignalKind::terminate())?,
@@ -193,7 +193,7 @@ impl Signals {
     }
 
     /// On the first of them: keep its number in `caught`, then cancel `cancel`.
-    async fn cancel(mut self, cancel: CancellationToken, caught: Arc<AtomicI32>) {
+    pub(super) async fn cancel(mut self, cancel: CancellationToken, caught: Arc<AtomicI32>) {
         let n = tokio::select! {
             Some(()) = self.int.recv() => SIGINT,
             Some(()) = self.term.recv() => SIGTERM,

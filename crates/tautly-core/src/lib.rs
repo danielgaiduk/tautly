@@ -47,7 +47,7 @@ pub use config::{
     LoadedConfig, MODELS_FILE, ProviderEntry, ProvidersConfig, ReceiptsConfig, RoutingConfig,
     TelemetryConfig, config_home, parse_models_file,
 };
-pub use engine::{Engine, EngineBuilder, EngineError, session_root};
+pub use engine::{Engine, EngineBuilder, EngineError, session_root, sessions_running};
 pub use evidence::{
     DEFAULT_TEST_COMMANDS, EvidenceConfig, EvidenceTracker, TestEvidence, TestMatcher,
 };
@@ -66,8 +66,8 @@ pub use provider_setup::{
 pub use receipt::{ReceiptBuilder, Savings};
 pub use record::SessionRecord;
 pub use signals::{
-    Signal, SignalPolicy, SignalRouter, handle_signals, install_signal_handlers,
-    install_termination_handlers,
+    ServerHold, Signal, SignalPolicy, SignalRouter, handle_signals, hold_signal_router,
+    install_signal_handlers, install_termination_handlers,
 };
 pub use timetravel::{FileState, MaterializeReport, TtError};
 pub use tree::TreeNode;
@@ -87,7 +87,7 @@ pub use tautly_context::prompt::system as system_prompt;
 pub use tautly_mcp::config::{import_into_toml, parse_mcp_json};
 pub use tautly_mcp::names::is_valid_server_name;
 pub use tautly_mcp::{McpHub, ServerStatus, printable, printable_multiline};
-pub use tautly_provider::{Catalog, ModelInfo, Price};
+pub use tautly_provider::{Catalog, EditFormat, ModelInfo, Price};
 pub use tautly_session::{
     Error as LogError, Origin, SessionReader, SessionSummary as LogSummary,
     list_here_in as list_logs_here, list_in as list_logs,

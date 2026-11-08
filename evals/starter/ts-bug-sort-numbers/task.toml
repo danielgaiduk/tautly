@@ -1,0 +1,6 @@
+id = "ts-bug-sort-numbers"
+prompt = "`sortNumbers` in src/sort.ts sorts [10, 9, 1] as [1, 10, 9]. Fix it to sort numerically, ascending, without changing its input."
+timeout_s = 600
+budget_usd = 1.0
+tags = ["typescript", "bug"]
+approve = "yolo"

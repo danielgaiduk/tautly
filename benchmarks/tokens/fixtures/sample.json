@@ -1,0 +1,118 @@
+[
+  {
+    "model": "anthropic/claude-sonnet-5-5",
+    "edit_format": null,
+    "tasks": [
+      {
+        "id": "py-bug-off-by-one",
+        "trial": 1,
+        "passed": true,
+        "reason": null,
+        "cost_usd": 0.0412,
+        "cost_estimated": false,
+        "cost_partial": false,
+        "episode_cost_usd": 0.0011,
+        "tokens_in": 6210,
+        "tokens_out": 830,
+        "cache_read": 9400,
+        "side_tokens": 940,
+        "edit_calls": 2,
+        "edit_failures": 0,
+        "blocked_attempts": 0,
+        "edit_repairs_by_stage": {"whitespace": 1},
+        "duration_s": 41.3
+      }
+    ],
+    "summary": {
+      "trials": 3,
+      "pass_rate": 0.82,
+      "total_cost_usd": 6.4213,
+      "episode_cost_usd": 0.1532,
+      "cost_estimated": false,
+      "cost_partial": false,
+      "edit_failure_rate": 0.031,
+      "tokens_per_solved_task": 18342.6,
+      "cache_hit_ratio": 0.612,
+      "blocked_attempts": 4,
+      "edit_repairs_by_stage": {"whitespace": 21, "indentation": 9, "anchor": 2},
+      "mean": {
+        "pass_rate": 0.82,
+        "total_cost_usd": 2.1404,
+        "edit_failure_rate": 0.031,
+        "tokens_per_solved_task": 18342.6,
+        "cache_hit_ratio": 0.612
+      },
+      "stdev": {
+        "pass_rate": 0.02,
+        "total_cost_usd": 0.0911,
+        "edit_failure_rate": 0.004,
+        "tokens_per_solved_task": 512.3,
+        "cache_hit_ratio": 0.011
+      }
+    }
+  },
+  {
+    "model": "openai/gpt-5",
+    "edit_format": "patch",
+    "tasks": [],
+    "summary": {
+      "trials": 3,
+      "pass_rate": 0.7733,
+      "total_cost_usd": 4.0127,
+      "episode_cost_usd": 0.0874,
+      "cost_estimated": true,
+      "cost_partial": false,
+      "edit_failure_rate": 0.058,
+      "tokens_per_solved_task": 22104.1,
+      "cache_hit_ratio": 0.455,
+      "blocked_attempts": 9,
+      "edit_repairs_by_stage": {"normalized": 3, "whitespace": 14},
+      "mean": {
+        "pass_rate": 0.7733,
+        "total_cost_usd": 1.3376,
+        "edit_failure_rate": 0.058,
+        "tokens_per_solved_task": 22104.1,
+        "cache_hit_ratio": 0.455
+      },
+      "stdev": {
+        "pass_rate": 0.0306,
+        "total_cost_usd": 0.1204,
+        "edit_failure_rate": 0.009,
+        "tokens_per_solved_task": 1310.8,
+        "cache_hit_ratio": 0.02
+      }
+    }
+  },
+  {
+    "model": "google/gemini-3-pro",
+    "edit_format": null,
+    "tasks": [],
+    "summary": {
+      "trials": 3,
+      "pass_rate": 0.74,
+      "total_cost_usd": 3.5521,
+      "episode_cost_usd": 0.0702,
+      "cost_estimated": false,
+      "cost_partial": false,
+      "edit_failure_rate": 0.047,
+      "tokens_per_solved_task": 25877.0,
+      "cache_hit_ratio": 0.398,
+      "blocked_attempts": 6,
+      "edit_repairs_by_stage": {"indentation": 11, "whitespace": 17},
+      "mean": {
+        "pass_rate": 0.74,
+        "total_cost_usd": 1.184,
+        "edit_failure_rate": 0.047,
+        "tokens_per_solved_task": 25877.0,
+        "cache_hit_ratio": 0.398
+      },
+      "stdev": {
+        "pass_rate": 0.04,
+        "total_cost_usd": 0.0874,
+        "edit_failure_rate": 0.006,
+        "tokens_per_solved_task": 1802.4,
+        "cache_hit_ratio": 0.017
+      }
+    }
+  }
+]
