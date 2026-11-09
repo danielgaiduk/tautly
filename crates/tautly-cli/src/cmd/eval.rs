@@ -354,6 +354,7 @@ struct TaskResult {
     tokens_in: u64,
     tokens_out: u64,
     cache_read: u64,
+    cache_write: u64,
     /// Side-model tokens (input + output).
     side_tokens: u64,
     /// `edit` and `write` results, and those that failed.
@@ -671,6 +672,7 @@ fn see(r: &mut TaskResult, finish: &mut Option<String>, ev: &Value) {
                 r.tokens_in += num("tokens_in");
                 r.tokens_out += num("tokens_out");
                 r.cache_read += num("cache_read");
+                r.cache_write += num("cache_write");
             } else {
                 r.side_tokens += num("tokens_in") + num("tokens_out");
             }
@@ -774,7 +776,7 @@ struct Figures {
 }
 
 /// `tokens_per_solved_task = Σ(tokens_in + tokens_out + side_tokens) / solved`,
-/// `cache_hit_ratio = Σcache_read / Σ(tokens_in + cache_read)`, edit failures per `edit`
+/// `cache_hit_ratio = Σcache_read / Σ(tokens_in + cache_read + cache_write)`, edit failures per `edit`
 /// and `write` result.
 fn figures(runs: &[&TaskResult]) -> Figures {
     let solved = runs.iter().filter(|r| r.passed).count();
@@ -783,7 +785,7 @@ fn figures(runs: &[&TaskResult]) -> Figures {
         .map(|r| r.tokens_in + r.tokens_out + r.side_tokens)
         .sum();
     let cache: u64 = runs.iter().map(|r| r.cache_read).sum();
-    let input: u64 = runs.iter().map(|r| r.tokens_in).sum();
+    let input: u64 = runs.iter().map(|r| r.tokens_in + r.cache_write).sum();
     let edits: u32 = runs.iter().map(|r| r.edit_calls).sum();
     let failed: u32 = runs.iter().map(|r| r.edit_failures).sum();
     Figures {

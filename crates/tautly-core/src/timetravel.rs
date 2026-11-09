@@ -1299,6 +1299,9 @@ impl Session {
                             writer.checkpoint()?;
                         }
                     }
+                    // Its end first: the rebuild below reads this log, and would take the
+                    // restore it is in the middle of for one a crash cut off.
+                    ended(&mut writer, &mut report);
                     let there = RecordLog::open(&found)?;
                     let r = rebuild_with(&there, None, Some(&calibration))?;
                     Ok::<_, TtError>(r)
@@ -1310,7 +1313,7 @@ impl Session {
                 };
                 match continued {
                     Ok(r) => {
-                        ended(&mut both, &mut report);
+                        ended(&mut live, &mut report);
                         Ok((report, Some((writer, r))))
                     }
                     Err(e) => {

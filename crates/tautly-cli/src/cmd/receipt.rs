@@ -252,7 +252,7 @@ impl Summary {
 /// The receipt's `(label, value)` lines.
 fn rows(s: &Summary, evidence: Option<&TestEvidence>) -> Vec<(&'static str, String)> {
     let est = if s.estimated { " (est.)" } else { "" };
-    let seen = s.tokens_in + s.cache_read;
+    let seen = s.tokens_in + s.cache_read + s.cache_write;
     let models: Vec<String> = s.models.iter().map(|m| printable(m)).collect();
     let saved = s.index + s.diff_reads + s.context_gc + s.filters;
     let mut rows = vec![

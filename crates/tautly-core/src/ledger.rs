@@ -176,7 +176,8 @@ pub struct StatsRow {
     /// The receipts' `total_usd`; `None` when none had one.
     pub saved_usd: Option<f64>,
     pub wall_ms: u64,
-    /// `cache_read / (input + cache_read)` of the usage rows; `None` when both are 0.
+    /// `cache_read / (input + cache_read + cache_write)` of the usage rows; `None` when all
+    /// are 0.
     pub cache_hit_ratio: Option<f64>,
 }
 
@@ -481,7 +482,8 @@ impl Ledger {
             "SELECT {usage_key} AS k, \
              COALESCE(SUM(u.input + u.output + u.cache_read + u.cache_write), 0), \
              SUM(u.cost_usd), COUNT(*) - COUNT(u.cost_usd), COALESCE(SUM(u.estimated), 0), \
-             COALESCE(SUM(u.input), 0), COALESCE(SUM(u.cache_read), 0) \
+             COALESCE(SUM(u.input), 0), COALESCE(SUM(u.cache_read), 0), \
+             COALESCE(SUM(u.cache_write), 0) \
              FROM {usage_from} WHERE u.at_ms >= ?1 GROUP BY k"
         ))?;
         let usage = stmt.query_map(params![since], |r| {
@@ -493,11 +495,12 @@ impl Ledger {
                 n(r.get(4)?),
                 n(r.get(5)?),
                 n(r.get(6)?),
+                n(r.get(7)?),
             ))
         })?;
         for row in usage {
-            let (key, tokens, cost, unpriced, estimated, input, cache_read) = row?;
-            let seen = input.saturating_add(cache_read);
+            let (key, tokens, cost, unpriced, estimated, input, cache_read, cache_write) = row?;
+            let seen = input.saturating_add(cache_read).saturating_add(cache_write);
             let entry = rows.entry(key.clone()).or_insert_with(|| empty(&key));
             entry.tokens = tokens;
             entry.cost_usd = cost;

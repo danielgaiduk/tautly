@@ -695,6 +695,45 @@ async fn switch_back_and_forth_restores_each_tip_exactly() {
     run.stop().await;
 }
 
+/// A switch that writes files never warns that a restore was cut off: the target is
+/// rebuilt after its log records the restore's end, not in the middle of it.
+#[tokio::test]
+async fn a_switch_does_not_warn_about_its_own_restore() {
+    let repo = Repo::git_repo(AB);
+    let mut script = two_turns_script();
+    script.extend([
+        tools_step(vec![write("w3", "d.txt", "dee\n")]),
+        text_step_no_usage("on the branch"),
+    ]);
+    let mock = MockProvider::new(script);
+    let mut run = run_two_turns(&repo, &mock).await;
+    let (a, _) = run.current();
+    run.rewind(3, false, &[]).await.done();
+    run.turn_with("branch work").await;
+    run.engine
+        .send(Command::Switch {
+            id: None,
+            session_id: a.clone(),
+            dry_run: false,
+            overwrite: Vec::new(),
+        })
+        .await
+        .unwrap();
+    let seen = run
+        .until(|e| matches!(e, Event::SessionChanged { .. } | Event::Error { .. }))
+        .await;
+    let warned: Vec<&String> = seen
+        .iter()
+        .filter_map(|e| match e {
+            Event::Warning { message } if message.contains("cut off") => Some(message),
+            _ => None,
+        })
+        .collect();
+    assert!(warned.is_empty(), "{warned:?}");
+    assert_eq!(run.current().0, a);
+    run.stop().await;
+}
+
 fn two_turns_script() -> Vec<MockTurn> {
     vec![
         tools_step(vec![write("w1", "a.txt", "one\n")]),

@@ -297,7 +297,7 @@ pub enum Event {
     /// What user turn `turn` (1-based) spent and saved (spec 7.11.1), sent right before its
     /// `TurnFinished` whatever the reason. Token fields sum the main and side roles;
     /// `side_tokens` is the side share (input + output). `cache_hit_ratio` is
-    /// `cache_read / (tokens_in + cache_read)`, absent when both are 0. `wall_ms` runs
+    /// `cache_read / (tokens_in + cache_read + cache_write)`, absent when all are 0. `wall_ms` runs
     /// from `TurnStarted` to `TurnFinished`. `steps` counts distinct provider steps (a step
     /// sent again after an overflow counts once); `tool_calls` counts the calls that ran
     /// (not those refused, denied, blocked or cancelled first). Every number in `saved` is

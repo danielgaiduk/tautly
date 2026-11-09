@@ -187,7 +187,11 @@ impl ReceiptBuilder {
                 + per_million(self.context_gc, p.cache_read)
                 + cache
         });
-        let seen = self.tokens_in.saturating_add(self.cache_read);
+        // Every prompt token: uncached, read from the cache, or written to it.
+        let seen = self
+            .tokens_in
+            .saturating_add(self.cache_read)
+            .saturating_add(self.cache_write);
         Event::TurnReceipt {
             turn: self.turn,
             model: self.model,

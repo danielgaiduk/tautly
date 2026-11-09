@@ -146,6 +146,12 @@ fn cache_hit_ratio_formula() {
     let r = receipt(&b.finish(None, Instant::now()));
     assert!(close(r.cache_hit_ratio.unwrap(), 0.8), "{r:?}");
 
+    // A cache write is not a hit: 500 read of 100 uncached + 500 read + 400 written.
+    let mut b = builder();
+    b.usage(UsageRole::Main, &usage(100, 10, 500, 400), None);
+    let r = receipt(&b.finish(None, Instant::now()));
+    assert!(close(r.cache_hit_ratio.unwrap(), 0.5), "{r:?}");
+
     let r = receipt(&builder().finish(None, Instant::now()));
     assert_eq!(r.cache_hit_ratio, None);
 }
